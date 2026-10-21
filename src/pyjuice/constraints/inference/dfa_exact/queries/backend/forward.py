@@ -173,7 +173,8 @@ def run_forward(backend, bufs: dict, plan, x: torch.Tensor, missing: torch.Tenso
                 built["counts"] = fresh_counts(compact, hold["regions"], hold["fresh"])
             return built["counts"]
 
-        hold = dict(hold, ivs = np.unique(prog.reg_iv_all[hold["regions"]]), order = order, counts = counts)
+        ivs = np.unique(prog.reg_iv_all[hold["regions"]])
+        hold = dict(hold, ivs = ivs, ivset = set(ivs.tolist()), order = order, counts = counts)
     else:
         hold = None
     masses = backend.state.masses() if masses is None else masses
@@ -304,7 +305,7 @@ def _sums(backend, parts, block_size: int, nodes: torch.Tensor, element_mars: to
             if max_cols == 0:
                 continue
             order = None                                # (some rows hold their values: their lanes left as they are)
-            if hold is not None and np.isin(ivs, hold["ivs"]).any():
+            if hold is not None and any(iv in hold["ivset"] for iv in ivs.tolist()):   # (a part's few intervals)
                 order = hold["order"]()
             fused_sum(nodes, element_mars, pc.params, nids, cids, pids, nb_reg,
                       regions if order is None else dict(regions, slots = order.slots), elem_first, elem_width,

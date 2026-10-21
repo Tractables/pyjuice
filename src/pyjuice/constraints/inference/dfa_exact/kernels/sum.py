@@ -748,24 +748,29 @@ def _cuda_split_buffer(dev, num_blocks: int, max_cols: int, tn: int, nch: int, s
     return split_buffer(dev, host_cdiv(num_blocks, 4) * host_cdiv(max_cols, tn), per_tile)
 
 
-def _cuda_forward(plan, node_mars, params, nids, nb_reg, sel, num_blocks, regions, lanes, gated, g, pre_args,
-                  batch_size, max_cols, precision):
-    """The fused forward launch ``plan`` (:func:`_cuda_plan`) on the CUDA kernel, from the pre-pass's chunks
-    (``pre_args``: its buffer, ``pre_cm``, ``pre_ld``)."""
+def _cuda_forward(plan, node_mars, element_mars, params, nids, cids, nb_reg, sel, num_blocks, regions, lanes, gated,
+                  g, pre_args, elem_first, elem_width, batch_size, max_cols, precision):
+    """The fused forward launch ``plan`` (:func:`_cuda_plan`) on the CUDA kernel: one call -- the pre-pass over the
+    children's chunks (``cids`` row 0 of ``element_mars``, into ``pre_args``: its buffer, ``pre_cm``, ``pre_ld``), the
+    sums, and a split launch's merge by the last share in."""
     mod, (wbase, cells, nch, affine), tn, split, wfrag = plan
-    sbuf = _cuda_split_buffer(node_mars.device, num_blocks, max_cols, tn, nch, split, node_mars)
+    dev = node_mars.device
+    sbuf = _cuda_split_buffer(dev, num_blocks, max_cols, tn, nch, split, node_mars)
     pre, pre_cm, pre_ld = pre_args
     _, _, _, _, sstride, lz, lzstride, coff, reg_ivk, Bq, steps = g
     ext = gated is not None
     perm, reg_perm, reg_live = (lanes.perm, lanes.reg_first, lanes.reg_live) if lanes is not None else (nids,) * 3
+    dummy = _int32_dummy(dev)
     mod.fused_sum_cuda(False, node_mars, node_mars, params, _no_fragments(params) if wfrag is None else wfrag, wbase,
                        1024, pre, pre_ld, pre_cm, nids, nb_reg, nb_reg, nids if sel is None else sel, regions["offset"],
-                       regions["width"], regions["first"], regions["slots"], perm, reg_perm, reg_live, 0, 0,
-                       gated["minor"] if ext else node_mars,
-                       cells if ext else _int32_dummy(node_mars.device), gated["mstride"] if ext else 0,
+                       regions["width"], regions["first"], regions["slots"], perm, reg_perm, reg_live, elem_first,
+                       elem_width, gated["minor"] if ext else node_mars,
+                       cells if ext else dummy, gated["mstride"] if ext else 0,
                        lz if ext else node_mars, lzstride if ext else 0, coff, reg_ivk, Bq, steps, batch_size,
                        num_blocks, nch, max_cols, ext, ext and sstride == 0, ext and gated["lanes"] is not None,
-                       lanes is not None, sel is not None, precision == "tf32x3", affine, tn, sbuf, split)
+                       lanes is not None, sel is not None, precision == "tf32x3", affine, tn, sbuf, split,
+                       element_mars, cids, dummy, dummy, dummy, 1, 1,
+                       2 if wfrag is not None and wfrag.dtype == torch.bfloat16 else 1, nch * 32)
 
 
 _CUDA_TD_TABLES = {}
@@ -852,30 +857,22 @@ def _cuda_top_down(plan, element_flows, node_flows, params, tables, regions, ele
     num_blocks = rows.numel() if sel is None else sel.numel()
     lanes = liveness.lanes if liveness is not None else None
     perm, reg_perm, reg_live = (lanes.perm, lanes.reg_first, lanes.reg_live) if lanes is not None else (rows,) * 3
-    TILE_B = min(_TILES[precision][2], max(16, host_next_power_of_2(max_cols)))
     pre_ld = host_cdiv(max_cols, 8) * 8                                 # (groups of 8 columns, :func:`_frag_offsets`)
     pre = pre_buffer(dev, npar * (32 + 1) * pre_ld)
-    for first, size in grid_chunks(host_cdiv(max_cols, TILE_B), 1):      # (one child block's parents: every one's)
-        _top_down_prepass_kernel[(npar, size)](
-            node_flows, pre, npar * 32 * pre_ld, pre_ld, tables["cb_ivreg"], tables["cb_row"] if idx is None else idx,
-            tables["par_ptr"], tables["par_nid"], tables["par_reg"], regions["offset"], regions["width"],
-            regions["first"], regions["slots"], perm, reg_perm, reg_live, gl[2], gl[3], gl[4], gl[5], gl[6], gl[7],
-            batch_size, npar, first, BS = 32, NGC = 32, TILE_I = 32, TILE_B = TILE_B, PRUNE = liveness is not None,
-            INDEXED = idx is not None, GATED = gated is not None,
-            LANES = gated is not None and gated["lanes"] is not None,
-            SHARED_GATES = gated is not None and gated["gstride"] == 0, REL = True, PRECISION = precision,
-            FRAG = 2 if wfrag is not None and wfrag.dtype == torch.bfloat16 else 1, num_warps = 4)
     ext = gated is not None
     sbuf = _cuda_split_buffer(dev, num_blocks, max_cols, tn, npar, split, element_flows)
+    dummy = _int32_dummy(dev)
     mod.fused_sum_cuda(True, element_flows, node_flows, params, _no_fragments(params) if wfrag is None else wfrag,
                        wbase, wstride, pre, pre_ld, npar * 32 * pre_ld, rows, rreg, colreg,
                        rows if sel is None else sel, regions["offset"], regions["width"], regions["first"],
                        regions["slots"], perm, reg_perm, reg_live, elem_first, elem_width,
-                       gated["minor"] if ext else element_flows, cells if ext else _int32_dummy(dev),
+                       gated["minor"] if ext else element_flows, cells if ext else dummy,
                        gated["mstride"] if ext else 0,
-                       element_flows, 0, gl[4], gl[5], gl[6], gl[7], batch_size, num_blocks, npar, max_cols, ext,
-                       ext and gl[1] == 0, ext and gated["lanes"] is not None, liveness is not None, sel is not None,
-                       precision == "tf32x3", affine, tn, sbuf, split)
+                       gl[2] if ext else element_flows, gl[3] if ext else 0, gl[4], gl[5], gl[6], gl[7], batch_size,
+                       num_blocks, npar, max_cols, ext, ext and gl[1] == 0, ext and gated["lanes"] is not None,
+                       liveness is not None, sel is not None, precision == "tf32x3", affine, tn, sbuf, split,
+                       node_flows, dummy, tables["par_ptr"], tables["par_nid"], tables["par_reg"], sl, 2,
+                       2 if wfrag is not None and wfrag.dtype == torch.bfloat16 else 1, 0)
 
 
 def fused_sum(node_mars: torch.Tensor, element_mars: torch.Tensor, params: torch.Tensor, nids: torch.Tensor,
@@ -950,18 +947,17 @@ def fused_sum(node_mars: torch.Tensor, element_mars: torch.Tensor, params: torch
         al = 4 if plan is None else 8                   # (the CUDA kernel's groups of 8 columns, :func:`_frag_offsets`)
         pre_ld = host_cdiv(max_cols, al) * al
         pre = pre_buffer(node_mars.device, (nch * TILE_E + nch) * pre_ld)
+        if plan is not None:                            # the CUDA kernel's call runs its own pre-pass
+            _cuda_forward(plan, node_mars, element_mars, params, nids, cids, nb_reg, sel, num_blocks, regions, lanes,
+                          gated, g, (pre, nch * TILE_E * pre_ld, pre_ld), elem_first, elem_width, batch_size, max_cols,
+                          precision)
+            return
         for first, size in grid_chunks(num_col_tiles, 1):
             _forward_prepass_kernel[(nch, size)](
                 element_mars, pre, nch * TILE_E * pre_ld, pre_ld, cids, nb_reg, regions["slots"], perm, reg_perm,
                 reg_live, elem_first, elem_width, batch_size, num_edges, first, TILE_E = TILE_E, TILE_B = TILE_B,
-                PRUNE = liveness is not None, PRECISION = precision,
-                FRAG = 0 if plan is None else 2 if plan[4] is not None and plan[4].dtype == torch.bfloat16 else 1,
-                num_warps = 4)
+                PRUNE = liveness is not None, PRECISION = precision, num_warps = 4)
         pre_kw = dict(pre_args = (pre, nch * TILE_E * pre_ld, pre_ld))
-        if plan is not None:
-            _cuda_forward(plan, node_mars, params, nids, nb_reg, sel, num_blocks, regions, lanes, gated, g,
-                          pre_kw["pre_args"], batch_size, max_cols, precision)
-            return
     if split > 1 or pre_kw:
         buf = (buf[0] if buf else node_mars,) + (pre_kw["pre_args"] if pre_kw else (node_mars, 0, 0))
         split_kw = dict(SPLIT = split, PRE = bool(pre_kw))

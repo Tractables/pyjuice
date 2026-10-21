@@ -144,6 +144,16 @@ struct Args {
     float* split_buf;                 // split: every tile's head and shares
     int split, share;                 // the shares of every tile's chunks (1: none) and the chunks of each
     long long per_tile;               // floats of a tile in the split buffer
+    // The pre-pass, launched ahead of the sums on the same stream (`prepass_kernel`): 0 none (`pre` filled by the
+    // Triton pre-pass), 1 forward -- `values` element_mars, `cids` the children (row 0 of the blocks' table, `num_edges`
+    // of them) --, 2 top-down -- `values` node_flows, the parents of the first child block (`par_ptr` at the block, its
+    // slices `sl` to a block, `par_nid` / `par_reg`), less the column's sample's log Z (EXT). `frag`: e as the products
+    // read it, 1 fp32 (`round_tf32`: on the TF32 grid; fp32-level products read it as it is), 2 bf16
+    const float* values;
+    float* pre_w;                     // `pre`, written
+    Idx cids, par_ptr, par_nid, par_reg;
+    int sl, prepass, frag, round_tf32;
+    long long num_edges;
 };
 
 
@@ -182,6 +192,107 @@ __device__ __forceinline__ void where_of(const Args& a, Where& w) {
 
 __device__ __forceinline__ void put(const Where& w, int b, long long r, long long col, float o) {
     w.out[b][r * w.ow[b] + col] = o;
+}
+
+
+// The pre-pass of chunk `blockIdx.x` and a tile of PRE_COLS columns from `blockIdx.y PRE_COLS`: the chunk's 32 rows
+// -- forward the children `cids[32 ch + i]` (element rows), top-down the parent entry's node block (TD: less the
+// column's sample's log Z, EXT) --, their maximum per column t, and e = exp(x - t) in the order the sums read it
+// (`_frag_offsets` / `_frag_offsets_bf16` in `kernels/sum.py`: a group of 8 columns' 32 rows contiguous, the tile's
+// groups from `32 k0` of the chunk's rows), t at `pre_cm + ch pre_ld + k`. Pruned, the live columns (the region's lane
+// order) alone are read, the rest -inf: e 0, as the Triton pre-pass writes them.
+#define PRE_COLS 64
+
+template <bool TD, bool EXT, int FRAG>
+__global__ void __launch_bounds__(THREADS) prepass_kernel(Args a) {
+    __shared__ float X[BS][PRE_COLS + 1];
+    __shared__ float Tc[PRE_COLS];
+    __shared__ long long cols[PRE_COLS];
+    __shared__ int samp[PRE_COLS];
+    const int tid = threadIdx.x, ch = blockIdx.x;
+    const long long k0 = (long long)blockIdx.y * PRE_COLS;
+    const long long s0 = a.indexed ? a.sel[0] : 0;                   // (every block's columns: one region)
+    const long long reg = a.colreg[TD ? s0 : 0];
+    const long long ncols = (long long)a.B * a.reg_slots[reg];
+    if (k0 >= ncols) return;
+    const long long num_live = a.prune ? (long long)a.reg_live[reg] : ncols;
+    long long nid0 = 0, width = 0, base = 0;
+    if (TD) {                                                        // the parent entry's node block
+        const long long p = a.par_ptr[s0 / a.sl] + ch;
+        nid0 = a.par_nid[p];
+        const long long r = a.par_reg[p];
+        width = a.reg_width[r];
+        base = a.reg_offset[r] + (nid0 - a.reg_first[r]) * width;
+    }
+    const bool search = TD && EXT && a.lzstride != 0 && a.lanes;
+    const long long obase = search ? a.reg_ivk[reg] * (a.Bq + 1) : 0;
+    for (int c = tid; c < PRE_COLS; c += THREADS) {                  // the columns and their samples
+        const long long k = k0 + c;
+        const bool in = k < num_live;
+        const long long col = in ? (a.prune ? a.perm[a.reg_perm[reg] + k] : k) : 0;
+        cols[c] = in ? col : -1;
+        int s = 0;
+        if (TD && EXT && a.lzstride != 0 && in) {
+            if (search) {
+                int lo = 0, hi = a.Bq;
+                for (int st = 0; st < a.steps; ++st) {
+                    const int mid = (lo + hi + 1) / 2;
+                    const bool go = a.coff[obase + mid] <= col;
+                    lo = go ? mid : lo;
+                    hi = go ? hi : mid - 1;
+                }
+                s = lo;
+            } else {
+                s = (int)(col / a.reg_slots[reg]);
+            }
+        }
+        samp[c] = s;
+    }
+    __syncthreads();
+    for (int i = tid; i < BS * PRE_COLS; i += THREADS) {             // x
+        const int r = i / PRE_COLS, c = i % PRE_COLS;
+        const long long col = cols[c];
+        float x = -CUDART_INF_F;
+        if (col >= 0) {
+            if (TD) {
+                x = a.values[base + r * width + col];
+                if (EXT) x -= a.lz[(long long)samp[c] * a.lzstride + nid0 + r];
+            } else {
+                const long long e = (long long)ch * BS + r;
+                if (e < a.num_edges) {
+                    const long long cid = a.cids[e];
+                    if (cid >= a.elem_first) x = a.values[(cid - a.elem_first) * a.elem_width + col];
+                }
+            }
+        }
+        X[r][c] = x;
+    }
+    __syncthreads();
+    for (int c = tid; c < PRE_COLS; c += THREADS) {                  // t
+        float t = -CUDART_INF_F;
+        for (int r = 0; r < BS; ++r) t = fmaxf(t, X[r][c]);
+        Tc[c] = t;
+        const long long k = k0 + c;
+        if (k < ncols) a.pre_w[a.pre_cm + (long long)ch * a.pre_ld + k] = t;
+    }
+    __syncthreads();
+    const long long ebase = (long long)ch * BS * a.pre_ld + k0 * BS;   // e: the tile's groups, contiguous
+    for (int i = tid; i < BS * PRE_COLS; i += THREADS) {
+        const int g = i / 256, o = i % 256;
+        int r, c;
+        if (FRAG == 2) {                                              // (m16n8k16 B fragments, four values a lane)
+            r = (o / 128) * 16 + ((o % 4) / 2) * 8 + ((o % 16) / 4) * 2 + (o % 2);
+            c = g * 8 + (o % 128) / 16;
+        } else {                                                      // (m16n8k8 B fragments, two values a lane)
+            r = (o / 64) * 8 + (o % 2) * 4 + (o % 8) / 2;
+            c = g * 8 + (o % 64) / 8;
+        }
+        if (k0 + c >= ncols) continue;
+        const float t = Tc[c];
+        const float e = __expf(X[r][c] - (t == -CUDART_INF_F ? 0.f : t));
+        if (FRAG == 2) reinterpret_cast<__nv_bfloat16*>(a.pre_w)[ebase + i] = __float2bfloat16_rn(e);
+        else a.pre_w[ebase + i] = a.round_tf32 ? __uint_as_float(to_tf32(e)) : e;
+    }
 }
 
 
@@ -618,8 +729,17 @@ static const void* allowed() {
     return k;
 }
 
+template <bool TD, bool EXT>
+static void launch_prepass(const Args& a, unsigned col_tiles, cudaStream_t stream) {
+    dim3 pgrid((unsigned)a.nch, col_tiles);
+    if (a.frag == 2) prepass_kernel<TD, EXT, 2><<<pgrid, THREADS, 0, stream>>>(a);
+    else prepass_kernel<TD, EXT, 1><<<pgrid, THREADS, 0, stream>>>(a);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
 template <bool EXT, bool X3, bool FA, bool BF, int TN, bool TD>
-static void launch(const Args& a, dim3 grid, cudaStream_t stream) {
+static void launch(const Args& a, dim3 grid, unsigned pre_tiles, cudaStream_t stream) {
+    if (a.prepass) launch_prepass<TD, EXT>(a, pre_tiles, stream);
     allowed<EXT, X3, FA, BF, TN, TD>();
     const size_t bytes = smem_bytes(TN, TD, EXT, a.share, a.affine);
     fused_sum_kernel<EXT, X3, FA, BF, TN, TD><<<grid, THREADS, bytes, stream>>>(a);
@@ -632,13 +752,13 @@ static void launch(const Args& a, dim3 grid, cudaStream_t stream) {
 }
 
 template <bool EXT, bool X3, bool FA, bool BF, bool TD>
-static void launch_tn(const Args& a, int tn, dim3 grid, cudaStream_t stream) {
+static void launch_tn(const Args& a, int tn, dim3 grid, unsigned pre_tiles, cudaStream_t stream) {
     switch (tn) {
-        case 64: return launch<EXT, X3, FA, BF, 64, TD>(a, grid, stream);
-        case 80: return launch<EXT, X3, FA, BF, 80, TD>(a, grid, stream);
-        case 96: return launch<EXT, X3, FA, BF, 96, TD>(a, grid, stream);
-        case 112: return launch<EXT, X3, FA, BF, 112, TD>(a, grid, stream);
-        case 128: return launch<EXT, X3, FA, BF, 128, TD>(a, grid, stream);
+        case 64: return launch<EXT, X3, FA, BF, 64, TD>(a, grid, pre_tiles, stream);
+        case 80: return launch<EXT, X3, FA, BF, 80, TD>(a, grid, pre_tiles, stream);
+        case 96: return launch<EXT, X3, FA, BF, 96, TD>(a, grid, pre_tiles, stream);
+        case 112: return launch<EXT, X3, FA, BF, 112, TD>(a, grid, pre_tiles, stream);
+        case 128: return launch<EXT, X3, FA, BF, 128, TD>(a, grid, pre_tiles, stream);
     }
     TORCH_CHECK(false, "tiles of 64, 80, 96, 112 or 128 columns");
 }
@@ -653,9 +773,13 @@ void fused_sum_cuda(bool td, torch::Tensor out0, torch::Tensor out1, torch::Tens
                     int64_t elem_width, torch::Tensor scales, torch::Tensor cells, int64_t sstride, torch::Tensor lz,
                     int64_t lzstride, torch::Tensor coff, torch::Tensor reg_ivk, int64_t Bq, int64_t steps, int64_t B,
                     int64_t num_blocks, int64_t nch, int64_t max_cols, bool ext, bool shared, bool lanes, bool prune,
-                    bool indexed, bool x3, bool affine, int64_t tn, torch::Tensor split_buf, int64_t split) {
+                    bool indexed, bool x3, bool affine, int64_t tn, torch::Tensor split_buf, int64_t split,
+                    torch::Tensor values, torch::Tensor cids, torch::Tensor par_ptr, torch::Tensor par_nid,
+                    torch::Tensor par_reg, int64_t sl, int64_t prepass, int64_t frag, int64_t num_edges) {
     TORCH_CHECK(out0.is_cuda() && out0.scalar_type() == torch::kFloat32 && out1.scalar_type() == torch::kFloat32,
                 "outputs: fp32 on the device");
+    TORCH_CHECK(prepass == 0 || (values.scalar_type() == torch::kFloat32 && (frag == 1 || frag == 2)),
+                "the pre-pass: fp32 values, e in fp32 or bf16");
     TORCH_CHECK(wbase.scalar_type() == torch::kInt64 && cells.scalar_type() == torch::kInt32,
                 "wbase int64, cells int32");
     const bool copy = wfrag.numel() > 0;            // (empty: the weights as they are)
@@ -714,11 +838,23 @@ void fused_sum_cuda(bool td, torch::Tensor out0, torch::Tensor out1, torch::Tens
     if (grid.x == 0 || grid.y == 0) return;
     TORCH_CHECK(a.split == 1 || split_buf.numel() >= SPLIT_TILES + (long long)grid.x * grid.y * a.per_tile,
                 "the split buffer is too small");
+    a.prepass = (int)prepass;
+    a.frag = (int)frag;
+    a.round_tf32 = !x3 && frag == 1;
+    a.num_edges = num_edges;
+    a.sl = (int)sl;
+    a.values = prepass ? values.data_ptr<float>() : nullptr;
+    a.pre_w = pre.data_ptr<float>();
+    a.cids = idx_of(cids);
+    a.par_ptr = idx_of(par_ptr);
+    a.par_nid = idx_of(par_nid);
+    a.par_reg = idx_of(par_reg);
+    const unsigned pre_tiles = (unsigned)((max_cols + PRE_COLS - 1) / PRE_COLS);
     cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
     const int t = (int)tn;
 #define DISPATCH(E, X, F, BF) if (ext == E && x3 == X && fa == F && bf == BF) \
-        return td ? launch_tn<E, X, F, BF, true>(a, t, grid, stream) \
-                  : launch_tn<E, X, F, BF, false>(a, t, grid, stream);
+        return td ? launch_tn<E, X, F, BF, true>(a, t, grid, pre_tiles, stream) \
+                  : launch_tn<E, X, F, BF, false>(a, t, grid, pre_tiles, stream);
     DISPATCH(false, false, false, false) DISPATCH(false, true, false, false) DISPATCH(true, false, false, false)
     DISPATCH(true, true, false, false) DISPATCH(false, false, true, false) DISPATCH(true, false, true, false)
     DISPATCH(false, false, false, true) DISPATCH(true, false, false, true)

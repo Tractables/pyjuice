@@ -296,3 +296,40 @@ def test_tf32_products_round_to_nearest(reference, monkeypatch):
     assert torch.equal(torch.isfinite(got), fin)
     drift = float((got[fin] - want[fin]).mean())
     assert abs(drift) < 2e-3, drift
+
+
+@pytest.mark.parametrize("precision", ["fp32", "tf32", "bf16"])
+@pytest.mark.parametrize("storage", ["dense", "compact"])
+@pytest.mark.parametrize("external", ["none", "per_sample"])
+def test_a_cuda_launch_is_one_call(external, storage, precision, gate_sums, monkeypatch):
+    """A fused launch on the CUDA kernel is one call of the extension: its pre-pass runs there (the Triton pre-pass
+    kernels run for the launches without a CUDA plan alone), and a split's merge kernel follows from the same call;
+    the same values as the Triton kernels."""
+    from torch.profiler import ProfilerActivity, profile
+    mod = get_module()
+    if mod is None:
+        pytest.skip("the CUDA extension is unavailable")
+    pc = circuit(128, external != "none", gate_sums)
+    cc = jc.compile(jc.DFA.contains([[1, 2]], V) & jc.Not(jc.DFA.contains([[2, 2]], V)), pc)
+    kw = inputs(pc, 3, external)
+    plans, td_plans = recorded_plans(monkeypatch)
+    nones = []                                                          # the launches without a CUDA plan
+    for name in ("_cuda_plan", "_cuda_td_plan"):
+        real = getattr(lifted_sum, name)
+        monkeypatch.setattr(lifted_sum, name,
+                            (lambda real: lambda *a, **k: (lambda p: nones.append(p is None) or p)(real(*a, **k)))(real))
+    monkeypatch.setattr(lifted_sum, "CUDA_MIN_TILES", 0)                # every launch it may take
+    monkeypatch.setattr(lifted_sum, "SPLIT_MIN_SHARE", 1)               # shares of a chunk: merged
+    calls(cc, 3, kw, precision, storage)                                # (compiled, warm)
+    del nones[:]
+    with profile(activities = [ProfilerActivity.CUDA]) as prof:
+        got = calls(cc, 3, kw, precision, storage)
+    events = {e.key: e.count for e in prof.key_averages()}
+    assert plans and td_plans and any(p[3] > 1 for p in plans + td_plans), [p[2:4] for p in plans + td_plans]
+    assert any("prepass_kernel" in k and not k.startswith("_") for k in events), sorted(events)   # the CUDA pre-pass
+    assert any("fused_sum_merge_kernel" in k for k in events), sorted(events)                      # the shares merged
+    triton_pre = sum(c for k, c in events.items() if k.startswith("_forward_prepass") or k.startswith("_top_down_prepass"))
+    assert triton_pre <= sum(nones), (triton_pre, sum(nones))
+    monkeypatch.setattr(lifted_sum, "SPLIT_MIN_SHARE", 8)
+    monkeypatch.setattr(lifted_sum, "CUDA_MIN_TILES", 1 << 40)          # none
+    assert_same(got, calls(cc, 3, kw, precision, storage), precision)
