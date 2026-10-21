@@ -66,6 +66,29 @@ def test_active_states_match_brute_force():
             assert L.satisfiable == (len(want[0]) > 0)
 
 
+def test_the_sweeps_stop_at_their_fixed_point_and_run_on_the_device():
+    """The reachable and the accepting states are swept to a fixed point (a row equal to the one before repeats):
+    an automaton that settles, one that alternates for ever (a parity counter: no row equals the one before, every
+    one is swept), and random ones, against the brute force at lengths well past where they settle; the sweeps on
+    the device give the host's layout, bit for bit."""
+    from pyjuice.constraints.inference.dfa_exact.compiled.layout import _build
+    V = 2
+    parity = jc.DFA.from_dense(V, [[1, 1], [0, 0]], 0, [0])                  # accepts an even number of tokens
+    settling = jc.DFA.contains([[1, 1]], V)                                   # every state possible from t = 2 on
+    for dfa in (parity, settling, random_dfa(4, V, 3), random_dfa(5, V, 11)):
+        for n in (1, 2, 9, 10):
+            L = _build(dfa, n)
+            want = brute_active(dfa, n, V)
+            for t in range(n + 1):
+                assert {int(s) for s in L.state_id[t] if s >= 0} == want[t], (n, t)
+            if torch.cuda.is_available():
+                D = _build(dfa, n, device = "cuda")
+                assert torch.equal(D.state_id, L.state_id) and torch.equal(D.col_of_state, L.col_of_state)
+                assert torch.equal(D.width, L.width) and D.state_id.device.type == "cpu"
+    L = _build(parity, 10)
+    assert L.width.tolist() == [1] * 11                                      # (one state possible at every boundary)
+
+
 def test_successors_are_consistent():
     V = 3
     for seed in range(15):

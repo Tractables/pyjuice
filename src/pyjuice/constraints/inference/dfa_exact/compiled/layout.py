@@ -158,15 +158,18 @@ _CACHE: "OrderedDict[tuple, BoundaryLayout]" = OrderedDict()
 _CACHE_SIZE = 64
 
 
-def build_layout(automaton: DFA, n: int) -> BoundaryLayout:
+def build_layout(automaton: DFA, n: int, device = None, report = None) -> BoundaryLayout:
     """
-    The :class:`BoundaryLayout` of ``automaton`` over ``n`` positions (cached by fingerprint and ``n``).
+    The :class:`BoundaryLayout` of ``automaton`` over ``n`` positions (cached by fingerprint and ``n``; on the host).
 
     :param automaton: a complete DFA (what the ``automaton`` capability returns)
     :type automaton: DFA
 
     :param n: number of positions (the PC's number of variables)
     :type n: int
+
+    :param device: where the sweeps over the automaton run (None: the host) -- the same layout either way
+    :param report: None, or the compilation's progress (:class:`~...compiler.Progress`), told of the sweeps
     """
     if not isinstance(automaton, DFA):
         raise TypeError(f"Expected a DFA, got {type(automaton).__name__}.")
@@ -177,40 +180,73 @@ def build_layout(automaton: DFA, n: int) -> BoundaryLayout:
     if layout is not None:
         _CACHE.move_to_end(key)
         return layout
-    layout = _build(automaton, int(n))
+    layout = _build(automaton, int(n), device, report)
     _CACHE[key] = layout
     if len(_CACHE) > _CACHE_SIZE:
         _CACHE.popitem(last = False)
     return layout
 
 
-def _build(dfa: DFA, n: int) -> BoundaryLayout:
-    K, C = dfa.num_states, dfa.num_classes
-    delta = dfa.delta                                                       # [K, C]
-
-    # reachable from the initial state in exactly t tokens
-    reach = torch.zeros(n + 1, K, dtype = torch.bool)
-    reach[0, dfa.initial] = True
+def _sweep(first: torch.Tensor, step, n: int, report, stage: str) -> torch.Tensor:
+    """bool [n + 1, K]: ``first``, then ``step`` of the row before, ``n`` times -- to a FIXED POINT: a row equal to
+    the one before stays (the step is a function of the row), so the rest are copies. Decoding at a length well past
+    the shortest accepted string, the sweeps settle after a few dozen boundaries of a thousand."""
+    out = torch.empty(n + 1, first.numel(), dtype = torch.bool, device = first.device)
+    out[0] = first
+    if report is not None:
+        report.stage(stage, n)
     for t in range(n):
-        reach[t + 1, delta[reach[t]].flatten()] = True
+        out[t + 1] = step(out[t])
+        if torch.equal(out[t + 1], out[t]):
+            out[t + 2:] = out[t + 1]
+            if report is not None:
+                report.advance(n - t)
+            break
+        if report is not None:
+            report.advance()
+    return out
+
+
+def _build(dfa: DFA, n: int, device = None, report = None) -> BoundaryLayout:
+    K, C = dfa.num_states, dfa.num_classes
+    dev = torch.device("cpu") if device is None else torch.device(device)
+    _, delta, accept = dfa._tables_on(dev)                                  # [K, C], [K]
+    delta = delta.long()
+
+    def forward(row):                                                       # the successors of a set of states
+        nxt = torch.zeros(K, dtype = torch.bool, device = dev)
+        nxt[delta[row].reshape(-1)] = True
+        return nxt
+
+    initial = torch.zeros(K, dtype = torch.bool, device = dev)
+    initial[dfa.initial] = True
+    # reachable from the initial state in exactly t tokens ...
+    reach = _sweep(initial, forward, n, report, "layout: reachable states")
     # ... and able to reach acceptance in exactly n - t more tokens
-    accept_in = torch.stack([dfa.accept_within(r) for r in range(n + 1)], dim = 0)     # [r, K]
-    active = reach & accept_in.flip(0)                                      # [n+1, K]
+    accept_in = _sweep(accept.bool(), lambda row: row[delta].any(dim = 1), n, report, "layout: accepting states")
+    active = (reach & accept_in.flip(0)).cpu()                              # [n+1, K]
     # the column order: the fewest tokens to acceptance (within n), descending, then the state id
-    to_accept = torch.where(accept_in.any(dim = 0), accept_in.to(torch.uint8).argmax(dim = 0), n + 1)
+    to_accept = torch.where(accept_in.any(dim = 0), accept_in.to(torch.uint8).argmax(dim = 0), n + 1).cpu()
 
     width = active.sum(dim = 1)
     W = max(int(width.max()), 1)
     state_id = torch.full((n + 1, W), -1, dtype = torch.long)
     col_of_state = torch.full((n + 1, K), -1, dtype = torch.long)
+    if report is not None:
+        report.stage("layout: columns", n + 1)
     for t in range(n + 1):
-        ids = torch.nonzero(active[t]).flatten()
-        ids = ids[torch.argsort((n + 1 - to_accept[ids]) * K + ids)]
-        state_id[t, :ids.numel()] = ids
-        col_of_state[t, ids] = torch.arange(ids.numel())
+        if t > 0 and torch.equal(active[t], active[t - 1]):                 # (the same states: the same columns)
+            state_id[t], col_of_state[t] = state_id[t - 1], col_of_state[t - 1]
+        else:
+            ids = torch.nonzero(active[t]).flatten()
+            ids = ids[torch.argsort((n + 1 - to_accept[ids]) * K + ids)]
+            state_id[t, :ids.numel()] = ids
+            col_of_state[t, ids] = torch.arange(ids.numel())
+        if report is not None:
+            report.advance()
 
     return BoundaryLayout(n = n, token_class = dfa.token_class, width = width, state_id = state_id,
-                          col_of_state = col_of_state, delta = delta.to(torch.long).contiguous(),
+                          col_of_state = col_of_state, delta = dfa.delta.to(torch.long).contiguous(),
                           satisfiable = bool(width[0] > 0))
 
 

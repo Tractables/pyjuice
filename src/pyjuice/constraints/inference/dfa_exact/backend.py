@@ -147,10 +147,15 @@ class DFAExactBackend(Backend):
         return reasons
 
     @classmethod
-    def build(cls, constraint: Constraint, pc, structure: PCStructure) -> "DFAExactBackend":
+    def build(cls, constraint: Constraint, pc, structure: PCStructure, report = None) -> "DFAExactBackend":
         automaton = constraint.automaton()
-        layout = build_layout(automaton, structure.num_vars)
-        return cls(pc, constraint, structure, automaton, layout, build_pc_tables(structure, layout, pc))
+        layout = build_layout(automaton, structure.num_vars, device = pc.device, report = report)
+        if report is not None:
+            report.stage("the PC's tables", 1)
+        tables = build_pc_tables(structure, layout, pc)
+        if report is not None:
+            report.advance()
+        return cls(pc, constraint, structure, automaton, layout, tables)
 
     def rebind(self, pc, structure: PCStructure) -> "DFAExactBackend":
         """The same constraint on another PC with the same structure: the automaton, its layout and token classes are

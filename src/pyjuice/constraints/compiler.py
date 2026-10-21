@@ -20,7 +20,33 @@ from .language.base import Constraint
 from .structure import analyze_structure
 
 
-def compile(constraint: Constraint, pc: TensorCircuit, backend: Optional[str] = None) -> ConstrainedCircuit:
+class Progress:
+    """
+    A compilation's progress, shown as a bar (``tqdm``, as :func:`pyjuice.compile` shows its own): one per stage,
+    ``stage(name, total)`` starting a stage of ``total`` steps, ``advance(k)`` moving it ``k`` steps, ``close()``
+    ending the last. Backends tell it their stages (:meth:`~.inference.base.Backend.build`).
+    """
+
+    def __init__(self):
+        self.bar = None
+
+    def stage(self, name: str, total: int):
+        from tqdm import tqdm
+        self.close()
+        self.bar = tqdm(total = total, desc = f"Compiling the constraint ({name})", leave = False)
+
+    def advance(self, k: int = 1):
+        if self.bar is not None:
+            self.bar.update(k)
+
+    def close(self):
+        if self.bar is not None:
+            self.bar.close()
+            self.bar = None
+
+
+def compile(constraint: Constraint, pc: TensorCircuit, backend: Optional[str] = None,
+            verbose: bool = False) -> ConstrainedCircuit:
     """
     Compile ``constraint`` against ``pc`` for constrained queries.
 
@@ -40,6 +66,10 @@ def compile(constraint: Constraint, pc: TensorCircuit, backend: Optional[str] = 
         picks the first that can serve the pair (today there is one, ``"dfa_exact"``: exact lifting of the
         constraint's automaton, for PCs whose node scopes are contiguous in variable order)
     :type backend: Optional[str]
+
+    :param verbose: whether to show the compilation's progress, stage by stage (:class:`Progress`); the tables a
+        backend builds for its queries at the first one are not part of it
+    :type verbose: bool
     """
     t0 = time.perf_counter()
     if not isinstance(constraint, Constraint):
@@ -55,8 +85,13 @@ def compile(constraint: Constraint, pc: TensorCircuit, backend: Optional[str] = 
     for cls in ([BACKENDS[backend]] if backend is not None else BACKENDS.values()):
         reasons = cls.refusals(constraint, structure)
         if not reasons:
-            return ConstrainedCircuit(pc, constraint, structure, cls.build(constraint, pc, structure),
-                                      compile_time_s = time.perf_counter() - t0)
+            report = Progress() if verbose else None
+            try:
+                built = cls.build(constraint, pc, structure, report = report)
+            finally:
+                if report is not None:
+                    report.close()
+            return ConstrainedCircuit(pc, constraint, structure, built, compile_time_s = time.perf_counter() - t0)
         refused[cls.name] = reasons
     raise ConstraintCompileError("\n".join(f"Cannot compile the constraint against this PC (backend {name!r}):\n"
                                            + "\n".join(f"  - {r}" for r in reasons)

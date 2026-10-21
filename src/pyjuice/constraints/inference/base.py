@@ -42,8 +42,9 @@ class Backend(ABC):
 
     @classmethod
     @abstractmethod
-    def build(cls, constraint, pc, structure) -> "Backend":
-        """Compile the pair (one :meth:`refusals` accepts) for queries."""
+    def build(cls, constraint, pc, structure, report = None) -> "Backend":
+        """Compile the pair (one :meth:`refusals` accepts) for queries; ``report``: None, or the compilation's
+        progress to tell (:class:`~..compiler.Progress`)."""
 
     @abstractmethod
     def rebind(self, pc, structure) -> "Backend":

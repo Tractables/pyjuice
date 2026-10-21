@@ -67,6 +67,20 @@ def test_hmm_compiles_with_the_lifted_backend():
     assert "dfa_exact" in repr(cc) and cc.info()["width_per_boundary"] == cc.backend.width_per_boundary.tolist()
 
 
+def test_verbose_compile_shows_its_stages(capsys):
+    """``verbose``: a progress bar per stage of the compilation (the layout's sweeps, the PC's tables), the same
+    circuit as without."""
+    pc = hmm(7)
+    pc.to("cuda")
+    dfa = jc.DFA.contains([[1, 2, 1]], V)
+    loud = jc.compile(dfa, pc, verbose = True)                           # (a layout not built before: its sweeps)
+    err = capsys.readouterr().err
+    assert "layout: reachable states" in err and "layout: columns" in err and "the PC's tables" in err
+    quiet = jc.compile(dfa, pc)
+    assert not capsys.readouterr().err
+    assert torch.equal(loud.backend.layout.state_id, quiet.backend.layout.state_id)
+
+
 def test_1d_pd_compiles_with_interval_scopes():
     pc = juice.compile(juice.structures.PD(data_shape = (8,), num_latents = 4, split_intervals = 1,
                                            input_node_params = {"num_cats": V}), verbose = False)
