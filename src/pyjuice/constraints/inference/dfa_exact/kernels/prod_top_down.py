@@ -230,7 +230,8 @@ def _entry_mass(masses, x, code_oc, eprobs, pr, lz, lw0, eidx0, num_enum, oc, ow
 
 @triton_jit
 def _input_block_top_down_kernel(element_flows, temp_flows, node_flows, node_mars, obs_class, next_col, delta, state_id, col_of_state, class_mars,
-                                mass_row, mass_stride, trans, trans_stride, pred_ptr, pred_col, pred_x, width, iv_of,
+                                mass_row, mass_stride, trans, mbase, mcount, mrank, bbase, mb_stride, mrank_stride,
+                                pred_ptr, pred_col, pred_x, width, iv_of,
                                 iv_info, iv_table, once_iv, live, lanes, lane_first, lane_live, coff, ccount, cstart,
                                 ccolumns, crank, children, tiles, ptr, parents, reg_offset, reg_width, reg_first,
                                 code, tok_ptr, eidx, eprobs, prow, lognorm, enum_logw, Cs, num_enum, logw_stride,
@@ -238,7 +239,8 @@ def _input_block_top_down_kernel(element_flows, temp_flows, node_flows, node_mar
                                 C_KIND: tl.constexpr, OUT_TEMP: tl.constexpr, GROUPED: tl.constexpr,
                                 PRUNE: tl.constexpr, ORDERED: tl.constexpr, COMPACT: tl.constexpr,
                                 C_FULL: tl.constexpr, OUT_FULL: tl.constexpr, SAMPLE: tl.constexpr, ENUM: tl.constexpr,
-                                LOGW: tl.constexpr, TN: tl.constexpr, SUBS: tl.constexpr, TILE: tl.constexpr):
+                                LOGW: tl.constexpr, SAMPLE_MASSES: tl.constexpr, TN: tl.constexpr, SUBS: tl.constexpr,
+                                TILE: tl.constexpr):
     """The right operand ``R`` over ``[t + 1, t2)`` of ``input @ block`` steps: ``O_R[q, j] = log sum over the
     parents, and over the entries ``(i, class)`` leading to ``q`` at boundary ``t``, of mass + O_out[i, j]``. One
     program per ``TN`` children of a node tile (:func:`~.common.node_tiles`: children of one interval with as many
@@ -247,8 +249,9 @@ def _input_block_top_down_kernel(element_flows, temp_flows, node_flows, node_mar
     order, live ones first -- a tile of dead lanes only stores -inf (a first writer) or nothing (a later one), since
     evidence usually leaves a few live (one per sample through an observed prefix). ``COMPACT``: the child's and the
     parents' values compact (:mod:`.compact`), a lane per pair of live columns, -inf at a pair the automaton does not
-    join. ``SAMPLE``: class masses of each sample's own (see :class:`~..state.ClassMasses`; transition masses
-    ``trans_stride`` floats apart). Ungrouped, an entry's mass is read by its class's code (``ENUM``: an enumerated
+    join. ``SAMPLE``: class masses of each sample's own (see :class:`~..state.ClassMasses`; the transition masses as
+    :meth:`~..compiled.program.Program.mass_args` lays them out, ``SAMPLE_MASSES`` each sample's own over its
+    entries). Ungrouped, an entry's mass is read by its class's code (``ENUM``: an enumerated
     class's from its token, see :func:`_entry_mass`; ``Cs`` the stored classes, the table's width)."""
     c, real, c0 = _tile_rows(tiles, tl.program_id(0), TN, SUBS)
     tile = pid0 + tl.program_id(1)
@@ -305,11 +308,11 @@ def _input_block_top_down_kernel(element_flows, temp_flows, node_flows, node_mar
                           other = float("-inf"))                             # the observed token's log-prob
             op = _out_flows_ptr(tl.load(parents + p * 7 + 0), element_flows, temp_flows, out_first, out_width,
                                 temp_width, OUT_TEMP)[:, None] + _parent_base(b, ostride, COMPACT)[None, :]
-            if GROUPED:
-                masses = (trans + tl.load(parents + p * 7 + 6).to(tl.int64))[:, None]
-                if SAMPLE:                                                   # (the lane's sample's)
-                    masses = masses + tl.where((tl.load(mass_stride + (u - input_start)) > 0)[:, None],
-                                               b.to(tl.int64)[None, :] * trans_stride, 0)
+            if GROUPED:                                                      # the parents' transition masses: each
+                mt = b.to(tl.int64) * mb_stride + t                          # step's rank's block of the boundary's
+                masses = trans + tl.load(mbase + mt)[None, :] + \
+                    tl.load(parents + p * 7 + 6).to(tl.int64)[:, None] * tl.load(mcount + mt).to(tl.int64)[None, :]
+                bbt = tl.load(bbase + t)                                     # pairs, or of the lane's sample's entries
             else:
                 mrow = tl.load(mass_row + (u - input_start)).to(tl.int64)[:, None]
                 if SAMPLE:
@@ -335,8 +338,11 @@ def _input_block_top_down_kernel(element_flows, temp_flows, node_flows, node_mar
                 if GROUPED:                                                  # the observed class leads to q?
                     holds = _next_col(next_col, delta, state_id, col_of_state, t, i, tl.maximum(oc, 0), ev, K, W, C,
                                       HOMOGENEOUS) == q
+                    if SAMPLE_MASSES:                                        # the sample's entry, or none: no mass
+                        x = tl.load(mrank + b * mrank_stride + bbt + x, mask = ev, other = -1)
                     mass = tl.where((oc >= 0)[None, :], tl.where(holds[None, :], own, float("-inf")),
-                                    tl.load(masses + x[None, :], mask = vm & (oc < 0)[None, :], other = float("-inf")))
+                                    tl.load(masses + x[None, :], mask = vm & ((oc < 0) & (x >= 0))[None, :],
+                                            other = float("-inf")))
                 elif ENUM:                                                   # is it this entry's class?
                     tk = tl.load(tok_ptr + t)
                     mass = _entry_mass(masses, x, code_oc, eprobs, pr, lz, enum_logw + b * logw_stride + tk, eidx + tk,
@@ -354,7 +360,8 @@ def _input_block_top_down_kernel(element_flows, temp_flows, node_flows, node_mar
 
 @triton_jit
 def _block_input_top_down_kernel(element_flows, temp_flows, node_flows, node_mars, obs_class, next_col, delta, state_id, col_of_state, class_mars,
-                                mass_row, mass_stride, trans, trans_stride, entry_ptr, entry_succ, entry_x, width,
+                                mass_row, mass_stride, trans, mbase, mcount, mrank, bbase, mb_stride, mrank_stride,
+                                entry_ptr, entry_succ, entry_x, width,
                                 iv_of, iv_info, iv_table, once_iv, live, lanes, lane_first, lane_live, coff, ccount,
                                 cstart, ccolumns, crank, children, tiles, ptr, parents, reg_offset, reg_width,
                                 reg_first, code, tok_ptr, eidx, eprobs, prow, lognorm, enum_logw, Cs, num_enum,
@@ -362,7 +369,8 @@ def _block_input_top_down_kernel(element_flows, temp_flows, node_flows, node_mar
                                 C_KIND: tl.constexpr, OUT_TEMP: tl.constexpr, GROUPED: tl.constexpr,
                                 PRUNE: tl.constexpr, ORDERED: tl.constexpr, COMPACT: tl.constexpr,
                                 C_FULL: tl.constexpr, OUT_FULL: tl.constexpr, SAMPLE: tl.constexpr, ENUM: tl.constexpr,
-                                LOGW: tl.constexpr, TN: tl.constexpr, SUBS: tl.constexpr, TILE: tl.constexpr):
+                                LOGW: tl.constexpr, SAMPLE_MASSES: tl.constexpr, TN: tl.constexpr, SUBS: tl.constexpr,
+                                TILE: tl.constexpr):
     """The left operand ``L`` over ``[t0, t)`` of ``block @ input`` steps (output over ``[t0, t + 1)``): ``O_L[i, q] =
     log sum over the parents and over the entries ``(successor, class)`` of ``q`` at boundary ``t`` of mass +
     O_out[i, successor]``. Node tiles, ``ORDERED``, ``COMPACT``, ``SAMPLE``, codes (``ENUM``): as
@@ -434,11 +442,11 @@ def _block_input_top_down_kernel(element_flows, temp_flows, node_flows, node_mar
             ov = tl.load(op + so[None, :], mask = real[:, None] & (obs & (so >= 0))[None, :], other = float("-inf"))
             mx, acc = _lse_step_one_exp(mx, acc, tl.where(obs[None, :], own + ov, float("-inf")))
             if any_miss:
-                if GROUPED:
-                    masses = (trans + tl.load(parents + p * 7 + 6).to(tl.int64))[:, None]
-                    if SAMPLE:                                               # (the lane's sample's)
-                        masses = masses + tl.where((tl.load(mass_stride + (u - input_start)) > 0)[:, None],
-                                                   b.to(tl.int64)[None, :] * trans_stride, 0)
+                if GROUPED:                                                  # the parents' transition masses (as in
+                    mt = b.to(tl.int64) * mb_stride + t                      # _input_block_top_down_kernel)
+                    masses = trans + tl.load(mbase + mt)[None, :] + \
+                        tl.load(parents + p * 7 + 6).to(tl.int64)[:, None] * tl.load(mcount + mt).to(tl.int64)[None, :]
+                    bbt = tl.load(bbase + t)
                 else:
                     mrow = tl.load(mass_row + (u - input_start)).to(tl.int64)[:, None]
                     if SAMPLE:
@@ -462,7 +470,9 @@ def _block_input_top_down_kernel(element_flows, temp_flows, node_flows, node_mar
                     ov = tl.load(op + sl[None, :], mask = vm, other = float("-inf"))
                     x = tl.load(entry_x + e0 + k, mask = em & (sl >= 0), other = 0)
                     if GROUPED:
-                        mass = tl.load(masses + x[None, :], mask = vm, other = float("-inf"))
+                        if SAMPLE_MASSES:                                    # the sample's entry, or none: no mass
+                            x = tl.load(mrank + b * mrank_stride + bbt + x, mask = em & (sl >= 0), other = -1)
+                        mass = tl.load(masses + x[None, :], mask = vm & (x >= 0)[None, :], other = float("-inf"))
                     elif ENUM:                                               # (no lane here observes a token)
                         tk = tl.load(tok_ptr + t)                            # (`t0`: the block's start)
                         mass = _entry_mass(masses, x, x, eprobs, pr, lz, enum_logw + b * logw_stride + tk, eidx + tk,
@@ -1025,7 +1035,8 @@ def run_top_down(launches, bufs, prog, regions, element_flows, temp_flows, node_
     ivs = prog.intervals
     prune, live = live is not None, live if live is not None else obs_class
     tt, grouped = prog.trans_top_down, prog.trans_top_down.grouped
-    trans = prog.transition_buffer(masses.batch)
+    margs = prog.mass_args()                                              # the query's transition masses
+    mpos = tuple(margs[k] for k in ("trans", "mbase", "mcount", "mrank", "bbase", "mb_stride", "mrank_stride"))
     sample = masses.batch > 1
     if compact is not None:
         cl = compact
@@ -1063,14 +1074,15 @@ def run_top_down(launches, bufs, prog, regions, element_flows, temp_flows, node_
                 kernel[(tiles.numel() // NODE_TILE * (height // tn), size)](
                     element_flows, temp_flows, node_flows, node_mars, obs_class, prog.next_col_arg, prog.delta,
                     prog.state_id, prog.col_of_state, masses.table,
-                    masses.row, masses.stride if sample else masses.row, trans, prog.trans_size, *tables, prog.width_t,
+                    masses.row, masses.stride if sample else masses.row, *mpos, *tables, prog.width_t,
                     ivs.of, ivs.info, ivs.table, once_iv, live,
                     *(lanes if ordered else (live, live, live)), crank = compact.rank if compact is not None else live,
                     children = la.children, tiles = tiles, ptr = la.ptr, parents = la.parents, B = B, n = n, W = W,
                     C = C, K = prog.K, input_start = prog.input_start, pid0 = first, C_KIND = c_kind,
                     OUT_TEMP = out_temp, HOMOGENEOUS = prog.homogeneous,
                     GROUPED = grouped, PRUNE = prune, ORDERED = ordered, COMPACT = compact is not None,
-                    C_FULL = c_full, OUT_FULL = out_full, SAMPLE = sample, TN = tn, SUBS = height // tn, TILE = tile,
+                    C_FULL = c_full, OUT_FULL = out_full, SAMPLE = sample, SAMPLE_MASSES = margs["SAMPLE_MASSES"],
+                    TN = tn, SUBS = height // tn, TILE = tile,
                     num_warps = TOP_DOWN_WARPS, **common, **lists, **enumerated_args(prog, masses))
         elif compact is not None:                    # block @ block on compact values, a sample's rectangle at a time
             c_kind, o_kind, out_temp = la.kinds

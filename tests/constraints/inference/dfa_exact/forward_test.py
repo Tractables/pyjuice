@@ -594,7 +594,9 @@ def test_transition_masses_match_brute_force(build_pc, monkeypatch):
     mass_row = prog.mass_row.long().cpu()
     assert (cm[torch.isfinite(cm)] < -87.4).any()                       # class masses below the normal range
     assert (cm.max(dim = 1).values < -87.4).any()                       # ... every class of a row
-    for u, t, off in prog.trans_job[0].long().cpu().tolist():
+    pair_off, pairs = prog.pair_off.cpu(), prog.pairs_t.cpu()
+    for u, t, rk in prog.trans_job[0].long().cpu().tolist():                 # (input row, position, step rank)
+        off = int(pair_off[t]) + rk * int(pairs[t])                          # the step's block of the boundary's pairs
         for q in range(width[t]):
             to = nc[t, q].long()
             for g in range(int(ptr[t, q]), int(ptr[t, q + 1])):

@@ -212,6 +212,27 @@ def test_sample_successors_are_the_allowed_classes_successors(tokens, build_pc):
                     want = sorted({0 if t == n - 1 else int(nc[t, q, c]) for c in range(C)
                                    if allowed[b, t, c] and nc[t, q, c] >= 0}) if q < width[t] else []
                     assert succ[b, ptr[b, t, q]:ptr[b, t, q + 1]].tolist() == want, (seed, b, t, q)
+        # every program entry's rank among the sample's at its boundary (-1: kept by no allowed class), and the
+        # sample's entries' program entries, counted per boundary
+        tt = prog.succ
+        eptr, esucc = tt.entry_ptr.view(n, W + 1).long().cpu(), tt.entry_succ.long().cpu()
+        bbase = tt.boundary_base.cpu().tolist()
+        rank, entry = lists.rank.cpu(), lists.entry.cpu()
+        assert rank.shape == (B, tt.num_entries) and entry.shape == (B, tt.num_entries + 1)
+        for b in range(B):
+            for t in range(n):
+                k = 0
+                for q in range(width[t]):
+                    for g in range(int(eptr[t, q]), int(eptr[t, q + 1])):
+                        s = int(esucc[g])
+                        kept = any(allowed[b, t, c] and nc[t, q, c] >= 0 and (t == n - 1 or int(nc[t, q, c]) == s)
+                                   for c in range(C))
+                        pg = bbase[t] + g - int(eptr[t, 0])
+                        assert int(rank[b, pg]) == (k if kept else -1), (seed, b, t, q, g)
+                        if kept:
+                            assert int(entry[b, ptr[b, t, 0] + k]) == pg
+                            k += 1
+                assert k == ptr[b, t, W] - ptr[b, t, 0]
         assert tokens == V or C > 62
         every = sample_successors(prog, torch.ones(1, n, C, dtype = torch.bool, device = prog.dev))
         tt, E = prog.succ, prog.succ.num_entries                       # (the program's lists, boundary after boundary:

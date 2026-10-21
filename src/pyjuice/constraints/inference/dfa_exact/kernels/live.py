@@ -565,12 +565,18 @@ class SampleSuccessors:
     end's being its one column) less the successors only classes ruled out lead to -- a CSR per sample, ``ptr`` int32
     [Be, n, W + 1] (numbers within the sample's entries, ``ptr[b, t, 0]`` the boundary's first), ``succ`` int32 [Be,
     E]; ``Be`` 1 for one set of lists for every sample. ``allowed``: int8 [Be, n, C], the classes allowed (what the
-    lists were built from), by which a query's :class:`SuccessorLists` keep entries too.
+    lists were built from), by which a query's :class:`SuccessorLists` keep entries too. ``rank`` int32 [Be, E]: every
+    program entry's number among the sample's at its boundary (-1: no class the sample allows leads along it), and
+    ``entry`` int32 [Be, E + 1]: the program entry (counted per boundary, see
+    :attr:`~.transitions.TransitionTables.boundary_base`) of every entry of the sample's lists -- by which a sample's
+    transition masses are laid out over its entries (:class:`~.transitions.SampleMasses`).
     """
 
     ptr: torch.Tensor
     succ: torch.Tensor
     allowed: Optional[torch.Tensor] = None
+    rank: Optional[torch.Tensor] = None
+    entry: Optional[torch.Tensor] = None
 
     def strides(self):
         """``(ps, ss)``: a sample's lists apart in ``ptr`` and ``succ`` (0 for one set for every sample)."""
@@ -673,9 +679,12 @@ def sample_successors(prog, allowed: torch.Tensor) -> SampleSuccessors:
     key, first = entry_classes(prog)
     ptr = torch.empty(Be, n, W + 1, dtype = torch.int32, device = dev)
     succ = torch.empty(Be, E + 1, dtype = torch.int32, device = dev)
+    entry = torch.zeros(Be, E + 1, dtype = torch.int32, device = dev)
+    rank = torch.empty(Be, E, dtype = torch.int32, device = dev)
     eptr = tt.entry_ptr.long().view(n, W + 1)
     rows = (eptr - eptr[:, :1] + tt.boundary_base[:n, None]).view(-1)       # the pointer rows, counted per boundary
     ranges = list(zip(tt.boundary_base.tolist(), eptr[:, 0].tolist(), (eptr[:, W] - eptr[:, 0]).tolist()))
+    tb = torch.searchsorted(tt.boundary_base[1:n + 1], torch.arange(E, device = dev), right = True)   # entries' boundaries
     P = key.numel()
     step = max(1, SUPPORT_CHUNK // max(P, E, 1))
     for b0 in range(0, Be, step):                                           # (the scans over the chunk's samples
@@ -690,11 +699,15 @@ def sample_successors(prog, allowed: torch.Tensor) -> SampleSuccessors:
         count = count.as_strided((bs, E + 1), (E, 1))
         count = count - count[:, :1]                                        # count[:, e]: the kept entries before e
         ptr[b0:b0 + bs] = count[:, rows].view(bs, n, W + 1)
+        starts = count[:, tt.boundary_base[:n]]                             # ... before each boundary's first
+        rank[b0:b0 + bs] = torch.where(kept, count[:, :E] - starts[:, tb], -1)
+        entry[b0:b0 + bs].scatter_(1, torch.where(kept, count[:, :E].long(), E),
+                                   torch.arange(E, dtype = torch.int32, device = dev)[None].expand(bs, -1))
         for base, shared, size in ranges:                                   # a boundary's successors: its segment's
             if size:
                 at = torch.where(kept[:, base:base + size], count[:, base:base + size].long(), E)
                 succ[b0:b0 + bs].scatter_(1, at, tt.entry_succ[shared:shared + size][None].expand(bs, -1))
-    return SampleSuccessors(ptr = ptr, succ = succ, allowed = allowed.to(torch.int8))
+    return SampleSuccessors(ptr = ptr, succ = succ, allowed = allowed.to(torch.int8), rank = rank, entry = entry)
 
 
 def live_successors(prog, masses) -> Optional[SampleSuccessors]:

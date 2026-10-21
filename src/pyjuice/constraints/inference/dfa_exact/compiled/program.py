@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import bisect
 from collections import OrderedDict, defaultdict
-from typing import Tuple
+from typing import Optional, Tuple
 
 import numpy as np
 import torch
@@ -18,7 +18,8 @@ from ..kernels.common import IDENTITY, SUM, TEMP
 from ..kernels.prod import Launch, skip_masks
 from ..kernels.sum import dense_groups
 from ..kernels.live import live_successors
-from ..kernels.transitions import (enumerated_tokens, transition_job, transition_masses, transition_stats,
+from ..kernels.transitions import (SampleMasses, enumerated_tokens, sample_classes, sample_masses,
+                                   sample_transition_masses, transition_job, transition_masses, transition_stats,
                                    transition_tables)
 from ..external_params import block_scale
 from .layout import interval_tables
@@ -39,13 +40,6 @@ ALIAS_COPIES = True
 #: (2026-10-21): JSON Schema automata, 30-47 live classes per column against 2-3 successors on average but one
 #: column of 67-85, were never grouped; grouped, hard_0 x HMM 4096 decodes by diffusion 3.2x faster.
 GROUP_MIN_RATIO = 8
-
-#: Group a query's transitions though its inputs prune the walks per sample (a session's soft evidence that rules
-#: classes out: the successor lists are each sample's live ones, :func:`~..kernels.live.live_successors`): off -- the
-#: masses are built for every column's pairs, a sample at a time, while the pruned walks touch few of them (JSON hard_0
-#: x Codpula 4096, B = 4: a diffusion step 5x slower grouped, 2026-10-21). On, such a query is grouped when its
-#: samples' masses fit (see :meth:`Program.grouped_for`).
-GROUP_PRUNED_WALKS = False
 
 #: ``input @ block`` steps at the same position and block interval run this many to a program on the class-by-class
 #: path, when the block is not the identity (see :func:`~.prod._input_block_group_kernel`; launches wider than
@@ -76,13 +70,11 @@ TRANSITION_TABLE_MAX_ENTRIES = 1 << 30
 #: (rebuilding them query by query would read every class's mass anyway, and write besides; the forward reads the
 #: classes' masses directly instead): the floats they may take, at least -- or :data:`TRANSITION_MEMORY_SHARE` of the
 #: device's free memory when the program is built, when that is more (JSON hard_0 x HMM 4096 at n = 128: 1.2G floats,
-#: 4.7 GB, for a diffusion decode 3.3x faster); per sample under per-sample class masses (``B`` samples' masses take
-#: ``B`` times the floats); a query whose inputs prune the walks per sample takes the per-class kernels whatever the
-#: budget (:data:`GROUP_PRUNED_WALKS`, see :meth:`Program.grouped_for`)
+#: 4.7 GB, for a diffusion decode 3.3x faster). Under a session's per-sample inputs the masses are each sample's own,
+#: over the entries its inputs leave possible alone (:class:`~..kernels.transitions.SampleMasses`: few, where the
+#: inputs rule most classes out), and the query takes them when they fit (see :meth:`Program.transitions`)
 TRANSITION_BUDGET = 1 << 26
 TRANSITION_MEMORY_SHARE = 0.25
-#: The most floats of transition masses a sample may take: the steps' offsets into them are int32 in the launch rows
-TRANSITION_OFFSET_MAX = (1 << 31) - 1
 
 
 #: Ungrouped transitions: the forward kernels loop over a column's live entries (its live classes' successors and
@@ -334,30 +326,42 @@ class Program:
         self.skip = skip_masks(self.reach, self.skip_triples, device = dev)
 
         # a missing token's transitions, GROUPED by successor -- every input @ block / block @ input step's transition
-        # masses, a row of the boundary's pairs at t_off, all kept (offsets set here, once) and built once per
-        # computation of the class masses -- when the boundaries' live classes are GROUP_MIN_RATIO times their
-        # successors or more (`grouped_worth`), the query's walks not pruned per sample by its inputs and its masses
-        # within the budget (`grouped_for`, per query: `transitions`); else one entry per live class, its mass read by the
-        # class's code (:class:`~..kernels.transitions.EnumeratedTokens`): the ungrouped tables, built when first used
+        # masses, a row per entry of the step's boundary, all kept and built once per computation of the class masses
+        # -- when the boundaries' live classes are GROUP_MIN_RATIO times their successors or more (`grouped_worth`) and
+        # the query's masses fit the budget (`grouped_for`, per query: `transitions`); else one entry per live class,
+        # its mass read by the class's code (:class:`~..kernels.transitions.EnumeratedTokens`): the ungrouped tables,
+        # built when first used. A step's masses are the r-th block of its boundary's after the position's first, r
+        # its RANK among the position's steps (field 6, set here once): of the boundary's pairs when the masses are
+        # one set for every sample (`pair_off`), of the sample's entries under per-sample ones (`SampleMasses`)
         ins = launches_of(tuple(TRANS_COLS))
         pairs = torch.tensor(self.succ.num_pairs, dtype = torch.long)
-        sizes = [pairs[launches[li][2][:, TRANS_COLS[launches[li][0]][1]]] for launches, li in ins]
         self.group_worth = grouped_worth(self.transition_stats, int(pairs.sum()))
         self.trans_budget = transition_budget(dev)
         self.entry_loop = entry_loop(self.transition_stats, self.C)    # ungrouped kernels: entries, or every class
         self.trans_pairs = pairs
         self._tr, self._ungrouped = tr, None
-        self.trans_size, rows = 0, []
-        for z, (launches, li) in zip(sizes, ins):
+        positions = [launches[li][2][:, TRANS_COLS[launches[li][0]][1]] for launches, li in ins]
+        tcat = torch.cat(positions) if positions else torch.zeros(0, dtype = torch.long)
+        steps_t = torch.bincount(tcat, minlength = self.n)               # input steps per position
+        order = torch.argsort(tcat, stable = True)
+        rank = torch.empty_like(tcat)
+        rank[order] = torch.arange(tcat.numel()) - (torch.cumsum(steps_t, 0) - steps_t)[tcat[order]]
+        rows, k = [], 0
+        for (launches, li), pos in zip(ins, positions):
             form, kinds, st, iv, sz = launches[li]
             st = st.clone()
-            st[:, 6] = self.trans_size + torch.cumsum(z, 0) - z
-            self.trans_size += int(z.sum())
+            st[:, 6] = rank[k:k + pos.numel()]
+            k += pos.numel()
             rows.append(st[:, [*TRANS_COLS[form], 6]])
             launches[li] = (form, kinds, st, iv, sz)
+        self.pos_steps = steps_t.to(dev)                                    # int64 [n]
+        self.pairs_t = pairs.to(dev)                                        # int64 [n]: the boundaries' pairs
+        self.pair_off = (torch.cumsum(steps_t * pairs, 0) - steps_t * pairs).to(dev)   # one set of masses: where a
+        self.trans_size = int((steps_t * pairs).sum())                      # position's start
         self.trans_job = transition_job(torch.cat(rows), dev) if rows else None
-        self._trans, self._trans_version = None, None
-        self.trans = self.succ if self.grouped_for(1) else self.ungrouped_tables()
+        self._trans, self._trans_version, self._sample_layout = None, None, None
+        self.trans_layout: Optional[SampleMasses] = None                    # the query's masses: one set, or a sample's
+        self.trans = self.succ if self.grouped_for(self.trans_size) else self.ungrouped_tables()
         self.trans_persistent = self.trans.grouped                  # (grouped transitions are always kept whole)
 
         for launches, li in launches_of(("input_block", "block_input", "block_block", "copy")):
@@ -393,24 +397,48 @@ class Program:
         out_ivs = np.unique(np.asarray([self.iv_index[iv] for iv in ends], dtype = np.int64))
         return Launch(form, kinds, steps, E_max, X_max, S_max, rows, iv, sizes, groups_host, out_ivs)
 
-    def transition_buffer(self, samples: int = 1) -> torch.Tensor:
-        """Where the transition masses go (``samples`` blocks of ``trans_size``, for class masses of each sample's
-        own; allocated on first use, and again for more samples) -- under the ungrouped tables, whose kernels read
-        no masses, a float."""
-        size = self.trans_size * samples if self.trans.grouped else 1
+    def transition_buffer(self) -> torch.Tensor:
+        """Where the query's transition masses go (``trans_size`` floats for one set of masses, a per-sample layout's
+        ``size``, see :meth:`transitions`; allocated on first use, and again for more) -- under the ungrouped tables,
+        whose kernels read no masses, a float."""
+        if not self.trans.grouped:
+            size = 1
+        else:
+            size = self.trans_size if self.trans_layout is None else self.trans_layout.size
         if self._trans is None or self._trans.numel() < size:
             self._trans = None
             self._trans = torch.empty(max(1, size), dtype = torch.float32, device = self.dev)
         return self._trans
 
-    def grouped_for(self, batch: int, pruned: bool = False) -> bool:
-        """Whether a query whose class masses are ``batch`` samples' (1: one set for all) takes the grouped
-        transitions: its walks not ``pruned`` per sample by its inputs (unless :data:`GROUP_PRUNED_WALKS`), worth it
-        (:func:`grouped_worth`), and the masses, ``trans_size`` floats a sample, within the budget
-        (:func:`transition_budget`), a sample's under 2^31 (:data:`TRANSITION_OFFSET_MAX`: the steps' offsets into
-        them are int32; the samples' blocks are reached in int64)."""
-        return ((not pruned or GROUP_PRUNED_WALKS) and self.group_worth and self.trans_size <= TRANSITION_OFFSET_MAX
-                and self.trans_size * batch <= self.trans_budget)
+    def grouped_for(self, size: int) -> bool:
+        """Whether a query whose transition masses would take ``size`` floats takes the grouped transitions: worth it
+        (:func:`grouped_worth`), and the masses within the budget (:func:`transition_budget`)."""
+        return self.group_worth and size <= self.trans_budget
+
+    def sample_layout(self, masses, succ) -> SampleMasses:
+        """The layout of ``masses``' per-sample transition masses over the successor lists ``succ`` (their
+        :class:`~..kernels.live.SampleSuccessors`), kept for the class masses' version."""
+        kept = self._sample_layout
+        if kept is None or kept.version != masses.version:
+            kept = self._sample_layout = sample_masses(masses, succ, self)
+        return kept
+
+    def mass_args(self) -> dict:
+        """The grouped kernels' arguments for the query's transition masses (see :meth:`transitions`): ``trans`` the
+        buffer; a step's masses at ``mbase[b mb_stride + t] + rank * mcount[b mb_stride + t]`` for the lane's sample
+        ``b``, its boundary ``t`` and its rank among the position's steps -- the position's first pair's and the
+        boundary's pairs for one set of masses (``mb_stride`` 0), the sample's first and its entries' count under
+        per-sample ones --, the entry's place there its pair's number ``x`` (``entry_x``), or ``SAMPLE_MASSES``: the
+        sample's ``mrank[b mrank_stride + bbase[t] + x]`` (-1: no mass, see :class:`~..kernels.transitions.SampleMasses`)."""
+        lay = self.trans_layout
+        if lay is None:
+            return dict(trans = self.transition_buffer(), mbase = self.pair_off, mcount = self.pairs_t,
+                        mrank = self.pairs_t, bbase = self.succ.boundary_base, mb_stride = 0, mrank_stride = 0,
+                        SAMPLE_MASSES = False)
+        own = lay.Be > 1
+        return dict(trans = self.transition_buffer(), mbase = lay.base, mcount = lay.count, mrank = lay.rank,
+                    bbase = self.succ.boundary_base, mb_stride = self.n if own else 0,
+                    mrank_stride = lay.rank.size(1) if own else 0, SAMPLE_MASSES = True)
 
     def ungrouped_tables(self):
         """The ungrouped transition tables (one entry per live class), built when first needed."""
@@ -425,17 +453,26 @@ class Program:
 
     def transitions(self, masses):
         """The transitions of a query under ``masses`` (its class masses, a :class:`~..state.ClassMasses`): grouped
-        when :meth:`grouped_for` says so of their batch and of whether the inputs prune the walks per sample (their
-        :func:`~..kernels.live.live_successors`, built here when not yet) -- ``trans`` the grouped tables, their
+        when :meth:`grouped_for` says so of the masses' size -- one set for every sample, ``trans_size`` floats, or
+        under per-sample inputs that rule classes out (their :func:`~..kernels.live.live_successors`, built here when
+        not yet) each sample's own over its entries (:meth:`sample_layout`) -- ``trans`` the grouped tables, the
         masses built from the class masses unless they already are -- else the ungrouped tables. A query's drivers
         call this before its liveness (whose successor lists follow ``trans``) and its passes."""
-        grouped = self.grouped_for(masses.batch, live_successors(self, masses) is not None)
-        if grouped != self.trans.grouped:
+        succ = live_successors(self, masses)
+        layout = None if succ is None else self.sample_layout(masses, succ)
+        grouped = self.grouped_for(self.trans_size if layout is None else layout.size)
+        if grouped != self.trans.grouped or (grouped and layout is not self.trans_layout):
             self.trans = self.succ if grouped else self.ungrouped_tables()
             self.trans_persistent = grouped
+            self.trans_layout = layout if grouped else None
             self._trans, self._trans_version = None, None               # (the masses go with the grouped tables)
         if grouped and self.trans_job is not None and self._trans_version != masses.version:
-            transition_masses(self.transition_buffer(masses.batch), self.trans_job, masses, self)
+            if layout is None:
+                transition_masses(self.transition_buffer(), self.trans_job, masses, self)
+            else:
+                if layout.cls_ptr is None:
+                    sample_classes(layout, succ, self)
+                sample_transition_masses(self.transition_buffer(), self.trans_job, masses, self, layout)
             self._trans_version = masses.version
 
     def _entry(self, t: int) -> int:

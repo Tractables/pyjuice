@@ -313,9 +313,10 @@ def test_sample_inputs_stored_columns_and_log_z_match_a_float64_brute_force(evid
 
 def test_transition_masses_with_enumerated_classes_match_a_float64_brute_force(build_pc, monkeypatch):
     """Grouped transitions kept whole: every (step, column, successor)'s mass is the log-sum over the tokens leading
-    there of ``p(v)`` -- and under dense evidence of a session, per sample, of ``q(v) = p(v) w(v) / Z``."""
+    there of ``p(v)`` -- and under dense evidence of a session, per sample, of ``q(v) = p(v) w(v) / Z``, over the
+    sample's entries alone (:class:`~pyjuice.constraints.inference.dfa_exact.kernels.transitions.SampleMasses`): an
+    entry no allowed class leads along has no mass (its log-sum would be -inf)."""
     monkeypatch.setattr(P, "GROUP_MIN_RATIO", 0)
-    monkeypatch.setattr(P, "GROUP_PRUNED_WALKS", True)                       # (the dense evidence rules tokens out)
     n, B = 6, 3
     dfa = singleton_automaton()
     for ev in ("none", "dense"):
@@ -327,10 +328,15 @@ def test_transition_masses_with_enumerated_classes_match_a_float64_brute_force(b
             decoder.marginal(data, missing)
             prog = cc.backend.program()
             masses = cc.backend.state._session[2] if ev == "dense" else cc.backend.state.masses()
-            T = prog.transition_buffer(masses.batch).double().cpu()
-        assert prog.trans.grouped and prog.trans_persistent
+            T = prog.transition_buffer().double().cpu()
+            layout = prog.trans_layout
+        assert prog.trans.grouped and prog.trans_persistent and (layout is not None) == (ev == "dense")
         tt, width, nc = prog.trans, prog.width, cc.backend.layout.next_col_table()
         ptr, succ = tt.entry_ptr.long().cpu(), tt.entry_succ.long().cpu()
+        pair_off, pairs, bbase = prog.pair_off.cpu(), prog.pairs_t.cpu(), tt.boundary_base.cpu()
+        if layout is not None:
+            base, count, rank = layout.base.cpu(), layout.count.long().cpu(), layout.rank.long().cpu()
+            assert layout.Be == B and T.numel() >= layout.size and layout.size < B * prog.trans_size
         layer = next(iter(pc.input_layer_group))
         p = layer.params.double().view(-1, V).cpu()
         tc = cc.backend.token_classes.token_class.long().cpu()
@@ -340,7 +346,7 @@ def test_transition_masses_with_enumerated_classes_match_a_float64_brute_force(b
         lognorm = masses.lognorm.double().cpu() if masses.lognorm is not None else None
         E = inputs["categorical_evidence_logp"].double().cpu() if ev == "dense" else None
         checked = 0
-        for u, t, off in prog.trans_job[0].long().cpu().tolist():
+        for u, t, rk in prog.trans_job[0].long().cpu().tolist():                 # (input row, position, step rank)
             for b in range(masses.batch):
                 r = int(row_of[u - prog.input_start] + b * stride[u - prog.input_start])
                 q_tok = p[prow[r]].clone()
@@ -352,7 +358,15 @@ def test_transition_masses_with_enumerated_classes_match_a_float64_brute_force(b
                     for g in range(int(ptr[t, q]), int(ptr[t, q + 1])):
                         classes = (to >= 0) if t + 1 == n else (to == succ[g])
                         want = q_tok[classes[tc]].sum().log()
-                        got = T[b * prog.trans_size + off + g - int(ptr[t, 0])]
+                        x = g - int(ptr[t, 0])                              # the pair's number within the boundary
+                        if layout is None:
+                            got = T[int(pair_off[t]) + rk * int(pairs[t]) + x]
+                        else:
+                            k = int(rank[b, int(bbase[t]) + x])             # the sample's entry, or none
+                            if k < 0:
+                                assert torch.isneginf(want), (u, t, b, q, g)
+                                continue
+                            got = T[int(base[b, t]) + rk * int(count[b, t]) + k]
                         assert torch.equal(torch.isneginf(got), torch.isneginf(want)) and \
                             (torch.isneginf(want) or abs(float(got - want)) < 1e-5), (u, t, b, q, g)
                         checked += 1
@@ -464,7 +478,6 @@ def test_enumerated_classes_change_nothing(kind, transitions, storage, evidence_
     stored -- transitions grouped (the enumerated classes in the transition masses) or ungrouped (the forward kernels
     over every class, or over a column's live entries; the top-down kernels read every entry's mass by code)."""
     monkeypatch.setattr(P, "GROUP_MIN_RATIO", 0 if transitions == "grouped" else 1 << 30)
-    monkeypatch.setattr(P, "GROUP_PRUNED_WALKS", transitions == "grouped")    # (the inputs rule tokens out)
     monkeypatch.setattr(P, "ENTRY_LOOP_MAX_LIVE", 2 if transitions == "entries" else 0)
     n, B = KINDS[kind], 4
     pc = build_pc(kind, n, V, input_dist = dists.SoftEvidenceCategorical if evidence_kind != "none" else None)

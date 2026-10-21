@@ -256,11 +256,11 @@ def test_a_session_of_one_row_whose_evidence_prunes(kind, build_pc):
 
 
 def test_grouping_is_the_querys(build_pc, monkeypatch):
-    """A query takes the grouped transitions when its inputs prune no walk per sample and its masses fit the budget,
-    the per-class tables otherwise -- a marginal without inputs grouped; a session of 3 rows' evidence that rules
-    classes out not, the same values, the program building the ungrouped tables only then; the marginal again
-    grouped, and not under a budget below its masses; the session grouped once pruned walks may be
-    (GROUP_PRUNED_WALKS) and its 3 samples' masses fit, the same values."""
+    """A query takes the grouped transitions when its masses fit the budget, the per-class tables otherwise -- a
+    marginal without inputs over one set of masses; a session of 3 rows' evidence that rules classes out over each
+    sample's own masses, laid out over its entries alone (fewer floats than 3 sets), the same values as the brute
+    force; the same session with a budget below them the per-class tables, the program building the ungrouped tables
+    only then, the same values; the marginal again grouped, and not under a budget below its masses."""
     import pyjuice.constraints.inference.dfa_exact.compiled.program as P
     from pyjuice.constraints.inference.dfa_exact.kernels.live import live_successors
     monkeypatch.setattr(P, "GROUP_MIN_RATIO", 0)                            # worth it, whatever the automaton
@@ -271,25 +271,29 @@ def test_grouping_is_the_querys(build_pc, monkeypatch):
     c = CONSTRAINTS["contains"]()
     cc = jc.compile(c, pc)
     prog = cc.backend.program()
-    assert prog.grouped_for(1) and prog.grouped_for(3) and not prog.grouped_for(3, pruned = True)
-    assert prog.trans.grouped and prog._ungrouped is None and prog.transition_buffer().numel() == prog.trans_size
+    assert prog.trans.grouped and prog.trans_layout is None and prog._ungrouped is None
+    assert prog.transition_buffer().numel() == prog.trans_size
     want = brute_force(pc, c, data, missing, E)
-    with cc.decoder(categorical_evidence_logp = E, precision = "fp32") as decoder:    # pruned per sample: ungrouped
+    with cc.decoder(categorical_evidence_logp = E, precision = "fp32") as decoder:    # each sample's own masses
         got = decoder.marginal(data, missing)
-        assert live_successors(prog, cc.backend.state._session[2]) is not None
-        assert not prog.trans.grouped and prog._ungrouped is not None
-        assert prog.transition_buffer(3).numel() == 1                         # (no masses kept for them)
+        masses = cc.backend.state._session[2]
+        assert live_successors(prog, masses) is not None
+        layout = prog.trans_layout
+        assert prog.trans.grouped and layout is not None and layout.Be == 3 and layout.version == masses.version
+        assert 0 < layout.size < 3 * prog.trans_size and prog.transition_buffer().numel() == layout.size
+        assert prog._ungrouped is None
+        prog.trans_budget = layout.size - 1                                   # over the budget: the per-class tables
+        again = decoder.marginal(data, missing)
+        assert not prog.trans.grouped and prog.trans_layout is None and prog._ungrouped is not None
+        assert prog.transition_buffer().numel() == 1                          # (no masses kept)
     assert_close(got, want, n)
+    assert_close(again, want, n)
+    prog.trans_budget = prog.trans_size
     cc.backend.marginal(data[:1], missing[:1])                                # one set of masses: grouped again
-    assert prog.trans.grouped and cc.backend.grouped
+    assert prog.trans.grouped and prog.trans_layout is None and cc.backend.grouped
     prog.trans_budget = prog.trans_size - 1                                   # over the budget: the per-class tables
     cc.backend.marginal(data[:1], missing[:1])
-    assert not prog.grouped_for(1) and not prog.trans.grouped
-    monkeypatch.setattr(P, "GROUP_PRUNED_WALKS", True)                        # pruned walks grouped: the 3 samples'
-    prog.trans_budget = 3 * prog.trans_size                                   # masses fit
-    with cc.decoder(categorical_evidence_logp = E, precision = "fp32") as decoder:
-        assert_close(decoder.marginal(data, missing), want, n)
-        assert prog.trans.grouped and prog.transition_buffer(3).numel() == 3 * prog.trans_size
+    assert not prog.grouped_for(prog.trans_size) and not prog.trans.grouped
 
 
 def test_a_plain_query_inside_a_session(build_pc):
