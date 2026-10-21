@@ -279,6 +279,7 @@ def _forward_steps(prog, todo: np.ndarray, sample: np.ndarray, lists: IndexLists
     t, launches, full, runs_of, ivs_of = _forward_tables(prog)
     lc, lmax, cc, cs, gc, gs, run_sel, pc, pslots, ps, buf = _forward_modes(todo, sample, t.data, t.offsets)
     counts, part_counts, run_sel, run_ptr = lc.tolist(), pc.tolist(), run_sel.tolist(), t.part_dense_ptr.tolist()
+    active = _forward_active(prog, lc, pc, run_sel, t.part_dense_ptr)       # (the steps with anything to run)
 
     def cut(L, m):
         la, count = launches[L], counts[L][m]
@@ -299,8 +300,15 @@ def _forward_steps(prog, todo: np.ndarray, sample: np.ndarray, lists: IndexLists
                 groups[size] = (None if n == len(firsts) - 1 else lists.add(buf[gs[G, m]:gs[G, m] + n]), n)
         return Cut(chunks, groups, int(lmax[L, m, 0]), int(lmax[L, m, 1]), int(lmax[L, m, 2]), int(count))
 
-    steps, L, P = [], 0, 0
-    for kind, prod_index, layers in prog.steps:
+    idle = getattr(prog, "fw_idle_steps", None)             # every step with nothing to run, built once (never
+    if idle is None:                                          # mutated: a pass reads them)
+        idle = prog.fw_idle_steps = [(kind, prod_index, [([], [], 0, 0) for _ in layers] if kind == "prod" else
+                                      [(block_size, [], []) for block_size, _ in layers])
+                                     for kind, prod_index, layers in prog.steps]
+    steps = list(idle)
+    for si in np.flatnonzero(active).tolist():
+        kind, prod_index, layers = prog.steps[si]
+        L, P = int(prog.fw_step_ranges[si, 0]), int(prog.fw_step_ranges[si, 2])
         layers_out = []
         if kind == "prod":
             for stages, num_temps, temp_slots in layers:
@@ -333,8 +341,32 @@ def _forward_steps(prog, todo: np.ndarray, sample: np.ndarray, lists: IndexLists
                             out[m].append((dense, num_edges, f))
                     P += 1
                 layers_out.append((block_size, out[0], out[1]))
-        steps.append((kind, prod_index, layers_out))
+        steps[si] = (kind, prod_index, layers_out)
     return steps
+
+
+def _forward_active(prog, lc, pc, run_sel, part_dense_ptr) -> np.ndarray:
+    """bool [steps]: the Program's steps with a launch computing something in a mode (``lc`` [launches, 2] counts),
+    or a sum part with fused blocks (``pc`` [parts, 2]) or dense runs (``run_sel`` [runs, 2]) in one -- by prefix
+    sums over the steps' ranges of launches and parts (``prog.fw_step_ranges``, built once), so that a query whose
+    steps mostly do nothing (decoding left to right: all but the target's) plans in time proportional to the rest."""
+    ranges = getattr(prog, "fw_step_ranges", None)
+    if ranges is None:
+        ranges, L, P = [], 0, 0
+        for kind, _, layers in prog.steps:
+            L0, P0 = L, P
+            if kind == "prod":
+                L += sum(len(st) for stages, _, _ in layers for st in stages)
+            else:
+                P += sum(len(parts) for _, parts in layers)
+            ranges.append((L0, L, P0, P))
+        prog.fw_step_ranges = ranges = np.asarray(ranges, dtype = np.int64).reshape(-1, 4)
+    lcum = np.concatenate([[0], np.cumsum(lc.any(axis = 1))])
+    sel = np.asarray(run_sel).reshape(-1, 2).any(axis = 1) if len(run_sel) else np.zeros(0, dtype = bool)
+    rcum = np.concatenate([[0], np.cumsum(sel)])
+    dense = rcum[part_dense_ptr[1:]] - rcum[part_dense_ptr[:-1]] > 0 if pc.shape[0] else np.zeros(0, dtype = bool)
+    pcum = np.concatenate([[0], np.cumsum(pc.any(axis = 1) | dense)])
+    return (lcum[ranges[:, 1]] > lcum[ranges[:, 0]]) | (pcum[ranges[:, 3]] > pcum[ranges[:, 2]])
 
 
 class _Flat:
@@ -358,8 +390,24 @@ class _Flat:
 #: order, each a range of launches -- their children in runs of one source, a sum region or a scratch row, every run's
 #: parents' output rows as ranges and its siblings' distinct operands --, of input steps, of class weight launches --
 #: their destinations, each a range of edges -- and of fold rows -- each a range of sum regions; every layer's fold
-#: launches' rows; then the sum layers' dense runs and fused child blocks, in groups), in the order they are packed
-_TD_FIELDS = ("layer_pi", "layer_temps", "layer_stage_ptr", "layer_foldrow_ptr", "stage_unit_ptr", "stage_input_ptr", "stage_cw_ptr", "stage_fold_ptr", "unit_child_ptr", "unit_run_ptr", "run_child_ptr", "run_src", "run_iv", "run_par_ptr", "par_lo", "par_hi", "run_sib_ptr", "sib_id", "unit_child_temp", "unit_out_temp", "unit_bb", "unit_sib_temp", "input_out_temp", "input_row", "input_pos", "cw_dest_ptr", "cw_temp", "dest_pos", "dest_edge_ptr", "dest_edge_temp", "fold_out", "fold_temp", "fold_reg_ptr", "fold_reg", "foldrow_out", "elem_base", "sumlayer_pi", "sumlayer_run_ptr", "sumlayer_group_ptr", "group_block_ptr", "run_reg", "run_lo", "run_hi", "block_elem", "block_lo", "block_hi", "block_reg", "block_ivreg", "reg_iv")
+#: launches' rows; then the sum layers' dense runs and fused child blocks, in groups), in the order they are packed;
+#: last, a stage's input steps and a class weight launch's destinations BY POSITION (:func:`_position_groups`): a
+#: query visits its target positions' alone, not every position's
+_TD_FIELDS = ("layer_pi", "layer_temps", "layer_stage_ptr", "layer_foldrow_ptr", "stage_unit_ptr", "stage_input_ptr", "stage_cw_ptr", "stage_fold_ptr", "unit_child_ptr", "unit_run_ptr", "run_child_ptr", "run_src", "run_iv", "run_par_ptr", "par_lo", "par_hi", "run_sib_ptr", "sib_id", "unit_child_temp", "unit_out_temp", "unit_bb", "unit_sib_temp", "input_out_temp", "input_row", "input_pos", "cw_dest_ptr", "cw_temp", "dest_pos", "dest_edge_ptr", "dest_edge_temp", "fold_out", "fold_temp", "fold_reg_ptr", "fold_reg", "foldrow_out", "elem_base", "sumlayer_pi", "sumlayer_run_ptr", "sumlayer_group_ptr", "group_block_ptr", "run_reg", "run_lo", "run_hi", "block_elem", "block_lo", "block_hi", "block_reg", "block_ivreg", "reg_iv", "ipos_ptr", "ipos_pos", "ipos_first", "ipos_end", "ipos_idx", "dpos_ptr", "dpos_pos", "dpos_first", "dpos_end", "dpos_idx")
+
+
+def _position_groups(ptr: np.ndarray, pos: np.ndarray, n: int):
+    """The items of every range of the CSR ``ptr`` (int64 [m + 1]) grouped by their position ``pos`` (int64 [items]):
+    ``(gptr, gpos, gfirst, gend, idx)`` -- range ``r``'s groups are ``gptr[r] .. gptr[r + 1]``, group ``g`` the items
+    ``idx[gfirst[g] .. gend[g]]`` at position ``gpos[g]``."""
+    m = ptr.size - 1
+    owner = np.repeat(np.arange(m, dtype = np.int64), np.diff(ptr))
+    idx = np.lexsort((pos, owner))                                            # by range, then position
+    keys = owner[idx] * (n + 1) + pos[idx]
+    starts = np.flatnonzero(np.r_[True, keys[1:] != keys[:-1]]) if idx.size else np.zeros(0, dtype = np.int64)
+    gptr = np.searchsorted(owner[idx][starts], np.arange(m + 1, dtype = np.int64)) if idx.size else \
+        np.zeros(m + 1, dtype = np.int64)
+    return gptr, pos[idx][starts], starts, np.r_[starts[1:], idx.size] if idx.size else starts, idx
 
 
 def _top_down_tables(prog, td):
@@ -521,12 +569,80 @@ def _top_down_tables(prog, td):
     F.add("group_block_ptr", n_blocks)
     arrays = F.done()
     arrays.update(elem_base = elem_base, reg_iv = td.reg_iv)
+    for name, ptr, pos in (("ipos", arrays["stage_input_ptr"], arrays["input_pos"]),
+                           ("dpos", arrays["cw_dest_ptr"], arrays["dest_pos"])):
+        groups = _position_groups(ptr, pos, prog.n)
+        arrays.update({f"{name}_{k}": v for k, v in zip(("ptr", "pos", "first", "end", "idx"), groups)})
     td.flat = (_Packed(_TD_FIELDS, arrays), index)
     return td.flat
 
 
+def _top_down_active(td, index, unit_count, cw_count, foldrow_mode, run_mode, group_count) -> np.ndarray:
+    """bool [steps]: the top-down program's steps with anything computed -- a launch's child in a mode (``unit_count``
+    [units, 2]), a class weight destination (``cw_count`` [launches]; None: no scoring), a fold row
+    (``foldrow_mode`` >= 0), a dense run (``run_mode`` >= 0) or a fused block (``group_count`` [groups, 2]) -- by
+    prefix sums over the steps' ranges in the flat tables (``td.step_ranges``, built once from ``index``)."""
+    ranges = getattr(td, "step_ranges", None)
+    if ranges is None:
+        ranges = np.zeros((len(td.steps), 10), dtype = np.int64)            # u0 u1 w0 w1 f0 f1 r0 r1 g0 g1
+        for si, (kind, pi, layers) in enumerate(td.steps):
+            r = ranges[si]
+            if kind == "prod":
+                units = cws = 0
+                u0 = w0 = f0 = f1 = -1
+                for (fold_stages, stages, _, _), (stage_ids, fold_ids) in zip(layers, index[si]):
+                    for (launches, _, _, cw_launches), (u, w) in zip(stages, stage_ids):
+                        if u0 < 0:
+                            u0, w0 = u, w
+                        units += len(launches)
+                        cws += len(cw_launches)
+                    for ids in fold_ids:
+                        for a, b in ids:
+                            f0, f1 = (a if f0 < 0 else min(f0, a)), max(f1, b)
+                r[:] = (max(u0, 0), max(u0, 0) + units, max(w0, 0), max(w0, 0) + cws, max(f0, 0), max(f1, 0),
+                        0, 0, 0, 0)
+            else:
+                runs, groups = 0, []
+                r0 = -1
+                for (_, dense_runs, _), (first, grp) in zip(layers, index[si]):
+                    if r0 < 0:
+                        r0 = first
+                    runs += len(dense_runs)
+                    groups += [g for g, _, _ in grp]
+                g0 = min(groups) if groups else 0
+                r[:] = (0, 0, 0, 0, 0, 0, max(r0, 0), max(r0, 0) + runs, g0, g0 + len(groups))
+        td.step_ranges = ranges
+    cum = lambda flags: np.concatenate([[0], np.cumsum(flags)])
+    on = lambda c, lo, hi: c[ranges[:, hi]] > c[ranges[:, lo]]
+    active = on(cum(unit_count.any(axis = 1)), 0, 1) | on(cum(foldrow_mode >= 0), 4, 5) | \
+        on(cum(run_mode >= 0), 6, 7) | on(cum(group_count.any(axis = 1)), 8, 9)
+    if cw_count is not None:
+        active |= on(cum(cw_count > 0), 2, 3)
+    return active
+
+
+def _mode_workspace(t, td):
+    """The work arrays of :func:`_top_down_modes` sized by the program, kept on ``td`` across queries: the ones
+    indexed by every launch child, class weight destination or product row -- a query writes a few of their entries
+    and the next resets those (:func:`_top_down_modes` keeps the runs and launches it touched), so that a query pays
+    for what it computes, not for the program's size."""
+    work = getattr(td, "mode_work", None)
+    if work is None:
+        temps = int(t.layer_temps.max()) if t.layer_temps.size else 1
+        work = td.mode_work = (np.full(int(t.unit_child_ptr[-1]), -1, dtype = np.int8),            # child_mode
+                               np.zeros(t.run_src.size, dtype = np.bool_),                        # run_on
+                               np.zeros(t.dest_pos.size, dtype = np.bool_),                        # dest_sel
+                               np.zeros(t.cw_temp.size, dtype = np.int64),                        # cw_count
+                               np.zeros(int(t.elem_base[-1]), dtype = np.bool_),                   # ereq
+                               np.zeros(int(t.elem_base[-1]) + t.elem_base.size - 1, dtype = np.int64),   # E
+                               np.zeros(t.elem_base.size - 1, dtype = np.bool_),                   # touched
+                               np.zeros(temps, dtype = np.bool_), np.full(temps, -1, dtype = np.int8))   # treq, tin
+    return work
+
+
 @njit(cache = True)
-def _top_down_modes(req, positions, once, scoring, data, offsets):
+def _top_down_modes(req, positions, once, scoring, data, offsets, child_mode, run_on, dest_sel, cw_count, ereq, E,
+                    touched, treq_all, tin_all):
     """The plan of :func:`top_down_plan` over :func:`_top_down_tables`, in one pass from the bottom up: per product
     layer, the stages in the forward's order (a child computed -- a sum region ``req`` marks, or a fold a later
     stage's computed child reads -- marks its parents' outputs; an input at a target position its product's), then in
@@ -584,20 +700,38 @@ def _top_down_modes(req, positions, once, scoring, data, offsets):
     block_reg = data[offsets[46]:offsets[47]]
     block_ivreg = data[offsets[47]:offsets[48]]
     reg_iv = data[offsets[48]:offsets[49]]
-    n_children = unit_child_ptr[-1]
-    child_mode = np.full(n_children, -1, dtype = np.int8)
-    run_on = np.zeros(run_src.size, dtype = np.bool_)
+    ipos_ptr = data[offsets[49]:offsets[50]]                                 # (input steps by position, per stage)
+    ipos_pos = data[offsets[50]:offsets[51]]
+    ipos_first = data[offsets[51]:offsets[52]]
+    ipos_end = data[offsets[52]:offsets[53]]
+    ipos_idx = data[offsets[53]:offsets[54]]
+    dpos_ptr = data[offsets[54]:offsets[55]]                                 # (destinations by position, per launch)
+    dpos_pos = data[offsets[55]:offsets[56]]
+    dpos_first = data[offsets[56]:offsets[57]]
+    dpos_end = data[offsets[57]:offsets[58]]
+    dpos_idx = data[offsets[58]:offsets[59]]
+    # the work arrays (:func:`_mode_workspace`): what the query before wrote, reset
+    for j in range(run_on.size):
+        if run_on[j]:
+            child_mode[run_child_ptr[j]:run_child_ptr[j + 1]] = -1
+            run_on[j] = False
+    for w in range(cw_count.size):
+        if cw_count[w] > 0:
+            dest_sel[cw_dest_ptr[w]:cw_dest_ptr[w + 1]] = False
+            cw_count[w] = 0
+    for pi in range(touched.size):
+        if touched[pi]:
+            ereq[elem_base[pi]:elem_base[pi + 1]] = False
+            touched[pi] = False
     unit_count = np.zeros((unit_child_temp.size, 2), dtype = np.int64)
-    dest_sel = np.zeros(dest_pos.size, dtype = np.bool_)
-    cw_count = np.zeros(cw_temp.size, dtype = np.int64)
     foldrow_mode = np.full(foldrow_out.size, -1, dtype = np.int8)
-    ereq = np.zeros(elem_base[-1], dtype = np.bool_)
-    touched = np.zeros(elem_base.size - 1, dtype = np.bool_)              # product groups with a product computed
     prior = np.zeros(reg_iv.size, dtype = np.bool_)
     for L in range(layer_pi.size):
         base = elem_base[layer_pi[L]]
-        treq = np.zeros(layer_temps[L], dtype = np.bool_)
-        tin = np.full(layer_temps[L], -1, dtype = np.int8)
+        treq = treq_all[:layer_temps[L]]
+        tin = tin_all[:layer_temps[L]]
+        treq[:] = False
+        tin[:] = -1
         for s in range(layer_stage_ptr[L], layer_stage_ptr[L + 1]):   # the forward's order: what is computed
             for u in range(stage_unit_ptr[s], stage_unit_ptr[s + 1]):
                 for j in range(unit_run_ptr[u], unit_run_ptr[u + 1]):         # children of one source
@@ -609,18 +743,23 @@ def _top_down_modes(req, positions, once, scoring, data, offsets):
                             else:
                                 ereq[base + par_lo[k]:base + par_hi[k]] = True
                                 touched[layer_pi[L]] = True
-            for i in range(stage_input_ptr[s], stage_input_ptr[s + 1]):
-                if positions[input_pos[i]]:
-                    if input_out_temp[i]:
-                        treq[input_row[i]] = True
-                    else:
-                        ereq[base + input_row[i]] = True
-                        touched[layer_pi[L]] = True
+            for g in range(ipos_ptr[s], ipos_ptr[s + 1]):                 # the stage's inputs at target positions
+                if positions[ipos_pos[g]]:
+                    for k in range(ipos_first[g], ipos_end[g]):
+                        i = ipos_idx[k]
+                        if input_out_temp[i]:
+                            treq[input_row[i]] = True
+                        else:
+                            ereq[base + input_row[i]] = True
+                            touched[layer_pi[L]] = True
         for s in range(layer_stage_ptr[L + 1] - 1, layer_stage_ptr[L] - 1, -1):    # the order they run in
             if scoring:
                 for w in range(stage_cw_ptr[s], stage_cw_ptr[s + 1]):
-                    for d in range(cw_dest_ptr[w], cw_dest_ptr[w + 1]):
-                        if positions[dest_pos[d]]:
+                    for g in range(dpos_ptr[w], dpos_ptr[w + 1]):          # its destinations at target positions
+                        if not positions[dpos_pos[g]]:
+                            continue
+                        for k in range(dpos_first[g], dpos_end[g]):
+                            d = dpos_idx[k]
                             dest_sel[d] = True
                             cw_count[w] += 1
                             if cw_temp[w]:                                  # a fold operand: per sample
@@ -654,9 +793,8 @@ def _top_down_modes(req, positions, once, scoring, data, offsets):
     run_mode = np.full(run_reg.size, -1, dtype = np.int8)
     block_mode = np.full(block_reg.size, -1, dtype = np.int8)
     group_count = np.zeros((group_block_ptr.size - 1, 2), dtype = np.int64)
-    E = np.zeros(ereq.size + touched.size, dtype = np.int64)               # per touched group, from 0 at base + pi:
-    for pi in range(touched.size):                                          # prefix sums of the products computed
-        if touched[pi]:
+    for pi in range(touched.size):                       # per touched group, from 0 at base + pi (never written):
+        if touched[pi]:                                   # prefix sums of the products computed
             for k in range(elem_base[pi], elem_base[pi + 1]):
                 E[k + pi + 1] = E[k + pi] + ereq[k]
     for S in range(sumlayer_pi.size):
@@ -685,6 +823,8 @@ def _top_down_steps(td, t, index, m, scoring: bool, lists: IndexLists) -> list:
     once, per sample) as an index list added to ``lists`` (None for all of them); per sum layer, its dense runs and
     fused node blocks in each mode."""
     child_mode, unit_count, dest_sel, cw_count, foldrow_mode, run_mode, block_mode, group_count, _ = m
+    active = _top_down_active(td, index, unit_count, cw_count if scoring else None, foldrow_mode, run_mode,
+                              group_count)
     unit_count, cw_count, run_mode, group_count = (a.tolist() for a in (unit_count, cw_count, run_mode, group_count))
     child_ptr, dest_ptr = t.unit_child_ptr.tolist(), t.cw_dest_ptr.tolist()
 
@@ -696,8 +836,14 @@ def _top_down_steps(td, t, index, m, scoring: bool, lists: IndexLists) -> list:
             return selection(modes, mode, count)
         return None if count == modes.size else lists.add(*node_tiles(la.host["group"], np.nonzero(modes == mode)[0]))
 
-    out = [None] * len(td.steps)
-    for si, (kind, pi, layers) in enumerate(td.steps):
+    idle = getattr(td, "idle_steps", None)                  # every step with nothing computed, built once (never
+    if idle is None:                                          # mutated: a pass reads them)
+        idle = td.idle_steps = [(kind, pi, [(([], []), [], 0, 0) for _ in layers] if kind == "prod" else
+                                 [(block_size, ([], []), ([], [])) for block_size, _, _ in layers])
+                                for kind, pi, layers in td.steps]
+    out = list(idle)
+    for si in np.flatnonzero(active).tolist():
+        kind, pi, layers = td.steps[si]
         layers_out = []
         if kind == "prod":
             for (fold_stages, stages, num_temps, temp_slots), (stage_ids, fold_ids) in zip(layers, index[si]):

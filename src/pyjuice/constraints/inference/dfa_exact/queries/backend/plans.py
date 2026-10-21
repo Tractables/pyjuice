@@ -50,7 +50,7 @@ from typing import Optional
 import numpy as np
 import torch
 
-from .planners import IndexLists, _forward_steps, _top_down_modes, _top_down_steps, _top_down_tables, \
+from .planners import IndexLists, _forward_steps, _mode_workspace, _top_down_modes, _top_down_steps, _top_down_tables, \
     class_weight_writes
 
 
@@ -386,7 +386,7 @@ def top_down_plan(prog, td, targets: Optional[np.ndarray], once: np.ndarray, val
     r_once = once[td.reg_iv]
     req = needed[td.reg_iv] & ~np.where(r_once, valid, False if held is None else held)   # sum regions computed
     t, index = _top_down_tables(prog, td)
-    m = _top_down_modes(req, positions, once, scoring, t.data, t.offsets)
+    m = _top_down_modes(req, positions, once, scoring, t.data, t.offsets, *_mode_workspace(t, td))
     lists = IndexLists()                                 # every index list, copied to the device together
     out = _top_down_steps(td, t, index, m, scoring, lists)
     cw_fill = class_weight_writes(prog, out, positions) if scoring else True

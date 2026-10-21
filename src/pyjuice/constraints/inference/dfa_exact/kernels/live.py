@@ -376,9 +376,17 @@ LIVE_STEP_TILE = 256
 LIVE_CUDA = True
 
 
+def _cuda_module():
+    """The CUDA extension (:func:`~.c.get_module`) when the CUDA sweeps are on (:data:`LIVE_CUDA`), else None."""
+    if not LIVE_CUDA:
+        return None
+    from .c import get_module
+    return get_module()
+
+
 def _cuda_sweep(prog):
-    """The extension if the CUDA sweep takes ``prog``'s automaton (its most successor entries a boundary kept as
-    ``prog.live_smax``), else None."""
+    """The extension if the shared-memory CUDA sweep takes ``prog``'s automaton (its most successor entries a
+    boundary kept as ``prog.live_smax``), else None (the wide sweep, or the Triton kernels, then)."""
     if not LIVE_CUDA:
         return None
     ok = getattr(prog, "live_cuda", None)
@@ -705,7 +713,10 @@ def live_successors(prog, masses) -> Optional[SampleSuccessors]:
 def liveness(prog, obs_class: torch.Tensor, B: int, succ: Optional[SampleSuccessors] = None) -> Liveness:
     """The :class:`Liveness` of a query whose observed token classes are ``obs_class`` ([B, n] int32, -1 where
     missing): the sweeps -- where a token is missing, through every class, or the classes of ``succ``
-    (:func:`live_successors`). Nothing waits for the device."""
+    (:func:`live_successors`) -- by the CUDA kernel in shared memory, or past its width the CUDA kernel in global
+    memory (``kernels/c/liveness.cu``: with every class allowed, a full forward row stays full through the missing
+    tokens after the last observed, and the backward rows over them are full, so a left-to-right query's sweeps
+    cost its prefix), or without the extension the Triton kernels. Nothing waits for the device."""
     n, W, C, K = prog.n, prog.W, prog.C, prog.K
     dev = prog.dev
     live = torch.empty(B, n + 1, W, dtype = torch.int8, device = dev)
@@ -716,17 +727,26 @@ def liveness(prog, obs_class: torch.Tensor, B: int, succ: Optional[SampleSuccess
     ps, ss = (0, 0) if succ is None else succ.strides()
     tables = (obs_class, prog.next_col_arg, prog.delta, prog.state_id, prog.col_of_state, ptr, ent, prog.width_t, ps, ss)
     homogeneous = prog.homogeneous
-    if W >= LIVE_STEPS_MIN_WIDTH:                    # a launch per boundary, programs over samples and columns
-        live.zero_()
-        live[:, 0, 0] = 1                                                   # the initial column
-        back[:, n, 0] = 1                                                   # the sequence end
-        for t in range(n):
-            _live_forward_kernel[(B, host_cdiv(prog.width[t], LIVE_STEP_TILE))](
-                live, *tables, t, n, W, C, K, TILE = LIVE_STEP_TILE, HOMOGENEOUS = homogeneous, num_warps = 4)
-        for t in range(n - 1, -1, -1):
-            _live_backward_kernel[(B, host_cdiv(prog.width[t], LIVE_STEP_TILE))](
-                live, back, *tables, t, n, W, C, K, TILE = LIVE_STEP_TILE, HOMOGENEOUS = homogeneous, num_warps = 4)
-    elif _cuda_sweep(prog) is not None and obs_class.dtype == torch.int32 and obs_class.is_contiguous():
+    cuda = _cuda_module() is not None and obs_class.dtype == torch.int32 and obs_class.is_contiguous()
+    if W >= LIVE_STEPS_MIN_WIDTH or (cuda and _cuda_sweep(prog) is None):   # too wide for shared memory
+        if cuda:                                     # one CTA per sample and sweep, the rows in global memory, with
+            live.zero_()                             # shortcuts where the sweep saturates (every class allowed)
+            scratch = torch.empty(2 * B, dtype = torch.int32, device = dev)     # (the sweeps' per-sample flags)
+            _cuda_module().liveness_wide_cuda(live, back, obs_class, prog.next_col_arg, prog.delta, prog.state_id,
+                                              prog.col_of_state, ptr, ent, prog.width_t, n, W, C, K, ps, ss,
+                                              homogeneous, succ is None, scratch)
+        else:                                        # a launch per boundary, programs over samples and columns
+            live.zero_()
+            live[:, 0, 0] = 1                                                   # the initial column
+            back[:, n, 0] = 1                                                   # the sequence end
+            for t in range(n):
+                _live_forward_kernel[(B, host_cdiv(prog.width[t], LIVE_STEP_TILE))](
+                    live, *tables, t, n, W, C, K, TILE = LIVE_STEP_TILE, HOMOGENEOUS = homogeneous, num_warps = 4)
+            for t in range(n - 1, -1, -1):
+                _live_backward_kernel[(B, host_cdiv(prog.width[t], LIVE_STEP_TILE))](
+                    live, back, *tables, t, n, W, C, K, TILE = LIVE_STEP_TILE, HOMOGENEOUS = homogeneous,
+                    num_warps = 4)
+    elif cuda and _cuda_sweep(prog) is not None:
         _cuda_sweep(prog).liveness_cuda(live, back, obs_class, prog.next_col_arg, prog.delta, prog.state_id,
                                         prog.col_of_state, ptr, ent, prog.width_t, n, W, C, K, prog.live_smax, ps, ss,
                                         homogeneous)

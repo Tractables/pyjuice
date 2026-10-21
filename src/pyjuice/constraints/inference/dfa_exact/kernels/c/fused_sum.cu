@@ -814,6 +814,11 @@ int64_t ctas_per_sm(bool td, bool ext, bool x3, bool fa, bool bf, int64_t tn, in
 
 // liveness.cu
 bool liveness_fits(int64_t n, int64_t W, int64_t smax);
+void liveness_wide_cuda(torch::Tensor live, torch::Tensor back, torch::Tensor obs_class, torch::Tensor next_col,
+                        torch::Tensor delta, torch::Tensor state_id, torch::Tensor col_of_state,
+                        torch::Tensor entry_ptr, torch::Tensor entry_succ, torch::Tensor width, int64_t n, int64_t W,
+                        int64_t C, int64_t K, int64_t ps, int64_t ss, bool homogeneous, bool every_class,
+                        torch::Tensor scratch);
 void liveness_cuda(torch::Tensor live, torch::Tensor back, torch::Tensor obs_class, torch::Tensor next_col,
                    torch::Tensor delta, torch::Tensor state_id, torch::Tensor col_of_state, torch::Tensor entry_ptr,
                    torch::Tensor entry_succ, torch::Tensor width, int64_t n, int64_t W, int64_t C, int64_t K,
@@ -846,6 +851,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "the weights' tiles a launch reads, in its A-fragment order: TF32 (an fp32 copy) or bf16 (a bf16 copy)");
     m.def("liveness_fits", &liveness_fits, "whether the shared-memory liveness sweep takes an automaton");
     m.def("liveness_cuda", &liveness_cuda, "the liveness sweep, one CTA per sample in shared memory");
+    m.def("liveness_wide_cuda", &liveness_wide_cuda,
+          "the liveness sweep of an automaton too wide for shared memory, one CTA per sample and direction");
     m.def("ibtd_cuda", &ibtd_cuda, "an input @ block top-down launch on compact values, a sample's live terms");
     m.def("ibtd_smem_max", &ibtd_smem_max, "the most dynamic shared memory of an input @ block top-down CTA of one child");
 }

@@ -74,17 +74,18 @@ def transitions(request, monkeypatch):
     return request.param
 
 
-@pytest.fixture(params = ["cuda", "per_sample", "per_boundary"])
+@pytest.fixture(params = ["cuda", "cuda_wide", "per_sample", "per_boundary"])
 def sweeps(request, monkeypatch):
-    """The liveness sweeps: the CUDA kernel's (a CTA per sample and sweep, the default where the extension builds), one
-    Triton program per sample, or a launch per boundary (used from far wider automata than the test ones by
-    default)."""
+    """The liveness sweeps: the CUDA kernel's in shared memory (a CTA per sample and sweep, the default where the
+    extension builds), the CUDA kernel's in global memory (the default past the shared memory's width: the rows in
+    ``live`` / ``back``, with the saturation shortcuts), one Triton program per sample, or a launch per boundary
+    (used from far wider automata than the test ones by default)."""
     from pyjuice.constraints.inference.dfa_exact.kernels import live
     from pyjuice.constraints.inference.dfa_exact.kernels.c import get_module
-    if request.param == "cuda" and get_module() is None:
+    if request.param.startswith("cuda") and get_module() is None:
         pytest.skip("the dfa_exact CUDA extension is unavailable")
-    monkeypatch.setattr(live, "LIVE_CUDA", request.param == "cuda")
-    monkeypatch.setattr(live, "LIVE_STEPS_MIN_WIDTH", 0 if request.param == "per_boundary" else 1 << 30)
+    monkeypatch.setattr(live, "LIVE_CUDA", request.param.startswith("cuda"))
+    monkeypatch.setattr(live, "LIVE_STEPS_MIN_WIDTH", 0 if request.param in ("per_boundary", "cuda_wide") else 1 << 30)
     return request.param
 
 
@@ -311,7 +312,7 @@ def test_per_boundary_liveness_equals_per_sample(kind, build_pc, monkeypatch):
         got = {}
         arms = [("per_sample", 1 << 30, False), ("per_boundary", 0, False)]
         if get_module() is not None:
-            arms.append(("cuda", 1 << 30, True))
+            arms += [("cuda", 1 << 30, True), ("cuda_wide", 0, True)]
         for name, min_width, cuda in arms:
             monkeypatch.setattr(live, "LIVE_STEPS_MIN_WIDTH", min_width)
             monkeypatch.setattr(live, "LIVE_CUDA", cuda)
