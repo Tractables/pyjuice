@@ -390,7 +390,8 @@ def _input_block_kernel(element_mars, node_mars, temp, obs_class, next_col, delt
             if GROUPED:
                 masses = trans + tl.load(steps + s * 7 + 6).to(tl.int64)      # the step's transition masses
                 if SAMPLE:                                                   # (the lane's sample's)
-                    masses = masses + tl.where(tl.load(mass_stride + (u - input_start)) > 0, b * trans_stride, 0)
+                    masses = masses + tl.where(tl.load(mass_stride + (u - input_start)) > 0,
+                                               b.to(tl.int64) * trans_stride, 0)
                 tk, pr, lz = 0, 0, 0.0                                       # (no class masses read)
             else:                                                            # the input's row of the class masses
                 mrow = tl.load(mass_row + (u - input_start)).to(tl.int64) + b * 0     # (the lane's sample's)
@@ -620,7 +621,8 @@ def _block_input_kernel(element_mars, node_mars, temp, obs_class, next_col, delt
         if GROUPED:
             masses = trans + tl.load(steps + s * 7 + 6).to(tl.int64)          # the step's transition masses
             if SAMPLE:                                                       # (the lane's sample's)
-                masses = masses + tl.where(tl.load(mass_stride + (u - input_start)) > 0, b * trans_stride, 0)
+                masses = masses + tl.where(tl.load(mass_stride + (u - input_start)) > 0,
+                                           b.to(tl.int64) * trans_stride, 0)
         else:                                                                # the input's row of the class masses
             mrow = tl.load(mass_row + (u - input_start)).to(tl.int64) + b * 0
             if SAMPLE:
@@ -1238,7 +1240,7 @@ def run_products(stages, bufs, prog, regions, element_mars, node_mars, masses, o
                 for s0, s1, _, sel, cnt in cut.chunks:
                     part = steps[s0:s1]
                     idx = dict(sel = part if sel is None else sel.tensor, INDEXED = sel is not None)
-                    if form == "input_block" and groups is not None and lanes > GROUP_MIN_LANES:
+                    if form == "input_block" and not tt.grouped and groups is not None and lanes > GROUP_MIN_LANES:
                         r_kind, out_temp, (out_full, *r_full) = kinds
                         assert (s0, s1) == (0, launch.rows.size(0))   # groups index the launch's one chunk
 

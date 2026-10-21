@@ -138,6 +138,26 @@ def test_enumeration_needs_enough_singletons(build_pc, monkeypatch):
     assert jc.compile(singleton_automaton(), pc).backend.token_classes.enumerate_max == 0
 
 
+def test_grouping_follows_the_live_classes_per_successor(build_pc):
+    """Grouped by successor when the boundaries' live classes are GROUP_MIN_RATIO times their successor pairs: an
+    automaton of 40 classes whose every state has 2 successors groups (20 classes a successor), one whose classes
+    and successors are alike does not -- whatever a single column branches into. (Tokens with the same transitions
+    are one class: every token here takes a distinct one of the 2^6 patterns of a state's two successors.)"""
+    rng = random.Random(3)
+    vocab, states = 40, 6
+    nxt = [rng.sample(range(states), 2) for _ in range(states)]
+    branchy = jc.DFA.from_dense(vocab, [[nxt[q][(v >> q) & 1] for v in range(vocab)] for q in range(states)], 0, [1, 2])
+    assert branchy.num_classes == vocab
+    flat = class_automaton(vocab, classes = 8, states = states, seed = 5)   # (8 classes, ~5 successors a state)
+    pc = build_pc("hmm", 6, vocab)
+    for dfa, want in ((branchy, True), (flat, False)):
+        cc = jc.compile(dfa, pc)
+        prog = cc.backend.program()
+        live, columns, most = prog.transition_stats
+        pairs = int(prog.trans_pairs.sum())
+        assert (live >= P.GROUP_MIN_RATIO * pairs) == want and cc.backend.grouped == want, (live, pairs, most)
+
+
 def test_the_codes_of_every_class_at_every_boundary(build_pc, monkeypatch):
     """The enumerated tokens live at every boundary, and every class's code there: a stored class's column, a live
     enumerated class's ``-1 - e`` (its token the e-th of the boundary's), a dead one's ``-1 - count`` (token 0 is
@@ -295,6 +315,7 @@ def test_transition_masses_with_enumerated_classes_match_a_float64_brute_force(b
     """Grouped transitions kept whole: every (step, column, successor)'s mass is the log-sum over the tokens leading
     there of ``p(v)`` -- and under dense evidence of a session, per sample, of ``q(v) = p(v) w(v) / Z``."""
     monkeypatch.setattr(P, "GROUP_MIN_RATIO", 0)
+    monkeypatch.setattr(P, "GROUP_PRUNED_WALKS", True)                       # (the dense evidence rules tokens out)
     n, B = 6, 3
     dfa = singleton_automaton()
     for ev in ("none", "dense"):
@@ -443,6 +464,7 @@ def test_enumerated_classes_change_nothing(kind, transitions, storage, evidence_
     stored -- transitions grouped (the enumerated classes in the transition masses) or ungrouped (the forward kernels
     over every class, or over a column's live entries; the top-down kernels read every entry's mass by code)."""
     monkeypatch.setattr(P, "GROUP_MIN_RATIO", 0 if transitions == "grouped" else 1 << 30)
+    monkeypatch.setattr(P, "GROUP_PRUNED_WALKS", transitions == "grouped")    # (the inputs rule tokens out)
     monkeypatch.setattr(P, "ENTRY_LOOP_MAX_LIVE", 2 if transitions == "entries" else 0)
     n, B = KINDS[kind], 4
     pc = build_pc(kind, n, V, input_dist = dists.SoftEvidenceCategorical if evidence_kind != "none" else None)

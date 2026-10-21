@@ -64,8 +64,6 @@ class TopDownProgram:
 def top_down_program(backend) -> TopDownProgram:
     prog = backend.program()
     dev, n = prog.dev, prog.n
-    if not hasattr(prog, "trans_top_down"):                   # the transitions as the top-down kernels read them:
-        prog.trans_top_down = prog.trans                       # the forward's (grouped ones are kept whole)
     reach = prog.reach
     firsts = prog.firsts
     score = score_tables(prog)

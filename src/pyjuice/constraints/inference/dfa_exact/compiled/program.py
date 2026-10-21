@@ -17,6 +17,7 @@ import torch
 from ..kernels.common import IDENTITY, SUM, TEMP
 from ..kernels.prod import Launch, skip_masks
 from ..kernels.sum import dense_groups
+from ..kernels.live import live_successors
 from ..kernels.transitions import (enumerated_tokens, transition_job, transition_masses, transition_stats,
                                    transition_tables)
 from ..external_params import block_scale
@@ -26,15 +27,25 @@ from .layout import interval_tables
 #: Read a one-child product over a sum straight from the sum's row instead of copying its block (see Program)
 ALIAS_COPIES = True
 
-#: A missing token's transitions are grouped by successor (see :class:`~.transitions.TransitionTables`) when a
-#: column has at least this many live token classes, on average over every boundary's columns, per successor of the
-#: most branching column (and their masses fit :data:`TRANSITION_BUDGET`; see :func:`grouped_transitions`): its
-#: products then loop over successors, not classes, through transition masses built per query. Below it, they loop
-#: over the live classes, and nothing more is built. 8 from a sweep on HMMs (grouped against class by class, batch
-#: 1 / 16; every class live in every column): 512 classes, 16 successors x1.6-1.8 / x2.7-3.4; 128 and 16 x1.0-1.2 /
+#: A missing token's transitions are grouped by successor (see :class:`~.transitions.TransitionTables`) when the
+#: boundaries' live (column, class) pairs are at least this many times their (column, successor) pairs -- live token
+#: classes per successor, over every column of every boundary (:func:`grouped_worth`; and a query's masses must fit,
+#: :func:`transition_budget`): the products then loop over successors, not classes, through transition masses built
+#: per query. Below it, they loop over the live classes, and nothing more is built. 8 from a sweep on HMMs (grouped
+#: against class by class, batch 1 / 16; every class live in every column, every column branching alike, so the
+#: ratio over all columns is each column's): 512 classes, 16 successors x1.6-1.8 / x2.7-3.4; 128 and 16 x1.0-1.2 /
 #: x1.4-1.5; at 4 classes per successor and below, nothing gained or losses (64 successors: 256 classes
-#: x0.71-0.73 / x1.24, 64 classes x0.81-0.87).
+#: x0.71-0.73 / x1.24, 64 classes x0.81-0.87). The ratio was compared against the MOST branching column before
+#: (2026-10-21): JSON Schema automata, 30-47 live classes per column against 2-3 successors on average but one
+#: column of 67-85, were never grouped; grouped, hard_0 x HMM 4096 decodes by diffusion 3.2x faster.
 GROUP_MIN_RATIO = 8
+
+#: Group a query's transitions though its inputs prune the walks per sample (a session's soft evidence that rules
+#: classes out: the successor lists are each sample's live ones, :func:`~..kernels.live.live_successors`): off -- the
+#: masses are built for every column's pairs, a sample at a time, while the pruned walks touch few of them (JSON hard_0
+#: x Codpula 4096, B = 4: a diffusion step 5x slower grouped, 2026-10-21). On, such a query is grouped when its
+#: samples' masses fit (see :meth:`Program.grouped_for`).
+GROUP_PRUNED_WALKS = False
 
 #: ``input @ block`` steps at the same position and block interval run this many to a program on the class-by-class
 #: path, when the block is not the identity (see :func:`~.prod._input_block_group_kernel`; launches wider than
@@ -63,8 +74,15 @@ TRANSITION_TABLE_MAX_ENTRIES = 1 << 30
 
 #: step's, built once per computation of the class masses. Transitions whose masses would not fit are not grouped
 #: (rebuilding them query by query would read every class's mass anyway, and write besides; the forward reads the
-#: classes' masses directly instead)
+#: classes' masses directly instead): the floats they may take, at least -- or :data:`TRANSITION_MEMORY_SHARE` of the
+#: device's free memory when the program is built, when that is more (JSON hard_0 x HMM 4096 at n = 128: 1.2G floats,
+#: 4.7 GB, for a diffusion decode 3.3x faster); per sample under per-sample class masses (``B`` samples' masses take
+#: ``B`` times the floats); a query whose inputs prune the walks per sample takes the per-class kernels whatever the
+#: budget (:data:`GROUP_PRUNED_WALKS`, see :meth:`Program.grouped_for`)
 TRANSITION_BUDGET = 1 << 26
+TRANSITION_MEMORY_SHARE = 0.25
+#: The most floats of transition masses a sample may take: the steps' offsets into them are int32 in the launch rows
+TRANSITION_OFFSET_MAX = (1 << 31) - 1
 
 
 #: Ungrouped transitions: the forward kernels loop over a column's live entries (its live classes' successors and
@@ -78,21 +96,28 @@ TRANSITION_BUDGET = 1 << 26
 ENTRY_LOOP_MAX_LIVE = 0.5
 
 
-def grouped_transitions(stats: Tuple[int, int, int], pair_masses: int) -> bool:
-    """Whether a missing token's transitions are grouped by successor: when the input steps' ``pair_masses`` (floats
-    of transition masses) fit :data:`TRANSITION_BUDGET`, and a column's live classes, on average over every
-    boundary's columns, are :data:`GROUP_MIN_RATIO` times the most successors of any column or more -- the ungrouped
-    kernels' loop over a column's live classes against the grouped kernels' loop over its successors (``stats``: the
-    layout's :func:`~..kernels.transitions.transition_stats`)."""
-    if pair_masses > TRANSITION_BUDGET:
-        return False
-    live, columns, most = stats
-    return live >= GROUP_MIN_RATIO * most * max(columns, 1)
+def grouped_worth(stats: Tuple[int, int, int], pairs: int) -> bool:
+    """Whether a missing token's transitions are worth grouping by successor: the boundaries' live (column, class)
+    pairs (``stats``: the layout's :func:`~..kernels.transitions.transition_stats`), what the ungrouped kernels' loops
+    read, are :data:`GROUP_MIN_RATIO` times their (column, successor) ``pairs`` or more, what the grouped kernels'
+    read. (Whether the masses fit is the query's question, see :meth:`Program.transitions`.)"""
+    live, _, _ = stats
+    return live >= GROUP_MIN_RATIO * max(pairs, 1)
+
+
+def transition_budget(dev) -> int:
+    """The floats of transition masses a query may keep: :data:`TRANSITION_BUDGET`, or
+    :data:`TRANSITION_MEMORY_SHARE` of the device's free memory (and the blocks its allocator holds unused) when
+    that is more."""
+    if dev.type != "cuda":
+        return TRANSITION_BUDGET
+    free = torch.cuda.mem_get_info(dev)[0] + torch.cuda.memory_reserved(dev) - torch.cuda.memory_allocated(dev)
+    return max(TRANSITION_BUDGET, int(TRANSITION_MEMORY_SHARE * free) // 4)
 
 
 def entry_loop(stats: Tuple[int, int, int], C: int) -> bool:
     """Whether the ungrouped forward kernels loop over a column's live entries rather than every class: at most
-    :data:`ENTRY_LOOP_MAX_LIVE` of the (column, class) pairs live (``stats`` as :func:`grouped_transitions`)."""
+    :data:`ENTRY_LOOP_MAX_LIVE` of the (column, class) pairs live (``stats`` as :func:`grouped_worth`)."""
     live, columns, _ = stats
     return live < ENTRY_LOOP_MAX_LIVE * columns * C
 
@@ -308,31 +333,32 @@ class Program:
         self.skip_triples = list(triples)
         self.skip = skip_masks(self.reach, self.skip_triples, device = dev)
 
-        # a missing token's transitions: GROUPED by successor -- every input @ block / block @ input step's transition
+        # a missing token's transitions, GROUPED by successor -- every input @ block / block @ input step's transition
         # masses, a row of the boundary's pairs at t_off, all kept (offsets set here, once) and built once per
-        # computation of the class masses -- when they fit TRANSITION_BUDGET and a column's live classes are
-        # GROUP_MIN_RATIO times its successors or more (see :func:`grouped_transitions`); else one entry per live
-        # class, its mass read by the class's code (:class:`~..kernels.transitions.EnumeratedTokens`)
+        # computation of the class masses -- when the boundaries' live classes are GROUP_MIN_RATIO times their
+        # successors or more (`grouped_worth`), the query's walks not pruned per sample by its inputs and its masses
+        # within the budget (`grouped_for`, per query: `transitions`); else one entry per live class, its mass read by the
+        # class's code (:class:`~..kernels.transitions.EnumeratedTokens`): the ungrouped tables, built when first used
         ins = launches_of(tuple(TRANS_COLS))
         pairs = torch.tensor(self.succ.num_pairs, dtype = torch.long)
         sizes = [pairs[launches[li][2][:, TRANS_COLS[launches[li][0]][1]]] for launches, li in ins]
-        grouped = grouped_transitions(self.transition_stats, sum(int(z.sum()) for z in sizes))
-        self.trans = self.succ if grouped else transition_tables(tr, grouped = False,
-                                                                 enum = self.enum)
+        self.group_worth = grouped_worth(self.transition_stats, int(pairs.sum()))
+        self.trans_budget = transition_budget(dev)
         self.entry_loop = entry_loop(self.transition_stats, self.C)    # ungrouped kernels: entries, or every class
-        self.trans_persistent = grouped                             # (grouped transitions are always kept whole)
-        self.trans_pairs = pairs if grouped else None
+        self.trans_pairs = pairs
+        self._tr, self._ungrouped = tr, None
         self.trans_size, rows = 0, []
-        if grouped:
-            for z, (launches, li) in zip(sizes, ins):
-                form, kinds, st, iv, sz = launches[li]
-                st = st.clone()
-                st[:, 6] = self.trans_size + torch.cumsum(z, 0) - z
-                self.trans_size += int(z.sum())
-                rows.append(st[:, [*TRANS_COLS[form], 6]])
-                launches[li] = (form, kinds, st, iv, sz)
+        for z, (launches, li) in zip(sizes, ins):
+            form, kinds, st, iv, sz = launches[li]
+            st = st.clone()
+            st[:, 6] = self.trans_size + torch.cumsum(z, 0) - z
+            self.trans_size += int(z.sum())
+            rows.append(st[:, [*TRANS_COLS[form], 6]])
+            launches[li] = (form, kinds, st, iv, sz)
         self.trans_job = transition_job(torch.cat(rows), dev) if rows else None
         self._trans, self._trans_version = None, None
+        self.trans = self.succ if self.grouped_for(1) else self.ungrouped_tables()
+        self.trans_persistent = self.trans.grouped                  # (grouped transitions are always kept whole)
 
         for launches, li in launches_of(("input_block", "block_input", "block_block", "copy")):
             launches[li] = self._launch(*launches[li])
@@ -350,7 +376,9 @@ class Program:
         elif form in TRANS_COLS:
             groups = None                                               # input @ block steps, several to a program
             chunks = [(0, S, None)]                                     # (every step's masses at hand: one chunk)
-            if not self.trans.grouped and form == "input_block" and kinds[0] != IDENTITY and INPUT_BLOCK_GROUP > 1:
+            # (the step groups of the class-by-class kernels, built whatever the program's transitions: a query's
+            # are its own, see `transitions`)
+            if form == "input_block" and kinds[0] != IDENTITY and INPUT_BLOCK_GROUP > 1:
                 sizes_g = dict.fromkeys((INPUT_BLOCK_GROUP, *INPUT_BLOCK_GROUP_ALTERNATIVES))   # default first
                 order, firsts = _step_groups(rows, [G for G in sizes_g if G > 1])
                 rows, iv, sizes = rows[order], iv[order], sizes[order]
@@ -367,17 +395,46 @@ class Program:
 
     def transition_buffer(self, samples: int = 1) -> torch.Tensor:
         """Where the transition masses go (``samples`` blocks of ``trans_size``, for class masses of each sample's
-        own; allocated on first use, and again for more samples)."""
-        size = self.trans_size * samples
+        own; allocated on first use, and again for more samples) -- under the ungrouped tables, whose kernels read
+        no masses, a float."""
+        size = self.trans_size * samples if self.trans.grouped else 1
         if self._trans is None or self._trans.numel() < size:
             self._trans = None
             self._trans = torch.empty(max(1, size), dtype = torch.float32, device = self.dev)
         return self._trans
 
+    def grouped_for(self, batch: int, pruned: bool = False) -> bool:
+        """Whether a query whose class masses are ``batch`` samples' (1: one set for all) takes the grouped
+        transitions: its walks not ``pruned`` per sample by its inputs (unless :data:`GROUP_PRUNED_WALKS`), worth it
+        (:func:`grouped_worth`), and the masses, ``trans_size`` floats a sample, within the budget
+        (:func:`transition_budget`), a sample's under 2^31 (:data:`TRANSITION_OFFSET_MAX`: the steps' offsets into
+        them are int32; the samples' blocks are reached in int64)."""
+        return ((not pruned or GROUP_PRUNED_WALKS) and self.group_worth and self.trans_size <= TRANSITION_OFFSET_MAX
+                and self.trans_size * batch <= self.trans_budget)
+
+    def ungrouped_tables(self):
+        """The ungrouped transition tables (one entry per live class), built when first needed."""
+        if self._ungrouped is None:
+            self._ungrouped = transition_tables(self._tr, grouped = False, enum = self.enum)
+        return self._ungrouped
+
+    @property
+    def trans_top_down(self):
+        """The transitions as the top-down kernels read them: the forward's (the query's, see :meth:`transitions`)."""
+        return self.trans
+
     def transitions(self, masses):
-        """When transitions are grouped: build their masses from the query's class masses
-        (:class:`~..state.ClassMasses`), unless they already are."""
-        if self.trans.grouped and self.trans_job is not None and self._trans_version != masses.version:
+        """The transitions of a query under ``masses`` (its class masses, a :class:`~..state.ClassMasses`): grouped
+        when :meth:`grouped_for` says so of their batch and of whether the inputs prune the walks per sample (their
+        :func:`~..kernels.live.live_successors`, built here when not yet) -- ``trans`` the grouped tables, their
+        masses built from the class masses unless they already are -- else the ungrouped tables. A query's drivers
+        call this before its liveness (whose successor lists follow ``trans``) and its passes."""
+        grouped = self.grouped_for(masses.batch, live_successors(self, masses) is not None)
+        if grouped != self.trans.grouped:
+            self.trans = self.succ if grouped else self.ungrouped_tables()
+            self.trans_persistent = grouped
+            self._trans, self._trans_version = None, None               # (the masses go with the grouped tables)
+        if grouped and self.trans_job is not None and self._trans_version != masses.version:
             transition_masses(self.transition_buffer(masses.batch), self.trans_job, masses, self)
             self._trans_version = masses.version
 

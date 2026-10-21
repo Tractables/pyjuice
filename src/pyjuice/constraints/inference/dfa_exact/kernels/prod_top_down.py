@@ -309,7 +309,7 @@ def _input_block_top_down_kernel(element_flows, temp_flows, node_flows, node_mar
                 masses = (trans + tl.load(parents + p * 7 + 6).to(tl.int64))[:, None]
                 if SAMPLE:                                                   # (the lane's sample's)
                     masses = masses + tl.where((tl.load(mass_stride + (u - input_start)) > 0)[:, None],
-                                               b[None, :] * trans_stride, 0)
+                                               b.to(tl.int64)[None, :] * trans_stride, 0)
             else:
                 mrow = tl.load(mass_row + (u - input_start)).to(tl.int64)[:, None]
                 if SAMPLE:
@@ -438,7 +438,7 @@ def _block_input_top_down_kernel(element_flows, temp_flows, node_flows, node_mar
                     masses = (trans + tl.load(parents + p * 7 + 6).to(tl.int64))[:, None]
                     if SAMPLE:                                               # (the lane's sample's)
                         masses = masses + tl.where((tl.load(mass_stride + (u - input_start)) > 0)[:, None],
-                                                   b[None, :] * trans_stride, 0)
+                                                   b.to(tl.int64)[None, :] * trans_stride, 0)
                 else:
                     mrow = tl.load(mass_row + (u - input_start)).to(tl.int64)[:, None]
                     if SAMPLE:
@@ -883,8 +883,8 @@ def _input_block_boundaries(la: TopDownLaunch, prog) -> dict:
         n, W = prog.n, prog.W
         counts = getattr(prog, "pred_counts", None)
         if counts is None:                                                   # every boundary's predecessor entries
-            pp = prog.trans_top_down.pred_ptr.view(n, W + 1).cpu().numpy().astype(np.int64)
-            counts = prog.pred_counts = pp[:, W] - pp[:, 0]
+            pp = prog.ungrouped_tables().pred_ptr.view(n, W + 1).cpu().numpy().astype(np.int64)   # (the CUDA walk
+            counts = prog.pred_counts = pp[:, W] - pp[:, 0]                                        # runs ungrouped)
         ts = np.unique(la.host["parents"][:, 2]).astype(np.int64)
         ecum = np.zeros(ts.size + 1, dtype = np.int64)
         np.cumsum(counts[ts], out = ecum[1:])

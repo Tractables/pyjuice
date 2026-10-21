@@ -606,11 +606,12 @@ def test_transition_masses_match_brute_force(build_pc, monkeypatch):
 
 @pytest.mark.parametrize("kind", ["hmm", "pd"])
 def test_transitions_over_the_budget_are_not_grouped(kind, build_pc, monkeypatch):
-    """Transitions grouped by the ratio, with a budget of one float: the program reads the classes' masses instead
-    (ungrouped tables), and gives the marginal of grouping them -- a wide automaton; the buffers filled with NaN
-    before each call, so a slot no program writes shows."""
+    """Transitions grouped by the ratio, with a budget of one float (and no share of the device's memory): the
+    program reads the classes' masses instead (ungrouped tables), and gives the marginal of grouping them -- a wide
+    automaton; the buffers filled with NaN before each call, so a slot no program writes shows."""
     import pyjuice.constraints.inference.dfa_exact.compiled.program as P
     monkeypatch.setattr(P, "GROUP_MIN_RATIO", 0)
+    monkeypatch.setattr(P, "TRANSITION_MEMORY_SHARE", 0)
     rng = random.Random(0)
     K, n = 48, KINDS[kind]
     dfa = jc.DFA.from_dense(V, [[rng.randrange(K) for _ in range(V)] for _ in range(K)], 0, rng.sample(range(K), 12))

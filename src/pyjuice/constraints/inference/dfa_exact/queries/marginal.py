@@ -69,6 +69,7 @@ def marginal(backend, data: torch.Tensor, missing_mask: Optional[torch.Tensor] =
     with torch.no_grad():
         obs_class = torch.where(missing, -1, backend.token_classes.token_class[x]).contiguous()
         masses = backend.state.masses(external)
+        prog.transitions(masses)                        # (the query's transition tables, grouped or not: fixed here)
         succ = live_successors(prog, masses)            # (per-sample inputs that rule classes out: theirs)
         if external is not None:                        # values that differ per sample, or cheaper per sample
             observed = observed | external.observed_under(prog, masses)

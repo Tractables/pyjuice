@@ -196,6 +196,7 @@ def class_weights(backend, data: torch.Tensor, missing: torch.Tensor, positions:
         x, obs_class = evidence
     held = held or {}
     masses = backend.state.masses(external) if masses is None else masses
+    prog.transitions(masses)                            # (the query's transition tables, grouped or not: fixed here)
     succ = live_successors(prog, masses)                # (per-sample inputs that rule classes out: theirs)
     if external is not None:                            # values that differ per sample, or cheaper per sample
         observed = observed | external.observed_under(prog, masses)
