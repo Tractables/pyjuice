@@ -292,6 +292,31 @@ def test_transition_tables_against_next_col(seed, grouped):
         assert columns == sum(width[:n]) and live == sum(int((L.next_col_at(t) >= 0).sum()) for t in range(n))
 
 
+@pytest.mark.parametrize("grouped", [False, True])
+def test_alike_boundaries_share_their_entries(grouped):
+    """Boundaries with the same possible states as each other, and the same at the next boundary, have the same
+    entries and share one segment: the entries stored are the distinct boundaries' (past the shortest accepted
+    string every state is possible, so most boundaries are alike), the pointer rows of alike boundaries point into
+    the same segment, and every boundary's entries read through them are its own
+    (:func:`test_transition_tables_against_next_col` checks those)."""
+    import hashlib
+    n = 12
+    L = build_layout(jc.DFA.contains([[1, 2]], 3), n)
+    tr = L.transitions(torch.device("cpu"))
+    tt = transition_tables(tr, grouped)
+    sid, width = L.state_id.numpy(), L.width.tolist()
+    rows = [hashlib.blake2b(sid[t, :width[t]].tobytes()).digest() for t in range(n + 1)]
+    keys = [(rows[t], rows[t + 1], t + 1 == n) for t in range(n)]
+    entries = lambda t: int((L.next_col_at(t) >= 0).sum()) if not grouped else tt.num_pairs[t]
+    distinct = {k: entries(t) for t, k in enumerate(keys)}
+    assert len(distinct) < n and tt.entry_succ.numel() == sum(distinct.values()) < sum(entries(t) for t in range(n))
+    for t, u in zip(range(n), range(1, n)):
+        same = keys[t] == keys[u]
+        assert (tt.entry_ptr[t, 0] == tt.entry_ptr[u, 0]) == same and (tt.cls_ptr[t, 0] == tt.cls_ptr[u, 0]) == same
+        if same:
+            assert torch.equal(tt.entry_ptr[t], tt.entry_ptr[u]) and torch.equal(tt.pred_ptr[t], tt.pred_ptr[u])
+
+
 def test_unsatisfiable_constraint_has_empty_boundaries():
     L = build_layout(jc.DFA.contains([[1, 2, 1]], 4), 2)
     assert not L.satisfiable and (L.width == 0).all() and all(L.next_col_at(t).numel() == 0 for t in range(2))

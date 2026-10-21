@@ -299,13 +299,13 @@ class SuccessorLists:
     For every sample ``b``, boundary ``t`` and live column ``i`` of a query, the column's entries (of the Program's
     transition tables, ``Program.trans``) whose successor is live at ``t + 1`` -- and, under a session's per-sample
     inputs, whose class the sample allows there (:attr:`Liveness.allowed`; a ruled-out class's mass is -inf: its term
-    adds nothing) --, ascending: ``entries[b E + e_t +
-    start[b, t, i] + k]`` for ``k < count[b, t, i]``, ``E`` the tables' entries and ``e_t`` boundary ``t``'s first --
-    each (sample, boundary) list within its boundary's entry range, so none waits for another's count. A dead column's
-    ``start`` and ``count`` are unwritten (never read).
+    adds nothing) --, ascending: ``entries[b E + start[b, t, i] + k]`` for ``k < count[b, t, i]``, ``E`` the tables'
+    entries counted per boundary (:attr:`~.transitions.TransitionTables.num_entries`) -- each (sample, boundary) list
+    within its boundary's entry range (from :attr:`~.transitions.TransitionTables.boundary_base` on), so none waits for
+    another's count. A dead column's ``start`` and ``count`` are unwritten (never read).
 
     :ivar start, count: int32 [B, n, W]
-    :ivar entries: int32 [B E], entry numbers
+    :ivar entries: int32 [B E], entry numbers (the tables')
     :ivar use: int32 [n], whether the boundary takes its lists, every sample's (:data:`SUCCESSOR_LIST_MAX_LIVE`)
     :ivar num_entries: ``E``
     :ivar boundaries: ``use`` on the host -- a launch compiles with the lists alone where every boundary of its steps
@@ -321,13 +321,13 @@ class SuccessorLists:
 
 
 @triton_jit
-def _successor_lists_kernel(live, entry_ptr, entry_succ, count, start, columns, lstart, lcount, entries, sizes, n, W, E,
-                            allowed, entry_class, a_stride, C, TILE: tl.constexpr, ALLOWED: tl.constexpr):
+def _successor_lists_kernel(live, entry_ptr, entry_succ, boundary_base, count, start, columns, lstart, lcount, entries,
+                            sizes, n, W, E, allowed, entry_class, a_stride, C, TILE: tl.constexpr, ALLOWED: tl.constexpr):
     """One program per (sample, boundary ``t < n``): over the sample's live columns at ``t`` (``count`` / ``start`` /
     ``columns``, :meth:`Liveness.lists`), ascending, their entries whose successor is live at ``t + 1`` -- ``ALLOWED``:
     and whose class (``entry_class``) the sample allows there (``allowed`` int8 [Be, n, C], ``a_stride`` a sample's
-    flags apart) --, into the (sample, boundary)'s :class:`SuccessorLists`; ``sizes`` [B, n, 2]: the entries kept, and
-    those columns' entries."""
+    flags apart) --, into the (sample, boundary)'s :class:`SuccessorLists`, from the boundary's ``boundary_base`` on
+    (``lstart`` counted from the sample's first); ``sizes`` [B, n, 2]: the entries kept, and those columns' entries."""
     pid = tl.program_id(0)
     b = (pid // n).to(tl.int64)
     t = pid % n
@@ -335,7 +335,8 @@ def _successor_lists_kernel(live, entry_ptr, entry_succ, count, start, columns, 
     nc = tl.load(count + row)
     cs = tl.load(start + row)
     nxt = live + (row + 1) * W                                              # the successors' boundary
-    region = entries + b * E + tl.load(entry_ptr + t * (W + 1))
+    base = tl.load(boundary_base + t)
+    region = entries + b * E + base
     out = (b * n + t) * W
     kept = tl.zeros([], dtype = tl.int32)
     total = tl.zeros([], dtype = tl.int32)
@@ -356,7 +357,7 @@ def _successor_lists_kernel(live, entry_ptr, entry_succ, count, start, columns, 
             tl.store(region + kept + tl.cumsum(v, axis = 0) - v, e, mask = v != 0)
             kept += tl.sum(v, axis = 0)
         total += e1 - e0
-        tl.store(lstart + out + i, first)
+        tl.store(lstart + out + i, (base + first).to(tl.int32))
         tl.store(lcount + out + i, kept - first)
     tl.store(sizes + (b * n + t) * 2, kept)
     tl.store(sizes + (b * n + t) * 2 + 1, total)
@@ -428,7 +429,7 @@ class Liveness:
             prog, B, n = self.prog, self.B, self.prog.n
             W = prog.W
             tt = prog.trans
-            E = int(tt.entry_succ.numel())
+            E = tt.num_entries
             parts = [B * E, B * n * W, B * n * W, B * n * 2]
             offs = np.cumsum([0] + [-(-z // 4) * 4 for z in parts])          # (16-byte aligned pieces)
             store = state.storage_view("successor_lists", int(offs[-1])).view(torch.int32)
@@ -438,8 +439,8 @@ class Liveness:
             C = prog.C
             a_stride = n * C if classes and self.allowed.size(0) > 1 else 0          # (one set: every sample's)
             if n > 0 and B > 0:
-                _successor_lists_kernel[(B * n,)](self.live, tt.entry_ptr, tt.entry_succ, count, start, columns, lstart,
-                                                  lcount, entries, sizes, n, W, E,
+                _successor_lists_kernel[(B * n,)](self.live, tt.entry_ptr, tt.entry_succ, tt.boundary_base, count, start,
+                                                  columns, lstart, lcount, entries, sizes, n, W, E,
                                                   self.allowed if classes else self.live,
                                                   tt.entry_class if classes else tt.entry_succ, a_stride, C,
                                                   TILE = SUCCESSOR_LIST_TILE, ALLOWED = classes, num_warps = 4)
@@ -626,14 +627,16 @@ def class_support(prog, masses) -> Optional[torch.Tensor]:
 def entry_classes(prog):
     """``(key, first)``: every (entry, class) pair of the program's grouped successor lists -- an entry (column,
     successor) and a class leading along it --, by entry: the pair's place in a sample's classes [n, C], ``t * C +
-    c`` (int64 [P]), and every entry's first pair (int64 [E + 1]); built once per program."""
+    c`` (int64 [P]), and every entry's first pair (int64 [E + 1]), the entries counted per boundary
+    (:attr:`~.transitions.TransitionTables.num_entries`); built once per program."""
     kept = getattr(prog, "entry_class_pairs", None)
     if kept is None:
         tt, n, W, C, dev = prog.succ, prog.n, prog.W, prog.C, prog.dev
         tr = prog.layout.transitions(dev)
-        E = tt.entry_succ.numel()
+        E = tt.num_entries
         ptr, ptr_h, esucc = tt.entry_ptr.long().view(n, W + 1), tt.entry_ptr.view(n, W + 1).cpu().numpy(), \
             tt.entry_succ.long()
+        bases = tt.boundary_base.cpu().numpy()
         keys, es = [], []
         for t in range(n):                       # a boundary's entries: its (column, successor) pairs, in that order
             nc = tr.at(t)
@@ -641,7 +644,7 @@ def entry_classes(prog):
             s = nc[q, c] if t + 1 < n else torch.zeros_like(q)
             first, last = int(ptr_h[t, 0]), int(ptr_h[t, W])
             qe = torch.repeat_interleave(torch.arange(W, device = dev), ptr[t, 1:] - ptr[t, :W])
-            e = first + torch.searchsorted(qe * (W + 1) + esucc[first:last], q * (W + 1) + s)
+            e = int(bases[t]) + torch.searchsorted(qe * (W + 1) + esucc[first:last], q * (W + 1) + s)
             keys.append(t * C + c)
             es.append(e)
         e = torch.cat(es) if es else torch.zeros(0, dtype = torch.int64, device = dev)
@@ -658,10 +661,13 @@ def sample_successors(prog, allowed: torch.Tensor) -> SampleSuccessors:
     successor) of the grouped lists stays for sample ``b`` when some class allowed at its boundary leads along it --
     one of its (entry, class) pairs (:func:`entry_classes`). Nothing waits for the device."""
     tt, (n, W, C) = prog.succ, (prog.n, prog.W, prog.C)
-    Be, E, dev = allowed.size(0), tt.entry_succ.numel(), prog.dev
+    Be, E, dev = allowed.size(0), tt.num_entries, prog.dev                # (the entries counted per boundary)
     key, first = entry_classes(prog)
     ptr = torch.empty(Be, n, W + 1, dtype = torch.int32, device = dev)
     succ = torch.empty(Be, E + 1, dtype = torch.int32, device = dev)
+    eptr = tt.entry_ptr.long().view(n, W + 1)
+    rows = (eptr - eptr[:, :1] + tt.boundary_base[:n, None]).view(-1)       # the pointer rows, counted per boundary
+    ranges = list(zip(tt.boundary_base.tolist(), eptr[:, 0].tolist(), (eptr[:, W] - eptr[:, 0]).tolist()))
     P = key.numel()
     step = max(1, SUPPORT_CHUNK // max(P, E, 1))
     for b0 in range(0, Be, step):                                           # (the scans over the chunk's samples
@@ -675,8 +681,11 @@ def sample_successors(prog, allowed: torch.Tensor) -> SampleSuccessors:
         count[1:] = torch.cumsum(kept.reshape(-1), dim = 0, dtype = torch.int32)
         count = count.as_strided((bs, E + 1), (E, 1))
         count = count - count[:, :1]                                        # count[:, e]: the kept entries before e
-        ptr[b0:b0 + bs] = count[:, tt.entry_ptr.long().view(-1)].view(bs, n, W + 1)
-        succ[b0:b0 + bs].scatter_(1, torch.where(kept, count[:, :E].long(), E), tt.entry_succ[None].expand(bs, -1))
+        ptr[b0:b0 + bs] = count[:, rows].view(bs, n, W + 1)
+        for base, shared, size in ranges:                                   # a boundary's successors: its segment's
+            if size:
+                at = torch.where(kept[:, base:base + size], count[:, base:base + size].long(), E)
+                succ[b0:b0 + bs].scatter_(1, at, tt.entry_succ[shared:shared + size][None].expand(bs, -1))
     return SampleSuccessors(ptr = ptr, succ = succ, allowed = allowed.to(torch.int8))
 
 

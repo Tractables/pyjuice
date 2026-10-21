@@ -12,6 +12,7 @@ parameter row: a step's lanes read along one row, see :meth:`~..state.State.enum
 weight (``enum_logw``, see :class:`~..state.ClassMasses`) over the row's ``Z``.
 """
 
+import hashlib
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
@@ -110,6 +111,11 @@ class TransitionTables:
     :ivar entry_class, pred_class: ungrouped only, [entries] int32: every entry's class, in the entry and the
         predecessor order -- by which a session's per-sample inputs rule entries out (the ``input @ block`` entry loops'
         :class:`~.live.SuccessorLists`, the CUDA top-down walk's terms)
+    :ivar boundary_base, num_entries: boundaries alike share their entries (see :func:`transition_tables`), so a
+        structure with a value PER BOUNDARY AND ENTRY -- a sample's successor lists -- counts the boundaries' entries
+        one after the other: ``boundary_base`` int64 [n + 1] on the device, boundary ``t``'s entries are
+        ``boundary_base[t] .. boundary_base[t + 1]`` there (its entry ``e`` at ``boundary_base[t] + e - entry_ptr[t, 0]``),
+        ``num_entries`` their total, ``boundary_base[n]``
     """
 
     grouped: bool
@@ -132,6 +138,8 @@ class TransitionTables:
     cls_order: Optional[torch.Tensor] = None
     entry_class: Optional[torch.Tensor] = None
     pred_class: Optional[torch.Tensor] = None
+    boundary_base: Optional[torch.Tensor] = None
+    num_entries: int = 0
 
 
 def transition_stats(tr) -> Tuple[int, int, int]:
@@ -156,64 +164,96 @@ def transition_stats(tr) -> Tuple[int, int, int]:
 
 
 def transition_tables(tr, grouped: bool, enum: Optional[EnumeratedTokens] = None) -> TransitionTables:
-    """The :class:`TransitionTables` of a layout's transitions ``tr`` (a :class:`~..compiled.layout.Transitions`, on
-    the device; built there a boundary at a time); ``enum`` the :class:`EnumeratedTokens` (None: nothing enumerated,
-    every class's code the class itself)."""
+    """
+    The :class:`TransitionTables` of a layout's transitions ``tr`` (a :class:`~..compiled.layout.Transitions`, on the
+    device); ``enum`` the :class:`EnumeratedTokens` (None: nothing enumerated, every class's code the class itself).
+
+    A boundary's entries depend on its possible states and the next boundary's alone (its columns, their successors'
+    columns, the classes live there -- an enumerated token's code counts from the boundary's first), and on its being
+    the sequence end. Boundaries alike SHARE their entries: one segment, built once, every one of them pointing into it
+    (``entry_ptr[t]``, ``pred_ptr[t]``, ``cls_ptr[t]``, ``enum_ptr[t]``). Decoding at a length well past the shortest
+    accepted string, most boundaries are alike: a JSON Schema automaton of 24k states has 81 distinct of 1024.
+    """
     n, W, C, dev = tr.n, tr.W, tr.C, tr.device
     code = enum.code.long() if enum is not None and enum.num > 0 else None
-    zeros = lambda *shape: torch.zeros(*shape, dtype = torch.int64, device = dev)
     arange = lambda k: torch.arange(k, dtype = torch.int64, device = dev)
-    entry_ptr, pred_ptr, enum_ptr = zeros(n, W + 1), zeros(n, W + 1), zeros(n, W + 1)
-    cls_ptr = zeros(n, C + 1)
-    cls_order = arange(C).repeat(n, 1)
-    succs, xs, cols, pxs, num_pairs, ees, epairs, ccols, csuccs = [], [], [], [], [], [], [], [], []
-    clss, pclss = [], []                                                    # (ungrouped: the entries' classes)
-    base = max_pairs = ebase = max_enum = cbase = max_cls = 0
+    i32 = lambda x: x.to(dev, torch.int32).contiguous()
+    cat = lambda xs, total: i32(torch.cat(xs)) if total > 0 else torch.zeros(1, dtype = torch.int32, device = dev)
+
+    sid = tr.state_id.cpu().numpy()                                          # the boundaries alike, by their states
+    digests = [hashlib.blake2b(sid[t, :tr.width[t]].tobytes(), digest_size = 16).digest() for t in range(n + 1)]
+    number, group, firsts = {}, [], []                                       # a key's number; every boundary's; its first
     for t in range(n):
+        key = (digests[t], digests[t + 1], t + 1 == n)
+        if key not in number:
+            number[key] = len(firsts)
+            firsts.append(t)
+        group.append(number[key])
+    G = len(firsts)
+    at = torch.tensor(group, dtype = torch.long, device = dev)
+
+    succs, xs, cols, pxs, pairs, ees, epairs, ccols, csuccs, clss, pclss = ([] for _ in range(11))
+    entry_rows, pred_rows, enum_rows, cls_rows, orders = ([] for _ in range(5))
+    sizes, csizes, esizes = [], [], []
+    max_pairs = max_enum = max_cls = 0
+    for t in firsts:                                                          # one segment per distinct boundary
         succ = tr.at(t)                                                      # [wt, C]
         if t + 1 == n:
             succ = torch.where(succ >= 0, 0, -1)                             # a sequence end: one column
         q, c = torch.nonzero(succ >= 0, as_tuple = True)                     # by column, then class
         by_cls = torch.argsort(c * (W + 1) + q, stable = True)               # by class, then column
-        cls_ptr[t] = cbase + torch.searchsorted(c[by_cls], arange(C + 1))
+        cls_rows.append(torch.searchsorted(c[by_cls], arange(C + 1)))
         ccols.append(q[by_cls]); csuccs.append(succ[q, c][by_cls])
-        cbase += q.numel()
+        csizes.append(q.numel())
         lengths = torch.bincount(c, minlength = C)
-        cls_order[t] = torch.argsort(-lengths, stable = True)
+        orders.append(torch.argsort(-lengths, stable = True))
         max_cls = max(max_cls, int(lengths.max()) if q.numel() else 0)
         if grouped:
             key, inverse = torch.unique(q * (W + 1) + succ[q, c], return_inverse = True)    # by column, successor
             eq, es, ex = key // (W + 1), key % (W + 1), arange(key.numel())
-            num_pairs.append(key.numel())
+            pairs.append(key.numel())
             max_pairs = max(max_pairs, int(torch.bincount(eq, minlength = 1).max()) if key.numel() else 0)
             if code is not None:                                             # the enumerated classes' live entries
                 en = code[t, c] < 0
-                enum_ptr[t] = ebase + torch.searchsorted(q[en], arange(W + 1))
+                enum_rows.append(torch.searchsorted(q[en], arange(W + 1)))
                 ees.append(-1 - code[t, c[en]]); epairs.append(inverse[en])
-                ebase += int(en.sum())
+                esizes.append(int(en.sum()))
                 max_enum = max(max_enum, int(torch.bincount(q[en], minlength = 1).max()) if en.any() else 0)
         else:
             eq, es, ex = q, succ[q, c], (c if code is None else code[t, c])
             clss.append(c)
-        entry_ptr[t] = base + torch.searchsorted(eq, arange(W + 1))
+        entry_rows.append(torch.searchsorted(eq, arange(W + 1)))
         by_succ = torch.argsort(es * (W + 1) + eq, stable = True)
-        pred_ptr[t] = base + torch.searchsorted(es[by_succ], arange(W + 1))
+        pred_rows.append(torch.searchsorted(es[by_succ], arange(W + 1)))
         succs.append(es); xs.append(ex); cols.append(eq[by_succ]); pxs.append(ex[by_succ])
         if not grouped:
             pclss.append(c[by_succ])
-        base += eq.numel()
-    i32 = lambda x: x.to(dev, torch.int32).contiguous()
-    cat = lambda xs, total: i32(torch.cat(xs)) if total > 0 else torch.zeros(1, dtype = torch.int32, device = dev)
-    return TransitionTables(grouped = grouped, entry_ptr = i32(entry_ptr), entry_succ = cat(succs, base),
-                            entry_x = cat(xs, base), pred_ptr = i32(pred_ptr), pred_col = cat(cols, base),
-                            pred_x = cat(pxs, base), num_pairs = num_pairs, max_pairs = max_pairs,
-                            enum_ptr = i32(enum_ptr) if grouped else None,
+        sizes.append(eq.numel())
+
+    def pointers(rows, counts):
+        """[n, width] int32: every boundary's pointer row, its segment's relative row past the segments before."""
+        if not rows:
+            return torch.zeros(n, W + 1, dtype = torch.int32, device = dev)
+        bases = torch.tensor([0] + list(np.cumsum(counts)[:-1]), dtype = torch.int64, device = dev)
+        return i32(torch.stack(rows)[at] + bases[at][:, None])
+
+    base, cbase, ebase = sum(sizes), sum(csizes), sum(esizes)
+    enumerated = grouped and code is not None
+    per_boundary = np.concatenate([[0], np.cumsum([sizes[g] for g in group])]).astype(np.int64)
+    return TransitionTables(grouped = grouped, entry_ptr = pointers(entry_rows, sizes), entry_succ = cat(succs, base),
+                            entry_x = cat(xs, base), pred_ptr = pointers(pred_rows, sizes), pred_col = cat(cols, base),
+                            pred_x = cat(pxs, base), num_pairs = [pairs[g] for g in group] if grouped else [],
+                            max_pairs = max_pairs,
+                            enum_ptr = pointers(enum_rows, esizes) if enumerated else (pointers([], []) if grouped else None),
                             enum_e = cat(ees, ebase) if grouped else None,
                             enum_pair = cat(epairs, ebase) if grouped else None, max_enum = max_enum,
-                            cls_ptr = i32(cls_ptr), cls_col = cat(ccols, cbase), cls_succ = cat(csuccs, cbase),
-                            max_cls = max_cls, cls_order = i32(cls_order),
+                            cls_ptr = pointers(cls_rows, csizes) if G else
+                            torch.zeros(n, C + 1, dtype = torch.int32, device = dev),
+                            cls_col = cat(ccols, cbase), cls_succ = cat(csuccs, cbase), max_cls = max_cls,
+                            cls_order = i32(torch.stack(orders)[at]) if G else i32(arange(C).repeat(n, 1)),
                             entry_class = None if grouped else cat(clss, base),
-                            pred_class = None if grouped else cat(pclss, base))
+                            pred_class = None if grouped else cat(pclss, base),
+                            boundary_base = torch.from_numpy(per_boundary).to(dev), num_entries = int(per_boundary[-1]))
 
 
 #: :func:`transition_masses`' tiles: the most rows (input steps at one position) and columns per program, classes per

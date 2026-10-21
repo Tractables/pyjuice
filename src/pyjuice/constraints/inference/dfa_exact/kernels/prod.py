@@ -222,11 +222,12 @@ def _lane_rows(tok_ptr, prow, lognorm, t, mrow, lm, ENUM: tl.constexpr, LOGW: tl
 
 
 @triton.jit
-def _list_range(entry_ptr, succ_start, succ_count, b, t, i, miss, n, W, E):
+def _list_range(succ_start, succ_count, b, t, i, miss, n, W, E):
     """``(l0, l1)``, int64: lanes' column ``i`` at boundary ``t`` (samples ``b``, ``miss`` the lanes on) -- its
-    successor list's range in the :class:`~.live.SuccessorLists`' entries (those whose successor is live)."""
+    successor list's range in the :class:`~.live.SuccessorLists`' entries (those whose successor is live; ``start``
+    counted from the sample's first)."""
     bt = b.to(tl.int64) * n + t
-    l0 = b.to(tl.int64) * E + tl.load(entry_ptr + t * (W + 1)) + tl.load(succ_start + bt * W + i, mask = miss, other = 0)
+    l0 = b.to(tl.int64) * E + tl.load(succ_start + bt * W + i, mask = miss, other = 0)
     return l0, l0 + tl.load(succ_count + bt * W + i, mask = miss, other = 0)
 
 
@@ -405,7 +406,7 @@ def _input_block_kernel(element_mars, node_mars, temp, obs_class, next_col, delt
                 else:
                     listed = False
                 if listed:
-                    l0, l1 = _list_range(entry_ptr, succ_start, succ_count, b, t, i, miss, n, W, E)
+                    l0, l1 = _list_range(succ_start, succ_count, b, t, i, miss, n, W, E)
                     for kk in range(0, tl.max(l1 - l0, axis = 0)):                  # (kk: not the int32 k below)
                         pm = miss & (l0 + kk < l1)
                         ee = tl.load(succ_entries + l0 + kk, mask = pm, other = 0)
@@ -534,7 +535,7 @@ def _input_block_group_kernel(element_mars, node_mars, temp, obs_class, next_col
                 else:
                     listed = False
                 if listed:
-                    l0, l1 = _list_range(entry_ptr, succ_start, succ_count, b, t, i, miss, n, W, E)
+                    l0, l1 = _list_range(succ_start, succ_count, b, t, i, miss, n, W, E)
                     for kk in range(0, tl.max(l1 - l0, axis = 0)):                  # (kk: not the int32 k below)
                         pm = miss & (l0 + kk < l1)
                         ee = tl.load(succ_entries + l0 + kk, mask = pm, other = 0)

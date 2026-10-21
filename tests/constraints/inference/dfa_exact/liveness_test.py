@@ -213,10 +213,12 @@ def test_sample_successors_are_the_allowed_classes_successors(tokens, build_pc):
                     assert succ[b, ptr[b, t, q]:ptr[b, t, q + 1]].tolist() == want, (seed, b, t, q)
         assert tokens == V or C > 62
         every = sample_successors(prog, torch.ones(1, n, C, dtype = torch.bool, device = prog.dev))
-        E = prog.succ.entry_succ.numel()
-        assert every.strides() == (0, 0)
-        assert torch.equal(every.ptr[0], prog.succ.entry_ptr.view(n, W + 1))
-        assert torch.equal(every.succ[0, :E], prog.succ.entry_succ)
+        tt, E = prog.succ, prog.succ.num_entries                       # (the program's lists, boundary after boundary:
+        assert every.strides() == (0, 0)                                # alike boundaries share theirs)
+        eptr = tt.entry_ptr.view(n, W + 1).long()
+        assert torch.equal(every.ptr[0].long(), eptr - eptr[:, :1] + tt.boundary_base[:n, None])
+        own = torch.cat([tt.entry_succ[int(eptr[t, 0]):int(eptr[t, W])] for t in range(n)])
+        assert torch.equal(every.succ[0, :E], own)
 
 
 @pytest.mark.parametrize("shared", [False, True])
@@ -545,10 +547,13 @@ def test_successor_lists_match_a_brute_force(kind, form, classes, build_pc, monk
     sl = lv.successor_lists(cc.backend.state)
     assert lv.successor_lists(cc.backend.state) is sl                       # built once
     start, count, entries, use = (x.cpu().long() for x in (sl.start, sl.count, sl.entries, sl.use))
-    E = sl.num_entries
-    assert E == succ.numel() and entries.numel() == B * E
+    E = sl.num_entries                                                       # (the entries counted per boundary:
+    assert E == prog.trans.num_entries == sum(int(ep[t, -1] - ep[t, 0]) for t in range(n))   # alike ones share)
+    assert entries.numel() == B * E
+    base = prog.trans.boundary_base.cpu().long()
     for (b, t, i), want in lists.items():
-        s0 = b * E + int(ep[t, 0]) + int(start[b, t, i])
+        s0 = b * E + int(start[b, t, i])                                     # (a start counts from the sample's first)
+        assert int(base[t]) <= int(start[b, t, i]) <= int(base[t + 1])
         assert torch.equal(entries[s0:s0 + int(count[b, t, i])], want), (b, t, i)
     assert use.tolist() == [int(kept[t] <= L.SUCCESSOR_LIST_MAX_LIVE * total[t]) for t in range(n)]  # over samples
     assert 0 < int(use.sum()) < n
