@@ -319,9 +319,6 @@ class SumLayer(Layer, nn.Module):
         # pbase are the per-tile first child-node index / first param offset, and cuda_ok records
         # whether this layer's edge/param layout satisfies the kernel's contiguity assumptions.
         self._cached_fw_cuda = dict()
-        # Per-signature autotuned dispatch choice: ("cuda", cfg_id) or ("triton", -1). Decided once
-        # by benchmarking the valid CUDA tile configs against Triton for this layer's shape.
-        self._cached_fw_cuda_choice = dict()
         # Small-batch (batch<16) forward CUDA fast path: per-signature (sb_ebase, sb_pbase, sb_ok),
         # where sb_ebase/sb_pbase are the per-node-block first child / first param and sb_ok records
         # whether the layer's children are GLOBALLY contiguous + params block_size-strided.
@@ -900,7 +897,7 @@ class SumLayer(Layer, nn.Module):
         # bf16 dot path (`use_bf16`), no pflow tempering, TILE_SIZE_K == 64 with num_edges a multiple of it, and a contiguous
         # edge/param layout (`cuda_ok`). `is_available()` JIT-compiles on first call and self-disables
         # (-> Triton) on an unsuitable GPU/toolchain/CUTLASS, so this is a no-op without the CUDA
-        # prerequisites. The best tile config (or Triton) is autotuned once per layer signature.
+        # prerequisites. The best tile config (or Triton) is measured once per launch SHAPE.
         if (FORWARD_SUM_CUDA and use_bf16 and propagation_alg_id == 0
                 and not pflow_tempered_enabled
                 and TILE_SIZE_K == 64 and num_edges % TILE_SIZE_K == 0
@@ -908,21 +905,23 @@ class SumLayer(Layer, nn.Module):
             ebase, pbase, cuda_ok = self._cached_fw_cuda[signature]
             valid_cfgs = cuda_kernels.valid_configs(self.block_size, batch_size) if cuda_ok else []
             if valid_cfgs:
-                # The best config depends on batch_size (which tile shapes are valid + their speed),
-                # so the autotuned choice is keyed by (signature, batch_size), not signature alone.
-                choice_key = (signature, batch_size)
-                choice = self._cached_fw_cuda_choice.get(choice_key)
+                # The best config depends on the shape (which tile shapes are valid, and their speed).
+                # Measured once per SHAPE and cached process-wide (`autotune.choose`), not per layer: the
+                # arms agree only to ~1e-6, so structurally identical layers that measured on their own
+                # could each take a different one, and identical models disagree in the last bits (a
+                # CUDA-graph replay against an eager twin caught it, tests/model/precision_option_test.py).
+                tlmm_key = ("sum_fw_tlmm_cuda", num_edges) + fw_key
+                choice = autotune.cached(tlmm_key)
                 if choice is None:
-                    # Autotune once: fastest of {valid CUDA tile configs} vs Triton. Every candidate
-                    # computes the same result into `node_mars`, so it stays correct afterwards.
+                    # Fastest of {valid CUDA tile configs} vs Triton. Every candidate computes the same
+                    # result into `node_mars`, so it stays correct afterwards.
                     cands = [(("triton", -1), (lambda: _launch_fw(default_fw_cfg)))]
                     cands += [(("cuda", c),
                                (lambda c=c: cuda_kernels.tlmm_forward_sum(
                                    node_mars, element_mars, params, nids, ebase, pbase,
                                    batch_size, self.block_size, K_NUM_TILES, c)))
                               for c in valid_cfgs]
-                    choice = autotune.best_of(cands) or ("triton", -1)
-                    self._cached_fw_cuda_choice[choice_key] = choice
+                    choice = autotune.choose(tlmm_key, cands)
 
                 if choice[0] == "cuda":
                     cuda_kernels.tlmm_forward_sum(
