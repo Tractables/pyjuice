@@ -617,7 +617,7 @@ class ExternalSumParams():
         if consts is None:
             consts = cache_c[ckey] = torch.tensor(
                 [float(pseudocount), float(step_size), 1.0 - float(step_size),
-                 1e-38, 1e-30, 1e-12, 0.0], dtype = torch.float32, device = dev)
+                 1e-38, 1e-30, 0.0], dtype = torch.float32, device = dev)
             if len(cache_c) > 8:                  # a schedule sweeping step sizes must not grow it
                 for k in list(cache_c)[:-4]:
                     del cache_c[k]
@@ -772,7 +772,7 @@ class ExternalSumParams():
         new_theta = theta * ((1.0 - step_size) + step_size * ratio) / cum[nb][:, None, :]
         new_theta = new_theta.clamp_min(1e-30)                              # momentum-underflow guard
         if keep_zero_params:
-            new_theta = torch.where(theta < 1e-12, torch.zeros_like(new_theta), new_theta)
+            new_theta = torch.where(theta == 0.0, torch.zeros_like(new_theta), new_theta)
         new_theta = new_theta.reshape(-1)
         if out is not None:
             out.copy_(new_theta)

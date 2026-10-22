@@ -1502,7 +1502,8 @@ class TensorCircuit(nn.Module):
         :param pseudocount: a pseudo count added to the parameter flows
         :type pseudocount: float
 
-        :param keep_zero_params: if set to `True`, do not add pseudocounts to zero parameters
+        :param keep_zero_params: if `True`, freeze exactly zero parameters; positive parameters are updated
+            regardless of their magnitude (no implicit pruning threshold)
         :type keep_zero_params: bool
 
         :param step_size_rescaling: whether to rescale the step size by flows
