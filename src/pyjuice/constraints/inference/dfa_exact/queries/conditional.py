@@ -176,9 +176,11 @@ def class_weights(backend, data: torch.Tensor, missing: torch.Tensor, positions:
     :param evidence: None, or ``(x, obs_class)`` on the device if already built: the tokens (int64 [B, n], 0 where
         missing) and their classes (int32 [B, n], -1 where missing)
     :returns: ``(groups, masses)``: per row group with a target position, ``(group, its target positions (host),
-        weights [live rows, rows of the group], row [positions x B, classes])``: column ``p * B + b`` (sample ``b`` of
-        the ``p``-th position) class ``c``'s weights at row ``row[p * B + b, c]`` (int32; -1: dead, -inf) -- and the
-        class masses the query read (:class:`~..state.ClassMasses`)
+        weights [rows, rows of the group], row [positions x B, classes], rep)``: column ``p * B + b`` (sample ``b`` of
+        the ``p``-th position) class ``c``'s weights at row ``row[p * B + b, c]`` (int32; -1: dead, -inf), a row shared
+        by the classes with the same live pairs -- ``rep`` (None, or int32 [positions x B, classes]) every class's
+        representative, its row's owner (see :class:`~..kernels.score.ClassWeightRows`) -- and the class masses the
+        query read (:class:`~..state.ClassMasses`)
     """
     prog, td, dev = backend.program(), backend.top_down_program(), backend.device
     score = score_tables(prog)
@@ -243,7 +245,8 @@ def class_weights(backend, data: torch.Tensor, missing: torch.Tensor, positions:
                               lambda: backend.state.flows(B, bufs, compact))
     else:
         flows = backend.state.flows(B, bufs, compact)
-    rows = class_weight_rows(prog, lv, col_pos, col_K, col_first, group_first, B)   # (their sizes copied behind
+    rows = class_weight_rows(prog, lv, col_pos, col_K, col_first, group_first, B,     # (their sizes copied behind
+                             backend.token_classes.stored_of_class)
     gates = F.gate_context(backend, external)                                         # the forward pass's launches)
     hold = None if partial is None or compact is None else dict(regions = partial, fresh = carry["fresh"])
     forward = lambda p, **kw: F.run_forward(backend, bufs, p, x, missing, obs_class, lv, precision, compact, masses,
@@ -261,7 +264,8 @@ def class_weights(backend, data: torch.Tensor, missing: torch.Tensor, positions:
     cw = dict(buf = buf, col = col, K = K, rows = rows)
     run_backward(backend, bufs, flows, plan, x, missing, obs_class, lv, precision, class_weights = cw,
                  masses = masses, compact = compact, gates = gates)
-    return [(g, pos, buf[rows.starts[i]:rows.starts[i + 1]].view(-1, len(score.rows[g])), rows.row[f:f + len(pos) * B])
+    return [(g, pos, buf[rows.starts[i]:rows.starts[i + 1]].view(-1, len(score.rows[g])), rows.row[f:f + len(pos) * B],
+             None if rows.rep is None else rows.rep[f:f + len(pos) * B])
             for i, (g, pos, f) in enumerate(groups)], masses
 
 
@@ -382,12 +386,12 @@ def conditional(backend, data: torch.Tensor, missing_mask: Optional[torch.Tensor
             out = torch.empty(M, width, device = dev)
         log_marginal = torch.empty(M + 1, device = dev) if return_log_marginal else None
         enum = enumerated_args(prog, masses)
-        for gi, ((g, pos, w, row), sample) in enumerate(zip(groups, samples)):
+        for gi, ((g, pos, w, row, rep), sample) in enumerate(zip(groups, samples)):
             out_row = view(2 + gi)[:len(pos) * B]
             table = backend.state.token_table(g, score.rows[g], precision)
             logz = score_group(out, table, w, row, score.rows_t[g], masses.table, out_row, backend.token_classes,
                                F.PRECISIONS[precision], view(2 + G + gi)[:len(pos)], enum, candidates = cand,
-                               sample = sample)
+                               sample = sample, rep = rep)
             if log_marginal is not None:
                 log_marginal[torch.where(out_row >= 0, out_row, M)] = logz
     return (out, log_marginal[:M]) if return_log_marginal else out

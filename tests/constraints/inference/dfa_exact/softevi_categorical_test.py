@@ -464,21 +464,25 @@ def test_conditional_matches_the_reference(kind, shared, sum_path, transitions, 
     assert_rows_close(got_c, want_c, n)
 
 
+@pytest.mark.parametrize("rows", ["own", "shared"])
 @pytest.mark.parametrize("shared", [False, True])
 @pytest.mark.parametrize("columns", ["whole", "in shares"])
-def test_score_weights_paths(shared, columns, reference, monkeypatch):
+def test_score_weights_paths(shared, columns, rows, reference, monkeypatch):
     """The scoring's class weights under per-sample inputs (an HMM of 160 input nodes per position): a program per
     (column, class tile) over every row, or over shares of 64 rows -- the shares' partials, then their combination,
-    the last share short -- the reference's conditionals either way."""
+    the last share short --, the classes' rows their own or shared by the classes with the same live pairs (every
+    class reads its row in the first launch, a second exponentiates each row once) -- the reference's conditionals
+    every way."""
     from pyjuice.constraints.inference.dfa_exact.kernels import score
     if columns == "in shares":
         monkeypatch.setattr(score, "SCORE_SHARE_ROWS", 1)
+    monkeypatch.setattr(score, "CLASS_ROWS_SHARED", rows == "shared")
     shares, real = [], score._score_weights_kernel
 
     class Recorded:
         def __getitem__(self, grid):
             def launch(*args, **kwargs):
-                shares.append((kwargs["SHARES"], kwargs["FINISH"]))
+                shares.append((kwargs["SHARES"], kwargs["FINISH"], kwargs["SPLIT"]))
                 return real[grid](*args, **kwargs)
             return launch
 
@@ -497,10 +501,14 @@ def test_score_weights_paths(shared, columns, reference, monkeypatch):
     with cc.decoder(categorical_evidence_logp = E, precision = "fp32") as decoder:
         got = decoder.conditional(data, m)
     assert_rows_close(got, reference.conditional(cc, data, m, inputs = dict(categorical_evidence_logp = E)), n)
+    split = rows == "shared"
+    assert shares and all(sp == split for _, _, sp in shares), shares
     if columns == "in shares":                                # several shares, each launched twice (then combined)
-        assert shares and all(s > 1 for s, _ in shares) and {f for _, f in shares} == {False, True}, shares
-    else:
-        assert shares and all(s == 1 and not f for s, f in shares), shares
+        assert all(s > 1 for s, _, _ in shares) and {f for _, f, _ in shares} == {False, True}, shares
+    else:                                                     # one launch a group (shared rows: then their exps)
+        assert all(s == 1 for s, _, _ in shares), shares
+        finish = [f for _, f, _ in shares]
+        assert finish == ([False, True] if split else [False]) * (len(finish) // (2 if split else 1)), shares
 
 
 @pytest.mark.parametrize("kind", ["hmm", "pd", "hand_left"])

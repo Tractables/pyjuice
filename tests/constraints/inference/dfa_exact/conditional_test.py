@@ -227,10 +227,10 @@ def test_auto_storage_keeps_the_smaller_buffers(kind, query, build_pc):
 
 
 def dense_weights(groups):
-    """Every row group's class weights from :func:`class_weights` (its live rows, ``(group, positions, weights,
-    row)``) as ``(group, positions, [positions x B, classes, rows])``: -inf at a dead (column, class)."""
+    """Every row group's class weights from :func:`class_weights` (its rows, ``(group, positions, weights, row,
+    rep)``) as ``(group, positions, [positions x B, classes, rows])``: -inf at a dead (column, class)."""
     out = []
-    for g, pos, w, row in groups:
+    for g, pos, w, row, _ in groups:
         full = torch.full((*row.shape, w.size(1)), -float("inf"), device = w.device)
         live = row >= 0
         full[live] = w[row[live].long()]
@@ -280,18 +280,38 @@ def test_class_weights_match_the_reference(kind, name, pattern, sum_path, build_
     assert checked > 0
 
 
+def live_lists(prog, live, allowed, stored, t, b):
+    """Brute force: the live classes of the column of position ``t`` and sample ``b``, in the boundary's class order,
+    each with its key -- its live pairs (``next_col``: the column it leads ``i`` to, at the last position the sequence
+    end's one column; a pair live at both ends, every pair where ``live`` is None) and whether it is stored -- a class
+    the sample's ``allowed`` rules out having none."""
+    nc, width, order, n = prog.layout.next_col_table(), prog.width, prog.trans.cls_order.cpu(), prog.n
+    out = {}
+    for c in order[t].tolist():
+        pairs = tuple((i, 0 if t + 1 == n else int(nc[t, i, c])) for i in range(int(width[t])) if nc[t, i, c] >= 0)
+        pairs = tuple((i, q) for i, q in pairs if live is None or (live[b, t, i] and live[b, t + 1, q]))
+        if pairs and (allowed is None or allowed[b, t, c]):
+            out[c] = (pairs, bool(stored[c] >= 0))
+    return out
+
+
+@pytest.mark.parametrize("shared", [True, False])
 @pytest.mark.parametrize("classes", ["every", "sample"])
 @pytest.mark.parametrize("one_pair", [False, True])
 @pytest.mark.parametrize("pattern", ["none", "prefix", "mixed"])
 @pytest.mark.parametrize("storage", ["dense", "compact"])
 @pytest.mark.parametrize("kind", ["hmm", "pd", "hand_left", "left_linear", "walks"])
-def test_live_class_rows_match_a_brute_force(kind, storage, pattern, one_pair, classes, build_pc, monkeypatch):
+def test_live_class_rows_match_a_brute_force(kind, storage, pattern, one_pair, classes, shared, build_pc, monkeypatch):
     """A query keeps its class weights in their live rows alone: a target column's (position ``t``, sample ``b``)
-    class ``c`` has a row exactly when a column live at ``t`` for the sample leads by ``c`` to one live at ``t + 1``
+    class ``c`` is live exactly when a column live at ``t`` for the sample leads by ``c`` to one live at ``t + 1``
     (``next_col``; at the last position the sequence end's one column) -- every column live where the query prunes
-    nothing --; a column's live classes on consecutive rows in the boundary's class order, a row group's columns in
-    order. Also reading a class's pairs one at a time (``one_pair``: every list walked over several tiles), and under a
-    session's per-sample classes (``classes``, stood in for the session's): a class the sample rules out has none."""
+    nothing --, its weights a sum over those live pairs. Shared rows (``CLASS_ROWS_SHARED``): the live classes of a
+    column with the same live pairs and kind (stored or enumerated) share one row, their representative the first of
+    them in the boundary's class order, a column's representatives on consecutive rows in that order; unshared, every
+    live class a row of its own in that order. A row group's columns in order. Also reading a class's pairs one at a
+    time (``one_pair``: every list walked over several tiles), and under a session's per-sample classes (``classes``,
+    stood in for the session's): a class the sample rules out has none."""
+    monkeypatch.setattr(S, "CLASS_ROWS_SHARED", shared)
     if one_pair:
         monkeypatch.setattr(S, "LIVE_CLASS_LANES", 1)
     n = {"walks": 6}.get(kind, KINDS.get(kind))
@@ -310,25 +330,79 @@ def test_live_class_rows_match_a_brute_force(kind, storage, pattern, one_pair, c
     prog = cc.backend.program()
     lv = report["liveness"]
     live = None if lv is None else lv.live.cpu() != 0
-    nc, width, order = prog.layout.next_col_table(), prog.width, prog.trans.cls_order.cpu()
-    checked = 0
-    for g, pos, w, row in groups:
+    stored = cc.backend.token_classes.stored_of_class.cpu()
+    checked = merged = 0
+    for g, pos, w, row, rep in groups:
         row, rows = row.cpu(), 0
+        assert (rep is not None) == shared
         for p, t in enumerate(pos.tolist()):
             for b in range(B):
-                want = []
-                for c in order[t].tolist():
-                    succ = [(i, 0 if t + 1 == n else int(nc[t, i, c])) for i in range(int(width[t]))
-                            if nc[t, i, c] >= 0]
-                    if (allowed is None or allowed[b, t, c]) and \
-                            any(live is None or (live[b, t, i] and live[b, t + 1, q]) for i, q in succ):
-                        want.append(c)
+                keys = live_lists(prog, live, allowed, stored, t, b)
+                want = list(keys)
                 m = p * B + b
-                assert [c for c in order[t].tolist() if row[m, c] >= 0] == want, (g, t, b)
-                assert [int(row[m, c]) for c in want] == list(range(rows, rows + len(want))), (g, t, b)
-                rows, checked = rows + len(want), checked + 1
+                assert [c for c in prog.trans.cls_order[t].tolist() if row[m, c] >= 0] == want, (g, t, b)
+                if shared:
+                    first = {}
+                    for c in want:
+                        first.setdefault(keys[c], c)
+                    reps = list(dict.fromkeys(first[keys[c]] for c in want))         # in class order
+                    assert [int(rep[m, c]) for c in want] == [first[keys[c]] for c in want], (g, t, b)
+                    assert [int(row[m, c]) for c in want] == [rows + reps.index(first[keys[c]]) for c in want], (g, t, b)
+                    assert all(int(rep[m, c]) == -1 for c in range(prog.C) if c not in keys), (g, t, b)
+                    rows, merged = rows + len(reps), merged + len(want) - len(reps)
+                else:
+                    assert [int(row[m, c]) for c in want] == list(range(rows, rows + len(want))), (g, t, b)
+                    rows += len(want)
+                checked += 1
         assert w.size(0) == rows
     assert checked > 0 and (lv is not None or pattern == "none")
+    assert merged > 0 or not shared or pattern == "none"    # (a sample past a 2: every class leads to acceptance)
+
+
+@pytest.mark.parametrize("pattern", ["none", "mixed"])
+@pytest.mark.parametrize("storage", ["dense", "compact"])
+@pytest.mark.parametrize("kind", ["hmm", "pd", "hand_left", "left_linear"])
+def test_shared_rows_are_exact_whatever_the_keys(kind, storage, pattern, build_pc, monkeypatch):
+    """Classes share a row only when their live pairs and kinds are the same, whatever their keys: with every key the
+    same (``CLASS_ROW_KEY_MASK`` 0: every live class of a column a candidate for the first) the rows are still checked
+    exactly -- classes sharing a row have the same live pairs, and the first class of the column is shared by every
+    class with its pairs --, and every class's weights are those it gets with rows of its own (unshared) and with the
+    keys in full: the same -inf, the finite ones equal to their rounding (the walks' tiles follow the rows' number)."""
+    n = KINDS[kind]
+    cc = jc.compile(CONSTRAINTS["either"](), build_pc(kind, n, V))
+    data, missing = evidence(pattern, n)
+    positions = missing.any(dim = 0).numpy()
+    B, dev = data.size(0), cc.pc.params.device
+    out = {}
+    for name, shared, mask in (("unshared", False, S.CLASS_ROW_KEY_MASK), ("keys", True, S.CLASS_ROW_KEY_MASK),
+                               ("collide", True, 0)):
+        monkeypatch.setattr(S, "CLASS_ROWS_SHARED", shared)
+        monkeypatch.setattr(S, "CLASS_ROW_KEY_MASK", mask)
+        report = {}
+        with torch.no_grad():
+            groups, _ = class_weights(cc.backend, data, missing.to(dev), positions, storage = storage, report = report)
+        out[name] = (groups, [w for _, _, w in dense_weights(groups)], report["liveness"])
+    for name in ("keys", "collide"):
+        for a, b in zip(out["unshared"][1], out[name][1]):
+            assert torch.equal(torch.isneginf(a), torch.isneginf(b)), name
+            fin = torch.isfinite(a)
+            assert ((a[fin] - b[fin]).abs() <= 1e-5 * a[fin].abs() + n * 1e-6).all(), name
+    prog = cc.backend.program()
+    groups, _, lv = out["collide"]
+    live = None if lv is None else lv.live.cpu() != 0
+    stored = cc.backend.token_classes.stored_of_class.cpu()
+    for g, pos, w, row, rep in groups:
+        row, rep = row.cpu(), rep.cpu()
+        for p, t in enumerate(pos.tolist()):
+            for b in range(B):
+                keys = live_lists(prog, live, None, stored, t, b)
+                m = p * B + b
+                for c in keys:
+                    r = int(rep[m, c])
+                    assert keys[r] == keys[c] and int(row[m, c]) == int(row[m, r]), (g, t, b, c)
+                if keys:
+                    c0 = next(iter(keys))
+                    assert all(int(rep[m, c]) == c0 for c in keys if keys[c] == keys[c0]), (g, t, b)
 
 
 @pytest.mark.parametrize("one_sample", [False, True])
