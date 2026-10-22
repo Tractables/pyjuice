@@ -375,64 +375,125 @@ __global__ void __launch_bounds__(THREADS) fused_sum_kernel(Args a) {
     const bool ranged = EXT && a.sstride != 0 && span <= TT::SL;    // (else a scale per column)
     const int q4 = (span + 3) / 4;                      // ranged: a block's copies of 16 bytes
 
-    auto load = [&](int ch, int st) {                   // chunk ch into stage st
-        float* As = smem + st * TT::ST;
+    // The copies a thread issues every chunk and their invariants -- which blocks are live (a mask), the thread's
+    // place in a weight tile and its first weight of each block (affine: advanced by wstride a chunk; else the share's
+    // table), its e copies (E_COPIES of 16 bytes, THREADS copies apart; a bit each: within the tile and its column one
+    // of the launch's), its t copy (its bytes and columns), its scale copy (a block's, a block's 4 samples', or a
+    // (block, column)'s) -- settled once where the registers allow (DESC), so that a chunk's load adds the chunk's
+    // offsets alone: settled every chunk, with the arguments reloaded and divisions by q4, they ran ~800 instructions
+    // a warp a chunk for 15 copies, 0.75 of a chunk's 1.1 us (Codpula hard_0 B8, tiles of 16: the copies themselves
+    // were never waited on). The three-pass products past 64 columns and the fp32 operands at 128 sit at the register
+    // cap: their descriptors are settled per chunk, as before, rather than spilled.
+    constexpr bool DESC = BF || TN <= (X3 ? 64 : 112);
+    constexpr int E_N = BF ? BS * TN / 8 : BS * TN / 4;              // the tile's e copies (8 bf16 or 4 floats each)
+    constexpr int E_COPIES = (E_N + THREADS - 1) / THREADS;          // a thread's
+    constexpr int S_COPIES = (NBT * TN + THREADS - 1) / THREADS;     // scales by (block, column): a thread's copies
+    const long long ncols = w.ncols;
+    const int wr = tid / (BS / 4), wq = (tid % (BS / 4)) * 4;         // (weights as they are: the thread's row, 4 columns)
+    const int wt_off = BF ? 8 * tid : FA ? 4 * tid : wr * BS + wq;    // the thread's elements in a weight tile
+    const int wd_off = FA ? 4 * tid : wr * TT::A_LD + wq;             // and in a stage's (BF: bf16 units, wt_off)
+    #pragma unroll
+    for (int b = 0; b < NBT; ++b) w0[b] += wt_off;                    // (affine: the thread's first weight of chunk 0)
+    const int s_mode = !EXT ? 0 : a.sstride == 0 ? 1 : ranged ? 2 : 3;   // 1 a block's, 2 a block's samples, 3 by column
+    unsigned vmask = 0, emask = 0, smask = 0;                         // the live blocks, the e copies and the scale
+    long long t_pos = 0;                                              // copies by column that are; t: the thread's 4
+    int t_bytes = 0;                                                  // columns and their bytes
+    int s_b = 0, s_k = 0;                                             // mode 2: the thread's block and first sample
+    bool s_v = false;
+    int s_slot[S_COPIES];                                             // mode 3: each copy's sample
+    auto settle = [&]() {
+        vmask = 0;
+        #pragma unroll
+        for (int b = 0; b < NBT; ++b) vmask |= (w.nbs[b] >= 0 ? 1u : 0u) << b;
+        emask = 0;
+        #pragma unroll
+        for (int m = 0; m < E_COPIES; ++m) {
+            const int i = tid + THREADS * m;
+            const long long col = col0 + 8 * (i / (BF ? 32 : 64)) + (i % 16) / 2;
+            if (i < E_N && col < ncols) emask |= 1u << m;
+        }
+        t_pos = 0;
+        t_bytes = 0;
+        if (tid < TN / 4) {
+            t_pos = col0 + 4 * tid;
+            t_bytes = (int)max(0LL, min(16LL, 4 * (ncols - t_pos)));
+            if (t_bytes == 0) t_pos = 0;
+        }
+        s_b = s_k = 0;
+        s_v = false;
+        if (s_mode == 2 && tid < NBT * q4) {
+            s_b = tid / q4;
+            s_k = 4 * (tid % q4);
+            s_v = (vmask >> s_b) & 1;
+        } else if (s_mode == 1 && tid < NBT) {
+            s_v = (vmask >> tid) & 1;
+        }
+        smask = 0;
+        #pragma unroll
+        for (int m = 0; m < S_COPIES; ++m) {
+            const int i = tid + THREADS * m, b = i / TN, c = i % TN;
+            s_slot[m] = s_mode == 3 && i < NBT * TN ? Ss[c] : 0;
+            if (s_mode == 3 && i < NBT * TN && ((vmask >> b) & 1) && col0 + c < ncols) smask |= 1u << m;
+        }
+    };
+    if (DESC) settle();
+
+    auto load = [&](int ch, int st) {                   // chunk ch into stage st: the thread's copies at its offsets
+        if (!DESC) settle();                            // (at the register cap: settled every chunk)
+        float* As = smem + (st ? TT::ST : 0);
         float* Bs = As + TT::A_ST;
         float* tS = Bs + TT::B_ST;
         float* sS = tS + TN;
+        const int k = ch - ch0;
+        const long long wch = (long long)ch * a.wstride;
         #pragma unroll
         for (int b = 0; b < NBT; ++b) {                 // the weights' 32 rows, 16 B at a time: 4 copies a thread
-            const int r = tid / (BS / 4), q4 = (tid % (BS / 4)) * 4;
-            const bool v = w.nbs[b] >= 0;
-            const long long first = !v ? 0 : a.affine ? w0[b] + (long long)ch * a.wstride : Wb[b * a.share + ch - ch0];
+            const long long first = a.affine ? w0[b] + wch : Wb[b * a.share + k] + wt_off;
+            const int bytes = (vmask >> b) & 1 ? 16 : 0;
             if (BF) {                                   // (the bf16 copy: the tile's 1024 in a row, 2 KB)
                 if (tid < 128)
-                    cp_async16(reinterpret_cast<__nv_bfloat16*>(As + b * BS * TT::A_LD) + 8 * tid,
-                               reinterpret_cast<const __nv_bfloat16*>(a.wfrag) + first + 8 * tid, v ? 16 : 0);
+                    cp_async16(reinterpret_cast<__nv_bfloat16*>(As + b * BS * TT::A_LD) + wt_off,
+                               reinterpret_cast<const __nv_bfloat16*>(a.wfrag) + first, bytes);
             } else if (FA)                              // (the copy: the tile's 1024 floats in a row)
-                cp_async16(As + b * BS * TT::A_LD + 4 * tid, a.wfrag + first + 4 * tid, v ? 16 : 0);
+                cp_async16(As + b * BS * TT::A_LD + wd_off, a.wfrag + first, bytes);
             else
-                cp_async16(As + (b * BS + r) * TT::A_LD + q4, a.weights + first + r * BS + q4, v ? 16 : 0);
+                cp_async16(As + b * BS * TT::A_LD + wd_off, a.weights + first, bytes);
         }
-        if (BF) {                                       // e in bf16: the tile's groups in a row, 8 a copy
-            const __nv_bfloat16* eb = reinterpret_cast<const __nv_bfloat16*>(a.pre) +
-                                      (long long)ch * BS * a.pre_ld + col0 * BS;
-            for (int i = tid; i < BS * TN / 8; i += THREADS) {
-                const long long col = col0 + 8 * (i / 32) + (i % 16) / 2;
-                cp_async16(reinterpret_cast<__nv_bfloat16*>(Bs) + 8 * i, col < w.ncols ? eb + 8 * i : eb,
-                           col < w.ncols ? 16 : 0);
-            }
-        } else {
-            const float* ech = a.pre + (long long)ch * BS * a.pre_ld + col0 * BS;   // e: the tile's groups in a
-            for (int i = tid; i < BS * TN / 4; i += THREADS) {          // row; a copy holds one column's, zeros past
-                const long long col = col0 + 8 * (i / 64) + (i % 16) / 2;
-                cp_async16(Bs + 4 * i, col < w.ncols ? ech + 4 * i : a.pre, col < w.ncols ? 16 : 0);
+        const long long ebase = (long long)ch * BS * a.pre_ld + col0 * BS;   // e: the tile's groups in a row; a
+        #pragma unroll                                                       // copy one column's 8 bf16 or 4 floats
+        for (int m = 0; m < E_COPIES; ++m) {
+            const int i = tid + THREADS * m;
+            if (i < E_N) {
+                const bool v = (emask >> m) & 1;
+                if (BF)
+                    cp_async16(reinterpret_cast<__nv_bfloat16*>(Bs) + 8 * i,
+                               reinterpret_cast<const __nv_bfloat16*>(a.pre) + ebase + (v ? 8 * i : 0), v ? 16 : 0);
+                else
+                    cp_async16(Bs + 4 * i, a.pre + ebase + (v ? 4 * i : 0), v ? 16 : 0);
             }
         }
-        for (int i = tid; i < TN / 4; i += THREADS) {                   // t
-            const long long pos = col0 + 4 * i;
-            const int bytes = (int)max(0LL, min(16LL, 4 * (w.ncols - pos)));
-            cp_async16(tS + 4 * i, a.pre + a.pre_cm + (long long)ch * a.pre_ld + (bytes ? pos : 0), bytes);
+        if (tid < TN / 4)                                             // t
+            cp_async16(tS + 4 * tid, a.pre + a.pre_cm + (long long)ch * a.pre_ld + t_pos, t_bytes);
+        if (EXT) {                                                    // s
+            if (s_mode == 1) {                                        // every sample's: a block's
+                if (tid < NBT) cp_async4(sS + tid * TT::SL, a.scales + (s_v ? Cl[tid * a.share + k] : 0), s_v);
+            } else if (s_mode == 2) {                                 // a block's samples, 4 a copy
+                if (tid < NBT * q4) {
+                    const long long at = s_v ? (long long)Cl[s_b * a.share + k] * a.sstride + lo4 + s_k : 0;
+                    cp_async16(sS + s_b * TT::SL + s_k, a.scales + at, s_v ? 16 : 0);
+                }
+            } else {                                                  // a (block, column)'s
+                #pragma unroll
+                for (int m = 0; m < S_COPIES; ++m) {
+                    const int i = tid + THREADS * m, b = i / TN, c = i % TN;
+                    if (i < NBT * TN) {
+                        const bool v = (smask >> m) & 1;
+                        const long long at = v ? (long long)Cl[b * a.share + k] * a.sstride + s_slot[m] : 0;
+                        cp_async4(sS + b * TT::SL + c, a.scales + at, v);
+                    }
+                }
+            }
         }
-        if (EXT && a.sstride == 0)                                      // every sample's: s per block
-            for (int b = tid; b < NBT; b += THREADS) {
-                const bool v = w.nbs[b] >= 0;
-                cp_async4(sS + b * TT::SL, a.scales + (v ? Cl[b * a.share + ch - ch0] : 0), v);
-            }
-        else if (ranged)                                                // s per (block, sample), 4 samples a copy
-            for (int i = tid; i < NBT * q4; i += THREADS) {
-                const int b = i / q4, k = 4 * (i % q4);
-                const bool v = w.nbs[b] >= 0;
-                const long long at = v ? (long long)Cl[b * a.share + ch - ch0] * a.sstride + lo4 + k : 0;
-                cp_async16(sS + b * TT::SL + k, a.scales + at, v ? 16 : 0);
-            }
-        else if (EXT)                                                   // s per (block, column)
-            for (int i = tid; i < NBT * TN; i += THREADS) {
-                const int b = i / TN, c = i % TN;
-                const bool v = w.nbs[b] >= 0 && col0 + c < w.ncols;
-                const long long at = v ? (long long)Cl[b * a.share + ch - ch0] * a.sstride + Ss[c] : 0;
-                cp_async4(sS + b * TT::SL + c, a.scales + at, v);
-            }
     };
     load(ch0, 0);                                       // (under pass 1)
     cp_commit();
@@ -497,6 +558,10 @@ __global__ void __launch_bounds__(THREADS) fused_sum_kernel(Args a) {
         const int c = wc + 2 * lane + h;
         slot[h] = !EXT || !fl || a.sstride == 0 ? 0 : ranged ? min(max(Ss[c] - lo4, 0), TT::SL - 1) : c;
     }
+    __syncthreads();                                    // (pass 1's shifts in: a factor lane's two, read once)
+    float Tl[2];
+    #pragma unroll
+    for (int h = 0; h < 2; ++h) Tl[h] = DESC && fl ? Ts[wb * TN + wc + 2 * lane + h] : -CUDART_INF_F;
 
     // A chunk: its copies waited for, the next chunk's issued under its products, its sums into P and the lane's two
     // factors into G (shuffled to the fold)
@@ -515,7 +580,7 @@ __global__ void __launch_bounds__(THREADS) fused_sum_kernel(Args a) {
             const int c = wc + 2 * lane + h;
             G[h] = 0.f;
             if (fl) {
-                const float T = Ts[wb * TN + c];
+                const float T = DESC ? Tl[h] : Ts[wb * TN + c];
                 const float t = !EXT ? tS[c] : tS[c] + sS[slot[h]];
                 G[h] = T != -CUDART_INF_F && t != -CUDART_INF_F ? __expf(t - T) : 0.f;
             }
