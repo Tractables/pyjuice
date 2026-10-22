@@ -97,7 +97,7 @@ class _InspectionMixin:
                 propagation_alg = self._run_params["propagation_alg"], 
                 logspace_flows = self._run_params["logspace_flows"], 
                 negate_pflows = self._run_params["negate_pflows"],
-                force_use_fp32 = self._run_params["force_use_fp32"], **kwargs
+                precision = self._run_params["precision"], **kwargs
             )
 
             return self.element_flows[nsid:neid,:].detach()

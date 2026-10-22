@@ -115,7 +115,8 @@ def test_hmm_backward_small_batch():
     smaller layers). The flows computed at `batch_size in {1, 2, 3}` (sparse path) must match
     the block-sparse path used at `batch_size >= 4`, and be invariant to the batch tiling.
 
-    `force_use_fp32 = True` removes bf16 rounding so the cross-path comparison can be tight.
+    `precision = "fp32"` removes bf16 rounding (and computes the flows without tensor cores) so the
+    cross-path comparison can be tight.
     """
 
     device = torch.device("cuda:0")
@@ -132,7 +133,7 @@ def test_hmm_backward_small_batch():
         input_dist = juice.distributions.Categorical(num_cats = num_cats)
     )
     ns.init_parameters(perturbation = 2.0)
-    pc = juice.compile(ns)
+    pc = juice.compile(ns, precision = "fp32")
     pc.to(device)
 
     # A fixed pool of distinct samples; `n_pool` is divisible by every tested batch size.
@@ -144,9 +145,8 @@ def test_hmm_backward_small_batch():
         # `flows_memory = 0.0` zeros the accumulator on the first chunk, `1.0` accumulates after.
         for i, s in enumerate(range(0, n_pool, batch_size)):
             x = data[s:s + batch_size].contiguous()
-            pc(x, force_use_fp32 = True)
-            pc.backward(x, flows_memory = 0.0 if i == 0 else 1.0,
-                        allow_modify_flows = False, force_use_fp32 = True)
+            pc(x)
+            pc.backward(x, flows_memory = 0.0 if i == 0 else 1.0, allow_modify_flows = False)
         torch.cuda.synchronize()
         return pc.param_flows.clone()
 
@@ -179,9 +179,10 @@ def test_sum_layer_backward_mode_and_fp32():
     1. The `mode=` override (forcing the sparse / block-sparse / pytorch backend) referenced a bare
        `STR2MODE` instead of `self.STR2MODE` -> NameError. `pc.forward` / `pc.backward` thread `mode=`
        down to `SumLayer._forward` / `_backward`, so forcing a backend must not raise.
-    2. `force_use_fp32 = True` was silently dropped on the block-sparse *parameter*-flow backward
-       (swallowed by `**kwargs`), while the element-flow backward honored it. It must now be accepted
-       on the parameter-flow path and still produce correct (finite) parameter flows.
+    2. The exact-fp32 backward (once `force_use_fp32 = True`, now `precision = "fp32"`) was silently
+       dropped on the block-sparse *parameter*-flow backward (swallowed by `**kwargs`), while the
+       element-flow backward honored it. It must reach the parameter-flow path and still produce
+       correct (finite) parameter flows.
     """
 
     device = torch.device("cuda:0")
@@ -197,8 +198,9 @@ def test_sum_layer_backward_mode_and_fp32():
 
     data = torch.randint(0, 6, [16, 4], device = device)
 
-    def param_flows(**kw):
-        fwd_kw = {k: v for k, v in kw.items() if k in ("mode", "force_use_fp32")}
+    def param_flows(precision = "auto", **kw):
+        pc.precision = precision
+        fwd_kw = {k: v for k, v in kw.items() if k in ("mode",)}
         pc(data, **fwd_kw)
         pc.backward(data, flows_memory = 0.0, allow_modify_flows = False, **kw)
         torch.cuda.synchronize()
@@ -213,8 +215,8 @@ def test_sum_layer_backward_mode_and_fp32():
     assert torch.isfinite(got).all()
     assert (got - ref).abs().max() / (ref.abs().max() + 1e-12) < 2e-2
 
-    # (2) `force_use_fp32` must be accepted on the parameter-flow path and stay correct.
-    got = param_flows(force_use_fp32 = True)
+    # (2) The exact-fp32 backward must reach the parameter-flow path and stay correct.
+    got = param_flows(precision = "fp32")
     assert torch.isfinite(got).all()
     assert (got - ref).abs().max() / (ref.abs().max() + 1e-12) < 2e-2
 

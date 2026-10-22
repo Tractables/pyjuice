@@ -165,8 +165,7 @@ def eval_partition_grad(pc, negate_pflows: bool = True, input_layer_norm_params:
         if layer_group.is_prod():
             layer_group(pc.node_mars, pc.element_mars)
         elif layer_group.is_sum():
-            layer_group(pc.node_mars, pc.element_mars, pc.params,
-                        force_use_fp32 = False, propagation_alg = "LL")
+            layer_group(pc.node_mars, pc.element_mars, pc.params, propagation_alg = "LL", precision = pc.precision)
         else:
             raise ValueError(f"Unknown layer type {type(layer_group)}.")
 
