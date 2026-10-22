@@ -439,10 +439,10 @@ __global__ void __launch_bounds__(THREADS) fused_sum_kernel(Args a) {
 
     {   // pass 1: T = max over the share's chunks of t + s -- a thread's one or two (block, column)s together, which of
         // them are live tested once, outside the loops (a loop without a test: its loads in flight together)
-        static_assert(NBT * TN >= THREADS && NBT * TN <= 2 * THREADS, "a thread's one or two (block, column)s");
+        static_assert(NBT * TN <= 2 * THREADS, "a thread's one or two (block, column)s");   // (narrow tiles: idle threads)
         const int i1 = tid + THREADS;
-        const int b0 = tid / TN, c0 = tid % TN, b1 = i1 / TN, c1 = i1 % TN;
-        const bool v0 = w.nbs[b0] >= 0 && col0 + c0 < w.num_live;
+        const int b0 = min(tid / TN, NBT - 1), c0 = tid % TN, b1 = i1 / TN, c1 = i1 % TN;
+        const bool v0 = tid < NBT * TN && w.nbs[b0] >= 0 && col0 + c0 < w.num_live;
         const bool v1 = i1 < NBT * TN && w.nbs[min(b1, NBT - 1)] >= 0 && col0 + c1 < w.num_live;
         const float* tp0 = a.pre + a.pre_cm + col0 + c0;
         const float* tp1 = a.pre + a.pre_cm + col0 + c1;
@@ -478,7 +478,7 @@ __global__ void __launch_bounds__(THREADS) fused_sum_kernel(Args a) {
                 T1 = fmaxf(T1, t1);
             }
         }
-        Ts[tid] = T0;
+        if (tid < NBT * TN) Ts[tid] = T0;
         if (i1 < NBT * TN) Ts[i1] = T1;
     }
 
@@ -754,13 +754,15 @@ static void launch(const Args& a, dim3 grid, unsigned pre_tiles, cudaStream_t st
 template <bool EXT, bool X3, bool FA, bool BF, bool TD>
 static void launch_tn(const Args& a, int tn, dim3 grid, unsigned pre_tiles, cudaStream_t stream) {
     switch (tn) {
+        case 16: return launch<EXT, X3, FA, BF, 16, TD>(a, grid, pre_tiles, stream);
+        case 32: return launch<EXT, X3, FA, BF, 32, TD>(a, grid, pre_tiles, stream);
         case 64: return launch<EXT, X3, FA, BF, 64, TD>(a, grid, pre_tiles, stream);
         case 80: return launch<EXT, X3, FA, BF, 80, TD>(a, grid, pre_tiles, stream);
         case 96: return launch<EXT, X3, FA, BF, 96, TD>(a, grid, pre_tiles, stream);
         case 112: return launch<EXT, X3, FA, BF, 112, TD>(a, grid, pre_tiles, stream);
         case 128: return launch<EXT, X3, FA, BF, 128, TD>(a, grid, pre_tiles, stream);
     }
-    TORCH_CHECK(false, "tiles of 64, 80, 96, 112 or 128 columns");
+    TORCH_CHECK(false, "tiles of 16, 32, 64, 80, 96, 112 or 128 columns");
 }
 
 
@@ -935,13 +937,14 @@ int64_t ctas_per_sm(bool td, bool ext, bool x3, bool fa, bool bf, int64_t tn, in
 #define K_OF(T, E, X, F, B, N) \
     if (td == T && ext == E && x3 == X && fa == F && bf == B && tn == N) k = allowed<E, X, F, B, N, T>();
 #define K_TN(T, E, X, F, B) \
+    K_OF(T, E, X, F, B, 16) K_OF(T, E, X, F, B, 32) \
     K_OF(T, E, X, F, B, 64) K_OF(T, E, X, F, B, 80) K_OF(T, E, X, F, B, 96) K_OF(T, E, X, F, B, 112) \
     K_OF(T, E, X, F, B, 128)
 #define K_TD(T) K_TN(T, false, false, false, false) K_TN(T, false, true, false, false) \
     K_TN(T, true, false, false, false) K_TN(T, true, true, false, false) K_TN(T, false, false, true, false) \
     K_TN(T, true, false, true, false) K_TN(T, false, false, false, true) K_TN(T, true, false, false, true)
     K_TD(false) K_TD(true)
-    TORCH_CHECK(k != nullptr, "tiles of 64, 80, 96, 112 or 128 columns (fragment-ordered weights: TF32 or bf16)");
+    TORCH_CHECK(k != nullptr, "tiles of 16, 32, 64, 80, 96, 112 or 128 columns (fragment-ordered weights: TF32 or bf16)");
     int n = 0;
     C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&n, k, THREADS, bytes));
     return n;

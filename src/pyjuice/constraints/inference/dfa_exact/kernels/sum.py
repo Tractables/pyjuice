@@ -561,8 +561,12 @@ def shared_children(cids: torch.Tensor, nb_reg: torch.Tensor) -> bool:
 #: many tiles of 4 node blocks x its columns (:data:`_CUDA_TNS`).
 CUDA_MIN_TILES = 0
 
-#: The CUDA kernel's tiles of columns: a launch's narrowest that covers its columns in as few tiles as 128 would.
-_CUDA_TNS = (64, 80, 96, 112, 128)
+#: The CUDA kernel's tiles of columns: a launch's narrowest that covers its columns in as few tiles as 128 would. The
+#: narrow ones serve a session's pruned launches (Codpula hard_0 B8: 8 live columns a launch, one a sample). A tile of
+#: 16 takes 47 KB of shared memory and 64 registers a thread, so two CTAs share an SM and the split (:func:`_cuda_split`)
+#: puts a tile's chunks in twice the shares: the chunk loop is bound by its instructions' issue, not by its copies, and
+#: an SM running one CTA's chain is half idle (a launch of 33 MB of weights 37.7 -> 20.7 us).
+_CUDA_TNS = (16, 32, 64, 80, 96, 112, 128)
 
 #: Bytes of the shares' sums the merge reads in a chunk's time (L2 at ~4.7 TB/s, a chunk's products ~1.6 us): the
 #: merge's cost in :func:`_cuda_split`.
