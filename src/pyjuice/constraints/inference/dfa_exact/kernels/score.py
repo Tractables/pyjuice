@@ -698,7 +698,9 @@ def _score_weights_kernel(w, row, class_mars, rows, nodes, positions, mrow, mstr
     node ``u`` reads row ``mrow[u] + b mstride[u]`` (``STRIDE``; else ``mrow[u]``) of the masses; without per-column
     masses every column reads ``rows``. One share (``SHARES`` 1): all of it. Several: the shares' maxima, running
     maxima and sums into ``part`` ([N, class tiles, SHARES, 3, TC]), then (``FINISH``, a second launch) every share
-    combines them in order and writes its rows."""
+    combines them in order and writes its rows. A program none of whose classes is live for its column (most of them:
+    a column has a few live stored classes, an observed one none) skips its walks over the rows -- every load of
+    them would be masked off -- and writes what they would have left: -inf shifts and parts."""
     n = tl.program_id(0).to(tl.int64)
     ct = tl.program_id(1)
     sh_ = tl.program_id(2)
@@ -707,11 +709,12 @@ def _score_weights_kernel(w, row, class_mars, rows, nodes, positions, mrow, mstr
     cs = tl.load(class_of_stored + xs, mask = cm, other = 0).to(tl.int64)
     rr = tl.load(row + n * C + cs, mask = cm, other = -1)                    # the classes' rows (-1: dead, -inf)
     lv = cm & (rr >= 0)
+    any_live = tl.max(lv.to(tl.int32), axis = 0) > 0
     base = w + tl.maximum(rr, 0).to(tl.int64) * K
     t = tl.load(positions + n // B)
     b = n % B
     k_lo = sh_ * KS
-    k_hi = tl.minimum(K, k_lo + KS)
+    k_hi = tl.where(any_live, tl.minimum(K, k_lo + KS), k_lo)               # (no live class: no rows to walk)
     if not FINISH:
         big = tl.full([TC], float("-inf"), dtype = tl.float32)
         mz = tl.full([TC], float("-inf"), dtype = tl.float32)
@@ -873,8 +876,9 @@ def _score_tokens_kernel(table, w, row, enum_tokens, token_class, code, tok_ptr,
     else:
         lw = tl.where(live, 0.0, float("-inf"))
     ok = lw > float("-inf")
+    KD = tl.where(tl.max(ok.to(tl.int32), axis = 0) > 0, K, 0)              # (no lane on: no dot, every lane -inf)
     acc, m = _log_dot(table + tk[:, None] * K, w + tl.maximum(rw, 0).to(tl.int64)[:, None] * K, nodes + t * K, mrow,
-                      mstride, lognorm, b, ok, ok, K, BH, EVEN_K, True, PER_COLUMN, STRIDE)
+                      mstride, lognorm, b, ok, ok, KD, BH, EVEN_K, True, PER_COLUMN, STRIDE)
     u = tl.where(ok, tl.log(acc) + m + lw, float("-inf"))
     top = tl.max(u, axis = 0)
     s = tl.where(top == float("-inf"), 0.0, top)
@@ -947,7 +951,8 @@ def _score_kernel(table, w, row, shift, logz, toks, tile_cls, out_row, out, logw
     nl = nm & (rw >= 0)                                                       # (-1: dead, weights -inf)
     wrow = w + tl.maximum(rw, 0).to(tl.int64)[:, None] * K
     acc = tl.zeros([BB, BV], dtype = tl.float32)
-    for k0 in range(0, K, BH):
+    KD = tl.where(tl.max(nl.to(tl.int32), axis = 0) > 0, K, 0)             # (the class dead for every column: no dot)
+    for k0 in range(0, KD, BH):
         ks = k0 + tl.arange(0, BH)
         if EVEN_K:
             bt = tl.load(trow + ks[:, None], mask = ok[None, :], other = 0.0)                           # [BH, BV]
@@ -1012,8 +1017,9 @@ def _score_candidates_kernel(table, w, row, shift, token_class, code, positions,
         enum = on & (tl.load(code + t * C + c, mask = on, other = 0) < 0)
     else:
         enum = on & (c < 0)
+    KD = tl.where(tl.max(on.to(tl.int32), axis = 0) > 0, K, 0)              # (no lane on: no dot, every lane -inf)
     acc, m = _log_dot(table + tks[:, None] * K, w + tl.maximum(rw, 0).to(tl.int64)[:, None] * K, nodes + t * K, mrow,
-                      mstride, lognorm, b, on, enum, K, BH, EVEN_K, ENUM, PER_COLUMN, STRIDE)
+                      mstride, lognorm, b, on, enum, KD, BH, EVEN_K, ENUM, PER_COLUMN, STRIDE)
     sc = tl.where(enum, m, tl.load(shift + n * C + c, mask = on & ~enum, other = float("-inf")))
     val = tl.where(on, tl.log(acc) + sc, float("-inf"))
     if WEIGHTS == 1:
