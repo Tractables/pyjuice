@@ -11,6 +11,8 @@ _TRITON_META_PARAMS = frozenset({
     "launch_cooperative_grid", "launch_pdl", "grid", "warmup", "debug", "instrumentation_mode",
 })
 
+_UNSEEN = object()                      # (a call pattern no launch has had yet)
+
 
 class FastJITFunction3x:
     """Low-overhead Triton relaunch for triton >= 3.0.
@@ -28,6 +30,17 @@ class FastJITFunction3x:
     and force a fresh compile via the standard path). Anything unexpected (callable grid, unknown
     kwarg, a missing required arg, any exception) falls back to the standard ``triton.jit`` launch, so
     the result is always correct -- at worst it is merely the un-accelerated path.
+
+    A launch binds its arguments with a function generated for its call pattern -- how many arguments
+    it passes by position, and the names it passes by keyword, in order (``_binder``) --, which builds
+    the same signature as the generic binding (``_gather`` + ``_signature``) without a loop over the
+    parameters. It hands ``CompiledKernel.run`` each tensor on the current CUDA device as its address
+    (the int its signature read), which Triton's launcher takes as it is; for a tensor, it would call
+    ``data_ptr`` and ask the driver for the pointer's device address in the current context
+    (``cuPointerGetAttribute``) -- for memory of the current device, that address itself -- for every
+    tensor argument of every launch. Any other tensor (a CPU tensor, PyTorch's pinned memory among them;
+    a tensor on another GPU, which the driver refuses when that GPU's memory is not mapped here) is passed
+    as it is, and Triton's launcher handles it as before.
     """
 
     def __init__(self, fn: Callable):
@@ -38,6 +51,7 @@ class FastJITFunction3x:
         self.defaults = tuple(p.default for p in self.params)   # inspect._empty when required
         self.name_to_idx = {p.name: i for i, p in enumerate(self.params)}
         self.cache = dict()
+        self.binders = dict()                                    # call pattern -> its binder (None: generic)
         # Imported here (not at module load) so plain `import pyjuice` never depends on these triton
         # internals on triton versions where this fast path is unused.
         from triton.runtime import driver as _driver
@@ -71,6 +85,66 @@ class FastJITFunction3x:
         return (device, *[(v.dtype, v.data_ptr() & 15) if not c and isinstance(v, Tensor) else v
                           for v, c in zip(vals, self.is_constexpr)], meta_items)
 
+    def _binder(self, npos: int, knames: tuple):
+        # The binding of the calls passing the first `npos` parameters by position and `knames` by keyword,
+        # in this order, as a function `(device, args, kwargs) -> (values to run with, signature)`: the
+        # positional arguments and the keyword values unpacked into locals named as the parameters, the
+        # missing ones their defaults, then the signature `_signature` would build (constexprs and non-tensor
+        # values by value, a tensor's (dtype, data_ptr() & 15), the meta-parameters given, sorted), and the
+        # values in declared order -- a tensor on the current device as the int its signature read. None
+        # (the call bound by `_gather`, as before) when the generic binding would not be a plain one: a name
+        # it does not know (`_gather` raises, the launch falls back), one given twice (`_gather` keeps the
+        # keyword's), a required parameter not given, or a parameter name the generated code reserves
+        # (`_fj_...`).
+        names = [p.name for p in self.params]
+        if npos > len(names) or any(name.startswith("_fj_") for name in names):
+            return None
+        given, meta = set(names[:npos]), []
+        local = []                                              # every keyword value's local
+        for k in knames:
+            if k in _TRITON_META_PARAMS:
+                meta.append(k)
+                local.append(f"_fj_m{len(meta) - 1}")
+            elif k in self.name_to_idx and k not in given:
+                given.add(k)
+                local.append(k)
+            else:
+                return None
+        lines = ["def _fj_bind(_fj_dev, _fj_args, _fj_kwargs):"]
+        if npos:
+            lines.append(f"    {', '.join(names[:npos])}, = _fj_args")
+        if knames:
+            lines.append(f"    {', '.join(local)}, = _fj_kwargs.values()")
+        defaults = {}
+        for i, name in enumerate(names):
+            if name not in given:
+                if self.defaults[i] is inspect.Parameter.empty:
+                    return None
+                defaults[f"_fj_d{i}"] = self.defaults[i]
+                lines.append(f"    {name} = _fj_d{i}")
+        sig = []
+        for i, (name, c) in enumerate(zip(names, self.is_constexpr)):
+            if c:
+                sig.append(name)
+                continue
+            lines += [f"    if _fj_isinstance({name}, _fj_Tensor):",
+                      f"        _fj_p = {name}.data_ptr()",
+                      f"        _fj_s{i} = ({name}.dtype, _fj_p & 15)",
+                      f"        if {name}.get_device() == _fj_dev:",
+                      f"            {name} = _fj_p",
+                      f"    else:",
+                      f"        _fj_s{i} = {name}"]
+            sig.append(f"_fj_s{i}")
+        order = sorted(range(len(meta)), key = lambda j: meta[j])
+        meta_items = "".join(f"({meta[j]!r}, _fj_m{j}), " for j in order)
+        lines.append(f"    return ({', '.join(names)},), (_fj_dev, {', '.join(sig)}, ({meta_items}))")
+        namespace = dict(_fj_isinstance = isinstance, _fj_Tensor = torch.Tensor, **defaults)
+        try:
+            exec("\n".join(lines), namespace)
+        except Exception:                                       # (e.g. no parameter at all: the generic binding)
+            return None
+        return namespace["_fj_bind"]
+
     def __getitem__(self, grid: Union[Tuple, Callable]):
         jit_fn = self.jit_fn
 
@@ -79,10 +153,17 @@ class FastJITFunction3x:
                 if type(grid) is not tuple:          # callable grids: not fast-pathed
                     return jit_fn[grid](*args, **kwargs)
 
-                vals, meta_items = self._gather(args, kwargs)
                 driver = self._driver.active
                 device = driver.get_current_device()
-                sig = self._signature(vals, device, meta_items)
+                key = (len(args), *kwargs)
+                bind = self.binders.get(key, _UNSEEN)
+                if bind is _UNSEEN:
+                    bind = self.binders[key] = self._binder(len(args), key[1:])
+                if bind is not None:
+                    vals, sig = bind(device, args, kwargs)
+                else:
+                    vals, meta_items = self._gather(args, kwargs)
+                    sig = self._signature(vals, device, meta_items)
 
                 kernel = self.cache.get(sig)
                 if kernel is None:

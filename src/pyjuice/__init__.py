@@ -8,6 +8,7 @@ import pyjuice.transformations
 import pyjuice.queries
 import pyjuice.io
 import pyjuice.visualize
+import pyjuice.constraints
 
 # TensorCircuit
 from pyjuice.model import compile, TensorCircuit

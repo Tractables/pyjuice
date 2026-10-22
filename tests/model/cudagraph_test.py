@@ -143,7 +143,7 @@ def test_one_large_batch_does_not_keep_its_buffers():
     process (3.1 GB against 1.0 GB per-shape allocation, measured on a 1024-latent HMM). A storage more
     than `_BUFFER_SHRINK_RATIO` times the need is now reallocated -- unless graphs are recorded, whose
     replays need the addresses to stay."""
-    from pyjuice.model.tensorcircuit import _BUFFER_SHRINK_RATIO
+    from pyjuice.model.cuda_graphs import _BUFFER_SHRINK_RATIO
     device = torch.device("cuda:0")
     pc = _hmm(device)
     small, large = torch.randint(0, 10, [4, 8], device = device), torch.randint(0, 10, [200, 8], device = device)

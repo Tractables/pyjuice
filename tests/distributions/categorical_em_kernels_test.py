@@ -58,6 +58,70 @@ def test_categorical_em():
     assert torch.all(torch.abs(new_params - updated_params) < 1e-4)
 
 
+@pytest.mark.parametrize("keep_zero_params", [False, True])
+@pytest.mark.parametrize("num_cats", [200, 300])       # the kernel for at most 256 categories, and the one past it
+def test_categorical_em_update(num_cats, keep_zero_params):
+    """One mini-batch EM step of Categorical input nodes, some of whose parameters are exactly zero, against its
+    definition: ``(1 - s) p + s (f + c / V) / Z`` for flows ``f``, step size ``s`` and pseudocount ``c``, with ``Z``
+    the node's flows plus ``c``. Under ``keep_zero_params`` a zero parameter stays zero and ``Z`` sums the flows and
+    pseudocounts of the others alone; every node's parameters sum to 1 either way."""
+
+    torch.manual_seed(0)
+    nodes = 16
+
+    ns = [inputs(v, num_node_blocks = 1, block_size = nodes, dist = dists.Categorical(num_cats = num_cats))
+          for v in range(4)]
+    n1 = summate(multiply(ns[0], ns[1]), num_node_blocks = 1, block_size = nodes)
+    n2 = summate(multiply(ns[2], ns[3]), num_node_blocks = 1, block_size = nodes)
+    n = summate(multiply(n1, n2), num_node_blocks = 1, block_size = 1)
+
+    pc = TensorCircuit(n)
+
+    device = torch.device("cuda:0")
+    pc.to(device)
+
+    # Every node zeroes a few categories of its own (no category is zero under every node of a variable, so every
+    # sample has a finite likelihood), renormalized
+    layer = pc.input_layer_group[0]
+    params = layer.params.view(-1, num_cats)
+    zero = torch.zeros_like(params, dtype = torch.bool)
+    for i in range(params.size(0)):
+        zero[i, (torch.arange(3, device = device) * 37 + i) % num_cats] = True
+    with torch.no_grad():
+        params[zero] = 0.0
+        params /= params.sum(dim = 1, keepdim = True)
+
+    data = torch.randint(0, num_cats, [64, 4]).to(device)
+
+    lls = pc(data)
+    assert torch.isfinite(lls).all()
+
+    pc.backward(data)
+
+    ## EM tests ##
+
+    step_size = 0.5
+    pseudocount = 0.1
+
+    p = params.clone().double()
+    f = layer.param_flows.view(-1, num_cats).clone().double()
+    if keep_zero_params:
+        g = torch.where(zero, 0.0, f + pseudocount / num_cats)
+        new_params = torch.where(zero, 0.0, (1.0 - step_size) * p + step_size * g / g.sum(dim = 1, keepdim = True))
+    else:
+        new_params = (1.0 - step_size) * p + step_size * (f + pseudocount / num_cats) / \
+            (f.sum(dim = 1, keepdim = True) + pseudocount)
+
+    pc.mini_batch_em(step_size = step_size, pseudocount = pseudocount, keep_zero_params = keep_zero_params)
+
+    updated_params = layer.params.view(-1, num_cats).double()
+
+    assert torch.allclose(updated_params.sum(dim = 1), torch.ones_like(updated_params[:, 0]), atol = 1e-5)
+    if keep_zero_params:
+        assert torch.all(updated_params[zero] == 0.0)
+    assert torch.allclose(updated_params, new_params, rtol = 1e-4, atol = 1e-6)
+
+
 def test_categorical_em_speed():
 
     num_cats = 50257

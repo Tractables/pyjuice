@@ -100,6 +100,7 @@ def train(pc, num_epochs, train_loader, valid_loader, device, propagation_alg, *
     return best_valid_ll
 
 
+@pytest.mark.slow
 def test_hmm_em():
     
     device = torch.device("cuda:0")

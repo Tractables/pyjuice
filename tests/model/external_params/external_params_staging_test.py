@@ -574,7 +574,7 @@ def test_every_staging_transpose_tier_agrees():
     reach whichever backend the machine happens to have.
 
     All three compute the same pure permutation, so they must agree BIT FOR BIT."""
-    from pyjuice.model import tensorcircuit as tc
+    from pyjuice.model import external_params as staging
     from pyjuice.nodes.external_params.kernels.c import get_module
     from pyjuice.nodes.external_params.kernels.staging import staging_transpose_triton
 
@@ -590,20 +590,20 @@ def test_every_staging_transpose_tier_agrees():
     if get_module() is not None:
         tiers["cuda"] = get_module().staging_transpose
 
-    orig = tc._staging_transpose_fn
+    orig = staging._staging_transpose_fn
     try:
         for name, fn in tiers.items():
-            tc._staging_transpose_fn = (lambda fn = fn: fn)
+            staging._staging_transpose_fn = (lambda fn = fn: fn)
 
             flat = torch.zeros([batch * n], device = device)          # a whole-group destination
-            tc._staged_copy([], [], [(flat, src)])
+            staging._staged_copy([], [], [(flat, src)])
             assert torch.equal(flat, expect), f"'{name}' tier, flat destination"
 
             shaped = torch.zeros([n_blk, gates, batch], device = device)   # a per-node destination
-            tc._staged_copy([], [], [(shaped, src)])
+            staging._staged_copy([], [], [(shaped, src)])
             assert torch.equal(shaped.reshape(-1), expect), f"'{name}' tier, storage-shaped destination"
     finally:
-        tc._staging_transpose_fn = orig
+        staging._staging_transpose_fn = orig
 
 
 def test_an_ungated_forward_drops_a_previously_staged_gate():

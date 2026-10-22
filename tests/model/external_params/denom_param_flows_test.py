@@ -869,7 +869,7 @@ def test_fused_em_correction_matches_the_torch_reference(block_size, n_blocks, c
     `_fused_em_correction` returning non-None is asserted as well: it declines shapes it cannot serve and
     the caller then runs the reference, which would make a comparison of "both paths" vacuous.
     """
-    import pyjuice.nodes.external_params.block_scale as bsmod
+    import pyjuice.nodes.external_params.blockscale.denominators as bsmod
 
     dev = torch.device("cuda:0")
     root, ns = _build_shape(block_size, n_blocks, ch_block_size)
@@ -907,7 +907,7 @@ def test_fused_em_correction_matches_the_torch_reference(block_size, n_blocks, c
 def test_fused_em_correction_matches_reference_for_shared_layer_and_ties():
     """The two structural cases the per-shape test above cannot build: several gated `ns` in ONE layer
     (so `row_map` has to separate them) and a TIE GROUP (so the members' `W` have to be summed)."""
-    import pyjuice.nodes.external_params.block_scale as bsmod
+    import pyjuice.nodes.external_params.blockscale.denominators as bsmod
 
     dev = torch.device("cuda:0")
     B = 96
@@ -1047,7 +1047,7 @@ def test_mini_batch_em_matches_the_pre_restructuring_sequence(circuit, step_size
     """
     from pyjuice.model.backend.parflow_fusing import compute_cum_par_flows
     from pyjuice.model.backend.par_update import em_par_update
-    import pyjuice.nodes.external_params.block_scale as bsmod
+    import pyjuice.nodes.external_params.blockscale.denominators as bsmod
 
     dev = torch.device("cuda:0")
     B = 96

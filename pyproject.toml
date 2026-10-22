@@ -29,13 +29,19 @@ authors = [
 cuda = [
     "nvidia-cutlass>=3.5",
 ]
+# Text-level constraints (pyjuice.constraints.Regex, JSONSchema): `pip install pyjuice[constraints]`.
+constraints = [
+    "interegular>=0.3.3",
+]
 dev = [
     "pytest",
     "pytest-xdist",
     "pytest-skip-slow",
     "torchvision",
     "datasets",
-    "matplotlib"
+    "matplotlib",
+    "jsonschema",
+    "outlines-core>=0.2.14,<0.3",      # (tests: the JSON Schema texts against outlines-core's)
 ]
 
 [options.packages.find]
@@ -48,6 +54,7 @@ readme = {file = "README.md"}
 # present in installed trees / wheels (it is compiled at runtime via torch.utils.cpp_extension).
 [tool.setuptools.package-data]
 "pyjuice.layer.kernels.c" = ["*.cu", "*.cuh", "*.h"]
+"pyjuice.constraints.inference.dfa_exact.kernels.c" = ["*.cu"]
 
 [tool.pytest.ini_options]
 addopts = [

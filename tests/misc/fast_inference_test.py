@@ -9,6 +9,8 @@ so does `params.data[...] = x`). Every guarantee therefore comes from the scope 
 on the in-repo write paths, and that is what is pinned here.
 """
 
+import gc
+
 import pytest
 import torch
 
@@ -158,14 +160,21 @@ def test_the_copy_does_not_change_the_answer():
     assert torch.equal(outside, inside) and torch.equal(outside, after)
 
 
+def _settled_memory_allocated() -> int:
+    """The process's allocated CUDA memory once the cyclic garbage earlier work left (an earlier test's, in the same
+    worker) is collected: collected later, inside a measured window, it would read as memory given back."""
+    gc.collect()
+    torch.cuda.synchronize()
+    return torch.cuda.memory_allocated()
+
+
 @cuda_only
 def test_the_memory_is_actually_returned():
     """A freed copy has to give the allocator its block back, or the scope leaks per entry."""
     pc = _softevi_pc(num_vars = 6, states = 32)
     x, kw = _topk_evidence(pc, 8, 2)
     pc(x, **kw)
-    torch.cuda.synchronize()
-    base = torch.cuda.memory_allocated()
+    base = _settled_memory_allocated()
 
     with juice.fast_inference():
         pc(x, **kw)
@@ -174,21 +183,19 @@ def test_the_memory_is_actually_returned():
         expected = sum(l.params.numel() * l.params.element_size() for l in pc.input_layer_group)
         assert inside - base >= expected * 0.9, "the copy does not look allocated"
 
-    torch.cuda.synchronize()
-    assert torch.cuda.memory_allocated() <= base + expected * 0.1, "the copy was not released"
+    assert _settled_memory_allocated() <= base + expected * 0.1, "the copy was not released"
 
 
 @cuda_only
 def test_repeated_entries_do_not_accumulate():
     pc = _softevi_pc()
     x, kw = _topk_evidence(pc, 8, 2)
-    pc(x, **kw); torch.cuda.synchronize()
-    base = torch.cuda.memory_allocated()
+    pc(x, **kw)
+    base = _settled_memory_allocated()
     for _ in range(5):
         with juice.fast_inference():
             pc(x, **kw)
-    torch.cuda.synchronize()
-    assert torch.cuda.memory_allocated() <= base + 1024, "entries leak"
+    assert _settled_memory_allocated() <= base + 1024, "entries leak"
 
 
 def _topk_evidence(pc, batch, num_masked, K = 8, mask_id = None):
@@ -346,7 +353,7 @@ def _bf16_circuit(dev, num_cats = None):
     # threshold was raised from 4096 to 32768 this helper's hardcoded 4096 fell below it, which made
     # one test fail loudly and -- worse -- made `test_bf16_params_changes_the_answer_only_slightly`
     # pass VACUOUSLY, since fp32 and bf16 are trivially equal when neither takes the GEMM.
-    from pyjuice.nodes.distributions.softevi_categorical import _GEMM_MIN_CATS
+    from pyjuice.nodes.distributions.softevi.forward import _GEMM_MIN_CATS
     if num_cats is None:
         num_cats = _GEMM_MIN_CATS
     torch.manual_seed(0)

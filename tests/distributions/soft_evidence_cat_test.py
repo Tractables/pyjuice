@@ -3,7 +3,7 @@ import triton
 import pyjuice as juice
 import time
 import pyjuice.nodes.distributions as dists
-from pyjuice.nodes.distributions import softevi_categorical as softevi_cat
+from pyjuice.nodes.distributions.softevi import forward as softevi_fw
 import math
 
 import pytest
@@ -985,10 +985,10 @@ def test_soft_evidence_categorical_value_mask_no_slowdown():
     )
 
     prep_kwargs = dict(categorical_evidence_logp = evi, batch_size = batch_size)
-    plain_kwargs, plain_grid = softevi_cat._prep_args_apply_fw_kernel(input_layer, prep_kwargs)
+    plain_kwargs, plain_grid = softevi_fw._prep_args_apply_fw_kernel(input_layer, prep_kwargs)
 
     prep_kwargs["soft_evidence_value_mask"] = value_mask
-    mask_kwargs, mask_grid = softevi_cat._prep_args_apply_fw_w_value_mask_kernel(input_layer, prep_kwargs)
+    mask_kwargs, mask_grid = softevi_fw._prep_args_apply_fw_w_value_mask_kernel(input_layer, prep_kwargs)
 
     run_plain = lambda: input_layer.dist.fw_kernel[plain_grid](**common_kwargs, **plain_kwargs)
     run_mask = lambda: input_layer.dist.fw_w_value_mask_kernel[mask_grid](**common_kwargs, **mask_kwargs)

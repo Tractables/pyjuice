@@ -92,6 +92,7 @@ def full_batch_em_epoch(pc, train_loader, test_loader, device):
     print(f"[train LL: {train_ll:.2f}; test LL: {test_ll:.2f}].....[train forward+backward+step {t1-t0:.2f}; test forward {t2-t1:.2f}] ")
 
 
+@pytest.mark.slow
 def test_hclt_zero_preserving():
 
     device = torch.device("cuda:0")
@@ -190,6 +191,7 @@ def test_hclt_zero_preserving():
             assert torch.all(~mask | (params < 1e-12))
 
 
+@pytest.mark.slow
 def test_hmm_zero_preserving():
 
     device = torch.device("cuda:0")
@@ -286,6 +288,7 @@ def test_hmm_zero_preserving():
             assert torch.all(~mask | (params < 1e-12))
 
 
+@pytest.mark.slow
 def test_hmm_zero_preserving_node_zeroling():
 
     device = torch.device("cuda:0")
