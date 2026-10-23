@@ -204,6 +204,12 @@ class ExternalParamsSumLayer(SumLayer):
     def restore_cuda_graph_state(self, state) -> None:
         self.external_params.restore_cuda_graph_state(self, state)
 
+    def _drop_device_caches(self) -> None:
+        """The sum layer's own, and every parameterization's of the layer's node groups."""
+        super()._drop_device_caches()
+        for params in {id(ns.external_params): ns.external_params for ns in self.nodes}.values():
+            params.drop_device_caches(self)
+
     def assign_denom_flow_offsets(self, base: int) -> int:
         """
         Carve this layer's slices out of the PC's denominator flow buffer, starting at `base`, and

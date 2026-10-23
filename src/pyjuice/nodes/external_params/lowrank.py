@@ -389,6 +389,14 @@ class LowRankSumParams(ExternalSumParams):
     def restore_cuda_graph_state(self, layer, state) -> None:
         layer._lr_bw_state = state
 
+    def drop_device_caches(self, layer) -> None:
+        super().drop_device_caches(layer)
+        for name in ("_lr_fw_plans", "_lr_bw_state"):
+            layer.__dict__.pop(name, None)
+        # Shared by every layer of the parameterization: rebuilt on the next use of each
+        for cache in (self._scratch, self._scratch_views, self._tiles_cache, self._base_cache, self._shared_logz):
+            cache.clear()
+
     def forward_layer(self, layer, ns_tensors, node_mars, element_mars, params, **kwargs) -> None:
         """
         Apply the correction to the whole layer.

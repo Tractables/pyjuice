@@ -450,11 +450,19 @@ class SumLayer(Layer, nn.Module):
 
     def to(self, device):
         super(SumLayer, self).to(device)
+        self._drop_device_caches()
+        return self
 
-        # Move cached fw pcids to the new device
-        for k, v in self._cached_fw_pcids.items():
-            new_v = [tensor.to(device) for tensor in v]
-            self._cached_fw_compiled_pcids[k] = new_v
+    def _drop_device_caches(self) -> None:
+        """Forget the tensors derived from the layer's tables (index tables, CUDA operands, scratch buffers), to be
+        rebuilt on the tables' device by the next pass: after the tables moved, those would point at the old device.
+        What the caches keep of the host only (tuning choices, dense plans) stays."""
+        for cache in (self._cached_fw_pcids, self._cached_fw_cuda, self._cached_fw_sb, self._cached_bk_parids,
+                      self._cached_bk_ele_cuda, self._cached_bk_ele_sb, self._cached_bk_par_cuda,
+                      self._cached_bk_par_trim):
+            cache.clear()
+        self._bk_ele_scratch = None
+        self._bk_par_scratch = None
 
     @property
     def num_parameters(self):

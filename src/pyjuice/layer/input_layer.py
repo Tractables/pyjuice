@@ -300,6 +300,10 @@ class InputLayer(Layer, nn.Module):
         for i in range(len(self.tied2source_nids)):
             self.tied2source_nids[i][2] = self.tied2source_nids[i][2].to(device)
 
+        # Allocated by a backward as a plain attribute, so `nn.Module.to` does not move it
+        if self.param_flows is not None:
+            self.param_flows = self.param_flows.to(device)
+
         self.device = device
 
     def _ensure_fast_inference_params(self, kwargs = None):

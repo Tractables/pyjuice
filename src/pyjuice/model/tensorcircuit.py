@@ -170,9 +170,16 @@ class TensorCircuit(_BuildMixin, _CudaGraphsMixin, _ExternalParamsMixin, _Learni
         else:
             device = torch.device(device)
 
+        moved = getattr(self, "device", None) != device
+
         super(TensorCircuit, self).to(device)
 
         self.input_layer_group.to(device)
+
+        # `nn.Module.to` moves the inner layers' tables but not the tensors their passes derived from them
+        if moved:
+            for layer_group in self.inner_layer_groups:
+                layer_group.to(device)
 
         self.device = device
 
