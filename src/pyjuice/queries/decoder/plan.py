@@ -97,7 +97,10 @@ class Structure:
 
     def input_groups(self, variables) -> np.ndarray:
         """The input groups of ``variables``, ascending."""
-        variables = np.asarray(variables, dtype = np.int64)
+        variables = np.asarray(variables, dtype = np.int64).reshape(-1)
+        if variables.size == 1:                                  # one variable's: ascending and distinct as kept
+            v = variables[0]
+            return self.inp_idx[self.inp_ptr[v]:self.inp_ptr[v + 1]]
         out = [self.inp_idx[self.inp_ptr[v]:self.inp_ptr[v + 1]] for v in variables]
         return np.unique(np.concatenate(out)) if len(out) > 0 else np.zeros([0], dtype = np.int64)
 
@@ -211,10 +214,20 @@ class Planner:
 def _invalidate(changed, var_ptr, var_idx, scope, in_ok, out_ok, root):
     G, W = scope.shape
     words = np.zeros(W, dtype = np.uint64)
+    work = 0
     for v in changed:
         words[v >> 6] |= np.uint64(1) << np.uint64(v & 63)
-        for j in range(var_ptr[v], var_ptr[v + 1]):
-            in_ok[var_idx[j]] = 0
+        work += var_ptr[v + 1] - var_ptr[v]
+    if work <= G * W:                                    # the changed variables' groups
+        for v in changed:
+            for j in range(var_ptr[v], var_ptr[v + 1]):
+                in_ok[var_idx[j]] = 0
+    else:                                                # many changes: one scan of every group's scope costs less
+        for g in range(G):
+            for w in range(W):
+                if words[w] & scope[g, w]:
+                    in_ok[g] = 0
+                    break
     for g in range(G):
         if g != root and out_ok[g]:
             for w in range(W):

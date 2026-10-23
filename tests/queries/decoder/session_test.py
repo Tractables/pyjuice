@@ -121,6 +121,17 @@ def _steps(sequence, B, V, soft, inputs, rng):
                 masked = np.flatnonzero(miss[b])
                 miss[b, rng.choice(masked, size = min(2, masked.size), replace = False)] = False
         add("marginal")
+    elif sequence == "targets_in_turn":
+        # One evidence, the conditionals of the variables it leaves missing one after another -- nothing changes
+        # between those calls, so seeds hold valid insides -- and a marginal; then one of them observed, and again
+        miss[:] = rng.random((B, V)) < 0.3
+        miss[:, rng.choice(V, size = max(2, V // 2), replace = False)] = True
+        for _ in range(2):
+            free = np.flatnonzero(miss.all(axis = 0))
+            for t in free.tolist():
+                add("conditional", [t])
+            add("marginal")
+            miss[:, int(rng.choice(free))] = False
     else:
         miss[:] = rng.random((B, V)) < 0.5
         for _ in range(20):
@@ -177,7 +188,7 @@ MODELS = ["hmm", "hmm_fp32", "hmm_soft", "hclt", "hclt_fp32", "pd", "pd_fp32", "
 
 
 @cuda_only
-@pytest.mark.parametrize("sequence", ["left_to_right", "diffusion", "random"])
+@pytest.mark.parametrize("sequence", ["left_to_right", "diffusion", "random", "targets_in_turn"])
 @pytest.mark.parametrize("kind", MODELS)
 @pytest.mark.parametrize("early_stop", [False, True])
 def test_a_session_answers_as_the_queries(kind, sequence, early_stop, monkeypatch):
@@ -304,6 +315,84 @@ def test_a_left_to_right_step_launches_a_few_layers(monkeypatch):
             decoder.marginal(x, missing_mask = miss)
             if t >= 2:
                 assert counts == before, (t, {k: counts[k] - before[k] for k in counts})
+
+
+@cuda_only
+@pytest.mark.parametrize("sequence", ["left_to_right", "diffusion", "random", "targets_in_turn"])
+@pytest.mark.parametrize("kind", ["hmm", "hclt", "pd_fp32"])
+@pytest.mark.parametrize("early_stop", [False, True])
+def test_the_insides_a_session_holds_valid_are_a_forwards(kind, sequence, early_stop):
+    """After every call, every inside the planner holds valid is, to the bit, what a forward of the call's evidence
+    computes -- a twin circuit's (compiled the same, parameters the same) through `juice.queries.marginal`: the
+    rows a pass seeds or an external-parameter layer shifts are put back, and nothing stale is held valid."""
+    pc, V, B, inputs, soft = _model(kind)
+    twin = _model(kind)[0]
+    steps = _steps(sequence, B, V, soft, inputs, np.random.default_rng(8))
+    with juice.decoder(pc, early_stop = early_stop, **inputs) as decoder:
+        for i, (x, miss, query, targets) in enumerate(steps):
+            if query == "marginal":
+                decoder.marginal(x, missing_mask = miss)
+            else:
+                decoder.conditional(x, missing_mask = miss, target_vars = targets)
+            planner = decoder._planner
+            valid = np.flatnonzero(planner.in_ok)
+            if valid.size == 0:
+                continue
+            rows = torch.cat([torch.arange(*planner.structure.groups[g]._output_ind_range) for g in valid]).to(DEV)
+            juice.queries.marginal(twin, data = x.clone(), missing_mask = miss, **inputs)
+            assert torch.equal(pc.node_mars[rows], twin.node_mars[rows]), \
+                (i, query, float((pc.node_mars[rows] - twin.node_mars[rows]).abs().max()))
+
+
+@cuda_only
+def test_a_conditional_after_evidence_of_low_probability():
+    """With early stop a conditional's pass is scaled by the last call's log p: after nearly every variable of a
+    64-category chain is observed at once, its flows at the target are ~e^-40 of a full backward's -- far below the
+    input layer's `1e-12` guard -- until normalized over the target's nodes. The session answers as the queries."""
+    torch.manual_seed(0)
+    V, C64, B = 12, 64, 4
+    pc = juice.compile(juice.structures.HMM(seq_length = V, num_latents = 16, num_emits = C64), verbose = False,
+                       precision = "fp32").to(DEV)
+    x = torch.randint(0, C64, (B, V), device = DEV)
+    everything = torch.ones(B, V, dtype = torch.bool, device = DEV)
+    most = torch.zeros(B, V, dtype = torch.bool, device = DEV)
+    most[:, [3, 7]] = True
+    with juice.decoder(pc) as decoder:
+        decoder.conditional(x, missing_mask = everything, target_vars = [3])
+        got = decoder.conditional(x, missing_mask = most, target_vars = [3])
+    want = juice.queries.conditional(pc, data = x, missing_mask = most, target_vars = [3])
+    assert juice.queries.marginal(pc, data = x, missing_mask = most).max() < -28        # below the guard: e^-28 = 7e-13
+    assert torch.allclose(got, want, atol = 1e-5), float((got - want).abs().max())
+
+
+@cuda_only
+@pytest.mark.parametrize("expand", ["host", "device"])
+def test_row_sets(expand, monkeypatch):
+    """`_Rows`: a set's rows in the order of its groups, ranges that continue one another merged -- one run a slice,
+    more an index tensor (expanded on the host, or past `_HOST_ROWS` rows on the device) -- with every row's segment
+    where asked; an empty set absent."""
+    from types import SimpleNamespace
+    if expand == "device":
+        monkeypatch.setattr(session, "_HOST_ROWS", 0)
+    lo = np.array([0, 4, 10, 12, 30, 40, 48, 60])
+    hi = np.array([4, 8, 12, 20, 31, 48, 50, 64])
+    rows = session._Rows(SimpleNamespace(lo = lo, hi = hi))
+    rows.add("one_run", np.array([0, 1]))
+    rows.add("two_runs", np.array([2, 3, 0]))
+    rows.add("merged_and_single", np.array([5, 6, 4]))
+    rows.add("not_continuing", np.array([1, 0]))
+    rows.add("segments", np.array([0, 2, 5]), segments = np.array([0, 1, 1]))
+    rows.add("empty", np.array([], dtype = np.int64))
+    rows.upload(DEV)
+    assert rows.get("one_run") == slice(0, 8)
+    want = {"two_runs": [*range(10, 20), *range(0, 4)], "merged_and_single": [*range(40, 50), 30],
+            "not_continuing": [*range(4, 8), *range(0, 4)]}
+    for name, w in want.items():
+        assert rows.get(name).tolist() == w, name
+    r, seg = rows.get("segments")
+    assert r.tolist() == [*range(0, 4), *range(10, 12), *range(40, 48)]
+    assert seg.tolist() == [0] * 4 + [1] * 2 + [1] * 8
+    assert rows.get("empty") is None
 
 
 @cuda_only

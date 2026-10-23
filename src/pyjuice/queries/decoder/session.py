@@ -72,45 +72,165 @@ def _input_keywords(pc) -> set:
 
 
 class _Layout:
-    """Where the planner's groups are in the compiled circuit: every sum and input group's node rows, and every layer's
-    groups -- per input layer, per layer of every inner layer group -- with, for a sum layer, the layers of the product
-    layer group below it that hold its children."""
+    """Where the planner's groups are in the compiled circuit, as arrays -- over the groups:
+
+    * ``lo`` / ``hi`` [G]: every sum and input group's node rows (-1 for a product: its values live in
+      ``element_mars``, which every product layer rewrites);
+    * ``layer_of`` [G]: the layer holding the group;
+
+    and over the layers, numbered bottom-up (the input layers, then the layers of every inner layer group in order):
+
+    * ``kind`` / ``group`` / ``index``: the layer's kind (INPUT / PROD / SUM), its inner layer group (-1 for an input
+      layer) and its index there;
+    * ``child_prods[l]``: for a sum layer, the layers of the product layer group below that hold its groups' children;
+    * ``gated[l]``: an external-parameter sum layer; ``nid_range[l]``: a sum layer's node rows."""
 
     def __init__(self, pc, planner: Planner):
         s = planner.structure
+        G = len(s.groups)
         index = {id(ns): g for g, ns in enumerate(s.groups)}
-        self.rows = [ns._output_ind_range if s.kind[g] != PROD else None for g, ns in enumerate(s.groups)]
+        self.lo = np.full([G], -1, dtype = np.int64)
+        self.hi = np.full([G], -1, dtype = np.int64)
+        for g, ns in enumerate(s.groups):
+            if s.kind[g] != PROD:
+                self.lo[g], self.hi[g] = ns._output_ind_range
 
-        def groups_of(layer):
-            gs = set()
-            for ns in layer.nodes:
-                assert id(ns) in index, "a compiled layer holds a node group the circuit's graph does not"
-                gs.add(index[id(ns)])
-            return gs
-
-        self.input_groups = [groups_of(layer) for layer in pc.input_layer_group]
-        self.inner_groups = [[groups_of(layer) for layer in lg] for lg in pc.inner_layer_groups]
-        mapped = set().union(*self.input_groups, *[g for lg in self.inner_groups for g in lg])
-        assert mapped == set(range(len(s.groups))), "the circuit's graph and its compiled layers disagree"
-
-        self.has_external = any(isinstance(layer, ExternalParamsSumLayer) for lg in pc.inner_layer_groups
-                                for layer in lg)
-        self.child_prods = []                    # [k][i]: layers of layer group k - 1 holding layer i's children
-        self.gated = []
-        for k, lg in enumerate(pc.inner_layer_groups):
-            per_layer, gated = [], []
+        self.layer_of = np.full([G], -1, dtype = np.int64)
+        kind, group, layer_index, layers = [], [], [], []
+        for k, lg in [(-1, pc.input_layer_group)] + list(enumerate(pc.inner_layer_groups)):
             for i, layer in enumerate(lg):
-                if lg.is_sum():
-                    children = set()
-                    for g in self.inner_groups[k][i]:
-                        children.update(s.ch_idx[s.ch_ptr[g]:s.ch_ptr[g + 1]].tolist())
-                    per_layer.append([j for j, below in enumerate(self.inner_groups[k - 1]) if below & children])
-                    gated.append(isinstance(layer, ExternalParamsSumLayer))
-                else:
-                    per_layer.append([])
-                    gated.append(False)
-            self.child_prods.append(per_layer)
-            self.gated.append(gated)
+                for ns in layer.nodes:
+                    assert id(ns) in index, "a compiled layer holds a node group the circuit's graph does not"
+                    self.layer_of[index[id(ns)]] = len(layers)
+                kind.append(INPUT if k < 0 else (SUM if lg.is_sum() else PROD))
+                group.append(k)
+                layer_index.append(i)
+                layers.append(layer)
+        assert (self.layer_of >= 0).all(), "the circuit's graph and its compiled layers disagree"
+        self.kind, self.group, self.index = (np.array(a, dtype = np.int64) for a in (kind, group, layer_index))
+
+        self.gated = np.array([isinstance(layer, ExternalParamsSumLayer) for layer in layers])
+        self.has_external = bool(self.gated.any())
+        self.nid_range = [layer.nid_range if kind[l] == SUM else None for l, layer in enumerate(layers)]
+        self.child_prods = [[] for _ in layers]
+        for g in np.flatnonzero(s.kind == SUM):
+            l = self.layer_of[g]
+            for c in s.ch_idx[s.ch_ptr[g]:s.ch_ptr[g + 1]]:
+                lc = int(self.layer_of[c])
+                if self.kind[lc] == PROD and lc not in self.child_prods[l]:
+                    self.child_prods[l].append(lc)
+        for l in range(len(layers)):
+            self.child_prods[l].sort()
+
+    def layers(self, groups, kind):
+        """The layers of ``kind`` holding any of ``groups``, ascending."""
+        ls = np.unique(self.layer_of[groups])
+        return ls[self.kind[ls] == kind]
+
+    def by_group(self, ls):
+        """``ls`` (ascending layers) split into runs of one inner layer group each, in order."""
+        if ls.size == 0:
+            return []
+        return np.split(ls, np.flatnonzero(np.diff(self.group[ls])) + 1)
+
+    def children(self, ls):
+        """The product layers holding the children of sum layers ``ls`` (one layer group's), ascending."""
+        if len(ls) == 1:
+            return self.child_prods[ls[0]]
+        return sorted(set(c for l in ls for c in self.child_prods[l]))
+
+
+class _Rows:
+    """A call's sets of node rows -- each the rows of some sum and input groups, in the order of the groups given --
+    prepared on the host and uploaded in one copy. A set lying in one run of rows is a slice, with nothing to upload;
+    any other an index tensor, expanded on the device from its runs. A set with ``segments`` (one per group) gives with
+    its rows every row's segment. ``meta``: what the call notes of its sets."""
+
+    def __init__(self, layout: _Layout):
+        self.L = layout
+        self.ranges = {}                         # name -> (lo [R], hi [R], segment [R] or None)
+        self.sets = {}
+        self.meta = {}
+
+    def add(self, name, groups, segments = None) -> None:
+        lo, hi = self.L.lo[groups], self.L.hi[groups]
+        if lo.size == 0:
+            return
+        if segments is None:                     # ranges that continue one another merged into runs, in order
+            start = np.ones([lo.size], dtype = bool)
+            start[1:] = lo[1:] != hi[:-1]
+            first = np.flatnonzero(start)
+            lo, hi = lo[first], hi[np.append(first[1:], lo.size) - 1]
+        self.ranges[name] = (lo, hi, segments)
+
+    def upload(self, device) -> None:
+        self.sets = {}
+        multi = []
+        for name, (lo, hi, seg) in self.ranges.items():
+            if lo.size == 1 and seg is None:
+                self.sets[name] = slice(int(lo[0]), int(hi[0]))
+            else:
+                multi.append(name)
+        if not multi:
+            return
+        # A set of up to `_HOST_ROWS` rows goes up whole, expanded on the host; a larger one as its runs, expanded on
+        # the device (its rows would cost more to upload)
+        parts, plan = [], []
+        for name in multi:
+            lo, hi, seg = self.ranges[name]
+            lens = hi - lo
+            total = int(lens.sum())
+            starts = lo - (np.cumsum(lens) - lens)
+            if total <= _HOST_ROWS:
+                parts.append(np.repeat(starts, lens) + np.arange(total))
+                if seg is not None:
+                    parts.append(np.repeat(seg, lens))
+                plan.append((name, True, lo.size, total, seg is not None))
+            else:
+                parts += [starts, lens] + ([] if seg is None else [seg])
+                plan.append((name, False, lo.size, total, seg is not None))
+        packed = torch.from_numpy(np.concatenate(parts).astype(np.int64)).to(device)
+        pos = 0
+        for name, host, R, total, segmented in plan:
+            if host:
+                rows = packed[pos:pos + total]
+                pos += total
+                if segmented:
+                    rows = (rows, packed[pos:pos + total])
+                    pos += total
+            else:
+                starts, lens = packed[pos:pos + R], packed[pos + R:pos + 2 * R]
+                pos += 2 * R
+                rows = torch.repeat_interleave(starts, lens, output_size = total) + torch.arange(total, device = device)
+                if segmented:
+                    rows = (rows, torch.repeat_interleave(packed[pos:pos + R], lens, output_size = total))
+                    pos += R
+            self.sets[name] = rows
+
+    def get(self, name):
+        return self.sets.get(name)
+
+
+# The most rows of a set `_Rows` uploads expanded on the host (beyond, its runs, expanded on the device)
+_HOST_ROWS = 1 << 16
+
+
+def _get(t: torch.Tensor, rows):
+    return t[rows]
+
+
+def _copy(t: torch.Tensor, rows) -> torch.Tensor:
+    """``t``'s ``rows``, copied (a slice of ``t`` is a view of it)."""
+    return t[rows].clone() if isinstance(rows, slice) else t[rows]
+
+
+def _put(t: torch.Tensor, rows, value) -> None:
+    if isinstance(rows, slice):
+        t[rows] = value
+    elif isinstance(value, torch.Tensor):
+        t.index_copy_(0, rows, value)
+    else:
+        t.index_fill_(0, rows, value)
 
 
 class Decoder:
@@ -202,12 +322,15 @@ class Decoder:
         cuts = self.early_stop and pc.precision == "fp32" and not self._layout.has_external
         plan = self._planner.marginal(cuts = cuts)
         kwargs = dict(self._kwargs, missing_mask = missing_mask)
+        rows = _Rows(self._layout)
+        rows.add("cut", plan.cut)
+        rows.upload(pc.node_mars.device)
         self._forward(plan.recompute, data, kwargs)
         if plan.cut.size == 0:
             lls = pc.node_mars[pc._root_node_range[0]:pc._root_node_range[1], :].permute(1, 0).clone()
         else:
-            rows = self._rows(plan.cut)
-            lls = torch.logsumexp(pc.node_mars[rows] + self._node_out[rows], dim = 0)[:, None]
+            cut = rows.get("cut")
+            lls = torch.logsumexp(_get(pc.node_mars, cut) + _get(self._node_out, cut), dim = 0)[:, None]
         if self.early_stop:
             self._log_p = lls[:, 0].clone()
         self._planner.commit(plan)
@@ -226,20 +349,20 @@ class Decoder:
         reuse = self.early_stop and self._log_p is not None
         plan = self._planner.conditional(targets, reuse = reuse)
         kwargs = dict(self._kwargs, missing_mask = missing_mask, target_vars = target_vars)
+        rows = self._conditional_rows(plan, targets, reuse)
         self._forward(plan.recompute, data, kwargs)
         if reuse:
             scale = self._log_p
         else:
             scale = pc.node_mars[pc._root_node_range[0]:pc._root_node_range[1]].logsumexp(dim = 0)
-        self._backward(plan, kwargs, scale, reuse)
+        self._backward(plan, kwargs, scale, reuse, rows)
 
         if self.early_stop:
-            s = self._planner.structure
-            visited = [g for g in plan.visited.tolist() if s.kind[g] != PROD]
-            if visited:
-                rows = self._rows(visited)
-                self._node_out[rows] = pc.node_flows[rows] - pc.node_mars[rows] + scale[None, :]
-            log_p = self._normalize_target_flows(targets)
+            visited = rows.get("visited")
+            if visited is not None:
+                _put(self._node_out, visited,
+                     _get(pc.node_flows, visited) - _get(pc.node_mars, visited) + scale[None, :])
+            log_p = self._normalize_target_flows(rows, len(targets))
             if log_p is not None:
                 self._log_p = log_p + scale
 
@@ -271,45 +394,83 @@ class Decoder:
             differ = data != x0
             if differ.dim() == 3:                                    # soft evidence: a variable's whole slice
                 differ = differ.any(dim = 2)
-            changed = torch.nonzero(((miss != m0) | (~miss & differ)).any(dim = 0)).flatten().cpu().numpy()
+            changed = np.flatnonzero(((miss != m0) | (~miss & differ)).any(dim = 0).cpu().numpy())
         self._planner.observe(changed)
         return miss
 
     def _remember(self, data: torch.Tensor, miss: torch.Tensor) -> None:
-        self._previous = (data.clone(), miss.clone())                # never the caller's tensors
+        """Keep a copy of the call's evidence (never the caller's tensors), in the session's own buffers."""
+        prev = self._previous
+        if prev is not None and prev[0].shape == data.shape and prev[0].dtype == data.dtype:
+            prev[0].copy_(data)
+            prev[1].copy_(miss)
+        else:
+            self._previous = (data.clone(), miss.clone())
 
-    def _normalize_target_flows(self, targets: Sequence[int]) -> Optional[torch.Tensor]:
+    def _conditional_rows(self, plan, targets: Sequence[int], reuse: bool) -> _Rows:
+        """The row sets a conditional reads and writes, uploaded at once: per layer group, the sum seeds whose outsides
+        start the pass there (the root's not, when the pass starts from its inside); the input seeds; and with early
+        stop, the visited groups (whose outsides are stored) and the targets' input groups (one segment per target)."""
+        s, L = self._planner.structure, self._layout
+        rows = _Rows(L)
+        seeds = plan.seeds
+        sums = seeds[s.kind[seeds] == SUM]
+        if not reuse:
+            sums = sums[sums != s.root]
+        ks = L.group[L.layer_of[sums]]
+        for k in np.unique(ks):
+            rows.add(("seeds", int(k)), sums[ks == k])
+        rows.add("input_seeds", seeds[s.kind[seeds] == INPUT])
+        if self.early_stop:
+            rows.add("visited", plan.visited[s.kind[plan.visited] != PROD])
+            t = np.asarray(targets, dtype = np.int64)
+            counts = s.inp_ptr[t + 1] - s.inp_ptr[t]
+            groups = s.inp_idx[np.arange(int(counts.sum())) + np.repeat(s.inp_ptr[t] - (np.cumsum(counts) - counts), counts)]
+            if t.size == 1:
+                rows.add("targets", groups)
+            else:
+                seg = np.repeat(np.arange(t.size), counts)
+                rows.add("targets", groups, segments = seg)
+                per = np.bincount(seg, weights = L.hi[groups] - L.lo[groups], minlength = t.size)
+                if per.size > 0 and per[0] > 0 and (per == per[0]).all():
+                    rows.meta["target_rows"] = int(per[0])                # every target that many rows
+        rows.upload(self.pc.node_mars.device)
+        return rows
+
+    def _normalize_target_flows(self, rows: _Rows, num_targets: int) -> Optional[torch.Tensor]:
         """Make the targets' flows a full backward's. The pass ran with ``log p`` taken as its scale (an estimate),
         so a node's flow is ``out * in / exp(scale)`` rather than ``out * in / p``; a target's input nodes are a cut
         (every induced tree has one leaf of the variable), so their flows sum to ``p / exp(scale)`` -- divided out per
         target and sample. The input layers' conditionals normalize with a small additive guard (``1e-12``), which
         flows of another scale would not survive. Returns that ``log (p / exp(scale))``, of the first target, [B]."""
-        s, L = self._planner.structure, self._layout
-        rows, seg = [], []
-        for i, t in enumerate(targets):
-            for g in s.input_groups([t]).tolist():
-                a, b = L.rows[g]
-                rows.append(torch.arange(a, b))
-                seg.append(torch.full([b - a], i, dtype = torch.long))
-        if not rows:
+        r = rows.get("targets")
+        if r is None:
             return None
-        device = self.pc.node_flows.device
-        rows, seg = torch.cat(rows).to(device), torch.cat(seg).to(device)
         nf = self.pc.node_flows
-        vals = nf[rows]
+        if num_targets == 1:
+            # One segment: its maximum and its result broadcast, not gathered row by row (the same values)
+            vals = _get(nf, r)
+            seg = torch.zeros([vals.size(0)], dtype = torch.long, device = vals.device)
+            m = vals.amax(dim = 0, keepdim = True)
+            m = torch.where(torch.isfinite(m), m, 0.0)
+            tot = torch.zeros_like(m).index_add_(0, seg, torch.exp(vals - m))
+            log_p = torch.where(tot > 0, m + torch.log(tot), 0.0)            # evidence of probability 0: as it is
+            _put(nf, r, vals - log_p)
+            return log_p[0]
+        rows_t, seg = r
+        vals = nf[rows_t]
         B = vals.size(1)
-        m = torch.full([len(targets), B], -float("inf"), dtype = vals.dtype, device = device)
-        m = m.scatter_reduce(0, seg[:, None].expand(-1, B), vals, reduce = "amax")
+        if rows.meta.get("target_rows") is not None:
+            m = vals.view(num_targets, -1, B).amax(dim = 1)                  # every target's rows together, in order
+        else:
+            m = torch.full([num_targets, B], -float("inf"), dtype = vals.dtype, device = vals.device)
+            m = m.scatter_reduce(0, seg[:, None].expand(-1, B), vals, reduce = "amax")
         m = torch.where(torch.isfinite(m), m, 0.0)
-        tot = torch.zeros([len(targets), B], dtype = vals.dtype, device = device).index_add_(0, seg, torch.exp(vals - m[seg]))
-        log_p = torch.where(tot > 0, m + torch.log(tot), 0.0)                # evidence of probability 0: as it is
-        nf[rows] = vals - log_p[seg]
+        tot = torch.zeros([num_targets, B], dtype = vals.dtype, device = vals.device) \
+                   .index_add_(0, seg, torch.exp(vals - m[seg]))
+        log_p = torch.where(tot > 0, m + torch.log(tot), 0.0)
+        _put(nf, rows_t, vals - log_p[seg])
         return log_p[0]
-
-    def _rows(self, groups) -> torch.Tensor:
-        """The node rows of sum and input ``groups``, as one index tensor."""
-        ranges = [self._layout.rows[g] for g in groups]
-        return torch.cat([torch.arange(a, b) for a, b in ranges]).to(self.pc.node_mars.device)
 
     # ---------------------------------------------------------------------------------------------
     # Execution, by whole layers
@@ -319,29 +480,24 @@ class Decoder:
         """Recompute the insides of the groups ``recompute``: the layers holding any of them (a sum layer with the
         layers of the product layer group below that hold its children), bottom-up."""
         pc, L = self.pc, self._layout
-        todo = set(recompute.tolist())
-        if not todo:
+        if recompute.size == 0:
             return
-        for i, layer in enumerate(pc.input_layer_group):
-            if L.input_groups[i] & todo:
-                distributions.forward(layer, data.clone() if data.dim() == 3 else data, pc.node_mars, **kwargs)
+        for l in L.layers(recompute, INPUT):
+            distributions.forward(pc.input_layer_group[L.index[l]], data.clone() if data.dim() == 3 else data,
+                                  pc.node_mars, **kwargs)
 
         alg = pc.default_propagation_alg
         sum_opts = dict(kwargs, **pc.propagation_alg_kwargs, precision = pc.precision, pflow_temperature = 1.0)
-        for k, lg in enumerate(pc.inner_layer_groups):
-            if not lg.is_sum():
-                continue
-            active = [i for i in range(len(lg)) if L.inner_groups[k][i] & todo]
-            if not active:
-                continue
-            below = pc.inner_layer_groups[k - 1]
-            for j in sorted(set(j for i in active for j in L.child_prods[k][i])):
-                below[j].forward(pc.node_mars, pc.element_mars)
+        for ls in L.by_group(L.layers(recompute, SUM)):
+            k = int(L.group[ls[0]])
+            lg, below = pc.inner_layer_groups[k], pc.inner_layer_groups[k - 1]
+            for p in L.children(ls):
+                below[L.index[p]].forward(pc.node_mars, pc.element_mars)
             layer_alg = alg if isinstance(alg, str) else alg[k]
-            for i in active:
-                lg[i].forward(pc.node_mars, pc.element_mars, pc.params, propagation_alg = layer_alg, **sum_opts)
+            for l in ls:
+                lg[L.index[l]].forward(pc.node_mars, pc.element_mars, pc.params, propagation_alg = layer_alg, **sum_opts)
 
-    def _backward(self, plan, kwargs: dict, scale: torch.Tensor, reuse: bool) -> None:
+    def _backward(self, plan, kwargs: dict, scale: torch.Tensor, reuse: bool, rows: _Rows) -> None:
         """The top-down pass of a conditional, in log-space flows: over the layers holding visited groups or seeds.
         With ``reuse``, every seed starts from its stored outside: for its layer's backward, its ``node_mars`` is set to
         ``scale - out`` and its flow to 0, so that the flows below it are ``out * in / exp(scale)`` -- a full backward's
@@ -357,50 +513,43 @@ class Decoder:
         pc._init_buffer(name = "element_flows", shape = (pc.num_elements, B), set_value = -float("inf"))
         nf, nm = pc.node_flows, pc.node_mars
 
-        seeds, visited = set(plan.seeds.tolist()), set(plan.visited.tolist())
         root = s.root
-        if root in seeds and not reuse:
-            a, b = L.rows[root]
-            nf[a:b] = 0.0                                            # the root's flow, its inside kept
+        if not reuse and bool((plan.seeds == root).any()):
+            nf[L.lo[root]:L.hi[root]] = 0.0                          # the root's flow, its inside kept
 
         bk_opts = dict(kwargs, param_flows = None, denom_param_flows = None, allow_modify_flows = False,
                        logspace_flows = True, negate_pflows = False, precision = pc.precision,
                        pflow_temperature = 1.0, temper_eflow = False)
-        work = seeds | visited
-        for k in range(len(pc.inner_layer_groups) - 1, -1, -1):
-            lg = pc.inner_layer_groups[k]
+        # Every layer group holding work, top-down: a product group's layers with visited groups, a sum group's with
+        # visited groups or seeds
+        work = {}
+        for ls in L.by_group(L.layers(np.concatenate([plan.seeds, plan.visited]), SUM)):
+            work[int(L.group[ls[0]])] = ls
+        for ls in L.by_group(L.layers(plan.visited, PROD)):
+            work[int(L.group[ls[0]])] = ls
+        for k in sorted(work, reverse = True):
+            lg, ls = pc.inner_layer_groups[k], work[k]
             if lg.is_prod():
-                for j in range(len(lg)):
-                    if L.inner_groups[k][j] & visited:
-                        lg[j].backward(nf, pc.element_flows, logspace_flows = True)
+                for l in ls:
+                    lg[L.index[l]].backward(nf, pc.element_flows, logspace_flows = True)
                 continue
-            active = [i for i in range(len(lg)) if L.inner_groups[k][i] & work]
-            if not active:
-                continue
-            saved = []
-            for i in active:
-                if L.gated[k][i]:
-                    a, b = lg[i].nid_range
-                    saved.append((a, b, nm[a:b].clone()))
-                for g in L.inner_groups[k][i] & seeds:
-                    if g == root and not reuse:
-                        continue
-                    a, b = L.rows[g]
-                    if not L.gated[k][i]:
-                        saved.append((a, b, nm[a:b].clone()))
-                    nm[a:b] = scale[None, :] - self._node_out[a:b]
-                    nf[a:b] = 0.0
+            saved = [(slice(*L.nid_range[l]), nm[slice(*L.nid_range[l])].clone()) for l in ls if L.gated[l]]
+            seeds = rows.get(("seeds", k))
+            if seeds is not None:
+                saved.append((seeds, _copy(nm, seeds)))
+                _put(nm, seeds, scale[None, :] - _get(self._node_out, seeds))
+                _put(nf, seeds, 0.0)
             below = pc.inner_layer_groups[k - 1]
-            for j in sorted(set(j for i in active for j in L.child_prods[k][i])):
-                below[j].forward(nm, pc.element_mars)
-            for i in active:
-                lg[i].backward(nf, pc.element_flows, nm, pc.element_mars, pc.params, propagation_alg = "LL", **bk_opts)
-            for a, b, val in reversed(saved):
-                nm[a:b] = val
+            for p in L.children(ls):
+                below[L.index[p]].forward(nm, pc.element_mars)
+            for l in ls:
+                lg[L.index[l]].backward(nf, pc.element_flows, nm, pc.element_mars, pc.params, propagation_alg = "LL",
+                                        **bk_opts)
+            for r, val in reversed(saved):
+                _put(nm, r, val)
 
         # Input groups among the seeds -- targets whose outsides are stored -- last: a visited product above one (a
         # parent of another target) adds to its flow, which the stored outside already accounts for
-        for g in seeds:
-            if s.kind[g] == INPUT:
-                a, b = L.rows[g]
-                nf[a:b] = self._node_out[a:b] + nm[a:b] - scale[None, :]
+        seeds = rows.get("input_seeds")
+        if seeds is not None:
+            _put(nf, seeds, _get(self._node_out, seeds) + _get(nm, seeds) - scale[None, :])
