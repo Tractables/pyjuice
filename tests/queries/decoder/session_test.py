@@ -67,6 +67,11 @@ def _model(kind):
                                  input_dist = dists.Categorical(num_cats = C))
         ns.init_parameters(perturbation = 2.0)
         return juice.compile(ns, verbose = False, precision = precision).to(DEV), 16, 4, {}, False
+    if kind == "pd_wide":                                            # padded product parents: the dummy rows
+        ns = juice.structures.PD(data_shape = (6, 6), num_latents = 4, split_intervals = 2,
+                                 input_dist = dists.Categorical(num_cats = C))
+        ns.init_parameters(perturbation = 2.0)
+        return juice.compile(ns, verbose = False, precision = precision).to(DEV), 36, 4, {}, False
     if kind in ("softevi", "softevi_topk"):
         pc, _ = _chain(lambda: dists.SoftEvidenceCategorical(num_cats = C), 6, 8, 4)
         g = torch.Generator(device = DEV).manual_seed(1)
@@ -350,19 +355,21 @@ def test_a_left_to_right_step_launches_a_few_layers(monkeypatch):
 
 @cuda_only
 @pytest.mark.parametrize("sequence", ["left_to_right", "diffusion", "random", "targets_in_turn"])
-@pytest.mark.parametrize("kind", ["hmm", "hmm_soft", "hclt", "pd_fp32", "softevi", "blockscale", "lowrank"])
+@pytest.mark.parametrize("kind", ["hmm", "hmm_soft", "hclt", "pd_fp32", "pd_wide", "softevi", "blockscale", "lowrank"])
 @pytest.mark.parametrize("early_stop", [False, True])
-def test_a_session_reads_only_the_flows_it_fills(kind, sequence, early_stop, monkeypatch):
-    """A conditional's pass fills (-inf) only the flows it reads before writing them: with both flow buffers poisoned
-    with NaN before every call, the session still answers as the queries."""
+@pytest.mark.parametrize("poison", [float("nan"), 0.0])
+def test_a_session_reads_only_the_flows_it_fills(kind, sequence, early_stop, poison, monkeypatch):
+    """A conditional's pass fills (-inf) only the flows it reads before writing them -- the dummy rows the tables'
+    padding points at among them: with both flow buffers poisoned before every call, with NaN or with the zeros of a
+    buffer `_init_buffer` just cut (log flows of 1), the session still answers as the queries."""
     _restrict_always(monkeypatch)
     pc, V, B, inputs, soft = _model(kind)
     steps = _steps(sequence, B, V, soft, inputs, np.random.default_rng(9))
     want = _queries(pc, steps, inputs)
     with juice.decoder(pc, early_stop = early_stop, **inputs) as decoder:
         for i, ((x, miss, query, targets), w) in enumerate(zip(steps, want)):
-            pc.node_flows.fill_(float("nan"))
-            pc.element_flows.fill_(float("nan"))
+            pc.node_flows.fill_(poison)
+            pc.element_flows.fill_(poison)
             if query == "marginal":
                 g = decoder.marginal(x, missing_mask = miss)
             else:

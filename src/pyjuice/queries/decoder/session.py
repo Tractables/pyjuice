@@ -144,6 +144,15 @@ class _Layout:
                 lo, hi = _union(self.lo[ch], self.hi[ch])
                 self.fill_nodes[l] = list(zip(lo.tolist(), hi.tolist()))
 
+        # The rows of the flow buffers outside every group -- the dummy rows the tables' padding points at, whose
+        # flows a pass reads (a product's backward adds its padded parents' element flows): -inf, as a full backward
+        # leaves them, before every pass
+        prods = s.kind == PROD
+        elo = np.array([ns._output_ind_range[0] for g, ns in enumerate(s.groups) if prods[g]], dtype = np.int64)
+        ehi = np.array([ns._output_ind_range[1] for g, ns in enumerate(s.groups) if prods[g]], dtype = np.int64)
+        self.outside_nodes = _complement(self.lo[~prods], self.hi[~prods], pc.num_nodes)
+        self.outside_elements = _complement(elo, ehi, pc.num_elements)
+
     def layers(self, groups, kind):
         """The layers of ``kind`` holding any of ``groups``, ascending."""
         ls = np.unique(self.layer_of[groups])
@@ -282,6 +291,14 @@ def _union(lo: np.ndarray, hi: np.ndarray):
     start[1:] = lo[1:] > hi[:-1]
     first = np.flatnonzero(start)
     return lo[first], hi[np.append(first[1:], lo.size) - 1]
+
+
+def _complement(lo: np.ndarray, hi: np.ndarray, n: int):
+    """The rows of ``[0, n)`` outside the ranges ``[lo, hi)``, as ``[(a, b)]``."""
+    lo, hi = _union(lo, hi)
+    starts, ends = np.r_[0, hi], np.r_[lo, n]
+    keep = ends > starts
+    return list(zip(starts[keep].tolist(), ends[keep].tolist()))
 
 
 def _get(t: torch.Tensor, rows):
@@ -494,16 +511,18 @@ class Decoder:
         # The layers the pass runs (for `_backward` too), and the flows to fill (-inf) before it: those its layers read
         # or add to before writing them (`_Layout.fill_nodes`). What else a pass reads unwritten feeds only groups it
         # does not visit -- every parent of a visited group is visited or a seed, so a visited product's element flow
-        # comes from sum layers the pass runs -- and nothing reads those groups' flows: element flows and the rest of the
-        # node flows need no fill. Small buffers are filled whole (`_FILL_MIN_VALUES`, `_FILL_WHOLE_FRACTION`); a few
-        # ranges one launch each, more through an index uploaded with the call's other rows.
+        # comes from sum layers the pass runs -- and nothing reads those groups' flows: the rest of the flows need no
+        # fill but the dummy rows outside every group, which the tables' padding reads (`_Layout.outside_nodes` /
+        # `outside_elements`). Small buffers are filled whole (`_FILL_MIN_VALUES`, `_FILL_WHOLE_FRACTION`); a few ranges
+        # one launch each, more through an index uploaded with the call's other rows.
         sum_layers = L.layers(np.concatenate([seeds, plan.visited]), SUM)
         prod_layers = L.layers(plan.visited, PROD)
         rows.meta["sum_layers"], rows.meta["prod_layers"] = sum_layers, prod_layers
         rows.meta["fill_nodes"] = rows.meta["fill_elements"] = "all"
         if (self.pc.num_nodes + self.pc.num_elements) * self.pc.node_mars.size(1) >= _FILL_MIN_VALUES:
-            rows.meta["fill_elements"] = []
-            ranges = _merge([r for l in sum_layers.tolist() + prod_layers.tolist() for r in L.fill_nodes[l]])
+            rows.meta["fill_elements"] = L.outside_elements
+            ranges = _merge([r for l in sum_layers.tolist() + prod_layers.tolist() for r in L.fill_nodes[l]]
+                            + L.outside_nodes)
             if sum(b - a for a, b in ranges) > _FILL_WHOLE_FRACTION * self.pc.num_nodes:
                 pass                                                 # most of the buffer: fill all of it
             elif len(ranges) <= _MAX_FILL_SLICES:
