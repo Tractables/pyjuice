@@ -148,9 +148,9 @@ def _discrete_logistic_backward_kernel(cat_probs_ptr, node_flows_ptr, node_ids_p
     range_high = tl.load(metadata_ptr + s_mids + 1, mask = mask, other = 0)
     node_nch = tl.load(metadata_ptr + s_mids + 2, mask = mask, other = 0).to(tl.int64)
 
-    # Get flow
+    # Get flow (log-space flows, see `backward`)
     nflow_offsets = global_node_offsets * batch_size + batch_offsets
-    nflow = tl.load(node_flows_ptr + nflow_offsets, mask = mask, other = 0)
+    nflow = tl.exp(tl.load(node_flows_ptr + nflow_offsets, mask = mask, other = -float("inf")))
 
     # Compute edge flows and accumulate
     for cat_id in range(num_cats):
@@ -173,6 +173,8 @@ def _discrete_logistic_backward_kernel(cat_probs_ptr, node_flows_ptr, node_ids_p
 
 def backward(layer, inputs: torch.Tensor, node_flows: torch.Tensor, node_mars: torch.Tensor,
              params: Optional[torch.Tensor] = None, **kwargs):
+
+    assert kwargs.get("logspace_flows", False), "The conditional backward reads log-space flows (`logspace_flows = True`)."
 
     if params is None:
         params = layer.params

@@ -43,7 +43,14 @@ def conditional(pc: TensorCircuit, data: torch.Tensor, missing_mask: Optional[to
 
     :param bk_input_fn: an optional custom function for the backward pass of input layers
     :type bk_input_fn: Optional[Union[str,Callable]]
+
+    :note: the backward pass runs with log-space flows and without flow modification (`logspace_flows = True`,
+           `allow_modify_flows = False`) -- the regime external sum parameters need -- so a custom `bk_input_fn`
+           receives log-space flows.
     """
+
+    assert kwargs.setdefault("logspace_flows", True) and not kwargs.setdefault("allow_modify_flows", False), \
+        "`conditional` runs the backward pass with `logspace_flows = True` and `allow_modify_flows = False`."
 
     outputs = []
 
