@@ -601,6 +601,11 @@ class LowRankSumParams(ExternalSumParams):
         Add the external contribution to the child flows, write `dLL/dU` and `dLL/dV`, and restore
         `node_mars`.
 
+        The child flows' correction and the gradients come from ONE kernel, so it runs whether or not
+        the gradients were asked for (`compute_external_grads = False` leaves no gradient buffer): into a
+        scratch buffer then, never read. Skipping it, as this once did, left every flow below the layer
+        with only the shared parameters' term.
+
         The restore runs in a `finally`: `node_mars` is shared with the rest of the circuit, so leaving
         it in the `logT` form would silently corrupt every layer evaluated afterwards.
         """
@@ -613,8 +618,10 @@ class LowRankSumParams(ExternalSumParams):
             ext = kwargs.get(_buffer_kwarg(), None)
             grad_ext = kwargs.get(_grad_buffer_kwarg(), None)
 
-            if ext is not None and grad_ext is not None:
+            if ext is not None:
                 self._alloc_device = node_mars.device
+                if grad_ext is None:
+                    grad_ext = self._alloc("grad_scratch", ext.numel()).view(ext.shape)
 
                 tile_n = min(self.tile_n or 16, block_size)
                 tb = max(1, min(32, batch_size))
