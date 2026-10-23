@@ -22,6 +22,9 @@ from pyjuice.layer import set_autotune
 # Scope promising that parameters will not change, so layers may hold derived copies of them
 from pyjuice.utils.fast_inference import fast_inference
 
+# Decoder sessions: queries that reuse, between calls, what the evidence left unchanged
+from pyjuice.queries.decoder import decoder
+
 # Construction methods
 from pyjuice.nodes import multiply, summate, inputs, set_block_size, structural_properties
 

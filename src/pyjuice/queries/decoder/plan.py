@@ -164,6 +164,13 @@ class Planner:
         self.out_ok[s.root] = 1
         self.pending = np.zeros([s.num_vars], dtype = np.uint8)     # changed since the root's inside was last valid
 
+    def reset(self) -> None:
+        """Nothing valid, as before the first call."""
+        self.in_ok[:] = 0
+        self.out_ok[:] = 0
+        self.out_ok[self.structure.root] = 1
+        self.pending[:] = 0
+
     def observe(self, changed) -> None:
         """The variables whose evidence (value, or missing or not) changed in any sample since the last call."""
         s = self.structure
@@ -171,24 +178,29 @@ class Planner:
         _invalidate(changed, s.var_ptr, s.var_idx, s.scope, self.in_ok, self.out_ok, s.root)
         self.pending[changed] = 1
 
-    def marginal(self) -> MarginalPlan:
+    def marginal(self, cuts: bool = True) -> MarginalPlan:
+        """The plan of a marginal; ``cuts`` False: always up to the root."""
         s = self.structure
         recompute, cut, cost = _marginal(np.flatnonzero(self.pending).astype(np.int64), s.kind, s.scope, s.ch_ptr,
                                          s.ch_idx, s.par_ptr, s.par_idx, s.inp_ptr, s.inp_idx, self.in_ok,
-                                         self.out_ok, s.cost, s.num_nodes.astype(np.float64), s.root)
+                                         self.out_ok, s.cost, s.num_nodes.astype(np.float64), s.root, cuts)
         return MarginalPlan(recompute, cut, cost)
 
-    def conditional(self, target_vars) -> ConditionalPlan:
+    def conditional(self, target_vars, reuse: bool = True) -> ConditionalPlan:
+        """The plan of a conditional of ``target_vars``; ``reuse`` False: no stored outside is read -- the pass
+        starts at the root, from its inside (recomputed if stale), as a full backward does."""
         s = self.structure
         targets = s.input_groups(target_vars)
+        out_ok = self.out_ok if reuse else np.zeros_like(self.out_ok)
         recompute, seeds, visited = _conditional(targets, s.kind, s.ch_ptr, s.ch_idx, s.par_ptr, s.par_idx,
-                                                 self.in_ok, self.out_ok, s.root)
+                                                 self.in_ok, out_ok, s.root, not reuse)
         return ConditionalPlan(recompute, seeds, visited, targets)
 
-    def commit(self, plan) -> None:
-        """``plan`` ran: its recomputed insides, and a conditional's visited outsides, are valid."""
+    def commit(self, plan, outsides: bool = True) -> None:
+        """``plan`` ran: its recomputed insides, and a conditional's visited outsides (unless ``outsides`` is
+        False: they were not stored), are valid."""
         self.in_ok[plan.recompute] = 1
-        if isinstance(plan, ConditionalPlan):
+        if isinstance(plan, ConditionalPlan) and outsides:
             visited = plan.visited[self.structure.kind[plan.visited] != PROD]
             self.out_ok[visited] = 1
         if self.in_ok[self.structure.root]:
@@ -231,7 +243,7 @@ def _closure(required, kind, ch_ptr, ch_idx, in_ok):
 
 @njit(cache = True)
 def _marginal(pending, kind, scope, ch_ptr, ch_idx, par_ptr, par_idx, inp_ptr, inp_idx, in_ok, out_ok, cost, num_nodes,
-              root):
+              root, cuts):
     G, W = scope.shape
 
     # To the root
@@ -243,6 +255,8 @@ def _marginal(pending, kind, scope, ch_ptr, ch_idx, par_ptr, par_idx, inp_ptr, i
         if best[g]:
             best_cost += cost[g]
     best_cut = np.zeros(G, dtype = np.uint8)
+    if not cuts:
+        return np.nonzero(best)[0].astype(np.int64), np.nonzero(best_cut)[0].astype(np.int64), best_cost
 
     # A variable's input groups, where their outsides are valid: recompute the stale ones among them (no children)
     for v in range(inp_ptr.size - 1):
@@ -343,7 +357,7 @@ def _pending_cut(pending, kind, scope, ch_ptr, ch_idx, par_ptr, par_idx, out_ok)
 
 
 @njit(cache = True)
-def _conditional(targets, kind, ch_ptr, ch_idx, par_ptr, par_idx, in_ok, out_ok, root):
+def _conditional(targets, kind, ch_ptr, ch_idx, par_ptr, par_idx, in_ok, out_ok, root, seed_insides):
     G = kind.size
     need = np.zeros(G, dtype = np.uint8)                 # needs an outside
     for g in targets:
@@ -366,6 +380,10 @@ def _conditional(targets, kind, ch_ptr, ch_idx, par_ptr, par_idx, in_ok, out_ok,
     required = np.zeros(G, dtype = np.uint8)
     for g in targets:
         required[g] = 1
+    if seed_insides:                                     # the pass reads the seeds' insides too
+        for g in range(G):
+            if seed[g]:
+                required[g] = 1
     for g in range(G):
         if visited[g]:
             if kind[g] == PROD:
