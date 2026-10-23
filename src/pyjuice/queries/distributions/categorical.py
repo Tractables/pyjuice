@@ -5,15 +5,18 @@ import triton
 import triton.language as tl
 from typing import Optional
 
-from .common import emission_sums, target_nodes, target_weights
+from .common import emission_sums, layer_facts, target_weights, targets
 
 
-# From this many categories the conditional's input-layer backward takes `emission_sums` rather than
-# `_categorical_backward_kernel`, whose atomic add per (node, sample, category) dominates at large vocabularies.
-# MEASURED (whole `conditional` calls; tied and untied HMMs, an HCLT and a PD over 28 x 28 variables, B = 1 / 16 /
-# 128, one target or up to 392): from 1024 categories the matmuls win every configuration, 0.25-0.88x at 1024 and
-# 0.011-0.037x at 65536; at 256 and below the kernel wins or ties (0.73-1.47x).
-MATMUL_MIN_CATS = 1024
+# From this many categories (from `MATMUL_MIN_CATS_ONE_TARGET` for a query of one target) the conditional's input-layer
+# backward takes `emission_sums` rather than `_categorical_backward_kernel`, which loops over the categories in every
+# program and adds atomically per (node, sample, category), every target's outputs taking one add per node of it.
+# MEASURED (the input-layer step alone, both arms without their host syncs; tied and untied HMM emissions, 16 / 128 /
+# 1024 nodes per target, B = 1 / 16 / 128, 1 or 32 targets): from 256 categories the matmuls win every configuration
+# (0.03-0.81x of the kernel); from 128, every one of one target (0.21-0.94x), while with 32 targets they lose up to
+# 1.39x; at 64 and below the kernel wins or ties wherever there are several targets.
+MATMUL_MIN_CATS = 256
+MATMUL_MIN_CATS_ONE_TARGET = 128
 
 
 @triton.jit
@@ -150,6 +153,17 @@ def _categorical_backward_kernel(cat_probs_ptr, node_flows_ptr, node_ids_ptr, re
         tl.atomic_add(cat_probs_ptr + p_offsets, eflow, mask = cmask)
 
 
+def _facts(layer):
+    """``(num_cats, uniform)`` of ``layer``: the most categories any of its nodes has, and whether every node has that
+    many -- kept with its :class:`~.common.LayerFacts`."""
+    f = layer_facts(layer)
+    c = f.extra.get("categorical")
+    if c is None:
+        num_cats = int(layer.metadata[layer.s_mids].max().item())
+        c = f.extra["categorical"] = (num_cats, all(ns.dist.num_cats == num_cats for ns in layer.nodes))
+    return c
+
+
 def backward(layer, inputs: torch.Tensor, node_flows: torch.Tensor, node_mars: torch.Tensor,
              params: Optional[torch.Tensor] = None, **kwargs):
 
@@ -160,34 +174,32 @@ def backward(layer, inputs: torch.Tensor, node_flows: torch.Tensor, node_mars: t
 
     sid, eid = layer._output_ind_range[0], layer._output_ind_range[1]
 
-    num_vars = layer.vids.max().item() + 1
-    num_cats = int(layer.metadata[layer.s_mids].max().item())
+    num_cats, uniform = _facts(layer)
     batch_size = node_flows.size(1)
 
-    node_ids, rev_vars_mapping, num_target_vars = target_nodes(layer, kwargs.get("target_vars"), num_vars,
-                                                               node_flows.device)
-    num_target_nodes = node_ids.size(0)
+    t = targets(layer, kwargs.get("target_vars"), node_flows.device)
+    num_target_nodes = t.nodes.size(0)
 
     # Large vocabularies: sum_n F(n) p_n(:) as matmuls with the emission table (`emission_sums`) instead of the kernel's
     # atomic add per (node, sample, category). Needs every node of the layer to have the same `num_cats`.
-    if num_cats >= MATMUL_MIN_CATS and all(ns.dist.num_cats == num_cats for ns in layer.nodes):
-        rows_of = rev_vars_mapping[layer.vids[node_ids, 0]]
-        weights = target_weights(node_flows[sid + node_ids], rows_of, num_target_vars)
-        sums = emission_sums(layer.params, layer.s_pids[node_ids], rows_of, weights, num_target_vars, num_cats)
+    if uniform and (num_cats >= MATMUL_MIN_CATS or (t.num_targets == 1 and num_cats >= MATMUL_MIN_CATS_ONE_TARGET)):
+        weights = target_weights(node_flows[sid + t.nodes], t.rows_of, t.num_targets)
+        s_pids, rows_of = t.host if t.host is not None else (layer.s_pids[t.nodes], t.rows_of)
+        sums = emission_sums(layer.params, s_pids, rows_of, weights, t.num_targets, num_cats)
         return sums / (sums.sum(dim = 2, keepdim = True) + 1e-12)
 
-    cat_probs = torch.zeros([num_target_vars * num_cats * batch_size], dtype = torch.float32, device = node_flows.device)
+    cat_probs = torch.zeros([t.num_targets * num_cats * batch_size], dtype = torch.float32, device = node_flows.device)
 
     node_nchs = layer.metadata[layer.s_mids]
 
     grid = lambda meta: (triton.cdiv(num_target_nodes * batch_size, meta['BLOCK_SIZE']),)
 
     _categorical_backward_kernel[grid](
-        cat_probs, node_flows, node_ids, rev_vars_mapping, layer.vids, layer.s_pids, node_nchs, layer.params,
+        cat_probs, node_flows, t.nodes, t.rev_vars_mapping, layer.vids, layer.s_pids, node_nchs, layer.params,
         sid, eid, num_target_nodes, batch_size, num_cats, BLOCK_SIZE = 512
     )
 
-    cat_probs = cat_probs.reshape(num_target_vars, num_cats, batch_size)
+    cat_probs = cat_probs.reshape(t.num_targets, num_cats, batch_size)
 
     cat_probs /= (cat_probs.sum(dim = 1, keepdim = True) + 1e-12)
     cat_probs = cat_probs.permute(2, 0, 1)

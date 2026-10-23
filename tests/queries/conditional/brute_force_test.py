@@ -29,9 +29,10 @@ AUTO_ATOL = 5e-5        # the default precision (bf16 dots where the tiles allow
 @pytest.fixture(params = ["kernel", "matmul"])
 def categorical_path(request, monkeypatch):
     """Categorical's conditional backward through its kernel, or through `emission_sums` (taken from MATMUL_MIN_CATS
-    categories; forced here) -- and that path, not the other, ran."""
+    categories, MATMUL_MIN_CATS_ONE_TARGET for one target; forced here) -- and that path, not the other, ran."""
     import pyjuice.queries.distributions.categorical as qc
-    monkeypatch.setattr(qc, "MATMUL_MIN_CATS", 1 << 40 if request.param == "kernel" else 0)
+    for name in ("MATMUL_MIN_CATS", "MATMUL_MIN_CATS_ONE_TARGET"):
+        monkeypatch.setattr(qc, name, 1 << 40 if request.param == "kernel" else 0)
     calls = []
     sums = qc.emission_sums
     monkeypatch.setattr(qc, "emission_sums", lambda *a, **k: calls.append(1) or sums(*a, **k))
@@ -98,14 +99,14 @@ def _missing(B, V, targets, seed):
 
 
 @cuda_only
-@pytest.mark.parametrize("target_vars", [[2, 5], None])
+@pytest.mark.parametrize("target_vars", [[2, 5], [5], None])
 @pytest.mark.parametrize("mask_dims", [1, 2])
 def test_categorical_hard_data(target_vars, mask_dims, categorical_path):
     torch.manual_seed(0)
     V, C, B = 8, 5, 12
     pc = juice.compile(juice.structures.HMM(seq_length = V, num_latents = 16, num_emits = C), verbose = False,
                        precision = "fp32").to(DEV)
-    targets = [2, 5]
+    targets = [5] if target_vars == [5] else [2, 5]
     data = torch.randint(0, C, (B, V), device = DEV)
     if mask_dims == 2:
         missing = _missing(B, V, targets, 1)
@@ -144,6 +145,7 @@ def test_categorical_paths_agree_at_a_large_vocabulary(tied, monkeypatch):
     got = {}
     for path, threshold in (("kernel", 1 << 40), ("matmul", 0)):
         monkeypatch.setattr(qc, "MATMUL_MIN_CATS", threshold)
+        monkeypatch.setattr(qc, "MATMUL_MIN_CATS_ONE_TARGET", threshold)
         got[path] = juice.queries.conditional(pc, data = data, missing_mask = missing, target_vars = targets)
     assert torch.allclose(got["matmul"], got["kernel"], atol = 1e-6, rtol = 1e-4), \
         float((got["matmul"] - got["kernel"]).abs().max())
@@ -372,21 +374,30 @@ def test_softevi_categorical_marginal_and_refusals():
 
 
 @cuda_only
+@pytest.mark.parametrize("indexing", ["device", "host"])
 @pytest.mark.parametrize("layout", ["shared", "shared_scattered", "private", "mixed", "unaligned", "absent_target",
-                                    "chunked"])
-def test_emission_sums_against_a_loop(layout, monkeypatch):
-    """`emission_sums` -- both of its forms, the table viewed or gathered, chunked or not -- against the sum it
-    stands for, node by node."""
+                                    "chunked", "one_target", "one_target_scattered", "one_target_unordered",
+                                    "shared_repeated", "private_repeated"])
+def test_emission_sums_against_a_loop(layout, indexing, monkeypatch):
+    """`emission_sums` -- both of its forms, the table viewed or gathered, chunked or not, its indexing built on the
+    device or on the host; one target (whose rows, ascending, take the weights as they are); rows a target's nodes read
+    twice -- against the sum it stands for, node by node."""
     import pyjuice.queries.distributions.common as common
     g = torch.Generator(device = DEV).manual_seed(12)
     C, B, T, H = 7, 5, 4, 6
+    if layout.startswith("one_target"):
+        T = 1
     offset = 3 if layout == "unaligned" else 0                     # parameters that do not start a row of the table
-    if layout == "shared":
+    if layout in ("shared", "one_target", "one_target_unordered"):
         rows = torch.arange(H, device = DEV).repeat(T)             # every target reads the same H rows
-    elif layout == "shared_scattered":
+    elif layout in ("shared_scattered", "one_target_scattered"):
         rows = (2 * torch.arange(H, device = DEV)).repeat(T)       # ... which are not a contiguous run
     elif layout in ("private", "chunked", "unaligned", "absent_target"):
         rows = torch.arange(T * H, device = DEV)                   # every target its own rows
+    elif layout == "shared_repeated":
+        rows = torch.arange(H // 2, device = DEV).repeat(2 * T)    # every target reads each of H / 2 rows twice
+    elif layout == "private_repeated":
+        rows = torch.arange(T * H // 2, device = DEV).view(T, -1).repeat(1, 2).view(-1)   # its own rows, each twice
     else:
         rows = torch.cat([torch.arange(H, device = DEV).repeat(2), torch.arange(H, 3 * H, device = DEV)])
     rows_of = torch.arange(T, device = DEV).repeat_interleave(H)
@@ -395,15 +406,81 @@ def test_emission_sums_against_a_loop(layout, monkeypatch):
         rows, rows_of = rows[keep], rows_of[keep]
     if layout == "chunked":
         monkeypatch.setattr(common, "_SUMS_CHUNK", H * C)          # one target per chunk
-    perm = torch.randperm(rows.numel(), device = DEV, generator = g)            # nodes in no particular order
-    rows, rows_of = rows[perm], rows_of[perm]
+    if layout not in ("one_target", "one_target_scattered"):       # (those keep their nodes in the order of their rows)
+        perm = torch.randperm(rows.numel(), device = DEV, generator = g)        # nodes in no particular order
+        rows, rows_of = rows[perm], rows_of[perm]
     n_rows = int(rows.max()) + 1
     params = torch.rand(offset + n_rows * C, device = DEV, generator = g)
     s_pids = offset + rows * C
     weights = torch.rand(rows.numel(), B, device = DEV, generator = g)
 
-    got = common.emission_sums(params, s_pids, rows_of, weights, T, C)
+    if indexing == "host":
+        got = common.emission_sums(params, s_pids.cpu().numpy(), rows_of.cpu().numpy(), weights, T, C)
+    else:
+        got = common.emission_sums(params, s_pids, rows_of, weights, T, C)
     want = torch.zeros(B, T, C, device = DEV)
     for n in range(rows.numel()):
         want[:, rows_of[n], :] += weights[n][:, None] * params[s_pids[n]:s_pids[n] + C][None, :]
     assert torch.allclose(got, want, atol = 1e-5), float((got - want).abs().max())
+
+
+@cuda_only
+@pytest.mark.parametrize("num_targets", [1, 3])
+def test_target_weights_of_a_target_nothing_weighs(num_targets):
+    """`target_weights`: every (target, sample) shifted by its largest weight -- and a target whose nodes all weigh
+    nothing (log -inf: evidence of probability 0) keeps zeros, not the NaN of -inf minus -inf."""
+    import pyjuice.queries.distributions.common as common
+    g = torch.Generator(device = DEV).manual_seed(13)
+    B, H = 5, 4
+    log_w = torch.randn(num_targets * H, B, device = DEV, generator = g) * 30
+    rows_of = torch.arange(num_targets, device = DEV).repeat_interleave(H)
+    log_w[rows_of == 0, 1] = -float("inf")                         # target 0 weighs nothing in sample 1
+    w = common.target_weights(log_w, rows_of, num_targets)
+    assert torch.isfinite(w).all()
+    assert (w[rows_of == 0, 1] == 0).all()
+    for t in range(num_targets):
+        for b in range(B):
+            if (t, b) != (0, 1):
+                ref = log_w[rows_of == t, b]
+                assert torch.allclose(w[rows_of == t, b], torch.exp(ref - ref.max()))
+
+
+@cuda_only
+@pytest.mark.parametrize("indexing", ["host", "device"])
+@pytest.mark.parametrize("target_vars", [None, [3], [7, 0, 4], [2, 5, 2], []])
+def test_targets_against_a_scan_of_the_layer(target_vars, indexing, monkeypatch):
+    """`targets` -- built on the host, or on the device (past `_HOST_INDEX_MAX` nodes; forced here) -- against a scan
+    of the layer: the nodes whose first variable is a target, ascending within each target; every node's output row,
+    a variable listed twice answering in the row of its last listing; and the layer facts it keeps, host data only."""
+    import numpy as np
+    import pyjuice.queries.distributions.common as common
+    if indexing == "device":
+        monkeypatch.setattr(common, "_HOST_INDEX_MAX", -1)
+    torch.manual_seed(0)
+    V = 10
+    x = torch.randint(0, 5, (256, V))
+    ns = juice.structures.HCLT(x.float(), num_latents = 8, input_dist = dists.Categorical(num_cats = 5))
+    ns.init_parameters()
+    layer = juice.compile(ns, verbose = False).to(DEV).input_layer_group[0]
+    t = common.targets(layer, target_vars, DEV)
+
+    tv = list(range(V)) if target_vars is None else target_vars
+    vids = layer.vids[:, 0].cpu()
+    scan = torch.nonzero(torch.isin(vids, torch.tensor(tv, dtype = torch.long))).flatten()
+    nodes = t.nodes.cpu()
+    assert sorted(nodes.tolist()) == scan.tolist()
+    for v in set(tv):
+        mine = nodes[vids[nodes] == v]
+        assert torch.equal(mine, mine.sort().values)
+    row = {v: i for i, v in enumerate(tv)}
+    assert t.rows_of.cpu().tolist() == [row[int(vids[n])] for n in nodes]
+    assert all(int(t.rev_vars_mapping[v]) == r for v, r in row.items())
+    assert t.num_targets == len(tv)
+    assert t.max_nodes == max([int((vids == v).sum()) for v in tv], default = 0)
+    if indexing == "host":
+        assert np.array_equal(t.host[0], layer.s_pids.cpu().numpy()[nodes.numpy()])
+        assert np.array_equal(t.host[1], t.rows_of.cpu().numpy())
+    else:
+        assert t.host is None
+    f = common.layer_facts(layer)
+    assert all(isinstance(getattr(f, k), (int, np.ndarray)) for k in ("num_vars", "var_ptr", "var_nodes", "s_pids"))

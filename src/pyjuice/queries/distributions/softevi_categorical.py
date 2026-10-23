@@ -20,7 +20,7 @@ from __future__ import annotations
 import torch
 from typing import Optional
 
-from .common import emission_sums, target_nodes, target_weights
+from .common import emission_sums, layer_facts, target_weights, targets
 
 
 def forward(layer, inputs: torch.Tensor, node_mars: torch.Tensor,
@@ -63,19 +63,20 @@ def backward(layer, inputs: torch.Tensor, node_flows: torch.Tensor, node_mars: t
         params = layer.params
 
     num_cats = layer.dist.num_cats
-    for ns in layer.nodes:
-        if ns.dist.num_cats != num_cats:
-            raise NotImplementedError("A conditional query of a `SoftEvidenceCategorical` layer whose nodes have "
-                                      "different `num_cats`.")
+    f = layer_facts(layer)
+    if "softevi_uniform" not in f.extra:
+        f.extra["softevi_uniform"] = all(ns.dist.num_cats == num_cats for ns in layer.nodes)
+    if not f.extra["softevi_uniform"]:
+        raise NotImplementedError("A conditional query of a `SoftEvidenceCategorical` layer whose nodes have "
+                                  "different `num_cats`.")
 
     sid, eid = layer._output_ind_range
     batch_size = node_flows.size(1)
     device = node_flows.device
-    num_vars = layer.vids.max().item() + 1
 
-    nodes, rev_vars_mapping, num_target_vars = target_nodes(layer, kwargs.get("target_vars"), num_vars, device)
+    t = targets(layer, kwargs.get("target_vars"), device)
+    nodes, rows_of, num_target_vars = t.nodes, t.rows_of, t.num_targets   # rows_of: every target node's output row
     vids = layer.vids[nodes, 0]
-    rows_of = rev_vars_mapping[vids]                                         # every target node's output row
     lvids = vids if layer.var_idmapping is None else layer.var_idmapping[vids]
 
     # Every target node's weight F(n) / Z_n -- a node no token weighs (Z_n = 0) contributes nothing
@@ -84,7 +85,8 @@ def backward(layer, inputs: torch.Tensor, node_flows: torch.Tensor, node_mars: t
     a = torch.where(torch.isneginf(log_z), -float("inf"), a)
     weights = target_weights(a, rows_of, num_target_vars)
 
-    sums = emission_sums(params, layer.s_pids[nodes], rows_of, weights, num_target_vars, num_cats)
+    s_pids, rows = t.host if t.host is not None else (layer.s_pids[nodes], rows_of)
+    sums = emission_sums(params, s_pids, rows, weights, num_target_vars, num_cats)
 
     # Every target's evidence row (a target the layer has no node of reads row 0, and its sums are zero)
     lvid_of = torch.zeros([num_target_vars], dtype = torch.long, device = device).scatter_(0, rows_of, lvids)
