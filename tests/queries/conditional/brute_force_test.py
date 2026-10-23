@@ -26,6 +26,19 @@ ATOL = 1e-5             # precision = "fp32"
 AUTO_ATOL = 5e-5        # the default precision (bf16 dots where the tiles allow them): measured up to 3.8e-6
 
 
+@pytest.fixture(params = ["kernel", "matmul"])
+def categorical_path(request, monkeypatch):
+    """Categorical's conditional backward through its kernel, or through `emission_sums` (taken from MATMUL_MIN_CATS
+    categories; forced here) -- and that path, not the other, ran."""
+    import pyjuice.queries.distributions.categorical as qc
+    monkeypatch.setattr(qc, "MATMUL_MIN_CATS", 1 << 40 if request.param == "kernel" else 0)
+    calls = []
+    sums = qc.emission_sums
+    monkeypatch.setattr(qc, "emission_sums", lambda *a, **k: calls.append(1) or sums(*a, **k))
+    yield request.param
+    assert bool(calls) == (request.param == "matmul")
+
+
 def _brute_force(pc, data, missing, targets, num_cats, **kwargs):
     """[B, len(targets), num_cats]: for every target variable t (missing in every row), P(x_t = v | e) normalized from
     log p(x_t = v, e) -- `data` with t set to v (a one-hot slice for soft data), t observed."""
@@ -87,7 +100,7 @@ def _missing(B, V, targets, seed):
 @cuda_only
 @pytest.mark.parametrize("target_vars", [[2, 5], None])
 @pytest.mark.parametrize("mask_dims", [1, 2])
-def test_categorical_hard_data(target_vars, mask_dims):
+def test_categorical_hard_data(target_vars, mask_dims, categorical_path):
     torch.manual_seed(0)
     V, C, B = 8, 5, 12
     pc = juice.compile(juice.structures.HMM(seq_length = V, num_latents = 16, num_emits = C), verbose = False,
@@ -103,7 +116,7 @@ def test_categorical_hard_data(target_vars, mask_dims):
 
 
 @cuda_only
-def test_categorical_hclt():
+def test_categorical_hclt(categorical_path):
     torch.manual_seed(0)
     V, C, B = 10, 6, 16
     x = torch.randint(0, C, (256, V))
@@ -116,7 +129,28 @@ def test_categorical_hclt():
 
 
 @cuda_only
-def test_categorical_soft_data():
+@pytest.mark.parametrize("tied", [True, False])
+def test_categorical_paths_agree_at_a_large_vocabulary(tied, monkeypatch):
+    """Where brute force would take thousands of forwards: the kernel and `emission_sums` (each against brute force
+    above) give the same conditionals over 8192 categories, tied emissions or not."""
+    import pyjuice.queries.distributions.categorical as qc
+    torch.manual_seed(0)
+    V, C, B = 6, 8192, 12
+    pc = juice.compile(juice.structures.HMM(seq_length = V, num_latents = 16, num_emits = C, homogeneous = tied),
+                       verbose = False, precision = "fp32").to(DEV)
+    targets = [1, 4]
+    data = torch.randint(0, C, (B, V), device = DEV)
+    missing = _missing(B, V, targets, 11)
+    got = {}
+    for path, threshold in (("kernel", 1 << 40), ("matmul", 0)):
+        monkeypatch.setattr(qc, "MATMUL_MIN_CATS", threshold)
+        got[path] = juice.queries.conditional(pc, data = data, missing_mask = missing, target_vars = targets)
+    assert torch.allclose(got["matmul"], got["kernel"], atol = 1e-6, rtol = 1e-4), \
+        float((got["matmul"] - got["kernel"]).abs().max())
+
+
+@cuda_only
+def test_categorical_soft_data(categorical_path):
     torch.manual_seed(0)
     V, C, B = 6, 4, 10
     pc = juice.compile(juice.structures.HMM(seq_length = V, num_latents = 8, num_emits = C), verbose = False,
@@ -170,7 +204,7 @@ def test_extern_product_categorical():
     # LowRank's backward runs from block_size 16 and batch 16
     ("lowrank", 16, 16), ("lowrank", 32, 24),
 ])
-def test_external_sum_params(external, block_size, B):
+def test_external_sum_params(external, block_size, B, categorical_path):
     torch.manual_seed(0)
     V, C = 5, 6
     precision, atol = ("auto", AUTO_ATOL) if external == "blockscale" else ("fp32", ATOL)
@@ -335,3 +369,41 @@ def test_softevi_categorical_marginal_and_refusals():
         juice.queries.conditional(pc, data = data, missing_mask = missing, target_vars = [1],
                                   categorical_evidence_logp_grad = torch.zeros_like(inputs["categorical_evidence_logp"]),
                                   **inputs)
+
+
+@cuda_only
+@pytest.mark.parametrize("layout", ["shared", "shared_scattered", "private", "mixed", "unaligned", "absent_target",
+                                    "chunked"])
+def test_emission_sums_against_a_loop(layout, monkeypatch):
+    """`emission_sums` -- both of its forms, the table viewed or gathered, chunked or not -- against the sum it
+    stands for, node by node."""
+    import pyjuice.queries.distributions.common as common
+    g = torch.Generator(device = DEV).manual_seed(12)
+    C, B, T, H = 7, 5, 4, 6
+    offset = 3 if layout == "unaligned" else 0                     # parameters that do not start a row of the table
+    if layout == "shared":
+        rows = torch.arange(H, device = DEV).repeat(T)             # every target reads the same H rows
+    elif layout == "shared_scattered":
+        rows = (2 * torch.arange(H, device = DEV)).repeat(T)       # ... which are not a contiguous run
+    elif layout in ("private", "chunked", "unaligned", "absent_target"):
+        rows = torch.arange(T * H, device = DEV)                   # every target its own rows
+    else:
+        rows = torch.cat([torch.arange(H, device = DEV).repeat(2), torch.arange(H, 3 * H, device = DEV)])
+    rows_of = torch.arange(T, device = DEV).repeat_interleave(H)
+    if layout == "absent_target":
+        keep = rows_of != 2                                        # target 2 has no node
+        rows, rows_of = rows[keep], rows_of[keep]
+    if layout == "chunked":
+        monkeypatch.setattr(common, "_SUMS_CHUNK", H * C)          # one target per chunk
+    perm = torch.randperm(rows.numel(), device = DEV, generator = g)            # nodes in no particular order
+    rows, rows_of = rows[perm], rows_of[perm]
+    n_rows = int(rows.max()) + 1
+    params = torch.rand(offset + n_rows * C, device = DEV, generator = g)
+    s_pids = offset + rows * C
+    weights = torch.rand(rows.numel(), B, device = DEV, generator = g)
+
+    got = common.emission_sums(params, s_pids, rows_of, weights, T, C)
+    want = torch.zeros(B, T, C, device = DEV)
+    for n in range(rows.numel()):
+        want[:, rows_of[n], :] += weights[n][:, None] * params[s_pids[n]:s_pids[n] + C][None, :]
+    assert torch.allclose(got, want, atol = 1e-5), float((got - want).abs().max())

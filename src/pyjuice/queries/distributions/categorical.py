@@ -5,7 +5,15 @@ import triton
 import triton.language as tl
 from typing import Optional
 
-from .common import target_nodes
+from .common import emission_sums, target_nodes, target_weights
+
+
+# From this many categories the conditional's input-layer backward takes `emission_sums` rather than
+# `_categorical_backward_kernel`, whose atomic add per (node, sample, category) dominates at large vocabularies.
+# MEASURED (whole `conditional` calls; tied and untied HMMs, an HCLT and a PD over 28 x 28 variables, B = 1 / 16 /
+# 128, one target or up to 392): from 1024 categories the matmuls win every configuration, 0.25-0.88x at 1024 and
+# 0.011-0.037x at 65536; at 256 and below the kernel wins or ties (0.73-1.47x).
+MATMUL_MIN_CATS = 1024
 
 
 @triton.jit
@@ -159,6 +167,14 @@ def backward(layer, inputs: torch.Tensor, node_flows: torch.Tensor, node_mars: t
     node_ids, rev_vars_mapping, num_target_vars = target_nodes(layer, kwargs.get("target_vars"), num_vars,
                                                                node_flows.device)
     num_target_nodes = node_ids.size(0)
+
+    # Large vocabularies: sum_n F(n) p_n(:) as matmuls with the emission table (`emission_sums`) instead of the kernel's
+    # atomic add per (node, sample, category). Needs every node of the layer to have the same `num_cats`.
+    if num_cats >= MATMUL_MIN_CATS and all(ns.dist.num_cats == num_cats for ns in layer.nodes):
+        rows_of = rev_vars_mapping[layer.vids[node_ids, 0]]
+        weights = target_weights(node_flows[sid + node_ids], rows_of, num_target_vars)
+        sums = emission_sums(layer.params, layer.s_pids[node_ids], rows_of, weights, num_target_vars, num_cats)
+        return sums / (sums.sum(dim = 2, keepdim = True) + 1e-12)
 
     cat_probs = torch.zeros([num_target_vars * num_cats * batch_size], dtype = torch.float32, device = node_flows.device)
 

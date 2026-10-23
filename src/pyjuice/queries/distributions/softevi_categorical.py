@@ -17,11 +17,10 @@ read the same emission rows.
 
 from __future__ import annotations
 
-import numpy as np
 import torch
 from typing import Optional
 
-from .common import target_nodes
+from .common import emission_sums, target_nodes, target_weights
 
 
 def forward(layer, inputs: torch.Tensor, node_mars: torch.Tensor,
@@ -49,48 +48,6 @@ def _log_normalizers(layer, inputs: torch.Tensor, node_mars: torch.Tensor, kwarg
     layer.forward(data = data, node_mars = scratch, soft_evidence_value_mask = free, **evidence)
 
     return scratch[sid:eid]
-
-
-def _emission_sums(params: torch.Tensor, s_pids: torch.Tensor, rows_of: torch.Tensor, weights: torch.Tensor,
-                   num_targets: int, num_cats: int) -> torch.Tensor:
-    """``[B, num_targets, num_cats]``: ``sum_n weights[n, b] p_n(:)`` over the nodes ``n`` of every target
-    (``rows_of[n]`` its output row, ``s_pids[n]`` its parameters). One matmul per group of targets whose nodes read the
-    same emission rows -- all of them when the emissions are tied, one per target when they are not -- so every row is
-    read once per group and no product with a row a target does not read is formed."""
-    batch_size = weights.size(1)
-    device = weights.device
-
-    # The emission table: `params` itself, viewed as rows, when every node's parameters start a row of it
-    if params.numel() % num_cats == 0 and bool((s_pids % num_cats == 0).all()):
-        table = params.view(-1, num_cats)
-        rows = s_pids // num_cats
-    else:
-        uniq, rows = torch.unique(s_pids, return_inverse = True)
-        table = params[uniq[:, None] + torch.arange(num_cats, device = device)[None, :]]
-
-    rows_h, t_h = rows.cpu().numpy(), rows_of.cpu().numpy()
-    groups = dict()
-    for t in np.unique(t_h):
-        groups.setdefault(tuple(np.unique(rows_h[t_h == t]).tolist()), []).append(int(t))
-
-    sums = torch.zeros([batch_size, num_targets, num_cats], dtype = weights.dtype, device = device)
-    for key, targets in groups.items():
-        if key[-1] - key[0] + 1 == len(key):
-            tab = table[key[0]:key[-1] + 1]                                  # a contiguous run of rows: a view
-        else:
-            tab = table[torch.tensor(key, device = device)]
-
-        sel = np.nonzero(np.isin(t_h, targets))[0]
-        sel_d = torch.from_numpy(sel).to(device)
-        pos = torch.from_numpy(np.searchsorted(targets, t_h[sel])).to(device)            # target within the group
-        col = torch.from_numpy(np.searchsorted(key, rows_h[sel])).to(device)             # row within the group
-
-        R = torch.zeros([batch_size, len(targets), len(key)], dtype = weights.dtype, device = device)
-        R.index_put_((torch.arange(batch_size, device = device)[:, None], pos[None, :], col[None, :]),
-                     weights[sel_d].t(), accumulate = True)
-        sums[:, targets, :] = (R.view(batch_size * len(targets), len(key)) @ tab).view(batch_size, len(targets), num_cats)
-
-    return sums
 
 
 def backward(layer, inputs: torch.Tensor, node_flows: torch.Tensor, node_mars: torch.Tensor,
@@ -121,17 +78,13 @@ def backward(layer, inputs: torch.Tensor, node_flows: torch.Tensor, node_mars: t
     rows_of = rev_vars_mapping[vids]                                         # every target node's output row
     lvids = vids if layer.var_idmapping is None else layer.var_idmapping[vids]
 
-    # Every target node's weight F(n) / Z_n, shifted per (target, sample) by its largest -- a node no token weighs
-    # (Z_n = 0) contributes nothing
+    # Every target node's weight F(n) / Z_n -- a node no token weighs (Z_n = 0) contributes nothing
     log_z = _log_normalizers(layer, inputs, node_mars, kwargs)[nodes]       # [target nodes, B]
     a = node_flows[sid + nodes] - log_z
     a = torch.where(torch.isneginf(log_z), -float("inf"), a)
-    shift = torch.full([num_target_vars, batch_size], -float("inf"), dtype = a.dtype, device = device)
-    shift = shift.scatter_reduce(0, rows_of[:, None].expand(-1, batch_size), a, reduce = "amax")
-    shift = torch.where(torch.isfinite(shift), shift, 0.0)
-    weights = torch.exp(a - shift[rows_of])
+    weights = target_weights(a, rows_of, num_target_vars)
 
-    sums = _emission_sums(params, layer.s_pids[nodes], rows_of, weights, num_target_vars, num_cats)
+    sums = emission_sums(params, layer.s_pids[nodes], rows_of, weights, num_target_vars, num_cats)
 
     # Every target's evidence row (a target the layer has no node of reads row 0, and its sums are zero)
     lvid_of = torch.zeros([num_target_vars], dtype = torch.long, device = device).scatter_(0, rows_of, lvids)
