@@ -5,7 +5,7 @@ import triton
 import triton.language as tl
 from typing import Optional
 
-from .common import target_nodes
+from .common import layer_facts, targets
 
 
 @triton.jit
@@ -181,12 +181,14 @@ def backward(layer, inputs: torch.Tensor, node_flows: torch.Tensor, node_mars: t
 
     sid, eid = layer._output_ind_range[0], layer._output_ind_range[1]
 
-    num_vars = layer.vids.max().item() + 1
-    num_cats = int(layer.metadata[layer.s_mids + 2].max().item())
+    f = layer_facts(layer)
+    if "discrete_logistic_num_cats" not in f.extra:          # the most categories of any node (metadata's third entry)
+        f.extra["discrete_logistic_num_cats"] = int(layer.metadata[layer.s_mids + 2].max().item())
+    num_cats = f.extra["discrete_logistic_num_cats"]
     batch_size = node_flows.size(1)
 
-    node_ids, rev_vars_mapping, num_target_vars = target_nodes(layer, kwargs.get("target_vars"), num_vars,
-                                                               node_flows.device)
+    t = targets(layer, kwargs.get("target_vars"), node_flows.device)
+    node_ids, rev_vars_mapping, num_target_vars = t.nodes, t.rev_vars_mapping, t.num_targets
     num_target_nodes = node_ids.size(0)
 
     cat_probs = torch.zeros([num_target_vars * num_cats * batch_size], dtype = torch.float32, device = node_flows.device)
