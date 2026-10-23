@@ -20,7 +20,7 @@ import torch
 import pyjuice as juice
 import pyjuice.nodes.distributions as dists
 import pyjuice.queries.decoder.session as session
-from pyjuice.layer import SumLayer
+from pyjuice.layer import InputLayer, SumLayer
 from pyjuice.nodes import inputs, multiply, summate, BlockScaleSumParams, LowRankSumParams
 
 
@@ -187,11 +187,28 @@ MODELS = ["hmm", "hmm_fp32", "hmm_soft", "hclt", "hclt_fp32", "pd", "pd_fp32", "
           "blockscale", "lowrank"]
 
 
+def _restrict_always(monkeypatch):
+    """Input runs and restricted flow fills at any size and coverage (the test circuits are below the sizes they start
+    at, and their calls often fill most of a buffer)."""
+    monkeypatch.setattr(session, "_RUNS_MIN_VALUES", 0)
+    monkeypatch.setattr(session, "_FILL_MIN_VALUES", 0)
+    monkeypatch.setattr(session, "_FILL_WHOLE_FRACTION", 2.0)        # never the whole buffer
+
+
+@pytest.fixture(params = ["default", "always"])
+def restrict(request, monkeypatch):
+    """The session's input runs and restricted fills at their default sizes -- whole layers and whole fills here -- or
+    always."""
+    if request.param == "always":
+        _restrict_always(monkeypatch)
+    return request.param
+
+
 @cuda_only
 @pytest.mark.parametrize("sequence", ["left_to_right", "diffusion", "random", "targets_in_turn"])
 @pytest.mark.parametrize("kind", MODELS)
 @pytest.mark.parametrize("early_stop", [False, True])
-def test_a_session_answers_as_the_queries(kind, sequence, early_stop, monkeypatch):
+def test_a_session_answers_as_the_queries(kind, sequence, early_stop, restrict, monkeypatch):
     pc, V, B, inputs, soft = _model(kind)
     steps = _steps(sequence, B, V, soft, inputs, np.random.default_rng(3))
     want = _queries(pc, steps, inputs)
@@ -285,7 +302,9 @@ def test_repeated_conditionals_through_external_parameter_layers():
 def test_a_left_to_right_step_launches_a_few_layers(monkeypatch):
     """Left to right over an HMM of 24 steps (at fp32, where marginals take cuts): past the first steps, a
     conditional runs at most two sum layers' backwards and two sum layers' forwards (the newly observed variable's
-    emission into its transition), and the marginal after it none."""
+    emission into its transition), the input layer's forward over the one input group of that variable, a pass that
+    fills a fraction of the flows, and the marginal after it none."""
+    _restrict_always(monkeypatch)
     torch.manual_seed(0)
     V = 24
     pc = juice.compile(juice.structures.HMM(seq_length = V, num_latents = 16, num_emits = C), verbose = False,
@@ -301,16 +320,28 @@ def test_a_left_to_right_step_launches_a_few_layers(monkeypatch):
 
     monkeypatch.setattr(SumLayer, "forward", count("forward", fw))
     monkeypatch.setattr(SumLayer, "backward", count("backward", bw))
+    input_runs = []
+    forward_runs = InputLayer._forward_runs
+    monkeypatch.setattr(InputLayer, "_forward_runs",
+                        lambda self, data, node_mars, node_runs, **kw: input_runs.append(list(node_runs)) or
+                        forward_runs(self, data, node_mars, node_runs, **kw))
     x = torch.randint(0, C, (2, V), device = DEV)
     with juice.decoder(pc) as decoder:
         for t in range(V):
             miss = torch.zeros(2, V, dtype = torch.bool, device = DEV)
             miss[:, t:] = True
             before = dict(counts)
+            n_runs = len(input_runs)
+            if t >= 2:
+                pc.node_flows.fill_(float("nan"))
             decoder.conditional(x, missing_mask = miss, target_vars = [t])
             step = {k: counts[k] - before[k] for k in counts}
             if t >= 2:
                 assert step["backward"] <= 2 and step["forward"] <= 2, (t, step)
+                assert len(input_runs) == n_runs + 1 and len(input_runs[-1]) == 1, (t, input_runs[n_runs:])
+                assert input_runs[-1][0][1] - input_runs[-1][0][0] == 16                 # one group, 16 latents
+                untouched = torch.isnan(pc.node_flows).all(dim = 1).float().mean()
+                assert untouched > 0.5, (t, float(untouched))
             before = dict(counts)
             decoder.marginal(x, missing_mask = miss)
             if t >= 2:
@@ -319,12 +350,39 @@ def test_a_left_to_right_step_launches_a_few_layers(monkeypatch):
 
 @cuda_only
 @pytest.mark.parametrize("sequence", ["left_to_right", "diffusion", "random", "targets_in_turn"])
+@pytest.mark.parametrize("kind", ["hmm", "hmm_soft", "hclt", "pd_fp32", "softevi", "blockscale", "lowrank"])
+@pytest.mark.parametrize("early_stop", [False, True])
+def test_a_session_reads_only_the_flows_it_fills(kind, sequence, early_stop, monkeypatch):
+    """A conditional's pass fills (-inf) only the flows it reads before writing them: with both flow buffers poisoned
+    with NaN before every call, the session still answers as the queries."""
+    _restrict_always(monkeypatch)
+    pc, V, B, inputs, soft = _model(kind)
+    steps = _steps(sequence, B, V, soft, inputs, np.random.default_rng(9))
+    want = _queries(pc, steps, inputs)
+    with juice.decoder(pc, early_stop = early_stop, **inputs) as decoder:
+        for i, ((x, miss, query, targets), w) in enumerate(zip(steps, want)):
+            pc.node_flows.fill_(float("nan"))
+            pc.element_flows.fill_(float("nan"))
+            if query == "marginal":
+                g = decoder.marginal(x, missing_mask = miss)
+            else:
+                g = decoder.conditional(x, missing_mask = miss, target_vars = targets)
+            if query == "marginal" and not early_stop:
+                assert torch.equal(g, w), (i, float((g - w).abs().max()))
+            else:
+                assert torch.allclose(g, w, atol = 1e-4 if query == "marginal" else 1e-5, rtol = 1e-5), \
+                    (i, query, float((g - w).abs().max()))
+
+
+@cuda_only
+@pytest.mark.parametrize("sequence", ["left_to_right", "diffusion", "random", "targets_in_turn"])
 @pytest.mark.parametrize("kind", ["hmm", "hclt", "pd_fp32"])
 @pytest.mark.parametrize("early_stop", [False, True])
-def test_the_insides_a_session_holds_valid_are_a_forwards(kind, sequence, early_stop):
+def test_the_insides_a_session_holds_valid_are_a_forwards(kind, sequence, early_stop, restrict):
     """After every call, every inside the planner holds valid is, to the bit, what a forward of the call's evidence
     computes -- a twin circuit's (compiled the same, parameters the same) through `juice.queries.marginal`: the
-    rows a pass seeds or an external-parameter layer shifts are put back, and nothing stale is held valid."""
+    rows a pass seeds or an external-parameter layer shifts are put back, input runs write what the whole layer
+    would, and nothing stale is held valid."""
     pc, V, B, inputs, soft = _model(kind)
     twin = _model(kind)[0]
     steps = _steps(sequence, B, V, soft, inputs, np.random.default_rng(8))

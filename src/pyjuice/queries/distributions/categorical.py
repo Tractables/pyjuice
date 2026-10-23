@@ -5,7 +5,7 @@ import triton
 import triton.language as tl
 from typing import Optional
 
-from .common import emission_sums, layer_facts, target_weights, targets
+from .common import emission_sums, layer_facts, runs as _runs, target_weights, targets
 
 
 # From this many categories (from `MATMUL_MIN_CATS_ONE_TARGET` for a query of one target) the conditional's input-layer
@@ -17,6 +17,9 @@ from .common import emission_sums, layer_facts, target_weights, targets
 # 1.39x; at 64 and below the kernel wins or ties wherever there are several targets.
 MATMUL_MIN_CATS = 256
 MATMUL_MIN_CATS_ONE_TARGET = 128
+
+# `forward` takes `node_runs` (see `queries.distributions`)
+NODE_RUNS = True
 
 
 @triton.jit
@@ -63,7 +66,7 @@ def _soft_evi_categorical_fw_kernel(data_ptr, node_mars_ptr, params_ptr, vids_pt
 
 
 def forward(layer, inputs: torch.Tensor, node_mars: torch.Tensor,
-            missing_mask: Optional[torch.Tensor] = None, **kwargs):
+            missing_mask: Optional[torch.Tensor] = None, node_runs = None, **kwargs):
 
     batch_size, num_vars = inputs.size(0), inputs.size(1)
 
@@ -73,7 +76,7 @@ def forward(layer, inputs: torch.Tensor, node_mars: torch.Tensor,
 
         inputs = inputs.permute(1, 0).contiguous()
 
-        layer.forward(data = inputs, node_mars = node_mars, missing_mask = missing_mask)
+        layer.forward(data = inputs, node_mars = node_mars, missing_mask = missing_mask, node_runs = node_runs)
 
     elif inputs.dim() == 3:
         # Soft evidence
@@ -95,15 +98,17 @@ def forward(layer, inputs: torch.Tensor, node_mars: torch.Tensor,
         num_nodes = eid - sid
 
         node_nchs = layer.metadata[layer.s_mids]
+        soft = inputs.reshape(-1).contiguous()
+        vids = layer.vids.reshape(-1)
 
-        grid = lambda meta: (triton.cdiv(num_nodes * batch_size, meta['BLOCK_SIZE']),)
-
-        _soft_evi_categorical_fw_kernel[grid](
-            inputs.reshape(-1).contiguous(), node_mars, layer.params, layer.vids.reshape(-1), layer.s_pids, node_nchs,
-            sid, num_nodes, num_cats, batch_size, BLOCK_SIZE = 512
-        )
-
-        node_mars[sid:eid,:] = node_mars[sid:eid,:].clip(max = 0.0)
+        # Every run of nodes (`node_runs`) through views that start at it, as `InputLayer._forward_runs` does
+        for start, n in _runs(node_runs, num_nodes):
+            grid = lambda meta: (triton.cdiv(n * batch_size, meta['BLOCK_SIZE']),)
+            _soft_evi_categorical_fw_kernel[grid](
+                soft, node_mars[start:], layer.params, vids[start:], layer.s_pids[start:], node_nchs[start:],
+                sid, n, num_cats, batch_size, BLOCK_SIZE = 512
+            )
+            node_mars[sid + start:sid + start + n,:] = node_mars[sid + start:sid + start + n,:].clip(max = 0.0)
 
     else:
         raise NotImplementedError("Unknown method to compute the forward pass for `Categorical`.")

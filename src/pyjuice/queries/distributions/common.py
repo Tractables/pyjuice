@@ -35,6 +35,19 @@ def layer_facts(layer) -> LayerFacts:
     return facts
 
 
+def runs(node_runs, num_nodes: int):
+    """``[(start, count)]`` of a layer's nodes to compute: every ``(start, end)`` of ``node_runs`` rounded up to a power
+    of two of nodes within the layer, as :meth:`~pyjuice.layer.InputLayer._forward_runs` rounds them; all of them when
+    ``node_runs`` is None."""
+    if node_runs is None:
+        return [(0, num_nodes)]
+    out = []
+    for start, end in node_runs:
+        n = min(1 << max(end - start - 1, 0).bit_length(), num_nodes)
+        out.append((min(start, num_nodes - n), n))
+    return out
+
+
 @dataclass
 class Targets:
     """The input nodes of a layer that a conditional query reads -- those whose (first) variable is a target -- and

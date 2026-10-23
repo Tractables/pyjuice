@@ -5,7 +5,11 @@ import triton
 import triton.language as tl
 from typing import Optional
 
-from .common import layer_facts, targets
+from .common import layer_facts, runs, targets
+
+
+# `forward` takes `node_runs` (see `queries.distributions`)
+NODE_RUNS = True
 
 
 @triton.jit
@@ -65,7 +69,7 @@ def _soft_evi_discrete_logistic_fw_kernel(data_ptr, node_mars_ptr, params_ptr, v
 
 
 def forward(layer, inputs: torch.Tensor, node_mars: torch.Tensor,
-            missing_mask: Optional[torch.Tensor] = None, **kwargs):
+            missing_mask: Optional[torch.Tensor] = None, node_runs = None, **kwargs):
 
     batch_size, num_vars = inputs.size(0), inputs.size(1)
 
@@ -79,7 +83,7 @@ def forward(layer, inputs: torch.Tensor, node_mars: torch.Tensor,
 
         inputs = inputs.permute(1, 0).contiguous()
 
-        layer.forward(data = inputs, node_mars = node_mars, missing_mask = missing_mask)
+        layer.forward(data = inputs, node_mars = node_mars, missing_mask = missing_mask, node_runs = node_runs)
 
     elif inputs.dim() == 3:
         # Soft evidence
@@ -99,16 +103,18 @@ def forward(layer, inputs: torch.Tensor, node_mars: torch.Tensor,
 
         sid, eid = layer._output_ind_range[0], layer._output_ind_range[1]
         num_nodes = eid - sid
+        soft = inputs.reshape(-1).contiguous()
+        vids = layer.vids.reshape(-1)
 
-        grid = lambda meta: (triton.cdiv(num_nodes * batch_size, meta['BLOCK_SIZE']),)
-
-        _soft_evi_discrete_logistic_fw_kernel[grid](
-            inputs.reshape(-1).contiguous(), node_mars, layer.params, layer.vids.reshape(-1), layer.s_pids,
-            layer.s_mids, layer.metadata, sid, num_nodes, num_cats, batch_size,
-            BLOCK_SIZE = 512
-        )
-
-        node_mars[sid:eid,:] = node_mars[sid:eid,:].clip(max = 0.0)
+        # Every run of nodes (`node_runs`) through views that start at it, as `InputLayer._forward_runs` does
+        for start, n in runs(node_runs, num_nodes):
+            grid = lambda meta: (triton.cdiv(n * batch_size, meta['BLOCK_SIZE']),)
+            _soft_evi_discrete_logistic_fw_kernel[grid](
+                soft, node_mars[start:], layer.params, vids[start:], layer.s_pids[start:],
+                layer.s_mids[start:], layer.metadata, sid, n, num_cats, batch_size,
+                BLOCK_SIZE = 512
+            )
+            node_mars[sid + start:sid + start + n,:] = node_mars[sid + start:sid + start + n,:].clip(max = 0.0)
 
     else:
         raise NotImplementedError("Unknown method to compute the forward pass for `DiscreteLogistic`.")

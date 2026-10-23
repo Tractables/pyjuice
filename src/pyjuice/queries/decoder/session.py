@@ -17,7 +17,9 @@ input distributions read (``categorical_evidence_logp``, ...) -- are given when 
 of it; external parameters are staged once, into a buffer of the session's own. The session opens a
 :func:`pyjuice.fast_inference` scope (its options pass through): the circuit's parameters must not change within it.
 
-A call runs its plan by whole layers: a layer whose groups the plan does not touch launches nothing. With
+A call runs its plan by whole layers -- an input layer whose distribution allows it, by the runs of its nodes the call
+recomputes -- and a layer whose groups the plan does not touch launches nothing; its backward fills (-inf) only the
+flows its pass reads before writing them. With
 ``early_stop`` (the default), a conditional starts its top-down pass from stored outsides, and a marginal may sum over
 a cut instead of going up to the root: results agree with the queries' to float rounding. Without it, a marginal is
 the root's value and a conditional's pass starts at the root from its inside, as a full backward does: marginals are
@@ -122,6 +124,26 @@ class _Layout:
         for l in range(len(layers)):
             self.child_prods[l].sort()
 
+        # Input layers: where their nodes start, how many they are, and whether their forward can compute some only
+        self.input_start = np.zeros([len(layers)], dtype = np.int64)
+        self.input_size = np.zeros([len(layers)], dtype = np.int64)
+        self.runs_ok = np.zeros([len(layers)], dtype = bool)
+        # The node flows a backward through a layer reads or adds to before the pass wrote them, as row ranges [a, b): a
+        # sum layer's own rows, a product layer's children's
+        self.fill_nodes = [[] for _ in layers]
+        for l, layer in enumerate(layers):
+            if kind[l] == INPUT:
+                start, end = layer._output_ind_range
+                self.input_start[l], self.input_size[l] = start, end - start
+                self.runs_ok[l] = distributions.takes_node_runs(layer)
+            elif kind[l] == SUM:
+                self.fill_nodes[l] = [tuple(layer.nid_range)]
+            else:
+                gs = np.flatnonzero((self.layer_of == l) & (s.kind == PROD))
+                ch = np.concatenate([s.ch_idx[s.ch_ptr[g]:s.ch_ptr[g + 1]] for g in gs])
+                lo, hi = _union(self.lo[ch], self.hi[ch])
+                self.fill_nodes[l] = list(zip(lo.tolist(), hi.tolist()))
+
     def layers(self, groups, kind):
         """The layers of ``kind`` holding any of ``groups``, ascending."""
         ls = np.unique(self.layer_of[groups])
@@ -151,6 +173,11 @@ class _Rows:
         self.ranges = {}                         # name -> (lo [R], hi [R], segment [R] or None)
         self.sets = {}
         self.meta = {}
+
+    def add_ranges(self, name, lo, hi) -> None:
+        """A set given as row ranges ``[lo, hi)`` (ascending, disjoint) rather than groups."""
+        if lo.size > 0:
+            self.ranges[name] = (lo, hi, None)
 
     def add(self, name, groups, segments = None) -> None:
         lo, hi = self.L.lo[groups], self.L.hi[groups]
@@ -213,6 +240,48 @@ class _Rows:
 
 # The most rows of a set `_Rows` uploads expanded on the host (beyond, its runs, expanded on the device)
 _HOST_ROWS = 1 << 16
+
+# The most runs of an input layer's nodes a call recomputes on their own (beyond, the whole layer, in one launch)
+_MAX_INPUT_RUNS = 4
+
+# Restricting work to what a call needs costs host time; below these sizes the work spared costs less. MEASURED
+# (brezel, HMM 256 x 256, B 16, left to right): finding a call's input runs and launching them took ~20 us more than the
+# whole layer, and its fills ~60 us more than filling both flow buffers -- the GPU time of a whole input layer of
+# ~2^21 node values, and of filling ~2^24 floats. Input runs: from `_RUNS_MIN_VALUES` node values (nodes x B) of an
+# input layer; fills restricted: from `_FILL_MIN_VALUES` flows in the two buffers.
+_RUNS_MIN_VALUES = 1 << 21
+_FILL_MIN_VALUES = 1 << 24
+
+# A flow buffer whose rows to fill are more than this fraction of it is filled whole (one launch)
+_FILL_WHOLE_FRACTION = 0.5
+
+
+def _merge(ranges):
+    """The union of a few row ranges ``[(a, b)]``, ascending and disjoint (plain Python: a call has a handful)."""
+    out = []
+    for a, b in sorted(ranges):
+        if out and a <= out[-1][1]:
+            if b > out[-1][1]:
+                out[-1] = (out[-1][0], b)
+        else:
+            out.append((a, b))
+    return out
+
+
+# The most row ranges of a flow buffer a pass fills one by one (beyond, through one index)
+_MAX_FILL_SLICES = 4
+
+
+def _union(lo: np.ndarray, hi: np.ndarray):
+    """The union of row ranges ``[lo, hi)``, as ascending disjoint ``(lo, hi)``."""
+    if lo.size == 0:
+        return lo, hi
+    order = np.argsort(lo, kind = "stable")
+    lo, hi = lo[order], np.maximum.accumulate(hi[order])
+    start = np.ones([lo.size], dtype = bool)
+    start[1:] = lo[1:] > hi[:-1]
+    first = np.flatnonzero(start)
+    return lo[first], hi[np.append(first[1:], lo.size) - 1]
 
 
 def _get(t: torch.Tensor, rows):
@@ -421,6 +490,27 @@ class Decoder:
         for k in np.unique(ks):
             rows.add(("seeds", int(k)), sums[ks == k])
         rows.add("input_seeds", seeds[s.kind[seeds] == INPUT])
+
+        # The layers the pass runs (for `_backward` too), and the flows to fill (-inf) before it: those its layers read
+        # or add to before writing them (`_Layout.fill_nodes`). What else a pass reads unwritten feeds only groups it
+        # does not visit -- every parent of a visited group is visited or a seed, so a visited product's element flow
+        # comes from sum layers the pass runs -- and nothing reads those groups' flows: element flows and the rest of the
+        # node flows need no fill. Small buffers are filled whole (`_FILL_MIN_VALUES`, `_FILL_WHOLE_FRACTION`); a few
+        # ranges one launch each, more through an index uploaded with the call's other rows.
+        sum_layers = L.layers(np.concatenate([seeds, plan.visited]), SUM)
+        prod_layers = L.layers(plan.visited, PROD)
+        rows.meta["sum_layers"], rows.meta["prod_layers"] = sum_layers, prod_layers
+        rows.meta["fill_nodes"] = rows.meta["fill_elements"] = "all"
+        if (self.pc.num_nodes + self.pc.num_elements) * self.pc.node_mars.size(1) >= _FILL_MIN_VALUES:
+            rows.meta["fill_elements"] = []
+            ranges = _merge([r for l in sum_layers.tolist() + prod_layers.tolist() for r in L.fill_nodes[l]])
+            if sum(b - a for a, b in ranges) > _FILL_WHOLE_FRACTION * self.pc.num_nodes:
+                pass                                                 # most of the buffer: fill all of it
+            elif len(ranges) <= _MAX_FILL_SLICES:
+                rows.meta["fill_nodes"] = ranges
+            else:
+                rows.meta["fill_nodes"] = None
+                rows.add_ranges("fill_nodes", np.array([a for a, _ in ranges]), np.array([b for _, b in ranges]))
         if self.early_stop:
             rows.add("visited", plan.visited[s.kind[plan.visited] != PROD])
             t = np.asarray(targets, dtype = np.int64)
@@ -483,8 +573,9 @@ class Decoder:
         if recompute.size == 0:
             return
         for l in L.layers(recompute, INPUT):
+            runs = self._input_runs(l, recompute)
             distributions.forward(pc.input_layer_group[L.index[l]], data.clone() if data.dim() == 3 else data,
-                                  pc.node_mars, **kwargs)
+                                  pc.node_mars, **(kwargs if runs is None else dict(kwargs, node_runs = runs)))
 
         alg = pc.default_propagation_alg
         sum_opts = dict(kwargs, **pc.propagation_alg_kwargs, precision = pc.precision, pflow_temperature = 1.0)
@@ -496,6 +587,22 @@ class Decoder:
             layer_alg = alg if isinstance(alg, str) else alg[k]
             for l in ls:
                 lg[L.index[l]].forward(pc.node_mars, pc.element_mars, pc.params, propagation_alg = layer_alg, **sum_opts)
+
+    def _input_runs(self, l: int, recompute: np.ndarray):
+        """The runs of input layer ``l``'s nodes that the call recomputes (layer-local ``(start, end)``), or None for the
+        whole layer: a layer whose forward computes all of its nodes, more than `_MAX_INPUT_RUNS` runs, or runs covering
+        most of the layer (one launch over it costs no more)."""
+        L = self._layout
+        if not L.runs_ok[l] or L.input_size[l] * self.pc.node_mars.size(1) < _RUNS_MIN_VALUES:
+            return None
+        gs = recompute[L.layer_of[recompute] == l]
+        if gs.size == 1:                                             # (one group: no union to take)
+            a, b = int(L.lo[gs[0]] - L.input_start[l]), int(L.hi[gs[0]] - L.input_start[l])
+            return [(a, b)] if 2 * (b - a) <= L.input_size[l] else None
+        lo, hi = _union(L.lo[gs] - L.input_start[l], L.hi[gs] - L.input_start[l])
+        if lo.size > _MAX_INPUT_RUNS or 2 * int((hi - lo).sum()) > L.input_size[l]:
+            return None
+        return list(zip(lo.tolist(), hi.tolist()))
 
     def _backward(self, plan, kwargs: dict, scale: torch.Tensor, reuse: bool, rows: _Rows) -> None:
         """The top-down pass of a conditional, in log-space flows: over the layers holding visited groups or seeds.
@@ -509,8 +616,18 @@ class Decoder:
         pc, L = self.pc, self._layout
         s = self._planner.structure
         B = pc.node_mars.size(1)
-        pc._init_buffer(name = "node_flows", shape = (pc.num_nodes, B), set_value = -float("inf"))
-        pc._init_buffer(name = "element_flows", shape = (pc.num_elements, B), set_value = -float("inf"))
+        for name, size, fill in (("node_flows", pc.num_nodes, "fill_nodes"),
+                                 ("element_flows", pc.num_elements, "fill_elements")):    # (see `_conditional_rows`)
+            ranges = rows.meta[fill]
+            if ranges == "all":
+                pc._init_buffer(name = name, shape = (size, B), set_value = -float("inf"))
+                continue
+            pc._init_buffer(name = name, shape = (size, B))
+            if ranges is None:
+                _put(pc.__dict__[name], rows.get(fill), -float("inf"))
+            else:
+                for a, b in ranges:
+                    pc.__dict__[name][a:b] = -float("inf")
         nf, nm = pc.node_flows, pc.node_mars
 
         root = s.root
@@ -523,9 +640,9 @@ class Decoder:
         # Every layer group holding work, top-down: a product group's layers with visited groups, a sum group's with
         # visited groups or seeds
         work = {}
-        for ls in L.by_group(L.layers(np.concatenate([plan.seeds, plan.visited]), SUM)):
+        for ls in L.by_group(rows.meta["sum_layers"]):
             work[int(L.group[ls[0]])] = ls
-        for ls in L.by_group(L.layers(plan.visited, PROD)):
+        for ls in L.by_group(rows.meta["prod_layers"]):
             work[int(L.group[ls[0]])] = ls
         for k in sorted(work, reverse = True):
             lg, ls = pc.inner_layer_groups[k], work[k]
