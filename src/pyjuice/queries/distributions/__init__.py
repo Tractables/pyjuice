@@ -13,13 +13,14 @@ A layer whose distribution has no module here is refused: the query then needs i
 ``bk_input_fn``.
 """
 
-from . import categorical, discrete_logistic, external_categorical
+from . import categorical, discrete_logistic, external_categorical, softevi_categorical
 
 
 MODULES = {
     "Categorical": categorical,
     "DiscreteLogistic": discrete_logistic,
     "ExternProductCategorical": external_categorical,
+    "ExternSoftEvidenceCategorical": softevi_categorical,
 }
 
 
