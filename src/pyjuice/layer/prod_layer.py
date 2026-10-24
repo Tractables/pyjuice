@@ -160,7 +160,8 @@ class ProdLayer(Layer, nn.Module):
         self.partitioned_u_cids = FastParamList([nn.Parameter(tensor, requires_grad = False) for tensor in u_cids])
         self.partitioned_parids = FastParamList([nn.Parameter(tensor, requires_grad = False) for tensor in parids])
 
-    def forward(self, node_mars: torch.Tensor, element_mars: torch.Tensor, **kwargs) -> None:
+    def forward(self, node_mars: torch.Tensor, element_mars: torch.Tensor,
+                partition_runs: Optional[Sequence] = None, **kwargs) -> None:
         """
         Computes the forward pass of a product layer. If `block_size == 1`, it is equivalent to the following:
         ```
@@ -168,21 +169,28 @@ class ProdLayer(Layer, nn.Module):
         ```
 
         Parameters:
-        `node_mars`:    [num_nodes, B]
-        `element_mars`: [max_num_els, B]
+        `node_mars`:      [num_nodes, B]
+        `element_mars`:   [max_num_els, B]
+        `partition_runs`: None (every partition), or per forward partition the rows of its tables to compute --
+                          None for all of them, else ascending disjoint `(start, end)` ranges (none: skipped) --,
+                          every other row of `element_mars` left as it is (see `_forward_backward`)
         """
 
         for partition_id in range(self.num_fw_partitions):
+            runs = None if partition_runs is None else partition_runs[partition_id]
+            if runs is not None and len(runs) == 0:
+                continue
             nids = self.partitioned_nids[partition_id]
             cids = self.partitioned_cids[partition_id]
 
             self._forward_backward(
-                element_mars, node_mars, nids, cids, accum = False
+                element_mars, node_mars, nids, cids, accum = False, runs = runs
             )
 
         return None
 
-    def backward(self, node_flows: torch.Tensor, element_flows: torch.Tensor, logspace_flows: bool = False, **kwargs) -> None:
+    def backward(self, node_flows: torch.Tensor, element_flows: torch.Tensor, logspace_flows: bool = False,
+                 partition_runs: Optional[Sequence] = None, **kwargs) -> None:
         """
         Computes the backward pass of a product layer:
         ```
@@ -190,16 +198,21 @@ class ProdLayer(Layer, nn.Module):
         ```
 
         Parameters:
-        `node_flows`:    [num_nodes, B]
-        `element_flows`: [max_num_els, B]
+        `node_flows`:     [num_nodes, B]
+        `element_flows`:  [max_num_els, B]
+        `partition_runs`: None, or per backward partition the rows of its tables (`partitioned_u_cids` /
+                          `partitioned_parids`) to compute, as in `forward`
         """
         
         for partition_id in range(self.num_bk_partitions):
+            runs = None if partition_runs is None else partition_runs[partition_id]
+            if runs is not None and len(runs) == 0:
+                continue
             u_cids = self.partitioned_u_cids[partition_id]
             parids = self.partitioned_parids[partition_id]
 
             self._forward_backward(node_flows, element_flows, u_cids, parids, accum = True,
-                                   prop_logsumexp = logspace_flows)
+                                   prop_logsumexp = logspace_flows, runs = runs)
         
         return None
 
@@ -211,7 +224,15 @@ class ProdLayer(Layer, nn.Module):
 
     def _forward_backward(self, node_vals: torch.Tensor, element_vals: torch.Tensor,
                           nids: torch.Tensor, cids: torch.Tensor,
-                          accum: bool = False, prop_logsumexp: bool = False) -> None:
+                          accum: bool = False, prop_logsumexp: bool = False,
+                          runs: Optional[Sequence] = None) -> None:
+        """
+        One partition's pass: `node_vals[nids]` from `element_vals[cids]`. With `runs` -- `(start, end)` ranges of the
+        rows of `nids` / `cids` -- only those rows' node blocks, every other row of `node_vals` left as it is. Every
+        decision is the whole partition's (its tile tuned on all of it, timed on a scratch output) and only the rows
+        and the grid are the run's: a program reduces over its own node block's edges alone, so each row gets the
+        bits the whole partition's launch gives it.
+        """
         tot_n_nodes = node_vals.size(0)
         tot_n_eles = element_vals.size(0)
         n_nblocks = nids.size(0)
@@ -228,25 +249,30 @@ class ProdLayer(Layer, nn.Module):
             BLOCK_N = 2048
             BLOCK_B = 1
 
-            grid = (n_nblocks * self.block_size, batch_size)
+            def _launch_large(part_nids, part_cids, n):
+                kernels._forward_backward_kernel_large[(n * self.block_size, batch_size)](
+                    node_vals_ptr = node_vals,
+                    element_vals_ptr = element_vals,
+                    nids_ptr = part_nids,
+                    cids_ptr = part_cids,
+                    tot_n_nodes = tot_n_nodes,
+                    tot_n_eles = tot_n_eles,
+                    n_nblocks = n,
+                    num_edges = num_edges,
+                    batch_size = batch_size,
+                    BLOCK_N = BLOCK_N,
+                    BLOCK_B = BLOCK_B,
+                    N_NUM_BLKS = host_cdiv(num_edges, BLOCK_N),
+                    block_size = block_size,
+                    accum = accum,
+                    prop_logsumexp = prop_logsumexp
+                )
             
-            kernels._forward_backward_kernel_large[grid](
-                node_vals_ptr = node_vals, 
-                element_vals_ptr = element_vals,
-                nids_ptr = nids, 
-                cids_ptr = cids, 
-                tot_n_nodes = tot_n_nodes,
-                tot_n_eles = tot_n_eles,
-                n_nblocks = n_nblocks,
-                num_edges = num_edges,
-                batch_size = batch_size, 
-                BLOCK_N = BLOCK_N, 
-                BLOCK_B = BLOCK_B, 
-                N_NUM_BLKS = host_cdiv(num_edges, BLOCK_N), 
-                block_size = block_size, 
-                accum = accum, 
-                prop_logsumexp = prop_logsumexp
-            )
+            if runs is None:
+                _launch_large(nids, cids, n_nblocks)
+            else:
+                for a, b in runs:
+                    _launch_large(nids[a:b], cids[a:b], b - a)
 
             return None
 
@@ -262,17 +288,17 @@ class ProdLayer(Layer, nn.Module):
             if batch_size < 64:
                 BLOCK_M = min(BLOCK_M, _SMALL_BATCH_PROD_TILE_M)
 
-            def _launch_2d(cfg, out):
+            def _launch_2d(cfg, out, part_nids = nids, part_cids = cids, n = n_nblocks):
                 bm, bb = cfg
-                grid = (host_cdiv(n_nblocks * self.block_size, bm), host_cdiv(batch_size, bb))
+                grid = (host_cdiv(n * self.block_size, bm), host_cdiv(batch_size, bb))
                 kernels._forward_backward_kernel_2d[grid](
                     node_vals_ptr = out,
                     element_vals_ptr = element_vals,
-                    nids_ptr = nids,
-                    cids_ptr = cids,
+                    nids_ptr = part_nids,
+                    cids_ptr = part_cids,
                     tot_n_nodes = tot_n_nodes,
                     tot_n_eles = tot_n_eles,
-                    n_nblocks = n_nblocks,
+                    n_nblocks = n,
                     num_edges = num_edges,
                     batch_size = batch_size,
                     BLOCK_M = bm,
@@ -293,7 +319,8 @@ class ProdLayer(Layer, nn.Module):
 
             # `accum` makes the output read-accumulate-write, so the timing runs must go to a
             # scratch buffer; without it the kernel just overwrites `node_vals` with the same values
-            # it is about to write anyway, so it can be timed in place.
+            # it is about to write anyway, so it can be timed in place -- but for a launch of some rows
+            # (`runs`), which must leave the others as they are: it times the whole partition on scratch.
             key = (kernels._forward_backward_kernel_2d, n_nblocks, num_edges, block_size,
                    batch_size, accum, prop_logsumexp, default_cfg)
             cfg = autotune.cached(key)
@@ -313,38 +340,44 @@ class ProdLayer(Layer, nn.Module):
                 # being captured, so gating on `cached` alone allocated a `node_vals`-sized clone on
                 # every call in those cases. NB this is inline, not inside a config helper -- it must
                 # fall through to the launch below, not return.
-                if accum and not autotune.should_tune(key, len(cfgs)):
+                on_scratch = accum or runs is not None
+                if on_scratch and not autotune.should_tune(key, len(cfgs)):
                     cfg = cfgs[0]
                 else:
-                    bench_out = node_vals if not accum else autotune.scratch_like(node_vals)
+                    bench_out = node_vals if not on_scratch else autotune.scratch_like(node_vals)
                     cfg = cfgs[0] if bench_out is None else \
                         autotune.pick(key, cfgs, lambda c: _launch_2d(c, bench_out))
                     del bench_out
 
-            _launch_2d(cfg, node_vals)
+            if runs is None:
+                _launch_2d(cfg, node_vals)
+            else:
+                for a, b in runs:
+                    _launch_2d(cfg, node_vals, nids[a:b], cids[a:b], b - a)
 
         else:
 
             BLOCK_B = min(1024 // num_edges, host_next_power_of_2(batch_size))
             BLOCK_M = min(max(1024 // (BLOCK_B * num_edges), 1), host_next_power_of_2(n_nblocks) * self.block_size)
 
-            grid = (host_cdiv(n_nblocks * self.block_size, BLOCK_M), host_cdiv(batch_size, BLOCK_B))
+            for part_nids, part_cids in ([(nids, cids)] if runs is None else [(nids[a:b], cids[a:b]) for a, b in runs]):
+                grid = (host_cdiv(part_nids.size(0) * self.block_size, BLOCK_M), host_cdiv(batch_size, BLOCK_B))
 
-            kernels._forward_backward_kernel_3d[grid](
-                node_vals_ptr = node_vals, 
-                element_vals_ptr = element_vals,
-                nids_ptr = nids, 
-                cids_ptr = cids, 
-                tot_n_nodes = tot_n_nodes,
-                tot_n_eles = tot_n_eles,
-                n_nblocks = n_nblocks,
-                num_edges = num_edges,
-                batch_size = batch_size,
-                BLOCK_M = BLOCK_M, 
-                BLOCK_B = BLOCK_B,
-                block_size = block_size,
-                accum = accum,
-                prop_logsumexp = prop_logsumexp
-            )
+                kernels._forward_backward_kernel_3d[grid](
+                    node_vals_ptr = node_vals,
+                    element_vals_ptr = element_vals,
+                    nids_ptr = part_nids,
+                    cids_ptr = part_cids,
+                    tot_n_nodes = tot_n_nodes,
+                    tot_n_eles = tot_n_eles,
+                    n_nblocks = part_nids.size(0),
+                    num_edges = num_edges,
+                    batch_size = batch_size,
+                    BLOCK_M = BLOCK_M,
+                    BLOCK_B = BLOCK_B,
+                    block_size = block_size,
+                    accum = accum,
+                    prop_logsumexp = prop_logsumexp
+                )
 
         return None

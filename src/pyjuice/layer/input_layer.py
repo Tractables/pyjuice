@@ -9,7 +9,7 @@ import triton.language as tl
 import textwrap
 import inspect
 import random
-from typing import Sequence, Dict, Optional
+from typing import Sequence, Dict, Optional, Tuple
 from triton.runtime.jit import JITFunction
 from copy import deepcopy
 from functools import reduce
@@ -300,6 +300,10 @@ class InputLayer(Layer, nn.Module):
         for i in range(len(self.tied2source_nids)):
             self.tied2source_nids[i][2] = self.tied2source_nids[i][2].to(device)
 
+        # Allocated by a backward as a plain attribute, so `nn.Module.to` does not move it
+        if self.param_flows is not None:
+            self.param_flows = self.param_flows.to(device)
+
         self.device = device
 
     def _ensure_fast_inference_params(self, kwargs = None):
@@ -392,8 +396,13 @@ class InputLayer(Layer, nn.Module):
         return self._bk_cuda_ok
 
     def forward(self, data: torch.Tensor, node_mars: torch.Tensor, params: Optional[Dict] = None,
-                missing_mask: Optional[torch.Tensor] = None, _batch_first: bool = True, 
-                _apply_missing_mask_only: bool = False, **kwargs):
+                missing_mask: Optional[torch.Tensor] = None, _batch_first: bool = True,
+                _apply_missing_mask_only: bool = False, node_runs: Optional[Sequence[Tuple[int, int]]] = None,
+                **kwargs):
+        if node_runs is not None:
+            return self._forward_runs(data, node_mars, node_runs, params = params, missing_mask = missing_mask,
+                                      _batch_first = _batch_first, **kwargs)
+
         self._used_external_params = (params is not None)
 
         if params is None:
@@ -494,6 +503,82 @@ class InputLayer(Layer, nn.Module):
 
         else:
             raise NotImplementedError("CPU forward fn for input nodes is not implemented.")
+
+    def _forward_runs(self, data: torch.Tensor, node_mars: torch.Tensor, node_runs: Sequence[Tuple[int, int]],
+                      params: Optional[Dict] = None, missing_mask: Optional[torch.Tensor] = None,
+                      _batch_first: bool = True, **kwargs):
+        """
+        `forward` for the nodes in `node_runs` only -- `(start, end)` ranges of the layer's nodes (layer-local ids):
+        the same two kernels, launched per run on views of the per-node tables and of `node_mars` that start at it,
+        so every node they write gets the bits the whole layer's launch gives it. The kernels take the node count as a
+        constant, so a run is rounded up to a power of two of nodes within the layer: it may recompute nodes next to
+        it, from the same data, to the same values. Distributions with post-processing kernels (whose launches cover
+        the whole layer) run their whole layer.
+        """
+        if self.post_fw_fns:
+            raise ValueError(f"`node_runs`: a {type(self.dist).__name__} layer runs post-processing kernels over all "
+                             f"of its nodes; run its whole layer.")
+        self._used_external_params = (params is not None)
+        if "cuda" not in self.device.type:
+            raise NotImplementedError("CPU forward fn for input nodes is not implemented.")
+
+        data = data.reshape(-1).contiguous()
+        batch_size = node_mars.size(1)
+        node_offset = self._output_ind_range[0]
+        layer_num_nodes = self._output_ind_range[1] - self._output_ind_range[0]
+
+        if not self._mars_kernel_built:
+            if self.fw_mar_fn is not None:
+                self._mars_kernel = self._compile_triton_kernel(self._mars_kernel_template, mar_fn = self.fw_mar_fn)
+            else:
+                self._mars_kernel = None
+            self._mars_kernel_built = True
+        self._ensure_fast_inference_params(kwargs)
+
+        if missing_mask is not None:
+            assert self.num_vars_per_node == 1, "`missing_mask` only supported for univariate distributions."
+            if missing_mask.dim() == 1:
+                mode = 0
+            elif _batch_first or self.pc_num_vars == missing_mask.size(1):
+                mode = 1
+            else:
+                mode = 2
+
+        for start, end in node_runs:
+            num_nodes = min(triton.next_power_of_2(end - start), layer_num_nodes)
+            start = min(start, layer_num_nodes - num_nodes)
+            grid = (triton.cdiv(num_nodes * batch_size, 1024),)
+            # The kernels write row `node_offset + i` of `node_mars` for node `i` of the tables they are given
+            if self._mars_kernel is not None:
+                self._mars_kernel[grid](
+                    params_ptr = self.params,
+                    node_mars_ptr = node_mars[start:],
+                    data_ptr = data,
+                    vids_ptr = self.vids[start:],
+                    s_pids_ptr = self.s_pids[start:],
+                    metadata_ptr = self.metadata,
+                    s_mids_ptr = self.s_mids[start:],
+                    layer_num_nodes = num_nodes,
+                    batch_size = batch_size,
+                    num_vars_per_node = self.num_vars_per_node,
+                    nv_block_size = triton.next_power_of_2(self.num_vars_per_node),
+                    node_offset = node_offset,
+                    BLOCK_SIZE = 1024,
+                    num_warps = 8
+                )
+            if missing_mask is not None:
+                self._fw_missing_mask_kernel[grid](
+                    missing_mask_ptr = missing_mask,
+                    node_mars_ptr = node_mars[start:],
+                    vids_ptr = self.vids[start:],
+                    num_vars = self.pc_num_vars,
+                    layer_num_nodes = num_nodes,
+                    batch_size = batch_size,
+                    node_offset = node_offset,
+                    BLOCK_SIZE = 1024,
+                    mode = mode,
+                    num_warps = 8
+                )
 
     def _fw_launch_common(self, data: torch.Tensor, node_mars: torch.Tensor):
         """The launch arguments every forward post-processing kernel shares, for a flattened `data` and a
@@ -683,8 +768,10 @@ class InputLayer(Layer, nn.Module):
             self._run_post(self.post_bp_fns, kwargs, bk_launch_common)
             kwargs.pop("_bk_launch_common", None)
 
-            # Handle the masked input nodes
-            if missing_mask is not None and self.bk_flow_mask_fn is not None:
+            # Handle the masked input nodes: their flows go to the parameter flows only, so there is nothing to do
+            # without them (`backward(compute_param_flows = False)` never allocates `param_flows`, and the kernel
+            # would not compile against None)
+            if missing_mask is not None and self.bk_flow_mask_fn is not None and self.param_flows is not None:
                 self._backward_missing(node_flows, missing_mask, missing_mask_mode, num_vars,
                                        logspace_flows)
         else:

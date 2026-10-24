@@ -13,15 +13,17 @@ except Exception:  # pragma: no cover - guards across triton versions
     class _TritonOutOfResources(Exception):
         pass
 from copy import deepcopy
-from typing import Sequence, List, Optional
+from typing import Sequence, List, Optional, Tuple
 
 from pyjuice.nodes import SumNodes
 from pyjuice.utils.parameter_list import FastParamList
 from pyjuice.utils.util import host_cdiv, host_next_power_of_2
 from .kernels import sum_forward_block_sparse as fw_bsparse
+from .kernels import sum_forward_block_sparse_fused as fw_fused
 from .kernels import sum_forward_sparse as fw_sparse
 from .kernels import sum_backward_node_flows as bk_nflows
 from .kernels import sum_backward_element_block_sparse as bk_ele_bsparse
+from .kernels import sum_backward_element_block_sparse_fused as bk_ele_fused
 from .kernels import sum_backward_element_sparse as bk_ele_sparse
 from .kernels import sum_backward_param_block_sparse as bk_par_bsparse
 from .kernels import sum_backward_param_sparse as bk_par_sparse
@@ -450,11 +452,19 @@ class SumLayer(Layer, nn.Module):
 
     def to(self, device):
         super(SumLayer, self).to(device)
+        self._drop_device_caches()
+        return self
 
-        # Move cached fw pcids to the new device
-        for k, v in self._cached_fw_pcids.items():
-            new_v = [tensor.to(device) for tensor in v]
-            self._cached_fw_compiled_pcids[k] = new_v
+    def _drop_device_caches(self) -> None:
+        """Forget the tensors derived from the layer's tables (index tables, CUDA operands, scratch buffers), to be
+        rebuilt on the tables' device by the next pass: after the tables moved, those would point at the old device.
+        What the caches keep of the host only (tuning choices, dense plans) stays."""
+        for cache in (self._cached_fw_pcids, self._cached_fw_cuda, self._cached_fw_sb, self._cached_bk_parids,
+                      self._cached_bk_ele_cuda, self._cached_bk_ele_sb, self._cached_bk_par_cuda,
+                      self._cached_bk_par_trim):
+            cache.clear()
+        self._bk_ele_scratch = None
+        self._bk_par_scratch = None
 
     @property
     def num_parameters(self):
@@ -470,14 +480,26 @@ class SumLayer(Layer, nn.Module):
 
     def forward(self, node_mars: torch.Tensor, element_mars: torch.Tensor, params: torch.Tensor,
                 propagation_alg: str = "LL", pflow_temperature: float = 1.0, precision: str = "auto",
+                partition_runs: Optional[Sequence] = None, compute_children: Optional[Tuple[torch.Tensor, int]] = None,
                 **kwargs) -> None:
         """
         Computes the forward pass of a sum layer.
 
         Parameters:
-        `node_mars`:    [num_nodes, B]
-        `element_mars`: [max_num_els, B]
-        `params`:       [num_params, B] or [num_params]
+        `node_mars`:      [num_nodes, B]
+        `element_mars`:   [max_num_els, B]
+        `params`:         [num_params, B] or [num_params]
+        `partition_runs`: None (every partition), or per forward partition the rows of its tables
+                          (`partitioned_nids` / `partitioned_cids` / `partitioned_pids`) to compute -- None for all
+                          of them, else ascending disjoint `(start, end)` ranges (none: skipped) --, every other row
+                          of `node_mars` left as it is. Each row gets the bits the whole partition's launch gives
+                          it: every decision is the whole partition's, only the rows and the grid the runs'. A
+                          partition `forward_runs_ok` refuses runs whole.
+        `compute_children`: None, or the product layer group below's `(table, first_row)` of every element row's
+                          child node rows (`pyjuice.layer.fused_children.element_children`): the children's element
+                          values may be stale, and every partition forms them itself from `node_mars` (the fused
+                          kernel of the `tlmm` regime; nothing is written to `element_mars`). Only for a layer whose
+                          every partition `fuses_children` at this batch; another raises.
         """
         assert not (propagation_alg != "LL" and abs(pflow_temperature - 1.0) > 1e-6), "`pflow_temperature` can only be 1 if `propagation_alg` is not 'LL'."
         if precision not in PRECISIONS:
@@ -486,6 +508,9 @@ class SumLayer(Layer, nn.Module):
             _pop_removed_precision_flags(kwargs)
 
         for partition_id in range(self.num_fw_partitions):
+            runs = None if partition_runs is None else partition_runs[partition_id]
+            if runs is not None and len(runs) == 0:
+                continue
             nids = self.partitioned_nids[partition_id]
             cids = self.partitioned_cids[partition_id]
             pids = self.partitioned_pids[partition_id]
@@ -493,10 +518,154 @@ class SumLayer(Layer, nn.Module):
             self._forward(
                 node_mars, element_mars, params, nids, cids, pids, 
                 partition_id = partition_id, propagation_alg = propagation_alg, 
-                pflow_temperature = pflow_temperature, precision = precision, **kwargs
+                pflow_temperature = pflow_temperature, precision = precision, runs = runs,
+                children = compute_children, **kwargs
             )
 
         return None
+
+    def _fw_block_sparse_tiles(self, num_edges: int, batch_size: int, propagation_alg_id: int,
+                               pflow_tempered_enabled: bool):
+        """The block-sparse forward's tile heuristic, ``(TILE_SIZE_K, TILE_SIZE_M, BLOCK_B)`` for a partition of
+        ``num_edges`` at ``batch_size`` -- shared by `_forward_block_sparse` and `fuses_children`, memoized per
+        shape (`_fw_tuning_oom`, which it reads, only ever turns on, so its entries are dropped then)."""
+        key = (num_edges, batch_size, propagation_alg_id, pflow_tempered_enabled)
+        cache = self.__dict__.setdefault("_fw_tiles_memo", {})
+        tiles = cache.get(key)
+        if tiles is not None:
+            return tiles
+        tiles = self._fw_block_sparse_tiles_compute(num_edges, batch_size, propagation_alg_id, pflow_tempered_enabled)
+        cache[key] = tiles
+        return tiles
+
+    def _fw_block_sparse_tiles_compute(self, num_edges: int, batch_size: int, propagation_alg_id: int,
+                                       pflow_tempered_enabled: bool):
+        BATCH_SIZE_NP2 = host_next_power_of_2(batch_size)
+        if batch_size < 16 and self.block_size >= _SMALL_BATCH_MIN_BLOCK_SIZE:
+            # Small-batch path (the `else` below is the unchanged >=16 heuristic). That heuristic
+            # ties TILE_SIZE_K to BATCH_SIZE_NP2, which collapses to 1-2 huge node-tiles at tiny
+            # batch -> ~1 SM busy and a >10x slowdown. Instead keep a normal edge tile and split the
+            # node dimension into many small tiles (high SM occupancy); the batch is a short, masked
+            # inner dim (BLOCK_B = BATCH_SIZE_NP2 < 16 -> no tensor-core dot, full fp32).
+            TILE_SIZE_K = min(64, num_edges)
+            while num_edges % TILE_SIZE_K != 0:
+                TILE_SIZE_K //= 2
+            TILE_SIZE_M = min(_SMALL_BATCH_FW_TILE_M, self.block_size)
+            BLOCK_B = BATCH_SIZE_NP2
+        else:
+            base_size = min(self.block_size, num_edges, BATCH_SIZE_NP2, 128)
+            if base_size >= 64:
+                TILE_SIZE_K = min(2048 // 32, num_edges)
+            else:
+                remainder = 2048 // (base_size ** 2)
+                TILE_SIZE_K = min(2048 // remainder, base_size * remainder, num_edges)
+            # Larger TILE_SIZE_M / BLOCK_B (bit-exact) amortize the per-m-tile recomputation of
+            # `emars_max` / `exp` / the `emars` load and the per-batch-tile `epars` load. Gated to the
+            # LL (non-tempered) regime that was validated bit-exact; auto-disabled on a prior OOM.
+            _fw_tile_cap = 4096 if (FORWARD_SUM_TUNED and not getattr(self, "_fw_tuning_oom", False)
+                                    and propagation_alg_id == 0 and not pflow_tempered_enabled) else 2048
+            TILE_SIZE_M = min(_fw_tile_cap // TILE_SIZE_K, self.block_size)
+            BLOCK_B = min(_fw_tile_cap // TILE_SIZE_K, BATCH_SIZE_NP2)
+        return TILE_SIZE_K, TILE_SIZE_M, BLOCK_B
+
+    def fuses_children(self, batch_size: int, propagation_alg: str = "LL", pflow_temperature: float = 1.0,
+                       params_dim: int = 1, is_cuda: bool = True) -> List[bool]:
+        """Per forward partition, whether `forward(compute_children = table)` forms the children's element values
+        itself: the block-sparse mode in the `tlmm` regime (tiles of at least 16: a tensor-core dot), LL propagation
+        without tempering, off the dense cuBLAS path -- the fused kernel's regime, and the one every circuit of size
+        runs. Elsewhere the caller computes the children (the product layers' forward) as always."""
+        if propagation_alg != "LL" or abs(pflow_temperature - 1.0) > 1e-6 or params_dim != 1:
+            return [False] * self.num_fw_partitions
+        out = []
+        for partition_id in range(self.num_fw_partitions):
+            cids = self.partitioned_cids[partition_id]
+            num_edges = cids.size(1)
+            block_sparse = (self.block_size >= 16 and num_edges >= 16 and batch_size >= 16) or \
+                           (self.block_size >= _SMALL_BATCH_MIN_BLOCK_SIZE and num_edges >= 16)
+            if not block_sparse:
+                out.append(False)
+                continue
+            if is_cuda and self.block_size >= _DENSE_MIN_BLOCK_SIZE and batch_size >= 16:
+                dense = self._dense_blocks(partition_id, self.partitioned_nids[partition_id], cids,
+                                           self.partitioned_pids[partition_id])
+                if dense is not None and dense[1] * batch_size >= _DENSE_MIN_WORK:
+                    out.append(False)
+                    continue
+            tk, tm, bb = self._fw_block_sparse_tiles(num_edges, batch_size, 0, False)
+            out.append(tm >= 16 and tk >= 16 and bb >= 16)
+        return out
+
+    def _bk_ele_tiles(self, num_edges: int, cs_block_size: int, batch_size: int, propagation_alg_id: int = 0,
+                      eflow_temperature: float = 1.0):
+        """The block-sparse element-flow backward's tile heuristic, ``(TILE_SIZE_K, TILE_SIZE_M, BLOCK_B)`` for a
+        partition of ``num_edges`` (parents x block size) and child blocks of ``cs_block_size`` at ``batch_size``,
+        the node tile doubled where `BACKWARD_ELE_FLOW_TUNED` does -- shared by `_backward_block_sparse_ele_flows`
+        and `fuses_children_backward`, memoized per shape."""
+        key = (num_edges, cs_block_size, batch_size, propagation_alg_id, eflow_temperature)
+        cache = self.__dict__.setdefault("_bk_tiles_memo", {})
+        tiles = cache.get(key)
+        if tiles is not None:
+            return tiles
+        tiles = self._bk_ele_tiles_compute(num_edges, cs_block_size, batch_size, propagation_alg_id, eflow_temperature)
+        cache[key] = tiles
+        return tiles
+
+    def _bk_ele_tiles_compute(self, num_edges: int, cs_block_size: int, batch_size: int, propagation_alg_id: int,
+                              eflow_temperature: float):
+        BATCH_SIZE_NP2 = host_next_power_of_2(batch_size)
+        if batch_size < 16 and self.block_size >= _SMALL_BATCH_MIN_BLOCK_SIZE:
+            # Small-batch path (mirrors the forward; the `else` is the unchanged >=16 heuristic). Keep
+            # a normal edge tile and split the child-node dimension into many small tiles for high SM
+            # occupancy; the batch is a short masked inner dim (no tensor-core dot).
+            TILE_SIZE_K = min(64, num_edges)
+            while num_edges % TILE_SIZE_K != 0:
+                TILE_SIZE_K //= 2
+            TILE_SIZE_M = min(_SMALL_BATCH_ELE_TILE_M, cs_block_size)
+            BLOCK_B = BATCH_SIZE_NP2
+        else:
+            TILE_SIZE_K, TILE_SIZE_M, BLOCK_B = self._ele_tile_family(num_edges, cs_block_size, BATCH_SIZE_NP2)
+        # Bit-exact tuning: a larger TILE_SIZE_M (element-output tiling only -> identical results)
+        # improves throughput in the LL block-sparse-dot regime. See BACKWARD_ELE_FLOW_TUNED.
+        if BACKWARD_ELE_FLOW_TUNED and propagation_alg_id == 0 and abs(eflow_temperature - 1.0) < 1e-6 \
+                and TILE_SIZE_M >= 16 and TILE_SIZE_K >= 16 and BLOCK_B >= 16 and 2 * TILE_SIZE_M <= cs_block_size:
+            TILE_SIZE_M = 2 * TILE_SIZE_M
+        return TILE_SIZE_K, TILE_SIZE_M, BLOCK_B
+
+    def fuses_children_backward(self, batch_size: int, propagation_alg: str = "LL", temper_eflow: bool = False,
+                                params_dim: int = 1) -> List[bool]:
+        """Per backward partition, whether `backward(compute_children = table)` forms its child elements' values
+        itself: the block-sparse mode with the plain element-flow kernel (tiles of at least 8), LL propagation
+        without tempering, no external parameterization (whose backward owns the element flows)."""
+        if propagation_alg != "LL" or temper_eflow or params_dim != 1 \
+                or getattr(self, "external_params", None) is not None:    # an external-parameter layer
+            return [False] * self.num_bk_partitions
+        out = []
+        for partition_id in range(self.num_bk_partitions):
+            num_edges = self.partitioned_parids[partition_id].size(1) * self.block_size
+            cs_block_size = self.cs_block_sizes[partition_id]
+            block_sparse = (self.block_size >= 16 and num_edges >= 16 and batch_size >= 16) or \
+                           (self.block_size >= _SMALL_BATCH_MIN_BLOCK_SIZE and num_edges >= 16)
+            if not block_sparse:
+                out.append(False)
+                continue
+            tk, tm, bb = self._bk_ele_tiles(num_edges, cs_block_size, batch_size)
+            out.append(tm >= 8 and tk >= 8 and bb >= 8)
+        return out
+
+    def forward_runs_ok(self, batch_size: int, propagation_alg: str = "LL", pflow_temperature: float = 1.0,
+                        is_cuda: bool = True) -> List[bool]:
+        """Per forward partition, whether its forward computes some of its rows only (`partition_runs`) at
+        ``batch_size``: all but those the dense cuBLAS path takes as one batched product (`_forward_dense`), whose
+        batch of node blocks a subset would change -- and with it the product's bits."""
+        dense = (propagation_alg == "LL" and abs(pflow_temperature - 1.0) < 1e-6 and is_cuda
+                 and self.block_size >= _DENSE_MIN_BLOCK_SIZE and batch_size >= 16)
+        ok = []
+        for partition_id in range(self.num_fw_partitions):
+            plan = self._dense_blocks(partition_id, self.partitioned_nids[partition_id],
+                                      self.partitioned_cids[partition_id],
+                                      self.partitioned_pids[partition_id]) if dense else None
+            ok.append(not (plan is not None and plan[1] * batch_size >= _DENSE_MIN_WORK and plan[3] > 1))
+        return ok
 
     def backward(self, node_flows: torch.Tensor, element_flows: torch.Tensor, 
                  node_mars: torch.Tensor, element_mars: torch.Tensor, 
@@ -505,7 +674,8 @@ class SumLayer(Layer, nn.Module):
                  logspace_flows: bool = False, negate_pflows: bool = False, 
                  accumulate_ch_flows: bool = False, allow_neg_flows: bool = False,
                  precision: str = "auto", pflow_temperature: float = 1.0, 
-                 temper_eflow: bool = False, **kwargs) -> None:
+                 temper_eflow: bool = False, partition_runs: Optional[Sequence] = None,
+                 compute_children: Optional[Tuple[torch.Tensor, int]] = None, **kwargs) -> None:
         """
         Computes the forward pass of a sum layer:
         ```
@@ -519,13 +689,26 @@ class SumLayer(Layer, nn.Module):
         ```
 
         Parameters:
-        `node_flows`:    [num_nodes, B]
-        `element_flows`: [max_num_els, B]
-        `node_mars`:     [num_nodes, B]
-        `element_mars`:  [max_num_els, B]
-        `params`:        [num_params, B] or [num_params]
+        `node_flows`:     [num_nodes, B]
+        `element_flows`:  [max_num_els, B]
+        `node_mars`:      [num_nodes, B]
+        `element_mars`:   [max_num_els, B]
+        `params`:         [num_params, B] or [num_params]
+        `partition_runs`: None, or per backward partition the rows of its tables (`partitioned_chids` /
+                          `partitioned_parids` / `partitioned_parpids`) whose element flows to compute, as in
+                          `forward` -- element flows only: without parameter flows or `allow_modify_flows`
+        `compute_children`: None, or the product layer group below's `(table, first_row)` of every element row's
+                          child node rows (`pyjuice.layer.fused_children.element_children`): the children's element
+                          values may be stale, and the element-flow kernel forms them itself from `node_mars` (the
+                          fused kernel of the `tlmm` regime). Element flows only, for a layer whose every partition
+                          `fuses_children_backward` at this batch; another raises.
         """
+        if compute_children is not None and (param_flows is not None or allow_modify_flows):
+            raise ValueError("`compute_children` serves a backward of element flows only.")
 
+        if partition_runs is not None and (param_flows is not None or allow_modify_flows):
+            raise ValueError("`partition_runs` restricts a backward's element flows: it takes neither "
+                             "`param_flows` nor `allow_modify_flows`, which read whole partitions.")
         assert not (allow_modify_flows and logspace_flows), "`allow_modify_flows` should be set to `False` when using `logspace_flows`."
         assert not (accumulate_ch_flows and logspace_flows), "`accumulate_ch_flows` should be set to `False` when using `logspace_flows`."
         assert not (accumulate_ch_flows and allow_modify_flows), "`accumulate_ch_flows` should be set to `False` when `allow_modify_flows=True`."
@@ -551,6 +734,9 @@ class SumLayer(Layer, nn.Module):
         
         ## Compute flows w.r.t. elements (i.e., product nodes) ##
         for partition_id in range(self.num_bk_partitions):
+            runs = None if partition_runs is None else partition_runs[partition_id]
+            if runs is not None and len(runs) == 0:
+                continue
             chids = self.partitioned_chids[partition_id]
             parids = self.partitioned_parids[partition_id]
             parpids = self.partitioned_parpids[partition_id]
@@ -571,6 +757,8 @@ class SumLayer(Layer, nn.Module):
                 force_use_fp32 = force_use_fp32,
                 pflow_temperature = pflow_temperature,
                 temper_eflow = temper_eflow,
+                runs = runs,
+                children = compute_children,
                 **kwargs
             )
 
@@ -611,7 +799,7 @@ class SumLayer(Layer, nn.Module):
                  pids: torch.Tensor,
                  partition_id: int = -1, mode: Optional[str] = None,
                  propagation_alg: str = "LL", pflow_temperature: float = 1.0, precision: str = "auto",
-                 **kwargs) -> None:
+                 runs: Optional[Sequence] = None, children: Optional[torch.Tensor] = None, **kwargs) -> None:
         """
         Forward pass of sum layers.
         
@@ -622,6 +810,7 @@ class SumLayer(Layer, nn.Module):
         `nids`:         [ng]
         `cids`:         [ng, c]
         `pids`:         [ng, c]
+        `runs`:         the rows of the tables to compute (`(start, end)`), or None for all (see `forward`)
         """
 
         num_edges = cids.size(1)
@@ -650,22 +839,28 @@ class SumLayer(Layer, nn.Module):
         else:
             mode = self.BLOCK_SPARSE
 
+        if children is not None and mode != self.BLOCK_SPARSE:
+            raise ValueError("`compute_children` takes the block-sparse `tlmm` regime (see `fuses_children`).")
+
         if mode == self.BLOCK_SPARSE:
             self._forward_block_sparse(
                 node_mars, element_mars, params, nids, cids, pids,
                 partition_id = partition_id, propagation_alg = propagation_alg, 
-                pflow_temperature = pflow_temperature, precision = precision, **kwargs
+                pflow_temperature = pflow_temperature, precision = precision, runs = runs, children = children,
+                **kwargs
             )
 
         elif mode == self.SPARSE:
             self._forward_sparse(
                 node_mars, element_mars, params, nids, cids, pids,
                 partition_id = partition_id, propagation_alg = propagation_alg, 
-                pflow_temperature = pflow_temperature, **kwargs
+                pflow_temperature = pflow_temperature, runs = runs, **kwargs
             )
 
         elif mode == self.PYTORCH:
             assert abs(pflow_temperature - 1.0) < 1e-6, "`pflow_temperature != 1.0` not supported by the PyTorch backend."
+            if runs is not None:
+                raise NotImplementedError("The PyTorch forward computes whole partitions only.")
 
             self._forward_pytorch(
                 node_mars, element_mars, params, nids, cids, pids,
@@ -679,7 +874,9 @@ class SumLayer(Layer, nn.Module):
                               params: torch.Tensor, nids: torch.Tensor, cids: torch.Tensor,
                               pids: torch.Tensor,
                               partition_id: int = -1, propagation_alg: str = "LL", 
-                              pflow_temperature: float = 1.0, precision: str = "auto", **kwargs) -> None:
+                              pflow_temperature: float = 1.0, precision: str = "auto",
+                              runs: Optional[Sequence] = None, children: Optional[torch.Tensor] = None,
+                              **kwargs) -> None:
         """
         Forward pass of sum layers with the block-sparse processing kernel.
         
@@ -690,6 +887,11 @@ class SumLayer(Layer, nn.Module):
         `nids`:         [ng]
         `cids`:         [ng, c]
         `pids`:         [ng, c]
+        `runs`:         the rows to compute (`(start, end)`), or None for all. Everything is decided for the whole
+                        partition -- the kernel, its tables, the tuned choices -- and the launches cover the runs'
+                        rows only: the Triton kernels by their tile offset (`pid_m_offset`) into the whole tables,
+                        the CUDA ones on views of them. A launch of some rows never tunes (it would time the whole
+                        partition in place): a choice not made yet -- by a whole launch -- takes the default.
         """
 
         assert params.dim() == 1, "Expecting a 1D `params`."
@@ -721,37 +923,17 @@ class SumLayer(Layer, nn.Module):
                 and self.block_size >= _DENSE_MIN_BLOCK_SIZE and batch_size >= 16):
             dense = self._dense_blocks(partition_id, nids, cids, pids)
             if dense is not None and dense[1] * batch_size >= _DENSE_MIN_WORK:
-                self._forward_dense(node_mars, element_mars, params, dense, exact = (precision == "fp32"))
+                if children is not None:
+                    raise ValueError("`compute_children` takes the block-sparse `tlmm` regime, not the dense path "
+                                     "(see `fuses_children`).")
+                self._forward_dense(node_mars, element_mars, params, dense, exact = (precision == "fp32"),
+                                    runs = runs)
                 return None
 
-        # Heuristic to set `TILE_SIZE_M`, `TILE_SIZE_K`, and `BLOCK_B`
-        if batch_size < 16 and self.block_size >= _SMALL_BATCH_MIN_BLOCK_SIZE:
-            # Small-batch path (the `else` below is the unchanged >=16 heuristic). That heuristic
-            # ties TILE_SIZE_K to BATCH_SIZE_NP2, which collapses to 1-2 huge node-tiles at tiny
-            # batch -> ~1 SM busy and a >10x slowdown. Instead keep a normal edge tile and split the
-            # node dimension into many small tiles (high SM occupancy); the batch is a short, masked
-            # inner dim (BLOCK_B = BATCH_SIZE_NP2 < 16 -> no tensor-core dot, full fp32).
-            TILE_SIZE_K = min(64, num_edges)
-            while num_edges % TILE_SIZE_K != 0:
-                TILE_SIZE_K //= 2
-            TILE_SIZE_M = min(_SMALL_BATCH_FW_TILE_M, self.block_size)
-            BLOCK_B = BATCH_SIZE_NP2
-            K_NUM_TILES = num_edges // TILE_SIZE_K
-        else:
-            base_size = min(self.block_size, num_edges, BATCH_SIZE_NP2, 128)
-            if base_size >= 64:
-                TILE_SIZE_K = min(2048 // 32, num_edges)
-            else:
-                remainder = 2048 // (base_size ** 2)
-                TILE_SIZE_K = min(2048 // remainder, base_size * remainder, num_edges)
-            # Larger TILE_SIZE_M / BLOCK_B (bit-exact) amortize the per-m-tile recomputation of
-            # `emars_max` / `exp` / the `emars` load and the per-batch-tile `epars` load. Gated to the
-            # LL (non-tempered) regime that was validated bit-exact; auto-disabled on a prior OOM.
-            _fw_tile_cap = 4096 if (FORWARD_SUM_TUNED and not getattr(self, "_fw_tuning_oom", False)
-                                    and propagation_alg_id == 0 and not pflow_tempered_enabled) else 2048
-            TILE_SIZE_M = min(_fw_tile_cap // TILE_SIZE_K, self.block_size)
-            BLOCK_B = min(_fw_tile_cap // TILE_SIZE_K, BATCH_SIZE_NP2)
-            K_NUM_TILES = num_edges // TILE_SIZE_K
+        # Heuristic to set `TILE_SIZE_M`, `TILE_SIZE_K`, and `BLOCK_B` (`_fw_block_sparse_tiles`)
+        TILE_SIZE_K, TILE_SIZE_M, BLOCK_B = self._fw_block_sparse_tiles(num_edges, batch_size, propagation_alg_id,
+                                                                        pflow_tempered_enabled)
+        K_NUM_TILES = num_edges // TILE_SIZE_K
 
         assert TILE_SIZE_K >= 4, f"`TILE_SIZE_K` should be greater than 4 (but got {TILE_SIZE_K}) in order to use the block-sparse kernel. " \
                                   "This is an internal error of PyJuice. Please consider checking the kernel dispatching criterions and use the " \
@@ -832,9 +1014,42 @@ class SumLayer(Layer, nn.Module):
             fw_kernel, tile_floor = fw_bsparse._fw_triton_block_sparse_csmm2_kernel, 1
             dot_kwargs = _NO_KWARGS
 
-        def _launch_fw(cfg):
+        # The children's element values formed in the kernel (`compute_children`): the fused copy of the tlmm kernel,
+        # never the CUDA gates -- their kernels read `element_mars`, which may be stale here. Tuned on its own
+        # (`autotune.pick`, keyed by shape as `fw_key` below, whole launches only as there): its optimum is not the
+        # plain kernel's -- re-forming the children per node tile wants TALLER node tiles (fewer re-formations) at 8
+        # warps (the registers to hold them without spilling); MEASURED on HCLT-1024 (1024 x 1024 blocks): B 16
+        # 4x the heuristic tile at 8 warps 0.64 -> 0.49 ms (products + plain 0.48), B 128 2x at 8 warps 1.45 -> 1.34.
+        if children is not None:
+            if not (fw_kernel is fw_bsparse._fw_triton_block_sparse_tlmm_kernel and propagation_alg_id == 0
+                    and not pflow_tempered_enabled):
+                raise ValueError("`compute_children` takes the block-sparse `tlmm` regime (see `fuses_children`).")
+            default_cfg = (TILE_SIZE_M, BLOCK_B, None)                     # (TILE_SIZE_M, BLOCK_B, num_warps)
+            fused_key = (fw_fused._fw_triton_block_sparse_tlmm_fused_kernel, self.block_size, TILE_SIZE_K, K_NUM_TILES,
+                         batch_size, num_nblocks, use_bf16, fp32_dot, children[0].size(1), default_cfg)
+
+            def _launch_fused(cfg, r = None):
+                self._forward_block_sparse_fused(node_mars, params, nids, cids_start, cids_increment, pids_start,
+                                                 pids_increment, children, batch_size, layer_n_nodes, TILE_SIZE_K,
+                                                 K_NUM_TILES, BLOCK_SIZE_M, use_bf16, fp32_dot, r, cfg)
+
+            cfg = autotune.cached(fused_key)
+            if cfg is None:
+                if runs is None:
+                    cands = [default_cfg] + [(tm, BLOCK_B, 8) for tm in (TILE_SIZE_M * 2, TILE_SIZE_M * 4)
+                                             if tm <= self.block_size]
+                    cfg = autotune.pick(fused_key, cands, _launch_fused)
+                else:
+                    cfg = default_cfg
+            _launch_fused(cfg, runs)
+            return None
+
+        def _launch_fw(cfg, first = 0, count = None):
+            """The node tiles (of `cfg`'s `TILE_SIZE_M`) ``[first, first + count)`` of the whole tables -- all of them
+            by default; a node block is `BLOCK_SIZE_M // TILE_SIZE_M` tiles, which the kernel reads from its tile
+            offset (`pid_m_offset`) on."""
             tm, bb = cfg
-            g = (host_cdiv(batch_size, bb), host_cdiv(layer_n_nodes, tm))
+            g = (host_cdiv(batch_size, bb), host_cdiv(layer_n_nodes, tm) if count is None else count)
             for pid_m_start in range(0, g[1], 32768):
                 curr_grid = (g[0], min(pid_m_start + 32768, g[1]) - pid_m_start)
                 fw_kernel[curr_grid](
@@ -855,7 +1070,7 @@ class SumLayer(Layer, nn.Module):
                     use_bf16 = use_bf16,
                     propagation_alg_id = propagation_alg_id,
                     pflow_tempered_enabled = pflow_tempered_enabled,
-                    pid_m_offset = pid_m_start,
+                    pid_m_offset = first + pid_m_start,
                     **propagation_alg_kwargs,
                     **pflow_tempered_kwargs,
                     **dot_kwargs,
@@ -912,7 +1127,9 @@ class SumLayer(Layer, nn.Module):
                 # CUDA-graph replay against an eager twin caught it, tests/model/precision_option_test.py).
                 tlmm_key = ("sum_fw_tlmm_cuda", num_edges) + fw_key
                 choice = autotune.cached(tlmm_key)
-                if choice is None:
+                if choice is None and runs is not None:
+                    choice = ("triton", -1)              # not measured yet: the reference (see `runs`)
+                elif choice is None:
                     # Fastest of {valid CUDA tile configs} vs Triton. Every candidate computes the same
                     # result into `node_mars`, so it stays correct afterwards.
                     cands = [(("triton", -1), (lambda: _launch_fw(default_fw_cfg)))]
@@ -921,12 +1138,26 @@ class SumLayer(Layer, nn.Module):
                                    node_mars, element_mars, params, nids, ebase, pbase,
                                    batch_size, self.block_size, K_NUM_TILES, c)))
                               for c in valid_cfgs]
+                    # The warp-specialized copy of the kernel (c/tlmm_forward_sum_pipelined.cu, bit-identical:
+                    # producer warps stream the operands a tile ahead of the MMA warps), its configs as more arms --
+                    # MEASURED on HCLT-1024's widest layer: 0.58 against 0.68 ms at B 128, 0.49 against 0.53 at B 64
+                    if cuda_kernels.pipe_is_available():
+                        cands += [(("cuda_pipe", c),
+                                   (lambda c=c: cuda_kernels.tlmm_forward_sum_pipelined(
+                                       node_mars, element_mars, params, nids, ebase, pbase,
+                                       batch_size, self.block_size, K_NUM_TILES, c)))
+                                  for c in cuda_kernels.pipe_valid_configs(self.block_size, batch_size)]
                     choice = autotune.choose(tlmm_key, cands)
 
-                if choice[0] == "cuda":
-                    cuda_kernels.tlmm_forward_sum(
-                        node_mars, element_mars, params, nids, ebase, pbase,
-                        batch_size, self.block_size, K_NUM_TILES, choice[1])
+                if choice[0] in ("cuda", "cuda_pipe"):
+                    kernel = cuda_kernels.tlmm_forward_sum if choice[0] == "cuda" else cuda_kernels.tlmm_forward_sum_pipelined
+                    if runs is None:
+                        kernel(node_mars, element_mars, params, nids, ebase, pbase,
+                               batch_size, self.block_size, K_NUM_TILES, choice[1])
+                    else:
+                        for a, b in runs:                    # (views of the tables: the grid comes from them)
+                            kernel(node_mars, element_mars, params, nids[a:b], ebase[a:b], pbase[a:b],
+                                   batch_size, self.block_size, K_NUM_TILES, choice[1])
                     return None
                 # choice == ("triton", -1): fall through to the Triton launch below
 
@@ -977,33 +1208,69 @@ class SumLayer(Layer, nn.Module):
                 # own could each take a different one and disagree in the last bits -- a cross-model
                 # bit-identity test caught exactly that (2.4e-7) once this path reached batch 32.
                 sb_key = ("sum_fw_smallbatch_cuda", num_edges) + fw_key
-                choice = autotune.cached(sb_key) or autotune.pick(
-                    sb_key, [("triton", -1)] + [("cuda", c) for c in range(n_sb_cfg)], _launch_sb)
+                choice = autotune.cached(sb_key)
+                if choice is None:
+                    choice = ("triton", -1) if runs is not None else autotune.pick(
+                        sb_key, [("triton", -1)] + [("cuda", c) for c in range(n_sb_cfg)], _launch_sb)
 
                 if choice[0] == "cuda":
-                    cuda_kernels.smallbatch_forward_sum(
-                        node_mars, element_mars, params, nids, sb_ebase, sb_pbase,
-                        batch_size, self.block_size, num_edges, choice[1])
+                    if runs is None:
+                        cuda_kernels.smallbatch_forward_sum(
+                            node_mars, element_mars, params, nids, sb_ebase, sb_pbase,
+                            batch_size, self.block_size, num_edges, choice[1])
+                    else:
+                        for a, b in runs:
+                            cuda_kernels.smallbatch_forward_sum(
+                                node_mars, element_mars, params, nids[a:b], sb_ebase[a:b], sb_pbase[a:b],
+                                batch_size, self.block_size, num_edges, choice[1])
                     return None
                 # choice == ("triton", -1): fall through to the Triton launch below
 
         # OOM-safe tuned launch: if the larger tuned tiles exceed this GPU's shared-memory/
         # register budget, fall back to the default configuration (recompiled untuned).
         try:
-            _launch_fw(autotune.cached(fw_key) or autotune.pick(fw_key, _fw_candidates(), _launch_fw))
+            if runs is None:
+                _launch_fw(autotune.cached(fw_key) or autotune.pick(fw_key, _fw_candidates(), _launch_fw))
+            else:
+                cfg = autotune.cached(fw_key) or default_fw_cfg
+                per = BLOCK_SIZE_M // cfg[0]                 # node tiles per row
+                for a, b in runs:
+                    _launch_fw(cfg, a * per, (b - a) * per)
         except _TritonOutOfResources:
             # `OutOfResources` is raised at compile time before any write, so retry is safe.
             if not (FORWARD_SUM_TUNED and not getattr(self, "_fw_tuning_oom", False)
                     and propagation_alg_id == 0 and not pflow_tempered_enabled):
                 raise
             self._fw_tuning_oom = True
+            self.__dict__.pop("_fw_tiles_memo", None)         # the tiles read `_fw_tuning_oom`
             warnings.warn("Forward sum-layer tile tuning (FORWARD_SUM_TUNED) exceeded shared "
                           "memory on this GPU; falling back to the default launch config.", RuntimeWarning)
             return self._forward_block_sparse(
                 node_mars, element_mars, params, nids, cids, pids,
                 partition_id=partition_id, propagation_alg=propagation_alg,
-                pflow_temperature=pflow_temperature, precision=precision, **kwargs)
+                pflow_temperature=pflow_temperature, precision=precision, runs=runs, **kwargs)
         return None
+
+    def _forward_block_sparse_fused(self, node_mars, params, nids, cids_start, cids_increment, pids_start,
+                                    pids_increment, children, batch_size, layer_n_nodes, TILE_SIZE_K, K_NUM_TILES,
+                                    BLOCK_SIZE_M, use_bf16, fp32_dot, runs, cfg) -> None:
+        """The fused tlmm forward (`kernels.sum_forward_block_sparse_fused`) over the whole partition or its `runs`
+        (node tiles from the run's offset, as `_launch_fw`), with ``cfg = (TILE_SIZE_M, BLOCK_B, num_warps)`` --
+        ``num_warps`` None for Triton's default."""
+        tm, bb, warps = cfg
+        table, first_row = children
+        K_CH = table.size(1)
+        per = BLOCK_SIZE_M // tm
+        spans = [(0, host_cdiv(layer_n_nodes, tm))] if runs is None else [(a * per, (b - a) * per) for a, b in runs]
+        nb = host_cdiv(batch_size, bb)
+        extra = _NO_KWARGS if warps is None else {"num_warps": warps}
+        for first, count in spans:
+            for pid_m_start in range(0, count, 32768):
+                fw_fused._fw_triton_block_sparse_tlmm_fused_kernel[(nb, min(pid_m_start + 32768, count) - pid_m_start)](
+                    node_mars, params, nids, cids_start, cids_increment, pids_start, pids_increment, table, first_row,
+                    batch_size, BLOCK_B = bb, TILE_SIZE_K = TILE_SIZE_K, K_NUM_TILES = K_NUM_TILES, TILE_SIZE_M = tm,
+                    BLOCK_SIZE_M = BLOCK_SIZE_M, K_CH = K_CH, use_bf16 = use_bf16, pid_m_offset = first + pid_m_start,
+                    fp32_dot = fp32_dot, num_stages = 1, **extra)
 
     def _dense_blocks(self, partition_id: int, nids: torch.Tensor, cids: torch.Tensor, pids: torch.Tensor):
         """
@@ -1037,19 +1304,23 @@ class SumLayer(Layer, nn.Module):
         return self._cached_fw_dense[partition_id]
 
     def _forward_dense(self, node_mars: torch.Tensor, element_mars: torch.Tensor, params: torch.Tensor,
-                       dense, exact: bool) -> None:
+                       dense, exact: bool, runs: Optional[Sequence] = None) -> None:
         """
         LL forward of a dense partition (see `_dense_blocks`): ``log(W @ exp(X - m)) + m`` per node block, with
         ``X`` its children's rows, ``m`` their column maximum and ``W`` read in place from ``params``. With one
         child group, ``X`` is exponentiated once and multiplied by each block's ``W``. With several, runs of
         groups take one batched product over ``[groups, ...]`` views, each run as many groups as `_DENSE_SCRATCH`
-        holds. The product is exact fp32 (``exact``) or TF32.
+        holds. The product is exact fp32 (``exact``) or TF32. With ``runs`` (rows of the partition), the node
+        blocks of those rows: one child group only -- each block is its own product -- as a subset of several
+        would change the batched product's shape, and with it its bits (`forward_runs_ok`).
         """
         from .kernels.sum_forward_dense import dense_colmax, dense_exp, dense_log
 
         blocks, E, c0, G = dense
         BS = self.block_size
         B = node_mars.size(1)
+        if runs is not None and G > 1:
+            raise ValueError("A dense partition of several child groups is computed whole (see `forward_runs_ok`).")
         prev = torch.get_float32_matmul_precision()
         torch.set_float32_matmul_precision("highest" if exact else "high")
         try:
@@ -1057,6 +1328,9 @@ class SumLayer(Layer, nn.Module):
                 colmax = element_mars[c0:c0 + E].amax(dim = 0)
                 ex = torch.empty(E, B, device = element_mars.device)
                 dense_exp(element_mars, colmax, ex, c0, E, B)
+                if runs is not None:
+                    # One child group: the blocks sorted by node id, the order of the partition's rows
+                    blocks = [blocks[r] for a, b in runs for r in range(a, b)]
                 for nid, p0 in blocks:
                     torch.mm(params[p0:p0 + E * BS].view(E, BS).t(), ex, out = node_mars[nid:nid + BS])
                 nids = [nid for nid, _ in blocks]
@@ -1084,7 +1358,7 @@ class SumLayer(Layer, nn.Module):
                         params: torch.Tensor, nids: torch.Tensor, cids: torch.Tensor,
                         pids: torch.Tensor,
                         partition_id: int = -1, propagation_alg: str = "LL",
-                        pflow_temperature: float = 1.0, **kwargs) -> None:
+                        pflow_temperature: float = 1.0, runs: Optional[Sequence] = None, **kwargs) -> None:
         """
         Forward pass of sum layers with the sparse processing kernel.
         
@@ -1095,6 +1369,9 @@ class SumLayer(Layer, nn.Module):
         `nids`:         [ng]
         `cids`:         [ng, c]
         `pids`:         [ng, c]
+        `runs`:         the rows to compute (`(start, end)`), or None for all: the kernel and its tiles are the whole
+                        partition's, launched on every run's rows of the tables (each node on its own, so its bits
+                        are the whole launch's)
         """
 
         num_nblocks = nids.size(0)
@@ -1119,29 +1396,34 @@ class SumLayer(Layer, nn.Module):
                 "node_mars_tempered": kwargs["node_mars_tempered"]
             }
 
+        # The tables the launches read, and their rows: the partition's, or every run's rows of them
+        parts = ((nids, cids, pids, num_nblocks),) if runs is None else \
+                [(nids[a:b], cids[a:b], pids[a:b], b - a) for a, b in runs]
+
         if host_cdiv(layer_n_nodes, self.block_size) <= 2048:
             BLOCK_B = max(min(2048 // num_edges, BATCH_SIZE_NP2), 1)
 
             BLOCK_SIZE_M = self.block_size
 
-            grid = (host_cdiv(batch_size, BLOCK_B), host_cdiv(layer_n_nodes, BLOCK_SIZE_M))
+            for part_nids, part_cids, part_pids, n in parts:
+                grid = (host_cdiv(batch_size, BLOCK_B), n)
 
-            fw_sparse._fw_triton_sparse_kernel[grid](
-                node_mars = node_mars, 
-                element_mars = element_mars, 
-                mparams = params, 
-                nids = nids, 
-                cids = cids,
-                pids = pids,
-                batch_size = batch_size, 
-                num_edges = num_edges, 
-                BLOCK_B = BLOCK_B, 
-                BLOCK_SIZE_M = BLOCK_SIZE_M,
-                propagation_alg_id = propagation_alg_id,
-                pflow_tempered_enabled = pflow_tempered_enabled,
-                **propagation_alg_kwargs,
-                **pflow_tempered_kwargs
-            )
+                fw_sparse._fw_triton_sparse_kernel[grid](
+                    node_mars = node_mars,
+                    element_mars = element_mars,
+                    mparams = params,
+                    nids = part_nids,
+                    cids = part_cids,
+                    pids = part_pids,
+                    batch_size = batch_size,
+                    num_edges = num_edges,
+                    BLOCK_B = BLOCK_B,
+                    BLOCK_SIZE_M = BLOCK_SIZE_M,
+                    propagation_alg_id = propagation_alg_id,
+                    pflow_tempered_enabled = pflow_tempered_enabled,
+                    **propagation_alg_kwargs,
+                    **pflow_tempered_kwargs
+                )
 
         else:
             BLOCK_B = max(min(2048 // num_edges, BATCH_SIZE_NP2), 1)
@@ -1149,29 +1431,10 @@ class SumLayer(Layer, nn.Module):
 
             BLOCK_SIZE_M = self.block_size
 
-            grid = (host_cdiv(batch_size, BLOCK_B), host_cdiv(layer_n_nodes, TILE_SIZE_M))
+            for part_nids, part_cids, part_pids, n in parts:
+                part_n_nodes = n * self.block_size
+                grid = (host_cdiv(batch_size, BLOCK_B), host_cdiv(part_n_nodes, TILE_SIZE_M))
 
-            if grid[1] <= 32768:
-                fw_sparse._fw_triton_large_sparse_kernel[grid](
-                    node_mars = node_mars,
-                    element_mars = element_mars,
-                    mparams = params,
-                    nids = nids,
-                    cids = cids,
-                    pids = pids,
-                    batch_size = batch_size,
-                    num_nodes = layer_n_nodes,
-                    pid_m_offset = 0,
-                    num_edges = num_edges,
-                    BLOCK_B = BLOCK_B,
-                    TILE_SIZE_M = TILE_SIZE_M,
-                    BLOCK_SIZE_M = BLOCK_SIZE_M,
-                    propagation_alg_id = propagation_alg_id,
-                    pflow_tempered_enabled = pflow_tempered_enabled,
-                    **propagation_alg_kwargs,
-                    **pflow_tempered_kwargs
-                )
-            else:
                 for pid_m_start in range(0, grid[1], 32768):
 
                     pid_m_end = min(pid_m_start + 32768, grid[1])
@@ -1181,11 +1444,11 @@ class SumLayer(Layer, nn.Module):
                         node_mars = node_mars,
                         element_mars = element_mars,
                         mparams = params,
-                        nids = nids,
-                        cids = cids,
-                        pids = pids,
+                        nids = part_nids,
+                        cids = part_cids,
+                        pids = part_pids,
                         batch_size = batch_size,
-                        num_nodes = layer_n_nodes,
+                        num_nodes = part_n_nodes,
                         pid_m_offset = pid_m_start,
                         num_edges = num_edges,
                         BLOCK_B = BLOCK_B,
@@ -1258,7 +1521,8 @@ class SumLayer(Layer, nn.Module):
                   allow_neg_flows: bool = False, 
                   force_use_fp32: bool = False, 
                   pflow_temperature: float = 1.0, 
-                  temper_eflow: bool = False, **kwargs) -> None:
+                  temper_eflow: bool = False, runs: Optional[Sequence] = None,
+                  children: Optional[torch.Tensor] = None, **kwargs) -> None:
         """
         Back pass of sum layers.
         
@@ -1272,6 +1536,8 @@ class SumLayer(Layer, nn.Module):
         `chids`:        [ng]
         `parids`:       [ng, c]
         `parpids`:      [ng, c]
+        `runs`:         the rows of `chids` whose element flows to compute (`(start, end)`), or None for all (see
+                        `backward`)
         """
 
         if cids is not None:
@@ -1314,6 +1580,10 @@ class SumLayer(Layer, nn.Module):
                 f"batch={batch_size}, num_edges={num_edges})."
             )
 
+        if children is not None and mode != self.BLOCK_SPARSE:
+            raise ValueError("`compute_children` takes the block-sparse element-flow kernel (see "
+                             "`fuses_children_backward`).")
+
         if mode == self.BLOCK_SPARSE:
             self._backward_block_sparse(
                 node_flows, element_flows, params, node_mars, element_mars, param_flows, 
@@ -1322,7 +1592,8 @@ class SumLayer(Layer, nn.Module):
                 propagation_alg = propagation_alg, logspace_flows = logspace_flows, 
                 negate_pflows = negate_pflows, accumulate_ch_flows = accumulate_ch_flows, 
                 allow_neg_flows = allow_neg_flows, force_use_fp32 = force_use_fp32, 
-                pflow_temperature = pflow_temperature, temper_eflow = temper_eflow, **kwargs
+                pflow_temperature = pflow_temperature, temper_eflow = temper_eflow, runs = runs,
+                children = children, **kwargs
             )
 
         elif mode == self.SPARSE:
@@ -1332,12 +1603,14 @@ class SumLayer(Layer, nn.Module):
                 partition_id = partition_id, allow_modify_flows = allow_modify_flows,
                 propagation_alg = propagation_alg, logspace_flows = logspace_flows, 
                 negate_pflows = negate_pflows, accumulate_ch_flows = accumulate_ch_flows, 
-                pflow_temperature = pflow_temperature, temper_eflow = temper_eflow, **kwargs
+                pflow_temperature = pflow_temperature, temper_eflow = temper_eflow, runs = runs, **kwargs
             )
 
         elif mode == self.PYTORCH:
             assert not allow_modify_flows, "Please set `allow_modify_flows` to False when " \
                                            "using the native PyTorch backward."
+            if runs is not None:
+                raise NotImplementedError("The PyTorch backward computes whole partitions only.")
             assert abs(pflow_temperature - 1.0) < 1e-6, "`pflow_temperature != 0` not supported with PyTorch backend."
             assert not temper_eflow, "`temper_eflow == True` not supported with PyTorch backend."
             self._backward_pytorch(
@@ -1433,7 +1706,8 @@ class SumLayer(Layer, nn.Module):
                                partition_id: int = -1, allow_modify_flows: bool = False, propagation_alg: str = "LL", 
                                logspace_flows: bool = False, negate_pflows: bool = False, accumulate_ch_flows: bool = False, 
                                allow_neg_flows: bool = False, force_use_fp32 = False, pflow_temperature: float = 1.0, 
-                               temper_eflow: bool = False, **kwargs) -> None:
+                               temper_eflow: bool = False, runs: Optional[Sequence] = None,
+                               children: Optional[torch.Tensor] = None, **kwargs) -> None:
         """
         Back pass of sum layers with block-sparse processing kernel.
         
@@ -1447,6 +1721,7 @@ class SumLayer(Layer, nn.Module):
         `chids`:        [ng]
         `parids`:       [ng, c]
         `parpids`:      [ng, c]
+        `runs`:         the rows of `chids` whose element flows to compute, or None for all
         """
 
         # Flows w.r.t. input elements (product nodes)
@@ -1462,6 +1737,8 @@ class SumLayer(Layer, nn.Module):
                 allow_neg_flows = allow_neg_flows, 
                 force_use_fp32 = force_use_fp32, 
                 eflow_temperature = pflow_temperature if temper_eflow else 1.0, 
+                runs = runs,
+                children = children,
                 **kwargs
             )
 
@@ -1562,7 +1839,16 @@ class SumLayer(Layer, nn.Module):
                                          partition_id: int = -1, allow_modify_flows: bool = False,
                                          propagation_alg: str = "LL", logspace_flows: bool = False, 
                                          accumulate_ch_flows: bool = False, allow_neg_flows: bool = False, 
-                                         force_use_fp32: bool = False, eflow_temperature: float = 1.0, **kwargs) -> None:
+                                         force_use_fp32: bool = False, eflow_temperature: float = 1.0,
+                                         runs: Optional[Sequence] = None, children: Optional[torch.Tensor] = None,
+                                         **kwargs) -> None:
+        """
+        The element flows of a backward partition's child blocks (`chids`), or with `runs` (`(start, end)` ranges of
+        its rows) of those rows only, every other row of `element_flows` left as it is. Everything is decided for the
+        whole partition -- the kernel, its tables, the tuned choices, timed on the whole partition into scratch --
+        and the launches cover the runs' rows: the Triton kernels from their tile offset (`pid_m_offset`) into the
+        whole tables, the CUDA ones on views of them.
+        """
 
         assert params.dim() == 1, "Expecting a 1D `params`."
 
@@ -1576,20 +1862,11 @@ class SumLayer(Layer, nn.Module):
         propagation_alg_id = self.propagation_alg_mapping[propagation_alg]
         propagation_alg_kwargs = self._get_propagation_alg_kwargs(propagation_alg, **kwargs)
 
-        # Heuristic to set `TILE_SIZE_M`, `TILE_SIZE_K`, and `BLOCK_B`
-        if batch_size < 16 and self.block_size >= _SMALL_BATCH_MIN_BLOCK_SIZE:
-            # Small-batch path (mirrors the forward; the `else` is the unchanged >=16 heuristic). Keep
-            # a normal edge tile and split the child-node dimension into many small tiles for high SM
-            # occupancy; the batch is a short masked inner dim (no tensor-core dot).
-            TILE_SIZE_K = min(64, num_edges)
-            while num_edges % TILE_SIZE_K != 0:
-                TILE_SIZE_K //= 2
-            TILE_SIZE_M = min(_SMALL_BATCH_ELE_TILE_M, cs_block_size)
-            BLOCK_B = BATCH_SIZE_NP2
-            K_NUM_TILES = num_edges // TILE_SIZE_K
-        else:
-            TILE_SIZE_K, TILE_SIZE_M, BLOCK_B = self._ele_tile_family(num_edges, cs_block_size, BATCH_SIZE_NP2)
-            K_NUM_TILES = num_edges // TILE_SIZE_K
+        # Heuristic to set `TILE_SIZE_M`, `TILE_SIZE_K`, and `BLOCK_B` (`_bk_ele_tiles`; its node tile doubled
+        # where `BACKWARD_ELE_FLOW_TUNED` does -- `_doubled_m` below applies the same rule to the candidates)
+        TILE_SIZE_K, TILE_SIZE_M, BLOCK_B = self._bk_ele_tiles(num_edges, cs_block_size, batch_size, propagation_alg_id,
+                                                               eflow_temperature)
+        K_NUM_TILES = num_edges // TILE_SIZE_K
 
         assert TILE_SIZE_K >= 4, f"`TILE_SIZE_K` should be greater than 4 (but got {TILE_SIZE_K}) in order to use the block-sparse kernel. " \
                                   "This is an internal error of PyJuice. Please consider checking the kernel dispatching criterions and use the " \
@@ -1654,7 +1931,6 @@ class SumLayer(Layer, nn.Module):
                     and tm >= 16 and tk >= 16 and bb >= 16 and 2 * tm <= cs_block_size:
                 return 2 * tm
             return tm
-        TILE_SIZE_M = _doubled_m(TILE_SIZE_M, TILE_SIZE_K, BLOCK_B)
 
         if TILE_SIZE_M >= 16 and TILE_SIZE_K >= 16 and BLOCK_B >= 16:
             TL_DOT = 1
@@ -1685,10 +1961,12 @@ class SumLayer(Layer, nn.Module):
                          logspace_flows = logspace_flows, allow_neg_flows = allow_neg_flows,
                          propagation_alg_id = propagation_alg_id, **propagation_alg_kwargs)
 
-        def _launch_ele(cfg, out):
+        def _launch_ele(cfg, out, first = 0, count = None):
+            """The child-node tiles (of `cfg`'s `TILE_SIZE_M`) ``[first, first + count)`` of the whole tables -- all of
+            them by default; a child block is `BLOCK_SIZE_M // TILE_SIZE_M` tiles."""
             tk, tm, bb = cfg
             ps, pi, pps, ppi, step = _parent_tables(tk)
-            g = (host_cdiv(batch_size, bb), host_cdiv(layer_n_nodes, tm))
+            g = (host_cdiv(batch_size, bb), host_cdiv(layer_n_nodes, tm) if count is None else count)
             for pid_m_start in range(0, g[1], 32768):
                 curr_grid = (g[0], min(pid_m_start + 32768, g[1]) - pid_m_start)
                 ele_kernel[curr_grid](
@@ -1711,7 +1989,7 @@ class SumLayer(Layer, nn.Module):
                     BLOCK_SIZE_K = BLOCK_SIZE_K,
                     TL_DOT = TL_DOT,
                     accumulate_ch_flows = accumulate_ch_flows,
-                    pid_m_offset = pid_m_start,
+                    pid_m_offset = first + pid_m_start,
                     num_stages = 1,
                     **dot_kwargs,
                     **ele_extra
@@ -1758,10 +2036,13 @@ class SumLayer(Layer, nn.Module):
             ele_cfgs = _ele_candidates()
             # `accumulate_ch_flows` makes `element_flows` read-accumulate-write, so the timing runs
             # must go to a scratch buffer; otherwise the kernel overwrites it with the values it is
-            # about to write for real anyway and can be timed in place.
+            # about to write for real anyway and can be timed in place -- but for a launch of some
+            # rows (`runs`), which must leave the others as they are: it times the whole partition on
+            # scratch.
             if not autotune.should_tune(ele_key, len(ele_cfgs)):
                 return default_ele_cfg                 # `pick` would decline; do not allocate for it
-            out = element_flows if not accumulate_ch_flows else autotune.scratch_like(element_flows)
+            on_scratch = accumulate_ch_flows or runs is not None
+            out = element_flows if not on_scratch else autotune.scratch_like(element_flows)
             if out is None:
                 return default_ele_cfg                 # no scratch -> leave this launch untuned
             return autotune.pick(ele_key, ele_cfgs, lambda c: _launch_ele(c, out))
@@ -1772,7 +2053,36 @@ class SumLayer(Layer, nn.Module):
         # kernels apply, by measuring. Deliberately BEFORE the CuTe guard below: which kernel is fastest
         # is not the same question as which regime this layer happens to fall in, and the ungated
         # autotuner already demonstrates that (it prefers Triton to its own CuTe kernel at some shapes).
+        # The child elements' values formed in the kernel (`compute_children`): the fused copy of the element-flow
+        # kernel, on the tiles the whole partition's launch tuned (timed on the original kernel into scratch), never
+        # the CUDA gates -- their kernels read `element_mars`, which may be stale here
+        if children is not None:
+            if not (ele_kernel is bk_ele_bsparse._bk_triton_block_sparse_ele_kernel and propagation_alg_id == 0
+                    and self._ext_bw_ele_hook is None):
+                raise ValueError("`compute_children` takes the plain block-sparse element-flow kernel (see "
+                                 "`fuses_children_backward`).")
+            cfg = _tuned_ele_cfg()
+            tk, tm, bb = cfg
+            ps, pi, pps, ppi, step = _parent_tables(tk)
+            table, first_row = children
+            per = BLOCK_SIZE_M // tm
+            spans = [(0, host_cdiv(layer_n_nodes, tm))] if runs is None else [(a * per, (b - a) * per) for a, b in runs]
+            for first, count in spans:
+                for pid_m_start in range(0, count, 32768):
+                    bk_ele_fused._bk_triton_block_sparse_ele_fused_kernel[
+                            (host_cdiv(batch_size, bb), min(pid_m_start + 32768, count) - pid_m_start)](
+                        node_flows, element_flows, node_mars, params, chids, ps, pi, pps, ppi, table, first_row,
+                        batch_size = batch_size, ptr_inc_step = step, allow_modify_flows = allow_modify_flows,
+                        logspace_flows = logspace_flows, BLOCK_B = bb, TILE_SIZE_K = tk, K_NUM_TILES = pi.size(1),
+                        TILE_SIZE_M = tm, BLOCK_SIZE_M = BLOCK_SIZE_M, BLOCK_SIZE_K = BLOCK_SIZE_K,
+                        K_CH = table.size(1), TL_DOT = TL_DOT, accumulate_ch_flows = accumulate_ch_flows,
+                        allow_neg_flows = allow_neg_flows, pid_m_offset = first + pid_m_start, num_stages = 1,
+                        **dot_kwargs)
+            return None
+
         if self._ext_bw_ele_hook is not None:
+            if runs is not None:
+                raise ValueError("An external parameterization's element-flow backward computes whole partitions.")
             if not (propagation_alg_id == 0 and abs(eflow_temperature - 1.0) < 1e-6
                     and allow_modify_flows == 0 and logspace_flows and not allow_neg_flows
                     and not accumulate_ch_flows and not force_use_fp32):
@@ -1820,6 +2130,14 @@ class SumLayer(Layer, nn.Module):
                 def _triton_ele(tgt):
                     _launch_ele(default_ele_cfg, tgt)
 
+                # The warp-specialized copy of the kernel (c/ele_backward_sum_pipelined.cu, bit-identical: producer
+                # warps stream the operands a tile ahead of the MMA warps) as a third arm -- MEASURED on HCLT-1024's
+                # widest layer: 0.70 against 0.83 ms at B 128, 0.55 against 0.60 at B 64
+                def _cuda_ele_pipe(tgt, a = None, b = None):
+                    cuda_kernels.ele_backward_sum_pipelined(
+                        tgt, element_mars, node_flows, node_mars, params, chids[a:b], ele_ebase[a:b], ele_pbase[a:b],
+                        batch_size, self.block_size, cs_block_size, K_NUM_TILES)
+
                 choice_key = (signature, batch_size)
                 choice = self._cached_bk_ele_choice.get(choice_key)
                 if choice is None:
@@ -1829,12 +2147,24 @@ class SumLayer(Layer, nn.Module):
                             or self._bk_ele_scratch.dtype != element_flows.dtype):
                         self._bk_ele_scratch = torch.empty_like(element_flows)
                     scr = self._bk_ele_scratch
-                    choice = autotune.best_of(
-                        [(("triton", -1), (lambda: _triton_ele(scr))),
-                         (("cuda", 0), (lambda: _cuda_ele(scr)))]) or ("triton", -1)
+                    cands = [(("triton", -1), (lambda: _triton_ele(scr))),
+                             (("cuda", 0), (lambda: _cuda_ele(scr)))]
+                    if cuda_kernels.ele_pipe_is_available():
+                        cands.append((("cuda_pipe", 0), (lambda: _cuda_ele_pipe(scr))))
+                    choice = autotune.best_of(cands) or ("triton", -1)
                     self._cached_bk_ele_choice[choice_key] = choice
-                if choice[0] == "cuda":
-                    _cuda_ele(element_flows)
+                if choice[0] in ("cuda", "cuda_pipe"):
+                    if choice[0] == "cuda_pipe":
+                        for a, b in ([(None, None)] if runs is None else runs):
+                            _cuda_ele_pipe(element_flows, a, b)
+                    elif runs is None:
+                        _cuda_ele(element_flows)
+                    else:
+                        for a, b in runs:                    # (views of the tables: the grid comes from them)
+                            cuda_kernels.ele_backward_sum(
+                                element_flows, element_mars, node_flows, node_mars, params, chids[a:b],
+                                ele_ebase[a:b], ele_pbase[a:b], batch_size, self.block_size, cs_block_size,
+                                K_NUM_TILES)
                     return None
                 # choice == ("triton", -1): fall through to the Triton launch below
 
@@ -1895,11 +2225,24 @@ class SumLayer(Layer, nn.Module):
                     choice = autotune.best_of(cands) or ("triton", -1)
                     self._cached_bk_ele_choice[choice_key] = choice
                 if choice[0] == "cuda":
-                    _cuda_ele_sb(element_flows, choice[1])
+                    if runs is None:
+                        _cuda_ele_sb(element_flows, choice[1])
+                    else:
+                        for a, b in runs:
+                            cuda_kernels.smallbatch_ele_backward_sum(
+                                element_flows, element_mars, node_flows, node_mars, params, chids[a:b],
+                                sb_ebase[a:b], sb_pbase[a:b], batch_size, self.block_size, cs_block_size,
+                                num_edges, choice[1])
                     return None
                 # choice == ("triton", -1): fall through to the Triton launch below
 
-        _launch_ele(_tuned_ele_cfg(), element_flows)
+        if runs is None:
+            _launch_ele(_tuned_ele_cfg(), element_flows)
+        else:
+            cfg = _tuned_ele_cfg()
+            per = BLOCK_SIZE_M // cfg[1]                     # child-node tiles per row
+            for a, b in runs:
+                _launch_ele(cfg, element_flows, a * per, (b - a) * per)
 
         return None
 
@@ -2303,7 +2646,8 @@ class SumLayer(Layer, nn.Module):
                          partition_id: int = -1, allow_modify_flows: bool = False, 
                          propagation_alg: str = "LL", logspace_flows: bool = False, 
                          negate_pflows: bool = False, accumulate_ch_flows: bool = False, 
-                         pflow_temperature: float = 1.0, temper_eflow: bool = False, **kwargs) -> None:
+                         pflow_temperature: float = 1.0, temper_eflow: bool = False,
+                         runs: Optional[Sequence] = None, **kwargs) -> None:
         """
         Back pass of sum layers with sparse processing kernel.
         
@@ -2317,6 +2661,7 @@ class SumLayer(Layer, nn.Module):
         `chids`:        [ng]
         `parids`:       [ng, c]
         `parpids`:      [ng, c]
+        `runs`:         the rows of `chids` whose element flows to compute, or None for all
         """
 
         # Flows w.r.t. input elements (product nodes)
@@ -2330,6 +2675,7 @@ class SumLayer(Layer, nn.Module):
                 logspace_flows = logspace_flows, 
                 accumulate_ch_flows = accumulate_ch_flows, 
                 eflow_temperature = pflow_temperature if temper_eflow else 1.0, 
+                runs = runs,
                 **kwargs
             )
 
@@ -2353,7 +2699,12 @@ class SumLayer(Layer, nn.Module):
                                    parpids: torch.Tensor, cs_block_size: int,
                                    allow_modify_flows: bool = False, propagation_alg: str = "LL", 
                                    logspace_flows: bool = False, accumulate_ch_flows: bool = False, 
-                                   eflow_temperature: float = 1.0, **kwargs) -> None:
+                                   eflow_temperature: float = 1.0, runs: Optional[Sequence] = None, **kwargs) -> None:
+        """
+        The element flows of a backward partition's child blocks, or with `runs` (`(start, end)` ranges of its rows)
+        of those rows only: the kernel and its tiles are the whole partition's, launched on every run's rows of the
+        tables (each child node on its own, so its bits are the whole launch's).
+        """
 
         assert params.dim() == 1, "Expecting a 1D `params`."
 
@@ -2369,6 +2720,10 @@ class SumLayer(Layer, nn.Module):
         propagation_alg_kwargs = self._get_propagation_alg_kwargs(propagation_alg, **kwargs)
 
         assert num_edges <= 16384, "The sparse backward kernel only support nodes with # edges smaller than 16384."
+
+        # The tables the launches read, and their rows: the partition's, or every run's rows of them
+        parts = ((chids, parids, parpids, num_nblocks),) if runs is None else \
+                [(chids[a:b], parids[a:b], parpids[a:b], b - a) for a, b in runs]
 
         if host_cdiv(layer_n_nodes, cs_block_size) <= 32768:
 
@@ -2410,49 +2765,52 @@ class SumLayer(Layer, nn.Module):
                     ele_BLOCK_M = nxt
 
                 TILES_PER_BLOCK = cs_block_size // ele_BLOCK_M
-                ele_grid = (host_cdiv(batch_size, BLOCK_B), host_cdiv(layer_n_nodes, ele_BLOCK_M))
 
-                bk_ele_sparse._bk_triton_sparse_ele_kernel[ele_grid](
-                    node_flows = node_flows,
-                    element_flows = element_flows,
-                    node_mars = node_mars,
-                    element_mars = element_mars,
-                    mparams = params,
-                    chids = chids,
-                    parids = parids,
-                    parpids = parpids,
-                    batch_size = batch_size,
-                    n_edge_blocks = n_edge_blocks,
-                    allow_modify_flows = allow_modify_flows,
-                    logspace_flows = logspace_flows,
-                    BLOCK_B = BLOCK_B,
-                    BLOCK_M = ele_BLOCK_M,
-                    BLOCK_SIZE_K = self.block_size,
-                    TILES_PER_BLOCK = TILES_PER_BLOCK,
-                    propagation_alg_id = propagation_alg_id,
-                    accumulate_ch_flows = accumulate_ch_flows,
-                    **propagation_alg_kwargs
-                )
+                for part_chids, part_parids, part_parpids, n in parts:
+                    ele_grid = (host_cdiv(batch_size, BLOCK_B), n * TILES_PER_BLOCK)
+
+                    bk_ele_sparse._bk_triton_sparse_ele_kernel[ele_grid](
+                        node_flows = node_flows,
+                        element_flows = element_flows,
+                        node_mars = node_mars,
+                        element_mars = element_mars,
+                        mparams = params,
+                        chids = part_chids,
+                        parids = part_parids,
+                        parpids = part_parpids,
+                        batch_size = batch_size,
+                        n_edge_blocks = n_edge_blocks,
+                        allow_modify_flows = allow_modify_flows,
+                        logspace_flows = logspace_flows,
+                        BLOCK_B = BLOCK_B,
+                        BLOCK_M = ele_BLOCK_M,
+                        BLOCK_SIZE_K = self.block_size,
+                        TILES_PER_BLOCK = TILES_PER_BLOCK,
+                        propagation_alg_id = propagation_alg_id,
+                        accumulate_ch_flows = accumulate_ch_flows,
+                        **propagation_alg_kwargs
+                    )
 
             else:
 
-                bk_ele_sparse._bk_triton_sparse_tempered_ele_kernel[grid](
-                    node_flows = node_flows, 
-                    element_flows = element_flows, 
-                    node_mars_tempered = kwargs["node_mars_tempered"],
-                    element_mars = element_mars, 
-                    mparams = params, 
-                    chids = chids, 
-                    parids = parids,
-                    parpids = parpids,
-                    batch_size = batch_size,
-                    n_edge_blocks = n_edge_blocks,
-                    BLOCK_B = BLOCK_B,
-                    BLOCK_M = BLOCK_M,
-                    BLOCK_SIZE_K = self.block_size,
-                    accumulate_ch_flows = accumulate_ch_flows,
-                    eflow_temperature = eflow_temperature
-                )
+                for part_chids, part_parids, part_parpids, n in parts:
+                    bk_ele_sparse._bk_triton_sparse_tempered_ele_kernel[(grid[0], n)](
+                        node_flows = node_flows,
+                        element_flows = element_flows,
+                        node_mars_tempered = kwargs["node_mars_tempered"],
+                        element_mars = element_mars,
+                        mparams = params,
+                        chids = part_chids,
+                        parids = part_parids,
+                        parpids = part_parpids,
+                        batch_size = batch_size,
+                        n_edge_blocks = n_edge_blocks,
+                        BLOCK_B = BLOCK_B,
+                        BLOCK_M = BLOCK_M,
+                        BLOCK_SIZE_K = self.block_size,
+                        accumulate_ch_flows = accumulate_ch_flows,
+                        eflow_temperature = eflow_temperature
+                    )
 
         else:
 
@@ -2461,51 +2819,26 @@ class SumLayer(Layer, nn.Module):
 
             allow_modify_flows = 1 if allow_modify_flows else 0
 
-            grid = (host_cdiv(batch_size, BLOCK_B), host_cdiv(layer_n_nodes, TILE_SIZE_M))
+            for part_chids, part_parids, part_parpids, n in parts:
+                part_n_eles = n * cs_block_size
+                grid = (host_cdiv(batch_size, BLOCK_B), host_cdiv(part_n_eles, TILE_SIZE_M))
 
-            if abs(eflow_temperature - 1.0) < 1e-6:
+                for pid_m_start in range(0, grid[1], 32768):
 
-                if grid[1] <= 32768:
-                    bk_ele_sparse._bk_triton_large_sparse_ele_kernel[grid](
-                        node_flows = node_flows,
-                        element_flows = element_flows,
-                        node_mars = node_mars,
-                        element_mars = element_mars,
-                        mparams = params,
-                        chids = chids,
-                        parids = parids,
-                        parpids = parpids,
-                        num_eles = layer_n_nodes,
-                        pid_m_offset = 0,
-                        batch_size = batch_size,
-                        n_edge_blocks = n_edge_blocks,
-                        allow_modify_flows = allow_modify_flows,
-                        logspace_flows = logspace_flows,
-                        BLOCK_B = BLOCK_B,
-                        TILE_SIZE_M = TILE_SIZE_M,
-                        BLOCK_SIZE_M = cs_block_size,
-                        BLOCK_SIZE_K = self.block_size,
-                        propagation_alg_id = propagation_alg_id,
-                        accumulate_ch_flows = accumulate_ch_flows,
-                        **propagation_alg_kwargs
-                    )
+                    pid_m_end = min(pid_m_start + 32768, grid[1])
+                    small_grid = (grid[0], pid_m_end - pid_m_start)
 
-                else:
-                    for pid_m_start in range(0, grid[1], 32768):
-
-                        pid_m_end = min(pid_m_start + 32768, grid[1])
-                        small_grid = (grid[0], pid_m_end - pid_m_start)
-
+                    if abs(eflow_temperature - 1.0) < 1e-6:
                         bk_ele_sparse._bk_triton_large_sparse_ele_kernel[small_grid](
                             node_flows = node_flows,
                             element_flows = element_flows,
                             node_mars = node_mars,
                             element_mars = element_mars,
                             mparams = params,
-                            chids = chids,
-                            parids = parids,
-                            parpids = parpids,
-                            num_eles = layer_n_nodes,
+                            chids = part_chids,
+                            parids = part_parids,
+                            parpids = part_parpids,
+                            num_eles = part_n_eles,
                             pid_m_offset = pid_m_start,
                             batch_size = batch_size,
                             n_edge_blocks = n_edge_blocks,
@@ -2519,47 +2852,17 @@ class SumLayer(Layer, nn.Module):
                             accumulate_ch_flows = accumulate_ch_flows,
                             **propagation_alg_kwargs
                         )
-
-            else:
-
-                if grid[1] <= 32768:
-                    bk_ele_sparse._bk_triton_large_sparse_tempered_ele_kernel[grid](
-                        node_flows = node_flows,
-                        element_flows = element_flows,
-                        node_mars_tempered = kwargs["node_mars_tempered"], 
-                        element_mars = element_mars,
-                        mparams = params,
-                        chids = chids,
-                        parids = parids,
-                        parpids = parpids,
-                        num_eles = layer_n_nodes,
-                        pid_m_offset = 0,
-                        batch_size = batch_size,
-                        n_edge_blocks = n_edge_blocks,
-                        BLOCK_B = BLOCK_B,
-                        TILE_SIZE_M = TILE_SIZE_M,
-                        BLOCK_SIZE_M = cs_block_size,
-                        BLOCK_SIZE_K = self.block_size,
-                        accumulate_ch_flows = accumulate_ch_flows,
-                        eflow_temperature = eflow_temperature
-                    )
-
-                else:
-                    for pid_m_start in range(0, grid[1], 32768):
-
-                        pid_m_end = min(pid_m_start + 32768, grid[1])
-                        small_grid = (grid[0], pid_m_end - pid_m_start)
-
+                    else:
                         bk_ele_sparse._bk_triton_large_sparse_tempered_ele_kernel[small_grid](
                             node_flows = node_flows,
                             element_flows = element_flows,
                             node_mars_tempered = kwargs["node_mars_tempered"], 
                             element_mars = element_mars,
                             mparams = params,
-                            chids = chids,
-                            parids = parids,
-                            parpids = parpids,
-                            num_eles = layer_n_nodes,
+                            chids = part_chids,
+                            parids = part_parids,
+                            parpids = part_parpids,
+                            num_eles = part_n_eles,
                             pid_m_offset = pid_m_start,
                             batch_size = batch_size,
                             n_edge_blocks = n_edge_blocks,

@@ -126,6 +126,10 @@ class TensorCircuit(_BuildMixin, _CudaGraphsMixin, _ExternalParamsMixin, _Learni
         # `_init_buffer` whenever the batch size changes.
         self.external_params = None
         self.external_params_grad = None
+
+        # Forward and backward passes run so far: a decoder session (`juice.decoder`) keeps its values in this
+        # circuit's buffers between its calls and starts over when another pass has run in between
+        self._num_runs = 0
         
         self._init_layers(
             layer_sparsity_tol = layer_sparsity_tol, 
@@ -166,9 +170,16 @@ class TensorCircuit(_BuildMixin, _CudaGraphsMixin, _ExternalParamsMixin, _Learni
         else:
             device = torch.device(device)
 
+        moved = getattr(self, "device", None) != device
+
         super(TensorCircuit, self).to(device)
 
         self.input_layer_group.to(device)
+
+        # `nn.Module.to` moves the inner layers' tables but not the tensors their passes derived from them
+        if moved:
+            for layer_group in self.inner_layer_groups:
+                layer_group.to(device)
 
         self.device = device
 
@@ -258,6 +269,7 @@ class TensorCircuit(_BuildMixin, _CudaGraphsMixin, _ExternalParamsMixin, _Learni
         """
 
         _pop_removed_precision_flags(kwargs)
+        self._num_runs = getattr(self, "_num_runs", 0) + 1
 
         with device_grad_controller(device = self.device, no_grad = True):
         
@@ -429,6 +441,7 @@ class TensorCircuit(_BuildMixin, _CudaGraphsMixin, _ExternalParamsMixin, _Learni
         :type apply_cudagraph: bool
         """
 
+        self._num_runs = getattr(self, "_num_runs", 0) + 1
         self._run_params["allow_modify_flows"] = allow_modify_flows
         self._run_params["propagation_alg"] = propagation_alg
         self._run_params["logspace_flows"] = logspace_flows

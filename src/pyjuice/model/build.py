@@ -13,6 +13,7 @@ from typing import Optional, Sequence, Union
 
 from pyjuice.nodes import CircuitNodes, InputNodes, ExternalParamsSumNodes, summate, multiply
 from pyjuice.layer import InputLayer, ProdLayer, SumLayer, ExternalParamsSumLayer, LayerGroup
+from pyjuice.layer.fused_children import attach_element_children
 from pyjuice.utils import BitSet
 
 from .backend import compile_cum_par_flows_fn, compile_par_update_fn, normalize_parameters
@@ -156,6 +157,8 @@ class _BuildMixin:
                         prod_layers.append(prod_layer)
                     
                     prod_layer_group = LayerGroup(prod_layers)
+                    # Every element row's child node rows, for the sum layers' fused passes (a buffer of the group)
+                    attach_element_children(prod_layer_group, max_node_block_size)
                     self.inner_layer_groups.append(prod_layer_group)
                     self.add_module(f"prod_layer_{layer_id}", prod_layer_group)
 
