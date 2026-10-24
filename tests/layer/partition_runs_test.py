@@ -56,7 +56,8 @@ TRITON = ((SL.fw_bsparse, ("_fw_triton_block_sparse_tlmm_kernel", "_fw_triton_bl
           (SL.bk_ele_bsparse, ("_bk_triton_block_sparse_ele_kernel", "_bk_triton_block_sparse_ele_csmm2_kernel")),
           (SL.bk_ele_sparse, ("_bk_triton_sparse_ele_kernel", "_bk_triton_large_sparse_ele_kernel")),
           (PL.kernels, ("_forward_backward_kernel_2d", "_forward_backward_kernel_large")))
-CUDA = ("tlmm_forward_sum", "smallbatch_forward_sum", "ele_backward_sum", "smallbatch_ele_backward_sum")
+CUDA = ("tlmm_forward_sum", "smallbatch_forward_sum", "ele_backward_sum", "smallbatch_ele_backward_sum",
+        "tlmm_forward_sum_pipelined")
 
 
 @pytest.fixture
@@ -105,7 +106,7 @@ class _Autotune:
 
     def best_of(self, candidates, *args, **kwargs):           # the element-flow gates: `(choice, run)` pairs
         choices = [c for c, _ in candidates]
-        if all(isinstance(c, tuple) and c[0] in ("triton", "cuda") for c in choices):
+        if all(isinstance(c, tuple) and c[0] in ("triton", "cuda", "cuda_pipe") for c in choices):
             return next((c for c in choices if c[0] == "cuda"), choices[0]) if self.cuda else choices[0]
         return self.real.best_of(candidates, *args, **kwargs)
 
@@ -306,7 +307,7 @@ def test_runs_get_the_whole_partitions_bits(case, cuda, hits, monkeypatch):
         expected = triton_paths
     assert expected <= hits, sorted(expected - hits)
     if not cuda:
-        assert not any(h.startswith("cuda.") for h in hits)
+        assert not any(h.startswith("cuda.") for h in hits), sorted(h for h in hits if h.startswith("cuda."))
 
 
 @pytest.mark.parametrize("case", ["hclt32-b8", "pd-b2", "hclt128-b64"])

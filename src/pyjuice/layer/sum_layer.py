@@ -1138,18 +1138,26 @@ class SumLayer(Layer, nn.Module):
                                    node_mars, element_mars, params, nids, ebase, pbase,
                                    batch_size, self.block_size, K_NUM_TILES, c)))
                               for c in valid_cfgs]
+                    # The warp-specialized copy of the kernel (c/tlmm_forward_sum_pipelined.cu, bit-identical:
+                    # producer warps stream the operands a tile ahead of the MMA warps), its configs as more arms --
+                    # MEASURED on HCLT-1024's widest layer: 0.58 against 0.68 ms at B 128, 0.49 against 0.53 at B 64
+                    if cuda_kernels.pipe_is_available():
+                        cands += [(("cuda_pipe", c),
+                                   (lambda c=c: cuda_kernels.tlmm_forward_sum_pipelined(
+                                       node_mars, element_mars, params, nids, ebase, pbase,
+                                       batch_size, self.block_size, K_NUM_TILES, c)))
+                                  for c in cuda_kernels.pipe_valid_configs(self.block_size, batch_size)]
                     choice = autotune.choose(tlmm_key, cands)
 
-                if choice[0] == "cuda":
+                if choice[0] in ("cuda", "cuda_pipe"):
+                    kernel = cuda_kernels.tlmm_forward_sum if choice[0] == "cuda" else cuda_kernels.tlmm_forward_sum_pipelined
                     if runs is None:
-                        cuda_kernels.tlmm_forward_sum(
-                            node_mars, element_mars, params, nids, ebase, pbase,
-                            batch_size, self.block_size, K_NUM_TILES, choice[1])
+                        kernel(node_mars, element_mars, params, nids, ebase, pbase,
+                               batch_size, self.block_size, K_NUM_TILES, choice[1])
                     else:
                         for a, b in runs:                    # (views of the tables: the grid comes from them)
-                            cuda_kernels.tlmm_forward_sum(
-                                node_mars, element_mars, params, nids[a:b], ebase[a:b], pbase[a:b],
-                                batch_size, self.block_size, K_NUM_TILES, choice[1])
+                            kernel(node_mars, element_mars, params, nids[a:b], ebase[a:b], pbase[a:b],
+                                   batch_size, self.block_size, K_NUM_TILES, choice[1])
                     return None
                 # choice == ("triton", -1): fall through to the Triton launch below
 

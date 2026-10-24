@@ -42,6 +42,8 @@ _sbele_module = None    # small-batch (batch<16) element-flow backward
 _sbele_attempted = False
 _sbpar_module = None    # small-batch (batch<16) parameter-flow backward
 _sbpar_attempted = False
+_pipe_module = None     # forward (tlmm), warp-specialized
+_pipe_attempted = False
 _flags_cache = "unset"  # cached (cuda_cflags, ldflags) or None; computed once
 _plain_flags_cache = "unset"  # cached plain (no-CUTLASS) cuda_cflags or None
 
@@ -335,6 +337,37 @@ def configs():
 def valid_configs(block_size: int, batch_size: int):
     """Config ids whose tile shape divides this layer's (block_size, batch)."""
     return [i for i, (bm, bn) in enumerate(configs())
+            if block_size % bm == 0 and batch_size % bn == 0]
+
+
+def pipe_is_available() -> bool:
+    """Whether the warp-specialized CUDA tlmm forward (tlmm_forward_sum_pipelined.cu) is usable (lazily JIT-compiles
+    once). CuTe, so it needs CUTLASS; no TMA, but it shares the CuTe kernels' toolchain gate."""
+    global _pipe_module, _pipe_attempted
+    if not _pipe_attempted:
+        _pipe_attempted = True
+        _pipe_module = _jit("pyjuice_sum_forward_pipelined_cuda", "tlmm_forward_sum_pipelined.cu")
+    return _pipe_module is not None
+
+
+def tlmm_forward_sum_pipelined(node_mars: torch.Tensor, element_mars: torch.Tensor, params: torch.Tensor,
+                               nids: torch.Tensor, ebase: torch.Tensor, pbase: torch.Tensor,
+                               batch_size: int, block_size: int, k_num_tiles: int, cfg: int = 0) -> None:
+    """The tlmm forward with producer warps streaming the operands and consumer warps computing (in-place into
+    ``node_mars``, bit-identical to `tlmm_forward_sum`), with tile config ``cfg`` (`pipe_configs`). Caller must
+    guarantee the plain kernel's dispatch conditions (the gate in ``sum_layer._forward_block_sparse``)."""
+    _pipe_module.tlmm_forward_sum_pipelined(node_mars, element_mars, params, nids, ebase, pbase,
+                                            int(batch_size), int(block_size), int(k_num_tiles), int(cfg))
+
+
+def pipe_configs():
+    """List of (BM, BN) tile shapes per config id of the warp-specialized forward kernel."""
+    return [tuple(c) for c in _pipe_module.configs()] if pipe_is_available() else []
+
+
+def pipe_valid_configs(block_size: int, batch_size: int):
+    """The warp-specialized forward kernel's config ids whose tile shape divides this layer's (block_size, batch)."""
+    return [i for i, (bm, bn) in enumerate(pipe_configs())
             if block_size % bm == 0 and batch_size % bn == 0]
 
 
