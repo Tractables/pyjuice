@@ -92,6 +92,69 @@ def test_the_pipelined_forward_is_the_cuda_forward_to_the_bit(name, B, monkeypat
     assert checked > 0, "no layer of the circuit takes the CUDA path"
 
 
+@pytest.mark.parametrize("B", [64, 128])
+@pytest.mark.parametrize("name", list(CIRCUITS))
+def test_the_pipelined_element_backward_is_the_cuda_backward_to_the_bit(name, B, monkeypatch):
+    """The warp-specialized element-flow backward (c/ele_backward_sum_pipelined.cu) against the CUDA element-flow
+    kernel it copies, on every row it writes; and the layer's dispatch, told the gate chose it, on a whole launch and on
+    runs."""
+    if not (ck.ele_is_available() and ck.ele_pipe_is_available()):
+        pytest.skip("the CUDA kernels are not available here")
+    pc, V, C = CIRCUITS[name]()
+    x = torch.randint(0, C, (B, V), device = DEV)
+    monkeypatch.setattr(SL, "BACKWARD_ELE_FLOW_CUDA", False)
+    pc(x)
+    pc.backward(x, compute_param_flows = False)                     # the backward's caches, Triton throughout
+    checked = 0
+    for lg in pc.inner_layer_groups:
+        if not lg.is_sum():
+            continue
+        for layer in lg:
+            for sig, (ebase, pbase, ok) in list(layer._cached_bk_ele_cuda.items()):
+                if not ok or sig[2] != 64:
+                    continue
+                part = sig[1]
+                chids, cs, bs = layer.partitioned_chids[part], int(layer.cs_block_sizes[part]), layer.block_size
+                if cs % 128 or B % 64:
+                    continue
+                n, knt = chids.numel(), ebase.size(1)
+                rows = (chids[:, None] + torch.arange(cs, device = DEV)[None, :]).reshape(-1)
+                ef = torch.full_like(pc.element_flows, NAN)
+                ck.ele_backward_sum(ef, pc.element_mars, pc.node_flows, pc.node_mars, pc.params, chids, ebase, pbase, B, bs, cs, knt)
+                want = ef[rows].clone()
+                ef.fill_(NAN)
+                ck.ele_backward_sum_pipelined(ef, pc.element_mars, pc.node_flows, pc.node_mars, pc.params, chids, ebase, pbase, B, bs, cs, knt)
+                assert torch.equal(ef[rows], want), (name, sig)
+                checked += 1
+            # the dispatch, told the gate chose the pipelined kernel: the layer's backward over all its partitions
+            # against the plain CUDA kernel's, whole and on runs of partition 0
+            if not layer._cached_bk_ele_cuda or not any(ok for _, _, ok in layer._cached_bk_ele_cuda.values()):
+                continue
+            kw = dict(logspace_flows = True)
+            with monkeypatch.context() as mp:
+                mp.setattr(SL, "BACKWARD_ELE_FLOW_CUDA", True)
+                mp.setattr(autotune, "best_of", lambda cands, *args, **k: ("cuda", 0))
+                layer._cached_bk_ele_choice.clear()
+                ef = torch.full_like(pc.element_flows, NAN)
+                layer.backward(pc.node_flows, ef, pc.node_mars, pc.element_mars, pc.params, **kw)
+                want = ef.clone()
+                mp.setattr(autotune, "best_of", lambda cands, *args, **k: ("cuda_pipe", 0))
+                layer._cached_bk_ele_choice.clear()
+                ef.fill_(NAN)
+                layer.backward(pc.node_flows, ef, pc.node_mars, pc.element_mars, pc.params, **kw)
+                assert torch.equal(torch.nan_to_num(ef, nan = 7.0), torch.nan_to_num(want, nan = 7.0)), name
+                n = layer.partitioned_chids[0].numel()
+                ef.fill_(NAN)
+                layer.backward(pc.node_flows, ef, pc.node_mars, pc.element_mars, pc.params,
+                               partition_runs = [[(0, 1), (n // 2, n)]] + [[]] * (layer.num_bk_partitions - 1), **kw)
+                cs = int(layer.cs_block_sizes[0])
+                rows = torch.cat([layer.partitioned_chids[0][s:e] for s, e in ((0, 1), (n // 2, n))])
+                rows = (rows[:, None] + torch.arange(cs, device = DEV)[None, :]).reshape(-1)
+                assert torch.equal(ef[rows], want[rows])
+                layer._cached_bk_ele_choice.clear()
+    assert checked > 0, "no layer of the circuit takes the CUDA path"
+
+
 def test_the_gate_offers_the_pipelined_configs(monkeypatch):
     """The plain CUDA gate's candidates hold the pipelined kernel's configs beside the plain ones and Triton."""
     if not (ck.is_available() and ck.pipe_is_available()):

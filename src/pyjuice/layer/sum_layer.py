@@ -2130,6 +2130,14 @@ class SumLayer(Layer, nn.Module):
                 def _triton_ele(tgt):
                     _launch_ele(default_ele_cfg, tgt)
 
+                # The warp-specialized copy of the kernel (c/ele_backward_sum_pipelined.cu, bit-identical: producer
+                # warps stream the operands a tile ahead of the MMA warps) as a third arm -- MEASURED on HCLT-1024's
+                # widest layer: 0.70 against 0.83 ms at B 128, 0.55 against 0.60 at B 64
+                def _cuda_ele_pipe(tgt, a = None, b = None):
+                    cuda_kernels.ele_backward_sum_pipelined(
+                        tgt, element_mars, node_flows, node_mars, params, chids[a:b], ele_ebase[a:b], ele_pbase[a:b],
+                        batch_size, self.block_size, cs_block_size, K_NUM_TILES)
+
                 choice_key = (signature, batch_size)
                 choice = self._cached_bk_ele_choice.get(choice_key)
                 if choice is None:
@@ -2139,12 +2147,17 @@ class SumLayer(Layer, nn.Module):
                             or self._bk_ele_scratch.dtype != element_flows.dtype):
                         self._bk_ele_scratch = torch.empty_like(element_flows)
                     scr = self._bk_ele_scratch
-                    choice = autotune.best_of(
-                        [(("triton", -1), (lambda: _triton_ele(scr))),
-                         (("cuda", 0), (lambda: _cuda_ele(scr)))]) or ("triton", -1)
+                    cands = [(("triton", -1), (lambda: _triton_ele(scr))),
+                             (("cuda", 0), (lambda: _cuda_ele(scr)))]
+                    if cuda_kernels.ele_pipe_is_available():
+                        cands.append((("cuda_pipe", 0), (lambda: _cuda_ele_pipe(scr))))
+                    choice = autotune.best_of(cands) or ("triton", -1)
                     self._cached_bk_ele_choice[choice_key] = choice
-                if choice[0] == "cuda":
-                    if runs is None:
+                if choice[0] in ("cuda", "cuda_pipe"):
+                    if choice[0] == "cuda_pipe":
+                        for a, b in ([(None, None)] if runs is None else runs):
+                            _cuda_ele_pipe(element_flows, a, b)
+                    elif runs is None:
                         _cuda_ele(element_flows)
                     else:
                         for a, b in runs:                    # (views of the tables: the grid comes from them)

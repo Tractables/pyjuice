@@ -57,7 +57,7 @@ TRITON = ((SL.fw_bsparse, ("_fw_triton_block_sparse_tlmm_kernel", "_fw_triton_bl
           (SL.bk_ele_sparse, ("_bk_triton_sparse_ele_kernel", "_bk_triton_large_sparse_ele_kernel")),
           (PL.kernels, ("_forward_backward_kernel_2d", "_forward_backward_kernel_large")))
 CUDA = ("tlmm_forward_sum", "smallbatch_forward_sum", "ele_backward_sum", "smallbatch_ele_backward_sum",
-        "tlmm_forward_sum_pipelined")
+        "tlmm_forward_sum_pipelined", "ele_backward_sum_pipelined")
 
 
 @pytest.fixture

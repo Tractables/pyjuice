@@ -44,6 +44,8 @@ _sbpar_module = None    # small-batch (batch<16) parameter-flow backward
 _sbpar_attempted = False
 _pipe_module = None     # forward (tlmm), warp-specialized
 _pipe_attempted = False
+_elepipe_module = None  # element-flow backward, warp-specialized
+_elepipe_attempted = False
 _flags_cache = "unset"  # cached (cuda_cflags, ldflags) or None; computed once
 _plain_flags_cache = "unset"  # cached plain (no-CUTLASS) cuda_cflags or None
 
@@ -369,6 +371,28 @@ def pipe_valid_configs(block_size: int, batch_size: int):
     """The warp-specialized forward kernel's config ids whose tile shape divides this layer's (block_size, batch)."""
     return [i for i, (bm, bn) in enumerate(pipe_configs())
             if block_size % bm == 0 and batch_size % bn == 0]
+
+
+def ele_pipe_is_available() -> bool:
+    """Whether the warp-specialized CUDA element-flow backward (ele_backward_sum_pipelined.cu) is usable (lazily
+    JIT-compiles once). CuTe, so it needs CUTLASS; no TMA, but it shares the CuTe kernels' toolchain gate."""
+    global _elepipe_module, _elepipe_attempted
+    if not _elepipe_attempted:
+        _elepipe_attempted = True
+        _elepipe_module = _jit("pyjuice_sum_backward_ele_pipelined_cuda", "ele_backward_sum_pipelined.cu")
+    return _elepipe_module is not None
+
+
+def ele_backward_sum_pipelined(element_flows: torch.Tensor, element_mars: torch.Tensor, node_flows: torch.Tensor,
+                               node_mars: torch.Tensor, params: torch.Tensor, chids: torch.Tensor,
+                               ebase: torch.Tensor, pbase: torch.Tensor,
+                               batch_size: int, block_size: int, cs_block_size: int, k_num_tiles: int) -> None:
+    """The element-flow backward with producer warps streaming the operands and consumer warps computing (in-place
+    into ``element_flows``, bit-identical to `ele_backward_sum`). Caller must guarantee the plain kernel's dispatch
+    conditions (the gate in ``sum_layer._backward_block_sparse_ele_flows``)."""
+    _elepipe_module.ele_backward_sum_pipelined(element_flows, element_mars, node_flows, node_mars, params, chids,
+                                               ebase, pbase, int(batch_size), int(block_size), int(cs_block_size),
+                                               int(k_num_tiles))
 
 
 def autotune(candidates, warmup: int = 3, reps: int = 7) -> int:
