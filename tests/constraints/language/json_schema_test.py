@@ -431,9 +431,9 @@ def test_the_texts_are_outlines_cores_on_jsonschemabench(subset):
     and the texts more than one branch holds are no instances (`{"a": {}}` under `{"a": {"oneOf": [x, y]}}`, two
     closed objects without `required`). Left out: schemas with `allOf`, `not` or `if` -- outlines-core concatenates
     `allOf`'s branches (`{"v": 1}{"w": 2}`, no JSON) and refuses the others; the combinator tests above check those --
-    and those whose regex repeats a piece more than 256 times (`maxLength: 32767`) or runs past 100k characters
-    (outlines-core writes a free-form value's regex out in place, 18 of them 1 MB): its automaton takes minutes, over
-    ten for the longest, where ours compiles in under a second."""
+    and those whose regex repeats a piece more than 256 times (`maxLength: 32767`) or runs past 8k characters
+    (outlines-core writes a free-form value's regex out in place, 18 of them 1 MB; a tenth of the corpus): its
+    automaton takes seconds to minutes, over ten for the longest, where ours compiles in under a second."""
     from pyjuice.constraints.language.backend import automata as A
     from pyjuice.constraints.language.json_schema import _prepare
     equal = subsets = 0
@@ -450,7 +450,7 @@ def test_the_texts_are_outlines_cores_on_jsonschemabench(subset):
         if ref_depth(schema) > 3 or combinators(schema) & {"allOf", "not", "if"}:
             continue
         pattern = outlines_core_regex(schema, r"[ ]?")
-        if max_repetition(pattern) > 256 or len(pattern) > 100_000:
+        if max_repetition(pattern) > 256 or len(pattern) > 8192:
             continue
         ours, theirs = outlines_core_texts(schema, r"[ ]?", pattern)
         if "oneOf" in combinators(schema):
