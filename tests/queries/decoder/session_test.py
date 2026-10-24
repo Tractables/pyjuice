@@ -422,7 +422,11 @@ def test_the_insides_a_session_holds_valid_are_a_forwards(kind, sequence, early_
     pc, V, B, inputs, soft = _model(kind)
     twin = _model(kind)[0]
     steps = _steps(sequence, B, V, soft, inputs, np.random.default_rng(8))
-    with juice.decoder(pc, early_stop = early_stop, **inputs) as decoder:
+    # No CUDA graphs: the twin's queries run inside the session's `fast_inference` scope, where a query is captured
+    # into a graph -- and capture declines to tune, so the graph holds the default tiles where the session's eager
+    # launches hold the tuned ones (they agree to ~1e-7 only, and the tuned choice departs from the default under a
+    # noisy GPU: this test failed once in a loaded suite)
+    with juice.decoder(pc, early_stop = early_stop, allow_cudagraph = False, **inputs) as decoder:
         for i, (x, miss, query, targets) in enumerate(steps):
             if query == "marginal":
                 decoder.marginal(x, missing_mask = miss)
