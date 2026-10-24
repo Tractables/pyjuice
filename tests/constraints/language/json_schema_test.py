@@ -12,6 +12,7 @@ import itertools
 import json
 import os
 import random
+import re
 import sys
 
 import pytest
@@ -331,15 +332,21 @@ FORMS = [{"type": "string"}, {"type": "integer"}, {"type": "number", "format": "
          {"allOf": [{"type": "boolean"}]}, {"anyOf": [{"type": "null"}, {"type": "array", "items": {"type": "integer"}}]}]
 
 
-def outlines_core_texts(schema, whitespace):
-    """``(ours, outlines-core's)``: the compiled texts of the (checked) schema, and those of outlines-core's regex."""
+def outlines_core_regex(schema, whitespace):
+    """outlines-core's regex of the (checked) schema."""
     oc = pytest.importorskip("outlines_core")
+    from pyjuice.constraints.language.json_schema import _prepare
+    return oc.json_schema.build_regex_from_schema(json.dumps(_prepare(schema)), whitespace)
+
+
+def outlines_core_texts(schema, whitespace, pattern = None):
+    """``(ours, outlines-core's)``: the compiled texts of the (checked) schema, and those of outlines-core's regex
+    (``pattern``, when made already)."""
     from pyjuice.constraints.language.backend import automata as A
     from pyjuice.constraints.language.backend.json_schema import compile_schema
     from pyjuice.constraints.language.json_schema import _prepare
-    prepared = _prepare(schema)
-    ref = A.regex(oc.json_schema.build_regex_from_schema(json.dumps(prepared), whitespace))
-    return compile_schema(prepared, whitespace), ref
+    ref = A.regex(outlines_core_regex(schema, whitespace) if pattern is None else pattern)
+    return compile_schema(_prepare(schema), whitespace), ref
 
 
 def same_as_outlines_core(schema, whitespace):
@@ -410,15 +417,29 @@ def jsonschemabench(max_chars):
     return out
 
 
+JSONSCHEMABENCH = ("Glaiveai2K", "Github_trivial", "Github_easy", "Github_medium", "Github_hard", "Kubernetes", "Snowplow",
+                   "WashingtonPost", "JsonSchemaStore")
+
+
 @pytest.mark.slow
-def test_the_texts_are_outlines_cores_on_jsonschemabench():
-    """Every schema the checker lets through (up to 4000 characters: outlines-core's regex goes through interegular)
-    has outlines-core's texts -- but those whose property names hold a quote, a backslash or a control character, and
-    those nesting more than 3 references: past them outlines-core drops a property, required or not (its texts then
-    miss documents with it, or hold documents without a required one), or gives up."""
+@pytest.mark.parametrize("subset", JSONSCHEMABENCH)
+def test_the_texts_are_outlines_cores_on_jsonschemabench(subset):
+    """Every schema the checker lets through (up to 4000 characters) has outlines-core's texts -- but those whose
+    property names hold a quote, a backslash or a control character, and those nesting more than 3 references: past
+    them outlines-core drops a property, required or not (its texts then miss documents with it, or hold documents
+    without a required one), or gives up. A schema with `oneOf` has some of them: outlines-core reads it as `anyOf`,
+    and the texts more than one branch holds are no instances (`{"a": {}}` under `{"a": {"oneOf": [x, y]}}`, two
+    closed objects without `required`). Left out: schemas with `allOf`, `not` or `if` -- outlines-core concatenates
+    `allOf`'s branches (`{"v": 1}{"w": 2}`, no JSON) and refuses the others; the combinator tests above check those --
+    and those whose regex repeats a piece more than 256 times (`maxLength: 32767`) or runs past 100k characters
+    (outlines-core writes a free-form value's regex out in place, 18 of them 1 MB): its automaton takes minutes, over
+    ten for the longest, where ours compiles in under a second."""
+    from pyjuice.constraints.language.backend import automata as A
     from pyjuice.constraints.language.json_schema import _prepare
-    checked = 0
-    for subset, k, text in jsonschemabench(4000):
+    equal = subsets = 0
+    for part, k, text in jsonschemabench(4000):
+        if part != subset:
+            continue
         schema = json.loads(text)
         try:
             _prepare(schema)
@@ -426,11 +447,38 @@ def test_the_texts_are_outlines_cores_on_jsonschemabench():
             continue
         if any(any(c in name for c in '"\\') or any(ord(c) < 0x20 for c in name) for name in property_names(schema)):
             continue
-        if ref_depth(schema) > 3:
+        if ref_depth(schema) > 3 or combinators(schema) & {"allOf", "not", "if"}:
             continue
-        assert same_as_outlines_core(schema, r"[ ]?"), (subset, k)
-        checked += 1
-    assert checked > 100
+        pattern = outlines_core_regex(schema, r"[ ]?")
+        if max_repetition(pattern) > 256 or len(pattern) > 100_000:
+            continue
+        ours, theirs = outlines_core_texts(schema, r"[ ]?", pattern)
+        if "oneOf" in combinators(schema):
+            assert A.is_empty(A.difference(ours, theirs)), (subset, k)
+            subsets += 1
+        else:
+            assert A.equivalent(ours, theirs), (subset, k)
+            equal += 1
+    assert equal + subsets > 0, subset
+
+
+def combinators(node):
+    """The combinators (`anyOf`, `oneOf`, `allOf`, `not`, `if`) anywhere in a schema."""
+    out = set()
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if key in ("anyOf", "oneOf", "allOf", "not", "if"):
+                out.add(key)
+            out |= combinators(value)
+    elif isinstance(node, list):
+        for value in node:
+            out |= combinators(value)
+    return out
+
+
+def max_repetition(pattern):
+    """The largest bound of a counted repetition (`{n}`, `{m,n}`) in a regex."""
+    return max((int(x) for pair in re.findall(r"\{\d*,(\d+)\}|\{(\d+)\}", pattern) for x in pair if x), default = 0)
 
 
 def test_references_are_followed_at_any_depth():
