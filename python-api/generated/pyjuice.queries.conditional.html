@@ -111,6 +111,11 @@
 <li><p><strong>bk_input_fn</strong> (<em>Optional</em><em>[</em><em>Union</em><em>[</em><a class="reference external" href="https://docs.python.org/3/builtins/stdtypes.html#str" title="(in Python v3.15)"><em>str</em></a><em>,</em><em>Callable</em><em>]</em><em>]</em>) – an optional custom function for the backward pass of input layers</p></li>
 </ul>
 </dd>
+<dt class="field-even">Note<span class="colon">:</span></dt>
+<dd class="field-even"><p>the backward pass runs with log-space flows and without flow modification (<cite>logspace_flows = True</cite>,
+<cite>allow_modify_flows = False</cite>) – the regime external sum parameters need – so a custom <cite>bk_input_fn</cite>
+receives log-space flows.</p>
+</dd>
 </dl>
 </dd></dl>
 
