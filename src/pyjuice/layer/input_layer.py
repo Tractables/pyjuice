@@ -768,8 +768,10 @@ class InputLayer(Layer, nn.Module):
             self._run_post(self.post_bp_fns, kwargs, bk_launch_common)
             kwargs.pop("_bk_launch_common", None)
 
-            # Handle the masked input nodes
-            if missing_mask is not None and self.bk_flow_mask_fn is not None:
+            # Handle the masked input nodes: their flows go to the parameter flows only, so there is nothing to do
+            # without them (`backward(compute_param_flows = False)` never allocates `param_flows`, and the kernel
+            # would not compile against None)
+            if missing_mask is not None and self.bk_flow_mask_fn is not None and self.param_flows is not None:
                 self._backward_missing(node_flows, missing_mask, missing_mask_mode, num_vars,
                                        logspace_flows)
         else:
