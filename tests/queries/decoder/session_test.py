@@ -21,6 +21,7 @@ import pyjuice as juice
 import pyjuice.nodes.distributions as dists
 import pyjuice.queries.decoder.session as session
 from pyjuice.layer import InputLayer, SumLayer
+from pyjuice.layer.kernels import autotune
 from pyjuice.nodes import inputs, multiply, summate, BlockScaleSumParams, LowRankSumParams
 
 
@@ -216,6 +217,11 @@ def restrict(request, monkeypatch):
     (`element_mars` rows are shared by the layer groups: theirs hold another group's products)."""
     if request.param != "default":
         _restrict_always(monkeypatch)
+        # No tuning: in these modes the session's launches are all of some rows, which never tune (they take the
+        # default tiles until a whole launch has chosen), while a twin's whole launches tune and may pick other tiles
+        # -- the same values to ~1e-7, not the same bits
+        was = autotune.set_autotune(False)
+        request.addfinalizer(lambda: autotune.set_autotune(was))
     if request.param == "rules":
         monkeypatch.setattr(session, "_PARTITION_WHOLE_FRACTION", 0.5)
     if request.param == "partitions":

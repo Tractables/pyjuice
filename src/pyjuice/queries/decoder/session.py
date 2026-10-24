@@ -43,6 +43,7 @@ import numpy as np
 import torch
 
 from pyjuice.layer import ExternalParamsSumLayer
+from pyjuice.layer.fused_children import element_children
 from pyjuice.layer.external_sum_layer import EXTERNAL_PARAMS_KWARG
 from pyjuice.utils.fast_inference import fast_inference
 
@@ -151,6 +152,8 @@ class _Layout:
         self.outside_elements = _complement(elo[prods], ehi[prods], pc.num_elements)
         self.is_prod = s.kind == PROD
         self.modules = layers
+        # The children of every element row, per product layer group: the sum layers' fused passes (`compute_children`)
+        self.child_tables = element_children(pc)
         self.elo, self.ehi = elo, ehi
         self.layer_groups = [np.flatnonzero(self.layer_of == l) for l in range(len(layers))]
         self.layer_children = [np.unique(np.concatenate([s.ch_idx[s.ch_ptr[g]:s.ch_ptr[g + 1]] for g in gs]))
@@ -406,6 +409,18 @@ _GROUP_RUNS_MIN_WORK = 1 << 26
 _MAX_PARTITION_RUNS = 4
 _PARTITION_WHOLE_FRACTION = 0.5
 
+# Fused passes: a sum layer whose kernels can form its children's element values from `node_mars` does, and the
+# session launches no product layer forward for it (`SumLayer.forward` / `backward(compute_children = ...)`). The
+# backward always (its fused kernel forms one element tile per program: MEASURED 0.58 vs 0.75 ms + the products on
+# HCLT-1024's widest layer; decodes -2..-17%). The forward only below the batch where the plain path's CUDA kernel
+# applies (BLOCK_B >= 64): there the fused Triton kernel runs at parity with the products + the plain kernel and the
+# saved launches are the gain (HCLT-1024 left to right at B 16: 0.919 -> 0.849 of the base decode); at B >= 64 the
+# products + the CUDA kernel beat every fused kernel, re-gathering the children from L2 per node tile costing more than
+# materializing them once (the fused CUDA kernel, at the L2 gather rate: 0.95 vs 0.86 ms; decodes 0.871 vs 0.835).
+_FUSE_FORWARD = True
+_FUSE_FORWARD_BELOW_BATCH = 64
+_FUSE_BACKWARD = True
+
 
 def _get(t: torch.Tensor, rows):
     return t[rows]
@@ -519,6 +534,22 @@ class Decoder:
             self._fw_ok[l] = pc.inner_layer_groups[k][int(L.index[l])].forward_runs_ok(
                 batch_size, alg if isinstance(alg, str) else alg[k], 1.0, pc.node_mars.is_cuda)
         self._group_runs = bool(any(on.any() for on in self._runs_on.values()))
+
+        # Fused passes at this batch size: the sum layers whose every partition forms its children's element values
+        # itself (`SumLayer.fuses_children` / `fuses_children_backward`): no product layer forward runs for them
+        self._fw_fused = np.zeros([L.kind.size], dtype = bool)
+        self._bk_fused = np.zeros([L.kind.size], dtype = bool)
+        if _FUSE_FORWARD or _FUSE_BACKWARD:
+            for l in np.flatnonzero((L.kind == SUM) & ~L.gated).tolist():
+                k = int(L.group[l])
+                layer = pc.inner_layer_groups[k][int(L.index[l])]
+                layer_alg = alg if isinstance(alg, str) else alg[k]
+                if _FUSE_FORWARD and batch_size < _FUSE_FORWARD_BELOW_BATCH:
+                    self._fw_fused[l] = all(layer.fuses_children(batch_size, layer_alg, 1.0, pc.params.dim(),
+                                                                 pc.node_mars.is_cuda))
+                if _FUSE_BACKWARD:
+                    self._bk_fused[l] = all(layer.fuses_children_backward(batch_size, "LL", False, pc.params.dim()))
+        self._any_fused = bool(self._fw_fused.any() or self._bk_fused.any())
 
     # ---------------------------------------------------------------------------------------------
     # Queries
@@ -729,15 +760,17 @@ class Decoder:
         alg = pc.default_propagation_alg
         sum_opts = dict(kwargs, **pc.propagation_alg_kwargs, precision = pc.precision, pflow_temperature = 1.0)
         sum_layers = L.layers(recompute, SUM)
+        fused, any_fused = self._fw_fused, self._any_fused
         if not self._group_runs:                                     # whole layers, as before group runs
             for ls in L.by_group(sum_layers):
                 k = int(L.group[ls[0]])
                 lg, below = pc.inner_layer_groups[k], pc.inner_layer_groups[k - 1]
-                for p in L.children(ls):
+                for p in L.children(ls[~fused[ls]] if any_fused else ls):   # the products a fused layer forms itself
                     below[L.index[p]].forward(pc.node_mars, pc.element_mars)
                 layer_alg = alg if isinstance(alg, str) else alg[k]
                 for l in ls:
-                    lg[L.index[l]].forward(pc.node_mars, pc.element_mars, pc.params, propagation_alg = layer_alg, **sum_opts)
+                    opts = dict(sum_opts, compute_children = L.child_tables[k - 1]) if fused[l] else sum_opts
+                    lg[L.index[l]].forward(pc.node_mars, pc.element_mars, pc.params, propagation_alg = layer_alg, **opts)
             return
         sum_runs, prod_runs = self._forward_plan(recompute, sum_layers)
         for ls in L.by_group(sum_layers):
@@ -749,6 +782,8 @@ class Decoder:
             for l in ls:
                 runs = sum_runs.get(int(l))
                 opts = sum_opts if runs is None else dict(sum_opts, partition_runs = runs)
+                if fused[l]:
+                    opts = dict(opts, compute_children = L.child_tables[k - 1])
                 lg[L.index[l]].forward(pc.node_mars, pc.element_mars, pc.params, propagation_alg = layer_alg, **opts)
 
     @staticmethod
@@ -804,6 +839,10 @@ class Decoder:
                     sums_computed[index.groups[(l, p)]] = True
                     parts[p] = None
             sum_runs[l] = parts
+        if self._any_fused:
+            for l in sum_layers.tolist():                            # a fused layer forms its children itself
+                if self._fw_fused[l]:
+                    sums_computed[L.layer_groups[l]] = False
         return sum_runs, self._product_runs(self._children(sums_computed))
 
     def _product_runs(self, need: np.ndarray) -> dict:
@@ -838,6 +877,12 @@ class Decoder:
                 sum_runs[l] = self._partition_runs("sum_bk", l, found, whole = products)
             else:
                 products[L.layer_children[l]] = True
+        if self._any_fused:                              # a fused layer forms its children itself: only the others read
+            reads = np.zeros_like(products)
+            for l in sum_layers.tolist():
+                if not self._bk_fused[l]:
+                    reads[L.layer_children[l]] = True
+            products &= reads
         on = self._runs_on["prod_bk"]
         found = self._row_index["prod_bk"].runs(V & ~L.is_prod) if on.any() else {}
         prod_bk = {l: self._partition_runs("prod_bk", l, found) for l in prod_layers.tolist() if on[l]}
@@ -918,18 +963,22 @@ class Decoder:
                 _put(nm, seeds, scale[None, :] - _get(self._node_out, seeds))
                 _put(nf, seeds, 0.0)
             below = pc.inner_layer_groups[k - 1]
+            fused = self._bk_fused
             if bk is None:                                           # whole layers, as before group runs
-                for p in L.children(ls):
+                for p in L.children(ls[~fused[ls]] if self._any_fused else ls):   # a fused layer forms its children
                     below[L.index[p]].forward(nm, pc.element_mars)
                 for l in ls:
+                    opts = dict(bk_opts, compute_children = L.child_tables[k - 1]) if fused[l] else bk_opts
                     lg[L.index[l]].backward(nf, pc.element_flows, nm, pc.element_mars, pc.params,
-                                            propagation_alg = "LL", **bk_opts)
+                                            propagation_alg = "LL", **opts)
             else:
                 for p, runs in bk["prod_fw"].get(k, []):
                     below[L.index[p]].forward(nm, pc.element_mars, partition_runs = runs)
                 for l in ls:
                     runs = bk["sum"].get(int(l))
                     opts = bk_opts if runs is None else dict(bk_opts, partition_runs = runs)
+                    if fused[l]:
+                        opts = dict(opts, compute_children = L.child_tables[k - 1])
                     lg[L.index[l]].backward(nf, pc.element_flows, nm, pc.element_mars, pc.params,
                                             propagation_alg = "LL", **opts)
             for r, val in reversed(saved):
