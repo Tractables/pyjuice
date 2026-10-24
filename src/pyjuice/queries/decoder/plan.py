@@ -69,13 +69,16 @@ class Structure:
         self.cost = np.array([float(ns.num_nodes if ns.is_input() else ns.num_edges) for ns in groups],
                              dtype = np.float64)
 
-        scopes = [ns.scope.to_list() for ns in groups]
-        self.num_vars = max(max(s) for s in scopes if len(s) > 0) + 1
+        # Every (group, variable) pair at once -- a PD over 28 x 28 variables has 800k of them, which Python loops over
+        # the pairs took a second for (MEASURED: scope bits, per-variable lists and an `is_input` call per pair)
+        scopes = [_scope_variables(ns) for ns in groups]
+        lens = np.array([s.size for s in scopes], dtype = np.int64)
+        pair_g = np.repeat(np.arange(G, dtype = np.int64), lens)
+        pair_v = np.concatenate(scopes) if G > 0 else np.zeros([0], dtype = np.int64)
+        self.num_vars = int(pair_v.max()) + 1 if pair_v.size > 0 else 0
         words = (self.num_vars + 63) // 64
         self.scope = np.zeros([G, words], dtype = np.uint64)
-        for g, s in enumerate(scopes):
-            for v in s:
-                self.scope[g, v >> 6] |= np.uint64(1) << np.uint64(v & 63)
+        np.bitwise_or.at(self.scope, (pair_g, pair_v >> 6), np.uint64(1) << (pair_v & 63).astype(np.uint64))
 
         children = [[index[id(cs)] for cs in ns.chs] if not ns.is_input() else [] for ns in groups]
         parents = [[] for _ in range(G)]
@@ -85,15 +88,12 @@ class Structure:
         self.ch_ptr, self.ch_idx = _csr(children)
         self.par_ptr, self.par_idx = _csr(parents)
 
-        var_groups = [[] for _ in range(self.num_vars)]
-        var_inputs = [[] for _ in range(self.num_vars)]
-        for g, s in enumerate(scopes):
-            for v in s:
-                var_groups[v].append(g)
-                if groups[g].is_input():
-                    var_inputs[v].append(g)
-        self.var_ptr, self.var_idx = _csr(var_groups)
-        self.inp_ptr, self.inp_idx = _csr(var_inputs)
+        # The groups of every variable, ascending (the pairs are in group order: a stable sort by variable keeps it)
+        order = np.argsort(pair_v, kind = "stable")
+        self.var_ptr, self.var_idx = _csr_from_sorted(pair_v[order], pair_g[order], self.num_vars)
+        is_input = self.kind[pair_g] == INPUT
+        self.inp_ptr, self.inp_idx = _csr_from_sorted(pair_v[order][is_input[order]], pair_g[order][is_input[order]],
+                                                      self.num_vars)
 
     def input_groups(self, variables) -> np.ndarray:
         """The input groups of ``variables``, ascending."""
@@ -130,6 +130,19 @@ def _csr(lists):
     ptr[1:] = np.cumsum([len(l) for l in lists])
     idx = np.array([x for l in lists for x in l], dtype = np.int64)
     return ptr, idx
+
+
+def _csr_from_sorted(keys: np.ndarray, values: np.ndarray, num_keys: int):
+    """CSR ``(ptr, idx)`` of ``values`` grouped by ``keys`` (ascending, in ``[0, num_keys)``)."""
+    ptr = np.zeros([num_keys + 1], dtype = np.int64)
+    ptr[1:] = np.cumsum(np.bincount(keys, minlength = num_keys))
+    return ptr, np.ascontiguousarray(values, dtype = np.int64)
+
+
+def _scope_variables(ns: CircuitNodes) -> np.ndarray:
+    """A node group's variables, ascending, read off its scope's bytes (a :class:`~pyjuice.utils.bitset.BitSet`
+    holds variable ``v`` as bit ``7 - v % 8`` of byte ``v // 8``: the order `np.unpackbits` unpacks)."""
+    return np.flatnonzero(np.unpackbits(np.frombuffer(bytes(ns.scope.values), dtype = np.uint8))).astype(np.int64)
 
 
 @dataclass
