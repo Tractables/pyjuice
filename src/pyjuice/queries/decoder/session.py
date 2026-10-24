@@ -1,13 +1,15 @@
 """
-``juice.decoder(pc, **inputs, **options)``: a session of queries of one circuit -- :meth:`Decoder.marginal` and
-:meth:`Decoder.conditional`, with the arguments and results of :func:`pyjuice.queries.marginal` and
-:func:`pyjuice.queries.conditional` -- that keeps, between its calls, the values the evidence left unchanged and
-computes only what a call's changes reach (the plan of :mod:`.plan`)::
+``juice.decoder(pc, **inputs, **options)``: a session of queries of one circuit -- :meth:`Decoder.marginal`,
+:meth:`Decoder.conditional` and :meth:`Decoder.sample`, with the arguments and results of
+:func:`pyjuice.queries.marginal`, :func:`pyjuice.queries.conditional` and :func:`pyjuice.queries.sample` -- that
+keeps, between its calls, the values the evidence left unchanged and computes only what a call's changes reach (the
+plan of :mod:`.plan`)::
 
     with juice.decoder(pc) as decoder:
         for t in range(n):
             probs = decoder.conditional(x, missing_mask = x_missing, target_vars = [t])
             ...
+        x_full = decoder.sample(x, missing_mask = x_missing)      # the missing variables drawn given the evidence
 
 Values live in the circuit's own buffers (``node_mars``, ``element_mars``, ``node_flows``, ``element_flows``);
 the session adds one, ``node_out``, the log-outsides its conditionals computed. Any other forward or backward of the
@@ -613,6 +615,55 @@ class Decoder:
         self._planner.commit(plan, outsides = self.early_stop)
         self._remember(data, miss)
         return out
+
+    def sample(self, data: Optional[torch.Tensor] = None, missing_mask: Optional[torch.Tensor] = None, *,
+               num_samples: Optional[int] = None, **options) -> torch.Tensor:
+        """Samples of the circuit, as :func:`pyjuice.queries.sample`.
+
+        With ``data``: one sample per row of the evidence, ``[B, V]`` in the input dtype, drawn from ``p(x | e)`` --
+        the missing variables sampled, the observed ones equal to the evidence (under soft evidence, a variable's
+        slice, every variable is drawn). The forward the draw needs is the session's: the rows of the variables whose
+        evidence changed since the last call, up to the root (every node must be current -- the walk may reach any --
+        so no marginal's cut), and it is kept for the calls after, as any call's.
+
+        Without ``data``: ``num_samples`` unconditional samples (``p(x)``), as many as the session's per-sample inputs
+        when it has them -- one gate per drawn sample, as :func:`pyjuice.queries.sample` takes them. No forward: the
+        draw reads the parameters, and the session's state is untouched.
+
+        ``options``: the sampler's own (``use_cudagraph``, ``fuse_top_down``)."""
+        self._check_open()
+        from ..sample import sample as sample_query          # (the package imports this module)
+        pc = self.pc
+        if data is None:
+            if missing_mask is not None:
+                raise TypeError("`missing_mask` without `data`: give the evidence to sample conditionally, or neither.")
+            if num_samples is None:
+                num_samples = self._inputs_batch()
+                if num_samples is None:
+                    raise TypeError("`num_samples`: how many unconditional samples to draw (the session has no "
+                                    "per-sample inputs to take it from).")
+            return sample_query(pc, num_samples = num_samples, conditional = False, **options, **self._inputs)
+        if num_samples is not None:
+            raise TypeError("`num_samples` is for sampling without evidence; with `data`, one sample per row is drawn.")
+        miss = self._prepare(data, missing_mask)
+        plan = self._planner.marginal(cuts = False)
+        self._forward(plan.recompute, data, dict(self._kwargs, missing_mask = missing_mask))
+        if self.early_stop:                                  # the root's inside: the next conditional's scale
+            self._log_p = pc.node_mars[pc._root_node_range[0]:pc._root_node_range[1]].logsumexp(dim = 0)
+        self._planner.commit(plan)
+        self._remember(data, miss)
+        out = sample_query(pc, conditional = True, **options, **self._inputs)
+        if data.dim() == 2:
+            out = torch.where(miss, out, data.to(out.dtype))
+        return out
+
+    def _inputs_batch(self) -> Optional[int]:
+        """The batch size of the session's per-sample inputs, None without any."""
+        for v in self._inputs.values():
+            for t in (v.values() if isinstance(v, dict) else [v]):
+                if torch.is_tensor(t) and t.dim() > 0:
+                    return int(t.size(0))
+        return None
 
     # ---------------------------------------------------------------------------------------------
     # Evidence

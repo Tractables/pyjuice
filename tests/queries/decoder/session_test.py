@@ -13,6 +13,8 @@ through external-parameter layers (whose backward shifts `node_mars` in place), 
 launches, and the refusals.
 """
 
+import random
+
 import numpy as np
 import pytest
 import torch
@@ -446,6 +448,75 @@ def test_the_insides_a_session_holds_valid_are_a_forwards(kind, sequence, early_
             juice.queries.marginal(twin, data = x.clone(), missing_mask = miss, **inputs)
             assert torch.equal(pc.node_mars[rows], twin.node_mars[rows]), \
                 (i, query, float((pc.node_mars[rows] - twin.node_mars[rows]).abs().max()))
+
+
+def _seeded(fn, seed):
+    """`fn()` under a fixed seed of both generators the sampler draws from (Python's `random` for the input emission,
+    torch's for the walk)."""
+    random.seed(seed)
+    torch.manual_seed(seed)
+    return fn()
+
+
+@cuda_only
+@pytest.mark.parametrize("kind", ["hmm", "hmm_soft", "hclt", "pd_fp32", "hclt_wide", "softevi", "blockscale"])
+@pytest.mark.parametrize("early_stop", [False, True])
+def test_a_session_samples_from_its_forward(kind, early_stop, restrict):
+    """Along a left-to-right sequence of conditionals and marginals, a sample at every step: (1) the insides the draw
+    read are a forward's of the step's evidence at EVERY node (the walk may reach any: no cut), to float rounding;
+    (2) the draw is the sampler's on those insides under the same seed, to the bit, with the observed variables equal
+    to the evidence (under soft evidence, every variable drawn); (3) the session's answers after it are still the
+    queries'."""
+    pc, V, B, inputs, soft = _model(kind)
+    steps = _steps("left_to_right", B, V, soft, inputs, np.random.default_rng(3))
+    with juice.decoder(pc, early_stop = early_stop, **inputs) as decoder:
+        for i, (x, miss, query, targets) in enumerate(steps):
+            if query == "conditional":
+                got = decoder.conditional(x, missing_mask = miss, target_vars = targets)
+                want = juice.queries.conditional(pc, data = x.clone(), missing_mask = miss, target_vars = targets, **inputs)
+                assert torch.allclose(got, want, atol = 1e-5), (i, float((got - want).abs().max()))
+                continue
+            s = _seeded(lambda: decoder.sample(x, missing_mask = miss), 100 + i)
+            assert s.shape == (B, V) and s.dtype == pc.input_layer_group[0].get_data_dtype()
+            # (2) the sampler on the session's insides, as they stand
+            ref = _seeded(lambda: juice.queries.sample(pc, conditional = True, **inputs), 100 + i)
+            if x.dim() == 2:
+                ref = torch.where(miss, ref, x.to(ref.dtype))
+                assert torch.equal(s[~miss], x.to(s.dtype)[~miss])
+            assert torch.equal(s, ref), i
+            # (1) those insides against a forward of the evidence, at every node
+            insides = pc.node_mars.clone()
+            juice.queries.marginal(pc, data = x.clone(), missing_mask = miss, **inputs)      # a forward of the evidence
+            assert torch.allclose(insides, pc.node_mars, atol = 1e-4, rtol = 1e-5), (i, float((insides - pc.node_mars).abs().max()))
+        # a marginal and a conditional at the end: the queries' (the session restarted after the forwards above)
+        x, miss = steps[-1][0], steps[-1][1]
+        got = decoder.marginal(x, missing_mask = miss)
+        want = juice.queries.marginal(pc, data = x.clone(), missing_mask = miss, **inputs)
+        assert torch.allclose(got, want, atol = 1e-4, rtol = 1e-5)
+
+
+@cuda_only
+def test_unconditional_samples_and_the_refusals():
+    """Without evidence a session draws as `juice.queries.sample` does, under the same seed, its per-sample inputs as
+    one gate per drawn sample and giving the count; the forms that mean nothing are refused."""
+    pc, V, B, inputs, soft = _model("hmm")
+    x = torch.randint(0, C, (B, V), device = DEV)
+    with juice.decoder(pc) as decoder:
+        got = _seeded(lambda: decoder.sample(num_samples = 7), 5)
+        want = _seeded(lambda: juice.queries.sample(pc, num_samples = 7), 5)
+        assert got.shape == (7, V) and torch.equal(got, want)
+        with pytest.raises(TypeError, match = "num_samples"):
+            decoder.sample()                                         # no per-sample inputs to take the count from
+        with pytest.raises(TypeError, match = "missing_mask"):
+            decoder.sample(missing_mask = torch.ones(B, V, dtype = torch.bool, device = DEV))
+        with pytest.raises(TypeError, match = "num_samples"):
+            decoder.sample(x, num_samples = 3)
+        decoder.sample(x, missing_mask = torch.ones(B, V, dtype = torch.bool, device = DEV))   # all missing: fine
+    pc, V, B, inputs, soft = _model("blockscale")
+    with juice.decoder(pc, **inputs) as decoder:
+        got = _seeded(lambda: decoder.sample(), 6)                   # the gates' batch: 16 samples
+        want = _seeded(lambda: juice.queries.sample(pc, num_samples = B, **inputs), 6)
+        assert got.shape == (B, V) and torch.equal(got, want)
 
 
 @cuda_only
