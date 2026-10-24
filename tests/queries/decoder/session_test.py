@@ -67,7 +67,12 @@ def _model(kind):
                                  input_dist = dists.Categorical(num_cats = C))
         ns.init_parameters(perturbation = 2.0)
         return juice.compile(ns, verbose = False, precision = precision).to(DEV), 16, 4, {}, False
-    if kind == "pd_wide":                                            # padded product parents: the dummy rows
+    if kind == "hclt_wide":                                          # partitions of many rows: group runs
+        x = torch.randint(0, C, (512, 24))
+        ns = juice.structures.HCLT(x.float(), num_latents = 8, input_dist = dists.Categorical(num_cats = C))
+        ns.init_parameters(perturbation = 2.0)
+        return juice.compile(ns, verbose = False, precision = precision).to(DEV), 24, 4, {}, False
+    if kind == "pd_wide":
         ns = juice.structures.PD(data_shape = (6, 6), num_latents = 4, split_intervals = 2,
                                  input_dist = dists.Categorical(num_cats = C))
         ns.init_parameters(perturbation = 2.0)
@@ -188,24 +193,47 @@ def _session(pc, steps, inputs, early_stop, monkeypatch):
     return out, len(starts)
 
 
-MODELS = ["hmm", "hmm_fp32", "hmm_soft", "hclt", "hclt_fp32", "pd", "pd_fp32", "softevi", "softevi_topk",
-          "blockscale", "lowrank"]
+MODELS = ["hmm", "hmm_fp32", "hmm_soft", "hclt", "hclt_fp32", "pd", "pd_fp32", "hclt_wide", "pd_wide", "softevi",
+          "softevi_topk", "blockscale", "lowrank"]
 
 
 def _restrict_always(monkeypatch):
-    """Input runs and restricted flow fills at any size and coverage (the test circuits are below the sizes they start
-    at, and their calls often fill most of a buffer)."""
+    """Input runs, group runs and restricted flow fills at any size and coverage (the test circuits are below the
+    sizes they start at, and their calls often fill most of a buffer)."""
     monkeypatch.setattr(session, "_RUNS_MIN_VALUES", 0)
+    monkeypatch.setattr(session, "_GROUP_RUNS_MIN_WORK", 0)
+    monkeypatch.setattr(session, "_PARTITION_WHOLE_FRACTION", 2.0)   # never the whole partition
     monkeypatch.setattr(session, "_FILL_MIN_VALUES", 0)
     monkeypatch.setattr(session, "_FILL_WHOLE_FRACTION", 2.0)        # never the whole buffer
 
 
-@pytest.fixture(params = ["default", "always"])
+@pytest.fixture(params = ["default", "always", "rules", "partitions", "sums"])
 def restrict(request, monkeypatch):
-    """The session's input runs and restricted fills at their default sizes -- whole layers and whole fills here -- or
-    always."""
-    if request.param == "always":
+    """The session's input runs, group runs and restricted fills at their default sizes -- whole layers and whole
+    fills here --; always; always with the default rules for a whole partition (many runs, most rows); with every
+    partition a call touches whole; or with every sum partition of a forward the call touches whole and the product
+    partitions below by their runs -- the products of all of a whole partition's groups computed, those of no other
+    (`element_mars` rows are shared by the layer groups: theirs hold another group's products)."""
+    if request.param != "default":
         _restrict_always(monkeypatch)
+    if request.param == "rules":
+        monkeypatch.setattr(session, "_PARTITION_WHOLE_FRACTION", 0.5)
+    if request.param == "partitions":
+        monkeypatch.setattr(session, "_MAX_PARTITION_RUNS", 0)
+    if request.param == "sums":
+        partition_runs = session.Decoder._partition_runs
+
+        def sums_whole(self, name, l, found, whole = None):
+            if name != "sum_fw":
+                return partition_runs(self, name, l, found, whole)
+            limit = session._MAX_PARTITION_RUNS
+            session._MAX_PARTITION_RUNS = -1                         # any runs: the whole partition
+            try:
+                return partition_runs(self, name, l, found, whole)
+            finally:
+                session._MAX_PARTITION_RUNS = limit
+
+        monkeypatch.setattr(session.Decoder, "_partition_runs", sums_whole)
     return request.param
 
 
@@ -355,7 +383,8 @@ def test_a_left_to_right_step_launches_a_few_layers(monkeypatch):
 
 @cuda_only
 @pytest.mark.parametrize("sequence", ["left_to_right", "diffusion", "random", "targets_in_turn"])
-@pytest.mark.parametrize("kind", ["hmm", "hmm_soft", "hclt", "pd_fp32", "pd_wide", "softevi", "blockscale", "lowrank"])
+@pytest.mark.parametrize("kind", ["hmm", "hmm_soft", "hclt", "pd_fp32", "hclt_wide", "pd_wide", "softevi",
+                                  "blockscale", "lowrank"])
 @pytest.mark.parametrize("early_stop", [False, True])
 @pytest.mark.parametrize("poison", [float("nan"), 0.0])
 def test_a_session_reads_only_the_flows_it_fills(kind, sequence, early_stop, poison, monkeypatch):
@@ -383,7 +412,7 @@ def test_a_session_reads_only_the_flows_it_fills(kind, sequence, early_stop, poi
 
 @cuda_only
 @pytest.mark.parametrize("sequence", ["left_to_right", "diffusion", "random", "targets_in_turn"])
-@pytest.mark.parametrize("kind", ["hmm", "hclt", "pd_fp32"])
+@pytest.mark.parametrize("kind", ["hmm", "hclt", "pd_fp32", "hclt_wide", "pd_wide"])
 @pytest.mark.parametrize("early_stop", [False, True])
 def test_the_insides_a_session_holds_valid_are_a_forwards(kind, sequence, early_stop, restrict):
     """After every call, every inside the planner holds valid is, to the bit, what a forward of the call's evidence
