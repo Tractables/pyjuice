@@ -54,6 +54,10 @@ readme = {file = "README.md"}
 # present in installed trees / wheels (it is compiled at runtime via torch.utils.cpp_extension).
 [tool.setuptools.package-data]
 "pyjuice.layer.kernels.c" = ["*.cu", "*.cuh", "*.h"]
+# Nested kernel packages also need their sources and headers for runtime compilation.
+"pyjuice.layer.kernels.c.input_layers" = ["*.cu"]
+"pyjuice.nodes.distributions.c_kernels" = ["*.cu"]
+"pyjuice.nodes.external_params.kernels.c" = ["*.cu", "*.cuh"]
 "pyjuice.constraints.inference.dfa_exact.kernels.c" = ["*.cu"]
 
 [tool.pytest.ini_options]
