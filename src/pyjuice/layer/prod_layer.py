@@ -160,6 +160,16 @@ class ProdLayer(Layer, nn.Module):
         self.partitioned_u_cids = FastParamList([nn.Parameter(tensor, requires_grad = False) for tensor in u_cids])
         self.partitioned_parids = FastParamList([nn.Parameter(tensor, requires_grad = False) for tensor in parids])
 
+        # The settled forward (`forward`'s fast path): per (node values' shape, element values' shape), every
+        # partition's launch of the 2-d kernel at its tuned tile -- the tuner key and tile, the grid, the tables --
+        # recorded by the full dispatch
+        self._fw_fast = dict()
+
+    def to(self, device):
+        super(ProdLayer, self).to(device)
+        self._fw_fast.clear()                   # (it holds the tables, which a conversion may replace)
+        return self
+
     def forward(self, node_mars: torch.Tensor, element_mars: torch.Tensor,
                 partition_runs: Optional[Sequence] = None, **kwargs) -> None:
         """
@@ -176,18 +186,64 @@ class ProdLayer(Layer, nn.Module):
                           every other row of `element_mars` left as it is (see `_forward_backward`)
         """
 
-        for partition_id in range(self.num_fw_partitions):
-            runs = None if partition_runs is None else partition_runs[partition_id]
-            if runs is not None and len(runs) == 0:
-                continue
-            nids = self.partitioned_nids[partition_id]
-            cids = self.partitioned_cids[partition_id]
+        # A whole forward whose every partition the full dispatch below sent to the 2-d kernel at a tuned tile relaunches
+        # those launches straight away (`_fw_fast_launch`, which checks first that each tile is still the tuner's).
+        # MEASURED, host time of an HMM-1024 product layer at B 64: the dispatch 2.6 of its 7.5 us.
+        fast_key = None
+        if partition_runs is None:
+            fast_key = (node_mars.shape, element_mars.shape)
+            fast = self._fw_fast.get(fast_key)
+            if fast is not None and self._fw_fast_launch(fast, node_mars, element_mars):
+                return None
 
-            self._forward_backward(
-                element_mars, node_mars, nids, cids, accum = False, runs = runs
-            )
+        # (a subclass overriding the dispatch records nothing: its launches are not this class's to replay)
+        self.__dict__["_fw_recording"] = [] if (fast_key is not None and
+                                                type(self)._forward_backward is ProdLayer._forward_backward) else None
+        try:
+            for partition_id in range(self.num_fw_partitions):
+                runs = None if partition_runs is None else partition_runs[partition_id]
+                if runs is not None and len(runs) == 0:
+                    continue
+                nids = self.partitioned_nids[partition_id]
+                cids = self.partitioned_cids[partition_id]
+
+                self._forward_backward(
+                    element_mars, node_mars, nids, cids, accum = False, runs = runs
+                )
+            recorded = self.__dict__["_fw_recording"]
+            if recorded is not None and len(recorded) == self.num_fw_partitions:
+                self._fw_fast[fast_key] = tuple(recorded)
+        finally:
+            self.__dict__["_fw_recording"] = None
 
         return None
+
+    def _fw_fast_launch(self, fast: tuple, node_mars: torch.Tensor, element_mars: torch.Tensor) -> bool:
+        """`forward`'s settled launch: every partition's recorded 2-d launch, as `_forward_backward` makes it -- if
+        every recorded tile is still what the tuner holds for its key (a cleared or retuned cache: no); else nothing
+        launched and False, the call then taking the full dispatch, which records the entry anew."""
+        for key, cfg, _, _, _, _, _ in fast:
+            if autotune.cached(key) != cfg:
+                return False
+        tot_n_nodes, tot_n_eles, batch_size = element_mars.size(0), node_mars.size(0), node_mars.size(1)
+        for _, (bm, bb), grid, nids, cids, n_nblocks, num_edges in fast:
+            kernels._forward_backward_kernel_2d[grid](
+                node_vals_ptr = element_mars,
+                element_vals_ptr = node_mars,
+                nids_ptr = nids,
+                cids_ptr = cids,
+                tot_n_nodes = tot_n_nodes,
+                tot_n_eles = tot_n_eles,
+                n_nblocks = n_nblocks,
+                num_edges = num_edges,
+                batch_size = batch_size,
+                BLOCK_M = bm,
+                BLOCK_B = bb,
+                block_size = self.block_size,
+                accum = False,
+                prop_logsumexp = False
+            )
+        return True
 
     def backward(self, node_flows: torch.Tensor, element_flows: torch.Tensor, logspace_flows: bool = False,
                  partition_runs: Optional[Sequence] = None, **kwargs) -> None:
@@ -351,6 +407,10 @@ class ProdLayer(Layer, nn.Module):
 
             if runs is None:
                 _launch_2d(cfg, node_vals)
+                recording = self.__dict__.get("_fw_recording")
+                if recording is not None and not accum and not prop_logsumexp and autotune.cached(key) == cfg:
+                    grid = (host_cdiv(n_nblocks * self.block_size, cfg[0]), host_cdiv(batch_size, cfg[1]))
+                    recording.append((key, cfg, grid, nids, cids, n_nblocks, num_edges))
             else:
                 for a, b in runs:
                     _launch_2d(cfg, node_vals, nids[a:b], cids[a:b], b - a)

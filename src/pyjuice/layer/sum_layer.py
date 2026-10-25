@@ -335,6 +335,9 @@ class SumLayer(Layer, nn.Module):
         # Per partition: its plan on the dense cuBLAS path, or None where that path does not take it (see
         # `_dense_blocks`).
         self._cached_fw_dense = dict()
+        # The settled forward (`forward`'s fast path): per (batch size, params dtype, precision) of a plain call, every
+        # partition's tuned CUDA tlmm launch -- its tuner key and choice, its tables -- recorded by the full dispatch
+        self._fw_fast = dict()
 
         # Layer info
         self._layer_nid_range = (layer_nid_start, layer_nid_start + self.num_nodes)
@@ -468,7 +471,7 @@ class SumLayer(Layer, nn.Module):
         What the caches keep of the host only (tuning choices, dense plans) stays."""
         for cache in (self._cached_fw_pcids, self._cached_fw_cuda, self._cached_fw_sb, self._cached_bk_parids,
                       self._cached_bk_ele_cuda, self._cached_bk_ele_sb, self._cached_bk_par_cuda,
-                      self._cached_bk_par_trim, self._cached_param_align8):
+                      self._cached_bk_par_trim, self._cached_param_align8, self._fw_fast):
             cache.clear()
         self._bk_ele_scratch = None
         self._bk_par_scratch = None
@@ -526,28 +529,71 @@ class SumLayer(Layer, nn.Module):
                           kernel of the `tlmm` regime; nothing is written to `element_mars`). Only for a layer whose
                           every partition `fuses_children` at this batch; another raises.
         """
+        # A plain call -- LL, no tempering, whole partitions, nothing else passed -- whose every partition the full
+        # dispatch below sent to a tuned CUDA tlmm kernel launches those kernels straight away (`_fw_fast_launch`, which
+        # checks first that the CUDA kernels are still on and each choice is still the tuner's). MEASURED, host time of
+        # an HMM-1024 layer at B 64: the dispatch's checks, tables and keys 5.7 of its 10.6 us.
+        fast_key = None
+        if (propagation_alg == "LL" and pflow_temperature == 1.0 and partition_runs is None and compute_children is None
+                and not kwargs and node_mars.is_cuda):
+            fast_key = (node_mars.size(1), params.dtype, precision)
+            fast = self._fw_fast.get(fast_key)
+            if fast is not None and self._fw_fast_launch(fast, node_mars, element_mars, params):
+                return None
+
         assert not (propagation_alg != "LL" and abs(pflow_temperature - 1.0) > 1e-6), "`pflow_temperature` can only be 1 if `propagation_alg` is not 'LL'."
         if precision not in PRECISIONS:
             raise ValueError(f"`precision` must be one of {PRECISIONS}, got {precision!r}.")
         if "force_use_bf16" in kwargs or "force_use_fp32" in kwargs:      # the shim only when needed: hot path
             _pop_removed_precision_flags(kwargs)
 
-        for partition_id in range(self.num_fw_partitions):
-            runs = None if partition_runs is None else partition_runs[partition_id]
-            if runs is not None and len(runs) == 0:
-                continue
-            nids = self.partitioned_nids[partition_id]
-            cids = self.partitioned_cids[partition_id]
-            pids = self.partitioned_pids[partition_id]
+        # (a subclass overriding the dispatch below records nothing: its launches are not this class's to replay)
+        record = fast_key is not None and type(self)._forward is SumLayer._forward and \
+            type(self)._forward_block_sparse is SumLayer._forward_block_sparse
+        self.__dict__["_fw_recording"] = [] if record else None
+        try:
+            for partition_id in range(self.num_fw_partitions):
+                runs = None if partition_runs is None else partition_runs[partition_id]
+                if runs is not None and len(runs) == 0:
+                    continue
+                nids = self.partitioned_nids[partition_id]
+                cids = self.partitioned_cids[partition_id]
+                pids = self.partitioned_pids[partition_id]
 
-            self._forward(
-                node_mars, element_mars, params, nids, cids, pids, 
-                partition_id = partition_id, propagation_alg = propagation_alg, 
-                pflow_temperature = pflow_temperature, precision = precision, runs = runs,
-                children = compute_children, **kwargs
-            )
+                self._forward(
+                    node_mars, element_mars, params, nids, cids, pids, 
+                    partition_id = partition_id, propagation_alg = propagation_alg, 
+                    pflow_temperature = pflow_temperature, precision = precision, runs = runs,
+                    children = compute_children, **kwargs
+                )
+            recorded = self.__dict__["_fw_recording"]
+            if recorded is not None and len(recorded) == self.num_fw_partitions:
+                self._fw_fast[fast_key] = tuple(recorded)
+        finally:
+            self.__dict__["_fw_recording"] = None
 
         return None
+
+    def _fw_fast_launch(self, fast: tuple, node_mars: torch.Tensor, element_mars: torch.Tensor,
+                        params: torch.Tensor) -> bool:
+        """`forward`'s settled launch: every partition's recorded CUDA tlmm kernel, as the full dispatch launches it --
+        if the CUDA kernels are still on (`FORWARD_SUM_CUDA`) and every recorded choice is still what the tuner holds
+        for its key (a cleared or retuned cache: no); else nothing launched and False, the call then taking the full
+        dispatch, which records the entry anew. (The arms' own switches, `FORWARD_SUM_PREPASS`, shape what is tuned: a
+        choice the tuner holds runs, here as there.)"""
+        if not FORWARD_SUM_CUDA:
+            return False
+        for key, choice, _, _, _, _ in fast:
+            if autotune.cached(key) != choice:
+                return False
+        batch_size = node_mars.size(1)
+        for _, choice, nids, ebase, pbase, k_num_tiles in fast:
+            kernel = (cuda_kernels.tlmm_forward_sum if choice[0] == "cuda" else
+                      cuda_kernels.tlmm_forward_sum_pipelined if choice[0] == "cuda_pipe" else
+                      cuda_kernels.tlmm_forward_sum_prepass)
+            kernel(node_mars, element_mars, params, nids, ebase, pbase, batch_size, self.block_size, k_num_tiles,
+                   choice[1])
+        return True
 
     def _fw_block_sparse_tiles(self, num_edges: int, batch_size: int, propagation_alg_id: int,
                                pflow_tempered_enabled: bool):
@@ -1195,6 +1241,9 @@ class SumLayer(Layer, nn.Module):
                     if runs is None:
                         kernel(node_mars, element_mars, params, nids, ebase, pbase,
                                batch_size, self.block_size, K_NUM_TILES, choice[1])
+                        recording = self.__dict__.get("_fw_recording")
+                        if recording is not None and autotune.cached(tlmm_key) == choice:
+                            recording.append((tlmm_key, choice, nids, ebase, pbase, K_NUM_TILES))
                     else:
                         for a, b in runs:                    # (views of the tables: the grid comes from them)
                             kernel(node_mars, element_mars, params, nids[a:b], ebase[a:b], pbase[a:b],
@@ -1284,6 +1333,7 @@ class SumLayer(Layer, nn.Module):
                 raise
             self._fw_tuning_oom = True
             self.__dict__.pop("_fw_tiles_memo", None)         # the tiles read `_fw_tuning_oom`
+            self._fw_fast.clear()
             warnings.warn("Forward sum-layer tile tuning (FORWARD_SUM_TUNED) exceeded shared "
                           "memory on this GPU; falling back to the default launch config.", RuntimeWarning)
             return self._forward_block_sparse(

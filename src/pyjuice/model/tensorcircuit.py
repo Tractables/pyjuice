@@ -22,6 +22,23 @@ from .external_params import _ExternalParamsMixin
 from .inspection import _InspectionMixin
 from .learning import _LearningMixin
 
+try:                                    # (torch's registries of the hooks every module call runs)
+    from torch.nn.modules.module import (_global_forward_hooks, _global_forward_pre_hooks, _global_backward_hooks,
+                                         _global_backward_pre_hooks)
+    _GLOBAL_HOOKS = (_global_forward_hooks, _global_forward_pre_hooks, _global_backward_hooks, _global_backward_pre_hooks)
+except ImportError:
+    _GLOBAL_HOOKS = None
+
+
+def _calls_its_forward(module: nn.Module) -> bool:
+    """Whether calling ``module`` would just call its `forward`: no hooks of its own or global ones, no compiled call, not
+    traced -- `nn.Module.__call__`'s own fast path, checked without the call. False where torch keeps the hooks elsewhere."""
+    if _GLOBAL_HOOKS is None:
+        return False
+    return not (module._forward_hooks or module._forward_pre_hooks or module._backward_hooks or module._backward_pre_hooks
+                or any(_GLOBAL_HOOKS) or getattr(module, "_compiled_call_impl", None) is not None
+                or torch._C._get_tracing_state())
+
 
 class TensorCircuit(_BuildMixin, _CudaGraphsMixin, _ExternalParamsMixin, _LearningMixin, _InspectionMixin,
                     nn.Module):
@@ -394,16 +411,21 @@ class TensorCircuit(_BuildMixin, _CudaGraphsMixin, _ExternalParamsMixin, _Learni
             sum_opts = dict(kwargs, precision = self.precision, pflow_temperature = pflow_temperature)
 
             def _run_inner_layers():
+                # The buffers and parameters looked up once, and a group without hooks called at its `forward` -- what
+                # `nn.Module.__call__` does for it, less that call's 0.6 us (MEASURED, a step of an HMM: two groups)
+                node_mars, element_mars, params = self.node_mars, self.element_mars, self.params
+                per_layer_alg = not isinstance(propagation_alg, str)
                 for layer_id, layer_group in enumerate(self.inner_layer_groups):
+                    run = layer_group.forward if _calls_its_forward(layer_group) else layer_group
                     if layer_group.is_prod():
                         # Prod layer
-                        layer_group(self.node_mars, self.element_mars)
+                        run(node_mars, element_mars)
 
                     elif layer_group.is_sum():
                         # Sum layer
-                        layer_group(self.node_mars, self.element_mars, self.params,
-                                    propagation_alg = propagation_alg if isinstance(propagation_alg, str) else propagation_alg[layer_id],
-                                    **sum_opts)
+                        run(node_mars, element_mars, params,
+                            propagation_alg = propagation_alg[layer_id] if per_layer_alg else propagation_alg,
+                            **sum_opts)
 
                     else:
                         raise ValueError(f"Unknown layer type {type(layer)}.")
