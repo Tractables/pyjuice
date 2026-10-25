@@ -43,7 +43,7 @@ def _cute_available():
 needs_cute = pytest.mark.skipif(not _cute_available(), reason = "needs the CuTe/TMA extension")
 
 
-def _build(K, gate_cbs, seed = 0):
+def _build(K, gate_cbs, seed = 0, apply_z_correction = True):
     """One gated layer, one node block, one child block -- so a gate is (0, ck) and the reference short."""
     torch.manual_seed(seed)
     with juice.set_block_size(K):
@@ -51,7 +51,8 @@ def _build(K, gate_cbs, seed = 0):
               for v in range(2)]
         prod = multiply(*ni)
         ns = summate(prod, num_node_blocks = 1,
-                     external_params = BlockScaleSumParams(ch_block_size = gate_cbs))
+                     external_params = BlockScaleSumParams(ch_block_size = gate_cbs,
+                                                           apply_z_correction = apply_z_correction))
         root = summate(multiply(ns), num_node_blocks = 1, block_size = 1)
     torch.manual_seed(seed)
     root.init_parameters(perturbation = 2.0)
@@ -85,9 +86,9 @@ def _reference(pc, ns, prod, phi, gate_cbs, batch):
     return t1 - t2
 
 
-def _run(K, gate_cbs, batch, scale, seed = 0):
+def _run(K, gate_cbs, batch, scale, seed = 0, apply_z_correction = True):
     dev = torch.device("cuda:0")
-    root, ns, prod = _build(K, gate_cbs, seed)
+    root, ns, prod = _build(K, gate_cbs, seed, apply_z_correction)
     pc = juice.compile(root, verbose = False).to(dev)
     torch.manual_seed(seed + 7)
     data = torch.randint(0, NUM_CATS, [batch, 2], device = dev)
@@ -119,6 +120,25 @@ def test_gradient_matches_the_reference(K, gate_cbs, batch, scale):
     tol = 2e-2 if batch >= 16 else 1e-4
     d = float((got - ref).abs().max() / ref.abs().max())
     assert d < tol, f"gradient off by {d} (relative)"
+
+
+@cuda_only
+@needs_cute
+@pytest.mark.parametrize("K,gate_cbs,batch", [(64, 8, 8), (128, 8, 64)])
+def test_the_gradient_follows_the_parameters_across_an_em_step(K, gate_cbs, batch):
+    """The log-Z term's per-gate parameter sums (`_sigma`) are kept until the parameters change, keyed on their version
+    -- which an EM step, writing them with Triton kernels, did not move: the gradient after a step was built from the
+    sums before it (MEASURED: 1.3e-2 off gradients of ~2.5e-2). The plain M-step (`apply_z_correction = False`: the
+    corrected one happened to write through torch, which moves the version), then the reference on the new parameters."""
+    pc, ns, prod, data, phi = _run(K, gate_cbs, batch, 1.0, apply_z_correction = False)
+    pc.mini_batch_em(step_size = 0.5, pseudocount = 0.1)
+    pc(data, sum_external_params = {ns: phi})
+    pc.backward(data, flows_memory = 0.0)
+    ref = _reference(pc, ns, prod, phi, gate_cbs, batch)
+    got = pc.get_external_params_grad(ns)[0].double()[:, 0, :]
+    tol = 2e-2 if batch >= 16 else 1e-4                           # (as `test_gradient_matches_the_reference`)
+    d = float((got - ref).abs().max() / ref.abs().max())
+    assert d < tol, f"gradient off by {d} (relative) after an EM step"
 
 
 @cuda_only

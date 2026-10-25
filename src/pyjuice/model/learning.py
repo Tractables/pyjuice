@@ -164,6 +164,11 @@ class _LearningMixin:
                 if params is not self.params:
                     self.params.data[ps:pe].copy_(params[ps:pe])
 
+            # The updates write `params` through Triton kernels, which do not move the tensor's version: signal it as an
+            # in-place update would, for the caches keyed on it (BlockScale's per-gate parameter sums -- MEASURED before:
+            # the gate gradient after an EM step used the sums from before it, 1.3e-2 off gradients of ~2.5e-2)
+            torch.autograd.graph.increment_version(self.params)
+
     # ---------------------------------------------------------------------------------------------
     # The fp32 master copy of parameters stored below fp32 (`param_dtype`; see `backend.params_master`)
     # ---------------------------------------------------------------------------------------------
