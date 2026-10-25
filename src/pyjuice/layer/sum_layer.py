@@ -60,6 +60,10 @@ BACKWARD_ELE_FLOW_TUNED = True
 # any unsupported shape / missing toolchain. Set False to disable.
 BACKWARD_ELE_FLOW_CUDA = True
 
+# The pre-pass copy of that kernel (c/ele_backward_sum_prepass.cu) among its measured arms; PYJUICE_BACKWARD_ELE_PREPASS=0
+# leaves it out.
+BACKWARD_ELE_FLOW_PREPASS = os.environ.get("PYJUICE_BACKWARD_ELE_PREPASS", "1") != "0"
+
 # Optional CUDA (CuTe/CUTLASS + fp16 + TMA) fast path for the block-sparse parameter-flow backward
 # `_bk_triton_block_sparse_par_kernel(_rmw)`. When enabled AND all dispatch conditions hold (LL,
 # logspace flows, allow_modify_flows / allow_neg_flows / negate_pflows all off, temperature 1,
@@ -2232,6 +2236,15 @@ class SumLayer(Layer, nn.Module):
                         tgt, element_mars, node_flows, node_mars, params, chids[a:b], ele_ebase[a:b], ele_pbase[a:b],
                         batch_size, self.block_size, cs_block_size, K_NUM_TILES)
 
+                # The pre-pass copy (c/ele_backward_sum_prepass.cu, bit-identical: the parents' log ratios' maxima and
+                # exponentials once per element block, then a streaming kernel over the parameter tiles), its configs as
+                # more arms -- MEASURED, bf16 params: HMM-1024 at B 64 22.5 against the pipelined kernel's 46.4 us;
+                # HCLT-1024's largest partition at B 128 541 against 570
+                def _cuda_ele_prepass(tgt, c, a = None, b = None):
+                    cuda_kernels.ele_backward_sum_prepass(
+                        tgt, element_mars, node_flows, node_mars, params, chids[a:b], ele_ebase[a:b], ele_pbase[a:b],
+                        batch_size, self.block_size, cs_block_size, K_NUM_TILES, c)
+
                 choice_key = (signature, batch_size)
                 choice = self._cached_bk_ele_choice.get(choice_key)
                 if choice is None:
@@ -2245,12 +2258,18 @@ class SumLayer(Layer, nn.Module):
                              (("cuda", 0), (lambda: _cuda_ele(scr)))]
                     if cuda_kernels.ele_pipe_is_available():
                         cands.append((("cuda_pipe", 0), (lambda: _cuda_ele_pipe(scr))))
+                    if BACKWARD_ELE_FLOW_PREPASS and cuda_kernels.ele_prepass_is_available():
+                        cands += [(("cuda_prepass", c), (lambda c=c: _cuda_ele_prepass(scr, c)))
+                                  for c in cuda_kernels.ele_prepass_valid_configs(cs_block_size, batch_size)]
                     choice = autotune.best_of(cands) or ("triton", -1)
                     self._cached_bk_ele_choice[choice_key] = choice
-                if choice[0] in ("cuda", "cuda_pipe"):
+                if choice[0] in ("cuda", "cuda_pipe", "cuda_prepass"):
                     if choice[0] == "cuda_pipe":
                         for a, b in ([(None, None)] if runs is None else runs):
                             _cuda_ele_pipe(element_flows, a, b)
+                    elif choice[0] == "cuda_prepass":
+                        for a, b in ([(None, None)] if runs is None else runs):
+                            _cuda_ele_prepass(element_flows, choice[1], a, b)
                     elif runs is None:
                         _cuda_ele(element_flows)
                     else:

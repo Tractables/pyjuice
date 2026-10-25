@@ -48,6 +48,8 @@ _elepipe_module = None  # element-flow backward, warp-specialized
 _elepipe_attempted = False
 _prepass_module = None  # forward (tlmm), exponentials pre-pass + streaming kernel
 _prepass_attempted = False
+_eleprepass_module = None  # element-flow backward, exponentials pre-pass + streaming kernel
+_eleprepass_attempted = False
 _flags_cache = "unset"  # cached (cuda_cflags, ldflags) or None; computed once
 _plain_flags_cache = "unset"  # cached plain (no-CUTLASS) cuda_cflags or None
 
@@ -427,6 +429,41 @@ def ele_backward_sum_pipelined(element_flows: torch.Tensor, element_mars: torch.
     _elepipe_module.ele_backward_sum_pipelined(element_flows, element_mars, node_flows, node_mars, params, chids,
                                                ebase, pbase, int(batch_size), int(block_size), int(cs_block_size),
                                                int(k_num_tiles))
+
+
+def ele_prepass_is_available() -> bool:
+    """Whether the pre-pass element-flow backward (ele_backward_sum_prepass.cu) is usable (lazily JIT-compiles once). CuTe,
+    so it needs CUTLASS; no TMA, but it shares the CuTe kernels' toolchain gate."""
+    global _eleprepass_module, _eleprepass_attempted
+    if not _eleprepass_attempted:
+        _eleprepass_attempted = True
+        _eleprepass_module = _jit("pyjuice_sum_backward_ele_prepass_cuda", "ele_backward_sum_prepass.cu")
+    return _eleprepass_module is not None
+
+
+def ele_backward_sum_prepass(element_flows: torch.Tensor, element_mars: torch.Tensor, node_flows: torch.Tensor,
+                             node_mars: torch.Tensor, params: torch.Tensor, chids: torch.Tensor,
+                             ebase: torch.Tensor, pbase: torch.Tensor,
+                             batch_size: int, block_size: int, cs_block_size: int, k_num_tiles: int, cfg: int = 0) -> None:
+    """The element-flow backward as a pre-pass over the parents' node tiles (their log ratios' maxima and exponentials,
+    once per element block) and a streaming kernel over the parameter tiles (in-place into ``element_flows``,
+    bit-identical to `ele_backward_sum`), with tile config ``cfg`` (`ele_prepass_configs`). Caller must guarantee the
+    plain kernel's dispatch conditions (the gate in ``sum_layer._backward_block_sparse_ele_flows``)."""
+    _eleprepass_module.ele_backward_sum_prepass(element_flows, element_mars, node_flows, node_mars, params, chids,
+                                                ebase, pbase, int(batch_size), int(block_size), int(cs_block_size),
+                                                int(k_num_tiles), int(cfg))
+
+
+def ele_prepass_configs():
+    """List of (BM, BN) tile shapes per config id of the pre-pass element-flow backward."""
+    return [tuple(c) for c in _eleprepass_module.configs()] if ele_prepass_is_available() else []
+
+
+def ele_prepass_valid_configs(cs_block_size: int, batch_size: int):
+    """The pre-pass element-flow backward's config ids whose tile shape divides a partition's (child block size,
+    batch)."""
+    return [i for i, (bm, bn) in enumerate(ele_prepass_configs())
+            if cs_block_size % bm == 0 and batch_size % bn == 0]
 
 
 def autotune(candidates, warmup: int = 3, reps: int = 7) -> int:

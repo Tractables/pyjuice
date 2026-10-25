@@ -106,7 +106,7 @@ class _Autotune:
 
     def best_of(self, candidates, *args, **kwargs):           # the element-flow gates: `(choice, run)` pairs
         choices = [c for c, _ in candidates]
-        if all(isinstance(c, tuple) and c[0] in ("triton", "cuda", "cuda_pipe") for c in choices):
+        if all(isinstance(c, tuple) and c[0] in ("triton", "cuda", "cuda_pipe", "cuda_prepass") for c in choices):
             return next((c for c in choices if c[0] == "cuda"), choices[0]) if self.cuda else choices[0]
         return self.real.best_of(candidates, *args, **kwargs)
 
