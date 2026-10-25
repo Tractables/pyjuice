@@ -93,6 +93,10 @@ FORWARD_SUM_TUNED = True
 # accuracy bar). On ANY of: incompatible GPU, missing nvcc/CUTLASS, compile failure, or an
 # unsupported layer shape, it transparently falls back to the Triton kernel. Set False to disable.
 FORWARD_SUM_CUDA = True
+
+# The pre-pass copy of that kernel (c/tlmm_forward_sum_prepass.cu) among its measured arms; PYJUICE_FORWARD_PREPASS=0
+# leaves it out.
+FORWARD_SUM_PREPASS = os.environ.get("PYJUICE_FORWARD_PREPASS", "1") != "0"
 from .kernels import c as cuda_kernels
 
 # Node-tile sizes for the small-batch (batch < 16) block-sparse path. At tiny batch the GPU is
@@ -1172,10 +1176,22 @@ class SumLayer(Layer, nn.Module):
                                        node_mars, element_mars, params, nids, ebase, pbase,
                                        batch_size, self.block_size, K_NUM_TILES, c)))
                                   for c in cuda_kernels.pipe_valid_configs(self.block_size, batch_size)]
+                    # The pre-pass copy (c/tlmm_forward_sum_prepass.cu, bit-identical: the element tiles' maxima and
+                    # exponentials computed once per node block, then a streaming kernel over the parameter tiles), its
+                    # configs as more arms -- MEASURED on HCLT-1024's widest layer at B 128, bf16 params: 385 against
+                    # the pipelined kernel's 541 us; HMM-1024 at B 64: 18.3 against 35.7
+                    if FORWARD_SUM_PREPASS and cuda_kernels.prepass_is_available():
+                        cands += [(("cuda_prepass", c),
+                                   (lambda c=c: cuda_kernels.tlmm_forward_sum_prepass(
+                                       node_mars, element_mars, params, nids, ebase, pbase,
+                                       batch_size, self.block_size, K_NUM_TILES, c)))
+                                  for c in cuda_kernels.prepass_valid_configs(self.block_size, batch_size)]
                     choice = autotune.choose(tlmm_key, cands)
 
-                if choice[0] in ("cuda", "cuda_pipe"):
-                    kernel = cuda_kernels.tlmm_forward_sum if choice[0] == "cuda" else cuda_kernels.tlmm_forward_sum_pipelined
+                if choice[0] in ("cuda", "cuda_pipe", "cuda_prepass"):
+                    kernel = (cuda_kernels.tlmm_forward_sum if choice[0] == "cuda" else
+                              cuda_kernels.tlmm_forward_sum_pipelined if choice[0] == "cuda_pipe" else
+                              cuda_kernels.tlmm_forward_sum_prepass)
                     if runs is None:
                         kernel(node_mars, element_mars, params, nids, ebase, pbase,
                                batch_size, self.block_size, K_NUM_TILES, choice[1])

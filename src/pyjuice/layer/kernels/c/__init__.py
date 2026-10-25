@@ -46,6 +46,8 @@ _pipe_module = None     # forward (tlmm), warp-specialized
 _pipe_attempted = False
 _elepipe_module = None  # element-flow backward, warp-specialized
 _elepipe_attempted = False
+_prepass_module = None  # forward (tlmm), exponentials pre-pass + streaming kernel
+_prepass_attempted = False
 _flags_cache = "unset"  # cached (cuda_cflags, ldflags) or None; computed once
 _plain_flags_cache = "unset"  # cached plain (no-CUTLASS) cuda_cflags or None
 
@@ -370,6 +372,38 @@ def pipe_configs():
 def pipe_valid_configs(block_size: int, batch_size: int):
     """The warp-specialized forward kernel's config ids whose tile shape divides this layer's (block_size, batch)."""
     return [i for i, (bm, bn) in enumerate(pipe_configs())
+            if block_size % bm == 0 and batch_size % bn == 0]
+
+
+def prepass_is_available() -> bool:
+    """Whether the pre-pass tlmm forward (tlmm_forward_sum_prepass.cu) is usable (lazily JIT-compiles once). CuTe, so it
+    needs CUTLASS; no TMA, but it shares the CuTe kernels' toolchain gate."""
+    global _prepass_module, _prepass_attempted
+    if not _prepass_attempted:
+        _prepass_attempted = True
+        _prepass_module = _jit("pyjuice_sum_forward_prepass_cuda", "tlmm_forward_sum_prepass.cu")
+    return _prepass_module is not None
+
+
+def tlmm_forward_sum_prepass(node_mars: torch.Tensor, element_mars: torch.Tensor, params: torch.Tensor,
+                             nids: torch.Tensor, ebase: torch.Tensor, pbase: torch.Tensor,
+                             batch_size: int, block_size: int, k_num_tiles: int, cfg: int = 0) -> None:
+    """The tlmm forward as a pre-pass over the element tiles (their maxima and exponentials, once per node block) and a
+    streaming kernel over the parameter tiles (in-place into ``node_mars``, bit-identical to `tlmm_forward_sum`), with
+    tile config ``cfg`` (`prepass_configs`). Caller must guarantee the plain kernel's dispatch conditions (the gate in
+    ``sum_layer._forward_block_sparse``)."""
+    _prepass_module.tlmm_forward_sum_prepass(node_mars, element_mars, params, nids, ebase, pbase,
+                                             int(batch_size), int(block_size), int(k_num_tiles), int(cfg))
+
+
+def prepass_configs():
+    """List of (BM, BN) tile shapes per config id of the pre-pass forward kernel."""
+    return [tuple(c) for c in _prepass_module.configs()] if prepass_is_available() else []
+
+
+def prepass_valid_configs(block_size: int, batch_size: int):
+    """The pre-pass forward kernel's config ids whose tile shape divides this layer's (block_size, batch)."""
+    return [i for i, (bm, bn) in enumerate(prepass_configs())
             if block_size % bm == 0 and batch_size % bn == 0]
 
 
