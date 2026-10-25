@@ -52,7 +52,9 @@ def _acc_all_kernel(node_flows_ptr, pfids_ptr, pids_ptr, params_ptr, param_flows
     pids = n_pids[:, None] + coffs[None, :]
     cmask = coffs < num_cats
 
-    params = tl.load(params_ptr + pids, mask = mask[:, None]).to(tl.float32)
+    # (the tile is BLOCK_C wide, a power of two: the categories past `num_cats` -- the next node's parameters, or past
+    # the last node the tensor's end -- are masked out of the normalizer)
+    params = tl.load(params_ptr + pids, mask = mask[:, None] & cmask[None, :], other = 0.0).to(tl.float32)
     if norm_params:
         norm_param = params / (tl.sum(params, axis = 1)[:, None] + 1e-12)
     else:
