@@ -17,11 +17,12 @@ every node's total (`cum_pflow_kernel`'s sum, without its atomics) and then ever
 * `_em_node_block_kernel` for any number of children: the flows read twice, once for the totals (fp32 5.06 ms, bf16
   6.41).
 
-Which one, and the one-pass tile (nodes and warps: the best differs by dtype -- fp32 16 nodes on 8 warps, bf16 with the
-master copy 8 on 16 -- and the others spill), `autotune.pick` measures per (children, dtype, master, keep-zero), the
-two-pass kernel the reference, into scratch copies of the parameters (none: the reference). A node's total is summed in
-one order (the atomics added in none): the parameters agree with the per-block kernels' to the last bits of fp32, and
-each form agrees with itself run to run to the bit (the two forms sum in different orders, ~1e-10 apart).
+Which one, and the one-pass tile, is a fixed rule (`_form`), not a timed choice: the forms sum a node's flows in different
+orders (~1e-10 apart, thousands of a layer's values differing in the last bits), and the update must come out to the
+same bits wherever it runs on the same values -- DDP's ranks each update from the same reduced flows, and with the form
+timed per process two of them could pick differently and drift apart (tests/optim/bf16_params_ddp_test.py, on busy
+GPUs). A node's total is summed in one order (the atomics added in none): the parameters agree with the per-block
+kernels' to the last bits of fp32, and with themselves run to run and rank to rank to the bit.
 
 The same kernels serve the fp32 master copy of parameters stored below fp32 (`params_master`): the old value read through
 `params_master._em_par_update_master_kernel`'s external-write check, both copies written.
@@ -54,8 +55,11 @@ BLOCK_C = 32
 #: The most children the one-pass kernel holds (a tile's whole column of flows in registers)
 ONE_PASS_MAX = 1024
 
-#: The one-pass kernel's candidate tiles, (nodes, warps): MEASURED best fp32 (16, 8), bf16 with the master copy (8, 16)
-ONE_PASS_CFGS = ((16, 8), (8, 16), (8, 8), (16, 16), (4, 8))
+#: The one-pass kernel's tile (nodes, warps) without and with a master copy: MEASURED on HCLT-1024 (1024 children) among
+#: (16, 8), (8, 16), (8, 8), (16, 16), (4, 8) -- fp32 16 nodes on 8 warps, bf16 with the master copy 8 on 16 (the master
+#: copy's second read and write); the others spilled (40+ ms against 3.95)
+ONE_PASS_TILE = (16, 8)
+ONE_PASS_TILE_MASTER = (8, 16)
 
 
 @triton.jit
@@ -240,6 +244,15 @@ def _tables(pc) -> _Tables:
     return t
 
 
+def _form(nch_bucket, has_master: bool) -> tuple:
+    """The kernel form for a group of node blocks of ``nch_bucket`` children (None: past `ONE_PASS_MAX`), as `_launch`
+    takes it: a function of the shape alone, so every process updating the same values gets the same bits."""
+    if nch_bucket is None:
+        return ("two", BLOCK_N, 4)
+    width, warps = ONE_PASS_TILE_MASTER if has_master else ONE_PASS_TILE
+    return ("one", width, warps)
+
+
 def _launch(cfg, tables, group, nch_bucket, stored, master, param_flows, cum_pflows, step_size, pseudocount, keep_zero):
     """One group's update with ``cfg``: ``("two", BLOCK_N, 4)`` the two-pass kernel, ``("one", nodes, warps)`` the
     one-pass one (its children ``nch_bucket``)."""
@@ -262,9 +275,7 @@ def em_update(pc, param_flows: torch.Tensor, step_size: float, pseudocount: floa
               exclude: Sequence = (), master: Optional[torch.Tensor] = None) -> None:
     """Mini-batch EM's update of ``pc.params`` (and of their fp32 master copy ``master`` when given) from
     ``param_flows``, every sum node not in the parameter ranges ``exclude``: the node-block kernels for blocks of at
-    least `MIN_BLOCK_SIZE` nodes (which of them per group of children: `autotune.pick`), the per-block kernels for the
-    others."""
-    from pyjuice.layer.kernels import autotune
+    least `MIN_BLOCK_SIZE` nodes (which of them per group of children: `_form`), the per-block kernels for the others."""
     from .par_update import em_par_update
     from .params_master import em_par_update_master
     tables = _tables(pc)
@@ -284,28 +295,7 @@ def em_update(pc, param_flows: torch.Tensor, step_size: float, pseudocount: floa
         cum_pflows.zero_()
     if cum_pflows is None:
         cum_pflows = torch.zeros([pc.par_update_kwargs[7]["tot_num_nodes"]], dtype = torch.float32, device = stored.device)
-    reference = ("two", BLOCK_N, 4)
     for nch_bucket, group in groups.items():
-        if nch_bucket is None:
-            cfg = reference
-        else:
-            cands = [reference] + [("one", w, nw) for w, nw in ONE_PASS_CFGS]
-            key = ("em_node_block", nch_bucket, int(group["blocks"].shape[0]), int(group["blocks"][:, 3].sum()),
-                   stored.dtype, master is not None, keep_zero)
-            cfg = autotune.cached(key)
-            if cfg is None:
-                if autotune.should_tune(key, len(cands)):
-                    # Measured into scratch copies: an update writes the parameters in place (the totals: overwritten)
-                    s_stored = autotune.scratch_like(stored)
-                    s_master = autotune.scratch_like(master) if master is not None else None
-                    if s_stored is None or (master is not None and s_master is None):
-                        cfg = reference
-                    else:
-                        cfg = autotune.pick(key, cands, lambda c: _launch(c, tables, group, nch_bucket, s_stored,
-                                                                          s_master, param_flows, cum_pflows,
-                                                                          step_size, pseudocount, keep_zero))
-                    del s_stored, s_master
-                else:
-                    cfg = reference
+        cfg = _form(nch_bucket, master is not None)
         _launch(cfg, tables, group, nch_bucket, stored, master, param_flows, cum_pflows, step_size, pseudocount,
                 keep_zero)

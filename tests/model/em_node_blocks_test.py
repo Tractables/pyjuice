@@ -1,10 +1,10 @@
 """
 Mini-batch EM's node-block update (`pyjuice.model.backend.em_blocks`) against float64 and against the per-block kernels
 it replaces (`par_update.em_par_update`, `params_master.em_par_update_master`), from one state: every kernel form (the
-two-pass reference and each one-pass tile, forced in turn), fp32 parameters and bf16 ones through their master copy,
+two-pass one and both one-pass tiles, forced in turn), fp32 parameters and bf16 ones through their master copy,
 node blocks from 1 to 128 nodes (the small ones the per-block kernels'), step sizes, pseudocounts, keep-zero, ranges
-excluded (the corrected ones of the external-parameter M-step), and the update agreeing with itself run to run to the
-bit (no atomics).
+excluded (the corrected ones of the external-parameter M-step), the update agreeing with itself run to run to the bit (no
+atomics), and its form a rule of the shape, never a measurement.
 """
 
 import pytest
@@ -19,7 +19,7 @@ from pyjuice.model.backend.params_master import em_par_update_master
 
 DEV = torch.device("cuda:0")
 cuda_only = pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs a GPU")
-CFGS = [("two", em_blocks.BLOCK_N, 4)] + [("one", w, nw) for w, nw in em_blocks.ONE_PASS_CFGS]
+CFGS = [("two", em_blocks.BLOCK_N, 4), ("one",) + em_blocks.ONE_PASS_TILE, ("one",) + em_blocks.ONE_PASS_TILE_MASTER]
 
 
 def _ref64(pc, params, flows, step_size, pseudocount, keep_zero, exclude = ()):
@@ -95,8 +95,8 @@ def _run(pc, flows, start, step_size, pcount, kz, exclude, path):
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16], ids = ["fp32", "bf16"])
 @pytest.mark.parametrize("kind", ["hclt", "hmm", "pd"])
 def test_every_form_is_the_update(cfg, dtype, kind, monkeypatch):
-    real = autotune.cached
-    monkeypatch.setattr(autotune, "cached", lambda key: cfg if isinstance(key, tuple) and key[:1] == ("em_node_block",) else real(key))
+    monkeypatch.setattr(em_blocks, "_form",
+                        lambda nch_bucket, has_master: cfg if nch_bucket is not None else ("two", em_blocks.BLOCK_N, 4))
     ns, V, C = _circuit(kind)
     pc, flows = _state(ns, V, C, dtype)
     sums = [n for n in pc.root_ns if n.is_sum() and not n.is_tied()]
@@ -118,6 +118,30 @@ def test_every_form_is_the_update(cfg, dtype, kind, monkeypatch):
         if excl:                                                           # an excluded range is left as it was
             lo, hi = excl[0]
             assert torch.equal(new[lo:hi], start[lo:hi].double())
+
+
+@cuda_only
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16], ids = ["fp32", "bf16"])
+def test_the_form_is_the_shapes_not_a_timing(dtype, monkeypatch):
+    """The forms sum in different orders, so which one runs must not depend on a measurement: two processes updating
+    the same values (DDP's ranks) would otherwise come out apart. The update never asks the tuner, and its form is
+    `_form`'s rule."""
+    ns, V, C = _circuit("hmm")
+    pc, flows = _state(ns, V, C, dtype)                                    # (the passes tune their kernels)
+
+    def no_tuning(*args, **kwargs):
+        raise AssertionError("the EM update consulted the tuner")
+    for name in ("pick", "choose", "best_of", "should_tune"):
+        monkeypatch.setattr(autotune, name, no_tuning)
+    launched = []
+    real = em_blocks._launch
+    monkeypatch.setattr(em_blocks, "_launch", lambda cfg, *a, **k: launched.append(cfg) or real(cfg, *a, **k))
+    start = pc.params.detach().clone()
+    master = start.float().clone() if dtype != torch.float32 else None
+    em_blocks.em_update(pc, flows, 0.5, 0.1, False, master = master)
+    want = ("one",) + (em_blocks.ONE_PASS_TILE_MASTER if master is not None else em_blocks.ONE_PASS_TILE)
+    assert launched and all(c == want for c in launched), launched
+    assert em_blocks._form(None, master is not None) == ("two", em_blocks.BLOCK_N, 4)
 
 
 @cuda_only
