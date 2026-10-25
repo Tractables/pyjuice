@@ -77,7 +77,7 @@ def _fw_triton_block_sparse_tlmm_kernel(node_mars, element_mars, mparams, nids, 
         acc_tempered = tl.zeros([TILE_SIZE_M, BLOCK_B], dtype = tl.float32) - float("inf")
 
     for k in range(0, K_NUM_TILES):
-        epars = tl.load(epars_ptr)
+        epars = tl.load(epars_ptr).to(tl.float32)
         emars = tl.load(emars_ptr, mask = mask_batch[None,:])
 
         if propagation_alg_id == 1:
@@ -225,7 +225,7 @@ def _fw_triton_block_sparse_csmm1_kernel(node_mars, element_mars, mparams, nids,
         acc_tempered = tl.zeros([TILE_SIZE_M, BLOCK_B], dtype = tl.float32) - float("inf")
 
     for k in range(0, K_NUM_TILES):
-        epars = tl.load(epars_ptr)
+        epars = tl.load(epars_ptr).to(tl.float32)
         emars = tl.load(emars_ptr, mask = mask_batch[None,:])
 
         if propagation_alg_id == 1:
@@ -373,7 +373,7 @@ def _fw_triton_block_sparse_csmm2_kernel(node_mars, element_mars, mparams, nids,
         acc_tempered = tl.zeros([TILE_SIZE_M, BLOCK_B], dtype = tl.float32) - float("inf")
 
     for k in range(0, K_NUM_TILES):
-        epars = tl.load(epars_ptr)
+        epars = tl.load(epars_ptr).to(tl.float32)
         emars = tl.load(emars_ptr, mask = mask_batch[:,None])
 
         if propagation_alg_id == 1:

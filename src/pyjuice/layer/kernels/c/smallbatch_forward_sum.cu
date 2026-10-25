@@ -21,15 +21,16 @@
 // strided across edges -- the caller verifies this (cuda_ok) and falls back to Triton otherwise.
 
 #include <torch/extension.h>
+#include "param_load.cuh"
 #include <cuda_runtime.h>
 #include <c10/cuda/CUDAStream.h>
 #include <c10/cuda/CUDAException.h>
 #include <cfloat>
 #include <vector>
 
-template <int SPLIT>
+template <int SPLIT, typename TP>
 __global__ void sb_fwd_kernel(float* __restrict__ node_mars, const float* __restrict__ element_mars,
-                              const float* __restrict__ params, const long* __restrict__ nids,
+                              const TP* __restrict__ params, const long* __restrict__ nids,
                               const long* __restrict__ ebase, const long* __restrict__ pbase,
                               int batch, int block_size, int num_edges) {
     const int groups = block_size >> 5;          // block_size / 32  (block_size is a multiple of 32)
@@ -51,7 +52,7 @@ __global__ void sb_fwd_kernel(float* __restrict__ node_mars, const float* __rest
     float m = -FLT_MAX, l = 0.f;
     for (int e = ty; e < num_edges; e += SPLIT) {
         float emar = element_mars[(eb + e) * batch + b];     // broadcast across the warp's lanes
-        float p = params[pb + (long)e * block_size + m_local]; // coalesced: 32 consecutive params
+        float p = ParamLoad<TP>::at(&params[pb + (long)e * block_size + m_local]); // coalesced: 32 consecutive params
         float nmx = fmaxf(m, emar);
         l = l * __expf(m - nmx) + p * __expf(emar - nmx);
         m = nmx;
@@ -75,7 +76,7 @@ __global__ void sb_fwd_kernel(float* __restrict__ node_mars, const float* __rest
     }
 }
 
-template <int SPLIT>
+template <int SPLIT, typename TP>
 static void launch_sb(torch::Tensor node_mars, torch::Tensor element_mars, torch::Tensor params,
                       torch::Tensor nids, torch::Tensor ebase, torch::Tensor pbase,
                       int batch, int block_size, int num_edges) {
@@ -85,28 +86,36 @@ static void launch_sb(torch::Tensor node_mars, torch::Tensor element_mars, torch
     dim3 blk(32, SPLIT);
     // Launch on the current stream (not the default stream) so the kernel is captured correctly when
     // pyjuice records a CUDA graph of the forward pass (see cat_backward.cu).
-    sb_fwd_kernel<SPLIT><<<grid, blk, 0, c10::cuda::getCurrentCUDAStream()>>>(
-        node_mars.data_ptr<float>(), element_mars.data_ptr<float>(), params.data_ptr<float>(),
+    sb_fwd_kernel<SPLIT, TP><<<grid, blk, 0, c10::cuda::getCurrentCUDAStream()>>>(
+        node_mars.data_ptr<float>(), element_mars.data_ptr<float>(), param_ptr<TP>(params),
         nids.data_ptr<long>(), ebase.data_ptr<long>(), pbase.data_ptr<long>(),
         batch, block_size, num_edges);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
 // cfg id -> SPLIT (edge-warps). SPLIT=32 was the sweep winner; the autotuner picks per layer/batch.
+template <typename TP>
+static void dispatch_sb(torch::Tensor node_mars, torch::Tensor element_mars, torch::Tensor params,
+                        torch::Tensor nids, torch::Tensor ebase, torch::Tensor pbase, int b, int bs, int ne, int64_t cfg) {
+    switch (cfg) {
+        case 0: launch_sb<32, TP>(node_mars, element_mars, params, nids, ebase, pbase, b, bs, ne); break;
+        case 1: launch_sb<16, TP>(node_mars, element_mars, params, nids, ebase, pbase, b, bs, ne); break;
+        case 2: launch_sb<24, TP>(node_mars, element_mars, params, nids, ebase, pbase, b, bs, ne); break;
+        case 3: launch_sb<8, TP>(node_mars, element_mars, params, nids, ebase, pbase, b, bs, ne); break;
+        // No silent default: an unknown cfg must not run zero kernels (a no-op launch can masquerade
+        // as correct against a reused output buffer -- see the autotune note in sum_layer.py).
+        default: TORCH_CHECK(false, "smallbatch_forward_sum: invalid cfg ", cfg);
+    }
+}
+
+// The parameters in the dtype they are stored in (`TensorCircuit.param_dtype`): fp32 or bf16.
 void smallbatch_forward_sum(torch::Tensor node_mars, torch::Tensor element_mars, torch::Tensor params,
                             torch::Tensor nids, torch::Tensor ebase, torch::Tensor pbase,
                             int64_t batch, int64_t block_size, int64_t num_edges, int64_t cfg) {
     int b = (int)batch, bs = (int)block_size, ne = (int)num_edges;
     TORCH_CHECK(bs % 32 == 0, "smallbatch_forward_sum: block_size must be a multiple of 32 (got ", bs, ")");
-    switch (cfg) {
-        case 0: launch_sb<32>(node_mars, element_mars, params, nids, ebase, pbase, b, bs, ne); break;
-        case 1: launch_sb<16>(node_mars, element_mars, params, nids, ebase, pbase, b, bs, ne); break;
-        case 2: launch_sb<24>(node_mars, element_mars, params, nids, ebase, pbase, b, bs, ne); break;
-        case 3: launch_sb<8>(node_mars, element_mars, params, nids, ebase, pbase, b, bs, ne); break;
-        // No silent default: an unknown cfg must not run zero kernels (a no-op launch can masquerade
-        // as correct against a reused output buffer -- see the autotune note in sum_layer.py).
-        default: TORCH_CHECK(false, "smallbatch_forward_sum: invalid cfg ", cfg);
-    }
+    if (params.scalar_type() == torch::kBFloat16) dispatch_sb<__nv_bfloat16>(node_mars, element_mars, params, nids, ebase, pbase, b, bs, ne, cfg);
+    else dispatch_sb<float>(node_mars, element_mars, params, nids, ebase, pbase, b, bs, ne, cfg);
 }
 
 std::vector<int64_t> smallbatch_fw_configs() { return {32, 16, 24, 8}; }  // SPLIT per config id

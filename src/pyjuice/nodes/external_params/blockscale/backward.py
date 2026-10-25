@@ -335,7 +335,7 @@ class _BackwardMixin:
             version rebuilt the candidate list every time; its two `torch.equal` eligibility checks
             forced a device sync per backward and cost more at small batch than the gate itself.
             """
-            key = ("eleplan", ctx["signature"], ctx["batch_size"], ctx["partition_id"])
+            key = ("eleplan", ctx["signature"], ctx["batch_size"], ctx["partition_id"], ctx["params"].dtype)
             plan = cache.get(key)
             if plan is None:
                 plan = _build_ele_plan(ctx)
@@ -369,8 +369,9 @@ class _BackwardMixin:
 
             # The CuTe fork still reads ONE gate per k-tile, so it needs a tile to lie in a single
             # parent block. Only the Triton fork splits the contraction per group.
-            if (ele_mod is not None and ctx["ele_cuda_ok"] and tk == 64 and pinc == 1
-                    and cbs % 128 == 0 and batch % 64 == 0 and plan["gate_tile"] is not None):
+            # (`ele_loads_aligned`: its 8-parameter loads, aligned for the parameters' dtype -- always at fp32)
+            if (ele_mod is not None and ctx["ele_cuda_ok"] and ctx.get("ele_loads_aligned", True) and tk == 64
+                    and pinc == 1 and cbs % 128 == 0 and batch % 64 == 0 and plan["gate_tile"] is not None):
                 kinds.append("cute")
 
             if (sb_mod is not None and batch < 16 and ne % blk == 0 and ctx["ele_cuda_ok"]

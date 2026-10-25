@@ -325,6 +325,9 @@ class SumLayer(Layer, nn.Module):
         # where sb_ebase/sb_pbase are the per-node-block first child / first param and sb_ok records
         # whether the layer's children are GLOBALLY contiguous + params block_size-strided.
         self._cached_fw_sb = dict()
+        # Below fp32 only: whether the CUDA kernels' 8-parameter loads are aligned for this layer's parameter bases,
+        # per (kind, signature) -- see `_cuda_param_loads_aligned`. Never consulted at fp32.
+        self._cached_param_align8 = dict()
         # Per partition: its plan on the dense cuBLAS path, or None where that path does not take it (see
         # `_dense_blocks`).
         self._cached_fw_dense = dict()
@@ -461,10 +464,28 @@ class SumLayer(Layer, nn.Module):
         What the caches keep of the host only (tuning choices, dense plans) stays."""
         for cache in (self._cached_fw_pcids, self._cached_fw_cuda, self._cached_fw_sb, self._cached_bk_parids,
                       self._cached_bk_ele_cuda, self._cached_bk_ele_sb, self._cached_bk_par_cuda,
-                      self._cached_bk_par_trim):
+                      self._cached_bk_par_trim, self._cached_param_align8):
             cache.clear()
         self._bk_ele_scratch = None
         self._bk_par_scratch = None
+
+    def _cuda_param_loads_aligned(self, params: torch.Tensor, key, pbase: torch.Tensor, row_stride: int) -> bool:
+        """Whether the CUDA kernels' 8-parameter loads (`c/param_load.cuh`) are aligned for parameters stored as
+        `params` are. At fp32 they are two 16-byte loads of 4 floats -- the layout the kernels always assumed -- and
+        this is True without a look. Below fp32 they are ONE 16-byte load of 8 values, so every base offset in `pbase`
+        and `row_stride` (the kernel's step between the parameter rows it loads) must be multiples of 8. `compilation`
+        packs the nodes' parameter ranges without padding, so a sum node whose parameter count is 4 mod 8 ahead of this
+        layer breaks that (MEASURED: CUDA "misaligned address" on bf16 parameters where fp32 ran). Checked once per
+        `key` -- a device sync, on the first pass below fp32 -- and kept; during a CUDA graph capture an unchecked key
+        takes the Triton kernel instead (uncached)."""
+        if params.dtype == torch.float32:
+            return True
+        ok = self._cached_param_align8.get(key)
+        if ok is None:
+            if torch.cuda.is_current_stream_capturing():
+                return False
+            ok = self._cached_param_align8[key] = (row_stride % 8 == 0) and bool((pbase % 8 == 0).all())
+        return ok
 
     @property
     def num_parameters(self):
@@ -918,8 +939,10 @@ class SumLayer(Layer, nn.Module):
                 "node_mars_tempered": kwargs["node_mars_tempered"]
             }
 
-        # Dense node blocks through cuBLAS where that is faster (see `_DENSE_MIN_BLOCK_SIZE`)
-        if (propagation_alg_id == 0 and not pflow_tempered_enabled and node_mars.is_cuda
+        # Dense node blocks through cuBLAS where that is faster (see `_DENSE_MIN_BLOCK_SIZE`) -- fp32 parameters only:
+        # `torch.mm` on bf16 operands returns bf16, too coarse for log-space node values, so bf16-stored parameters take
+        # the block-sparse kernels, which read them as they are and accumulate in fp32
+        if (propagation_alg_id == 0 and not pflow_tempered_enabled and node_mars.is_cuda and params.dtype == torch.float32
                 and self.block_size >= _DENSE_MIN_BLOCK_SIZE and batch_size >= 16):
             dense = self._dense_blocks(partition_id, nids, cids, pids)
             if dense is not None and dense[1] * batch_size >= _DENSE_MIN_WORK:
@@ -1026,7 +1049,7 @@ class SumLayer(Layer, nn.Module):
                 raise ValueError("`compute_children` takes the block-sparse `tlmm` regime (see `fuses_children`).")
             default_cfg = (TILE_SIZE_M, BLOCK_B, None)                     # (TILE_SIZE_M, BLOCK_B, num_warps)
             fused_key = (fw_fused._fw_triton_block_sparse_tlmm_fused_kernel, self.block_size, TILE_SIZE_K, K_NUM_TILES,
-                         batch_size, num_nblocks, use_bf16, fp32_dot, children[0].size(1), default_cfg)
+                         batch_size, num_nblocks, use_bf16, fp32_dot, children[0].size(1), params.dtype, default_cfg)
 
             def _launch_fused(cfg, r = None):
                 self._forward_block_sparse_fused(node_mars, params, nids, cids_start, cids_increment, pids_start,
@@ -1103,9 +1126,10 @@ class SumLayer(Layer, nn.Module):
 
         # The heuristic default is part of the key so that the `OutOfResources` retry below -- which
         # re-enters with a smaller default -- looks up a fresh entry instead of the config that just
-        # failed (which would loop forever).
+        # failed (which would loop forever). The parameters' dtype too: the kernels read them as stored, and their speeds
+        # differ (as do the element- and parameter-flow keys below).
         fw_key = (fw_kernel, self.block_size, TILE_SIZE_K, K_NUM_TILES, batch_size, num_nblocks,
-                  use_bf16, fp32_dot, propagation_alg_id, pflow_tempered_enabled, default_fw_cfg)
+                  use_bf16, fp32_dot, propagation_alg_id, pflow_tempered_enabled, params.dtype, default_fw_cfg)
 
         # Optional CUDA (CuTe/TMA) fast path for the `tlmm` regime. It is numerically equivalent to
         # the Triton tlmm kernel and only valid here: LL propagation (`propagation_alg_id == 0`), the
@@ -1118,6 +1142,7 @@ class SumLayer(Layer, nn.Module):
                 and TILE_SIZE_K == 64 and num_edges % TILE_SIZE_K == 0
                 and node_mars.is_cuda and cuda_kernels.is_available()):
             ebase, pbase, cuda_ok = self._cached_fw_cuda[signature]
+            cuda_ok = cuda_ok and self._cuda_param_loads_aligned(params, ("fw", signature), pbase, self.block_size)
             valid_cfgs = cuda_kernels.valid_configs(self.block_size, batch_size) if cuda_ok else []
             if valid_cfgs:
                 # The best config depends on the shape (which tile shapes are valid, and their speed).
@@ -2027,7 +2052,7 @@ class SumLayer(Layer, nn.Module):
         ele_key = (ele_kernel, self.block_size, cs_block_size, TILE_SIZE_K, K_NUM_TILES,
                    ptr_inc_step, batch_size, num_nblocks, TL_DOT, bool(dot_kwargs), accumulate_ch_flows,
                    allow_modify_flows, logspace_flows, allow_neg_flows, propagation_alg_id,
-                   default_ele_cfg)
+                   params.dtype, default_ele_cfg)
 
         def _tuned_ele_cfg():
             cfg = autotune.cached(ele_key)
@@ -2096,6 +2121,9 @@ class SumLayer(Layer, nn.Module):
                 element_flows = element_flows, element_mars = element_mars, node_flows = node_flows,
                 node_mars = node_mars, params = params, chids = chids,
                 ele_ebase = ele_ebase, ele_pbase = ele_pbase, ele_cuda_ok = ele_cuda_ok,
+                # (the 8-parameter loads of a CUDA kernel reading `ele_pbase` -- `_cuda_param_loads_aligned`)
+                ele_loads_aligned = self._cuda_param_loads_aligned(params, ("ele", signature), ele_pbase,
+                                                                   self.block_size),
                 parids_start = parids_start, parids_increment = parids_increment,
                 parpids_start = parpids_start, parpids_increment = parpids_increment,
                 ptr_inc_step = ptr_inc_step, batch_size = batch_size, block_size = self.block_size,
@@ -2121,7 +2149,7 @@ class SumLayer(Layer, nn.Module):
                 and cs_block_size % 128 == 0 and batch_size % 64 == 0
                 and node_flows.is_cuda and cuda_kernels.ele_is_available()):
             ele_ebase, ele_pbase, ele_cuda_ok = self._cached_bk_ele_cuda[signature]
-            if ele_cuda_ok:
+            if ele_cuda_ok and self._cuda_param_loads_aligned(params, ("ele", signature), ele_pbase, self.block_size):
                 def _cuda_ele(tgt):
                     cuda_kernels.ele_backward_sum(
                         tgt, element_mars, node_flows, node_mars, params, chids, ele_ebase, ele_pbase,
@@ -2495,7 +2523,7 @@ class SumLayer(Layer, nn.Module):
         # which re-enters with the untuned default -- cannot look up the config that just failed.
         par_key = (par_kernel, self.block_size, raw_num_edges, num_nblocks, batch_size,
                    TILE_SIZE_M, TILE_SIZE_B, B_NUM_TILES, TL_DOT, bool(dot_kwargs), allow_modify_flows,
-                   logspace_flows, negate_pflows, allow_neg_flows, propagation_alg_id, default_par_cfg)
+                   logspace_flows, negate_pflows, allow_neg_flows, propagation_alg_id, params.dtype, default_par_cfg)
 
         def _tuned_par_cfg():
             cfg = autotune.cached(par_key)
@@ -3166,6 +3194,10 @@ class SumLayer(Layer, nn.Module):
         """
 
         assert propagation_alg == "LL"
+
+        # fp32 math whatever the parameters are stored in (`params.log()` would otherwise run in bf16); the identity at
+        # fp32
+        params = params.float()
 
         # Flows w.r.t. input elements (product nodes)
         if chids is not None:

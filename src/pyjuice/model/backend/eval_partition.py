@@ -86,7 +86,7 @@ def sum_layer_partition_fn_block_kernel(node_mars, element_mars, mparams, nids, 
         cmars = tl.load(element_mars + cnode_ids, mask = mask_cnode, other = 0.0)
 
         par_ids = tl.load(pids + ngroup_id * c_num_nodes + offs_cnode, mask = mask_cnode) # [TILE_SIZE_C]
-        pars = tl.load(mparams + par_ids[None,:] + offs_nnode[:,None], mask = mask_cnode[None,:]) # [TILE_SIZE_N, TILE_SIZE_C]
+        pars = tl.load(mparams + par_ids[None,:] + offs_nnode[:,None], mask = mask_cnode[None,:]).to(tl.float32) # [TILE_SIZE_N, TILE_SIZE_C]
 
         cmars_max = tl.max(cmars)
         cmars_sub = tl.exp(cmars - cmars_max)
@@ -123,7 +123,7 @@ def sum_layer_partition_fn_node_kernel(node_mars, element_mars, mparams, nids, c
         cmars = tl.load(element_mars + cnode_ids, mask = (n_mask[:,None] & mask_cnode[None,:]), other = 0.0)
 
         par_ids = tl.load(pids + ngroup_ids[:,None] * c_num_nodes + offs_cnode[None,:], mask = (n_mask[:,None] & mask_cnode[None,:])) # [TILE_SIZE_N, TILE_SIZE_C]
-        pars = tl.load(mparams + par_ids + offs_nnode[:,None], mask = (n_mask[:,None] & mask_cnode[None,:])) # [TILE_SIZE_N, TILE_SIZE_C]
+        pars = tl.load(mparams + par_ids + offs_nnode[:,None], mask = (n_mask[:,None] & mask_cnode[None,:])).to(tl.float32) # [TILE_SIZE_N, TILE_SIZE_C]
 
         cmars_max = tl.max(cmars, axis = 1)
         cmars_sub = tl.exp(cmars - cmars_max[:,None])

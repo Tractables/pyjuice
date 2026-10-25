@@ -8,6 +8,9 @@ from typing import Optional, Sequence, Callable, Union
 
 from pyjuice.nodes import CircuitNodes
 from pyjuice.layer.sum_layer import PRECISIONS, _pop_removed_precision_flags
+
+#: The dtypes the sum layers' parameters may be stored in (`TensorCircuit.param_dtype`)
+PARAM_DTYPES = (torch.float32, torch.bfloat16)
 from pyjuice.nodes.methods import is_structured_decomposable
 
 from .backend import cum_par_flows_to_device, par_update_to_device
@@ -85,12 +88,16 @@ class TensorCircuit(_BuildMixin, _CudaGraphsMixin, _ExternalParamsMixin, _Learni
                  force_gpu_compilation: bool = False,
                  max_tied_ns_per_parflow_block: int = 32,
                  device: Optional[Union[int,torch.device]] = None,
-                 verbose: bool = True, cuda_graphs: bool = False, precision: str = "auto") -> None:
+                 verbose: bool = True, cuda_graphs: bool = False, precision: str = "auto",
+                 param_dtype: torch.dtype = torch.float32) -> None:
 
         super(TensorCircuit, self).__init__()
 
         self.cuda_graphs = bool(cuda_graphs)
         self.precision = precision
+        self.param_dtype = param_dtype
+        # The fp32 master copy of `params` while a circuit storing them below fp32 trains (`_params_for_update`)
+        self.register_buffer("params_master", None, persistent = False)
 
         assert isinstance(root_ns, CircuitNodes), "`root_ns` should be an instance of `CircuitNodes`."
 
@@ -239,6 +246,56 @@ class TensorCircuit(_BuildMixin, _CudaGraphsMixin, _ExternalParamsMixin, _Learni
         if value not in PRECISIONS:
             raise ValueError(f"`precision` must be one of {PRECISIONS}, got {value!r}.")
         self.__dict__["_precision"] = value
+
+    @property
+    def param_dtype(self) -> torch.dtype:
+        """
+        The dtype the sum layers' parameters (``params``) are STORED in: ``torch.float32`` (the default) or
+        ``torch.bfloat16``. Every kernel reads the parameters in that dtype and computes in fp32 (or in the bf16 / fp16
+        operand it already used): at fp32 nothing changes; at bf16 the parameters cost half the memory and the memory
+        traffic, which is what the large layers' time is -- and the forward's block-sparse kernels round the parameters
+        to bf16 for their products anyway (MEASURED: HCLT-1024 log-likelihoods 0.0000 nats apart on average, 5e-4 at
+        most). Parameter flows, node and element values stay fp32. Training keeps an fp32 master copy of the parameters
+        (``params_master``, made by the first update, 4 bytes a parameter until :meth:`drop_params_master`): the updates
+        run on it and store its rounding, because a bf16 value moves only by more than half its ulp (MEASURED: stored
+        alone, a mini-batch EM step of size 0.01 or an SGD step left 99.9-100% of the parameters unchanged); with it,
+        every optimizer follows its fp32 run (1-3e-3 relative). fp16 is not offered: its range turns small probabilities
+        into exact zeros. Set at compilation; :meth:`set_param_dtype` converts a compiled circuit.
+        """
+        return self.__dict__.get("_param_dtype", torch.float32)
+
+    @param_dtype.setter
+    def param_dtype(self, value: torch.dtype):
+        if value not in PARAM_DTYPES:
+            raise ValueError(f"`param_dtype` must be one of {PARAM_DTYPES}, got {value!r}.")
+        self.__dict__["_param_dtype"] = value
+
+    def set_param_dtype(self, dtype: torch.dtype) -> "TensorCircuit":
+        """Convert the sum layers' parameters in place to ``dtype`` (:attr:`param_dtype`); returns the circuit.
+
+        Converts the fp32 master copy where a training run left one (the precision the stored values rounded away), and
+        drops what was derived from the old tensor: the CUDA graphs recorded on it (never replayed -- keyed by it -- but
+        held) and the layers' operand caches, rebuilt by the next pass as after a device move (BlockScale's plans, whose
+        CUDA forks depend on the dtype, and its parameter sums, keyed by the tensor's version -- which a new tensor
+        restarts)."""
+        self.param_dtype = dtype
+        if self.params.dtype != dtype:
+            values = self._params_in_fp32()     # `params`, or the master copy in line with them
+            self.params = nn.Parameter(values.detach().to(dtype), requires_grad = self.params.requires_grad)
+            self._drop_cuda_graphs()
+            for group in self.inner_layer_groups:
+                for layer in group:
+                    drop = getattr(layer, "_drop_device_caches", None)
+                    if drop is not None:
+                        drop()
+        self.drop_params_master()
+        return self
+
+    def _load_from_state_dict(self, *args, **kwargs):
+        # `params` loaded in their stored dtype; the master copy of a training run is not part of the state. Dropped here
+        # rather than in `load_state_dict`, which a module holding the circuit does not call on it
+        super()._load_from_state_dict(*args, **kwargs)
+        self.drop_params_master()
 
     def forward(self, inputs: torch.Tensor, input_layer_fn: Optional[Union[str,Callable]] = None,
                 cache: Optional[dict] = None, return_cache: bool = False, record_cudagraph: Optional[bool] = None, 
@@ -640,7 +697,8 @@ def compile(ns: CircuitNodes, layer_sparsity_tol: float = 0.5,
             force_gpu_compilation: bool = False,
             max_tied_ns_per_parflow_block: int = 32,
             device: Optional[Union[int,torch.device]] = None,
-            verbose: bool = True, cuda_graphs: bool = False, precision: str = "auto") -> nn.Module:
+            verbose: bool = True, cuda_graphs: bool = False, precision: str = "auto",
+            param_dtype: torch.dtype = torch.float32) -> nn.Module:
     """
     Compile a PC represented by a DAG into an equivalent `torch.nn.Module`.
 
@@ -676,9 +734,13 @@ def compile(ns: CircuitNodes, layer_sparsity_tol: float = 0.5,
         or "fp32" (see :attr:`TensorCircuit.precision`; settable after compiling)
     :type precision: str
 
+    :param param_dtype: the dtype the sum layers' parameters are stored in, ``torch.float32`` (the default) or
+        ``torch.bfloat16`` (see :attr:`TensorCircuit.param_dtype`)
+    :type param_dtype: torch.dtype
+
     :returns: the compiled PC with type `torch.nn.Module`
     """
     return TensorCircuit(ns, layer_sparsity_tol = layer_sparsity_tol, max_num_partitions = max_num_partitions,
                          disable_gpu_compilation = disable_gpu_compilation, force_gpu_compilation = force_gpu_compilation,
                          max_tied_ns_per_parflow_block = max_tied_ns_per_parflow_block, device = device, verbose = verbose,
-                         cuda_graphs = cuda_graphs, precision = precision)
+                         cuda_graphs = cuda_graphs, precision = precision, param_dtype = param_dtype)

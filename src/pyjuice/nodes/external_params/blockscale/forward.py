@@ -188,9 +188,13 @@ class _ForwardMixin:
                     "make impossible (padding is by whole edge blocks)."
                 run_pad = pad3.all(-1).unsqueeze(-1)
 
+                # Below fp32, the kernel's 8-parameter loads are one 16-byte load each: its runs' first parameters
+                # must sit at multiples of 8 (`SumLayer._cuda_param_loads_aligned`; at fp32 the layout it always had)
                 if (bool(((c3 == c3[:, :, :1] + ar.view(1, 1, -1)) | run_pad).all())
                         and bool(((p3 == p3[:, :, :1]
-                                   + ar.view(1, 1, -1) * block_size) | run_pad).all())):
+                                   + ar.view(1, 1, -1) * block_size) | run_pad).all())
+                        and (params.dtype == torch.float32
+                             or (block_size % 8 == 0 and bool((p3[:, :, 0] % 8 == 0).all())))):
                     # The COMPILED TABLES go to the kernel unchanged -- no derived `ebase` / `pbase`
                     # slices to build here or to drift from what the layer compiled.
                     calls.append((nids, c3[:, :, 0].contiguous(), p3[:, :, 0].contiguous(),

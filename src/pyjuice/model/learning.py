@@ -11,6 +11,7 @@ import torch
 from typing import Optional
 
 from .backend import compute_cum_par_flows, em_par_update, eval_top_down_probs
+from .backend.params_master import em_par_update_master, sync_master
 
 from .common import device_grad_controller
 
@@ -103,7 +104,13 @@ class _LearningMixin:
             if step_size_rescaling:
                 self.init_param_flows(flows_memory = step_size / self._cum_flow)
 
-                eval_top_down_probs(self, update_pflow = True, scale = (1.0 - step_size), use_cudagraph = use_cudagraph)
+                # Below fp32, the `(1 - step_size) * P_td * theta` term from the fp32 master copy: built from the stored
+                # rounding, the step-size-1 update below would reset the copy to it every step, and an update smaller
+                # than half a bf16 ulp would never land (MEASURED: near convergence every parameter fp32 moved by > 2
+                # ulps in 40 steps stayed where it was)
+                td_params = self.params if self.params.dtype == torch.float32 else self._params_master(sync = True)
+                eval_top_down_probs(self, update_pflow = True, scale = (1.0 - step_size), use_cudagraph = use_cudagraph,
+                                    params = td_params)
 
                 self._cum_flow = 0.0 # Zero out the cumulative flow value
                 step_size = 1.0 # We have applied the step size within the parameter flows
@@ -130,20 +137,85 @@ class _LearningMixin:
             # Normalize and update parameters. The skipped ranges' results were previously computed here
             # and then overwritten -- ~94% of the sum parameters on a gated HMM.
             kwargs = self._par_update_kwargs_excluding([ns._param_range for ns, _ in corrections])
-            if kwargs[0].size(0) > 0:            # every block may belong to a corrected range
-                em_par_update(self.params, self.param_flows, kwargs,
-                              step_size = step_size, pseudocount = pseudocount,
-                              keep_zero_params = keep_zero_params)
+            if self.params.dtype == torch.float32:
+                params = self.params
+                if kwargs[0].size(0) > 0:        # every block may belong to a corrected range
+                    em_par_update(params, self.param_flows, kwargs,
+                                  step_size = step_size, pseudocount = pseudocount,
+                                  keep_zero_params = keep_zero_params)
+            else:                                # below fp32: the update on the fp32 master copy, stored in the same pass
+                params = self._params_master(sync = False)
+                if kwargs[0].size(0) > 0:
+                    em_par_update_master(params, self.params.data, self.param_flows, kwargs,
+                                         step_size = step_size, pseudocount = pseudocount,
+                                         keep_zero_params = keep_zero_params)
 
             # The conditional update, writing `params` in place -- which is what removes BOTH the
             # discarded pass above and a separate write-back. It reads the PRE-update `theta` of its own
             # range, which the call above no longer touches, so the ordering is safe either way round.
             for ns, sources in corrections:
                 ps, pe = ns._param_range
+                if params is not self.params:    # the range's master values in line with `params`, before reading them
+                    sync_master(params[ps:pe], self.params.data[ps:pe])
                 ns.external_params.compute_em_correction(
-                    ns, self.params, self.param_flows, denom_param_flows,
+                    ns, params, self.param_flows, denom_param_flows,
                     step_size, pseudocount, keep_zero_params, denom_sources = sources,
-                    out = self.params[ps:pe])
+                    out = params[ps:pe])
+                if params is not self.params:
+                    self.params.data[ps:pe].copy_(params[ps:pe])
+
+    # ---------------------------------------------------------------------------------------------
+    # The fp32 master copy of parameters stored below fp32 (`param_dtype`; see `backend.params_master`)
+    # ---------------------------------------------------------------------------------------------
+
+    def _params_for_update(self) -> torch.Tensor:
+        """The tensor a parameter update writes: `params` themselves when stored in fp32; otherwise their fp32 master
+        copy -- made by the first update (an exact upcast), and brought in line with `params` wherever those were written
+        since it was last stored. After writing it, call `_store_updated_params` -- and nothing that calls this in
+        between, which would take the not-yet-stored values for outside writes and undo them."""
+        if self.params.dtype == torch.float32:
+            return self.params
+        return self._params_master(sync = True)
+
+    def _params_master(self, sync: bool) -> torch.Tensor:
+        """The fp32 master copy of `params` (stored below fp32), made now if there is none (an exact upcast); with
+        ``sync``, brought in line with `params` where those were written since it was last stored (a pass over all of
+        them: an update that reads and writes every parameter does it itself instead, `em_par_update_master`)."""
+        master = getattr(self, "params_master", None)
+        if master is None or master.shape != self.params.shape or master.device != self.params.device:
+            master = self.params.detach().to(torch.float32)
+            if "params_master" in self._buffers:
+                self.params_master = master
+            else:                                # a circuit made before the buffer existed
+                self.register_buffer("params_master", master, persistent = False)
+        elif sync:
+            sync_master(master, self.params.data)
+        return master
+
+    def _store_updated_params(self) -> None:
+        """Store the master copy's values into `params` (rounded to their dtype), after an update wrote it."""
+        master = getattr(self, "params_master", None)
+        if master is not None and self.params.dtype != torch.float32:
+            self.params.data.copy_(master)
+            # What the in-place update of `params` signals at fp32 (the gradient optimizers' `clamp_`), which a write
+            # through `.data` does not: caches keyed on the version (BlockScale's parameter sums) must see it
+            torch.autograd.graph.increment_version(self.params)
+
+    def _params_in_fp32(self) -> torch.Tensor:
+        """The parameters in fp32: `params`, or below fp32 the master copy (in line with `params`) where there is one
+        and an upcast of `params` otherwise. Not a copy at fp32."""
+        if self.params.dtype == torch.float32:
+            return self.params.data
+        master = getattr(self, "params_master", None)
+        if master is not None and master.shape == self.params.shape and master.device == self.params.device:
+            sync_master(master, self.params.data)
+            return master
+        return self.params.detach().to(torch.float32)
+
+    def drop_params_master(self) -> None:
+        """Free the fp32 master copy of parameters stored below fp32 (made again by the next update, from `params`)."""
+        if "params_master" in self._buffers:
+            self.params_master = None
 
     def cumulate_flows(self, inputs: torch.Tensor, params: Optional[torch.Tensor] = None):
         with torch.no_grad():
@@ -265,7 +337,7 @@ class _LearningMixin:
         :param clone: whether to deepcopy parameters
         :type clone: bool
         """
-        params = self.params.detach().cpu()
+        params = self._params_in_fp32().detach().cpu()      # the nodes keep fp32 parameters, whatever the circuit stores
 
         for ns in self.root_ns:
             if ns.is_sum() and not ns.is_tied():

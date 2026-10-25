@@ -24,6 +24,7 @@
 // measures it against the plain kernel's configs per shape (`autotune.choose`).
 
 #include <torch/extension.h>
+#include "param_load.cuh"
 #include <cuda_bf16.h>
 #include <c10/cuda/CUDAStream.h>
 #include <c10/cuda/CUDAException.h>
@@ -49,9 +50,9 @@ __device__ __forceinline__ void bar_arrive(int id, int count) {
 extern __shared__ char smem_raw[];
 
 // PW producer warps beside the WM x WN MMA warps.
-template <int BM, int BN, int WM, int WN, int PW>
+template <int BM, int BN, int WM, int WN, int PW, typename TP>
 __global__ void __launch_bounds__((WM * WN + PW) * 32) tlmm_pipe_kernel(
-        float* __restrict__ node_mars, const float* __restrict__ element_mars, const float* __restrict__ mp,
+        float* __restrict__ node_mars, const float* __restrict__ element_mars, const TP* __restrict__ mp,
         const long* __restrict__ nids, const long* __restrict__ ebase, const long* __restrict__ pbase,
         int batch, int block_size, int knt, int pid_m_offset) {
     constexpr int NC = WM * WN * 32;                 // consumer threads
@@ -94,23 +95,20 @@ __global__ void __launch_bounds__((WM * WN + PW) * 32) tlmm_pipe_kernel(
             constexpr int PA = (BM * BK) / 8 / NP;
             static_assert((BM * BK) / 8 % NP == 0, "params items per producer thread");
             {
-                float4 a[PA], b[PA];
+                float v[PA][8];
                 CUTE_UNROLL
                 for (int t = 0; t < PA; t++) {
                     int i = ptid + t * NP;
                     int e = i / (BM / 8), mm = (i % (BM / 8)) * 8;
-                    const float* g = &mp[pc + (long)e * block_size + mm];
-                    a[t] = *(const float4*)g; b[t] = *(const float4*)(g + 4);
+                    ParamLoad<TP>::load8(&mp[pc + (long)e * block_size + mm], v[t]);
                 }
                 CUTE_UNROLL
                 for (int t = 0; t < PA; t++) {
                     int i = ptid + t * NP;
                     int e = i / (BM / 8), mm = (i % (BM / 8)) * 8;
                     bfloat16_t r[8];
-                    r[0] = static_cast<bfloat16_t>(a[t].x); r[1] = static_cast<bfloat16_t>(a[t].y);
-                    r[2] = static_cast<bfloat16_t>(a[t].z); r[3] = static_cast<bfloat16_t>(a[t].w);
-                    r[4] = static_cast<bfloat16_t>(b[t].x); r[5] = static_cast<bfloat16_t>(b[t].y);
-                    r[6] = static_cast<bfloat16_t>(b[t].z); r[7] = static_cast<bfloat16_t>(b[t].w);
+                    CUTE_UNROLL
+                    for (int j = 0; j < 8; j++) r[j] = static_cast<bfloat16_t>(v[t][j]);
                     *(float4*)&sAt(mm, e) = *(const float4*)r;
                 }
             }
@@ -236,20 +234,20 @@ __global__ void __launch_bounds__((WM * WN + PW) * 32) tlmm_pipe_kernel(
     }
 }
 
-template <int BM, int BN, int WM, int WN, int PW>
+template <int BM, int BN, int WM, int WN, int PW, typename TP>
 static void launch_cfg(torch::Tensor node_mars, torch::Tensor element_mars, torch::Tensor params, torch::Tensor nids,
                        torch::Tensor ebase, torch::Tensor pbase, int batch, int block_size, int knt) {
     constexpr int NTH = (WM * WN + PW) * 32;
     int smem = 2 * BM * BK * 2 + BN * BK * 2 + 2 * BK * BN * 4 + (BN + (WM * WN * 32 / BN) * BN + 4) * 4;
-    cudaFuncSetAttribute(tlmm_pipe_kernel<BM, BN, WM, WN, PW>,
+    cudaFuncSetAttribute(tlmm_pipe_kernel<BM, BN, WM, WN, PW, TP>,
                          cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
     int total_m = nids.size(0) * (block_size / BM);
     const int MAX_Y = 65535;
     for (int off = 0; off < total_m; off += MAX_Y) {
         int chunk = (total_m - off < MAX_Y) ? (total_m - off) : MAX_Y;
         dim3 grid(batch / BN, chunk);
-        tlmm_pipe_kernel<BM, BN, WM, WN, PW><<<grid, NTH, smem, c10::cuda::getCurrentCUDAStream()>>>(
-            node_mars.data_ptr<float>(), element_mars.data_ptr<float>(), params.data_ptr<float>(), nids.data_ptr<long>(),
+        tlmm_pipe_kernel<BM, BN, WM, WN, PW, TP><<<grid, NTH, smem, c10::cuda::getCurrentCUDAStream()>>>(
+            node_mars.data_ptr<float>(), element_mars.data_ptr<float>(), param_ptr<TP>(params), nids.data_ptr<long>(),
             ebase.data_ptr<long>(), pbase.data_ptr<long>(), batch, block_size, knt, off);
         C10_CUDA_KERNEL_LAUNCH_CHECK();
     }
@@ -259,16 +257,26 @@ static void launch_cfg(torch::Tensor node_mars, torch::Tensor element_mars, torc
 // 99 KB of shared memory of sm_120 (2 x 16 KB A, 2 x 16 KB elements, 8 KB B at (128, 64)); 16 MMA warps (MEASURED
 // above); 4 producer warps as the alternative (MEASURED 0.63 against 0.58 at B 128, 0.49 against 0.49 at B 64); the
 // 64-row tile for blocks of 64.
+template <typename TP>
+static void dispatch_cfg(torch::Tensor node_mars, torch::Tensor element_mars, torch::Tensor params, torch::Tensor nids,
+                         torch::Tensor ebase, torch::Tensor pbase, int b, int bs, int k, int64_t cfg) {
+    switch (cfg) {
+        case 0: launch_cfg<128, 64, 8, 2, 8, TP>(node_mars, element_mars, params, nids, ebase, pbase, b, bs, k); break;
+        case 1: launch_cfg<128, 64, 8, 2, 4, TP>(node_mars, element_mars, params, nids, ebase, pbase, b, bs, k); break;
+        case 2: launch_cfg<64, 64, 4, 2, 8, TP>(node_mars, element_mars, params, nids, ebase, pbase, b, bs, k); break;
+        default: launch_cfg<128, 64, 8, 2, 8, TP>(node_mars, element_mars, params, nids, ebase, pbase, b, bs, k); break;
+    }
+}
+
+// The parameters in the dtype they are stored in (`TensorCircuit.param_dtype`): fp32 or bf16.
 void tlmm_forward_sum_pipelined(torch::Tensor node_mars, torch::Tensor element_mars, torch::Tensor params,
                                 torch::Tensor nids, torch::Tensor ebase, torch::Tensor pbase, int64_t batch,
                                 int64_t block_size, int64_t knt, int64_t cfg) {
     int b = (int)batch, bs = (int)block_size, k = (int)knt;
-    switch (cfg) {
-        case 0: launch_cfg<128, 64, 8, 2, 8>(node_mars, element_mars, params, nids, ebase, pbase, b, bs, k); break;
-        case 1: launch_cfg<128, 64, 8, 2, 4>(node_mars, element_mars, params, nids, ebase, pbase, b, bs, k); break;
-        case 2: launch_cfg<64, 64, 4, 2, 8>(node_mars, element_mars, params, nids, ebase, pbase, b, bs, k); break;
-        default: launch_cfg<128, 64, 8, 2, 8>(node_mars, element_mars, params, nids, ebase, pbase, b, bs, k); break;
-    }
+    if (params.scalar_type() == torch::kBFloat16)
+        dispatch_cfg<__nv_bfloat16>(node_mars, element_mars, params, nids, ebase, pbase, b, bs, k, cfg);
+    else
+        dispatch_cfg<float>(node_mars, element_mars, params, nids, ebase, pbase, b, bs, k, cfg);
 }
 
 // (BM, BN) per config id; Python uses this to enumerate the configs valid for a layer shape.

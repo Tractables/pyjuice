@@ -22,15 +22,16 @@
 // (collision-free) flows, and block_size a multiple of 32 -- the caller guarantees this.
 
 #include <torch/extension.h>
+#include "param_load.cuh"
 #include <cuda_runtime.h>
 #include <c10/cuda/CUDAStream.h>
 #include <c10/cuda/CUDAException.h>
 #include <vector>
 
-template <int EY, int BMAX>
+template <int EY, int BMAX, typename TP>
 __global__ void sb_par_kernel(float* __restrict__ param_flows, const float* __restrict__ node_flows,
                               const float* __restrict__ node_mars, const float* __restrict__ element_mars,
-                              const float* __restrict__ params, const long* __restrict__ nids,
+                              const TP* __restrict__ params, const long* __restrict__ nids,
                               const long* __restrict__ cids, const long* __restrict__ pids,
                               const long* __restrict__ pfids, int batch, int block_size, int num_edges) {
     const int groups = block_size >> 5;             // block_size / 32 (block_size is a multiple of 32)
@@ -63,11 +64,11 @@ __global__ void sb_par_kernel(float* __restrict__ param_flows, const float* __re
         for (int b = 0; b < BMAX; b++) { if (b >= batch) break; s += __expf(pl[b] - mx); }
         term = s * __expf(mx);
     }
-    float val = params[pids[cb + e] + tile_id] * term;          // coalesced across lanes (node-contiguous)
+    float val = ParamLoad<TP>::at(&params[pids[cb + e] + tile_id]) * term;   // coalesced across lanes (node-contiguous)
     param_flows[pfids[cb + e] + tile_id] += val;                // collision-free RMW, coalesced
 }
 
-template <int EY, int BMAX>
+template <int EY, int BMAX, typename TP>
 static void launch_par(torch::Tensor param_flows, torch::Tensor node_flows, torch::Tensor node_mars,
                        torch::Tensor element_mars, torch::Tensor params, torch::Tensor nids,
                        torch::Tensor cids, torch::Tensor pids, torch::Tensor pfids,
@@ -77,9 +78,9 @@ static void launch_par(torch::Tensor param_flows, torch::Tensor node_flows, torc
     dim3 grid((unsigned int)(nb * groups), (unsigned int)((num_edges + EY - 1) / EY));
     dim3 blk(32, EY);
     // Launch on the current stream so the kernel is captured correctly under CUDA-graph recording.
-    sb_par_kernel<EY, BMAX><<<grid, blk, 0, c10::cuda::getCurrentCUDAStream()>>>(
+    sb_par_kernel<EY, BMAX, TP><<<grid, blk, 0, c10::cuda::getCurrentCUDAStream()>>>(
         param_flows.data_ptr<float>(), node_flows.data_ptr<float>(), node_mars.data_ptr<float>(),
-        element_mars.data_ptr<float>(), params.data_ptr<float>(), nids.data_ptr<long>(),
+        element_mars.data_ptr<float>(), param_ptr<TP>(params), nids.data_ptr<long>(),
         cids.data_ptr<long>(), pids.data_ptr<long>(), pfids.data_ptr<long>(), batch, block_size, num_edges);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
@@ -87,20 +88,21 @@ static void launch_par(torch::Tensor param_flows, torch::Tensor node_flows, torc
 // Dispatch on (EY from `cfg`) x (BMAX = next pow2 of batch, for register-tight state).
 #define SB_PAR_DISPATCH_BMAX(EE)                                                                                      \
     switch (bmax) {                                                                                                    \
-        case 1:  launch_par<EE, 1 >(param_flows, node_flows, node_mars, element_mars, params, nids, cids, pids, pfids, b, bs, ne); break; \
-        case 2:  launch_par<EE, 2 >(param_flows, node_flows, node_mars, element_mars, params, nids, cids, pids, pfids, b, bs, ne); break; \
-        case 4:  launch_par<EE, 4 >(param_flows, node_flows, node_mars, element_mars, params, nids, cids, pids, pfids, b, bs, ne); break; \
-        case 8:  launch_par<EE, 8 >(param_flows, node_flows, node_mars, element_mars, params, nids, cids, pids, pfids, b, bs, ne); break; \
-        case 16: launch_par<EE, 16>(param_flows, node_flows, node_mars, element_mars, params, nids, cids, pids, pfids, b, bs, ne); break; \
+        case 1:  launch_par<EE, 1, TP>(param_flows, node_flows, node_mars, element_mars, params, nids, cids, pids, pfids, b, bs, ne); break; \
+        case 2:  launch_par<EE, 2, TP>(param_flows, node_flows, node_mars, element_mars, params, nids, cids, pids, pfids, b, bs, ne); break; \
+        case 4:  launch_par<EE, 4, TP>(param_flows, node_flows, node_mars, element_mars, params, nids, cids, pids, pfids, b, bs, ne); break; \
+        case 8:  launch_par<EE, 8, TP>(param_flows, node_flows, node_mars, element_mars, params, nids, cids, pids, pfids, b, bs, ne); break; \
+        case 16: launch_par<EE, 16, TP>(param_flows, node_flows, node_mars, element_mars, params, nids, cids, pids, pfids, b, bs, ne); break; \
         default: TORCH_CHECK(false, "smallbatch_par_backward_sum: invalid batch ", b);                                \
     }
 
 // cfg id -> EY (edges split across threadIdx.y). The kernel is memory/latency-bound and EY-insensitive;
 // a couple of options are exposed for the autotuner to pick per layer/batch.
-void smallbatch_par_backward_sum(torch::Tensor param_flows, torch::Tensor node_flows, torch::Tensor node_mars,
-                                 torch::Tensor element_mars, torch::Tensor params, torch::Tensor nids,
-                                 torch::Tensor cids, torch::Tensor pids, torch::Tensor pfids,
-                                 int64_t batch, int64_t block_size, int64_t num_edges, int64_t cfg) {
+template <typename TP>
+static void smallbatch_par_backward_sum_t(torch::Tensor param_flows, torch::Tensor node_flows, torch::Tensor node_mars,
+                                          torch::Tensor element_mars, torch::Tensor params, torch::Tensor nids,
+                                          torch::Tensor cids, torch::Tensor pids, torch::Tensor pfids,
+                                          int64_t batch, int64_t block_size, int64_t num_edges, int64_t cfg) {
     int b = (int)batch, bs = (int)block_size, ne = (int)num_edges;
     int ey = (cfg == 0) ? 8 : (cfg == 1) ? 16 : (cfg == 2) ? 4 : -1;
     TORCH_CHECK(ey > 0, "smallbatch_par_backward_sum: invalid cfg ", cfg);
@@ -119,6 +121,17 @@ void smallbatch_par_backward_sum(torch::Tensor param_flows, torch::Tensor node_f
 }
 
 std::vector<int64_t> smallbatch_par_configs() { return {8, 16, 4}; }  // EY per config id
+
+// The parameters in the dtype they are stored in (`TensorCircuit.param_dtype`): fp32 or bf16.
+void smallbatch_par_backward_sum(torch::Tensor param_flows, torch::Tensor node_flows, torch::Tensor node_mars,
+                                 torch::Tensor element_mars, torch::Tensor params, torch::Tensor nids,
+                                 torch::Tensor cids, torch::Tensor pids, torch::Tensor pfids,
+                                 int64_t batch, int64_t block_size, int64_t num_edges, int64_t cfg) {
+    if (params.scalar_type() == torch::kBFloat16)
+        smallbatch_par_backward_sum_t<__nv_bfloat16>(param_flows, node_flows, node_mars, element_mars, params, nids, cids, pids, pfids, batch, block_size, num_edges, cfg);
+    else
+        smallbatch_par_backward_sum_t<float>(param_flows, node_flows, node_mars, element_mars, params, nids, cids, pids, pfids, batch, block_size, num_edges, cfg);
+}
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("smallbatch_par_backward_sum", &smallbatch_par_backward_sum,

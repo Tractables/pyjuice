@@ -198,7 +198,7 @@ def cum_pflow_kernel(cum_pflows, mparams, param_flows, nchs, par_start_ids, pflo
     if keep_zero_params:
         par_start = tl.load(par_start_ids + offs_m, mask = mask_m, other = 0)
         offs_par = par_start[:,None] + offs_blk[None,:] * blk_interval[:,None]
-        old_params = tl.load(mparams + offs_par, mask = mask_pflow, other = 0)
+        old_params = tl.load(mparams + offs_par, mask = mask_pflow, other = 0).to(tl.float32)
 
         nch = tl.load(nchs + offs_m, mask = mask_m, other = 1)
         pflows += (pseudocount / nch[:,None])
@@ -246,14 +246,14 @@ def em_par_update_kernel(mparams, param_flows, cum_pflows, nchs, par_start_ids, 
         new_param = (pflows + pseudocount / nch[:,None]) / (nflows[:,None] + pseudocount)
 
     offs_par = par_start[:,None] + offs_blk[None,:] * blk_interval[:,None]
-    old_param = tl.load(mparams + offs_par, mask = mask_pflow, other = 0)
+    old_param = tl.load(mparams + offs_par, mask = mask_pflow, other = 0).to(tl.float32)
 
     if keep_zero_params:
         updated_params = tl.where(old_param < 1e-12, 0.0, (1.0 - step_size) * old_param + step_size * new_param)
     else:
         updated_params = (1.0 - step_size) * old_param + step_size * new_param
 
-    tl.store(mparams + offs_par, updated_params, mask = mask_pflow)
+    tl.store(mparams + offs_par, updated_params.to(mparams.dtype.element_ty), mask = mask_pflow)
 
 
 @triton.jit
@@ -283,14 +283,14 @@ def sgd_par_update_kernel(mparams, param_grads, par_start_ids, pgrad_start_ids, 
     pgrads = tl.load(param_grads + offs_pgrad, mask = mask_pgrad, other = 0)
 
     offs_par = par_start[:,None] + offs_blk[None,:] * blk_interval[:,None]
-    old_param = tl.load(mparams + offs_par, mask = mask_pgrad, other = 0)
+    old_param = tl.load(mparams + offs_par, mask = mask_pgrad, other = 0).to(tl.float32)
 
     if keep_zero_params:
         updated_params = tl.where(old_param < 1e-12, 0.0, tl.exp(tl.log(old_param) + lr * pgrads))
     else:
         updated_params = tl.exp(tl.log(old_param) + lr * pgrads)
 
-    tl.store(mparams + offs_par, updated_params, mask = mask_pgrad)
+    tl.store(mparams + offs_par, updated_params.to(mparams.dtype.element_ty), mask = mask_pgrad)
 
 
 def em_par_update(params: torch.Tensor, param_flows: torch.Tensor, par_update_kwargs: Sequence, 

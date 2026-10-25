@@ -27,6 +27,7 @@
 // state tightly (e.g. 2 for batch == 2), so tiny batch carries no register waste.
 
 #include <torch/extension.h>
+#include "param_load.cuh"
 #include <cuda_runtime.h>
 #include <c10/cuda/CUDAStream.h>
 #include <c10/cuda/CUDAException.h>
@@ -43,10 +44,10 @@ __device__ __forceinline__ void lse_merge(float& m, float& l, float om, float ol
     m = nmx;
 }
 
-template <int WARPS, int BMAX>
+template <int WARPS, int BMAX, typename TP>
 __global__ void sb_ele_kernel(float* __restrict__ element_flows, const float* __restrict__ element_mars,
                               const float* __restrict__ node_flows, const float* __restrict__ node_mars,
-                              const float* __restrict__ params, const long* __restrict__ chids,
+                              const TP* __restrict__ params, const long* __restrict__ chids,
                               const long* __restrict__ ebase, const long* __restrict__ pbase,
                               int batch, int block_size, int cs_block_size, int num_edges) {
     const int lane = threadIdx.x;                       // 0..31  -> a 1/32 stride of the edges
@@ -64,7 +65,7 @@ __global__ void sb_ele_kernel(float* __restrict__ element_flows, const float* __
     for (int b = 0; b < BMAX; b++) { mm[b] = -INFINITY; ll[b] = 0.f; }
 
     for (int e = lane; e < num_edges; e += 32) {
-        const float wgt = params[pb0 + e];               // epar[m_local, e]; coalesced across lanes
+        const float wgt = ParamLoad<TP>::at(&params[pb0 + e]);   // epar[m_local, e]; coalesced across lanes
         const float* nf = node_flows + (eb0 + e) * (long)batch;
         const float* nm = node_mars + (eb0 + e) * (long)batch;
         #pragma unroll
@@ -92,7 +93,7 @@ __global__ void sb_ele_kernel(float* __restrict__ element_flows, const float* __
     }
 }
 
-template <int WARPS, int BMAX>
+template <int WARPS, int BMAX, typename TP>
 static void launch_ele(torch::Tensor element_flows, torch::Tensor element_mars, torch::Tensor node_flows,
                        torch::Tensor node_mars, torch::Tensor params, torch::Tensor chids,
                        torch::Tensor ebase, torch::Tensor pbase,
@@ -102,9 +103,9 @@ static void launch_ele(torch::Tensor element_flows, torch::Tensor element_mars, 
     dim3 blk(32, WARPS);
     // Launch on the current stream (not the default stream) so the kernel is captured correctly when
     // pyjuice records a CUDA graph of the backward pass (see cat_backward.cu).
-    sb_ele_kernel<WARPS, BMAX><<<grid, blk, 0, c10::cuda::getCurrentCUDAStream()>>>(
+    sb_ele_kernel<WARPS, BMAX, TP><<<grid, blk, 0, c10::cuda::getCurrentCUDAStream()>>>(
         element_flows.data_ptr<float>(), element_mars.data_ptr<float>(), node_flows.data_ptr<float>(),
-        node_mars.data_ptr<float>(), params.data_ptr<float>(), chids.data_ptr<long>(),
+        node_mars.data_ptr<float>(), param_ptr<TP>(params), chids.data_ptr<long>(),
         ebase.data_ptr<long>(), pbase.data_ptr<long>(), batch, block_size, cs_block_size, num_edges);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
@@ -112,21 +113,22 @@ static void launch_ele(torch::Tensor element_flows, torch::Tensor element_mars, 
 // Dispatch on (WARPS from `cfg`) x (BMAX = next pow2 of batch, for register-tight state).
 #define SB_ELE_DISPATCH_BMAX(WW)                                                                       \
     switch (bmax) {                                                                                     \
-        case 1:  launch_ele<WW, 1 >(element_flows, element_mars, node_flows, node_mars, params, chids, ebase, pbase, b, bs, cs, ne); break; \
-        case 2:  launch_ele<WW, 2 >(element_flows, element_mars, node_flows, node_mars, params, chids, ebase, pbase, b, bs, cs, ne); break; \
-        case 4:  launch_ele<WW, 4 >(element_flows, element_mars, node_flows, node_mars, params, chids, ebase, pbase, b, bs, cs, ne); break; \
-        case 8:  launch_ele<WW, 8 >(element_flows, element_mars, node_flows, node_mars, params, chids, ebase, pbase, b, bs, cs, ne); break; \
-        case 16: launch_ele<WW, 16>(element_flows, element_mars, node_flows, node_mars, params, chids, ebase, pbase, b, bs, cs, ne); break; \
+        case 1:  launch_ele<WW, 1, TP>(element_flows, element_mars, node_flows, node_mars, params, chids, ebase, pbase, b, bs, cs, ne); break; \
+        case 2:  launch_ele<WW, 2, TP>(element_flows, element_mars, node_flows, node_mars, params, chids, ebase, pbase, b, bs, cs, ne); break; \
+        case 4:  launch_ele<WW, 4, TP>(element_flows, element_mars, node_flows, node_mars, params, chids, ebase, pbase, b, bs, cs, ne); break; \
+        case 8:  launch_ele<WW, 8, TP>(element_flows, element_mars, node_flows, node_mars, params, chids, ebase, pbase, b, bs, cs, ne); break; \
+        case 16: launch_ele<WW, 16, TP>(element_flows, element_mars, node_flows, node_mars, params, chids, ebase, pbase, b, bs, cs, ne); break; \
         default: TORCH_CHECK(false, "smallbatch_ele_backward_sum: invalid batch ", b);                  \
     }
 
 // cfg id -> WARPS (child-warps per block). 8/16 were the sweep winners (equivalent); 4 trades a
 // smaller block for a larger grid to cover more SMs. The autotuner picks per layer/batch.
-void smallbatch_ele_backward_sum(torch::Tensor element_flows, torch::Tensor element_mars,
-                                 torch::Tensor node_flows, torch::Tensor node_mars, torch::Tensor params,
-                                 torch::Tensor chids, torch::Tensor ebase, torch::Tensor pbase,
-                                 int64_t batch, int64_t block_size, int64_t cs_block_size,
-                                 int64_t num_edges, int64_t cfg) {
+template <typename TP>
+static void smallbatch_ele_backward_sum_t(torch::Tensor element_flows, torch::Tensor element_mars,
+                                          torch::Tensor node_flows, torch::Tensor node_mars, torch::Tensor params,
+                                          torch::Tensor chids, torch::Tensor ebase, torch::Tensor pbase,
+                                          int64_t batch, int64_t block_size, int64_t cs_block_size,
+                                          int64_t num_edges, int64_t cfg) {
     int b = (int)batch, bs = (int)block_size, cs = (int)cs_block_size, ne = (int)num_edges;
     int warps = (cfg == 0) ? 8 : (cfg == 1) ? 16 : (cfg == 2) ? 4 : -1;
     TORCH_CHECK(warps > 0, "smallbatch_ele_backward_sum: invalid cfg ", cfg);
@@ -145,6 +147,18 @@ void smallbatch_ele_backward_sum(torch::Tensor element_flows, torch::Tensor elem
 }
 
 std::vector<int64_t> smallbatch_ele_configs() { return {8, 16, 4}; }  // WARPS per config id
+
+// The parameters in the dtype they are stored in (`TensorCircuit.param_dtype`): fp32 or bf16.
+void smallbatch_ele_backward_sum(torch::Tensor element_flows, torch::Tensor element_mars,
+                                 torch::Tensor node_flows, torch::Tensor node_mars, torch::Tensor params,
+                                 torch::Tensor chids, torch::Tensor ebase, torch::Tensor pbase,
+                                 int64_t batch, int64_t block_size, int64_t cs_block_size,
+                                 int64_t num_edges, int64_t cfg) {
+    if (params.scalar_type() == torch::kBFloat16)
+        smallbatch_ele_backward_sum_t<__nv_bfloat16>(element_flows, element_mars, node_flows, node_mars, params, chids, ebase, pbase, batch, block_size, cs_block_size, num_edges, cfg);
+    else
+        smallbatch_ele_backward_sum_t<float>(element_flows, element_mars, node_flows, node_mars, params, chids, ebase, pbase, batch, block_size, cs_block_size, num_edges, cfg);
+}
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("smallbatch_ele_backward_sum", &smallbatch_ele_backward_sum,

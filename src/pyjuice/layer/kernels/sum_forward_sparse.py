@@ -72,7 +72,7 @@ def _fw_triton_sparse_kernel(node_mars, element_mars, mparams, nids, cids, pids,
 
     # Inner loop
     for i in range(0, BLOCK_SIZE_M):
-        epars = tl.load(epars_ptr)
+        epars = tl.load(epars_ptr).to(tl.float32)
 
         if propagation_alg_id == 0:
             nmars = tl.where(emars_max == -float("inf"), -float("inf"), tl.log(tl.sum(emars * epars[:,None], axis = 0)) + emars_max)
@@ -123,7 +123,7 @@ def _fw_triton_large_sparse_kernel(node_mars, element_mars, mparams, nids, cids,
     # Initialize pointers to `params`
     offs_edge = tl.arange(0, num_edges)
     par_start = tl.load(pids + nblock_ids[:,None] * num_edges + offs_edge[None,:], mask = mask_m[:,None]) # [TILE_SIZE_M, num_edges]
-    epars = tl.load(mparams + tile_ids[:,None] * BLOCK_SIZE_M + par_start, mask = mask_m[:,None], other = 0.0) # [TILE_SIZE_M, num_edges]
+    epars = tl.load(mparams + tile_ids[:,None] * BLOCK_SIZE_M + par_start, mask = mask_m[:,None], other = 0.0).to(tl.float32) # [TILE_SIZE_M, num_edges]
 
     # Batch offsets and mask
     offs_batch = tl.arange(0, BLOCK_B) + pid_b * BLOCK_B

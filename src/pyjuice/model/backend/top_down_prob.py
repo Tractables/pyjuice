@@ -95,7 +95,7 @@ def sum_layer_td_backward_block_kernel(node_flows, element_flows, node_mars, ele
 
     pid_base = tl.load(parpids + cgroup_id * NUM_N_BLKS + ngroup_id)
     pids = pid_base + offs_cnode[:,None] * n_block_size + offs_nnode[None,:] # [TILE_SIZE_C, TILE_SIZE_N]
-    epars = tl.load(mparams + pids)
+    epars = tl.load(mparams + pids).to(tl.float32)
 
     if not pc_is_normalized:
         cmars = tl.load(element_mars + cids) # [TILE_SIZE_C]
@@ -136,7 +136,7 @@ def sum_layer_td_backward_node_kernel(node_flows, element_flows, node_mars, elem
 
     pids_base = tl.load(parpids + cgroup_ids[:,None] * NUM_N_BLKS + ngroup_ids[None,:], mask = cn_mask)
     pids = pids_base + offs_cnode[:,None] * n_block_size + offs_nnode[None,:] # [TILE_SIZE_C, TILE_SIZE_N]
-    epars = tl.load(mparams + pids, mask = cn_mask, other = 0.0)
+    epars = tl.load(mparams + pids, mask = cn_mask, other = 0.0).to(tl.float32)
 
     if not pc_is_normalized:
         cmars = tl.load(element_mars + cids) # [TILE_SIZE_C]
@@ -235,7 +235,7 @@ def sum_layer_td_pflow_kernel(node_flows, node_mars, element_mars, mparams, para
 
     pids_base = tl.load(pids + ngroup_ids[:,None] * c_num_nodes + offs_cnode[None,:], mask = nc_mask)
     epids = pids_base + offs_nnode[:,None] # [TILE_SIZE_N, TILE_SIZE_C]
-    epars = tl.load(mparams + epids, mask = nc_mask, other = 0.0)
+    epars = tl.load(mparams + epids, mask = nc_mask, other = 0.0).to(tl.float32)
 
     if not pc_is_normalized:
         nmars = tl.load(node_mars + snids, mask = n_mask, other = 0.0)
@@ -288,11 +288,15 @@ def sum_layer_td_pflow(layer, node_flows, node_mars, element_mars, params, param
         )
 
 
-def eval_top_down_probs(pc, update_pflow: bool = True, scale: float = 1.0, pc_is_normalized: bool = True, use_cudagraph: bool = True):
+def eval_top_down_probs(pc, update_pflow: bool = True, scale: float = 1.0, pc_is_normalized: bool = True, use_cudagraph: bool = True,
+                        params = None):
     """
     Computes the top-down probabilities of every node.
     We use the first # nodes entries in `pc.node_flows` and the first # element entries in `pc.element_flows`.
+    `params`: the sum layers' parameters to use, `pc.params` by default (mini-batch EM below fp32: the fp32 master copy,
+    whose `(1 - step_size) * P_td * theta` term must not be built from the stored rounding).
     """
+    params = pc.params if params is None else params
     assert hasattr(pc, "node_flows") and hasattr(pc, "element_flows")
     assert pc.node_flows.numel() >= pc.num_nodes
     assert pc.element_flows.numel() >= pc.num_elements
@@ -357,7 +361,7 @@ def eval_top_down_probs(pc, update_pflow: bool = True, scale: float = 1.0, pc_is
             if not pc_is_normalized and layer_group.is_sum():
                 prod_layer_group = pc.inner_layer_groups[layer_id]
                 for layer in prod_layer_group:
-                    prod_layer_partition_fn(layer, node_mars, element_mars, pc.params)
+                    prod_layer_partition_fn(layer, node_mars, element_mars, params)
 
             for layer in layer_group:
                 if layer.is_prod():
@@ -365,11 +369,11 @@ def eval_top_down_probs(pc, update_pflow: bool = True, scale: float = 1.0, pc_is
 
                 elif layer.is_sum():
                     element_flows[:] = 0.0
-                    sum_layer_td_backward(layer, node_flows, element_flows, node_mars, element_mars, pc.params, 
+                    sum_layer_td_backward(layer, node_flows, element_flows, node_mars, element_mars, params, 
                                           pc_is_normalized = pc_is_normalized)
 
                     if update_pflow:
-                        sum_layer_td_pflow(layer, node_flows, node_mars, element_mars, pc.params, pc.param_flows, hyperparameters,
+                        sum_layer_td_pflow(layer, node_flows, node_mars, element_mars, params, pc.param_flows, hyperparameters,
                                            pc_is_normalized = pc_is_normalized)
 
                         # ONLY layers that actually accumulate the denominator, and through their own
@@ -389,7 +393,7 @@ def eval_top_down_probs(pc, update_pflow: bool = True, scale: float = 1.0, pc_is
     # `node_mars` here is a fresh `.view(-1)` on every call, and a reallocated `param_flows` can come
     # back under a recycled id, which would replay the graph into memory that has since been freed.
     key = (update_pflow, pc_is_normalized, cuda_graph_key(node_mars), cuda_graph_key(element_mars),
-           cuda_graph_key(node_flows), cuda_graph_key(element_flows), cuda_graph_key(pc.params),
+           cuda_graph_key(node_flows), cuda_graph_key(element_flows), cuda_graph_key(params),
            cuda_graph_key(pc.param_flows if update_pflow else None), cuda_graph_key(hyperparameters),
            cuda_graph_key(denom_param_flows))
     if use_cudagraph and key in pc._tdp_cudagraph:

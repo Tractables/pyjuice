@@ -89,7 +89,7 @@ def _bs_triton_ele_kernel(node_flows, element_flows, node_mars, element_mars, mp
     gacc = tl.zeros([GROWS, BLOCK_B], dtype = tl.float32)
 
     for k in range(0, K_NUM_TILES):
-        epars = tl.load(epars_ptr)                          # [TILE_SIZE_M, TILE_SIZE_K]
+        epars = tl.load(epars_ptr).to(tl.float32)           # [TILE_SIZE_M, TILE_SIZE_K]
 
         nflows = tl.load(nflows_ptr, mask = mask_batch[None,:])
         nmars = tl.load(nmars_ptr, mask = mask_batch[None,:])
@@ -323,7 +323,7 @@ def _bs_triton_par_kernel(node_flows, node_mars, element_mars, mparams, param_fl
         mask_batch = offs_batch < batch_size
 
     par_start = tl.load(pids + nblock_id * num_edges + offs_edge)
-    epars = tl.load(mparams + offs_node[:,None] + par_start[None,:])
+    epars = tl.load(mparams + offs_node[:,None] + par_start[None,:]).to(tl.float32)
     pflows = acc * epars
 
     parflow_start = tl.load(pfids + nblock_id * num_edges + offs_edge)
@@ -598,7 +598,7 @@ def _bs_triton_denom_scatter_kernel(W, mparams, out, cids, pids, pfids,
                 mask = emask[None,:] & (gidx < n_gates)[None,:], other = 0.0)    # [M, K]
 
     par = tl.load(pids + nblock_id * num_edges + offs_edge, mask = emask, other = 0)
-    theta = tl.load(mparams + par[None,:] + offs_node[:,None], mask = emask[None,:], other = 0.0)
+    theta = tl.load(mparams + par[None,:] + offs_node[:,None], mask = emask[None,:], other = 0.0).to(tl.float32)
 
     pf = tl.load(pfids + nblock_id * num_edges + offs_edge, mask = emask, other = 0)
     # Rebase into `out` and mask to it. A partition may hold node blocks of SEVERAL `ns`, and only the

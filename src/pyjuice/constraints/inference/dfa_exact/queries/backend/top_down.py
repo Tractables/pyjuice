@@ -33,7 +33,7 @@ from ...kernels.common import SUM, tensor
 from ...kernels.prod import run_products as products
 from ...kernels.prod_top_down import run_top_down
 from ...kernels.score import run_class_weights
-from ...kernels.sum import (dense_sum_top_down, fill_dead_rows, fused_sum_top_down, per_sample_dense_sum_top_down,
+from ...kernels.sum import (dense_sum_top_down, fill_dead_rows, fused_sum_top_down, per_sample_dense_sum_top_down, query_weights,
                             sample_spans, stacked_weights)
 
 
@@ -92,6 +92,7 @@ def run_backward(backend, bufs: dict, flows: dict, plan, x: torch.Tensor, missin
         masses = backend.state.masses()
     prog.transitions(masses)
     stacks, kept = backend.state.weight_stacks()
+    params = query_weights(backend.pc.params, stacks)   # fp32 (a kept copy where stored below fp32)
 
     r = prog.root_region                                 # the root: top-down value 0 (log 1) on its slot
     computed, root_once = td.root
@@ -135,9 +136,9 @@ def run_backward(backend, bufs: dict, flows: dict, plan, x: torch.Tensor, missin
                         if key is not None and width_ <= F.STACK_MAX_COLUMNS[precision] and \
                                 (kept or prog.stack_uses[key] > 1):
                             if key not in stacks:
-                                stacks[key] = stacked_weights(pc.params, key[2], key[0], block_size)
+                                stacks[key] = stacked_weights(params, key[2], key[0], block_size)
                             stacked = stacks[key]
-                        dense_sum_top_down(element_flows, nf, pc.params, blocks, E, block_size,
+                        dense_sum_top_down(element_flows, nf, params, blocks, E, block_size,
                                           (int(offsets[r]), int(widths[r]), prog.firsts[r]), c0, elem_first, ew,
                                           ncols, dot, add, live = cols, stacked = stacked, piece = piece,
                                           bf16 = precision == "bf16", copies = stacks)
@@ -155,12 +156,12 @@ def run_backward(backend, bufs: dict, flows: dict, plan, x: torch.Tensor, missin
                             ncols = int(compact.total[iv])
                             spans = sample_spans(compact, iv, ncols, gated["gstride"] == 0)
                             if spans is not None:
-                                per_sample_dense_sum_top_down(element_flows, nf, pc.params, dense,
+                                per_sample_dense_sum_top_down(element_flows, nf, params, dense,
                                                               (int(offsets[r]), int(widths[r]), prog.firsts[r]),
                                                               elem_first, ew, ncols, dot, gated, spans,
                                                               compact.identity(ncols), bf16 = precision == "bf16")
                                 continue
-                        fused_sum_top_down(element_flows, nf, pc.params, tables, regs, elem_first, ew, nb,
+                        fused_sum_top_down(element_flows, nf, params, tables, regs, elem_first, ew, nb,
                                           block_size, cbs, max_cols = max_cols, precision = dot,
                                           liveness = liveness if part == 1 and compact is None else None,
                                           idx = tensor(idx), gated = gated,

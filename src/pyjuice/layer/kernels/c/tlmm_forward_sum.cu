@@ -21,6 +21,7 @@
 // fixed at 64; KNT (= num_edges / 64) is a runtime argument.
 
 #include <torch/extension.h>
+#include "param_load.cuh"
 #include <cuda_bf16.h>
 #include <cuda.h>
 #include <c10/cuda/CUDAStream.h>
@@ -62,9 +63,9 @@ __device__ __forceinline__ void mbar_wait(uint64_t* bar, int phase) {
 
 extern __shared__ char smem_raw[];
 
-template <int BM, int BN, int WM, int WN>
+template <int BM, int BN, int WM, int WN, typename TP>
 __global__ void __launch_bounds__(WM * WN * 32) tlmm_kernel(
-        float* __restrict__ node_mars, const float* __restrict__ mp,
+        float* __restrict__ node_mars, const TP* __restrict__ mp,
         const long* __restrict__ nids, const long* __restrict__ ebase,
         const long* __restrict__ pbase, int batch, int block_size, int knt, int pid_m_offset,
         const __grid_constant__ CUtensorMap desc) {
@@ -154,13 +155,11 @@ __global__ void __launch_bounds__(WM * WN * 32) tlmm_kernel(
         // A operand[m,e] = log-params, cast fp32 -> bf16 (the dot computes params . exp(emar-max)).
         for (int i = tid; i < (BM * BK) / 8; i += NTH) {
             int e = i / (BM / 8), mm = (i % (BM / 8)) * 8;
-            const float* g = &mp[pc + (long)e * block_size + mm];
-            float4 a = *(const float4*)g, b = *(const float4*)(g + 4);
+            float v[8];
+            ParamLoad<TP>::load8(&mp[pc + (long)e * block_size + mm], v);
             bfloat16_t r[8];
-            r[0] = static_cast<bfloat16_t>(a.x); r[1] = static_cast<bfloat16_t>(a.y);
-            r[2] = static_cast<bfloat16_t>(a.z); r[3] = static_cast<bfloat16_t>(a.w);
-            r[4] = static_cast<bfloat16_t>(b.x); r[5] = static_cast<bfloat16_t>(b.y);
-            r[6] = static_cast<bfloat16_t>(b.z); r[7] = static_cast<bfloat16_t>(b.w);
+            CUTE_UNROLL
+            for (int j = 0; j < 8; j++) r[j] = static_cast<bfloat16_t>(v[j]);
             *(float4*)&sAt(mm, e) = *(const float4*)r;
         }
         __syncthreads();
@@ -196,7 +195,7 @@ __global__ void __launch_bounds__(WM * WN * 32) tlmm_kernel(
 
 // Per-config host launcher. The TMA descriptor box dim depends on BN, so each instantiation caches
 // its own descriptor (keyed by element_mars base ptr / dims, constant within a forward pass).
-template <int BM, int BN, int WM, int WN>
+template <int BM, int BN, int WM, int WN, typename TP>
 static void launch_cfg(torch::Tensor node_mars, torch::Tensor element_mars, torch::Tensor params,
                        torch::Tensor nids, torch::Tensor ebase, torch::Tensor pbase,
                        int batch, int block_size, int knt) {
@@ -219,15 +218,15 @@ static void launch_cfg(torch::Tensor node_mars, torch::Tensor element_mars, torc
         desc_ptr = base; desc_rows = n_edge_rows; desc_batch = batch;
     }
     int smem = BM * BK * 2 + BN * BK * 2 + BK * BN * 4 + BN * 4 + 64;
-    cudaFuncSetAttribute(tlmm_kernel<BM, BN, WM, WN>,
+    cudaFuncSetAttribute(tlmm_kernel<BM, BN, WM, WN, TP>,
                          cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
     int total_m = nids.size(0) * (block_size / BM);
     const int MAX_Y = 65535;
     for (int off = 0; off < total_m; off += MAX_Y) {
         int chunk = (total_m - off < MAX_Y) ? (total_m - off) : MAX_Y;
         dim3 grid(batch / BN, chunk);
-        tlmm_kernel<BM, BN, WM, WN><<<grid, NTH, smem, c10::cuda::getCurrentCUDAStream()>>>(
-            node_mars.data_ptr<float>(), params.data_ptr<float>(), nids.data_ptr<long>(),
+        tlmm_kernel<BM, BN, WM, WN, TP><<<grid, NTH, smem, c10::cuda::getCurrentCUDAStream()>>>(
+            node_mars.data_ptr<float>(), param_ptr<TP>(params), nids.data_ptr<long>(),
             ebase.data_ptr<long>(), pbase.data_ptr<long>(), batch, block_size, knt, off, desc);
         C10_CUDA_KERNEL_LAUNCH_CHECK();
     }
@@ -237,17 +236,27 @@ static void launch_cfg(torch::Tensor node_mars, torch::Tensor element_mars, torc
 // picks the fastest valid one per layer shape. (Software-pipelined / double-buffered-TMA variants
 // were tried and removed: they never beat cfg0 on sm_120 because the per-tile bottleneck is the
 // epars smem-write + logaddexp, not the emars load latency that prefetching would hide.)
+template <typename TP>
+static void dispatch_cfg(torch::Tensor node_mars, torch::Tensor element_mars, torch::Tensor params,
+                         torch::Tensor nids, torch::Tensor ebase, torch::Tensor pbase, int b, int bs, int k, int64_t cfg) {
+    switch (cfg) {
+        case 0: launch_cfg<128, 64, 4, 2, TP>(node_mars, element_mars, params, nids, ebase, pbase, b, bs, k); break;
+        case 1: launch_cfg<64,  64, 2, 2, TP>(node_mars, element_mars, params, nids, ebase, pbase, b, bs, k); break;
+        case 2: launch_cfg<256, 64, 8, 2, TP>(node_mars, element_mars, params, nids, ebase, pbase, b, bs, k); break;
+        case 3: launch_cfg<128, 128, 4, 4, TP>(node_mars, element_mars, params, nids, ebase, pbase, b, bs, k); break;
+        default: launch_cfg<128, 64, 4, 2, TP>(node_mars, element_mars, params, nids, ebase, pbase, b, bs, k); break;
+    }
+}
+
+// The parameters in the dtype they are stored in (`TensorCircuit.param_dtype`): fp32 or bf16.
 void tlmm_forward_sum(torch::Tensor node_mars, torch::Tensor element_mars, torch::Tensor params,
                       torch::Tensor nids, torch::Tensor ebase, torch::Tensor pbase,
                       int64_t batch, int64_t block_size, int64_t knt, int64_t cfg) {
     int b = (int)batch, bs = (int)block_size, k = (int)knt;
-    switch (cfg) {
-        case 0: launch_cfg<128, 64, 4, 2>(node_mars, element_mars, params, nids, ebase, pbase, b, bs, k); break;
-        case 1: launch_cfg<64,  64, 2, 2>(node_mars, element_mars, params, nids, ebase, pbase, b, bs, k); break;
-        case 2: launch_cfg<256, 64, 8, 2>(node_mars, element_mars, params, nids, ebase, pbase, b, bs, k); break;
-        case 3: launch_cfg<128, 128, 4, 4>(node_mars, element_mars, params, nids, ebase, pbase, b, bs, k); break;
-        default: launch_cfg<128, 64, 4, 2>(node_mars, element_mars, params, nids, ebase, pbase, b, bs, k); break;
-    }
+    if (params.scalar_type() == torch::kBFloat16)
+        dispatch_cfg<__nv_bfloat16>(node_mars, element_mars, params, nids, ebase, pbase, b, bs, k, cfg);
+    else
+        dispatch_cfg<float>(node_mars, element_mars, params, nids, ebase, pbase, b, bs, k, cfg);
 }
 
 // (BM, BN) per config id; Python uses this to enumerate the configs valid for a layer shape.

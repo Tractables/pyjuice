@@ -30,6 +30,7 @@
 // sm_90+, `batch % 64 == 0`, contiguous edge/param layout). Outside it the Python layer raises.
 
 #include <torch/extension.h>
+#include "../../../../layer/kernels/c/param_load.cuh"   // `ParamLoad<TP>`: the parameters in their stored dtype
 #include <cuda_fp16.h>
 #include <cuda.h>
 #include <c10/cuda/CUDAStream.h>
@@ -75,9 +76,9 @@ __device__ __forceinline__ void mbar_wait(uint64_t* bar, int phase) {
 
 extern __shared__ char smem_raw[];
 
-template <bool WGRAD>
+template <bool WGRAD, typename TP>
 __global__ void __launch_bounds__(NTH) bs_ele_kernel(
-        float* __restrict__ eflows, const float* __restrict__ emars_g, const float* __restrict__ mp,
+        float* __restrict__ eflows, const float* __restrict__ emars_g, const TP* __restrict__ mp,
         const float* __restrict__ ext, float* __restrict__ grad_ext,
         const long* __restrict__ chids, const long* __restrict__ ebase, const long* __restrict__ pbase,
         const long* __restrict__ gate,
@@ -173,9 +174,10 @@ __global__ void __launch_bounds__(NTH) bs_ele_kernel(
         __syncthreads();   // all reads of sLf/sNm done before sA(=sNm region) is overwritten with epars
         // A[m,e] = epars (e-contiguous, 8/float4 from 8 contiguous mp floats)
         for (int i = tid; i < (BM * BK) / 8; i += NTH) { int m = i / (BK / 8), ee = (i % (BK / 8)) * 8;
-            const float* g = &mp[pc + (long)m * BSK + ee]; float4 a = *(const float4*)g, b2 = *(const float4*)(g + 4);
-            half_t r[8]; r[0] = static_cast<half_t>(a.x); r[1] = static_cast<half_t>(a.y); r[2] = static_cast<half_t>(a.z); r[3] = static_cast<half_t>(a.w);
-            r[4] = static_cast<half_t>(b2.x); r[5] = static_cast<half_t>(b2.y); r[6] = static_cast<half_t>(b2.z); r[7] = static_cast<half_t>(b2.w);
+            float v[8]; ParamLoad<TP>::load8(&mp[pc + (long)m * BSK + ee], v);
+            half_t r[8];
+            CUTE_UNROLL
+            for (int j = 0; j < 8; j++) r[j] = static_cast<half_t>(v[j]);
             *(float4*)&sAt(m, ee) = *(const float4*)r; }
         __syncthreads();
         // fp16 tensor-core dot: partial[m,b] = sum_e epars[m,e] * nfsub[e,b], accumulated in fp32.
@@ -249,32 +251,36 @@ void blockscale_ele_backward(torch::Tensor element_flows, torch::Tensor element_
     }
     int smem = BM * BK * 2 + BN * BK * 2 + BK * BN * 4 + BN * 4 + 1024;   // pA(fp16)+pBs(fp16)+sLf(f32)+sMx+bar
     smem += (BM >> gate_sh) * BN * 4;                                     // + the staged gates
-    cudaFuncSetAttribute(bs_ele_kernel<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
-    cudaFuncSetAttribute(bs_ele_kernel<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
-    int total_m = n_nblocks * (BSM / BM);
-    const int MAX_Y = 65535;
-    for (int off = 0; off < total_m; off += MAX_Y) {
-        int chunk = (total_m - off < MAX_Y) ? (total_m - off) : MAX_Y;
-        dim3 grid(batch / BN, chunk);
-        // WGRAD is a TEMPLATE parameter: the no-gradient path keeps its register count and occupancy.
-        if (grad_ext.numel() > 0)
-            bs_ele_kernel<true><<<grid, NTH, smem, c10::cuda::getCurrentCUDAStream()>>>(
-                element_flows.data_ptr<float>(), element_mars.data_ptr<float>(), params.data_ptr<float>(),
-                ext.data_ptr<float>(), grad_ext.data_ptr<float>(),
-                chids.data_ptr<long>(), ebase.data_ptr<long>(), pbase.data_ptr<long>(),
-                gate.data_ptr<long>(),
-                (int)batch, (int)BSK, (int)BSM, (int)knt, gate_sh, (long)ext_base, off,
-                g_descNf, g_descNm);
-        else
-            bs_ele_kernel<false><<<grid, NTH, smem, c10::cuda::getCurrentCUDAStream()>>>(
-                element_flows.data_ptr<float>(), element_mars.data_ptr<float>(), params.data_ptr<float>(),
-                ext.data_ptr<float>(), nullptr,
-                chids.data_ptr<long>(), ebase.data_ptr<long>(), pbase.data_ptr<long>(),
-                gate.data_ptr<long>(),
-                (int)batch, (int)BSK, (int)BSM, (int)knt, gate_sh, (long)ext_base, off,
-                g_descNf, g_descNm);
-        C10_CUDA_KERNEL_LAUNCH_CHECK();
-    }
+    auto run = [&](auto tag) {
+        using TP = decltype(tag);
+        cudaFuncSetAttribute(bs_ele_kernel<true, TP>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+        cudaFuncSetAttribute(bs_ele_kernel<false, TP>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+        int total_m = n_nblocks * (BSM / BM);
+        const int MAX_Y = 65535;
+        for (int off = 0; off < total_m; off += MAX_Y) {
+            int chunk = (total_m - off < MAX_Y) ? (total_m - off) : MAX_Y;
+            dim3 grid(batch / BN, chunk);
+            // WGRAD is a TEMPLATE parameter: the no-gradient path keeps its register count and occupancy.
+            if (grad_ext.numel() > 0)
+                bs_ele_kernel<true, TP><<<grid, NTH, smem, c10::cuda::getCurrentCUDAStream()>>>(
+                    element_flows.data_ptr<float>(), element_mars.data_ptr<float>(), param_ptr<TP>(params),
+                    ext.data_ptr<float>(), grad_ext.data_ptr<float>(),
+                    chids.data_ptr<long>(), ebase.data_ptr<long>(), pbase.data_ptr<long>(),
+                    gate.data_ptr<long>(),
+                    (int)batch, (int)BSK, (int)BSM, (int)knt, gate_sh, (long)ext_base, off,
+                    g_descNf, g_descNm);
+            else
+                bs_ele_kernel<false, TP><<<grid, NTH, smem, c10::cuda::getCurrentCUDAStream()>>>(
+                    element_flows.data_ptr<float>(), element_mars.data_ptr<float>(), param_ptr<TP>(params),
+                    ext.data_ptr<float>(), nullptr,
+                    chids.data_ptr<long>(), ebase.data_ptr<long>(), pbase.data_ptr<long>(),
+                    gate.data_ptr<long>(),
+                    (int)batch, (int)BSK, (int)BSM, (int)knt, gate_sh, (long)ext_base, off,
+                    g_descNf, g_descNm);
+            C10_CUDA_KERNEL_LAUNCH_CHECK();
+        }
+    };
+    if (params.scalar_type() == torch::kBFloat16) run(__nv_bfloat16{}); else run(float{});
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {

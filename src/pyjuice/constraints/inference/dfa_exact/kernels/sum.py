@@ -1149,6 +1149,19 @@ def _log_scatter_kernel(out, prod, m, rank, rows, ncols, ld, num_live, num_ctile
              mask = mask)
 
 
+def query_weights(params: torch.Tensor, stacks: dict) -> torch.Tensor:
+    """The sum layers' weights as the query's kernels take them: ``params`` themselves when stored in fp32; stored
+    below fp32 (`TensorCircuit.param_dtype`), an fp32 copy kept in ``stacks`` (`~.state.State.weight_stacks`: a
+    `pyjuice.fast_inference` scope's, else the query's own) -- the validity of the weight stacks and fragment-order
+    copies kept there, which assume the parameters fixed for as long -- made once."""
+    if params.dtype == torch.float32:
+        return params
+    hit = stacks.get("fp32 params")
+    if hit is None or hit.shape != params.shape or hit.device != params.device:
+        hit = stacks["fp32 params"] = params.detach().to(torch.float32)
+    return hit
+
+
 def stacked_weights(params: torch.Tensor, p0s, E: int, block_size: int) -> torch.Tensor:
     """``[K * block_size, E]``: the weights of K dense node blocks over the same ``E`` children (node block ``k``'s
     ``[E, block_size]`` matrix at ``params[p0s[k]]``), transposed and stacked in the order of ``p0s`` -- a copy, as

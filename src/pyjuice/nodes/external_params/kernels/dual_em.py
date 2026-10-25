@@ -81,7 +81,7 @@ def _dual_em_cum_kernel(mparams, param_flows, denom, cum, cids, pids, pfids, nid
 
     par = tl.load(pids + nblock_id * num_edges + offs_edge, mask = emask, other = 0)
     pf = tl.load(pfids + nblock_id * num_edges + offs_edge, mask = emask, other = 0)
-    theta = tl.load(mparams + par[None,:] + offs_node[:,None], mask = real[None,:], other = 0.0)
+    theta = tl.load(mparams + par[None,:] + offs_node[:,None], mask = real[None,:], other = 0.0).to(tl.float32)
     fp = tl.load(param_flows + pf[None,:] + offs_node[:,None], mask = real[None,:], other = 0.0)
 
     k = tl.load(kcount + nblock_id).to(tl.float32)
@@ -141,7 +141,7 @@ def _dual_em_update_kernel(mparams, param_flows, denom, cum, out, cids, pids, pf
 
     par = tl.load(pids + nblock_id * num_edges + offs_edge, mask = emask, other = 0)
     pf = tl.load(pfids + nblock_id * num_edges + offs_edge, mask = emask, other = 0)
-    theta = tl.load(mparams + par[None,:] + offs_node[:,None], mask = real[None,:], other = 0.0)
+    theta = tl.load(mparams + par[None,:] + offs_node[:,None], mask = real[None,:], other = 0.0).to(tl.float32)
     fp = tl.load(param_flows + pf[None,:] + offs_node[:,None], mask = real[None,:], other = 0.0)
 
     k = tl.load(kcount + nblock_id).to(tl.float32)

@@ -90,7 +90,7 @@ def _scoped_sum_kernel(nids, cids, pids, node_mars, element_mars, mparams,
             m1 = mask_lane[None,:] & mask_cal[:,None]
 
             cal_par_id = tl.load(pids + local_nids[None,:] * num_edges + offs_cal[:,None], mask = m1, other = 0)
-            cal_pars = tl.load(mparams + cal_par_id + local_nid_offs[None,:], mask = m1, other = 0.0)
+            cal_pars = tl.load(mparams + cal_par_id + local_nid_offs[None,:], mask = m1, other = 0.0).to(tl.float32)
 
             if CONDITIONAL:
                 cal_ch_id = tl.load(cids + local_nids[None,:] * num_edges + offs_cal[:,None], mask = m1, other = 0)
@@ -114,7 +114,7 @@ def _scoped_sum_kernel(nids, cids, pids, node_mars, element_mars, mparams,
         m2 = mask_lane[None,:] & mask_edge[:,None]
 
         par_id = tl.load(pids + local_nids[None,:] * num_edges + offs_edge[:,None], mask = m2, other = 0)
-        epars = tl.load(mparams + par_id + local_nid_offs[None,:], mask = m2, other = 0.0)
+        epars = tl.load(mparams + par_id + local_nid_offs[None,:], mask = m2, other = 0.0).to(tl.float32)
 
         if CONDITIONAL:
             ch_id = tl.load(cids + local_nids[None,:] * num_edges + offs_edge[:,None], mask = m2, other = 0)

@@ -19,6 +19,7 @@
 // batch % 64 == 0, contiguous edge/param layout); the Python dispatcher measures it against the plain kernel per shape.
 
 #include <torch/extension.h>
+#include "param_load.cuh"
 #include <cuda_fp16.h>
 #include <c10/cuda/CUDAStream.h>
 #include <c10/cuda/CUDAException.h>
@@ -50,9 +51,10 @@ __device__ __forceinline__ void bar_arrive(int id, int count) {
 
 extern __shared__ char smem_raw[];
 
+template <typename TP>
 __global__ void __launch_bounds__(NTH) ele_pipe_kernel(
         float* __restrict__ eflows, const float* __restrict__ emars_g, const float* __restrict__ nflows_g,
-        const float* __restrict__ nmars_g, const float* __restrict__ mp,
+        const float* __restrict__ nmars_g, const TP* __restrict__ mp,
         const long* __restrict__ chids, const long* __restrict__ ebase, const long* __restrict__ pbase,
         int batch, int BSK, int BSM, int knt, int pid_m_offset) {
     int mtiles = BSM / BM;
@@ -89,23 +91,20 @@ __global__ void __launch_bounds__(NTH) ele_pipe_kernel(
             constexpr int PA = (BM * BK) / 8 / NP;
             static_assert((BM * BK) / 8 % NP == 0, "params items per producer thread");
             {
-                float4 a[PA], b[PA];
+                float v[PA][8];
                 CUTE_UNROLL
                 for (int t = 0; t < PA; t++) {
                     int i = ptid + t * NP;
                     int m = i / (BK / 8), ee = (i % (BK / 8)) * 8;
-                    const float* g = &mp[pc + (long)m * BSK + ee];
-                    a[t] = *(const float4*)g; b[t] = *(const float4*)(g + 4);
+                    ParamLoad<TP>::load8(&mp[pc + (long)m * BSK + ee], v[t]);
                 }
                 CUTE_UNROLL
                 for (int t = 0; t < PA; t++) {
                     int i = ptid + t * NP;
                     int m = i / (BK / 8), ee = (i % (BK / 8)) * 8;
                     half_t r[8];
-                    r[0] = static_cast<half_t>(a[t].x); r[1] = static_cast<half_t>(a[t].y);
-                    r[2] = static_cast<half_t>(a[t].z); r[3] = static_cast<half_t>(a[t].w);
-                    r[4] = static_cast<half_t>(b[t].x); r[5] = static_cast<half_t>(b[t].y);
-                    r[6] = static_cast<half_t>(b[t].z); r[7] = static_cast<half_t>(b[t].w);
+                    CUTE_UNROLL
+                    for (int j = 0; j < 8; j++) r[j] = static_cast<half_t>(v[t][j]);
                     *(float4*)&sAt(m, ee) = *(const float4*)r;
                 }
             }
@@ -218,27 +217,39 @@ __global__ void __launch_bounds__(NTH) ele_pipe_kernel(
 }
 
 // element-flow backward (writes element_flows in-place). chids/ebase/pbase are int64 [neb] / [neb,knt].
-void ele_backward_sum_pipelined(torch::Tensor element_flows, torch::Tensor element_mars, torch::Tensor node_flows,
-                                torch::Tensor node_mars, torch::Tensor params, torch::Tensor chids,
-                                torch::Tensor ebase, torch::Tensor pbase,
-                                int64_t batch, int64_t BSK, int64_t BSM, int64_t knt) {
+template <typename TP>
+static void ele_backward_sum_pipelined_t(torch::Tensor element_flows, torch::Tensor element_mars, torch::Tensor node_flows,
+                                         torch::Tensor node_mars, torch::Tensor params, torch::Tensor chids,
+                                         torch::Tensor ebase, torch::Tensor pbase,
+                                         int64_t batch, int64_t BSK, int64_t BSM, int64_t knt) {
     TORCH_CHECK(BSM % BM == 0, "block_size must be divisible by ", BM);
     TORCH_CHECK(batch % BN == 0, "batch must be divisible by ", BN);
     int n_nblocks = chids.size(0);
     int smem = 2 * BM * BK * 2 + BN * BK * 2 + 2 * BK * BN * 4 + (BN + NC) * 4 + 64;
-    cudaFuncSetAttribute(ele_pipe_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    cudaFuncSetAttribute(ele_pipe_kernel<TP>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
     int total_m = n_nblocks * (BSM / BM);
     const int MAX_Y = 65535;
     for (int off = 0; off < total_m; off += MAX_Y) {
         int chunk = (total_m - off < MAX_Y) ? (total_m - off) : MAX_Y;
         dim3 grid(batch / BN, chunk);
-        ele_pipe_kernel<<<grid, NTH, smem, c10::cuda::getCurrentCUDAStream()>>>(
+        ele_pipe_kernel<TP><<<grid, NTH, smem, c10::cuda::getCurrentCUDAStream()>>>(
             element_flows.data_ptr<float>(), element_mars.data_ptr<float>(), node_flows.data_ptr<float>(),
-            node_mars.data_ptr<float>(), params.data_ptr<float>(),
+            node_mars.data_ptr<float>(), param_ptr<TP>(params),
             chids.data_ptr<long>(), ebase.data_ptr<long>(), pbase.data_ptr<long>(),
             (int)batch, (int)BSK, (int)BSM, (int)knt, off);
         C10_CUDA_KERNEL_LAUNCH_CHECK();
     }
+}
+
+// The parameters in the dtype they are stored in (`TensorCircuit.param_dtype`): fp32 or bf16.
+void ele_backward_sum_pipelined(torch::Tensor element_flows, torch::Tensor element_mars, torch::Tensor node_flows,
+                                torch::Tensor node_mars, torch::Tensor params, torch::Tensor chids,
+                                torch::Tensor ebase, torch::Tensor pbase,
+                                int64_t batch, int64_t BSK, int64_t BSM, int64_t knt) {
+    if (params.scalar_type() == torch::kBFloat16)
+        ele_backward_sum_pipelined_t<__nv_bfloat16>(element_flows, element_mars, node_flows, node_mars, params, chids, ebase, pbase, batch, BSK, BSM, knt);
+    else
+        ele_backward_sum_pipelined_t<float>(element_flows, element_mars, node_flows, node_mars, params, chids, ebase, pbase, batch, BSK, BSM, knt);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {

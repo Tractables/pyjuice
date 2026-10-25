@@ -82,7 +82,7 @@ def _bk_triton_block_sparse_ele_fused_kernel(node_flows, element_flows, node_mar
         acc = tl.zeros([TILE_SIZE_M, BLOCK_B], dtype = tl.float32)
 
     for k in range(0, K_NUM_TILES):
-        epars = tl.load(epars_ptr) # [TILE_SIZE_M, TILE_SIZE_K]
+        epars = tl.load(epars_ptr).to(tl.float32) # [TILE_SIZE_M, TILE_SIZE_K]
 
         if allow_modify_flows == 1:
             log_n_fdm = tl.load(nflows_ptr, mask = mask_batch[None,:]) # [TILE_SIZE_K, BLOCK_B]

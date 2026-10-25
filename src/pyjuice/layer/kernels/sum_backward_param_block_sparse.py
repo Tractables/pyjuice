@@ -58,7 +58,7 @@ def _bk_triton_block_sparse_par_kernel(node_flows, node_mars, element_mars, mpar
     if propagation_alg_id == 1:
         par_start = tl.load(pids + nblock_id * num_edges + offs_edge)
         epars_offsets = offs_node[:,None] + par_start[None,:] # [TILE_SIZE_M, TILE_SIZE_K]
-        epars = tl.load(mparams + epars_offsets)
+        epars = tl.load(mparams + epars_offsets).to(tl.float32)
         elpars = tl.log(epars)
 
     # Inner loop
@@ -137,7 +137,7 @@ def _bk_triton_block_sparse_par_kernel(node_flows, node_mars, element_mars, mpar
     if propagation_alg_id != 1:
         par_start = tl.load(pids + nblock_id * num_edges + offs_edge)
         epars_offsets = offs_node[:,None] + par_start[None,:] # [TILE_SIZE_M, TILE_SIZE_K]
-        epars = tl.load(mparams + epars_offsets)
+        epars = tl.load(mparams + epars_offsets).to(tl.float32)
 
     if propagation_alg_id != 1:
         pflows = acc * epars
@@ -198,7 +198,7 @@ def _bk_triton_block_sparse_par_kernel_rmw(node_flows, node_mars, element_mars, 
     if propagation_alg_id == 1:
         par_start = tl.load(pids + nblock_id * num_edges + offs_edge)
         epars_offsets = offs_node[:,None] + par_start[None,:] # [TILE_SIZE_M, TILE_SIZE_K]
-        epars = tl.load(mparams + epars_offsets)
+        epars = tl.load(mparams + epars_offsets).to(tl.float32)
         elpars = tl.log(epars)
 
     # Inner loop
@@ -277,7 +277,7 @@ def _bk_triton_block_sparse_par_kernel_rmw(node_flows, node_mars, element_mars, 
     if propagation_alg_id != 1:
         par_start = tl.load(pids + nblock_id * num_edges + offs_edge)
         epars_offsets = offs_node[:,None] + par_start[None,:] # [TILE_SIZE_M, TILE_SIZE_K]
-        epars = tl.load(mparams + epars_offsets)
+        epars = tl.load(mparams + epars_offsets).to(tl.float32)
 
     if propagation_alg_id != 1:
         pflows = acc * epars
@@ -332,7 +332,7 @@ def _bk_triton_block_sparse_par_csmm2_kernel(node_flows, node_mars, element_mars
     if propagation_alg_id == 1:
         par_start = tl.load(pids + nblock_id * num_edges + offs_edge)
         epars_offsets = offs_node[:,None] + par_start[None,:] # [TILE_SIZE_M, TILE_SIZE_K]
-        epars = tl.load(mparams + epars_offsets)
+        epars = tl.load(mparams + epars_offsets).to(tl.float32)
         elpars = tl.log(epars)
 
     # Inner loop
@@ -394,7 +394,7 @@ def _bk_triton_block_sparse_par_csmm2_kernel(node_flows, node_mars, element_mars
     if propagation_alg_id != 1:
         par_start = tl.load(pids + nblock_id * num_edges + offs_edge)
         epars_offsets = offs_node[:,None] + par_start[None,:] # [TILE_SIZE_M, TILE_SIZE_K]
-        epars = tl.load(mparams + epars_offsets)
+        epars = tl.load(mparams + epars_offsets).to(tl.float32)
 
     if propagation_alg_id != 1:
         pflows = acc * epars
@@ -481,7 +481,7 @@ def _bk_triton_block_sparse_tempered_par_kernel(node_flows, node_mars_tempered, 
     # Initialize `params` (only when NOT using MPE propagation method)
     par_start = tl.load(pids + nblock_id * num_edges + offs_edge)
     epars_offsets = offs_node[:,None] + par_start[None,:] # [TILE_SIZE_M, TILE_SIZE_K]
-    epars = tl.load(mparams + epars_offsets)
+    epars = tl.load(mparams + epars_offsets).to(tl.float32)
 
     pflows = acc * tlmath.pow(epars, 1.0 / pflow_temperature)
 
@@ -557,7 +557,7 @@ def _bk_triton_block_sparse_tempered_par_csmm2_kernel(node_flows, node_mars_temp
     # Initialize `params`
     par_start = tl.load(pids + nblock_id * num_edges + offs_edge)
     epars_offsets = offs_node[:,None] + par_start[None,:] # [TILE_SIZE_M, TILE_SIZE_K]
-    epars = tl.load(mparams + epars_offsets)
+    epars = tl.load(mparams + epars_offsets).to(tl.float32)
 
     pflows = acc * tlmath.pow(epars, 1.0 / pflow_temperature)
 

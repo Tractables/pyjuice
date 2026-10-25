@@ -32,6 +32,7 @@
 // node's `ch_block_size` must be powers of two -- the gate index is computed with shifts.
 
 #include <torch/extension.h>
+#include "../../../../layer/kernels/c/param_load.cuh"   // `ParamLoad<TP>`: the parameters in their stored dtype
 #include <cuda_runtime.h>
 #include <c10/cuda/CUDAStream.h>
 #include <c10/cuda/CUDAException.h>
@@ -50,10 +51,10 @@ __device__ __forceinline__ void lse_merge(float& m, float& l, float om, float ol
 
 // --------------------------------------------------------------------------------- element flows
 
-template <int WARPS, int BMAX, bool WGRAD>
+template <int WARPS, int BMAX, bool WGRAD, typename TP>
 __global__ void bs_sb_ele_kernel(float* __restrict__ element_flows, const float* __restrict__ element_mars,
                                  const float* __restrict__ node_flows, const float* __restrict__ node_mars,
-                                 const float* __restrict__ params, const float* __restrict__ ext,
+                                 const TP* __restrict__ params, const float* __restrict__ ext,
                                  const long* __restrict__ chids, const long* __restrict__ ebase,
                                  const long* __restrict__ pbase, const long* __restrict__ gate,
                                  float* __restrict__ grad_ext,
@@ -113,7 +114,7 @@ __global__ void bs_sb_ele_kernel(float* __restrict__ element_flows, const float*
 
         const int e0 = j * block_size, e1 = e0 + block_size;
         for (int e = e0 + lane; e < e1; e += 32) {
-            const float wgt = params[pb0 + e];           // epar[m_local, e]; coalesced across lanes
+            const float wgt = ParamLoad<TP>::at(&params[pb0 + e]);   // epar[m_local, e]; coalesced across lanes
             const float* nf = node_flows + (eb0 + e) * (long)batch;
             const float* nm = node_mars + (eb0 + e) * (long)batch;
             #pragma unroll
@@ -162,7 +163,7 @@ __global__ void bs_sb_ele_kernel(float* __restrict__ element_flows, const float*
     }
 }
 
-template <int WARPS, int BMAX>
+template <int WARPS, int BMAX, typename TP>
 static void launch_sb_ele(torch::Tensor element_flows, torch::Tensor element_mars, torch::Tensor node_flows,
                           torch::Tensor node_mars, torch::Tensor params, torch::Tensor ext,
                           torch::Tensor chids, torch::Tensor ebase, torch::Tensor pbase, torch::Tensor gate,
@@ -177,16 +178,16 @@ static void launch_sb_ele(torch::Tensor element_flows, torch::Tensor element_mar
     // WGRAD is a TEMPLATE parameter, so the no-gradient path compiles to exactly the kernel it was
     // before: no extra registers, no occupancy change.
     if (grad_ext.numel() > 0)
-        bs_sb_ele_kernel<WARPS, BMAX, true><<<grid, blk, 0, c10::cuda::getCurrentCUDAStream()>>>(
+        bs_sb_ele_kernel<WARPS, BMAX, true, TP><<<grid, blk, 0, c10::cuda::getCurrentCUDAStream()>>>(
             element_flows.data_ptr<float>(), element_mars.data_ptr<float>(), node_flows.data_ptr<float>(),
-            node_mars.data_ptr<float>(), params.data_ptr<float>(), ext.data_ptr<float>(),
+            node_mars.data_ptr<float>(), param_ptr<TP>(params), ext.data_ptr<float>(),
             chids.data_ptr<long>(), ebase.data_ptr<long>(), pbase.data_ptr<long>(), gate.data_ptr<long>(),
             grad_ext.data_ptr<float>(),
             batch, block_size, cs_block_size, num_edges, gate_sh, (int)gate.size(1), ext_base);
     else
-        bs_sb_ele_kernel<WARPS, BMAX, false><<<grid, blk, 0, c10::cuda::getCurrentCUDAStream()>>>(
+        bs_sb_ele_kernel<WARPS, BMAX, false, TP><<<grid, blk, 0, c10::cuda::getCurrentCUDAStream()>>>(
             element_flows.data_ptr<float>(), element_mars.data_ptr<float>(), node_flows.data_ptr<float>(),
-            node_mars.data_ptr<float>(), params.data_ptr<float>(), ext.data_ptr<float>(),
+            node_mars.data_ptr<float>(), param_ptr<TP>(params), ext.data_ptr<float>(),
             chids.data_ptr<long>(), ebase.data_ptr<long>(), pbase.data_ptr<long>(), gate.data_ptr<long>(),
             nullptr,
             batch, block_size, cs_block_size, num_edges, gate_sh, (int)gate.size(1), ext_base);
@@ -195,11 +196,11 @@ static void launch_sb_ele(torch::Tensor element_flows, torch::Tensor element_mar
 
 #define BS_SB_ELE_DISPATCH_BMAX(WW)                                                                    \
     switch (bmax) {                                                                                     \
-        case 1:  launch_sb_ele<WW, 1 >(element_flows, element_mars, node_flows, node_mars, params, ext, chids, ebase, pbase, gate, grad_ext, b, bs, cs, ne, gsh, eb_); break; \
-        case 2:  launch_sb_ele<WW, 2 >(element_flows, element_mars, node_flows, node_mars, params, ext, chids, ebase, pbase, gate, grad_ext, b, bs, cs, ne, gsh, eb_); break; \
-        case 4:  launch_sb_ele<WW, 4 >(element_flows, element_mars, node_flows, node_mars, params, ext, chids, ebase, pbase, gate, grad_ext, b, bs, cs, ne, gsh, eb_); break; \
-        case 8:  launch_sb_ele<WW, 8 >(element_flows, element_mars, node_flows, node_mars, params, ext, chids, ebase, pbase, gate, grad_ext, b, bs, cs, ne, gsh, eb_); break; \
-        case 16: launch_sb_ele<WW, 16>(element_flows, element_mars, node_flows, node_mars, params, ext, chids, ebase, pbase, gate, grad_ext, b, bs, cs, ne, gsh, eb_); break; \
+        case 1:  launch_sb_ele<WW, 1 , TP>(element_flows, element_mars, node_flows, node_mars, params, ext, chids, ebase, pbase, gate, grad_ext, b, bs, cs, ne, gsh, eb_); break; \
+        case 2:  launch_sb_ele<WW, 2 , TP>(element_flows, element_mars, node_flows, node_mars, params, ext, chids, ebase, pbase, gate, grad_ext, b, bs, cs, ne, gsh, eb_); break; \
+        case 4:  launch_sb_ele<WW, 4 , TP>(element_flows, element_mars, node_flows, node_mars, params, ext, chids, ebase, pbase, gate, grad_ext, b, bs, cs, ne, gsh, eb_); break; \
+        case 8:  launch_sb_ele<WW, 8 , TP>(element_flows, element_mars, node_flows, node_mars, params, ext, chids, ebase, pbase, gate, grad_ext, b, bs, cs, ne, gsh, eb_); break; \
+        case 16: launch_sb_ele<WW, 16, TP>(element_flows, element_mars, node_flows, node_mars, params, ext, chids, ebase, pbase, gate, grad_ext, b, bs, cs, ne, gsh, eb_); break; \
         default: TORCH_CHECK(false, "blockscale_sb_ele_backward: invalid batch ", b);                   \
     }
 
@@ -236,12 +237,16 @@ void blockscale_sb_ele_backward(torch::Tensor element_flows, torch::Tensor eleme
     while (bmax < b) bmax <<= 1;                          // next power of two >= batch
     // No silent default: an unknown cfg must not run zero kernels (a no-op launch can masquerade as
     // correct against a reused output buffer).
-    switch (warps) {
-        case 8:  BS_SB_ELE_DISPATCH_BMAX(8);  break;
-        case 16: BS_SB_ELE_DISPATCH_BMAX(16); break;
-        case 4:  BS_SB_ELE_DISPATCH_BMAX(4);  break;
-        default: TORCH_CHECK(false, "blockscale_sb_ele_backward: invalid cfg ", cfg);
-    }
+    auto run = [&](auto tag) {
+        using TP = decltype(tag);
+        switch (warps) {
+            case 8:  BS_SB_ELE_DISPATCH_BMAX(8);  break;
+            case 16: BS_SB_ELE_DISPATCH_BMAX(16); break;
+            case 4:  BS_SB_ELE_DISPATCH_BMAX(4);  break;
+            default: TORCH_CHECK(false, "blockscale_sb_ele_backward: invalid cfg ", cfg);
+        }
+    };
+    if (params.scalar_type() == torch::kBFloat16) run(__nv_bfloat16{}); else run(float{});
 }
 
 std::vector<int64_t> blockscale_sb_ele_configs() { return {8, 16, 4}; }  // WARPS per config id
@@ -262,10 +267,10 @@ std::vector<int64_t> blockscale_sb_ele_configs() { return {8, 16, 4}; }  // WARP
 //     ties every transition into one slot, which is an ordinary model, not an edge case.
 //
 // Both default off, so a dense untied layer generates exactly the code it did before.
-template <int EY, int BMAX, bool PADDED, bool PF_ATOMIC>
+template <int EY, int BMAX, bool PADDED, bool PF_ATOMIC, typename TP>
 __global__ void bs_sb_par_kernel(float* __restrict__ param_flows, const float* __restrict__ node_flows,
                                  const float* __restrict__ node_mars, const float* __restrict__ element_mars,
-                                 const float* __restrict__ params, const float* __restrict__ ext,
+                                 const TP* __restrict__ params, const float* __restrict__ ext,
                                  const long* __restrict__ nids, const long* __restrict__ cids,
                                  const long* __restrict__ pids, const long* __restrict__ pfids,
                                  const long* __restrict__ gate, int batch, int block_size, int num_edges,
@@ -312,7 +317,7 @@ __global__ void bs_sb_par_kernel(float* __restrict__ param_flows, const float* _
     // `>= num_dummy_eles > 0`, and unlike the gate it does not depend on the table being indexed right.
     if (PADDED && child == 0) return;
 
-    float val = params[pids[cb + e] + tile_id] * term;          // coalesced across lanes (node-contiguous)
+    float val = ParamLoad<TP>::at(&params[pids[cb + e] + tile_id]) * term;   // coalesced across lanes (node-contiguous)
     if (PF_ATOMIC) {
         atomicAdd(&param_flows[pfids[cb + e] + tile_id], val);
     } else {
@@ -320,7 +325,7 @@ __global__ void bs_sb_par_kernel(float* __restrict__ param_flows, const float* _
     }
 }
 
-template <int EY, int BMAX, bool PADDED, bool PF_ATOMIC>
+template <int EY, int BMAX, bool PADDED, bool PF_ATOMIC, typename TP>
 static void launch_sb_par(torch::Tensor param_flows, torch::Tensor node_flows, torch::Tensor node_mars,
                           torch::Tensor element_mars, torch::Tensor params, torch::Tensor ext,
                           torch::Tensor nids, torch::Tensor cids, torch::Tensor pids, torch::Tensor pfids,
@@ -331,9 +336,9 @@ static void launch_sb_par(torch::Tensor param_flows, torch::Tensor node_flows, t
     dim3 grid((unsigned int)(nb * groups), (unsigned int)((num_edges + EY - 1) / EY));
     dim3 blk(32, EY);
     // Launch on the current stream so the kernel is captured correctly under CUDA-graph recording.
-    bs_sb_par_kernel<EY, BMAX, PADDED, PF_ATOMIC><<<grid, blk, 0, c10::cuda::getCurrentCUDAStream()>>>(
+    bs_sb_par_kernel<EY, BMAX, PADDED, PF_ATOMIC, TP><<<grid, blk, 0, c10::cuda::getCurrentCUDAStream()>>>(
         param_flows.data_ptr<float>(), node_flows.data_ptr<float>(), node_mars.data_ptr<float>(),
-        element_mars.data_ptr<float>(), params.data_ptr<float>(), ext.data_ptr<float>(),
+        element_mars.data_ptr<float>(), param_ptr<TP>(params), ext.data_ptr<float>(),
         nids.data_ptr<long>(), cids.data_ptr<long>(), pids.data_ptr<long>(), pfids.data_ptr<long>(),
         gate.data_ptr<long>(), batch, block_size, num_edges, node_cbs, node_sh, gate_sh,
         (int)gate.size(1), ext_base);
@@ -342,11 +347,11 @@ static void launch_sb_par(torch::Tensor param_flows, torch::Tensor node_flows, t
 
 #define BS_SB_PAR_DISPATCH_BMAX(EE, PD, PA)                                                                    \
     switch (bmax) {                                                                                     \
-        case 1:  launch_sb_par<EE, 1 , PD, PA>(param_flows, node_flows, node_mars, element_mars, params, ext, nids, cids, pids, pfids, gate, b, bs, ne, ncb, nsh, gsh, eb_); break; \
-        case 2:  launch_sb_par<EE, 2 , PD, PA>(param_flows, node_flows, node_mars, element_mars, params, ext, nids, cids, pids, pfids, gate, b, bs, ne, ncb, nsh, gsh, eb_); break; \
-        case 4:  launch_sb_par<EE, 4 , PD, PA>(param_flows, node_flows, node_mars, element_mars, params, ext, nids, cids, pids, pfids, gate, b, bs, ne, ncb, nsh, gsh, eb_); break; \
-        case 8:  launch_sb_par<EE, 8 , PD, PA>(param_flows, node_flows, node_mars, element_mars, params, ext, nids, cids, pids, pfids, gate, b, bs, ne, ncb, nsh, gsh, eb_); break; \
-        case 16: launch_sb_par<EE, 16, PD, PA>(param_flows, node_flows, node_mars, element_mars, params, ext, nids, cids, pids, pfids, gate, b, bs, ne, ncb, nsh, gsh, eb_); break; \
+        case 1:  launch_sb_par<EE, 1 , PD, PA, TP>(param_flows, node_flows, node_mars, element_mars, params, ext, nids, cids, pids, pfids, gate, b, bs, ne, ncb, nsh, gsh, eb_); break; \
+        case 2:  launch_sb_par<EE, 2 , PD, PA, TP>(param_flows, node_flows, node_mars, element_mars, params, ext, nids, cids, pids, pfids, gate, b, bs, ne, ncb, nsh, gsh, eb_); break; \
+        case 4:  launch_sb_par<EE, 4 , PD, PA, TP>(param_flows, node_flows, node_mars, element_mars, params, ext, nids, cids, pids, pfids, gate, b, bs, ne, ncb, nsh, gsh, eb_); break; \
+        case 8:  launch_sb_par<EE, 8 , PD, PA, TP>(param_flows, node_flows, node_mars, element_mars, params, ext, nids, cids, pids, pfids, gate, b, bs, ne, ncb, nsh, gsh, eb_); break; \
+        case 16: launch_sb_par<EE, 16, PD, PA, TP>(param_flows, node_flows, node_mars, element_mars, params, ext, nids, cids, pids, pfids, gate, b, bs, ne, ncb, nsh, gsh, eb_); break; \
         default: TORCH_CHECK(false, "blockscale_sb_par_backward: invalid batch ", b);                   \
     }
 
@@ -392,13 +397,17 @@ void blockscale_sb_par_backward(torch::Tensor param_flows, torch::Tensor node_fl
         default: TORCH_CHECK(false, "blockscale_sb_par_backward: invalid cfg ", cfg); \
     }
 
-    if (padded) {
-        if (pf_atomic) { BS_SB_PAR_BY_EY(true,  true ); }
-        else           { BS_SB_PAR_BY_EY(true,  false); }
-    } else {
-        if (pf_atomic) { BS_SB_PAR_BY_EY(false, true ); }
-        else           { BS_SB_PAR_BY_EY(false, false); }
-    }
+    auto run = [&](auto tag) {
+        using TP = decltype(tag);
+        if (padded) {
+            if (pf_atomic) { BS_SB_PAR_BY_EY(true,  true ); }
+            else           { BS_SB_PAR_BY_EY(true,  false); }
+        } else {
+            if (pf_atomic) { BS_SB_PAR_BY_EY(false, true ); }
+            else           { BS_SB_PAR_BY_EY(false, false); }
+        }
+    };
+    if (params.scalar_type() == torch::kBFloat16) run(__nv_bfloat16{}); else run(float{});
 #undef BS_SB_PAR_BY_EY
 }
 

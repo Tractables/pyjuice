@@ -5,6 +5,8 @@ its bases): the values and flows of the last passes, the parameters and their fl
 
 from __future__ import annotations
 
+import torch
+
 from pyjuice.nodes import CircuitNodes
 
 
@@ -120,9 +122,9 @@ class _InspectionMixin:
 
         psid, peid = ns._param_range
         if clone:
-            ns_params = self.params[psid:peid].detach().clone()
+            ns_params = self._params_in_fp32()[psid:peid].detach().clone()   # a copy, in fp32 whatever is stored
         else:
-            ns_params = self.params[psid:peid]
+            ns_params = self.params[psid:peid]                     # a view, in the stored dtype
 
         local_parids = (ns._param_ids - psid) // (ns.block_size * ns.ch_block_size)
         num_parblocks = local_parids.size(0)

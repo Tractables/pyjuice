@@ -94,7 +94,7 @@ def sample_sum_layer_kernel(nids, cids, pids, node_mars, element_mars, mparams, 
 
             # Load parameters
             param_id = tl.load(pids + local_nids[None,:] * num_edges + offs_child[:,None], mask = (mask_sample[None,:] & mask_child[:,None]), other = 0)
-            epars = tl.load(mparams + param_id + local_nid_offs[None,:], mask = (mask_sample[None,:] & mask_child[:,None]), other = 0.0) # [BLOCK_K, BLOCK_B]
+            epars = tl.load(mparams + param_id + local_nid_offs[None,:], mask = (mask_sample[None,:] & mask_child[:,None]), other = 0.0).to(tl.float32) # [BLOCK_K, BLOCK_B]
 
             if conditional:
                 # In this case, we use `param * cmar / nmar` as the "parameter"
@@ -119,7 +119,7 @@ def sample_sum_layer_kernel(nids, cids, pids, node_mars, element_mars, mparams, 
 
         # Load parameters
         param_id = tl.load(pids + local_nids[None,:] * num_edges + offs_child[:,None], mask = (mask_sample[None,:] & mask_child[:,None]), other = 0)
-        epars = tl.load(mparams + param_id + local_nid_offs[None,:], mask = (mask_sample[None,:] & mask_child[:,None]), other = 0.0) # [BLOCK_K, BLOCK_S]
+        epars = tl.load(mparams + param_id + local_nid_offs[None,:], mask = (mask_sample[None,:] & mask_child[:,None]), other = 0.0).to(tl.float32) # [BLOCK_K, BLOCK_S]
 
         if conditional:
             # In this case, we use `param * cmar / nmar` as the "parameter"

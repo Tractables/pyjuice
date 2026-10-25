@@ -238,7 +238,7 @@ def _graph_bindings(pc, conditional: bool, staged = None, fused: bool = False):
     # circuit where only one of the two is correct, would be silently wrong rather than merely slow.
     return (pc.node_mars.data_ptr() if pc.node_mars is not None else 0,
             pc.element_mars.data_ptr() if pc.element_mars is not None else 0,
-            pc.params.data_ptr(), bool(conditional), bool(fused), external)
+            pc.params.data_ptr(), pc.params.dtype, bool(conditional), bool(fused), external)
 
 
 def _scoped_state(pc, plan, num_samples: int, conditional: bool, persistent: bool,

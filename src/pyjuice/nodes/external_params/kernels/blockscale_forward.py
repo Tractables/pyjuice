@@ -121,7 +121,7 @@ def _bs_triton_fw_kernel(node_mars, element_mars, mparams, ext, gate, log_z,
         emars = tl.load(element_mars + edge_start[:,None] * batch_size + offs_batch[None,:],
                         mask = mask_edge[:,None] & mask_batch[None,:], other = -float("inf"))
         epars = tl.load(mparams + par_start[None,:] + offs_node[:,None],
-                        mask = mask_edge[None,:], other = 0.0)       # [TILE_SIZE_M, TILE_SIZE_K]
+                        mask = mask_edge[None,:], other = 0.0).to(tl.float32)   # [TILE_SIZE_M, TILE_SIZE_K]
 
         # ---- N: the gate folds onto `element_mars`, so a padded or gateless edge is -inf and drops
         v = emars + lphi
