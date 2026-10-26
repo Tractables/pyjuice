@@ -8,11 +8,17 @@ corrected).
 
 from __future__ import annotations
 
+import os
 from collections import OrderedDict
 
 import torch
 
 from .common import _buffer_kwarg
+
+#: The pre-pass forward (kernels/c/blockscale_forward_prepass.cu: the CuTe fork's computation, to the bit, as a
+#: pre-pass, its merge factors and a streaming kernel) among the measured CUDA forks; PYJUICE_BLOCKSCALE_FORWARD_PREPASS=0
+#: leaves it out.
+FORWARD_PREPASS = os.environ.get("PYJUICE_BLOCKSCALE_FORWARD_PREPASS", "1") != "0"
 
 #: How many forward plans to keep per layer, keyed by batch size. Each holds a `log Z` buffer per
 #: partition sized by that batch, so this bounds memory; rebuilding an evicted one costs an AUTOTUNE,
@@ -37,10 +43,14 @@ class _ForwardMixin:
         """
         Resolve every per-layer launch argument once, and check each kernel's assumptions.
 
-        THREE kernels serve this type, and which apply is a property of the shape:
+        FOUR kernels serve this type, and which apply is a property of the shape:
 
           * the CuTe/TMA fork, for batches it can tile (`batch % 64 == 0`) on sm_90+ with CUTLASS. It
             carries the normalizer as a gate-factored contraction against a precomputed `sigma`;
+          * its pre-pass copy (`FORWARD_PREPASS`), bit-identical, where an edge tile is one run of
+            children (`ch_block_size >= 64`) and a gate spans at least 4 of them: the fork's work that
+            depends on the edge tile alone done once per node block, the running maxima as prefix
+            maxima, the tiles' MMAs spread over groups of warps and merged in order;
           * a plain-CUDA small-batch kernel, one warp per 32 nodes, which accumulates the normalizer
             inline and needs neither `batch % 64` nor `num_edges % 64` nor CUTLASS;
           * the portable Triton fork, which needs no CUDA toolchain at all and applies everywhere,
@@ -50,7 +60,7 @@ class _ForwardMixin:
         All three are collected here and the choice is MEASURED, so where they overlap the faster one
         wins rather than the one that happened to be checked first.
         """
-        from ..kernels.c import get_cute_module, get_sb_module
+        from ..kernels.c import get_cute_module, get_sb_module, get_prepass_module
         import pyjuice.layer.kernels.c as ck
 
         # NEITHER CUDA extension is required any more. The CuTe forward needs nvcc, CUTLASS and
@@ -59,6 +69,7 @@ class _ForwardMixin:
         # than either, but the alternative was not running at all.
         mod = get_cute_module()
         sb_mod = get_sb_module()
+        pre_mod = get_prepass_module() if FORWARD_PREPASS else None
 
         if getattr(layer, "ext_slots", None) is None:
             raise NotImplementedError(
@@ -87,6 +98,10 @@ class _ForwardMixin:
         valid = ([int(i) for i in mod.fitting_configs(block_size, batch_size, gate_cbs)]
                  if (mod is not None and block_size == gate_bs) else [])
         cfg = valid[0] if valid else 0    # provisional; measured once the launch args exist
+        # The pre-pass copy's tiles for this shape: it takes the fork's arguments, in the fork's single-run case
+        # (`node_cbs >= 64`), with a gate width >= 4, and like the fork one gate per node block.
+        pre_valid = ([int(i) for i in pre_mod.fitting_configs(block_size, batch_size, node_cbs, gate_cbs)]
+                     if (pre_mod is not None and block_size == gate_bs) else [])
 
         # The small-batch kernel needs only 32-node groups, but its children must be contiguous across
         # the WHOLE row rather than within each edge tile -- it walks the edge axis with a single base.
@@ -172,7 +187,7 @@ class _ForwardMixin:
             #
             # The within-run property is still VERIFIED rather than trusted -- it is an invariant of
             # another module, and a silent violation would be a wrong answer rather than a crash.
-            if valid and num_edges % 64 == 0:
+            if (valid or pre_valid) and num_edges % 64 == 0:
                 step = min(node_cbs, 64)
                 nrun = num_edges // step
                 c3, p3 = c2.view(-1, nrun, step), p2.view(-1, nrun, step)
@@ -357,6 +372,9 @@ class _ForwardMixin:
         if calls:
             for i in valid:
                 cands.append((("cute", i), _runner(mod.blockscale_forward, calls, i)))
+            # The pre-pass copy takes the same launch tuples, and writes `node_mars` and `log Z` by assignment too.
+            for i in pre_valid:
+                cands.append((("pre", i), _runner(pre_mod.blockscale_forward_prepass, calls, i)))
         if sb_calls:
             for i in range(len(sb_mod.blockscale_sb_configs())):
                 cands.append((("sb", i), _runner(sb_mod.blockscale_sb_forward, sb_calls, i)))
@@ -385,6 +403,8 @@ class _ForwardMixin:
 
         if kind == "cute":
             out_mod, fname, calls = mod, "blockscale_forward", _with_cfg(calls, best_cfg)
+        elif kind == "pre":
+            out_mod, fname, calls = pre_mod, "blockscale_forward_prepass", _with_cfg(calls, best_cfg)
         else:
             out_mod, fname, calls = sb_mod, "blockscale_sb_forward", _with_cfg(sb_calls, best_cfg)
 

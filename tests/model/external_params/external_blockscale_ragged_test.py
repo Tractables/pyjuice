@@ -176,7 +176,7 @@ def _fw_fork(layer):
     plans = getattr(layer, "_bs_fw_plans", None)
     assert plans, "no forward plan was built"
     fname = next(iter(plans.values()))[0][1]
-    return {"blockscale_forward": "cute", "blockscale_sb_forward": "sb"}[fname]
+    return {"blockscale_forward": "cute", "blockscale_sb_forward": "sb", "blockscale_forward_prepass": "pre"}[fname]
 
 
 def _run(name, batch = 64, gate_cbs = 8, scale = 0.7, seed = 0):
@@ -354,7 +354,7 @@ def test_forward_matches_materialized_pc(name, batch):
 
 @cuda_only
 @needs_cute
-def test_both_forward_forks_actually_serve_a_padded_shape():
+def test_both_forward_forks_actually_serve_a_padded_shape(monkeypatch):
     """COVERAGE, asserted rather than hoped for.
 
     `_build_plan` collects the CuTe/TMA fork and the plain-CUDA small-batch fork and picks between
@@ -370,7 +370,11 @@ def test_both_forward_forks_actually_serve_a_padded_shape():
     # Scanned across topologies AND batches rather than asserting that a particular batch picks a
     # particular fork. The choice is made by MEASUREMENT, so which fork wins where is a property of
     # the hardware and shifts when either kernel changes; what must hold is that both are exercised
-    # somewhere, which is the actual coverage question.
+    # somewhere, which is the actual coverage question. The CuTe fork's pre-pass copy is left out: it
+    # takes the CuTe fork's shapes where it is faster, and its own padded coverage is
+    # blockscale_forward_prepass_test.py's.
+    from pyjuice.nodes.external_params.blockscale import forward as bs_forward
+    monkeypatch.setattr(bs_forward, "FORWARD_PREPASS", False)
     seen = {}
     for name in NONDENSE:
         for batch in (64, 256):
@@ -734,12 +738,12 @@ def test_unconnected_gate_cells_are_never_read(name):
 @pytest.mark.parametrize("name", ["dense", "pad_tiles", "mixed", "sparse_ragged", "narrow"])
 @pytest.mark.parametrize("batch", [8, 64])
 def test_the_portable_triton_forward_serves_every_topology(name, batch):
-    """The PORTABLE forward, exercised by hiding both CUDA extensions.
+    """The PORTABLE forward, exercised by hiding the CUDA extensions.
 
     Note this test is NOT marked `needs_cute`: its whole point is the machine that cannot build them.
-    Both other forks are CUDA -- the CuTe one wants nvcc, CUTLASS and sm_90+, the small-batch one
-    wants nvcc -- so without a CUDA toolchain `BlockScaleSumParams` used to be refused outright
-    rather than merely being slow.
+    The other forks are CUDA -- the CuTe one and its pre-pass copy want nvcc, CUTLASS and sm_90+, the
+    small-batch one wants nvcc -- so without a CUDA toolchain `BlockScaleSumParams` used to be refused
+    outright rather than merely being slow.
 
     It also has no layout requirements at all: it reads `nids` / `cids` / `pids` PER LANE instead of
     deriving addresses from a per-tile base, so it needs neither contiguous children nor strided
@@ -751,16 +755,17 @@ def test_the_portable_triton_forward_serves_every_topology(name, batch):
     misunderstanding between them cannot pass."""
     gate_cbs = 8
     import pyjuice.nodes.external_params.kernels.c as _kc
-    saved = _kc.get_cute_module, _kc.get_sb_module
+    saved = _kc.get_cute_module, _kc.get_sb_module, _kc.get_prepass_module
     _kc.get_cute_module = lambda: None
     _kc.get_sb_module = lambda: None
+    _kc.get_prepass_module = lambda: None
     try:
         pc_a, root_a, ns_a, layer, data, phi = _run(name, batch = batch, gate_cbs = gate_cbs)
         lls_a = pc_a(data, sum_external_params = {ns_a: phi})
         assert next(iter(layer._bs_fw_plans.values()))[0][0] == "triton", \
             "the CUDA forks were hidden but a CUDA fork still ran"
     finally:
-        _kc.get_cute_module, _kc.get_sb_module = saved
+        _kc.get_cute_module, _kc.get_sb_module, _kc.get_prepass_module = saved
 
     dev = torch.device("cuda:0")
     root_b, ns_b = _build(name, gate_cbs = gate_cbs, gated = False)
