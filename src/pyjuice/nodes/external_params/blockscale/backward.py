@@ -7,9 +7,15 @@ normalizer shift undone and the gradient of the log gates' `log Z` term computed
 
 from __future__ import annotations
 
+import os
+
 import torch
 
 from .common import _buffer_kwarg
+
+#: The log-Z half of `d LL / d log phi` contracts at fp32 precision; PYJUICE_BLOCKSCALE_LOGZ_TF32=1 takes TF32 dots
+#: instead (the denominator flow's switch is PYJUICE_BLOCKSCALE_DENOM_TF32).
+LOGZ_DOT_IEEE = 0 if os.environ.get("PYJUICE_BLOCKSCALE_LOGZ_TF32", "0") == "1" else 1
 
 # Packs (parent node id, child element id) into one int64 key for the backward gate lookup. Node and
 # element ids are global row indices into `node_mars` / `element_mars`, so this holds for any circuit
@@ -736,7 +742,7 @@ class _BackwardMixin:
                         BLOCK_B = bb, GATE_TILE = gt, TILE_SIZE_M = tm,
                         USE_DOT = (1 if (gt >= 16 and tm >= 16 and batch >= 64) else 0),
                         gate_stride = gb.size(1),
-                        ext_base = state["ext_base"], num_stages = 1)
+                        ext_base = state["ext_base"], num_stages = 1, DOT_IEEE = LOGZ_DOT_IEEE)
 
                 gt, bb, tm = self._logz_tile(layer, _go, grad_ext, batch, bs_, n_gates, rows)
                 _go(gt, bb, tm, grad_ext)

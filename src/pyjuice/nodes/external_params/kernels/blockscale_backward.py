@@ -34,6 +34,14 @@ import triton.language as tl
 from pyjuice.utils.kernel_launcher import triton_jit
 
 
+@triton.jit
+def _tf32_rna(x):
+    """An fp32 ``x`` (finite) rounded to the nearest TF32 value, ties away from zero (as ``cvt.rna.tf32.f32``). A Triton
+    TF32 dot hands the tensor cores the fp32 bits and they drop the low 13: every operand truncated, every product
+    biased low (6.5e-4 relative on uniform operands); rounded first, the dot's error is unbiased."""
+    return ((x.to(tl.int32, bitcast = True) + 0x1000) & -8192).to(tl.float32, bitcast = True)
+
+
 @triton_jit
 def _bs_triton_ele_kernel(node_flows, element_flows, node_mars, element_mars, mparams,
                           ext, gate, chids, parids_start, parids_increment,
@@ -122,7 +130,10 @@ def _bs_triton_ele_kernel(node_flows, element_flows, node_mars, element_mars, mp
                 nsub_g = tl.where((offs_edge_gid == g)[:,None], n_fdm_sub, 0.0)
 
             if TL_DOT == 1:
-                partial_flows = tl.dot(epars, nsub_g)
+                # (the TF32 operands rounded: the gate gradient is a difference of this kernel's term and the log-Z
+                # kernel's, of nearly equal size, so a truncation bias here was most of its error -- MEASURED, the
+                # gates' zero-sum residual at K = 1024 9e-2 of the gradient's largest entry against 1.2e-2 rounded)
+                partial_flows = tl.dot(_tf32_rna(epars), _tf32_rna(nsub_g))
             else:
                 # axis-0 form on purpose -- see `_BROADCAST_SUM_NOTE` in pyjuice/layer/kernels/__init__.py
                 partial_flows = tl.sum(tl.trans(epars)[:,:,None] * nsub_g[:,None,:], axis = 0)
@@ -353,7 +364,7 @@ def _bs_triton_phigrad_logz_kernel(node_flows, log_z, sigma, ext, gate, grad_ext
                                    N_CHILD_GATES: tl.constexpr, BLOCK_SIZE_M: tl.constexpr,
                                    BLOCK_B: tl.constexpr, GATE_TILE: tl.constexpr,
                                    USE_DOT: tl.constexpr, gate_stride: tl.constexpr, ext_base,
-                                   TILE_SIZE_M: tl.constexpr = 0):
+                                   TILE_SIZE_M: tl.constexpr = 0, DOT_IEEE: tl.constexpr = 1):
     """
     The log-Z half of `d LL / d log phi`:
 
@@ -430,10 +441,16 @@ def _bs_triton_phigrad_logz_kernel(node_flows, log_z, sigma, ext, gate, grad_ext
     # [M, G, B] intermediate -- half a million elements here -- and was the dominant cost even after
     # the redundant loads were tiled away. `sigma^T @ v` is the same contraction on tensor cores.
     #
-    # Only where it pays. `tl.dot` is TF32, and at small batch this kernel is already cheap while the
-    # rest of the gradient path is exact fp32 -- so trading that accuracy away there buys nothing.
+    # Only where it pays: at small batch this kernel is already cheap. And at fp32 precision (DOT_IEEE),
+    # not TF32: this term and the element kernel's are of nearly equal size and the gradient is their
+    # difference, so a TF32 dot's truncation here was most of the gradient's error -- MEASURED, the
+    # gates' zero-sum residual of this term alone at 7-10% of the gradient's largest entry (K = 1024),
+    # hidden while the Triton element kernel's own TF32 error happened to cancel part of it.
     if USE_DOT:
-        out = tl.dot(tl.trans(sg), v)                                   # [G, B]
+        if DOT_IEEE:
+            out = tl.dot(tl.trans(sg), v, input_precision = "ieee")     # [G, B]
+        else:
+            out = tl.dot(tl.trans(sg), v)
     else:
         out = tl.sum(sg[:,:,None] * v[:,None,:], axis = 0)
 
