@@ -18,6 +18,8 @@ deliberately a COVERAGE test rather than a correctness one: the distributions ar
 configuration nobody happened to instantiate.
 """
 
+import functools
+
 import pytest
 import torch
 
@@ -81,7 +83,14 @@ STRUCTURES = {"hmm": _hmm, "hclt": _hclt, "pd": _pd, "rat_spn": _rat, "ragged": 
 
 @pytest.fixture(scope = "module")
 def circuits():
-    """Compiled once per structure -- building an HCLT / PD / RAT is the slow part of this file."""
+    return _circuits_once()
+
+
+@functools.cache
+def _circuits_once():
+    """Compiled once per structure and process -- building an HCLT / PD / RAT is the slow part of this file, and a
+    module fixture alone is set up again each time a worker comes back to the file (the suite's duration ordering
+    interleaves files: 37 builds in a full suite at 5 workers)."""
     out = {}
     for name, build in STRUCTURES.items():
         torch.manual_seed(0)

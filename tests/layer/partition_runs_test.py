@@ -319,6 +319,7 @@ def test_runs_of_linear_flows(case, hits):
     assert {PROD, SPELE} <= hits
 
 
+@pytest.mark.slow                                       # (MEASURED: 23 s -- the large kernels need > 2048 rows)
 def test_runs_of_the_large_kernels(hits):
     pc, V, C = wide()
     torch.manual_seed(1)
