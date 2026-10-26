@@ -18,6 +18,7 @@ from .backend import cum_par_flows_to_device, par_update_to_device
 from .build import _BuildMixin
 from .common import _pc_model_backward_hook, device_grad_controller, layer_iterator
 from .cuda_graphs import _CudaGraphsMixin
+from pyjuice.utils.deferred import deferred_scope
 from .external_params import _ExternalParamsMixin
 from .inspection import _InspectionMixin
 from .learning import _LearningMixin
@@ -593,14 +594,20 @@ class TensorCircuit(_BuildMixin, _CudaGraphsMixin, _ExternalParamsMixin, _Learni
             # Inner layers. As in `forward`, everything the sum layers are given besides the buffers is in
             # `sum_opts`, which is also what a recorded graph is keyed on. A query's `compute_param_flows =
             # False` used to replay a training step's graph, which writes parameter flows.
+            #
+            # `defer_param_flows`: a layer may leave its parameter flows to the end of the pass (`deferred_scope`, e.g.
+            # a tied group's, added by one contraction) -- not when a layer callback is given, which sees the flows
+            # between layers.
             sum_opts = dict(kwargs,
                             param_flows = self.param_flows if compute_param_flows else None,
                             denom_param_flows = self.denom_param_flows if compute_param_flows else None,
                             allow_modify_flows = allow_modify_flows, logspace_flows = logspace_flows,
                             negate_pflows = negate_pflows, precision = self.precision,
-                            pflow_temperature = pflow_temperature, temper_eflow = temper_eflow)
+                            pflow_temperature = pflow_temperature, temper_eflow = temper_eflow,
+                            defer_param_flows = (compute_param_flows and sum_layer_pre_backward_callback is None
+                                                 and sum_layer_post_backward_callback is None))
 
-            def _run_inner_layers():
+            def _inner_layers():
 
                 # Backward pass for inner layers
                 for layer_id in range(len(self.inner_layer_groups) - 1, -1, -1):
@@ -645,6 +652,12 @@ class TensorCircuit(_BuildMixin, _CudaGraphsMixin, _ExternalParamsMixin, _Learni
 
                     else:
                         raise ValueError(f"Unknown layer type {type(layer)}.")
+
+            def _run_inner_layers():
+                # What the layers deferred to the end of the pass, run inside it: a graph recorded from the pass replays it
+                with deferred_scope() as deferred:
+                    _inner_layers()
+                    deferred.run()
 
             # Callbacks run inside the captured region and could do anything, so they make the pass eager.
             use_graphs = sum_layer_pre_backward_callback is None and sum_layer_post_backward_callback is None

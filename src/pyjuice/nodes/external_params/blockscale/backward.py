@@ -12,6 +12,7 @@ import os
 import torch
 
 from .common import _buffer_kwarg
+from . import deferred_par
 
 #: The pre-pass element-flow backward (kernels/c/blockscale_ele_backward_prepass.cu: the Triton fork's computation,
 #: not its bits, as a pre-pass and a streaming kernel) among the measured element forks;
@@ -299,6 +300,7 @@ class _BackwardMixin:
         state = self._bw_state(layer, node_mars, kwargs)
 
         from ..kernels.c import get_ele_bw_module, get_par_bw_module, get_sb_bw_module, get_ele_prepass_module
+        from ..kernels.c import get_par_deferred_module
         from ..kernels.shift_logz import shift_logz
 
         # NO CUDA extension is required here. The CuTe and small-batch forks are accelerators, and
@@ -311,6 +313,9 @@ class _BackwardMixin:
         ele_mod, par_mod = get_ele_bw_module(), get_par_bw_module()
         sb_mod = get_sb_bw_module()
         elep_mod = get_ele_prepass_module() if ELE_PREPASS else None
+        # A tied group's parameter flows may be left to the end of the pass (`deferred_par`), when the backward allows it
+        pd_mod = get_par_deferred_module() if deferred_par.PAR_DEFER else None
+        layer._bs_defer = bool(kwargs.get("defer_param_flows", False))
 
         batch_size, block_size = state["batch_size"], state["block_size"]
         ext_base, gate_cbs, node_cbs = state["ext_base"], state["gate_cbs"], state["node_cbs"]
@@ -562,6 +567,10 @@ class _BackwardMixin:
                 "`_par_hook`'s forks assume collision-free `pfids` and unpadded `cids`; the sum " \
                 "layer's `par_ok` guard is supposed to have established both."
 
+            # A tied step's flows into its group's slots, added with the group's after the pass (`deferred_par`)
+            if deferred_par.try_defer(pd_mod, layer, ctx, gb, external_params, node_cbs, gate_cbs, ext_base, n_ngates_):
+                return
+
             def _cute(tgt):
                 par_mod.blockscale_par_backward(
                     tgt, ctx["node_flows"], ctx["node_mars"], ctx["element_mars"], ctx["params"],
@@ -678,6 +687,11 @@ class _BackwardMixin:
                     f"node gate, but TILE_SIZE_M is {ctx['TILE_SIZE_M']}."
                 )
             padded, pf_atomic = self._par_write_flags(layer, ctx["cids"], ctx["pfids"])
+            # A tied step deferred as from `_par_hook` -- only without either hazard: its flush writes every slot of
+            # the block per node block, unmasked and non-atomically (two node blocks on one block would race)
+            if (padded, pf_atomic) == (0, 0) and deferred_par.try_defer(
+                    pd_mod, layer, ctx, gb, external_params, node_cbs, gate_cbs, ext_base, n_ngates_):
+                return
             for s0 in range(0, grid[1], 32768):
                 cg = (grid[0], min(s0 + 32768, grid[1]) - s0)
                 _bs_triton_par_kernel[cg](
