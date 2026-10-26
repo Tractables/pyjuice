@@ -1,10 +1,13 @@
 """
 What BlockScale's backward keeps between calls: per partition and batch, the launch plans of the log-Z gradient and of
-the denominator flow. A circuit that ran at other batch sizes -- its plans built there -- must give what a fresh circuit
-gives, on a layer of TWO partitions, whose plans must not stand in for each other.
+the denominator flow; per partition, the log-Z term's per-gate parameter sums, until the parameters change. A circuit
+that ran at other batch sizes -- its plans built there -- must give what a fresh circuit gives, on a layer of TWO
+partitions, whose sums and plans must not stand in for each other; and parameters loaded as new tensors (which start
+at the old ones' version) must not be read through the old ones' sums.
 
-Against a fresh circuit, not a reference: a stale plan launches at another batch (another grid, another `batch_size`),
-an error of the gradient's own size, far past what two circuits choosing their forks by measurement differ by.
+Against a fresh circuit, not a reference: a stale plan launches at another batch (another grid, another `batch_size`)
+and a stale sum is another partition's or other parameters', each an error of the gradient's own size, far past what
+two circuits choosing their forks by measurement differ by.
 """
 
 import pytest
@@ -64,10 +67,29 @@ def _assert_close(got, ref, what):
 
 @cuda_only
 def test_a_circuit_run_at_other_batches_gives_a_fresh_circuits_backward():
-    used, ns, _ = _compile()
+    used, ns, layer = _compile()
     for batch in (64, 8, 128, 64, 8):
         data, phi = _inputs(ns, batch)
         got = _outputs(used, ns, data, phi)
         fresh, fns, _ = _compile()
         _assert_close(got, _outputs(fresh, fns, data, phi), f"batch {batch}")
+    # ... and the sums were KEPT meanwhile, each partition's its own (one entry for the layer had them evict each
+    # other: a gather of every parameter, each backward)
+    sums = {pid: hit[2] for pid, hit in layer._bs_sigma_cache.items()}
+    assert sorted(sums) == [0, 1] and sums[0].shape != sums[1].shape
+    _outputs(used, ns, *_inputs(ns, 64))
+    assert all(layer._bs_sigma_cache[pid][2] is s for pid, s in sums.items()), "the parameter sums were recomputed"
 
+
+@cuda_only
+def test_parameters_loaded_as_new_tensors_are_summed_anew():
+    used, ns, layer = _compile(seed = 0)
+    data, phi = _inputs(ns, 64)
+    _outputs(used, ns, data, phi)                              # the sums of seed 0's parameters, kept
+    version = used.params._version
+    other, ons, _ = _compile(seed = 1)
+    # (`state_dict`'s tensors share the other circuit's version counter, which its compile moved as far as this one's)
+    used.load_state_dict(other.state_dict(), assign = True)
+    assert used.params._version == version and not torch.equal(used.params, _compile(seed = 0)[0].params), \
+        "the case is OTHER parameters at an EQUAL version"
+    _assert_close(_outputs(used, ns, data, phi), _outputs(other, ons, data, phi), "after load_state_dict(assign)")

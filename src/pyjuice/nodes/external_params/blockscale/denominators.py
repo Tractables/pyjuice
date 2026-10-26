@@ -8,6 +8,7 @@ shared dual-EM kernels in its gate-space form.
 from __future__ import annotations
 
 import os
+import weakref
 
 import torch
 
@@ -431,12 +432,17 @@ class _DenominatorsMixin:
 
         Recomputing it every backward would be a full read of theta for a quantity that only moves when
         the parameters do -- i.e. once per EM step, not once per batch. `Tensor._version` bumps on the
-        in-place parameter update, which is exactly the invalidation signal.
+        in-place parameter update, which is exactly the invalidation signal. One entry per partition (a single entry
+        for the layer had its partitions evict each other: a full gather of theta every backward), each holding which
+        tensor it was summed from (a weak reference: a `params` tensor assigned anew may start at an equal version).
         """
-        cache = getattr(layer, "_bs_sigma_cache", None)
-        key = (pid, params._version, block_size, gate_cbs)
-        if cache is not None and cache[0] == key:
-            return cache[1], cache[2]
+        cache = layer.__dict__.get("_bs_sigma_cache")
+        if cache is None:
+            cache = layer.__dict__["_bs_sigma_cache"] = {}
+        key = (params._version, block_size, gate_cbs)
+        hit = cache.get(pid)
+        if hit is not None and hit[0] == key and hit[1]() is params:
+            return hit[2], hit[3]
 
         pids = layer.partitioned_pids[pid].to(torch.int64)
         rows, num_edges = pids.shape
@@ -448,5 +454,5 @@ class _DenominatorsMixin:
         sg = th.view(rows, n_gates, gate_cbs, block_size).sum(dim = 2)  # [rows, gates, block_size]
         sigma = sg.permute(0, 2, 1).reshape(rows * block_size, n_gates).contiguous()
 
-        layer._bs_sigma_cache = (key, sigma, n_gates)
+        cache[pid] = (key, weakref.ref(params), sigma, n_gates)
         return sigma, n_gates
