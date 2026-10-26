@@ -126,8 +126,27 @@ class _DenominatorsMixin:
             return self._accumulate_denom_torch(layer, node_flows, params, external_params,
                                                 denom_param_flows)
 
-        import triton
         from ..kernels.blockscale_backward import _bs_triton_denom_w_kernel
+
+        state = layer._bs_bw_state
+        dot_ieee = 0 if os.environ.get("PYJUICE_BLOCKSCALE_DENOM_TF32", "0") == "1" else 1
+
+        # The launches' tiles, grids and views, worked out once per (batch, precision) and kept with the buffer they view
+        # (another buffer replaces the plan); the forward's tensors (`nids`, `log Z`), the staging buffer and
+        # `node_flows` come with each call
+        plans = layer.__dict__.setdefault("_bs_denom_plans", {})
+        pkey = (state["batch_size"], state["ext_base"], dot_ieee)
+        plan = plans.get(pkey)
+        if plan is None or plan[0] is not denom_param_flows:
+            plan = plans[pkey] = (denom_param_flows, self._denom_plan(layer, params, denom_param_flows, dot_ieee))
+        for (nids, log_z, rows), (grid, W, gate, consts) in zip(state["shift_args"], plan[1]):
+            _bs_triton_denom_w_kernel[grid](
+                node_flows = node_flows, log_z = log_z, W = W, ext = external_params, gate = gate, nids = nids,
+                **consts)
+
+    def _denom_plan(self, layer, params, denom_param_flows, dot_ieee):
+        """Per partition `(grid, W, gate, constant arguments)` of `_bs_triton_denom_w_kernel` at this batch."""
+        import triton
 
         state = layer._bs_bw_state
         block_size, batch = state["block_size"], state["batch_size"]
@@ -137,6 +156,7 @@ class _DenominatorsMixin:
         TILE_SIZE_B = min(triton.next_power_of_2(batch), 64)
         B_NUM_TILES = triton.cdiv(batch, TILE_SIZE_B)
 
+        out = []
         for pid, (nids, log_z, rows) in enumerate(state["shift_args"]):
             gate = layer.ext_slots[0][pid]
             num_edges = layer.partitioned_cids[pid].size(1)
@@ -170,7 +190,6 @@ class _DenominatorsMixin:
                 TILE_SIZE_M //= 2
             m_tiles = max(1, block_size // TILE_SIZE_M)
             w_use_dot = 1 if (TILE_SIZE_M >= 16 and TILE_SIZE_G >= 16 and TILE_SIZE_B >= 16) else 0
-            dot_ieee = 0 if os.environ.get("PYJUICE_BLOCKSCALE_DENOM_TF32", "0") == "1" else 1
 
             # SPLIT THE BATCH REDUCTION across programs until the grid is big enough to fill the
             # device. Each slice holds a PARTIAL sum for the same `W[n,g]`, so their combine must be
@@ -182,14 +201,14 @@ class _DenominatorsMixin:
             B_TILES_PER_PROG = triton.cdiv(B_NUM_TILES, B_SPLITS)
             B_SPLITS = triton.cdiv(B_NUM_TILES, B_TILES_PER_PROG)
 
-            _bs_triton_denom_w_kernel[(rows * m_tiles, g_tiles, B_SPLITS)](
-                node_flows = node_flows, log_z = log_z, W = W, ext = external_params, gate = gate,
-                nids = nids, batch_size = batch, n_gates = n_gates,
+            out.append(((rows * m_tiles, g_tiles, B_SPLITS), W, gate, dict(
+                batch_size = batch, n_gates = n_gates,
                 TILE_SIZE_B = TILE_SIZE_B, TILE_SIZE_G = TILE_SIZE_G, TILE_SIZE_M = TILE_SIZE_M,
                 BLOCK_SIZE_M = block_size, NODE_CBS = node_cbs, GATE_CBS = gate_cbs,
                 gate_stride = gate.size(1), ext_base = ext_base,
                 B_TILES_PER_PROG = B_TILES_PER_PROG, USE_DOT = w_use_dot, DOT_IEEE = dot_ieee,
-                W_ATOMIC = 1 if B_SPLITS > 1 else 0, num_stages = 1)
+                W_ATOMIC = 1 if B_SPLITS > 1 else 0, num_stages = 1)))
+        return tuple(out)
 
     def _accumulate_denom_torch(self, layer, node_flows, params, external_params, denom_param_flows):
         """

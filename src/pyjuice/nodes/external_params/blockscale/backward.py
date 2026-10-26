@@ -23,6 +23,12 @@ ELE_PREPASS = os.environ.get("PYJUICE_BLOCKSCALE_ELE_PREPASS", "1") != "0"
 #: instead (the denominator flow's switch is PYJUICE_BLOCKSCALE_DENOM_TF32).
 LOGZ_DOT_IEEE = 0 if os.environ.get("PYJUICE_BLOCKSCALE_LOGZ_TF32", "0") == "1" else 1
 
+def _set_attrs(layer, **attrs) -> None:
+    """Plain attributes of a layer -- functions, tensors, None: never a parameter, buffer or module -- written past
+    `nn.Module.__setattr__`, whose registration checks cost ~1.5 us a write (a gated layer's backward makes fifteen)."""
+    layer.__dict__.update(attrs)
+
+
 # Packs (parent node id, child element id) into one int64 key for the backward gate lookup. Node and
 # element ids are global row indices into `node_mars` / `element_mars`, so this holds for any circuit
 # that fits in memory; asserted where the keys are built.
@@ -280,7 +286,7 @@ class _BackwardMixin:
             EXTERNAL_PARAMS_GRAD_BUFFER_KWARG
         grads = kwargs.get(EXTERNAL_PARAMS_GRAD_KWARG, None)
         want_grad = grads is not None and any(ns_info.ns in grads for ns_info, _ in ns_tensors)
-        layer._bs_grad_ext = kwargs.get(EXTERNAL_PARAMS_GRAD_BUFFER_KWARG, None) if want_grad else None
+        _set_attrs(layer, _bs_grad_ext = kwargs.get(EXTERNAL_PARAMS_GRAD_BUFFER_KWARG, None) if want_grad else None)
         if want_grad and layer._bs_grad_ext is None:
             raise RuntimeError("external-parameter gradients were requested but no gradient buffer "
                                "was supplied to the backward.")
@@ -315,7 +321,7 @@ class _BackwardMixin:
         elep_mod = get_ele_prepass_module() if ELE_PREPASS else None
         # A tied group's parameter flows may be left to the end of the pass (`deferred_par`), when the backward allows it
         pd_mod = get_par_deferred_module() if deferred_par.PAR_DEFER else None
-        layer._bs_defer = bool(kwargs.get("defer_param_flows", False))
+        _set_attrs(layer, _bs_defer = bool(kwargs.get("defer_param_flows", False)))
 
         batch_size, block_size = state["batch_size"], state["block_size"]
         ext_base, gate_cbs, node_cbs = state["ext_base"], state["gate_cbs"], state["node_cbs"]
@@ -710,15 +716,15 @@ class _BackwardMixin:
                     ext_base = ext_base, pid_m_offset = s0, num_stages = 1,
                     PADDED = padded, PF_ATOMIC = pf_atomic)
 
-        layer._ext_bw_ele_hook = _ele_hook
+        _set_attrs(layer, _ext_bw_ele_hook = _ele_hook)
         # Installed UNCONDITIONALLY, even without the CuTe param module: `_par_hook` falls back to its
         # own Triton candidate when `par_mod` is None. Making the hook itself conditional left a hole
         # -- the layer's CUDA param regime is gated on a DIFFERENT extension, so it can be available
         # while `par_mod` is not, and the backward would then run the ungated kernel and return
         # SHARED-parameter flows for a gated layer. Silently, with no error.
-        layer._ext_bw_par_hook = _par_hook
-        layer._ext_bw_par_sb_hook = _par_sb_hook if sb_mod is not None else None
-        layer._ext_bw_par_triton_hook = _par_triton_hook
+        _set_attrs(layer, _ext_bw_par_hook = _par_hook,
+                   _ext_bw_par_sb_hook = _par_sb_hook if sb_mod is not None else None,
+                   _ext_bw_par_triton_hook = _par_triton_hook)
 
         return None
 
@@ -729,10 +735,8 @@ class _BackwardMixin:
         if len(ns_tensors) == 0:
             return None
 
-        layer._ext_bw_ele_hook = None
-        layer._ext_bw_par_hook = None
-        layer._ext_bw_par_sb_hook = None
-        layer._ext_bw_par_triton_hook = None
+        _set_attrs(layer, _ext_bw_ele_hook = None, _ext_bw_par_hook = None, _ext_bw_par_sb_hook = None,
+                   _ext_bw_par_triton_hook = None)
 
         from ..kernels.shift_logz import shift_logz
 
@@ -742,51 +746,29 @@ class _BackwardMixin:
         # no operand with it. Uses `log Z` straight from the forward's cache, so nothing is recomputed.
         grad_ext = getattr(layer, "_bs_grad_ext", None)
         if grad_ext is not None:
-            import triton
             from ..kernels.blockscale_backward import _bs_triton_phigrad_logz_kernel
 
             external_params = kwargs.get(_buffer_kwarg(), None)
             bs_, gate_cbs = state["block_size"], state["gate_cbs"]
             batch = state["batch_size"]
 
+            # Per partition its launch (grid, constant arguments: the measured tile) once per batch and state; `sigma`
+            # (cached until the parameters change), the forward's tensors and the buffers come with each call
+            plans = layer.__dict__.setdefault("_bs_logz_plans", {})
             for pid, (nids, log_z, rows) in enumerate(state["shift_args"]):
                 sigma, n_gates = self._sigma(layer, params, pid, bs_, gate_cbs)
                 gb = layer.ext_slots[0][pid]
-                # WHY THE FIRST TERM STAYS FUSED. Fusing it costs the element kernel ~13 us -- far more
-                # than the ~0.8 us of arithmetic it adds -- which looks like an occupancy penalty from
-                # carrying its accumulator through that kernel's k loop. So a standalone kernel
-                # computing BOTH terms was written and measured against it. It lost everywhere: at
-                # K=1024 / block 128 / gate 8 it ran the gated backward at 1.38x the ungated one
-                # against the fused path's 1.34x, and at batch 8 at 3.6x against ~1.2x, because the
-                # separate kernel re-reads `node_flows`, `node_mars` and the parameters that the
-                # element kernel already has in registers. Reading them twice costs more than the
-                # occupancy does. Do not re-split this without re-measuring.
-                #
-                # `rows` is the y axis, which CUDA caps at 65535. The kernel reads `pid_nb` straight
-                # from `program_id(1)` with no offset argument, so it cannot be chunked the way the
-                # flow launches above are -- refuse rather than let the driver truncate the grid and
-                # silently drop the gradient of every node block past the cap.
-                assert rows <= 65535, \
-                    f"partition {pid} has {rows} node blocks, past the 65535 CUDA grid-y limit for " \
-                    f"the external-gradient kernel. Split the partition, or use a larger block size."
+                pkey = (batch, pid, bs_, gate_cbs, state["node_cbs"], state["ext_base"], LOGZ_DOT_IEEE)
+                plan = plans.get(pkey)
+                if plan is None:
+                    plan = plans[pkey] = self._logz_plan(layer, grad_ext, node_flows, external_params, state, nids,
+                                                         log_z, rows, sigma, gb, n_gates)
+                grid, consts = plan
+                _bs_triton_phigrad_logz_kernel[grid](
+                    node_flows = node_flows, log_z = log_z, sigma = sigma, ext = external_params, gate = gb,
+                    grad_ext = grad_ext, nids = nids, **consts)
 
-                def _go(gt, bb, tm, tgt, nids = nids, log_z = log_z, rows = rows, sigma = sigma,
-                        gb = gb, n_gates = n_gates):
-                    _bs_triton_phigrad_logz_kernel[
-                            (triton.cdiv(n_gates, gt), rows * (bs_ // tm), triton.cdiv(batch, bb))](
-                        node_flows = node_flows, log_z = log_z, sigma = sigma, ext = external_params,
-                        gate = gb, grad_ext = tgt, nids = nids,
-                        batch_size = batch, n_gates = n_gates,
-                        N_CHILD_GATES = state["node_cbs"] // gate_cbs, BLOCK_SIZE_M = bs_,
-                        BLOCK_B = bb, GATE_TILE = gt, TILE_SIZE_M = tm,
-                        USE_DOT = (1 if (gt >= 16 and tm >= 16 and batch >= 64) else 0),
-                        gate_stride = gb.size(1),
-                        ext_base = state["ext_base"], num_stages = 1, DOT_IEEE = LOGZ_DOT_IEEE)
-
-                gt, bb, tm = self._logz_tile(layer, _go, grad_ext, batch, bs_, n_gates, rows)
-                _go(gt, bb, tm, grad_ext)
-
-            layer._bs_grad_ext = None
+            _set_attrs(layer, _bs_grad_ext = None)
 
         # The denominator flow `F-` for `apply_z_correction`. Present exactly when the PC allocated
         # `denom_param_flows` (i.e. a layer requested it): a model built with `apply_z_correction = False`
@@ -802,6 +784,49 @@ class _BackwardMixin:
             shift_logz(node_mars, nids, log_z, state["block_size"], -1.0)
 
         return None
+
+    def _logz_plan(self, layer, grad_ext, node_flows, external_params, state, nids, log_z, rows, sigma, gb, n_gates):
+        """`(grid, constant arguments)` of `_bs_triton_phigrad_logz_kernel` for one partition at this batch, its tile
+        measured (`_logz_tile`, which times candidate launches into a scratch)."""
+        import triton
+        from ..kernels.blockscale_backward import _bs_triton_phigrad_logz_kernel
+
+        bs_, gate_cbs, batch = state["block_size"], state["gate_cbs"], state["batch_size"]
+        # WHY THE FIRST TERM STAYS FUSED. Fusing it costs the element kernel ~13 us -- far more
+        # than the ~0.8 us of arithmetic it adds -- which looks like an occupancy penalty from
+        # carrying its accumulator through that kernel's k loop. So a standalone kernel
+        # computing BOTH terms was written and measured against it. It lost everywhere: at
+        # K=1024 / block 128 / gate 8 it ran the gated backward at 1.38x the ungated one
+        # against the fused path's 1.34x, and at batch 8 at 3.6x against ~1.2x, because the
+        # separate kernel re-reads `node_flows`, `node_mars` and the parameters that the
+        # element kernel already has in registers. Reading them twice costs more than the
+        # occupancy does. Do not re-split this without re-measuring.
+        #
+        # `rows` is the y axis, which CUDA caps at 65535. The kernel reads `pid_nb` straight
+        # from `program_id(1)` with no offset argument, so it cannot be chunked the way the
+        # flow launches above are -- refuse rather than let the driver truncate the grid and
+        # silently drop the gradient of every node block past the cap.
+        assert rows <= 65535, \
+            f"a partition has {rows} node blocks, past the 65535 CUDA grid-y limit for " \
+            f"the external-gradient kernel. Split the partition, or use a larger block size."
+
+        def consts(gt, bb, tm):
+            return dict(batch_size = batch, n_gates = n_gates, N_CHILD_GATES = state["node_cbs"] // gate_cbs,
+                        BLOCK_SIZE_M = bs_, BLOCK_B = bb, GATE_TILE = gt, TILE_SIZE_M = tm,
+                        USE_DOT = (1 if (gt >= 16 and tm >= 16 and batch >= 64) else 0),
+                        gate_stride = gb.size(1), ext_base = state["ext_base"], num_stages = 1,
+                        DOT_IEEE = LOGZ_DOT_IEEE)
+
+        def grid(gt, bb, tm):
+            return (triton.cdiv(n_gates, gt), rows * (bs_ // tm), triton.cdiv(batch, bb))
+
+        def _go(gt, bb, tm, tgt):
+            _bs_triton_phigrad_logz_kernel[grid(gt, bb, tm)](
+                node_flows = node_flows, log_z = log_z, sigma = sigma, ext = external_params, gate = gb,
+                grad_ext = tgt, nids = nids, **consts(gt, bb, tm))
+
+        gt, bb, tm = self._logz_tile(layer, _go, grad_ext, batch, bs_, n_gates, rows)
+        return grid(gt, bb, tm), consts(gt, bb, tm)
 
     def _logz_tile(self, layer, launch, grad_ext, batch, block_size, n_gates, rows):
         """

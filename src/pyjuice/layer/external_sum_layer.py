@@ -661,10 +661,10 @@ class ExternalParamsSumLayer(SumLayer):
             # duration of this call (see `SumLayer._ext_bw_ele_hook`). Left installed after a raise
             # they would make the NEXT backward -- possibly an ungated one -- fail or, worse, run a
             # gated kernel against a stale plan.
-            self._ext_bw_ele_hook = None
-            self._ext_bw_par_hook = None
-            self._ext_bw_par_sb_hook = None
-            self._ext_bw_par_triton_hook = None
+            # (Plain attributes, written past `nn.Module.__setattr__`: its registration checks, ~1.5 us a write, on
+            # every gated layer's every backward.)
+            self.__dict__.update(_ext_bw_ele_hook = None, _ext_bw_par_hook = None, _ext_bw_par_sb_hook = None,
+                                 _ext_bw_par_triton_hook = None)
 
         return None
 
