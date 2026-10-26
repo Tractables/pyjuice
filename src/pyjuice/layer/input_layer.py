@@ -376,7 +376,9 @@ class InputLayer(Layer, nn.Module):
             self.param_flows = torch.zeros(shape, device = self.device)
         else:
             assert self.param_flows.size(0) == self.num_param_flows
-            if flows_memory < 1.0:
+            if flows_memory == 0.0:
+                self.param_flows.zero_()            # (a write pass, not a read-scale-write: see `TensorCircuit.init_param_flows`)
+            elif flows_memory < 1.0:
                 self.param_flows[:] *= flows_memory
 
         return None

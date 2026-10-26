@@ -251,7 +251,11 @@ class _LearningMixin:
             
         self._init_buffer(name = "param_flows", shape = pflow_shape)
 
-        if flows_memory != 1.0:
+        # At 0 a write pass (`zero_`), not a read-scale-write one: the same zeros at half the traffic (MEASURED, HCLT-1024's
+        # sum and input-layer flows: 2.4 ms each scaled), and a NaN or inf left in the buffer is cleared rather than kept
+        if flows_memory == 0.0:
+            self.param_flows.zero_()
+        elif flows_memory != 1.0:
             self.param_flows[:] *= flows_memory
 
         # The denominator flow buffer rides the identical reset/scale cadence, so `zero_param_flows`
@@ -266,7 +270,9 @@ class _LearningMixin:
         # still commutes with the reconstruction because `F- = theta * W` is linear in `W`.
         if self._requests_denom_param_flows:
             self._init_buffer(name = "denom_param_flows", shape = (self.num_denom_flows,))
-            if flows_memory != 1.0:
+            if flows_memory == 0.0:
+                self.denom_param_flows.zero_()
+            elif flows_memory != 1.0:
                 self.denom_param_flows[:] *= flows_memory
 
         # For input layers
