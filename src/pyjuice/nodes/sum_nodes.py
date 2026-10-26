@@ -398,9 +398,12 @@ class SumNodes(CircuitNodes):
             ch_gid_start = 0
             edge_ids = []
             for cs_id in range(len(self.chs)):
-                curr_edge_ids = per_ns_edge_ids[cs_id]
+                curr_edge_ids = per_ns_edge_ids[cs_id].clone()
+                assert torch.all(curr_edge_ids[1,:] >= 0), "Edge index underflow."
+                assert torch.all(curr_edge_ids[1,:] < self.chs[cs_id].num_node_blocks), "Edge index overflow."
                 curr_edge_ids[1,:] += ch_gid_start
                 edge_ids.append(curr_edge_ids)
+                ch_gid_start += self.chs[cs_id].num_node_blocks
 
             edge_ids = torch.cat(edge_ids, dim = 1)
 
