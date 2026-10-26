@@ -412,7 +412,8 @@ class Liveness:
     """
     The live columns of one query of ``B`` samples (see the module docstring), and what is derived from them on demand.
 
-    :ivar live: int8 [B, n + 1, W], every column's liveness per sample and boundary
+    :ivar live: int8 [B, n + 1, W], every column's liveness per sample and boundary -- the columns at or past a
+        boundary's width (``prog.width_t``) unspecified: every reader stops at the width
     :ivar lanes: the :class:`LaneOrder` of the sum intervals the query computes per sample (:meth:`order`), or None
         before it orders them
     :ivar allowed: None, or int8 [Be, n, C] (``Be`` 1 or ``B``): the classes a missing token can have per sample under

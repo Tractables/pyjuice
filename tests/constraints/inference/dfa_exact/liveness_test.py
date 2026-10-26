@@ -458,8 +458,9 @@ def test_pruning_engages_only_under_evidence(build_pc, monkeypatch):
     full = [data.size(0) * s for s in prog.sum_iv_slots]
     assert sum(lv.num_live) < 0.7 * sum(full)
     live = lv.live.cpu()
+    widths = [int(w) for w in cc.backend.layout.width.tolist()[:n]] + [1]
     for t in range(n // 2 + 1):                                  # through the observed prefix: one column each
-        assert (live[:, t].sum(dim = 1) <= 1).all()
+        assert (live[:, t, :widths[t]].sum(dim = 1) <= 1).all()
 
 
 @pytest.mark.parametrize("storage", ["dense", "compact"])
