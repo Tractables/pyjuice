@@ -293,3 +293,45 @@ def get_prepass_module():
         _prepass_module = None
 
     return _prepass_module
+
+
+# The pre-pass element-flow backward (blockscale_ele_backward_prepass.cu): CuTe (MMA atoms, ldmatrix), no TMA, the
+# same toolchain gate. Its own extension, so a failure leaves the other element forks in place.
+_ele_prepass_module = None
+_ele_prepass_attempted = False
+
+
+def get_ele_prepass_module():
+    """The pre-pass block-scale element-flow backward extension, or None if its toolchain is unavailable (warns once)."""
+    global _ele_prepass_module, _ele_prepass_attempted
+
+    if _ele_prepass_attempted:
+        return _ele_prepass_module
+
+    _ele_prepass_attempted = True
+
+    if not ENABLE_CUDA_KERNELS:
+        return None
+
+    from pyjuice.layer.kernels.c import _compile_flags
+
+    flags = _compile_flags()
+    if flags is None:
+        return None
+
+    cuda_cflags, ldflags = flags
+
+    from pyjuice.utils.cuda_ext import jit_load
+    try:
+        _ele_prepass_module = jit_load("pyjuice_blockscale_ele_prepass_cuda",
+                                       sources = [os.path.join(_THIS_DIR, "blockscale_ele_backward_prepass.cu")],
+                                       extra_cuda_cflags = cuda_cflags, extra_ldflags = ldflags,
+                                       verbose = False)
+    except Exception as e:
+        warnings.warn(
+            f"pyjuice CUDA kernel 'pyjuice_blockscale_ele_prepass_cuda' failed to compile "
+            f"({type(e).__name__}: {e}). The block-scale element-flow backward keeps its other kernels.",
+            RuntimeWarning)
+        _ele_prepass_module = None
+
+    return _ele_prepass_module

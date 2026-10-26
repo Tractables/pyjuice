@@ -189,7 +189,13 @@ def test_every_fork_computes_the_same_gradient():
     layer = [l for gg in pc.inner_layer_groups if gg.is_sum() for l in gg.layers
              if hasattr(l, "external_node_infos")][0]
 
-    for forced in ("triton", "cute"):
+    from pyjuice.nodes.external_params.kernels.c import get_ele_prepass_module
+    from pyjuice.nodes.external_params.blockscale import backward as bs_backward
+    elep = get_ele_prepass_module() if bs_backward.ELE_PREPASS else None
+    # (the pre-pass fork's configs too: at this gate width 8 its error is the log-Z kernel's TF32 one, ~3e-3, which
+    # the Triton element fork's own TF32 error happens to cancel)
+    pre = [("elep", int(c)) for c in elep.fitting_configs(128, 64, 8, 2)] if elep is not None else []
+    for forced in ["triton", "cute"] + pre:
         for k, v in layer._bs_bw_gate_cache.items():
             if isinstance(k, tuple) and k and k[0] == "eleplan":
                 v["kind"] = forced

@@ -13,6 +13,11 @@ import torch
 
 from .common import _buffer_kwarg
 
+#: The pre-pass element-flow backward (kernels/c/blockscale_ele_backward_prepass.cu: the Triton fork's computation,
+#: not its bits, as a pre-pass and a streaming kernel) among the measured element forks;
+#: PYJUICE_BLOCKSCALE_ELE_PREPASS=0 leaves it out.
+ELE_PREPASS = os.environ.get("PYJUICE_BLOCKSCALE_ELE_PREPASS", "1") != "0"
+
 #: The log-Z half of `d LL / d log phi` contracts at fp32 precision; PYJUICE_BLOCKSCALE_LOGZ_TF32=1 takes TF32 dots
 #: instead (the denominator flow's switch is PYJUICE_BLOCKSCALE_DENOM_TF32).
 LOGZ_DOT_IEEE = 0 if os.environ.get("PYJUICE_BLOCKSCALE_LOGZ_TF32", "0") == "1" else 1
@@ -293,7 +298,7 @@ class _BackwardMixin:
 
         state = self._bw_state(layer, node_mars, kwargs)
 
-        from ..kernels.c import get_ele_bw_module, get_par_bw_module, get_sb_bw_module
+        from ..kernels.c import get_ele_bw_module, get_par_bw_module, get_sb_bw_module, get_ele_prepass_module
         from ..kernels.shift_logz import shift_logz
 
         # NO CUDA extension is required here. The CuTe and small-batch forks are accelerators, and
@@ -305,6 +310,7 @@ class _BackwardMixin:
         # costs speed, not correctness.
         ele_mod, par_mod = get_ele_bw_module(), get_par_bw_module()
         sb_mod = get_sb_bw_module()
+        elep_mod = get_ele_prepass_module() if ELE_PREPASS else None
 
         batch_size, block_size = state["batch_size"], state["block_size"]
         ext_base, gate_cbs, node_cbs = state["ext_base"], state["gate_cbs"], state["node_cbs"]
@@ -332,9 +338,10 @@ class _BackwardMixin:
             """
             Run this layer's gated element flows with whichever of the forks is fastest here.
 
-            Three may apply and which wins is not deducible: the CuTe fork is strongest at very large
+            Four may apply and which wins is not deducible: the CuTe fork is strongest at very large
             batch, but the ungated layer's own autotuner prefers Triton to its CuTe kernel at many
-            shapes, and below batch 16 the plain-CUDA fork beats both. So they are MEASURED.
+            shapes, below batch 16 the plain-CUDA fork beats both, and the pre-pass fork (`ELE_PREPASS`)
+            takes the shapes it serves from Triton by 2-4x where measured. So they are MEASURED.
 
             The whole decision -- eligibility, gate tables, winner -- is cached per
             (signature, batch, partition) and only the winning launch is built per call. An earlier
@@ -379,6 +386,14 @@ class _BackwardMixin:
             if (ele_mod is not None and ctx["ele_cuda_ok"] and ctx.get("ele_loads_aligned", True) and tk == 64
                     and pinc == 1 and cbs % 128 == 0 and batch % 64 == 0 and plan["gate_tile"] is not None):
                 kinds.append("cute")
+
+            # The pre-pass fork (`ELE_PREPASS`) on the CuTe fork's tables, under the same contract (a k-tile of 64
+            # parents in one parent block, the 8-parameter loads aligned); its own scope -- batch % 64, a power-of-two
+            # gate width >= 4, the element block a multiple of a config's rows, the gates in shared memory -- is
+            # `fitting_configs`'.
+            if (elep_mod is not None and ctx["ele_cuda_ok"] and ctx.get("ele_loads_aligned", True) and tk == 64
+                    and pinc == 1 and plan["gate_tile"] is not None):
+                kinds += [("elep", int(c)) for c in elep_mod.fitting_configs(cbs, batch, gate_cbs, knt)]
 
             if (sb_mod is not None and batch < 16 and ne % blk == 0 and ctx["ele_cuda_ok"]
                     and pinc == 1):
@@ -475,6 +490,16 @@ class _BackwardMixin:
                     (layer._bs_grad_ext if layer._bs_grad_ext is not None
                      else external_params.new_empty(0)),
                     batch, blk, cbs, knt, gate_cbs, ext_base)
+
+            elif isinstance(kind, tuple) and kind[0] == "elep":
+                if external_params.data_ptr() % 16:            # (its log-gate rows are 16-byte copies)
+                    return _launch_ele(ctx, plan, tgt, "triton")
+                elep_mod.blockscale_ele_backward_prepass(
+                    tgt, ctx["element_mars"], ctx["node_flows"], ctx["node_mars"], ctx["params"],
+                    external_params, chids, ctx["ele_ebase"], ctx["ele_pbase"], plan["gate_tile"],
+                    (layer._bs_grad_ext if layer._bs_grad_ext is not None
+                     else external_params.new_empty(0)),
+                    batch, blk, cbs, knt, gate_cbs, ext_base, 1 if layer._bs_grad_ext is not None else 0, kind[1])
 
             elif isinstance(kind, tuple):                     # ("sb", cfg)
                 e0, p0 = plan["sb"]
