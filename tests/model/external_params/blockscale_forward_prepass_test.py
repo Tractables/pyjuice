@@ -233,11 +233,11 @@ def test_a_forward_taking_it_gives_the_forks_results(name, builder, dt, B, neg_g
         assert offered == set(pre.fitting_configs(a[5], B, a[7], a[8])), offered
     assert torch.equal(_bits(lls_a), _bits(lls_b)), f"{name}: log-likelihoods differ"
     assert all(torch.equal(_bits(u), _bits(v)) for u, v in zip(zs_a, zs_b)), f"{name}: log Z differs"
-    if torch.equal(_bits(pf_a), _bits(pf_c)):                # a deterministic backward: to the bit
-        assert torch.equal(_bits(pf_a), _bits(pf_b)), f"{name}: the backward's parameter flows differ"
-    else:                                                    # atomics: within the fork's own run-to-run spread
-        spread = float((pf_a - pf_c).abs().max())
-        assert float((pf_a - pf_b).abs().max()) <= 4 * spread + 1e-6, f"{name}: the backward's flows differ"
+    # Within the fork's own run-to-run spread, with a floor: the backward's atomics vary its bits, and two runs that
+    # happened to agree proved nothing (a third differed by an ulp in a loaded suite).
+    spread = float((pf_a - pf_c).abs().max())
+    tol = 4 * spread + 1e-6 * float(pf_a.abs().max())
+    assert float((pf_a - pf_b).abs().max()) <= tol, f"{name}: the backward's parameter flows differ"
 
 
 @needs_kernels
