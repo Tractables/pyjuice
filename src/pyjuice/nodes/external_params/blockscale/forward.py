@@ -37,7 +37,7 @@ class _ForwardMixin:
         """
         Resolve every per-layer launch argument once, and check each kernel's assumptions.
 
-        FOUR kernels serve this type, and which apply is a property of the shape:
+        FIVE kernels serve this type, and which apply is a property of the shape:
 
           * the CuTe/TMA fork, for batches it can tile (`batch % 64 == 0`) on sm_90+ with CUTLASS. It
             carries the normalizer as a gate-factored contraction against a precomputed `sigma`;
@@ -45,6 +45,10 @@ class _ForwardMixin:
             children (`ch_block_size >= 64`) and a gate spans at least 4 of them: the fork's work that
             depends on the edge tile alone done once per node block, the running maxima as prefix
             maxima, the tiles' MMAs spread over groups of warps and merged in order;
+          * the split forward (kernels/c/blockscale_forward_stream.cu), bf16 parameters in the pre-pass copy's scope:
+            the children cut into ranges each under one stabilizer, so each range is a plain bf16 GEMM, the ranges'
+            partials merged after, and the normalizer from `sigma` on the SMs the GEMM leaves idle -- not the fork's
+            bits (more accurate: fp32-level `log Z`). Its (tile, split) is measured once per shape (`_stream_code`);
           * a plain-CUDA small-batch kernel, one warp per 32 nodes, which accumulates the normalizer
             inline and needs neither `batch % 64` nor `num_edges % 64` nor CUTLASS;
           * the portable Triton fork, which needs no CUDA toolchain at all and applies everywhere,
@@ -54,7 +58,7 @@ class _ForwardMixin:
         All three are collected here and the choice is MEASURED, so where they overlap the faster one
         wins rather than the one that happened to be checked first.
         """
-        from ..kernels.c import get_cute_module, get_sb_module, get_prepass_module
+        from ..kernels.c import get_cute_module, get_sb_module, get_prepass_module, get_stream_module
         import pyjuice.layer.kernels.c as ck
 
         # NEITHER CUDA extension is required any more. The CuTe forward needs nvcc, CUTLASS and
@@ -96,6 +100,10 @@ class _ForwardMixin:
         # (`node_cbs >= 64`), with a gate width >= 4, and like the fork one gate per node block.
         pre_valid = ([int(i) for i in pre_mod.fitting_configs(block_size, batch_size, node_cbs, gate_cbs)]
                      if (pre_mod is not None and block_size == gate_bs) else [])
+        # The split forward's tiles: the same tuples and scope (bf16 parameters, node blocks of 64s).
+        stream_mod = get_stream_module() if params.dtype == torch.bfloat16 else None
+        stream_valid = ([int(i) for i in stream_mod.fitting_configs(block_size, batch_size, node_cbs, gate_cbs)]
+                        if (stream_mod is not None and block_size == gate_bs) else [])
 
         # The small-batch kernel needs only 32-node groups, but its children must be contiguous across
         # the WHOLE row rather than within each edge tile -- it walks the edge axis with a single base.
@@ -181,7 +189,7 @@ class _ForwardMixin:
             #
             # The within-run property is still VERIFIED rather than trusted -- it is an invariant of
             # another module, and a silent violation would be a wrong answer rather than a crash.
-            if (valid or pre_valid) and num_edges % 64 == 0:
+            if (valid or pre_valid or stream_valid) and num_edges % 64 == 0:
                 step = min(node_cbs, 64)
                 nrun = num_edges // step
                 c3, p3 = c2.view(-1, nrun, step), p2.view(-1, nrun, step)
@@ -362,6 +370,17 @@ class _ForwardMixin:
                             gate_stride = c["gate"].size(1), ext_base = ext_base, num_stages = 1)
             return run
 
+        def _stream_runner(code):
+            tuned = _with_cfg(calls, code)
+
+            def run():
+                for _ in range(REPEATS):
+                    for pid, args in enumerate(tuned):
+                        stream_mod.blockscale_forward_stream(
+                            node_mars, element_mars, params, external_params, *args,
+                            self._sigma(layer, params, pid, block_size, gate_cbs)[0])
+            return run
+
         cands = []
         if calls:
             for i in valid:
@@ -369,6 +388,12 @@ class _ForwardMixin:
             # The pre-pass copy takes the same launch tuples, and writes `node_mars` and `log Z` by assignment too.
             for i in pre_valid:
                 cands.append((("pre", i), _runner(pre_mod.blockscale_forward_prepass, calls, i)))
+            # The split forward: the same tuples and each partition's `sigma`, by assignment too; one candidate, its
+            # (tile, split) measured first.
+            if stream_valid:
+                code = self._stream_code(layer, calls, stream_mod, stream_valid, node_mars, element_mars, params,
+                                         external_params)
+                cands.append((("stream", code), _stream_runner(code)))
         if sb_calls:
             for i in range(len(sb_mod.blockscale_sb_configs())):
                 cands.append((("sb", i), _runner(sb_mod.blockscale_sb_forward, sb_calls, i)))
@@ -399,6 +424,8 @@ class _ForwardMixin:
             out_mod, fname, calls = mod, "blockscale_forward", _with_cfg(calls, best_cfg)
         elif kind == "pre":
             out_mod, fname, calls = pre_mod, "blockscale_forward_prepass", _with_cfg(calls, best_cfg)
+        elif kind == "stream":
+            out_mod, fname, calls = stream_mod, "blockscale_forward_stream", _with_cfg(calls, best_cfg)
         else:
             out_mod, fname, calls = sb_mod, "blockscale_sb_forward", _with_cfg(sb_calls, best_cfg)
 
@@ -414,6 +441,42 @@ class _ForwardMixin:
         }
 
         return out_mod, fname, calls
+
+    def _stream_code(self, layer, calls, stream_mod, valid, node_mars, element_mars, params, external_params):
+        """
+        The split forward's `config id * 16 + split` for this layer's shape: the rule's -- the first fitting tile, the
+        most splits that keep its grid within one block an SM -- or another (tile, split) where it measures faster
+        (`autotune.pick`, keyed by shape: equal layers share it), timed on the live buffers (it writes `node_mars` and
+        `log Z` by assignment).
+        """
+        from pyjuice.layer.kernels import autotune
+        from .denominators import _sm_count
+
+        batch = node_mars.size(1)
+        bs_, node_cbs, gate_cbs = calls[0][5], calls[0][7], calls[0][8]
+        cfgs = [tuple(int(v) for v in c) for c in stream_mod.configs()]
+        sms = _sm_count(node_mars.device)
+        cands = []
+        for i in valid:
+            bm, bn, kt = cfgs[i]
+            tiles = sum((batch // bn) * c[0].numel() * (bs_ // bm) for c in calls)
+            kmin = min(c[6] // kt for c in calls)
+            splits = [s for s in (1, 2, 3, 4, 5, 6, 8) if s <= kmin and (s == 1 or s * tiles <= 8 * sms)]
+            fit = [s for s in splits if s * tiles <= sms] or splits[:1]
+            cands += [i * 16 + s for s in [fit[-1]] + [s for s in splits if s != fit[-1]]]
+        if len(cands) == 1:
+            return cands[0]
+        sig = [self._sigma(layer, params, pid, bs_, gate_cbs)[0] for pid in range(len(calls))]
+
+        def bench(code):
+            tuned = [tuple(a[:-1]) + (code,) for a in calls]
+            for _ in range(3):
+                for args, s in zip(tuned, sig):
+                    stream_mod.blockscale_forward_stream(node_mars, element_mars, params, external_params, *args, s)
+
+        key = ("bs_fwd_stream", bs_, batch, node_cbs, gate_cbs, tuple((c[0].numel(), c[6]) for c in calls),
+               tuple(cands))
+        return autotune.pick(key, cands, bench)
 
     def forward_layer(self, layer, ns_tensors, node_mars, element_mars, params, **kwargs) -> None:
         """
@@ -482,6 +545,13 @@ class _ForwardMixin:
             return None
 
         fn = getattr(mod, fname)
+        if fname == "blockscale_forward_stream":
+            # and each partition's `sigma` (cached until the parameters change)
+            st = layer._bs_bw_state
+            for pid, args in enumerate(calls):
+                fn(node_mars, element_mars, params, external_params, *args,
+                   self._sigma(layer, params, pid, st["block_size"], st["gate_cbs"])[0])
+            return None
         for args in calls:
             fn(node_mars, element_mars, params, external_params, *args)
 

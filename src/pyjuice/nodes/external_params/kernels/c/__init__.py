@@ -418,3 +418,43 @@ def get_sigma_module():
 
     return _sigma_module
 
+
+# The split forward (blockscale_forward_stream.cu): CuTe (MMA atoms, ldmatrix), no TMA, the same toolchain gate as the
+# pre-pass copy. Its own extension, so a failure leaves the other forward forks in place.
+_stream_module = None
+_stream_attempted = False
+
+
+def get_stream_module():
+    """The split block-scale forward extension, or None if its toolchain is unavailable (warns once)."""
+    global _stream_module, _stream_attempted
+
+    if _stream_attempted:
+        return _stream_module
+
+    _stream_attempted = True
+
+    if not ENABLE_CUDA_KERNELS:
+        return None
+
+    from pyjuice.layer.kernels.c import _compile_flags
+
+    flags = _compile_flags()
+    if flags is None:
+        return None
+
+    cuda_cflags, ldflags = flags
+
+    from pyjuice.utils.cuda_ext import jit_load
+    try:
+        _stream_module = jit_load("pyjuice_blockscale_stream_cuda",
+                                  sources = [os.path.join(_THIS_DIR, "blockscale_forward_stream.cu")],
+                                  extra_cuda_cflags = cuda_cflags, extra_ldflags = ldflags,
+                                  verbose = False)
+    except Exception as e:
+        warnings.warn(
+            f"pyjuice CUDA kernel 'pyjuice_blockscale_stream_cuda' failed to compile "
+            f"({type(e).__name__}: {e}). The block-scale forward keeps its other kernels.", RuntimeWarning)
+        _stream_module = None
+
+    return _stream_module
