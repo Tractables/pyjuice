@@ -781,7 +781,9 @@ class SumLayer(Layer, nn.Module):
         # made once. The standard regime only -- LL, no tempering, whole partitions, flows not modified in place --,
         # where the decisions below read nothing but what the key holds (`kwargs` by name: their values are read by
         # the tempered kernels alone). A converted site adds one launcher per partition and kind of flow; any other
-        # leaves the count short, and the call is not planned.
+        # leaves the count short, and the call is not planned -- nor the recording around it, if one is open (a gated
+        # layer's, `ExternalParamsSumLayer.backward`, whose own sites this call's converted ones reach): so does a
+        # call in another regime, which records nothing.
         pkey = None
         if (partition_runs is None and compute_children is None and not allow_modify_flows and propagation_alg == "LL"
                 and pflow_temperature == 1.0 and not temper_eflow):
@@ -795,6 +797,8 @@ class SumLayer(Layer, nn.Module):
                 for launch in plan:
                     launch(node_flows, element_flows, node_mars, element_mars, params, param_flows)
                 return None
+        elif LaunchPlans.nested():
+            LaunchPlans.fail()
 
         if compute_children is not None and (param_flows is not None or allow_modify_flows):
             raise ValueError("`compute_children` serves a backward of element flows only.")
@@ -3138,9 +3142,13 @@ class SumLayer(Layer, nn.Module):
                 and batch_size < 16 and self.block_size % 32 == 0
                 and node_flows.is_cuda and cuda_kernels.smallbatch_par_is_available()
                 and self._ext_bw_par_sb_hook is not None):
-            self._ext_bw_par_sb_hook(
-                param_flows, node_flows, node_mars, element_mars, params, nids, cids, pids, pfids,
-                batch_size, self.block_size, num_edges, partition_id)
+            static = (nids, cids, pids, pfids, batch_size, self.block_size, num_edges, partition_id)
+
+            def _hook(node_flows, element_flows, node_mars, element_mars, params, param_flows, static = static):
+                self._ext_bw_par_sb_hook(param_flows, node_flows, node_mars, element_mars, params, *static)
+
+            LaunchPlans.add(_hook)
+            _hook(node_flows, None, node_mars, element_mars, params, param_flows)
             return None
 
         if (BACKWARD_PAR_FLOW_CUDA and propagation_alg_id == 0 and abs(pflow_temperature - 1.0) < 1e-6

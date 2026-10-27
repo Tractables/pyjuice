@@ -343,6 +343,26 @@ class ExternalSumParams():
             self.pre_backward(layer, ns_info, tensors, node_flows, element_flows, node_mars,
                               element_mars, params, **kwargs)
 
+    #: The tag of a layer backward's recording (`pyjuice.utils.launch_plans`): a parameterization's launch sites add
+    #: their launchers with it, so the sum layer's own sites -- the standard backward between the two hooks -- never
+    #: add to it, nor theirs to the sum layer's plans.
+    BACKWARD_PLAN_TAG = "external_sum_backward"
+
+    def backward_plan(self, layer, ns_tensors, ns_grad_tensors, node_mars, param_flows, denom_param_flows, kwargs):
+        """
+        `(key, launchers)` for a launch plan of this call's whole layer backward -- :func:`pre_backward_layer`, the
+        standard backward and :func:`post_backward_layer` --, or None (the default): every call takes the full path.
+
+        A parameterization that plans returns in `key` everything those three decide from at this call beyond what
+        the layer's own key holds (`ExternalParamsSumLayer.backward`: the batch, dtypes, device and flags) -- the
+        state its forward left, its own options --, and in `launchers` how many launchers its launch sites add with
+        `BACKWARD_PLAN_TAG` on the full path: one per unit of work, each taking `(node_flows, element_flows,
+        node_mars, element_mars, params, param_flows, denom_param_flows, kwargs)` -- `kwargs` the backward's, its
+        staging buffers among them -- and capturing no tensor of the call it was recorded in. Its checks of a call
+        must be in the key or here: a plan's replay runs none of them.
+        """
+        return None
+
     def post_backward_layer(self, layer, ns_tensors, ns_grad_tensors, node_flows, element_flows,
                             node_mars, element_mars, params, param_flows = None,
                             denom_param_flows = None, **kwargs) -> None:

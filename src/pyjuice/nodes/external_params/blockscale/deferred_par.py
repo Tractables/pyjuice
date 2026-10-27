@@ -95,10 +95,18 @@ def _long(t):
     return t if t.dtype == torch.long else t.long()
 
 
+def may_defer(mod, ctx, n_node_gates) -> bool:
+    """Whether a partition of this shape (`ctx`: its tables and sizes) defers at all -- the conditions fixed by it,
+    which `try_defer` checks first; the rest are a call's."""
+    blk, ne = ctx["block_size"], ctx["num_edges"]
+    return (mod is not None and n_node_gates == 1 and blk % 64 == 0 and ne % 64 == 0
+            and ctx["nids"].numel() * blk * ne >= MIN_FLOWS)
+
+
 def try_defer(mod, layer, ctx, gate_table, ext, node_cbs, gate_cbs, ext_base, n_node_gates) -> bool:
     """Capture this step's parameter flows into its tied group's slots (the flush deferred to the end of the pass)
     and return True; or return False, the caller then launching the step's own kernel."""
-    if mod is None or not getattr(layer, "_bs_defer", False) or n_node_gates != 1:
+    if not may_defer(mod, ctx, n_node_gates) or not getattr(layer, "_bs_defer", False):
         return False
     scope = current_scope()
     if scope is None:
@@ -106,8 +114,6 @@ def try_defer(mod, layer, ctx, gate_table, ext, node_cbs, gate_cbs, ext_base, n_
     pf, params = ctx["param_flows"], ctx["params"]
     batch, blk, ne = ctx["batch_size"], ctx["block_size"], ctx["num_edges"]
     nb = ctx["nids"].numel()
-    if blk % 64 != 0 or ne % 64 != 0 or nb * blk * ne < MIN_FLOWS:
-        return False
 
     # This layer's group, resolved once per (partition, batch): None where it does not defer
     cache = layer.__dict__.setdefault("_bs_pd_member", {})

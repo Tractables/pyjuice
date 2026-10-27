@@ -11,6 +11,7 @@ import os
 
 import torch
 
+from pyjuice.utils.launch_plans import LaunchPlans
 from .common import _buffer_kwarg
 from . import deferred_par
 
@@ -49,6 +50,19 @@ def _mod(name: str):
 def _shift_logz():
     """`kernels.shift_logz.shift_logz` (read off its module each call)."""
     return _mod("shift_logz").shift_logz
+
+
+_NO_GRAD = {}
+
+
+def _no_grad(ext):
+    """A 0-element tensor of `ext`'s dtype on its device: the CUDA forks' gradient argument when no gradient is wanted
+    (made once per device and dtype: an allocation a launch was ~1 us)."""
+    key = (ext.device, ext.dtype)
+    t = _NO_GRAD.get(key)
+    if t is None:
+        t = _NO_GRAD[key] = ext.new_empty(0)
+    return t
 
 
 def _host_extra(runs):
@@ -429,6 +443,30 @@ class _BackwardMixin:
             )
         return state
 
+    def backward_plan(self, layer, ns_tensors, ns_grad_tensors, node_mars, param_flows, denom_param_flows, kwargs):
+        """
+        This layer's backward as a launch plan (`ExternalSumParams.backward_plan`): a launcher for the `+log Z` shift
+        (`pre_backward_layer`), one a partition of element flows (`_ele_hook`) and of parameter flows (`_par_hook`,
+        `_par_triton_hook` or `_par_sb_hook`), and one for the post-backward (`post_backward_layer`). Keyed by the
+        gradient wanted, the deferral flag and the fixed half of the state the forward left -- its `log Z` buffers
+        are read off it at each call. Not planned where the full path raises (no forward state or one of another
+        batch, linear-space flows, a buffer missing), nor with the denominator flow's torch reference.
+        """
+        state = layer.__dict__.get("_bs_bw_state")
+        if (state is None or state["batch_size"] != node_mars.size(1) or not kwargs.get("logspace_flows", False)
+                or kwargs.get(_buffer_kwarg()) is None):
+            return None
+        grads_kwarg, grad_buffer_kwarg = _grad_kwargs()
+        grads = kwargs.get(grads_kwarg, None)
+        want_grad = grads is not None and any(ns_info.ns in grads for ns_info, _ in ns_tensors)
+        if want_grad and kwargs.get(grad_buffer_kwarg) is None:
+            return None
+        if denom_param_flows is not None and os.environ.get("PYJUICE_BLOCKSCALE_DENOM_REF", "0") == "1":
+            return None
+        key = ("blockscale", want_grad, bool(kwargs.get("defer_param_flows", False)), state["block_size"],
+               state["ext_base"], state["gate_cbs"], state["node_cbs"])
+        return key, 2 + layer.num_bk_partitions + (layer.num_fw_partitions if param_flows is not None else 0)
+
     def pre_backward_layer(self, layer, ns_tensors, node_flows, element_flows, node_mars,
                            element_mars, params, **kwargs) -> None:
         """
@@ -517,6 +555,23 @@ class _BackwardMixin:
         for nids, log_z, rows in state["shift_args"]:
             shift_logz(node_mars, nids, log_z, block_size, 1.0)
 
+        # Recording a plan of this backward (`backward_plan`): each site below adds its launcher -- the call's tensors,
+        # the staging buffers among them (`bk` / `gbk` in the backward's kwargs), its arguments.
+        planning = LaunchPlans.recording(self.BACKWARD_PLAN_TAG)
+        want_grad = layer._bs_grad_ext is not None
+        bk, gbk = _buffer_kwarg(), _grad_kwargs()[1]
+        if planning:
+            defer = layer._bs_defer
+
+            def _pre(node_flows, element_flows, node_mars, element_mars, params, param_flows, denom_param_flows,
+                     kwargs):
+                _set_attrs(layer, _bs_defer = defer)
+                shift = _shift_logz()
+                for nids, log_z, rows in layer.__dict__["_bs_bw_state"]["shift_args"]:
+                    shift(node_mars, nids, log_z, block_size, 1.0)
+
+            LaunchPlans.add(_pre, self.BACKWARD_PLAN_TAG)
+
         cache = getattr(layer, "_bs_bw_gate_cache", None)
         if cache is None:
             cache = layer._bs_bw_gate_cache = dict()
@@ -552,7 +607,16 @@ class _BackwardMixin:
             if plan is None:
                 plan = _build_ele_plan(ctx)
                 cache[key] = plan
-            _launch_ele(ctx, plan, ctx["element_flows"])
+            run = _ele_fn(ctx, plan, plan["kind"])
+            if planning:
+                def _ele(node_flows, element_flows, node_mars, element_mars, params, param_flows, denom_param_flows,
+                         kwargs):
+                    run(element_flows, node_flows, node_mars, element_mars, params, kwargs[bk],
+                        kwargs[gbk] if want_grad else None)
+
+                LaunchPlans.add(_ele, self.BACKWARD_PLAN_TAG)
+            run(ctx["element_flows"], ctx["node_flows"], ctx["node_mars"], ctx["element_mars"], ctx["params"],
+                external_params, layer._bs_grad_ext)
 
         def _scratch(ctx):
             scr = layer._bk_ele_scratch
@@ -700,72 +764,88 @@ class _BackwardMixin:
             return plan
 
         def _launch_ele(ctx, plan, tgt, kind = None):
-            kind = kind if kind is not None else plan["kind"]
+            _ele_fn(ctx, plan, plan["kind"] if kind is None else kind)(
+                tgt, ctx["node_flows"], ctx["node_mars"], ctx["element_mars"], ctx["params"], external_params,
+                layer._bs_grad_ext)
+
+        def _ele_fn(ctx, plan, kind):
+            """`kind`'s launch of this partition's element flows as a function of the call's tensors -- `(target,
+            node_flows, node_mars, element_mars, params, ext, grad)`, `grad` None without the gradient --, everything
+            else fixed by `ctx` and `plan`: what a plan replays (`backward_plan`)."""
             chids = ctx["chids"]
             batch, blk, cbs = ctx["batch_size"], ctx["block_size"], ctx["cs_block_size"]
             ne, knt = ctx["num_edges"], ctx["K_NUM_TILES"]
+            ebase, pbase = ctx["ele_ebase"], ctx["ele_pbase"]
+            no_grad = _no_grad(external_params)
 
             if kind == "cute":
-                ele_mod.blockscale_ele_backward(
-                    tgt, ctx["element_mars"], ctx["node_flows"], ctx["node_mars"], ctx["params"],
-                    external_params, chids, ctx["ele_ebase"], ctx["ele_pbase"], plan["gate_tile"],
-                    (layer._bs_grad_ext if layer._bs_grad_ext is not None
-                     else external_params.new_empty(0)),
-                    batch, blk, cbs, knt, gate_cbs, ext_base)
+                gt = plan["gate_tile"]
+
+                def run(tgt, node_flows, node_mars, element_mars, params, ext, grad):
+                    ele_mod.blockscale_ele_backward(
+                        tgt, element_mars, node_flows, node_mars, params, ext, chids, ebase, pbase, gt,
+                        no_grad if grad is None else grad, batch, blk, cbs, knt, gate_cbs, ext_base)
 
             elif isinstance(kind, tuple) and kind[0] == "elep":
-                if external_params.data_ptr() % 16:            # (its log-gate rows are 16-byte copies)
-                    return _launch_ele(ctx, plan, tgt, "triton")
-                elep_mod.blockscale_ele_backward_prepass(
-                    tgt, ctx["element_mars"], ctx["node_flows"], ctx["node_mars"], ctx["params"],
-                    external_params, chids, ctx["ele_ebase"], ctx["ele_pbase"], plan["gate_tile"],
-                    (layer._bs_grad_ext if layer._bs_grad_ext is not None
-                     else external_params.new_empty(0)),
-                    batch, blk, cbs, knt, gate_cbs, ext_base, 1 if layer._bs_grad_ext is not None else 0, kind[1])
+                gt, cfg, tri = plan["gate_tile"], kind[1], _ele_fn(ctx, plan, "triton")
+
+                def run(tgt, node_flows, node_mars, element_mars, params, ext, grad):
+                    if ext.data_ptr() % 16:                    # (its log-gate rows are 16-byte copies)
+                        return tri(tgt, node_flows, node_mars, element_mars, params, ext, grad)
+                    elep_mod.blockscale_ele_backward_prepass(
+                        tgt, element_mars, node_flows, node_mars, params, ext, chids, ebase, pbase, gt,
+                        no_grad if grad is None else grad, batch, blk, cbs, knt, gate_cbs, ext_base,
+                        0 if grad is None else 1, cfg)
 
             elif isinstance(kind, tuple) and kind[0] == "eles":
-                if external_params.data_ptr() % 16:            # (its log-gate rows are 16-byte loads)
-                    return _launch_ele(ctx, plan, tgt, "triton")
-                tb = plan["eles"]
-                eles_mod.blockscale_ele_backward_stream(
-                    tgt, ctx["element_mars"], ctx["node_flows"], ctx["node_mars"], ctx["params"],
-                    external_params, chids, ctx["ele_ebase"], ctx["ele_pbase"],
-                    (layer._bs_grad_ext if layer._bs_grad_ext is not None
-                     else external_params.new_empty(0)),
-                    batch, blk, cbs, knt, gate_cbs, ext_base, 1 if layer._bs_grad_ext is not None else 0, kind[1],
-                    tb["tables"], tb["ngrp"], tb["npc"])
+                tb, code, tri = plan["eles"], kind[1], _ele_fn(ctx, plan, "triton")
+
+                def run(tgt, node_flows, node_mars, element_mars, params, ext, grad):
+                    if ext.data_ptr() % 16:                    # (its log-gate rows are 16-byte loads)
+                        return tri(tgt, node_flows, node_mars, element_mars, params, ext, grad)
+                    eles_mod.blockscale_ele_backward_stream(
+                        tgt, element_mars, node_flows, node_mars, params, ext, chids, ebase, pbase,
+                        no_grad if grad is None else grad, batch, blk, cbs, knt, gate_cbs, ext_base,
+                        0 if grad is None else 1, code, tb["tables"], tb["ngrp"], tb["npc"])
 
             elif isinstance(kind, tuple):                     # ("sb", cfg)
-                e0, p0 = plan["sb"]
-                sb_mod.blockscale_sb_ele_backward(
-                    tgt, ctx["element_mars"], ctx["node_flows"], ctx["node_mars"], ctx["params"],
-                    external_params, chids, e0, p0, plan["gate_sb"],
-                    (layer._bs_grad_ext if layer._bs_grad_ext is not None
-                     else external_params.new_empty(0)),
-                    batch, blk, cbs, ne, gate_cbs, ext_base, kind[1])
+                (e0, p0), gsb, cfg = plan["sb"], plan["gate_sb"], kind[1]
+
+                def run(tgt, node_flows, node_mars, element_mars, params, ext, grad):
+                    sb_mod.blockscale_sb_ele_backward(
+                        tgt, element_mars, node_flows, node_mars, params, ext, chids, e0, p0, gsb,
+                        no_grad if grad is None else grad, batch, blk, cbs, ne, gate_cbs, ext_base, cfg)
 
             else:                                             # "triton"
                 from ..kernels.blockscale_backward import _bs_triton_ele_kernel
                 gb, grid = plan["gate_tile"], ctx["grid"]
-                for s0 in range(0, grid[1], 32768):
-                    cg = (grid[0], min(s0 + 32768, grid[1]) - s0)
-                    _bs_triton_ele_kernel[cg](
-                        node_flows = ctx["node_flows"], element_flows = tgt,
-                        node_mars = ctx["node_mars"], element_mars = ctx["element_mars"],
-                        mparams = ctx["params"], ext = external_params, gate = gb, chids = chids,
-                        parids_start = ctx["parids_start"], parids_increment = ctx["parids_increment"],
-                        parpids_start = ctx["parpids_start"],
-                        parpids_increment = ctx["parpids_increment"],
-                        batch_size = batch, ptr_inc_step = ctx["ptr_inc_step"],
-                        BLOCK_B = ctx["BLOCK_B"], TILE_SIZE_K = ctx["TILE_SIZE_K"],
-                        K_NUM_TILES = knt, TILE_SIZE_M = ctx["TILE_SIZE_M"],
-                        BLOCK_SIZE_M = cbs, BLOCK_SIZE_K = blk, TL_DOT = ctx["TL_DOT"],
-                        GATE_CBS = gate_cbs, gate_stride = gb.size(1), ext_base = ext_base,
-                        grad_ext = (layer._bs_grad_ext if layer._bs_grad_ext is not None
-                                    else external_params),
-                        WRITE_GRAD = (1 if layer._bs_grad_ext is not None else 0),
-                        GRAD_ATOMIC = (0 if plan.get("grad_store_ok") else 1),
-                        pid_m_offset = s0, num_stages = 1)
+                ps, pi, pps, ppi = ctx["parids_start"], ctx["parids_increment"], ctx["parpids_start"], \
+                    ctx["parpids_increment"]
+                step, bb, tk, tm, tl_dot = ctx["ptr_inc_step"], ctx["BLOCK_B"], ctx["TILE_SIZE_K"], \
+                    ctx["TILE_SIZE_M"], ctx["TL_DOT"]
+                grad_atomic = 0 if plan.get("grad_store_ok") else 1
+                chunks = [((grid[0], min(s0 + 32768, grid[1]) - s0), s0) for s0 in range(0, grid[1], 32768)]
+
+                def run(tgt, node_flows, node_mars, element_mars, params, ext, grad):
+                    for cg, s0 in chunks:
+                        _bs_triton_ele_kernel[cg](
+                            node_flows = node_flows, element_flows = tgt,
+                            node_mars = node_mars, element_mars = element_mars,
+                            mparams = params, ext = ext, gate = gb, chids = chids,
+                            parids_start = ps, parids_increment = pi,
+                            parpids_start = pps,
+                            parpids_increment = ppi,
+                            batch_size = batch, ptr_inc_step = step,
+                            BLOCK_B = bb, TILE_SIZE_K = tk,
+                            K_NUM_TILES = knt, TILE_SIZE_M = tm,
+                            BLOCK_SIZE_M = cbs, BLOCK_SIZE_K = blk, TL_DOT = tl_dot,
+                            GATE_CBS = gate_cbs, gate_stride = gb.size(1), ext_base = ext_base,
+                            grad_ext = ext if grad is None else grad,
+                            WRITE_GRAD = 0 if grad is None else 1,
+                            GRAD_ATOMIC = grad_atomic,
+                            pid_m_offset = s0, num_stages = 1)
+
+            return run
 
         def _par_hook(ctx):
             """
@@ -776,10 +856,7 @@ class _BackwardMixin:
             the element flows: the ungated layer's autotuner prefers Triton to its CuTe param kernel at
             some shapes, and forcing CuTe there cost 63 -> 123 us at batch 1024.
             """
-            import pyjuice.layer.kernels.c as ck
-
             gb = layer.ext_slots[0][ctx["partition_id"]]
-            batch, blk, ne = ctx["batch_size"], ctx["block_size"], ctx["num_edges"]
 
             # BOTH candidates below write `param_flows` non-atomically, and neither takes a padding
             # mask. That is sound only because the sum layer reaches this hook from behind `par_ok`,
@@ -796,36 +873,55 @@ class _BackwardMixin:
                 "`_par_hook`'s forks assume collision-free `pfids` and unpadded `cids`; the sum " \
                 "layer's `par_ok` guard is supposed to have established both."
 
-            # A tied step's flows into its group's slots, added with the group's after the pass (`deferred_par`)
-            if deferred_par.try_defer(pd_mod, layer, ctx, gb, external_params, node_cbs, gate_cbs, ext_base, n_ngates_):
-                return
+            run = _par_fn(ctx, gb)
+            if planning:
+                LaunchPlans.add(_par_launcher(run), self.BACKWARD_PLAN_TAG)
+            run(ctx["param_flows"], ctx["node_flows"], ctx["node_mars"], ctx["element_mars"], ctx["params"],
+                external_params)
 
-            def _cute(tgt):
+        def _par_fn(ctx, gb):
+            """`_par_hook`'s launch as a function of the call's tensors -- `(param_flows, node_flows, node_mars,
+            element_mars, params, ext)` --, everything else fixed by `ctx`: a tied step's flows into its group's slots
+            where they defer (`_deferrer`), else the CuTe or the Triton fork, picked by measuring once."""
+            from ..kernels.blockscale_backward import _bs_triton_par_kernel
+
+            batch, blk, ne = ctx["batch_size"], ctx["block_size"], ctx["num_edges"]
+            nbase, cbase, pbase, fbase = ctx["nbase"], ctx["cbase"], ctx["pbase"], ctx["fbase"]
+            nids, cids, pids, pfids = ctx["nids"], ctx["cids"], ctx["pids"], ctx["pfids"]
+            tsb, bnt, tk, tm, tl_dot = ctx["TILE_SIZE_B"], ctx["B_NUM_TILES"], ctx["TILE_SIZE_K"], \
+                ctx["TILE_SIZE_M"], ctx["TL_DOT"]
+
+            if n_ngates_ > 1 and tm > gate_bs_:
+                raise NotImplementedError(
+                    f"a node-axis gate of {gate_bs_} needs the parameter kernel's node tile inside "
+                    f"one node gate, but TILE_SIZE_M is {tm}."
+                )
+            nstride = self._gate_nstride(layer, nids) if n_ngates_ > 1 else None
+            grid = ctx["grid"]
+            chunks = [((grid[0], min(s0 + 32768, grid[1]) - s0), s0) for s0 in range(0, grid[1], 32768)]
+
+            def _cute(tgt, node_flows, node_mars, element_mars, params, ext):
                 par_mod.blockscale_par_backward(
-                    tgt, ctx["node_flows"], ctx["node_mars"], ctx["element_mars"], ctx["params"],
-                    external_params, ctx["nbase"], ctx["cbase"], ctx["pbase"], ctx["fbase"], gb,
+                    tgt, node_flows, node_mars, element_mars, params,
+                    ext, nbase, cbase, pbase, fbase, gb,
                     # trailing 0 = `use_atomic`: 0 read-add-store, 1 atomicAdd, 2 store-only. Safe at
                     # 0 only under the assertion above.
                     batch, blk, ne, node_cbs, gate_cbs, ext_base, 0)
 
-            def _triton(tgt):
-                from ..kernels.blockscale_backward import _bs_triton_par_kernel
-                grid = ctx["grid"]
-                for s0 in range(0, grid[1], 32768):
-                    cg = (grid[0], min(s0 + 32768, grid[1]) - s0)
+            def _triton(tgt, node_flows, node_mars, element_mars, params, ext):
+                for cg, s0 in chunks:
                     _bs_triton_par_kernel[cg](
-                        node_flows = ctx["node_flows"], node_mars = ctx["node_mars"],
-                        element_mars = ctx["element_mars"], mparams = ctx["params"],
-                        param_flows = tgt, ext = external_params, gate = gb,
-                        nids = ctx["nids"], cids = ctx["cids"], pids = ctx["pids"],
-                        pfids = ctx["pfids"], batch_size = batch, num_edges = ne,
-                        TILE_SIZE_B = ctx["TILE_SIZE_B"], B_NUM_TILES = ctx["B_NUM_TILES"],
-                        TILE_SIZE_K = ctx["TILE_SIZE_K"], TILE_SIZE_M = ctx["TILE_SIZE_M"],
-                        BLOCK_SIZE_M = blk, TL_DOT = ctx["TL_DOT"], NODE_CBS = node_cbs,
+                        node_flows = node_flows, node_mars = node_mars,
+                        element_mars = element_mars, mparams = params,
+                        param_flows = tgt, ext = ext, gate = gb,
+                        nids = nids, cids = cids, pids = pids,
+                        pfids = pfids, batch_size = batch, num_edges = ne,
+                        TILE_SIZE_B = tsb, B_NUM_TILES = bnt,
+                        TILE_SIZE_K = tk, TILE_SIZE_M = tm,
+                        BLOCK_SIZE_M = blk, TL_DOT = tl_dot, NODE_CBS = node_cbs,
                         GATE_CBS = gate_cbs, gate_stride = gb.size(1), ext_base = ext_base,
                         GATE_BS = gate_bs_, N_NODE_GATES = n_ngates_,
-                        gate_nstride = (self._gate_nstride(layer, ctx["nids"])
-                                        if n_ngates_ > 1 else None),
+                        gate_nstride = nstride,
                         pid_m_offset = s0, num_stages = 1,
                         # Reached only from behind `par_ok` (sum_layer.py), which already requires
                         # `_par_flow_collision_free` AND edge-contiguous `cids` -- so neither hazard
@@ -836,45 +932,77 @@ class _BackwardMixin:
 
             cands = ([("cute", _cute)] if (par_mod is not None and ctx["cute_ok"]) else []) \
                     + [("triton", _triton)]
-
             if n_ngates_ > 1:
-                if ctx["TILE_SIZE_M"] > gate_bs_:
-                    raise NotImplementedError(
-                        f"a node-axis gate of {gate_bs_} needs the parameter kernel's node tile inside "
-                        f"one node gate, but TILE_SIZE_M is {ctx['TILE_SIZE_M']}."
-                    )
                 cands = [c for c in cands if c[0] == "triton"]
-
+            fns = dict(cands)
             key = ("parplan", ctx["signature"], batch, ctx["partition_id"])
-            pick = cache.get(key)
-            if pick is None:
-                if len(cands) == 1:
-                    pick = cands[0][0]
-                else:
-                    # A SCRATCH clone: these kernels are read-accumulate-write, so trials on the live
-                    # `param_flows` would each add their contribution again.
-                    try:
-                        scr = torch.empty_like(ctx["param_flows"])
-                        # Each trial launches the kernel REPEATS times inside the timed region. These
-                        # candidates differ by only 6-25%, and a single launch spends comparable time
-                        # in Python and in the driver -- enough noise to mis-pick, which is exactly
-                        # what happened at K=2048 (CuTe chosen where Triton is 6% faster). Safe to
-                        # repeat because the target is a scratch buffer.
-                        REPEATS = 5
+            defer = _deferrer(ctx, gb)
 
-                        def _rep(f):
-                            def go():
-                                for _ in range(REPEATS):
-                                    f(scr)
-                            return go
+            def run(param_flows, node_flows, node_mars, element_mars, params, ext):
+                # A tied step's flows into its group's slots, added with the group's after the pass (`deferred_par`)
+                if defer is not None and defer(param_flows, node_flows, node_mars, element_mars, params, ext):
+                    return
+                pick = cache.get(key)
+                if pick is None:
+                    pick = cache[key] = _par_pick(cands, param_flows, node_flows, node_mars, element_mars, params,
+                                                  ext)
+                fns[pick](param_flows, node_flows, node_mars, element_mars, params, ext)
 
-                        pick = ck.autotune([(n, _rep(f)) for n, f in cands]) or cands[0][0]
-                        del scr
-                    except torch.cuda.OutOfMemoryError:
-                        pick = cands[0][0]
-                cache[key] = pick
+            return run
 
-            dict(cands)[pick](ctx["param_flows"])
+        def _par_pick(cands, param_flows, *args):
+            """The fastest of `_par_fn`'s candidates (their names and launches) at this call's tensors."""
+            import pyjuice.layer.kernels.c as ck
+
+            if len(cands) == 1:
+                return cands[0][0]
+            # A SCRATCH clone: these kernels are read-accumulate-write, so trials on the live
+            # `param_flows` would each add their contribution again.
+            try:
+                scr = torch.empty_like(param_flows)
+                # Each trial launches the kernel REPEATS times inside the timed region. These
+                # candidates differ by only 6-25%, and a single launch spends comparable time
+                # in Python and in the driver -- enough noise to mis-pick, which is exactly
+                # what happened at K=2048 (CuTe chosen where Triton is 6% faster). Safe to
+                # repeat because the target is a scratch buffer.
+                REPEATS = 5
+
+                def _rep(f):
+                    def go():
+                        for _ in range(REPEATS):
+                            f(scr, *args)
+                    return go
+
+                pick = ck.autotune([(n, _rep(f)) for n, f in cands]) or cands[0][0]
+                del scr
+            except torch.cuda.OutOfMemoryError:
+                pick = cands[0][0]
+            return pick
+
+        def _deferrer(ctx, gb):
+            """`defer(param_flows, node_flows, node_mars, element_mars, params, ext)`: whether `deferred_par.try_defer`
+            took this call's flows of the partition into its tied group's slots -- or None where its shape never
+            defers (`deferred_par.may_defer`)."""
+            if not deferred_par.may_defer(pd_mod, ctx, n_ngates_):
+                return None
+            static = {k: v for k, v in ctx.items()
+                      if k not in ("node_flows", "element_flows", "node_mars", "element_mars", "params", "param_flows")}
+
+            def defer(param_flows, node_flows, node_mars, element_mars, params, ext):
+                c = dict(static, param_flows = param_flows, node_flows = node_flows, node_mars = node_mars,
+                         element_mars = element_mars, params = params)
+                return deferred_par.try_defer(pd_mod, layer, c, gb, ext, node_cbs, gate_cbs, ext_base, n_ngates_)
+
+            return defer
+
+        def _par_launcher(run):
+            """A plan's launcher of a parameter-flow partition's `run(param_flows, node_flows, node_mars, element_mars,
+            params, ext)`."""
+            def _par(node_flows, element_flows, node_mars, element_mars, params, param_flows, denom_param_flows,
+                     kwargs):
+                run(param_flows, node_flows, node_mars, element_mars, params, kwargs[bk])
+
+            return _par
 
         def _par_sb_hook(param_flows, node_flows, node_mars, element_mars, params, nids, cids, pids,
                          pfids, batch, blk_size, num_edges, partition_id):
@@ -890,11 +1018,18 @@ class _BackwardMixin:
             # read-add-store of `+0.0` would race a real one for pfid 0), and `PF_ATOMIC` covers slots
             # that still collide afterwards, which is what parameter tying produces.
             padded, pf_atomic = self._par_write_flags(layer, cids, pfids)
-            sb_mod.blockscale_sb_par_backward(
-                param_flows, node_flows, node_mars, element_mars, params, external_params,
-                nids, cids, pids, pfids, layer.ext_slots[0][partition_id],
-                batch, blk_size, num_edges, node_cbs, gate_cbs, ext_base,
-                padded, pf_atomic, 0)
+            gt = layer.ext_slots[0][partition_id]
+
+            def run(param_flows, node_flows, node_mars, element_mars, params, ext):
+                sb_mod.blockscale_sb_par_backward(
+                    param_flows, node_flows, node_mars, element_mars, params, ext,
+                    nids, cids, pids, pfids, gt,
+                    batch, blk_size, num_edges, node_cbs, gate_cbs, ext_base,
+                    padded, pf_atomic, 0)
+
+            if planning:
+                LaunchPlans.add(_par_launcher(run), self.BACKWARD_PLAN_TAG)
+            run(param_flows, node_flows, node_mars, element_mars, params, external_params)
 
         def _par_triton_hook(ctx):
             """
@@ -918,26 +1053,37 @@ class _BackwardMixin:
             padded, pf_atomic = self._par_write_flags(layer, ctx["cids"], ctx["pfids"])
             # A tied step deferred as from `_par_hook` -- only without either hazard: its flush writes every slot of
             # the block per node block, unmasked and non-atomically (two node blocks on one block would race)
-            if (padded, pf_atomic) == (0, 0) and deferred_par.try_defer(
-                    pd_mod, layer, ctx, gb, external_params, node_cbs, gate_cbs, ext_base, n_ngates_):
-                return
-            for s0 in range(0, grid[1], 32768):
-                cg = (grid[0], min(s0 + 32768, grid[1]) - s0)
-                _bs_triton_par_kernel[cg](
-                    node_flows = ctx["node_flows"], node_mars = ctx["node_mars"],
-                    element_mars = ctx["element_mars"], mparams = ctx["params"],
-                    param_flows = ctx["param_flows"], ext = external_params, gate = gb,
-                    nids = ctx["nids"], cids = ctx["cids"], pids = ctx["pids"], pfids = ctx["pfids"],
-                    batch_size = ctx["batch_size"], num_edges = ctx["num_edges"],
-                    TILE_SIZE_B = ctx["TILE_SIZE_B"], B_NUM_TILES = ctx["B_NUM_TILES"],
-                    TILE_SIZE_K = ctx["TILE_SIZE_K"], TILE_SIZE_M = ctx["TILE_SIZE_M"],
-                    BLOCK_SIZE_M = ctx["block_size"], TL_DOT = ctx["TL_DOT"],
-                    NODE_CBS = node_cbs, GATE_CBS = gate_cbs, gate_stride = gb.size(1),
-                    GATE_BS = gate_bs_, N_NODE_GATES = n_ngates_,
-                    gate_nstride = (self._gate_nstride(layer, ctx["nids"])
-                                        if n_ngates_ > 1 else None),
-                    ext_base = ext_base, pid_m_offset = s0, num_stages = 1,
-                    PADDED = padded, PF_ATOMIC = pf_atomic)
+            defer = _deferrer(ctx, gb) if (padded, pf_atomic) == (0, 0) else None
+            nids, cids, pids, pfids = ctx["nids"], ctx["cids"], ctx["pids"], ctx["pfids"]
+            batch, ne, blk = ctx["batch_size"], ctx["num_edges"], ctx["block_size"]
+            tsb, bnt, tk, tm, tl_dot = ctx["TILE_SIZE_B"], ctx["B_NUM_TILES"], ctx["TILE_SIZE_K"], \
+                ctx["TILE_SIZE_M"], ctx["TL_DOT"]
+            nstride = self._gate_nstride(layer, nids) if n_ngates_ > 1 else None
+            chunks = [((grid[0], min(s0 + 32768, grid[1]) - s0), s0) for s0 in range(0, grid[1], 32768)]
+
+            def run(param_flows, node_flows, node_mars, element_mars, params, ext):
+                if defer is not None and defer(param_flows, node_flows, node_mars, element_mars, params, ext):
+                    return
+                for cg, s0 in chunks:
+                    _bs_triton_par_kernel[cg](
+                        node_flows = node_flows, node_mars = node_mars,
+                        element_mars = element_mars, mparams = params,
+                        param_flows = param_flows, ext = ext, gate = gb,
+                        nids = nids, cids = cids, pids = pids, pfids = pfids,
+                        batch_size = batch, num_edges = ne,
+                        TILE_SIZE_B = tsb, B_NUM_TILES = bnt,
+                        TILE_SIZE_K = tk, TILE_SIZE_M = tm,
+                        BLOCK_SIZE_M = blk, TL_DOT = tl_dot,
+                        NODE_CBS = node_cbs, GATE_CBS = gate_cbs, gate_stride = gb.size(1),
+                        GATE_BS = gate_bs_, N_NODE_GATES = n_ngates_,
+                        gate_nstride = nstride,
+                        ext_base = ext_base, pid_m_offset = s0, num_stages = 1,
+                        PADDED = padded, PF_ATOMIC = pf_atomic)
+
+            if planning:
+                LaunchPlans.add(_par_launcher(run), self.BACKWARD_PLAN_TAG)
+            run(ctx["param_flows"], ctx["node_flows"], ctx["node_mars"], ctx["element_mars"], ctx["params"],
+                external_params)
 
         _set_attrs(layer, _ext_bw_ele_hook = _ele_hook)
         # Installed UNCONDITIONALLY, even without the CuTe param module: `_par_hook` falls back to its
@@ -984,6 +1130,24 @@ class _BackwardMixin:
                 shift_logz(node_mars, nids, log_z, state["block_size"], -1.0)
         if denom_ref:
             self._accumulate_denom_torch(layer, node_flows, params, external_params, denom_param_flows)
+
+        # A plan's launcher of the above (`backward_plan`, which plans no call with the reference): the forward's
+        # state read at each call, as the staging buffers
+        if LaunchPlans.recording(self.BACKWARD_PLAN_TAG):
+            want_grad, bk, gbk = grad_ext is not None, _buffer_kwarg(), _grad_kwargs()[1]
+
+            def _post(node_flows, element_flows, node_mars, element_mars, params, param_flows, denom_param_flows,
+                      kwargs):
+                st = layer.__dict__["_bs_bw_state"]
+                if want_grad or fused_w:
+                    self._post_fused(layer, st, node_flows, node_mars, params, kwargs[bk],
+                                     kwargs[gbk] if want_grad else None, denom_param_flows if fused_w else None)
+                else:
+                    shift = _shift_logz()
+                    for nids, log_z, rows in st["shift_args"]:
+                        shift(node_mars, nids, log_z, st["block_size"], -1.0)
+
+            LaunchPlans.add(_post, self.BACKWARD_PLAN_TAG)
         _set_attrs(layer, _bs_grad_ext = None)
 
         return None

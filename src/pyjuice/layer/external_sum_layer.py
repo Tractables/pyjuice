@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import contextlib
+
 import torch
 import torch.nn as nn
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from pyjuice.nodes import ExternalParamsSumNodes
+from pyjuice.utils import launch_plans
+from pyjuice.utils.launch_plans import LaunchPlans
 from pyjuice.utils.parameter_list import FastParamList
 from .sum_layer import SumLayer
 
@@ -645,38 +649,82 @@ class ExternalParamsSumLayer(SumLayer):
             for ns_info, _ in ns_tensors
         ]
 
-        try:
-            self.external_params.pre_backward_layer(
-                self, ns_tensors, node_flows, element_flows, node_mars, element_mars, params,
-                param_flows = param_flows, propagation_alg = propagation_alg, **kwargs
-            )
+        # A launch plan of the rest (`pyjuice.utils.launch_plans`) where the parameterization keeps one
+        # (`ExternalSumParams.backward_plan`): the two hooks and the standard backward between them are host work
+        # around a few launches -- MEASURED (a tied gated HMM-2048 x4, B 64, bf16) 52 us a layer. The checks above
+        # run every call. Recorded under the parameterization's tag, its sites reached from the standard backward's
+        # converted ones -- which records itself as usual, inside, and fails this recording if it comes out short.
+        pkey, expected = self._backward_plan_key(ns_tensors, ns_grad_tensors, node_flows, node_mars, params,
+                                                 param_flows, denom_param_flows, propagation_alg, kwargs)
+        if pkey is not None:
+            plan = LaunchPlans.of(self).lookup(pkey)
+            if plan is not None:
+                for launch in plan:
+                    launch(node_flows, element_flows, node_mars, element_mars, params, param_flows, denom_param_flows,
+                           kwargs)
+                return None
+        elif LaunchPlans.nested():
+            LaunchPlans.fail()                     # (a recording around this call cannot capture what it launches)
 
-            # Shared-parameter flows -- the standard kernels, untouched. Skipped entirely when the
-            # parameterization owns the flows: its effective parameters vary per edge block, and the
-            # standard kernels would sum the parents together before any correction could separate them.
-            if not self.external_params.replaces_shared_backward:
-                super(ExternalParamsSumLayer, self).backward(
-                    node_flows, element_flows, node_mars, element_mars, params,
+        with (LaunchPlans.record(self.external_params.BACKWARD_PLAN_TAG) if pkey is not None
+              else contextlib.nullcontext()) as rec:
+            try:
+                self.external_params.pre_backward_layer(
+                    self, ns_tensors, node_flows, element_flows, node_mars, element_mars, params,
                     param_flows = param_flows, propagation_alg = propagation_alg, **kwargs
                 )
 
-            self.external_params.post_backward_layer(
-                self, ns_tensors, ns_grad_tensors,
-                node_flows, element_flows, node_mars, element_mars, params,
-                param_flows = param_flows, denom_param_flows = denom_param_flows,
-                propagation_alg = propagation_alg, **kwargs
-            )
-        finally:
-            # A parameterization may redirect the standard backward's CUDA kernels at its own for the
-            # duration of this call (see `SumLayer._ext_bw_ele_hook`). Left installed after a raise
-            # they would make the NEXT backward -- possibly an ungated one -- fail or, worse, run a
-            # gated kernel against a stale plan.
-            # (Plain attributes, written past `nn.Module.__setattr__`: its registration checks, ~1.5 us a write, on
-            # every gated layer's every backward.)
-            self.__dict__.update(_ext_bw_ele_hook = None, _ext_bw_par_hook = None, _ext_bw_par_sb_hook = None,
-                                 _ext_bw_par_triton_hook = None)
+                # Shared-parameter flows -- the standard kernels, untouched. Skipped entirely when the
+                # parameterization owns the flows: its effective parameters vary per edge block, and the
+                # standard kernels would sum the parents together before any correction could separate them.
+                if not self.external_params.replaces_shared_backward:
+                    super(ExternalParamsSumLayer, self).backward(
+                        node_flows, element_flows, node_mars, element_mars, params,
+                        param_flows = param_flows, propagation_alg = propagation_alg, **kwargs
+                    )
 
+                self.external_params.post_backward_layer(
+                    self, ns_tensors, ns_grad_tensors,
+                    node_flows, element_flows, node_mars, element_mars, params,
+                    param_flows = param_flows, denom_param_flows = denom_param_flows,
+                    propagation_alg = propagation_alg, **kwargs
+                )
+            finally:
+                # A parameterization may redirect the standard backward's CUDA kernels at its own for the
+                # duration of this call (see `SumLayer._ext_bw_ele_hook`). Left installed after a raise
+                # they would make the NEXT backward -- possibly an ungated one -- fail or, worse, run a
+                # gated kernel against a stale plan.
+                # (Plain attributes, written past `nn.Module.__setattr__`: its registration checks, ~1.5 us a write, on
+                # every gated layer's every backward.)
+                self.__dict__.update(_ext_bw_ele_hook = None, _ext_bw_par_hook = None, _ext_bw_par_sb_hook = None,
+                                     _ext_bw_par_triton_hook = None)
+
+        if pkey is not None:
+            LaunchPlans.of(self).store(pkey, rec, expected)
         return None
+
+    def _backward_plan_key(self, ns_tensors, ns_grad_tensors, node_flows, node_mars, params, param_flows,
+                           denom_param_flows, propagation_alg, kwargs):
+        """
+        `(key, launchers expected)` of this call's backward plan, or `(None, 0)`: not planned. The layer's part of the
+        key -- what the standard backward decides from, as its own plans take it (`SumLayer.backward`: the batch,
+        device, dtypes and flags by value, the other arguments by name), in the regime they plan -- and the
+        parameterization's (`ExternalSumParams.backward_plan`), where it plans this call.
+        """
+        if (not launch_plans.ENABLED or kwargs.get("compute_children") is not None
+                or kwargs.get("allow_modify_flows", False) or kwargs.get("pflow_temperature", 1.0) != 1.0
+                or kwargs.get("temper_eflow", False) or "force_use_bf16" in kwargs or "force_use_fp32" in kwargs):
+            return None, 0
+        own = self.external_params.backward_plan(self, ns_tensors, ns_grad_tensors, node_mars, param_flows,
+                                                 denom_param_flows, kwargs)
+        if own is None:
+            return None, 0
+        key = ("external_backward", own[0], node_flows.size(1), node_flows.device, node_flows.dtype, params.dtype,
+               None if param_flows is None else param_flows.dtype, denom_param_flows is not None, propagation_alg,
+               kwargs.get("logspace_flows", False), kwargs.get("negate_pflows", False),
+               kwargs.get("accumulate_ch_flows", False), kwargs.get("allow_neg_flows", False),
+               kwargs.get("precision", "auto"), tuple(kwargs))
+        return key, own[1]
 
     def _check_staged_batch(self, ns_tensors, num_samples: int) -> None:
         """

@@ -1,13 +1,16 @@
 """
-Launch plans (`pyjuice.utils.launch_plans`) and the sum layer's planned backward, eager.
+Launch plans (`pyjuice.utils.launch_plans`) and the planned backwards of sum layers, eager.
 
 The module: a plan is kept only with exactly the launchers expected and none failed, never during a CUDA graph capture
-(nor looked up then), never with plans off; a raising call leaves no recording open; recordings are per thread; a
-bounded store; `clear`. The sum layer: a planned backward -- the launchers an earlier call with this signature
-recorded -- gives the full path's element and node flows to the bit and its parameter flows and gate gradients within
-their atomics' rounding, launching the same GPU kernels, over gated HMMs (bf16 and fp32 parameters, tied gates, a
-ragged layer, two gated nodes in one layer), with and without gate gradients, deferred parameter flows, batch sizes
-alternating, a plain forward in between (no hooks: not planned), and `.to()` dropping the plans.
+(nor looked up then), never with plans off; a raising call leaves no recording open; recordings are per thread and
+tagged (a launcher goes to the innermost recording of its tag only; `nested`); a bounded store; `clear`. The layers: a
+gated layer's planned backward -- the launchers an earlier call with this signature recorded, the parameterization's
+hooks and the standard backward between them replayed whole (`ExternalParamsSumLayer.backward`) -- gives the full
+path's element and node flows to the bit and its parameter flows and gate gradients within their atomics' rounding,
+launching the same GPU kernels, over gated HMMs (bf16 and fp32 parameters, tied gates, a ragged layer, two gated nodes
+in one layer, batches below 16), with and without gate gradients, deferred parameter flows (a tied group deferring),
+batch sizes alternating, the call signatures interleaved, a new forward state, a plain forward in between (a plain sum
+layer's own plan), and `.to()` dropping the plans; the denominator's torch reference is not planned.
 """
 import os
 import sys
@@ -18,6 +21,8 @@ import torch
 
 import pyjuice as juice
 import pyjuice.utils.launch_plans as lp
+from pyjuice.nodes import BlockScaleSumParams
+from pyjuice.nodes.external_params.blockscale import deferred_par as dpar
 from pyjuice.utils.launch_plans import LaunchPlans
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "external_params"))
@@ -110,6 +115,47 @@ def test_the_store_is_bounded():
     assert len(plans.plans) <= LaunchPlans.MAX_PLANS
 
 
+@cuda_only
+def test_a_launcher_goes_to_the_innermost_recording_of_its_tag():
+    assert not LaunchPlans.nested() and not LaunchPlans.recording("outer")
+    with LaunchPlans.record("outer") as outer:
+        assert LaunchPlans.nested() and LaunchPlans.recording("outer") and not LaunchPlans.recording()
+        LaunchPlans.add(lambda: "outer 1", "outer")
+        LaunchPlans.add(lambda: "untagged")                 # (no untagged recording open: dropped)
+        with LaunchPlans.record() as inner:
+            assert LaunchPlans.recording("outer") and LaunchPlans.recording()
+            LaunchPlans.add(lambda: "outer 2", "outer")     # (to the enclosing one of its tag)
+            LaunchPlans.add(lambda: "inner")
+            with LaunchPlans.record("outer") as outer2:
+                LaunchPlans.add(lambda: "outer2", "outer")  # (the innermost of the tag only)
+        LaunchPlans.add(lambda: "outer 3", "outer")
+    assert [f() for f in outer.launchers] == ["outer 1", "outer 2", "outer 3"]
+    assert [f() for f in inner.launchers] == ["inner"]
+    assert [f() for f in outer2.launchers] == ["outer2"]
+    assert not LaunchPlans.nested()
+
+
+@cuda_only
+def test_an_incomplete_inner_recording_fails_the_ones_around_it():
+    o = _Owner()
+    plans = LaunchPlans.of(o)
+    for inner_count, outer_kept in [(1, True), (0, False), (2, False)]:
+        plans.clear()
+        with LaunchPlans.record("outer") as outer:
+            LaunchPlans.add(lambda: None, "outer")
+            with LaunchPlans.record() as inner:
+                for _ in range(inner_count):
+                    LaunchPlans.add(lambda: None)
+            plans.store("inner", inner, 1)
+        plans.store("outer", outer, 1)
+        assert (plans.lookup("inner") is not None) == (inner_count == 1)
+        assert (plans.lookup("outer") is not None) == outer_kept, inner_count
+    with LaunchPlans.record("a") as a:                      # `fail` marks every recording open
+        with LaunchPlans.record("b") as b:
+            LaunchPlans.fail()
+    assert a.failed and b.failed
+
+
 # --------------------------------------------------------------------------------- the sum layer's backward
 
 def _instance(builder, dt, seed = 0):
@@ -128,17 +174,28 @@ def _inputs(gated, V, B, seed):
     return phi, x
 
 
-def _step(pc, phi, x, grad, defer):
-    """A gated forward and backward; copies of the flows, parameter flows and gate gradients."""
-    grads = {ns: torch.zeros_like(p) for ns, p in phi.items()} if grad else None
-    pc(x, sum_external_params = phi)
-    kw = dict(sum_external_params_grad = grads) if grad else {}
+def _backward_kwargs(phi, grad, defer):
+    """The backward's kwargs: the gate gradients into new buffers, or none computed (`compute_external_grads`, on by
+    default)."""
+    if grad:
+        kw = dict(sum_external_params_grad = {ns: torch.zeros_like(p) for ns, p in phi.items()})
+    else:
+        kw = dict(compute_external_grads = False)
     if defer:
         kw["defer_param_flows"] = True
-    pc.backward(x, flows_memory = 0.0, **kw)
+    return kw
+
+
+def _step(pc, phi, x, grad, defer, param_flows = True, **backward_kw):
+    """A gated forward and backward; copies of the flows, parameter and denominator flows (None without), gate
+    gradients and the node values it leaves (the `log Z` shift undone)."""
+    pc(x, sum_external_params = phi)
+    kw = _backward_kwargs(phi, grad, defer)
+    pc.backward(x, flows_memory = 0.0, compute_param_flows = param_flows, **kw, **backward_kw)
     torch.cuda.synchronize()
-    return (pc.node_flows.clone(), pc.element_flows.clone(), pc.param_flows.clone(),
-            {ns: g.clone() for ns, g in grads.items()} if grad else {})
+    return (pc.node_flows.clone(), pc.element_flows.clone(), pc.param_flows.clone() if param_flows else None,
+            {ns: g.clone() for ns, g in kw["sum_external_params_grad"].items()} if grad else {},
+            pc.denom_param_flows.clone() if param_flows else None, pc.node_mars.clone())
 
 
 def _sum_layers(pc):
@@ -154,18 +211,58 @@ def _clear_plans(pc):
         LaunchPlans.of(layer).clear()
 
 
+def _layer_keys(layer):
+    """The keys of a gated layer's plans of its whole backward (`ExternalParamsSumLayer._backward_plan_key`)."""
+    return [k for k in LaunchPlans.of(layer).plans if k[0] == "external_backward"]
+
+
+def _count_full_paths(monkeypatch):
+    """`[n]`: how many gated backwards take the full path (`pre_backward_layer`) from now on."""
+    n = [0]
+    real = BlockScaleSumParams.pre_backward_layer
+
+    def counted(self, *args, **kwargs):
+        n[0] += 1
+        return real(self, *args, **kwargs)
+
+    monkeypatch.setattr(BlockScaleSumParams, "pre_backward_layer", counted)
+    return n
+
+
+def _count_deferred(monkeypatch):
+    """`[n]`: how many partitions' parameter flows `deferred_par.try_defer` takes from now on."""
+    n = [0]
+    real = dpar.try_defer
+
+    def counted(*args):
+        took = real(*args)
+        n[0] += int(took)
+        return took
+
+    monkeypatch.setattr(dpar, "try_defer", counted)
+    return n
+
+
+def _close(ref, got, what):
+    """`got` is `ref` within atomics' rounding: the same finite pattern, 1e-5 of the largest apart."""
+    fin = torch.isfinite(ref)
+    assert torch.equal(fin, torch.isfinite(got)), f"{what}' finite pattern"
+    scale = float(ref[fin].abs().max()) if bool(fin.any()) else 0.0
+    assert scale > 0, f"{what}: nothing to compare"
+    d = float((got[fin] - ref[fin]).abs().max()) / scale
+    assert d < 1e-5, f"{what} differ by {d:.1e} (relative)"
+
+
 def _same(ref, got, what):
-    nf_r, ef_r, pf_r, g_r = ref
-    nf, ef, pf, g = got
+    nf_r, ef_r, pf_r, g_r, w_r, nm_r = ref
+    nf, ef, pf, g, w, nm = got
     bits = lambda t: t.view(torch.int32)
     assert torch.equal(bits(nf), bits(nf_r)), f"{what}: node flows differ"
     assert torch.equal(bits(ef), bits(ef_r)), f"{what}: element flows differ"
-    fin = torch.isfinite(pf_r)
-    assert torch.equal(fin, torch.isfinite(pf)), f"{what}: parameter flows' finite pattern"
-    scale = float(pf_r[fin].abs().max()) if bool(fin.any()) else 0.0
-    assert scale > 0, f"{what}: no parameter flow to compare"
-    d = float((pf[fin] - pf_r[fin]).abs().max()) / scale
-    assert d < 1e-5, f"{what}: parameter flows differ by {d:.1e} (relative)"
+    assert torch.equal(bits(nm), bits(nm_r)), f"{what}: the node values left differ"
+    if pf_r is not None:                                   # (None: a backward without parameter flows)
+        _close(pf_r, pf, f"{what}: parameter flows")
+        _close(w_r, w, f"{what}: denominator flows")
     for ns in g_r:
         nan = torch.isnan(g_r[ns])
         assert torch.equal(nan, torch.isnan(g[ns])), f"{what}: the gradient's NaN pattern"
@@ -191,6 +288,7 @@ CASES = [
     ("pad", lambda: _topology(PAD, 128, 128, 16), "bf16", (128,)),
     ("two_nodes", lambda: _two(8, bs = 128), "bf16", (64,)),
     ("alternating_batches", lambda: _hmm(512, 2, 32), "bf16", (64, 128, 64, 128)),
+    ("small_batches", lambda: _hmm(512, 2, 32), "bf16", (8, 12)),         # the small-batch forks
 ]
 
 
@@ -199,6 +297,9 @@ CASES = [
                          ids = ["gradient", "no_gradient", "deferred"])
 @pytest.mark.parametrize("name,builder,dt,batches", CASES, ids = [c[0] for c in CASES])
 def test_a_planned_backward_gives_the_full_paths_results(name, builder, dt, batches, grad, defer, monkeypatch):
+    if defer:                                              # (the tied case's groups of 1M flows defer)
+        monkeypatch.setattr(dpar, "MIN_FLOWS", 1 << 20)
+    deferred = _count_deferred(monkeypatch)
     pc, gated, V = _instance(builder, {"bf16": torch.bfloat16, "fp32": torch.float32}[dt])
     inputs = [_inputs(gated, V, B, seed = i) for i, B in enumerate(batches)]
 
@@ -207,18 +308,23 @@ def test_a_planned_backward_gives_the_full_paths_results(name, builder, dt, batc
         _step(pc, phi, x, grad, defer)
     refs = [_step(pc, phi, x, grad, defer) for phi, x in inputs]
     assert all(not LaunchPlans.of(l).plans for l in _sum_layers(pc)), "plans stored while off"
+    if defer and name.startswith("tied"):
+        assert deferred[0] > 0, "the tied group did not defer"
 
     monkeypatch.setattr(lp, "ENABLED", True)
+    full = _count_full_paths(monkeypatch)
     for rnd in range(3):                                   # round 0 records, the later ones replay
         for (phi, x), ref, B in zip(inputs, refs, batches):
             _same(ref, _step(pc, phi, x, grad, defer), f"{name} B {B} round {rnd}")
-    planned = [l for l in _gated_layers(pc) if LaunchPlans.of(l).plans]
-    assert planned and len(planned) == len(_gated_layers(pc)), "the gated layers' backwards were not planned"
+        if rnd == 0:
+            recorded, deferred[0] = full[0], 0
+    assert recorded > 0 and full[0] == recorded, "a gated backward took the full path after its plan was recorded"
+    if defer and name.startswith("tied"):
+        assert deferred[0] > 0, "a replayed backward did not defer the tied group"
+    assert all(_layer_keys(l) for l in _gated_layers(pc)), "the gated layers' backwards were not planned"
 
     phi, x = inputs[0]
-    kw = dict(sum_external_params_grad = {ns: torch.zeros_like(p) for ns, p in phi.items()}) if grad else {}
-    if defer:
-        kw["defer_param_flows"] = True
+    kw = _backward_kwargs(phi, grad, defer)
 
     def profiled():                                        # (after a call at the same batch: no buffer resized)
         _step(pc, phi, x, grad, defer)
@@ -343,12 +449,13 @@ def test_a_real_device_move_replans_on_the_new_device():
 
 
 @cuda_only
-def test_a_plan_writes_the_buffers_of_its_call():
+@pytest.mark.parametrize("B", [128, 8])
+def test_a_plan_writes_the_buffers_of_its_call(B):
     """The circuit's flow and marginal buffers swapped for new tensors between calls at one batch size: a planned
     backward writes the ones it is given, not the ones its plan was recorded with (a launcher's tensors are its
-    arguments)."""
+    arguments) -- at a batch below 16 too (the small-batch forks)."""
     pc, gated, V = _instance(lambda: _hmm(512, 2, 32), torch.bfloat16)
-    phi, x = _inputs(gated, V, 128, seed = 0)
+    phi, x = _inputs(gated, V, B, seed = 0)
     lp_enabled = lp.ENABLED
     try:
         lp.ENABLED = False
@@ -366,3 +473,144 @@ def test_a_plan_writes_the_buffers_of_its_call():
         _same(ref, _step(pc, phi, x, True, False), "new buffers")
     finally:
         lp.ENABLED = lp_enabled
+
+
+@cuda_only
+def test_a_replay_reads_the_forward_state_of_its_call(monkeypatch):
+    """The gated layers' forward plans dropped before a forward with other gates: the forward builds a new state --
+    new `log Z` buffers holding other values -- and a replayed backward, recorded against the old one, shifts and
+    unshifts by the new."""
+    import pyjuice.layer.kernels.c as ck
+    monkeypatch.setattr(ck, "autotune", lambda cands, *a, **k: cands[0][0])   # (a rebuilt plan picks the same)
+    pc, gated, V = _instance(lambda: _hmm(512, 2, 32), torch.bfloat16)
+    (phi_a, x), (phi_b, _) = _inputs(gated, V, 128, seed = 0), _inputs(gated, V, 128, seed = 1)
+    monkeypatch.setattr(lp, "ENABLED", False)
+    _step(pc, phi_b, x, True, False)
+    ref = _step(pc, phi_b, x, True, False)
+    monkeypatch.setattr(lp, "ENABLED", True)
+    for _ in range(2):
+        _step(pc, phi_a, x, True, False)                   # recorded, then replayed
+    layers = _gated_layers(pc)
+    assert all(_layer_keys(l) for l in layers)
+    old = [l._bs_bw_state for l in layers]
+    for l in layers:
+        l.__dict__["_bs_fw_plans"].clear()
+    full = _count_full_paths(monkeypatch)
+    got = _step(pc, phi_b, x, True, False)
+    assert full[0] == 0, "the backward was not replayed"
+    assert all(l._bs_bw_state is not s for l, s in zip(layers, old)), "the forward kept its state"
+    _same(ref, got, "a new forward state")
+
+
+@cuda_only
+def test_each_call_signature_gets_its_own_plan(monkeypatch):
+    """With and without the gate gradient, with and without parameter flows (a query's backward: no denominator flow,
+    no deferral), and with a layer callback (no deferral), interleaved on one circuit whose tied group defers: each its
+    own plan, each the full path's results."""
+    monkeypatch.setattr(dpar, "MIN_FLOWS", 1 << 20)
+    deferred = _count_deferred(monkeypatch)
+    pc, gated, V = _instance(lambda: _tied_hmm(1024, 4, 16), torch.bfloat16)
+    phi, x = _inputs(gated, V, 64, seed = 0)
+
+    def run(kind):
+        grad = kind in ("gradient", "query_gradient", "callback")
+        kw = dict(sum_layer_post_backward_callback = lambda layer, **k: None) if kind == "callback" else {}
+        return _step(pc, phi, x, grad, False, param_flows = not kind.startswith("query"), **kw)
+
+    kinds = ("gradient", "plain", "query", "query_gradient", "callback")
+    monkeypatch.setattr(lp, "ENABLED", False)
+    refs = {k: [run(k) for _ in range(2)][-1] for k in kinds}
+    monkeypatch.setattr(lp, "ENABLED", True)
+    for rnd in range(2):
+        for k in ("gradient", "query", "callback", "plain", "query_gradient", "query", "gradient", "callback",
+                  "plain", "query_gradient"):
+            deferred[0] = 0
+            _same(refs[k], run(k), f"{k} round {rnd}")
+            assert (deferred[0] > 0) == (k in ("gradient", "plain")), f"{k} round {rnd}: deferred {deferred[0]}"
+    for layer in _gated_layers(pc):
+        assert len(_layer_keys(layer)) == len(kinds), "not one plan a call signature"
+
+
+@cuda_only
+def test_the_denominators_torch_reference_is_not_planned(monkeypatch):
+    """`PYJUICE_BLOCKSCALE_DENOM_REF=1` runs the reference beside the kernels: the gated backwards take the full path
+    every call (their standard part still plans itself) and give the same results as with plans off."""
+    monkeypatch.setenv("PYJUICE_BLOCKSCALE_DENOM_REF", "1")
+    pc, gated, V = _instance(lambda: _hmm(512, 2, 32), torch.bfloat16)
+    phi, x = _inputs(gated, V, 128, seed = 0)
+    monkeypatch.setattr(lp, "ENABLED", False)
+    _step(pc, phi, x, True, False)
+    ref = _step(pc, phi, x, True, False)
+    denom_ref = pc.denom_param_flows.clone()
+    monkeypatch.setattr(lp, "ENABLED", True)
+    for _ in range(3):
+        _same(ref, _step(pc, phi, x, True, False), "the reference")
+        assert torch.equal(pc.denom_param_flows, denom_ref)
+    assert not any(_layer_keys(l) for l in _gated_layers(pc))
+
+
+@cuda_only
+def test_a_plan_reads_the_staging_buffers_of_its_call(monkeypatch):
+    """A batch big enough to move the circuit's buffers to new storage between a plan's recording and its replay, and
+    other gates at the replay: the replayed backward reads the staging buffer and writes the gradient buffer of its
+    call, not those it was recorded with (which, held, would still hold the recorded call's values)."""
+    pc, gated, V = _instance(lambda: _hmm(512, 2, 32), torch.bfloat16)
+    (phi_a, x), (phi_b, _) = _inputs(gated, V, 64, seed = 0), _inputs(gated, V, 64, seed = 1)
+    phi_big, x_big = _inputs(gated, V, 1024, seed = 2)
+    monkeypatch.setattr(lp, "ENABLED", False)
+    for phi_, x_ in ((phi_b, x), (phi_big, x_big)):       # (warm: every choice tuned and cached)
+        _step(pc, phi_, x_, True, False)
+    ref = _step(pc, phi_b, x, True, False)
+    monkeypatch.setattr(lp, "ENABLED", True)
+    for _ in range(2):
+        _step(pc, phi_a, x, True, False)                   # recorded, then replayed
+    old = (pc.external_params.data_ptr(), pc.external_params_grad.data_ptr())
+    _step(pc, phi_big, x_big, True, False)                 # the buffers' storage grows ...
+    full = _count_full_paths(monkeypatch)
+    got = _step(pc, phi_b, x, True, False)                 # ... and batch 64 is cut from a new one
+    assert full[0] == 0, "the backward was not replayed"
+    new = (pc.external_params.data_ptr(), pc.external_params_grad.data_ptr())
+    assert new[0] != old[0] and new[1] != old[1], "the staging buffers did not move"
+    _same(ref, got, "staging buffers moved")
+
+
+@cuda_only
+def test_an_unplanned_call_inside_a_recording_fails_it(monkeypatch):
+    """A recording around a call that records nothing of its own -- a sum layer in a regime it does not plan (flows
+    modified in place), a gated layer whose parameterization does not plan it (the denominator's torch reference) --
+    cannot capture what that call launches, so the call fails it; a planned gated layer leaves it as it was."""
+    pc, gated, V = _instance(lambda: _hmm(512, 2, 32), torch.bfloat16)
+    phi, x = _inputs(gated, V, 64, seed = 0)
+
+    pc(x)                                                  # (plain: the gated layers as plain sum layers)
+    with LaunchPlans.record("outer") as outer:
+        pc.backward(x, flows_memory = 0.0, allow_modify_flows = True, logspace_flows = False)
+    assert outer.failed, "an unplanned sum layer's backward left the recording around it replayable"
+
+    def around_gated_layers(denom_ref):
+        if denom_ref:
+            monkeypatch.setenv("PYJUICE_BLOCKSCALE_DENOM_REF", "1")
+        else:
+            monkeypatch.delenv("PYJUICE_BLOCKSCALE_DENOM_REF", raising = False)
+        recs, open_ = [], []
+
+        def pre(layer, **kw):                              # (a recording around each gated layer's backward)
+            if hasattr(layer, "external_node_infos"):
+                cm = LaunchPlans.record("outer")
+                recs.append(cm.__enter__())
+                open_.append(cm)
+
+        def post(layer, **kw):
+            while open_:
+                open_.pop().__exit__(None, None, None)
+
+        for _ in range(2):                                 # (the second call replays the plan where there is one)
+            pc(x, sum_external_params = phi)
+            pc.backward(x, flows_memory = 0.0, sum_layer_pre_backward_callback = pre,
+                        sum_layer_post_backward_callback = post)
+        return recs
+
+    recs = around_gated_layers(True)
+    assert recs and all(r.failed for r in recs), "an unplanned gated layer left the recording around it replayable"
+    recs = around_gated_layers(False)
+    assert recs and not any(r.failed for r in recs), "a planned gated layer failed the recording around it"

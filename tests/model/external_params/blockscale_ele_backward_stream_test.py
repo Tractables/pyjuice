@@ -20,6 +20,7 @@ import pyjuice as juice
 import pyjuice.nodes.distributions as dists
 from pyjuice.nodes import inputs, multiply, summate, BlockScaleSumParams
 import pyjuice.layer.kernels.c as ck
+from pyjuice.utils.launch_plans import LaunchPlans
 from pyjuice.nodes.external_params.blockscale.backward import _BackwardMixin
 
 # (a sibling module: the pre-pass fork's circuits, capture helpers and float64 reference)
@@ -242,6 +243,7 @@ def test_a_backward_taking_it_matches_triton(name, builder, B, neg_gates, neg_ch
         for layer in _gated_layers(pc):
             for k in [k for k in layer._bs_bw_gate_cache if isinstance(k, tuple) and k[0] == "eleplan"]:
                 del layer._bs_bw_gate_cache[k]
+            LaunchPlans.of(layer).clear()                  # (its plans replay the choice dropped above)
         autotune, seen = _pick(prefer)
         monkeypatch.setattr(ck, "autotune", autotune)
         grads = _backward(pc, phi, x)
