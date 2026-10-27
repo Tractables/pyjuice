@@ -105,112 +105,6 @@ class _DenominatorsMixin:
         rows, bs, n_gates = self.denom_gate_geometry(layer)[pid]
         return denom_param_flows[off : off + size].view(rows * bs, n_gates)
 
-    def _accumulate_denom(self, layer, node_flows, params, external_params, denom_param_flows):
-        """
-        Contract this mini-batch into `W[node, gate] += sum_b u[n,b] * phi[g,b]`, this layer's share of
-        the denominator flow, in GATE space -- see the module note on why `W` is a sufficient and far
-        smaller accumulator than `F-` itself.
-
-        The contraction is over the GATE axis, which is `gate_cbs` times shorter than the edge axis, so
-        `node_flows` / `log Z` are read once per GATE tile rather than once per EDGE tile. See
-        `_bs_triton_denom_w_kernel` for the identity and the shift, and `compute_em_correction` for the
-        `F-[n,c] = theta[n,c] * W[n, g(c)]` reconstruction that closes the loop at M-step time.
-
-        `W` is a VIEW into the PC's flat denominator buffer, so it persists across backward calls and
-        rides `init_param_flows`' reset/scale cadence -- which is what makes this an ACCUMULATION (`+=`)
-        rather than a store: several mini-batches may feed one EM step.
-
-        Set `PYJUICE_BLOCKSCALE_DENOM_REF=1` to force the torch reference `_accumulate_denom_torch`
-        instead -- what the kernel is validated against, and a no-Triton escape hatch.
-        """
-        if os.environ.get("PYJUICE_BLOCKSCALE_DENOM_REF", "0") == "1":
-            return self._accumulate_denom_torch(layer, node_flows, params, external_params,
-                                                denom_param_flows)
-
-        from ..kernels.blockscale_backward import _bs_triton_denom_w_kernel
-
-        state = layer._bs_bw_state
-        dot_ieee = 0 if os.environ.get("PYJUICE_BLOCKSCALE_DENOM_TF32", "0") == "1" else 1
-
-        # The launches' tiles, grids and views, worked out once per (batch, precision) and kept with the buffer they view
-        # (another buffer replaces the plan); the forward's tensors (`nids`, `log Z`), the staging buffer and
-        # `node_flows` come with each call
-        plans = layer.__dict__.setdefault("_bs_denom_plans", {})
-        pkey = (state["batch_size"], state["ext_base"], dot_ieee)
-        plan = plans.get(pkey)
-        if plan is None or plan[0] is not denom_param_flows:
-            plan = plans[pkey] = (denom_param_flows, self._denom_plan(layer, params, denom_param_flows, dot_ieee))
-        for (nids, log_z, rows), (grid, W, gate, consts) in zip(state["shift_args"], plan[1]):
-            _bs_triton_denom_w_kernel[grid](
-                node_flows = node_flows, log_z = log_z, W = W, ext = external_params, gate = gate, nids = nids,
-                **consts)
-
-    def _denom_plan(self, layer, params, denom_param_flows, dot_ieee):
-        """Per partition `(grid, W, gate, constant arguments)` of `_bs_triton_denom_w_kernel` at this batch."""
-        import triton
-
-        state = layer._bs_bw_state
-        block_size, batch = state["block_size"], state["batch_size"]
-        node_cbs, gate_cbs, ext_base = state["node_cbs"], state["gate_cbs"], state["ext_base"]
-        dev = params.device
-
-        TILE_SIZE_B = min(triton.next_power_of_2(batch), 64)
-        B_NUM_TILES = triton.cdiv(batch, TILE_SIZE_B)
-
-        out = []
-        for pid, (nids, log_z, rows) in enumerate(state["shift_args"]):
-            gate = layer.ext_slots[0][pid]
-            num_edges = layer.partitioned_cids[pid].size(1)
-            n_gates = num_edges // gate_cbs
-            W = self._denom_slice(layer, denom_param_flows, pid)
-
-            # `rows` is the CUDA grid-y, capped at 65535 (as in `post_backward_layer`'s phigrad launch).
-            assert rows <= 65535, \
-                f"partition {pid} has {rows} node blocks, past the 65535 CUDA grid-y limit for the " \
-                f"denominator kernel. Use a larger block size."
-
-            # OCCUPANCY-bound, not bandwidth-bound, so the tiles are chosen to fill the device
-            # rather than to be as large as the register budget allows. MEASURED before this: the
-            # widest legal tiles left the kernel with 32 programs on a ~188-SM GPU, running at ~10%
-            # of achievable bandwidth (7.54 us against ~0.75 us of traffic).
-            #
-            # Shrinking the NODE tile here is free in traffic, unlike in the fused per-edge kernel
-            # this replaced, where it was a disaster: `node_flows` / `log Z` are PARTITIONED by node,
-            # so m-tiling moves them between programs rather than replicating them, and the only
-            # replicated operand is `lphi`, which is `n_gates` wide (16 here) rather than an edge
-            # tile (256 there).
-            target = 4 * _sm_count(dev)
-            TILE_SIZE_G = min(triton.next_power_of_2(n_gates), 64)
-            g_tiles = triton.cdiv(n_gates, TILE_SIZE_G)
-
-            # Widest node tile the register budget allows, then halved while the grid is under-filled.
-            TILE_SIZE_M = max(1, min(block_size, max(1, 4096 // max(1, TILE_SIZE_G))))
-            m_floor = 16 if block_size >= 16 else 1          # `tl.dot` needs 16
-            while TILE_SIZE_M > m_floor and \
-                    rows * (block_size // TILE_SIZE_M) * g_tiles * B_NUM_TILES < target:
-                TILE_SIZE_M //= 2
-            m_tiles = max(1, block_size // TILE_SIZE_M)
-            w_use_dot = 1 if (TILE_SIZE_M >= 16 and TILE_SIZE_G >= 16 and TILE_SIZE_B >= 16) else 0
-
-            # SPLIT THE BATCH REDUCTION across programs until the grid is big enough to fill the
-            # device. Each slice holds a PARTIAL sum for the same `W[n,g]`, so their combine must be
-            # atomic; with a single slice every `(n,g)` belongs to exactly one program and a
-            # read-add-write is safe. Either way it is an accumulation, never a store -- `W` is the
-            # persistent buffer, not a scratch.
-            base_progs = max(1, rows * m_tiles * g_tiles)
-            B_SPLITS = max(1, min(B_NUM_TILES, triton.cdiv(target, base_progs)))
-            B_TILES_PER_PROG = triton.cdiv(B_NUM_TILES, B_SPLITS)
-            B_SPLITS = triton.cdiv(B_NUM_TILES, B_TILES_PER_PROG)
-
-            out.append(((rows * m_tiles, g_tiles, B_SPLITS), W, gate, dict(
-                batch_size = batch, n_gates = n_gates,
-                TILE_SIZE_B = TILE_SIZE_B, TILE_SIZE_G = TILE_SIZE_G, TILE_SIZE_M = TILE_SIZE_M,
-                BLOCK_SIZE_M = block_size, NODE_CBS = node_cbs, GATE_CBS = gate_cbs,
-                gate_stride = gate.size(1), ext_base = ext_base,
-                B_TILES_PER_PROG = B_TILES_PER_PROG, USE_DOT = w_use_dot, DOT_IEEE = dot_ieee,
-                W_ATOMIC = 1 if B_SPLITS > 1 else 0, num_stages = 1)))
-        return tuple(out)
-
     def _accumulate_denom_torch(self, layer, node_flows, params, external_params, denom_param_flows):
         """
         The denominator flow `F-` for `apply_z_correction`:
@@ -229,9 +123,9 @@ class _DenominatorsMixin:
         which `compute_em_correction` rebuilds `F-[n,c] = theta[n,c] * W[n, g(c)]` -- so `theta` does not
         appear here at all.
 
-        REFERENCE implementation (torch), used to validate `_bs_triton_denom_w_kernel` and as its
-        no-Triton fallback. It materializes a `[rows, block_size, gates, batch]` tile per partition, so
-        the kernel replaces it on the hot path.
+        REFERENCE implementation (torch), which `_bs_post_backward_kernel`'s denominator is validated
+        against (`PYJUICE_BLOCKSCALE_DENOM_REF=1` runs it instead). It materializes a
+        `[rows, block_size, gates, batch]` tile per partition, so the kernel replaces it on the hot path.
 
         Only one node gate per block is served (`gate_counts(ns)[0] == 1`), which `pre_backward_layer`
         has already enforced when `apply_z_correction` is on.
@@ -255,8 +149,8 @@ class _DenominatorsMixin:
 
             # log phi of each edge, per (row, edge, batch); -inf on a padded edge block
             e = torch.arange(E, device = dev, dtype = torch.long)
-            # BOUNDED by the gate table's width, exactly as `_bs_triton_denom_w_kernel` bounds its own
-            # `gcol` load. `E` is the compiled `num_edges`, padded up to a power of two, while the
+            # BOUNDED by the gate table's width, exactly as `_bs_post_backward_kernel` bounds its own
+            # gate-table load. `E` is the compiled `num_edges`, padded up to a power of two, while the
             # table is only `ext_max_n_eblks` columns wide -- so whenever the widest row's edge-block
             # count is not a power of two the column runs PAST the row. Unlike the kernel (whose load
             # mask makes it read the sentinel) this is a torch gather, so it raised a device-side

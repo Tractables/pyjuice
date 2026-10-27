@@ -133,7 +133,8 @@ def test_the_prepass_element_backward_on_dead_columns(name, dts, monkeypatch):
 @pytest.mark.parametrize("name", list(CIRCUITS))
 def test_the_dispatch_reaches_the_prepass_element_backward(name, monkeypatch):
     """The layer's backward, told the gate chose the pre-pass kernel, over all its partitions against the plain CUDA
-    kernel's, whole and on runs of partition 0; and the gate's candidates hold its configs (none with the switch off)."""
+    kernel's, whole and on runs of partition 0; and the gate's candidates hold its configs (none where its extension
+    is not available)."""
     if not _available():
         pytest.skip("the CUDA kernels are not available here")
     B = 64
@@ -167,9 +168,10 @@ def test_the_dispatch_reaches_the_prepass_element_backward(name, monkeypatch):
                 rows = torch.cat([layer.partitioned_chids[0][s:e] for s, e in ((0, 1), (n // 2, n))])
                 rows = (rows[:, None] + torch.arange(cs0, device = DEV)[None, :]).reshape(-1)
                 assert torch.equal(ef[rows], want[rows])
+                available = ck.ele_prepass_is_available
                 for on in (True, False):
                     asked = []
-                    mp.setattr(SL, "BACKWARD_ELE_FLOW_PREPASS", on)
+                    mp.setattr(ck, "ele_prepass_is_available", available if on else (lambda: False))
                     mp.setattr(autotune, "best_of", lambda cands, *a, **k: asked.append([c for c, _ in cands]) or ("cuda", 0))
                     layer._cached_bk_ele_choice.clear()
                     layer.backward(pc.node_flows, ef, pc.node_mars, pc.element_mars, pc.params, **kw)

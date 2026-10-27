@@ -241,17 +241,6 @@ def test_a_forward_taking_it_gives_the_forks_results(name, builder, dt, B, neg_g
 
 
 @needs_kernels
-def test_the_switch_leaves_it_out(monkeypatch):
-    pc, phi, x = _instance(lambda: _hmm(256, 1, 16), "bf16", 64, False, False)
-    monkeypatch.setattr(bs_forward, "FORWARD_PREPASS", False)
-    autotune, seen = _pick("pre")
-    monkeypatch.setattr(ck, "autotune", autotune)
-    pc(x, sum_external_params = phi)
-    assert not any(isinstance(k, tuple) and k[0] == "pre" for k in seen) and seen, seen
-    assert {layer._bs_fw_plans[64][0][1] for layer in _gated_layers(pc)} != {"blockscale_forward_prepass"}
-
-
-@needs_kernels
 @pytest.mark.parametrize("label,builder", [
     ("child blocks of 32", lambda: _topology(PAD, 64, 32, 8)),     # an edge tile spans two runs of children
     ("gate width 2", lambda: _hmm(256, 1, 2)),

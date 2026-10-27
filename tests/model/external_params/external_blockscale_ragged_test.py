@@ -370,11 +370,11 @@ def test_both_forward_forks_actually_serve_a_padded_shape(monkeypatch):
     # Scanned across topologies AND batches rather than asserting that a particular batch picks a
     # particular fork. The choice is made by MEASUREMENT, so which fork wins where is a property of
     # the hardware and shifts when either kernel changes; what must hold is that both are exercised
-    # somewhere, which is the actual coverage question. The CuTe fork's pre-pass copy is left out: it
-    # takes the CuTe fork's shapes where it is faster, and its own padded coverage is
-    # blockscale_forward_prepass_test.py's.
-    from pyjuice.nodes.external_params.blockscale import forward as bs_forward
-    monkeypatch.setattr(bs_forward, "FORWARD_PREPASS", False)
+    # somewhere, which is the actual coverage question. The CuTe fork's pre-pass copy is left out (as if
+    # its extension had not built): it takes the CuTe fork's shapes where it is faster, and its own
+    # padded coverage is blockscale_forward_prepass_test.py's.
+    import pyjuice.nodes.external_params.kernels.c as bs_c
+    monkeypatch.setattr(bs_c, "get_prepass_module", lambda: None)
     seen = {}
     for name in NONDENSE:
         for batch in (64, 256):

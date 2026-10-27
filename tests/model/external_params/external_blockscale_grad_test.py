@@ -190,10 +190,8 @@ def test_every_fork_computes_the_same_gradient():
              if hasattr(l, "external_node_infos")][0]
 
     from pyjuice.nodes.external_params.kernels.c import get_ele_prepass_module
-    from pyjuice.nodes.external_params.blockscale import backward as bs_backward
-    elep = get_ele_prepass_module() if bs_backward.ELE_PREPASS else None
-    # (the pre-pass fork's configs too: at this gate width 8 its error is the log-Z kernel's TF32 one, ~3e-3, which
-    # the Triton element fork's own TF32 error happens to cancel)
+    elep = get_ele_prepass_module()
+    # (the pre-pass fork's configs too, where its extension builds)
     pre = [("elep", int(c)) for c in elep.fitting_configs(128, 64, 8, 2)] if elep is not None else []
     for forced in ["triton", "cute"] + pre:
         for k, v in layer._bs_bw_gate_cache.items():
@@ -247,59 +245,23 @@ def test_tied_gates_accumulate_across_every_layer_that_shares_them():
 
     # THE TWO ARMS MUST TAKE THE SAME NUMERICAL PATH, or this measures the wrong thing.
     #
-    # `_logz_tile` picks the log-Z gradient kernel's (GATE_TILE, BLOCK_B) by MEASUREMENT, separately
-    # for each circuit -- and the candidates are not equally accurate. Scored against the reference-
-    # free zero-sum invariant on this shape, the `USE_DOT = 0` tiles (GATE_TILE 1 and 8, which fall
-    # back to a broadcast-sum over an [M, G, B] intermediate) come out at 7.8e-3 relative against
-    # 8.8e-4 for the `tl.dot` tiles -- about 9x worse. When the tied arm happened to pick one and the
-    # untied arm the other, the difference between them was 1e-3 to 2.6e-3 and this assert failed;
-    # when they happened to agree it was 7.8e-8. That is what made this test flaky (2 of 5 runs), and
-    # it was never about the accumulation this test exists to check.
+    # The element fork is picked by MEASUREMENT, separately for each circuit, and it produces this gradient's first
+    # term -- and the forks differ in precision (fp16 dot vs pure fp32). When the two arms picked differently the
+    # difference between them was 1e-3 to 2.6e-3 and this assert failed; when they agreed it was ~1e-7. That made this
+    # test flaky, and it was never about the accumulation this test exists to check.
     #
-    # So the second arm REPLAYS the first arm's choices. Recorded rather than hardcoded, so the test
-    # does not silently stop exercising the autotuner's real selection if the shape changes.
-    # EVERY autotuned choice is replayed, not just the log-Z tile: the element fork is chosen the
-    # same way and produces this gradient's first term, and the forks differ in precision (fp16 dot
-    # vs pure fp32). Replaying only the log-Z tile took this from 2-of-5 runs passing to 8-of-10 --
-    # better, and still flaky, because the element pick was free to diverge.
-    #
-    # The replay is POSITIONAL, so the two arms have to make the same sequence of `autotune` calls --
-    # and `_logz_tile` calls `autotune` itself. The recording arm therefore logged three extra entries
-    # that the replaying arm never asks for, because it short-circuits `_logz_tile` and returns the
-    # recorded plan directly. From the first of those the streams were off by one: the log-Z pick was
-    # offered where an element-fork pick was expected, no candidate matched, and the fallback ran a
-    # LIVE measurement -- one per copy, each free to land on a different fork. That is what was left of
-    # the flakiness (3 of 8 runs). Those nested calls are excluded from the recording below, which
-    # aligns the streams exactly (9 recorded, 9 consumed, 0 fallbacks) and takes `d` from 1.5e-3 on a
-    # bad run to 9.3e-8 on every run.
-    import pyjuice.nodes.external_params.block_scale as _bs
+    # So the second arm REPLAYS the first arm's `autotune` picks. Recorded rather than hardcoded, so the test does not
+    # silently stop exercising the autotuner's real selection if the shape changes. The replay is POSITIONAL, so the two
+    # arms have to make the same sequence of calls -- asserted below. (The log-Z term's tile is `autotune.pick`'s,
+    # cached by shape process-wide, so the second arm takes the first arm's without a replay.)
     import pyjuice.layer.kernels.c as _ck
-    original_tile = _bs.BlockScaleSumParams._logz_tile
     original_autotune = _ck.autotune
-    recorded, recorded_at = [], []
-
-    def record(self, layer, launch, grad_ext, b, bs_, n_gates, rows):
-        record_at.inside_logz = True                    # its own `autotune` calls are not part of the stream
-        try:
-            pick = original_tile(self, layer, launch, grad_ext, b, bs_, n_gates, rows)
-        finally:
-            record_at.inside_logz = False
-        recorded.append(pick)
-        return pick
-
-    def replay(self, layer, launch, grad_ext, b, bs_, n_gates, rows):
-        assert replay.i < len(recorded), "the untied arm built more log-Z plans than the tied one"
-        pick = recorded[replay.i]
-        replay.i += 1
-        return pick
-    replay.i = 0
+    recorded_at = []
 
     def record_at(cands, **kw):
         pick = original_autotune(cands, **kw)
-        if not record_at.inside_logz:
-            recorded_at.append((tuple(n for n, _ in cands), pick))
+        recorded_at.append((tuple(n for n, _ in cands), pick))
         return pick
-    record_at.inside_logz = False
 
     def replay_at(cands, **kw):
         # The two circuits are structurally identical, so the streams must line up exactly. Anything
@@ -320,29 +282,19 @@ def test_tied_gates_accumulate_across_every_layer_that_shares_them():
         pc, copies = build(tie)
         pc(data, sum_external_params = {n: phi for n in copies})
         pc.backward(data, flows_memory = 0.0)
-        # the log-Z term in one launch with the denominator and the shift (`POST_FUSED`): its tile is
-        # `autotune.pick`'s, cached by shape, so the second arm takes the first arm's without a replay
-        fused = sum(len(l.__dict__.get("_bs_post_plans", {})) for g in pc.inner_layer_groups if g.is_sum()
-                    for l in g.layers)
-        return [pc.get_external_params_grad(n)[0].clone() for n in copies], fused
+        return [pc.get_external_params_grad(n)[0].clone() for n in copies]
 
     try:
-        _bs.BlockScaleSumParams._logz_tile, _ck.autotune = record, record_at
-        tied, fused_t = run(True)
-        _bs.BlockScaleSumParams._logz_tile, _ck.autotune = replay, replay_at
-        untied, fused_u = run(False)
+        _ck.autotune = record_at
+        tied = run(True)
+        _ck.autotune = replay_at
+        untied = run(False)
     finally:
-        _bs.BlockScaleSumParams._logz_tile = original_tile
         _ck.autotune = original_autotune
 
-    assert (recorded or (fused_t and fused_u)) and replay.i == len(recorded), \
-        f"the two arms built different numbers of log-Z plans ({len(recorded)} vs {replay.i}; fused " \
-        f"{fused_t} vs {fused_u}), so they did not take the same numerical path and the comparison below " \
-        f"is not apples-to-apples"
-
-    # Same requirement for the rest of the autotuned choices. A single live fallback here is enough to
-    # put the two arms on differently-rounded kernels, so demand that every recorded choice was asked
-    # for, in order, with the candidate set it was recorded against -- silence is not evidence.
+    # A single live fallback here is enough to put the two arms on differently-rounded kernels, so demand that every
+    # recorded choice was asked for, in order, with the candidate set it was recorded against -- silence is not
+    # evidence.
     assert recorded_at and replay_at.hits == len(recorded_at) == replay_at.i, \
         f"the two arms made different sequences of autotune calls ({len(recorded_at)} recorded, " \
         f"{replay_at.i} consumed, {replay_at.hits} replayed), so at least one kernel was picked by a " \

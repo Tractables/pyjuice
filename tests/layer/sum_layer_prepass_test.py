@@ -165,14 +165,15 @@ def test_the_prepass_forward_on_dead_columns(name, dts, monkeypatch):
 @pytest.mark.parametrize("B", [64, 128])
 def test_the_gate_offers_the_prepass_configs(B, monkeypatch):
     """The CUDA gate's candidates hold the pre-pass kernel's configs beside the plain and pipelined ones and Triton, and
-    not with `FORWARD_SUM_PREPASS` off."""
+    none where its extension is not available."""
     if not _available():
         pytest.skip("the CUDA kernels are not available here")
     pc, V, C = _hclt(128, torch.float32)
     x = torch.randint(0, C, (B, V), device = DEV)
     monkeypatch.setattr(SL, "FORWARD_SUM_CUDA", True)
+    available = ck.prepass_is_available
     for on in (True, False):
-        monkeypatch.setattr(SL, "FORWARD_SUM_PREPASS", on)
+        monkeypatch.setattr(ck, "prepass_is_available", available if on else (lambda: False))
         monkeypatch.setattr(autotune, "_CACHE", dict())
         asked = []
 

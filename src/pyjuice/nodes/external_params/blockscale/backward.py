@@ -14,19 +14,6 @@ import torch
 from .common import _buffer_kwarg
 from . import deferred_par
 
-#: The pre-pass element-flow backward (kernels/c/blockscale_ele_backward_prepass.cu: the Triton fork's computation,
-#: not its bits, as a pre-pass and a streaming kernel) among the measured element forks;
-#: PYJUICE_BLOCKSCALE_ELE_PREPASS=0 leaves it out.
-ELE_PREPASS = os.environ.get("PYJUICE_BLOCKSCALE_ELE_PREPASS", "1") != "0"
-
-#: The log-Z half of `d LL / d log phi` contracts at fp32 precision; PYJUICE_BLOCKSCALE_LOGZ_TF32=1 takes TF32 dots
-#: instead (the denominator flow's switch is PYJUICE_BLOCKSCALE_DENOM_TF32).
-LOGZ_DOT_IEEE = 0 if os.environ.get("PYJUICE_BLOCKSCALE_LOGZ_TF32", "0") == "1" else 1
-
-#: After a layer's flows, the log-Z half of `d LL / d log phi`, the denominator flow and the `-log Z` shift as one
-#: launch per partition (kernels/blockscale_post_backward.py); PYJUICE_BLOCKSCALE_POST_FUSED=0 keeps three.
-POST_FUSED = os.environ.get("PYJUICE_BLOCKSCALE_POST_FUSED", "1") != "0"
-
 def _set_attrs(layer, **attrs) -> None:
     """Plain attributes of a layer -- functions, tensors, None: never a parameter, buffer or module -- written past
     `nn.Module.__setattr__`, whose registration checks cost ~1.5 us a write (a gated layer's backward makes fifteen)."""
@@ -270,7 +257,7 @@ class _BackwardMixin:
         gate_bs_ = self.gate_sizes(ns_tensors[0][0].ns)[0]
         n_ngates_ = self.gate_counts(ns_tensors[0][0].ns)[0]
 
-        # `apply_z_correction` accumulates the denominator flow `F-` (see `_accumulate_denom` /
+        # `apply_z_correction` accumulates the denominator flow `F-` (see `_post_fused` /
         # `post_backward_layer`); the M-step then normalizes `theta * F+ / F-`. `F-` sums over a whole
         # node block, which a node-axis gate splits -- so, exactly like `d LL / d log phi`, it is served
         # only at one node gate per block. Refused here, before `node_mars` is perturbed.
@@ -322,9 +309,9 @@ class _BackwardMixin:
         # costs speed, not correctness.
         ele_mod, par_mod = get_ele_bw_module(), get_par_bw_module()
         sb_mod = get_sb_bw_module()
-        elep_mod = get_ele_prepass_module() if ELE_PREPASS else None
-        # A tied group's parameter flows may be left to the end of the pass (`deferred_par`), when the backward allows it
-        pd_mod = get_par_deferred_module() if deferred_par.PAR_DEFER else None
+        elep_mod = get_ele_prepass_module()
+        # A tied group's parameter flows may be left to the end of the pass (`deferred_par`), if the backward allows it
+        pd_mod = get_par_deferred_module()
         _set_attrs(layer, _bs_defer = bool(kwargs.get("defer_param_flows", False)))
 
         batch_size, block_size = state["batch_size"], state["block_size"]
@@ -355,7 +342,7 @@ class _BackwardMixin:
 
             Four may apply and which wins is not deducible: the CuTe fork is strongest at very large
             batch, but the ungated layer's own autotuner prefers Triton to its CuTe kernel at many
-            shapes, below batch 16 the plain-CUDA fork beats both, and the pre-pass fork (`ELE_PREPASS`)
+            shapes, below batch 16 the plain-CUDA fork beats both, and the pre-pass fork
             takes the shapes it serves from Triton by 2-4x where measured. So they are MEASURED.
 
             The whole decision -- eligibility, gate tables, winner -- is cached per
@@ -402,10 +389,10 @@ class _BackwardMixin:
                     and pinc == 1 and cbs % 128 == 0 and batch % 64 == 0 and plan["gate_tile"] is not None):
                 kinds.append("cute")
 
-            # The pre-pass fork (`ELE_PREPASS`) on the CuTe fork's tables, under the same contract (a k-tile of 64
-            # parents in one parent block, the 8-parameter loads aligned); its own scope -- batch % 64, a power-of-two
-            # gate width >= 4, the element block a multiple of a config's rows, the gates in shared memory -- is
-            # `fitting_configs`'.
+            # The pre-pass fork (kernels/c/blockscale_ele_backward_prepass.cu) on the CuTe fork's tables, under the same
+            # contract (a k-tile of 64 parents in one parent block, the 8-parameter loads aligned); its own scope --
+            # batch % 64, a power-of-two gate width >= 4, the element block a multiple of a config's rows, the gates in
+            # shared memory -- is `fitting_configs`'.
             if (elep_mod is not None and ctx["ele_cuda_ok"] and ctx.get("ele_loads_aligned", True) and tk == 64
                     and pinc == 1 and plan["gate_tile"] is not None):
                 kinds += [("elep", int(c)) for c in elep_mod.fitting_configs(cbs, batch, gate_cbs, knt)]
@@ -750,66 +737,42 @@ class _BackwardMixin:
         if denom_param_flows is not None and external_params is None:
             raise RuntimeError("`apply_z_correction` needs the external-parameter staging buffer.")
 
-        # The three below in one launch per partition (`POST_FUSED`) -- the denominator flow's torch reference
-        # (PYJUICE_BLOCKSCALE_DENOM_REF=1) on its own: it reads `node_flows` and `log Z`, never `node_mars`
+        # The log-Z half of `d LL / d log phi` (with the gradient), the denominator flow `F-` of `apply_z_correction`
+        # (with `denom_param_flows`, which the circuit allocates exactly when a layer asks for it) and the `-log Z`
+        # shift in one launch per partition; the shift alone without either. The denominator flow's torch reference
+        # (PYJUICE_BLOCKSCALE_DENOM_REF=1, what the kernel is validated against) runs on its own: it reads `node_flows`
+        # and `log Z`, never `node_mars`.
         denom_ref = denom_param_flows is not None and os.environ.get("PYJUICE_BLOCKSCALE_DENOM_REF", "0") == "1"
         fused_w = denom_param_flows is not None and not denom_ref
-        if POST_FUSED and (grad_ext is not None or fused_w):
+        if grad_ext is not None or fused_w:
             self._post_fused(layer, state, node_flows, node_mars, params, external_params, grad_ext,
                              denom_param_flows if fused_w else None)
-            if denom_ref:
-                self._accumulate_denom(layer, node_flows, params, external_params, denom_param_flows)
-            _set_attrs(layer, _bs_grad_ext = None)
-            return None
-
-        # The log-Z half of `d LL / d log phi`. Runs here, not in the element kernel, because it shares
-        # no operand with it. Uses `log Z` straight from the forward's cache, so nothing is recomputed.
-        if grad_ext is not None:
-            from ..kernels.blockscale_backward import _bs_triton_phigrad_logz_kernel
-
-            bs_, gate_cbs = state["block_size"], state["gate_cbs"]
-            batch = state["batch_size"]
-
-            # Per partition its launch (grid, constant arguments: the measured tile) once per batch and state; `sigma`
-            # (cached until the parameters change), the forward's tensors and the buffers come with each call
-            plans = layer.__dict__.setdefault("_bs_logz_plans", {})
-            for pid, (nids, log_z, rows) in enumerate(state["shift_args"]):
-                sigma, n_gates = self._sigma(layer, params, pid, bs_, gate_cbs)
-                gb = layer.ext_slots[0][pid]
-                pkey = (batch, pid, bs_, gate_cbs, state["node_cbs"], state["ext_base"], LOGZ_DOT_IEEE)
-                plan = plans.get(pkey)
-                if plan is None:
-                    plan = plans[pkey] = self._logz_plan(layer, grad_ext, node_flows, external_params, state, nids,
-                                                         log_z, rows, sigma, gb, n_gates)
-                grid, consts = plan
-                _bs_triton_phigrad_logz_kernel[grid](
-                    node_flows = node_flows, log_z = log_z, sigma = sigma, ext = external_params, gate = gb,
-                    grad_ext = grad_ext, nids = nids, **consts)
-
-            _set_attrs(layer, _bs_grad_ext = None)
-
-        # The denominator flow `F-` for `apply_z_correction`. Present exactly when the PC allocated
-        # `denom_param_flows` (i.e. a layer requested it): a model built with `apply_z_correction = False`
-        # does nothing here. Uses the forward's cached `log Z`, so it is independent of the `node_mars`
-        # shift about to be undone below.
-        if denom_param_flows is not None:
-            self._accumulate_denom(layer, node_flows, params, external_params, denom_param_flows)
-
-        for nids, log_z, rows in state["shift_args"]:
-            shift_logz(node_mars, nids, log_z, state["block_size"], -1.0)
+        else:
+            for nids, log_z, rows in state["shift_args"]:
+                shift_logz(node_mars, nids, log_z, state["block_size"], -1.0)
+        if denom_ref:
+            self._accumulate_denom_torch(layer, node_flows, params, external_params, denom_param_flows)
+        _set_attrs(layer, _bs_grad_ext = None)
 
         return None
 
     def _post_fused(self, layer, state, node_flows, node_mars, params, external_params, grad_ext, denom_param_flows):
-        """The log-Z gradient (with `grad_ext`), the denominator flow (with `denom_param_flows`) and the `-log Z` shift
-        of each partition in one launch of `_bs_post_backward_kernel`, its plan built once per batch (`_post_plan`)."""
+        """
+        The log-Z gradient (with `grad_ext`), the denominator flow (with `denom_param_flows`) and the `-log Z` shift of
+        each partition in one launch of `_bs_post_backward_kernel`, its plan built once per batch (`_post_plan`). Uses
+        `log Z` straight from the forward's cache, so nothing is recomputed.
+
+        WHY THE GRADIENT'S FIRST TERM STAYS IN THE ELEMENT KERNEL. Fusing it there costs that kernel ~13 us -- far more
+        than the ~0.8 us of arithmetic it adds, an occupancy penalty from carrying its accumulator through the k loop --
+        so a standalone kernel computing BOTH terms was written and measured against it. It lost everywhere: at K=1024 /
+        block 128 / gate 8 the gated backward ran at 1.38x the ungated one against 1.34x, and at batch 8 at 3.6x against
+        ~1.2x, re-reading the `node_flows`, `node_mars` and parameters the element kernel already holds in registers.
+        The log-Z term shares no operand with that kernel, so it runs here. Do not re-split without re-measuring.
+        """
         from ..kernels.blockscale_post_backward import _bs_post_backward_kernel
 
         bs_, gate_cbs, batch = state["block_size"], state["gate_cbs"], state["batch_size"]
         want_grad, want_w = grad_ext is not None, denom_param_flows is not None
-        # fp32-level contractions -- three TF32 passes (`tf32x3`) -- or one, where the TF32 switches ask for it
-        grad_prec = 2 if LOGZ_DOT_IEEE else 0
-        w_prec = 0 if os.environ.get("PYJUICE_BLOCKSCALE_DENOM_TF32", "0") == "1" else 2
 
         plans = layer.__dict__.setdefault("_bs_post_plans", {})
         for pid, (nids, log_z, rows) in enumerate(state["shift_args"]):
@@ -819,12 +782,11 @@ class _BackwardMixin:
                 sigma, n_gates = log_z, self.denom_gate_geometry(layer)[pid][2]     # (`sigma` unread)
             W = self._denom_slice(layer, denom_param_flows, pid) if want_w else log_z      # (unread without)
             gb = layer.ext_slots[0][pid]
-            pkey = (batch, pid, bs_, gate_cbs, state["node_cbs"], state["ext_base"], want_grad, want_w, grad_prec,
-                    w_prec)
+            pkey = (batch, pid, bs_, gate_cbs, state["node_cbs"], state["ext_base"], want_grad, want_w)
             plan = plans.get(pkey)
             if plan is None:
                 plan = plans[pkey] = self._post_plan(state, rows, n_gates, gb, nids, log_z, sigma, external_params,
-                                                     grad_ext, W, want_grad, want_w, grad_prec, w_prec)
+                                                     grad_ext, W, want_grad, want_w)
             grid, consts, shares = plan
             if shares is not None:                 # the node tiles' gradient shares and their groups' tickets
                 partial, counter = self._post_scratch(log_z.device, *shares)
@@ -836,10 +798,10 @@ class _BackwardMixin:
                 counter = counter, **consts)
 
     def _post_scratch(self, device, n_shares, n_groups):
-        """`(shares, counters)` for `_bs_post_backward_kernel`'s gradient sum: one pair per (device, size) for every layer
-        -- they run one after another on the stream -- never reallocated, so a CUDA graph that captured one keeps a live
-        address. The counters must read 0 before a launch, and every launch leaves them so; zeroed when made, or -- made
-        inside a capture, whose zeroing runs only on replay -- by the first call outside one."""
+        """`(shares, counters)` for `_bs_post_backward_kernel`'s gradient sum: one pair per (device, size) for every
+        layer -- they run one after another on the stream -- never reallocated, so a CUDA graph that captured one keeps
+        a live address. The counters must read 0 before a launch, and every launch leaves them so; zeroed when made, or
+        -- made inside a capture, whose zeroing runs only on replay -- by the first call outside one."""
         bufs = self.__dict__.setdefault("_bs_post_scratch", {})
         key = (device, n_shares, n_groups)
         entry = bufs.get(key)
@@ -852,13 +814,12 @@ class _BackwardMixin:
             entry[2] = True
         return entry[0], entry[1]
 
-    def _post_plan(self, state, rows, n_gates, gb, nids, log_z, sigma, external_params, grad_ext, W, want_grad, want_w,
-                   grad_prec, w_prec):
-        """`(grid, constant arguments, shares)` of `_bs_post_backward_kernel` for one partition at this batch -- `shares`
-        the sizes `(gradient shares, groups)` of its scratch where a node block is several tiles, else None: a tile by
-        rule, or one of a few around it where it measures faster (`autotune.pick`, keyed by shape: equal layers share
-        it), timed into scratch buffers -- the gradient and `W` are accumulated, `node_mars` written -- read through
-        scratch node rows (`nids` of their own)."""
+    def _post_plan(self, state, rows, n_gates, gb, nids, log_z, sigma, external_params, grad_ext, W, want_grad, want_w):
+        """`(grid, constant arguments, shares)` of `_bs_post_backward_kernel` for one partition at this batch --
+        `shares` the sizes `(gradient shares, groups)` of its scratch where a node block is several tiles, else None: a
+        tile by rule, or one of a few around it where it measures faster (`autotune.pick`, keyed by shape: equal layers
+        share it), timed into scratch buffers -- the gradient and `W` are accumulated, `node_mars` written -- read
+        through scratch node rows (`nids` of their own)."""
         import triton
         from pyjuice.layer.kernels import autotune
         from ..kernels.blockscale_post_backward import _bs_post_backward_kernel
@@ -901,7 +862,7 @@ class _BackwardMixin:
                         BLOCK_SIZE_M = bs_, gate_stride = gb.size(1), ext_base = state["ext_base"], TILE_M = tm,
                         TILE_G = tg, TILE_B = tb, B_TILES_PER_PROG = bpp, WANT_GRAD = int(want_grad),
                         WANT_W = int(want_w), W_ATOMIC = 1 if grid(c)[2] > 1 else 0,
-                        USE_DOT = 1 if min(tm, tg, tb) >= 16 else 0, GRAD_IEEE = grad_prec, W_IEEE = w_prec,
+                        USE_DOT = 1 if min(tm, tg, tb) >= 16 else 0,
                         GRAD_PARTIAL = 1 if (want_grad and bs_ // tm > 1) else 0, num_warps = warps, num_stages = 1)
 
         def shares(c):
@@ -911,7 +872,7 @@ class _BackwardMixin:
             return (rows * (bs_ // c[0]) * n_gates * batch, rows * g[1] * g[2])
 
         key = ("bs_post", bs_, rows, n_gates, state["node_cbs"] // gate_cbs, gb.size(1), batch, want_grad, want_w,
-               grad_prec, w_prec, cands[0])
+               cands[0])
         cfg = autotune.cached(key)
         if cfg is None and autotune.should_tune(key, len(cands)):
             dev = log_z.device
@@ -935,194 +896,3 @@ class _BackwardMixin:
             cfg = autotune.pick(key, cands, bench)
         cfg = cfg or cands[0]
         return grid(cfg), consts(cfg), shares(cfg)
-
-    def _logz_plan(self, layer, grad_ext, node_flows, external_params, state, nids, log_z, rows, sigma, gb, n_gates):
-        """`(grid, constant arguments)` of `_bs_triton_phigrad_logz_kernel` for one partition at this batch, its tile
-        measured (`_logz_tile`, which times candidate launches into a scratch)."""
-        import triton
-        from ..kernels.blockscale_backward import _bs_triton_phigrad_logz_kernel
-
-        bs_, gate_cbs, batch = state["block_size"], state["gate_cbs"], state["batch_size"]
-        # WHY THE FIRST TERM STAYS FUSED. Fusing it costs the element kernel ~13 us -- far more
-        # than the ~0.8 us of arithmetic it adds -- which looks like an occupancy penalty from
-        # carrying its accumulator through that kernel's k loop. So a standalone kernel
-        # computing BOTH terms was written and measured against it. It lost everywhere: at
-        # K=1024 / block 128 / gate 8 it ran the gated backward at 1.38x the ungated one
-        # against the fused path's 1.34x, and at batch 8 at 3.6x against ~1.2x, because the
-        # separate kernel re-reads `node_flows`, `node_mars` and the parameters that the
-        # element kernel already has in registers. Reading them twice costs more than the
-        # occupancy does. Do not re-split this without re-measuring.
-        #
-        # `rows` is the y axis, which CUDA caps at 65535. The kernel reads `pid_nb` straight
-        # from `program_id(1)` with no offset argument, so it cannot be chunked the way the
-        # flow launches above are -- refuse rather than let the driver truncate the grid and
-        # silently drop the gradient of every node block past the cap.
-        assert rows <= 65535, \
-            f"a partition has {rows} node blocks, past the 65535 CUDA grid-y limit for " \
-            f"the external-gradient kernel. Split the partition, or use a larger block size."
-
-        def consts(gt, bb, tm):
-            return dict(batch_size = batch, n_gates = n_gates, N_CHILD_GATES = state["node_cbs"] // gate_cbs,
-                        BLOCK_SIZE_M = bs_, BLOCK_B = bb, GATE_TILE = gt, TILE_SIZE_M = tm,
-                        USE_DOT = (1 if (gt >= 16 and tm >= 16 and batch >= 64) else 0),
-                        gate_stride = gb.size(1), ext_base = state["ext_base"], num_stages = 1,
-                        DOT_IEEE = LOGZ_DOT_IEEE)
-
-        def grid(gt, bb, tm):
-            return (triton.cdiv(n_gates, gt), rows * (bs_ // tm), triton.cdiv(batch, bb))
-
-        def _go(gt, bb, tm, tgt):
-            _bs_triton_phigrad_logz_kernel[grid(gt, bb, tm)](
-                node_flows = node_flows, log_z = log_z, sigma = sigma, ext = external_params, gate = gb,
-                grad_ext = tgt, nids = nids, **consts(gt, bb, tm))
-
-        gt, bb, tm = self._logz_tile(layer, _go, grad_ext, batch, bs_, n_gates, rows)
-        return grid(gt, bb, tm), consts(gt, bb, tm)
-
-    def _logz_tile(self, layer, launch, grad_ext, batch, block_size, n_gates, rows):
-        """
-        `(GATE_TILE, BLOCK_B)` for the log-Z gradient kernel, chosen by MEASUREMENT and cached.
-
-        The two axes trade against each other and neither dominates: a wider gate tile amortizes the
-        [M, B] `node_flows` / `log Z` load over more gates, a wider batch tile amortizes the [M, G]
-        `sigma` load over more samples, and their product sets how many programs there are. Picking
-        them independently -- a gate tile sized to fill the grid, a batch tile sized to fit shared
-        memory -- landed on (32, 128), and measuring the grid found (32, 16) and (64, 32) instead:
-        5.4 us against 10.4 at K=1024, 11.1 against 22.1 at K=2048, 3.0 against 12.2 at gate width 32.
-        Roughly 2x, and where the optimum sits moves with the shape, so it is measured rather than
-        ruled.
-
-        Below 16 the kernel loses `tl.dot` and falls back to a broadcast-sum with an [M, G, B]
-        intermediate, which at a wide batch tile measured 200-1200 us -- two orders of magnitude off,
-        and the reason a naive sweep must not simply take the smallest tile. Such tiles are therefore
-        offered only against the narrowest batch tile. But `GATE_TILE = 1` has to stay on the menu: a
-        single-node-block layer has one `rows` and, at small batch, one batch tile, so a 32-wide gate
-        tile leaves 2 programs for 188 SMs. Dropping it cost 1.2x -> 2.4x there, which is what the
-        [M, 1, B] intermediate buys back.
-
-        Trials run into a SCRATCH buffer. The kernel accumulates into the real one with `atomic_add`,
-        so timing candidates against it would add the log-Z term once per trial.
-        """
-        import triton
-        import pyjuice.layer.kernels.c as ck
-
-        key = ("logztile", batch, block_size, n_gates, rows)
-        pick = layer._bs_bw_gate_cache.get(key)
-        if pick is not None:
-            return pick
-
-        bcap = max(16, min(64, triton.next_power_of_2(batch)))
-        cands = [(gt, bb)
-                 for gt in (1, 8, 16, 32, 64) if gt <= max(1, triton.next_power_of_2(n_gates))
-                 for bb in (16, 32, 64) if bb <= bcap
-                 if gt >= 16 or bb == 16]
-
-        # PREFER A TILE THAT CAN USE `tl.dot`, on ACCURACY, wherever one exists.
-        #
-        # Below 16 the kernel loses `tl.dot` and falls back to a broadcast-sum over an [M, G, B]
-        # intermediate, and that fallback is measurably less accurate: scored against the
-        # reference-free zero-sum invariant, 3.99e-3 against 5.79e-4 on a 128-wide layer at gate 8,
-        # and 4.70e-3 against 5.68e-4 at gate 4 -- 7x to 8x. `GATE_TILE` itself has NO effect on
-        # accuracy (1, 8 and 16 all give 3.96e-3 with the fallback); it is purely whether `tl.dot` is
-        # reachable, which needs an output tile of 16.
-        #
-        # The narrow tiles exist for OCCUPANCY -- a single-node-block layer at small batch leaves the
-        # grid nearly empty with a wide gate tile -- so this used to look like a trade. MEASURED, it
-        # is not one: forcing the dot-capable tile on exactly those shapes costs 1.001x and 0.999x
-        # END TO END, because this kernel is a few microseconds of a step that is milliseconds. The
-        # accuracy is worth having for a gate gradient that a router is trained on.
-        #
-        # Narrow tiles stay on the menu where `tl.dot` is unreachable anyway (`USE_DOT` also needs
-        # `block_size >= 16` and `batch >= 64`), and where no wide tile fits the gate count -- so the
-        # single-node-block case that motivated them is still served.
-        if block_size >= 16 and batch >= 64:
-            dot_capable = [c for c in cands if c[0] >= 16]
-            if dot_capable:
-                cands = dot_capable
-
-        # RANKED before measuring, and only the finalists are timed. Every candidate that gets timed
-        # also gets COMPILED, and the constexprs differ per shape so nothing is reused between them --
-        # timing all of them put 230s of compilation into the test suite alone. The model only has to
-        # be good enough to keep the winner in the shortlist, which the measurement then confirms.
-        def _est(c):
-            gt, bb = c
-            gtiles = (n_gates + gt - 1) // gt
-            btiles = (batch + bb - 1) // bb
-            progs = gtiles * rows * btiles
-            # `node_flows` + `log Z` are [M, bb] per program and re-read once per gate tile; `sigma` is
-            # [M, gt] per program and re-read once per batch tile. Under-occupancy is what the two
-            # would otherwise be traded away for, so charge for it.
-            traffic = gtiles * rows * (batch * block_size * 8 + btiles * block_size * gt * 4)
-            starve = max(1.0, 376.0 / max(progs, 1))
-            # Below 16 gates the kernel loses `tl.dot` for a broadcast-sum over an [M, gt, B]
-            # intermediate, so its work grows with the tile rather than shrinking.
-            return traffic * starve * (gt if gt < 16 else 1)
-
-        # Ordered by FOOTPRINT for the fallback below: the narrowest tiles are the ones most likely to
-        # fit when the wide ones do not.
-        by_size = sorted(cands, key = lambda c: (c[1], c[0]))
-        short = sorted(cands, key = _est)[:4]
-        # The narrowest pair always stays on the shortlist. `_est` ranks by traffic, which favours WIDE
-        # tiles, so at a large block size every shortlisted candidate can be one that does not fit in
-        # shared memory -- measured at block_size 1024 / gate 4 / batch 1024, where all four needed
-        # 136-264 KB against a 101 KB limit, leaving nothing to measure.
-        if by_size and by_size[0] not in short:
-            short.append(by_size[0])
-
-        # NODE-TILE LADDER, widest first. `node_flows` and `log Z` are `[TILE_SIZE_M, bb]` per program,
-        # so at a wide block they exhaust shared memory for EVERY `(GATE_TILE, BLOCK_B)` pair and the
-        # search below has nothing to return -- measured at `block_size = 2048`, where the narrowest
-        # candidate still wanted 139264 bytes against a 101376 limit and a 2048-state HMM therefore
-        # could not run its gate gradient at all. Splitting the node axis is the only axis left.
-        #
-        # The full block is tried FIRST, so every shape that already fits keeps exactly the tile it
-        # had; the ladder only descends when the whole `(gt, bb)` search comes back empty.
-        tm_ladder = [block_size]
-        t = block_size
-        while t > 16:
-            t //= 2
-            tm_ladder.append(t)
-
-        try:
-            scr = torch.empty_like(grad_ext)
-            ok = []
-            for tm in tm_ladder:
-                # Shared memory is what rules a candidate out, and it is not worth modelling: Triton's
-                # own liveness decides which tiles are alive at once. Ask it, and drop what it refuses.
-                for gt, bb in short:
-                    try:
-                        launch(gt, bb, tm, scr)
-                        ok.append((gt, bb, tm))
-                    except Exception:
-                        pass
-                # Every shortlisted candidate was refused. Widen to the whole set, narrowest first, and
-                # take the first that runs -- an unmeasured but WORKING tile beats the alternative,
-                # which was to return one that had just raised and let the real launch fail.
-                if not ok:
-                    for c in by_size:
-                        if c in short:
-                            continue
-                        try:
-                            launch(c[0], c[1], tm, scr)
-                            ok.append((c[0], c[1], tm))
-                            break
-                        except Exception:
-                            pass
-                if ok:
-                    break
-            torch.cuda.synchronize()
-            if len(ok) > 1:
-                trials = [(c, (lambda c = c: launch(c[0], c[1], c[2], scr))) for c in ok]
-                pick = ck.autotune(trials) or ok[0]
-            elif ok:
-                pick = ok[0]
-            del scr
-        except torch.cuda.OutOfMemoryError:
-            pick = None
-
-        if pick is None:
-            # Nothing fit, or the scratch buffer could not be allocated. Hand back the narrowest pair
-            # and let the real launch report the failure against the real operands.
-            pick = (by_size[0][0], by_size[0][1], tm_ladder[-1]) if by_size else (1, 16, min(16, block_size))
-        layer._bs_bw_gate_cache[key] = pick
-        return pick

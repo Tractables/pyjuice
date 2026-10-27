@@ -5,8 +5,8 @@ the gradient on and off, on each gated layer's real inputs captured from a backw
 multiple of the consumer groups), 16 and 64, of one to four blocks; gate widths 4 to 512 (past the element tile, and
 past the element block); fp32 and bf16 parameters; log-gates -inf in places and in whole columns, children -inf;
 padded (phantom k-tiles), block-sparse, two-node layers and child blocks of 32. Then the plan: it offers the configs,
-and a backward taking them gives the Triton fork's parameter flows and gate gradients within the forks' rounding; the
-switch; and it declines what it does not serve. Skipped where the CUDA kernels cannot build.
+and a backward taking them gives the Triton fork's parameter flows and gate gradients within the forks' rounding; and
+it declines what it does not serve. Skipped where the CUDA kernels cannot build.
 """
 import pytest
 import torch
@@ -15,7 +15,6 @@ import pyjuice as juice
 import pyjuice.nodes.distributions as dists
 from pyjuice.nodes import inputs, multiply, summate, BlockScaleSumParams
 import pyjuice.layer.kernels.c as ck
-from pyjuice.nodes.external_params.blockscale import backward as bs_backward
 
 DEV = torch.device("cuda:0")
 NAN = float("nan")
@@ -303,17 +302,6 @@ def test_a_backward_taking_it_matches_triton(name, builder, dt, B, neg_gates, ne
         scale = float(g_t[ns][~nan].abs().max())
         d = float((g_t[ns] - g_p[ns])[~nan].abs().max()) / max(scale, 1e-30)
         assert d < 2e-2, f"{name}: the gate gradient differs by {d:.2e} (relative)"
-
-
-@needs_kernels
-def test_the_switch_leaves_it_out(monkeypatch):
-    pc, phi, x = _instance(lambda: _hmm(256, 1, 16), "bf16", 64, False, False)
-    monkeypatch.setattr(bs_backward, "ELE_PREPASS", False)
-    autotune, seen = _pick("elep")
-    monkeypatch.setattr(ck, "autotune", autotune)
-    _backward(pc, phi, x)
-    assert seen and not any(isinstance(k, tuple) and k[0] == "elep" for k in seen), seen
-    assert not any(isinstance(p["kind"], tuple) and p["kind"][0] == "elep" for p in _ele_plans(pc))
 
 
 @needs_kernels

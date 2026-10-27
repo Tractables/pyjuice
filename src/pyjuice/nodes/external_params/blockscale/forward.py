@@ -8,17 +8,11 @@ corrected).
 
 from __future__ import annotations
 
-import os
 from collections import OrderedDict
 
 import torch
 
 from .common import _buffer_kwarg
-
-#: The pre-pass forward (kernels/c/blockscale_forward_prepass.cu: the CuTe fork's computation, to the bit, as a
-#: pre-pass, its merge factors and a streaming kernel) among the measured CUDA forks; PYJUICE_BLOCKSCALE_FORWARD_PREPASS=0
-#: leaves it out.
-FORWARD_PREPASS = os.environ.get("PYJUICE_BLOCKSCALE_FORWARD_PREPASS", "1") != "0"
 
 #: How many forward plans to keep per layer, keyed by batch size. Each holds a `log Z` buffer per
 #: partition sized by that batch, so this bounds memory; rebuilding an evicted one costs an AUTOTUNE,
@@ -47,7 +41,7 @@ class _ForwardMixin:
 
           * the CuTe/TMA fork, for batches it can tile (`batch % 64 == 0`) on sm_90+ with CUTLASS. It
             carries the normalizer as a gate-factored contraction against a precomputed `sigma`;
-          * its pre-pass copy (`FORWARD_PREPASS`), bit-identical, where an edge tile is one run of
+          * its pre-pass copy (kernels/c/blockscale_forward_prepass.cu), bit-identical, where an edge tile is one run of
             children (`ch_block_size >= 64`) and a gate spans at least 4 of them: the fork's work that
             depends on the edge tile alone done once per node block, the running maxima as prefix
             maxima, the tiles' MMAs spread over groups of warps and merged in order;
@@ -69,7 +63,7 @@ class _ForwardMixin:
         # than either, but the alternative was not running at all.
         mod = get_cute_module()
         sb_mod = get_sb_module()
-        pre_mod = get_prepass_module() if FORWARD_PREPASS else None
+        pre_mod = get_prepass_module()
 
         if getattr(layer, "ext_slots", None) is None:
             raise NotImplementedError(

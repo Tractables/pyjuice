@@ -145,9 +145,10 @@ def test_the_form_is_the_shapes_not_a_timing(dtype, monkeypatch):
 
 
 @cuda_only
-def test_mini_batch_em_takes_it_and_the_switch_restores_the_per_block_kernels(monkeypatch):
+def test_mini_batch_em_takes_it(monkeypatch):
+    """`mini_batch_em` updates by node blocks, to what the per-block kernels give from the same state."""
     ns, V, C = _circuit("hmm")
-    pc, flows = _state(ns, V, C, torch.float32)
+    pc, _ = _state(ns, V, C, torch.float32)
     start = pc.params.detach().clone()
     calls = []
     real = em_blocks.em_update
@@ -155,8 +156,6 @@ def test_mini_batch_em_takes_it_and_the_switch_restores_the_per_block_kernels(mo
     pc.mini_batch_em(step_size = 0.5, pseudocount = 0.1)
     new = pc.params.detach().clone()
     assert calls == [1]
-    pc.params.data.copy_(start); pc.param_flows.copy_(flows)
-    monkeypatch.setattr(em_blocks, "ENABLED", False)
-    pc.mini_batch_em(step_size = 0.5, pseudocount = 0.1)
-    assert calls == [1]                                                    # the per-block kernels, as before
-    assert torch.allclose(pc.params, new, atol = 1e-7, rtol = 1e-6), float((pc.params - new).abs().max())
+    # (from the flows as `mini_batch_em` left them: it sums tied copies' flows in place before the update)
+    ref, _ = _run(pc, pc.param_flows.clone(), start, 0.5, 0.1, False, (), "old")
+    assert torch.allclose(new.double(), ref, atol = 1e-7, rtol = 1e-6), float((new.double() - ref).abs().max())

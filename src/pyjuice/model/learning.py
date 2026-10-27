@@ -10,8 +10,8 @@ from __future__ import annotations
 import torch
 from typing import Optional
 
-from .backend import compute_cum_par_flows, em_par_update, eval_top_down_probs
-from .backend.params_master import em_par_update_master, sync_master
+from .backend import compute_cum_par_flows, eval_top_down_probs
+from .backend.params_master import sync_master
 from .backend import em_blocks
 
 from .common import device_grad_controller
@@ -141,21 +141,9 @@ class _LearningMixin:
             # Below fp32: the update on the fp32 master copy, stored in the same pass
             params = self.params if self.params.dtype == torch.float32 else self._params_master(sync = False)
             master = None if params is self.params else params
-            if em_blocks.ENABLED:
-                # By node blocks, coalesced (`backend.em_blocks`: 6.6x the per-block kernels on HCLT-1024 at fp32)
-                em_blocks.em_update(self, self.param_flows, step_size, pseudocount, keep_zero_params,
-                                    exclude = exclude, master = master)
-            else:
-                kwargs = self._par_update_kwargs_excluding(exclude)
-                if kwargs[0].size(0) > 0:        # every block may belong to a corrected range
-                    if master is None:
-                        em_par_update(params, self.param_flows, kwargs,
-                                      step_size = step_size, pseudocount = pseudocount,
-                                      keep_zero_params = keep_zero_params)
-                    else:
-                        em_par_update_master(params, self.params.data, self.param_flows, kwargs,
-                                             step_size = step_size, pseudocount = pseudocount,
-                                             keep_zero_params = keep_zero_params)
+            # By node blocks, coalesced (`backend.em_blocks`: 6.6x the per-block kernels on HCLT-1024 at fp32)
+            em_blocks.em_update(self, self.param_flows, step_size, pseudocount, keep_zero_params,
+                                exclude = exclude, master = master)
 
             # The conditional update, writing `params` in place -- which is what removes BOTH the
             # discarded pass above and a separate write-back. It reads the PRE-update `theta` of its own

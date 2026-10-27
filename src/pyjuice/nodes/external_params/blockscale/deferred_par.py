@@ -23,18 +23,14 @@ A group's slots belong to the scope that filled them: a new backward -- also aft
 
 from __future__ import annotations
 
-import os
 import weakref
 
 import torch
 
 from pyjuice.utils.deferred import current_scope
 
-#: PYJUICE_BLOCKSCALE_PAR_DEFER=0 keeps every step's parameter flows in its own launch.
-PAR_DEFER = os.environ.get("PYJUICE_BLOCKSCALE_PAR_DEFER", "1") != "0"
-
 #: The operand slots a group may hold (MB).
-PAR_DEFER_MB = float(os.environ.get("PYJUICE_BLOCKSCALE_PAR_DEFER_MB", "128"))
+PAR_DEFER_MB = 128
 
 #: The smallest group (flows per step) that defers. The kernels win from ~1M flows (MEASURED, gate width 64, B 128,
 #: their time against the per-step Triton kernels': 262K flows (HMM-512 in 2 blocks, 15 steps) 67 -> 81 us; 1M
@@ -102,7 +98,7 @@ def _long(t):
 def try_defer(mod, layer, ctx, gate_table, ext, node_cbs, gate_cbs, ext_base, n_node_gates) -> bool:
     """Capture this step's parameter flows into its tied group's slots (the flush deferred to the end of the pass)
     and return True; or return False, the caller then launching the step's own kernel."""
-    if mod is None or not PAR_DEFER or not getattr(layer, "_bs_defer", False) or n_node_gates != 1:
+    if mod is None or not getattr(layer, "_bs_defer", False) or n_node_gates != 1:
         return False
     scope = current_scope()
     if scope is None:

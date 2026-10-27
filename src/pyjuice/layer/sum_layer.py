@@ -60,10 +60,6 @@ BACKWARD_ELE_FLOW_TUNED = True
 # any unsupported shape / missing toolchain. Set False to disable.
 BACKWARD_ELE_FLOW_CUDA = True
 
-# The pre-pass copy of that kernel (c/ele_backward_sum_prepass.cu) among its measured arms; PYJUICE_BACKWARD_ELE_PREPASS=0
-# leaves it out.
-BACKWARD_ELE_FLOW_PREPASS = os.environ.get("PYJUICE_BACKWARD_ELE_PREPASS", "1") != "0"
-
 # Optional CUDA (CuTe/CUTLASS + fp16 + TMA) fast path for the block-sparse parameter-flow backward
 # `_bk_triton_block_sparse_par_kernel(_rmw)`. When enabled AND all dispatch conditions hold (LL,
 # logspace flows, allow_modify_flows / allow_neg_flows / negate_pflows all off, temperature 1,
@@ -97,10 +93,6 @@ FORWARD_SUM_TUNED = True
 # accuracy bar). On ANY of: incompatible GPU, missing nvcc/CUTLASS, compile failure, or an
 # unsupported layer shape, it transparently falls back to the Triton kernel. Set False to disable.
 FORWARD_SUM_CUDA = True
-
-# The pre-pass copy of that kernel (c/tlmm_forward_sum_prepass.cu) among its measured arms; PYJUICE_FORWARD_PREPASS=0
-# leaves it out.
-FORWARD_SUM_PREPASS = os.environ.get("PYJUICE_FORWARD_PREPASS", "1") != "0"
 from .kernels import c as cuda_kernels
 
 # Node-tile sizes for the small-batch (batch < 16) block-sparse path. At tiny batch the GPU is
@@ -583,8 +575,9 @@ class SumLayer(Layer, nn.Module):
         """`forward`'s settled launch: every partition's recorded CUDA tlmm kernel, as the full dispatch launches it --
         if the CUDA kernels are still on (`FORWARD_SUM_CUDA`) and every recorded choice is still what the tuner holds
         for its key (a cleared or retuned cache: no); else nothing launched and False, the call then taking the full
-        dispatch, which records the entry anew. (The arms' own switches, `FORWARD_SUM_PREPASS`, shape what is tuned: a
-        choice the tuner holds runs, here as there.)"""
+        dispatch, which records the entry anew. (What is tuned is shaped by which arms are available, the pre-pass
+        copy's
+        among them: a choice the tuner holds runs, here as there.)"""
         if not FORWARD_SUM_CUDA:
             return False
         for key, choice, _, _, _, _ in fast:
@@ -1230,7 +1223,7 @@ class SumLayer(Layer, nn.Module):
                     # exponentials computed once per node block, then a streaming kernel over the parameter tiles), its
                     # configs as more arms -- MEASURED on HCLT-1024's widest layer at B 128, bf16 params: 385 against
                     # the pipelined kernel's 541 us; HMM-1024 at B 64: 18.3 against 35.7
-                    if FORWARD_SUM_PREPASS and cuda_kernels.prepass_is_available():
+                    if cuda_kernels.prepass_is_available():
                         cands += [(("cuda_prepass", c),
                                    (lambda c=c: cuda_kernels.tlmm_forward_sum_prepass(
                                        node_mars, element_mars, params, nids, ebase, pbase,
@@ -2258,7 +2251,7 @@ class SumLayer(Layer, nn.Module):
                              (("cuda", 0), (lambda: _cuda_ele(scr)))]
                     if cuda_kernels.ele_pipe_is_available():
                         cands.append((("cuda_pipe", 0), (lambda: _cuda_ele_pipe(scr))))
-                    if BACKWARD_ELE_FLOW_PREPASS and cuda_kernels.ele_prepass_is_available():
+                    if cuda_kernels.ele_prepass_is_available():
                         cands += [(("cuda_prepass", c), (lambda c=c: _cuda_ele_prepass(scr, c)))
                                   for c in cuda_kernels.ele_prepass_valid_configs(cs_block_size, batch_size)]
                     choice = autotune.best_of(cands) or ("triton", -1)

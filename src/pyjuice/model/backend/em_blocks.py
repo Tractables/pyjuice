@@ -33,7 +33,6 @@ writes then sharing sectors) keep `par_update.em_par_update` / `params_master.em
 
 from __future__ import annotations
 
-import os
 from typing import Optional, Sequence
 
 import numpy as np
@@ -41,9 +40,6 @@ import torch
 import triton
 import triton.language as tl
 
-
-#: The node-block update in `mini_batch_em` (PYJUICE_EM_NODE_BLOCKS=0: the per-block kernels throughout, as before)
-ENABLED = os.environ.get("PYJUICE_EM_NODE_BLOCKS", "1") != "0"
 
 #: Node blocks of at least this many nodes take the node-block kernel; smaller ones the per-block kernels
 MIN_BLOCK_SIZE = 16

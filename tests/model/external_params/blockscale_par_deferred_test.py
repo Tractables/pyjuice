@@ -3,8 +3,8 @@ A tied group's gated parameter flows deferred to one contraction (blockscale/def
 blockscale_par_deferred.cu): the flows a backward leaves against float64 recomputed from every captured step's inputs
 -- tied gated HMMs of one and two blocks, fp32 and bf16 parameters, a batch past the slots' 32 columns, -inf
 log-gates, 39 steps, and more steps than the slots hold (flushes during the pass); the
-deferral an accumulation (two backwards with `flows_memory = 1` give twice one); a layer callback, the switch, an
-untied or a small layer keeping the per-step kernels; a CUDA graph replaying it to the bit; and a backward that raised
+deferral an accumulation (two backwards with `flows_memory = 1` give twice one); a layer callback, an untied or a
+small layer keeping the per-step kernels; a CUDA graph replaying it to the bit; and a backward that raised
 part-way leaving nothing to the next. Skipped where the CUDA kernels cannot build.
 """
 import pytest
@@ -185,14 +185,12 @@ def test_it_accumulates_like_the_per_step_kernels(monkeypatch):
 
 
 @needs_kernels
-@pytest.mark.parametrize("label", ["a layer callback", "the switch", "untied", "below MIN_FLOWS"])
+@pytest.mark.parametrize("label", ["a layer callback", "untied", "below MIN_FLOWS"])
 def test_what_keeps_the_per_step_kernels(label, monkeypatch):
     if label == "below MIN_FLOWS":
         pc, phi, x = _instance(512, 2, 16, 6, "bf16", 64)               # 2 x 256 x 512 = 262K flows < 1M
     else:
         pc, phi, x = _instance(1024, 1, 64, 6, "bf16", 64, tied = label != "untied")
-    if label == "the switch":
-        monkeypatch.setattr(dpar, "PAR_DEFER", False)
     caps, _ = _record(monkeypatch)
     pc(x, sum_external_params = phi)
     if label == "a layer callback":
@@ -211,7 +209,7 @@ def test_the_deferred_flows_equal_the_per_step_ones_within_their_rounding(monkey
     pc(x, sum_external_params = phi)
     pc.backward(x, flows_memory = 0.0)
     deferred = pc.param_flows.clone()
-    monkeypatch.setattr(dpar, "PAR_DEFER", False)
+    monkeypatch.setattr(dpar, "MIN_FLOWS", 1 << 62)                     # no group reaches it: the per-step kernels
     pc(x, sum_external_params = phi)
     pc.backward(x, flows_memory = 0.0)
     fin = torch.isfinite(deferred)

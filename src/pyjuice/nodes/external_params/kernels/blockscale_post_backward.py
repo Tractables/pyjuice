@@ -2,18 +2,23 @@
 What `BlockScaleSumParams` does after a layer's flows, as ONE launch per partition: the log-Z half of the gate
 gradient, the denominator flow of `apply_z_correction`, and the `-log Z` shift that gives `node_mars` back.
 
-They ran as three launches (`_bs_triton_phigrad_logz_kernel`, `_bs_triton_denom_w_kernel`, `shift_logz`), each a
-few microseconds of work behind a launch -- MEASURED on a tied gated HMM-4096 at B 128, 9.7 + 12 + 3.8 us a step
-against ~1-2 us of traffic each -- and the first two build the SAME operands from the same loads:
+They ran as three launches (a log-Z gradient kernel, a denominator kernel, `shift_logz`), each a few microseconds of
+work behind a launch -- MEASURED on a tied gated HMM-4096 at B 128, 9.7 + 12 + 3.8 us a step against ~1-2 us of
+traffic each -- and the first two built the SAME operands from the same loads:
 
     v[n, b] = exp(node_flows[n,b] - log Z[n,b] + mx[b]),     p[g, b] = exp(log phi[g,b] - mx[b])
 
-with `mx[b]` the largest `log phi` over the tile's gates, a shift that cancels exactly in both products (the
-bounds are `_bs_triton_denom_w_kernel`'s). The gradient contracts them over the nodes, the denominator over the
-batch:
+The gradient contracts them over the nodes, the denominator over the batch (`sigma[n, g]` the sum of node n's
+parameters in gate g, `W` the gate-space accumulator `F-[n, c] = theta[n, c] * W[n, g(c)]` is rebuilt from):
 
     d LL / d log phi[g, b] -= p[g,b] * sum_n sigma[n,g] v[n,b]
     W[n, g]                += sum_b v[n,b] p[g,b]                       (atomic when batch slices share one)
+
+THE SHIFT `mx[b]` -- the largest `log phi` over the tile's gates -- IS LOAD-BEARING. `phi` cannot ride inside the
+exponent of `v`, which has no gate axis, so `exp(log phi)` would overflow for a router logit past ~88, and `exp(nf -
+log Z)` alone underflows to 0 wherever `log Z >= log phi` is large -- the whole log-Z term vanishing. Shifted, both
+factors are bounded: `p <= 1`, and `log Z >= mx + log sigma` bounds `v`'s exponent by `nf - log sigma`. The shift
+cancels exactly in both products, so tiles need not agree on it. A masked-out sample contributes an exact zero.
 
 and the shift, `node_mars[n, b] -= log Z[n, b]`, is an elementwise pass over the same (node, sample) tile, done by
 the programs of the first gate tile so each entry is written once. It reads only `log Z`, never what the two
@@ -28,13 +33,14 @@ the shares in tile order -- the one writer of each entry -- and sets the counter
 tickets are an acq_rel atomic after a CTA barrier, the shares read past L1 (`.cg`). A second launch for the sum
 instead: MEASURED ~12 us a layer more (its grid is the gradient's, a few programs, each walking every tile); the node
 tiles looping inside one program per block instead: 3-10x slower (a block's walk is latency-bound at any tile).
-`W` keeps an atomic add across batch slices, as `_bs_triton_denom_w_kernel` did across its.
+`W` keeps an atomic add across batch slices, as the denominator kernel did across its.
 
-Not bit-identical to the three launches: the gate tile (and with it `mx`) and the batch slicing can differ, which
-reorders the sums -- agreement to rounding. The shift is: one add, as in `shift_logz`.
+The dots run in three TF32 passes (`tf32x3`, fp32-level): the gradient is the difference of this term and the
+element kernel's, of nearly equal size, so one TF32 pass's truncation here was most of its error (MEASURED, the
+gates' zero-sum residual of this term alone at 7-10% of the gradient's largest entry, K = 1024). The shift is one
+add, as in `shift_logz`.
 """
 
-import triton
 import triton.language as tl
 
 from pyjuice.utils.kernel_launcher import triton_jit
@@ -46,8 +52,7 @@ def _bs_post_backward_kernel(node_flows, node_mars, log_z, sigma, ext, gate, nid
                              BLOCK_SIZE_M: tl.constexpr, gate_stride: tl.constexpr, ext_base,
                              TILE_M: tl.constexpr, TILE_G: tl.constexpr, TILE_B: tl.constexpr,
                              B_TILES_PER_PROG: tl.constexpr, WANT_GRAD: tl.constexpr, WANT_W: tl.constexpr,
-                             W_ATOMIC: tl.constexpr, USE_DOT: tl.constexpr, GRAD_IEEE: tl.constexpr,
-                             W_IEEE: tl.constexpr, GRAD_PARTIAL: tl.constexpr):
+                             W_ATOMIC: tl.constexpr, USE_DOT: tl.constexpr, GRAD_PARTIAL: tl.constexpr):
     pid_y = tl.program_id(0)                       # (node block, node tile): grid-x, past the 65535 of grid-y
     pid_g = tl.program_id(1)                       # gate tile
     pid_s = tl.program_id(2)                       # batch slice
@@ -59,8 +64,9 @@ def _bs_post_backward_kernel(node_flows, node_mars, log_z, sigma, ext, gate, nid
     nrows = (tl.load(nids + nb) + offs_node).to(tl.int64)
     zrows = nb.to(tl.int64) * BLOCK_SIZE_M + offs_node
 
-    # A gate's row in `ext`: the gate table's entry for its edge block (bounded by the table's width, as in
-    # `_bs_triton_phigrad_logz_kernel`: `n_gates` comes from the power-of-two padded edge count) plus its place
+    # A gate's row in `ext`: the gate table's entry for its edge block plus its place. BOUNDED by the table's width:
+    # `n_gates` comes from the compiled `num_edges`, padded up to a power of two, while the table is only as wide as
+    # the widest row's edge blocks -- past it, the column would pick up the NEXT row's gate, a valid offset
     offs_g = pid_g * TILE_G + tl.arange(0, TILE_G)
     mask_g = offs_g < n_gates
     j = offs_g // N_CHILD_GATES
@@ -94,12 +100,7 @@ def _bs_post_backward_kernel(node_flows, node_mars, log_z, sigma, ext, gate, nid
 
             if WANT_GRAD:
                 if USE_DOT:
-                    if GRAD_IEEE == 2:
-                        out = tl.dot(tl.trans(sg), v, input_precision = "tf32x3")               # [G, B]
-                    elif GRAD_IEEE:
-                        out = tl.dot(tl.trans(sg), v, input_precision = "ieee")
-                    else:
-                        out = tl.dot(tl.trans(sg), v)
+                    out = tl.dot(tl.trans(sg), v, input_precision = "tf32x3")                   # [G, B]
                 else:
                     # axis-0 form on purpose -- see `_BROADCAST_SUM_NOTE` in pyjuice/layer/kernels/__init__.py
                     out = tl.sum(sg[:,:,None] * v[:,None,:], axis = 0)
@@ -114,12 +115,7 @@ def _bs_post_backward_kernel(node_flows, node_mars, log_z, sigma, ext, gate, nid
 
             if WANT_W:
                 if USE_DOT:
-                    if W_IEEE == 2:
-                        acc += tl.dot(v, tl.trans(p), input_precision = "tf32x3")               # [M, G]
-                    elif W_IEEE:
-                        acc += tl.dot(v, tl.trans(p), input_precision = "ieee")
-                    else:
-                        acc += tl.dot(v, tl.trans(p))
+                    acc += tl.dot(v, tl.trans(p), input_precision = "tf32x3")                   # [M, G]
                 else:
                     acc += tl.sum(tl.trans(v)[:,:,None] * tl.trans(p)[:,None,:], axis = 0)
 
