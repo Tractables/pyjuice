@@ -329,6 +329,10 @@ class _DenominatorsMixin:
         in-place parameter update, which is exactly the invalidation signal. One entry per partition (a single entry
         for the layer had its partitions evict each other: a full gather of theta every backward), each holding which
         tensor it was summed from (a weak reference: a `params` tensor assigned anew may start at an equal version).
+
+        Summed by `blockscale_sigma.cu` where it compiles (fp32 or bf16 parameters on the GPU): one read of theta.
+        The torch gather below is the fallback -- an int64 index tensor the size of the partition's parameters and
+        their fp32 copy: MEASURED 316 us and ~300 MiB transient at 4 node blocks of 1024 x 4096 edges, against 12.5 us.
         """
         cache = layer.__dict__.get("_bs_sigma_cache")
         if cache is None:
@@ -340,13 +344,20 @@ class _DenominatorsMixin:
 
         pids = layer.partitioned_pids[pid].to(torch.int64)
         rows, num_edges = pids.shape
-        ar = torch.arange(block_size, device = params.device, dtype = torch.int64)
-        # (summed in fp32 whatever the parameters are stored in, as the forward sums them -- MEASURED: summed in bf16,
-        # the gate gradient came out 0.4-0.5% off; `.to` is the identity at fp32)
-        th = params[pids[:, :, None] + ar[None, None, :]].to(torch.float32)   # [rows, edges, block_size]
         n_gates = num_edges // gate_cbs
-        sg = th.view(rows, n_gates, gate_cbs, block_size).sum(dim = 2)  # [rows, gates, block_size]
-        sigma = sg.permute(0, 2, 1).reshape(rows * block_size, n_gates).contiguous()
+        from ..kernels.c import get_sigma_module
+        mod = (get_sigma_module() if params.is_cuda and params.dtype in (torch.float32, torch.bfloat16)
+               and num_edges % gate_cbs == 0 else None)
+        if mod is not None:
+            sigma = torch.empty(rows * block_size, n_gates, dtype = torch.float32, device = params.device)
+            mod.blockscale_sigma(params, pids.contiguous(), sigma, block_size, gate_cbs)
+        else:
+            ar = torch.arange(block_size, device = params.device, dtype = torch.int64)
+            # (summed in fp32 whatever the parameters are stored in, as the forward sums them -- MEASURED: summed in
+            # bf16, the gate gradient came out 0.4-0.5% off; `.to` is the identity at fp32)
+            th = params[pids[:, :, None] + ar[None, None, :]].to(torch.float32)   # [rows, edges, block_size]
+            sg = th.view(rows, n_gates, gate_cbs, block_size).sum(dim = 2)  # [rows, gates, block_size]
+            sigma = sg.permute(0, 2, 1).reshape(rows * block_size, n_gates).contiguous()
 
         cache[pid] = (key, weakref.ref(params), sigma, n_gates)
         return sigma, n_gates

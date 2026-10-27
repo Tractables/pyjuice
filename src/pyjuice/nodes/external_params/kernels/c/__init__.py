@@ -376,3 +376,45 @@ def get_par_deferred_module():
         _par_deferred_module = None
 
     return _par_deferred_module
+
+
+# The per-gate parameter sums sigma (blockscale_sigma.cu): plain CUDA, no CuTe. Its own extension, so a failure leaves
+# `_sigma` with its torch gather.
+_sigma_module = None
+_sigma_attempted = False
+
+
+def get_sigma_module():
+    """The block-scale per-gate parameter sum extension, or None if its toolchain is unavailable (warns once)."""
+    global _sigma_module, _sigma_attempted
+
+    if _sigma_attempted:
+        return _sigma_module
+
+    _sigma_attempted = True
+
+    if not ENABLE_CUDA_KERNELS:
+        return None
+
+    from pyjuice.layer.kernels.c import _compile_flags
+
+    flags = _compile_flags()
+    if flags is None:
+        return None
+
+    cuda_cflags, ldflags = flags
+
+    from pyjuice.utils.cuda_ext import jit_load
+    try:
+        _sigma_module = jit_load("pyjuice_blockscale_sigma_cuda",
+                                 sources = [os.path.join(_THIS_DIR, "blockscale_sigma.cu")],
+                                 extra_cuda_cflags = cuda_cflags, extra_ldflags = ldflags,
+                                 verbose = False)
+    except Exception as e:
+        warnings.warn(
+            f"pyjuice CUDA kernel 'pyjuice_blockscale_sigma_cuda' failed to compile "
+            f"({type(e).__name__}: {e}). The block-scale gate sums keep their torch gather.", RuntimeWarning)
+        _sigma_module = None
+
+    return _sigma_module
+
