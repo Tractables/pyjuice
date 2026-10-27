@@ -266,6 +266,27 @@ def test_a_backward_taking_it_matches_triton(name, builder, B, neg_gates, neg_ch
         assert d < 2e-2, f"{name}: the gate gradient differs by {d:.2e} (relative)"
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs a GPU")
+def test_the_plans_trials_charge_a_candidates_extra_host_time():
+    """Two candidates with the same GPU work (~150 us) and host work hidden behind it, one 80 us slower on the host: one
+    call's event time cannot tell them apart; charged the host time it costs beyond the other's, the slower loses."""
+    import time
+    from pyjuice.nodes.external_params.blockscale.backward import _host_extra, _charged
+
+    def make(spin):
+        def run():
+            torch.cuda._sleep(400000)
+            end = time.perf_counter() + spin
+            while time.perf_counter() < end:
+                pass
+        return run
+
+    runs = {"slow_host": make(80e-6), "fast_host": make(0.0)}
+    extra = _host_extra(runs)
+    assert extra["fast_host"] == 0.0 and extra["slow_host"] > 50e-6, extra
+    assert ck.autotune([(k, _charged(runs[k], extra[k])) for k in runs]) == "fast_host"
+
+
 @needs_kernels
 @pytest.mark.parametrize("label,builder,dt,B", [
     ("fp32 parameters", lambda: _hmm(1024, 1, 16), "fp32", 128),

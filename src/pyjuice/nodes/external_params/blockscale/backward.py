@@ -20,6 +20,54 @@ def _set_attrs(layer, **attrs) -> None:
     layer.__dict__.update(attrs)
 
 
+def _host_extra(runs):
+    """
+    Each of a plan's candidates' host time a call beyond the cheapest's, in seconds: the best of a few bursts of calls
+    issued back to back without a sync (the calls' own issue cost, their GPU work queued behind it).
+
+    A trial times one call between two CUDA events: max(its host time, its GPU time), so where a candidate's GPU work
+    outlasts its host time the event time does not see the host time -- which a host-bound backward pays in full, the
+    GPU waiting on it. MEASURED (the split element backward's three launches against the pre-pass kernel's two): 7.1
+    against 5.1 us a call, and a training step 1-2% slower where a near tie on the GPU went its way (a tied gated
+    HMM-2048 x4, 15 layers, B 64).
+    """
+    import time
+
+    host = dict()
+    for k, run in runs.items():
+        try:
+            run()                                   # (a first call compiles)
+            torch.cuda.synchronize()
+            best = float("inf")
+            for _ in range(2):
+                t0 = time.perf_counter()
+                for _ in range(3):
+                    run()
+                best = min(best, (time.perf_counter() - t0) / 3)
+                torch.cuda.synchronize()
+            host[k] = best
+        except Exception:
+            pass
+    h0 = min(host.values(), default = 0.0)
+    return {k: (host[k] - h0 if k in host else 0.0) for k in runs}
+
+
+def _charged(run, extra):
+    """`run` behind a host wait of `extra` seconds -- between a trial's first event and the launch, so the trial's event
+    time counts the host time the candidate costs beyond the cheapest's (`_host_extra`)."""
+    if extra <= 0:
+        return run
+    import time
+
+    def go():
+        end = time.perf_counter() + extra
+        while time.perf_counter() < end:
+            pass
+        run()
+
+    return go
+
+
 # Packs (parent node id, child element id) into one int64 key for the backward gate lookup. Node and
 # element ids are global row indices into `node_mars` / `element_mars`, so this holds for any circuit
 # that fits in memory; asserted where the keys are built.
@@ -611,7 +659,11 @@ class _BackwardMixin:
             saved_grad = layer._bs_grad_ext
             layer._bs_grad_ext = None if saved_grad is None else torch.zeros_like(saved_grad)
             try:
-                trials = [(k, (lambda k = k: _launch_ele(ctx, plan, scr, k))) for k in kinds]
+                runs = {k: (lambda k = k: _launch_ele(ctx, plan, scr, k)) for k in kinds}
+                # Each trial carries the host time its candidate costs beyond the cheapest's: a fork wins by saving
+                # more GPU time than it adds host time (`_host_extra`), so a host-bound backward does not lose to it.
+                extra = _host_extra(runs)
+                trials = [(k, _charged(runs[k], extra[k])) for k in kinds]
                 plan["kind"] = ck.autotune(trials) or kinds[0]
             finally:
                 layer._bs_grad_ext = saved_grad
