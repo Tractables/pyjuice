@@ -65,3 +65,42 @@ void staging_transpose(torch::Tensor dst, torch::Tensor src, int64_t B, int64_t 
         src.data_ptr<float>(), dst.data_ptr<float>(), (int)B, (int)N);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
+
+// Several transposes in ONE launch -- a forward's staging of every node's tensors: pair `blockIdx.z` reads its
+// `(src address, dst address, B, N)` from `table` [P, 4] (int64), a block past its pair's tiles returns (the grid
+// spans the largest pair). MEASURED (a tied gated HMM-2048 x4: 15 nodes' gates a forward): one call per pair was
+// most of the staging's 83 us of host time.
+__global__ void staging_transpose_batched_kernel(const long long* __restrict__ table) {
+    const long long* t = table + 4 * (long)blockIdx.z;
+    const float* src = reinterpret_cast<const float*>(t[0]);
+    float* dst = reinterpret_cast<float*>(t[1]);
+    const int B = (int)t[2], N = (int)t[3];
+    const int n0 = blockIdx.x * 32, b0 = blockIdx.y * 32;
+    if (n0 >= N || b0 >= B) return;                     // (the whole block: no barrier is left waiting)
+    __shared__ float tile[32][33];
+    const int tx = threadIdx.x, ty = threadIdx.y;
+    for (int i = 0; i < 32; i += 8) {
+        const int b = b0 + ty + i, n = n0 + tx;
+        if (b < B && n < N) tile[ty + i][tx] = src[(long)b * N + n];
+    }
+    __syncthreads();
+    for (int i = 0; i < 32; i += 8) {
+        const int n = n0 + ty + i, b = b0 + tx;
+        if (n < N && b < B) dst[(long)n * B + b] = tile[tx][ty + i];
+    }
+}
+
+// `dst_p[n, b] = src_p[b, n]` for every row p of `table` -- (src, dst) the addresses of contiguous float32 tensors
+// of B * N elements each, which the caller guarantees -- `max_b` / `max_n` the largest B and N.
+void staging_transpose_batched(torch::Tensor table, int64_t max_b, int64_t max_n) {
+    TORCH_CHECK(table.is_cuda() && table.scalar_type() == torch::kLong && table.dim() == 2 && table.size(1) == 4 &&
+                table.is_contiguous(), "staging_transpose_batched: an int64 [pairs, 4] table on the GPU");
+    const long P = table.size(0);
+    TORCH_CHECK(P < 65536, "staging_transpose_batched: at most 65535 pairs a launch");
+    if (P == 0 || max_b == 0 || max_n == 0) return;
+    dim3 grid((unsigned)((max_n + 31) / 32), (unsigned)((max_b + 31) / 32), (unsigned)P);
+    dim3 block(32, 8);
+    staging_transpose_batched_kernel<<<grid, block, 0, c10::cuda::getCurrentCUDAStream()>>>(
+        reinterpret_cast<const long long*>(table.data_ptr<int64_t>()));
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}

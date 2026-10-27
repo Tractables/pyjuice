@@ -40,6 +40,44 @@ def _staging_transpose_fn():
         return None
 
 
+def _staged_transposes_batched(fn, fast: list) -> bool:
+    """
+    Every `fast` pair's transpose in ONE launch of the CUDA extension's batched sibling, where `fn` is the
+    extension's own transpose (a test forcing another tier keeps it) and every pair is contiguous float32 of equal
+    sizes on one device; False (nothing launched) otherwise. One call per pair was most of a forward's staging
+    host time: MEASURED 83 us at a tied gated HMM-2048 x4 (15 nodes). The launch's table holds the pairs' addresses
+    and sizes -- nothing derived from them --, kept by value for the next call with the same ones.
+    """
+    from pyjuice.nodes.external_params.kernels.c import get_module
+    mod = get_module()
+    batched = getattr(mod, "staging_transpose_batched", None) if mod is not None else None
+    if batched is None or fn is not mod.staging_transpose:
+        return False
+    device = fast[0][0].device
+    rows, max_b, max_n = [], 0, 0
+    for dst, src in fast:
+        if not (dst.device == device and src.device == device and dst.dtype == torch.float32
+                and src.dtype == torch.float32 and dst.is_contiguous() and src.is_contiguous()
+                and dst.numel() == src.numel()):
+            return False
+        batch = src.size(0)
+        n = src.numel() // max(batch, 1)
+        rows.append((src.data_ptr(), dst.data_ptr(), batch, n))
+        max_b, max_n = max(max_b, batch), max(max_n, n)
+    key = (device, tuple(rows))
+    table = _PAIR_TABLES.get(key)
+    if table is None:
+        from pyjuice.utils.util import device_scalars
+        if len(_PAIR_TABLES) >= 16:
+            _PAIR_TABLES.clear()
+        table = _PAIR_TABLES[key] = device_scalars(rows, device, dtype = torch.int64)
+    batched(table, max_b, max_n)
+    return True
+
+
+_PAIR_TABLES = dict()
+
+
 def _staged_copy(plain_d: list, plain_s: list, fast: list) -> None:
     """
     Issue the staging copies: a tiled transpose for the pairs that are one, a batched `copy_` for the
@@ -56,6 +94,8 @@ def _staged_copy(plain_d: list, plain_s: list, fast: list) -> None:
     """
     if fast:
         fn = _staging_transpose_fn()
+        if len(fast) > 1 and _staged_transposes_batched(fn, fast):
+            fast = []
         for dst, src in fast:
             batch = src.size(0)
             n = src.numel() // max(batch, 1)

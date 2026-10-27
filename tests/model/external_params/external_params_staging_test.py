@@ -606,6 +606,46 @@ def test_every_staging_transpose_tier_agrees():
         staging._staging_transpose_fn = orig
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs a GPU")
+def test_several_pairs_stage_in_one_launch_bit_for_bit():
+    """Several pairs -- a forward's every node -- go through the CUDA extension's batched transpose in one launch:
+    batches and widths not multiples of 32, both destination shapes, pairs of different sizes (the grid spans the
+    largest; the others' extra blocks return). Its table holds the pairs' addresses and sizes, kept for the next call
+    with the same ones: new contents at the same addresses are read, a source moved elsewhere gets a new table. Bit
+    for bit, a pure permutation."""
+    from pyjuice.model import external_params as staging
+    from pyjuice.nodes.external_params.kernels.c import get_module
+    if get_module() is None or not hasattr(get_module(), "staging_transpose_batched"):
+        pytest.skip("the CUDA extension did not build")
+    device = torch.device("cuda:0")
+    torch.manual_seed(0)
+    shapes = [(33, 5, 7), (64, 1, 3), (100, 9, 4), (7, 2, 33), (1, 3, 5)]
+    srcs = [torch.randn(s, device = device) for s in shapes]
+    # the destinations stay where they are -- as the staging buffer's views do --, both shapes of them
+    dsts = [torch.empty([s.numel()], device = device) if i % 2 == 0 else
+            torch.empty(list(s.shape[1:]) + [s.size(0)], device = device) for i, s in enumerate(srcs)]
+
+    def run(srcs):
+        for d in dsts:
+            d.fill_(float("nan"))
+        staging._staged_copy([], [], list(zip(dsts, srcs)))
+        torch.cuda.synchronize()
+        for i, (dst, src) in enumerate(zip(dsts, srcs)):
+            expect = src.permute(*range(1, src.dim()), 0).reshape(-1)
+            assert torch.equal(dst.reshape(-1), expect), f"pair {i} {tuple(src.shape)}"
+
+    staging._PAIR_TABLES.clear()
+    run(srcs)
+    tables = len(staging._PAIR_TABLES)
+    for s in srcs:                                        # new contents, same addresses: the kept table
+        s.copy_(torch.randn_like(s))
+    run(srcs)
+    assert len(staging._PAIR_TABLES) == tables
+    srcs[2] = torch.randn(shapes[2], device = device)     # one source elsewhere: a table of its own
+    run(srcs)
+    assert len(staging._PAIR_TABLES) == tables + 1
+
+
 def test_an_ungated_forward_drops_a_previously_staged_gate():
     """
     What is staged always describes the MOST RECENT forward.
