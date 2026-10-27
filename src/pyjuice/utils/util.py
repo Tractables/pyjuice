@@ -25,6 +25,26 @@ def host_next_power_of_2(n: int) -> int:
     return n + 1
 
 
+def device_scalars(values, device, dtype = None):
+    """``torch.tensor(values, dtype = dtype, device = device)`` -- a few host scalars as a device tensor, e.g. a
+    kernel's step size and pseudocount -- without making the host wait for the device. The plain call stages the list
+    through pageable memory, and that copy returns only once the stream has run everything queued before it: one
+    synchronization per call. MEASURED (a tied gated HMM-2048 x4, 15 layers, B 64, bf16): the M-step's two such
+    calls (the per-block update's and the input layers') were the training step's only synchronizations; the first
+    took 282 us of host time, waiting on the backward's queued kernels. Here the values go to a pinned staging
+    tensor and copy without blocking (its block is not reused before the copy has run). During a CUDA graph
+    capture, the plain call (a graph would keep reading the staging tensor's memory after it is reused)."""
+    import torch
+
+    device = torch.device(device)
+    if device.type != "cuda":
+        return torch.tensor(values, dtype = dtype, device = device)
+    with torch.cuda.device(device):
+        if torch.cuda.is_current_stream_capturing():
+            return torch.tensor(values, dtype = dtype, device = device)
+        return torch.tensor(values, dtype = dtype, pin_memory = True).to(device, non_blocking = True)
+
+
 def max_cdf_power_of_2(val: int):
     count = 0
     while True:

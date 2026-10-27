@@ -10,6 +10,7 @@ from typing import Sequence
 
 from pyjuice.nodes import CircuitNodes
 from pyjuice.utils.kernel_launcher import FastJITFunction
+from pyjuice.utils.util import device_scalars
 
 
 @njit
@@ -311,7 +312,7 @@ def em_par_update(params: torch.Tensor, param_flows: torch.Tensor, par_update_kw
 
     grid = (triton.cdiv(num_blocks, BLOCK_ID),)
 
-    constexprs = torch.tensor([step_size, pseudocount, num_blocks]).to(params.device)
+    constexprs = device_scalars([step_size, pseudocount, num_blocks], params.device)
 
     cum_pflow_kernel[grid](
         cum_pflows, params, param_flows, nchs, par_start_ids, pflow_start_ids, blk_sizes, blk_intervals, 
@@ -354,7 +355,7 @@ def sgd_par_update(params: torch.Tensor, param_grads: torch.Tensor, par_update_k
 
     grid = (triton.cdiv(num_blocks, BLOCK_ID),)
 
-    constexprs = torch.tensor([lr, num_blocks]).to(params.device)
+    constexprs = device_scalars([lr, num_blocks], params.device)
 
     sgd_par_update_kernel[grid](
         params, param_grads, par_start_ids, pgrad_start_ids, blk_sizes, blk_intervals,

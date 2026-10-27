@@ -26,6 +26,7 @@ from pyjuice.utils.grad_fns import ReverseGrad
 from pyjuice.utils import BitSet
 from pyjuice.utils.source2fn import make_function_from_src
 from pyjuice.utils.kernel_launcher import triton_jit
+from pyjuice.utils.util import device_scalars
 from pyjuice.utils.fast_inference import param_copies_allowed, register_layer
 from .layer import Layer
 
@@ -962,7 +963,7 @@ class InputLayer(Layer, nn.Module):
                     if not self.provided("_em_kernel"):
                         self._em_kernel = self._compile_triton_kernel(self._em_kernel_template, em_fn = self.em_fn)
 
-                    constexprs = torch.tensor([step_size, pseudocount], dtype = torch.float32, device = self.device)
+                    constexprs = device_scalars([step_size, pseudocount], self.device, dtype = torch.float32)
 
                     if hasattr(self.dist, "em_block_size"):
                         BLOCK_SIZE = self.dist.em_block_size

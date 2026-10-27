@@ -7,6 +7,7 @@ import triton.language as tl
 from numba import njit
 
 from pyjuice.utils.kernel_launcher import triton_jit
+from pyjuice.utils.util import device_scalars
 
 
 @triton_jit
@@ -119,7 +120,7 @@ def normalize_parameters(params, par_update_kwargs, pseudocount: float = 0.0):
         num_blocks = par_start_ids.size(0)
         BLOCK_ID = 2048 // BLOCK_SIZE
 
-        constexprs = torch.tensor([pseudocount, num_blocks]).to(params.device)
+        constexprs = device_scalars([pseudocount, num_blocks], params.device)
 
         grid = (triton.cdiv(num_blocks, BLOCK_ID),)
 

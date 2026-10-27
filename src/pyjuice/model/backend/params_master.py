@@ -21,6 +21,8 @@ import torch
 import triton
 import triton.language as tl
 
+from pyjuice.utils.util import device_scalars
+
 
 @triton.jit
 def _sync_master_kernel(master_ptr, params_ptr, n, BLOCK: tl.constexpr):
@@ -109,7 +111,7 @@ def em_par_update_master(master: torch.Tensor, stored: torch.Tensor, param_flows
     num_blocks = par_start_ids.size(0)
     BLOCK_ID = 2048 // BLOCK_SIZE
     grid = (triton.cdiv(num_blocks, BLOCK_ID),)
-    constexprs = torch.tensor([step_size, pseudocount, num_blocks]).to(master.device)
+    constexprs = device_scalars([step_size, pseudocount, num_blocks], master.device)
     if keep_zero_params:
         sync_master(master, stored)          # the normalizer reads the old parameters (which are zero) before the update
     cum_pflow_kernel[grid](

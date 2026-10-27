@@ -18,6 +18,8 @@ import torch
 import triton
 import triton.language as tl
 
+from pyjuice.utils.util import device_scalars
+
 # In newer triton, the math functions moved (https://github.com/openai/triton/pull/3172).
 if hasattr(tl.extra, "cuda") and hasattr(tl.extra.cuda, "libdevice"):
     tlmath = tl.extra.cuda.libdevice
@@ -251,7 +253,7 @@ def sgd_input_layer_update(layer, lr: float):
     """Apply the log-space SGD update to an input layer's source parameters (no tied accumulation;
     callers consolidate tied flows beforehand)."""
     layer_num_source_nodes = layer.source_nids.size(0)
-    constexprs = torch.tensor([lr], dtype = torch.float32, device = layer.device)
+    constexprs = device_scalars([lr], layer.device, dtype = torch.float32)
     BLOCK_SIZE = 1024
     grid = (triton.cdiv(layer_num_source_nodes, BLOCK_SIZE),)
     _sgd_input_kernel[grid](
