@@ -458,3 +458,42 @@ def get_stream_module():
         _stream_module = None
 
     return _stream_module
+
+
+_ele_stream_module = None
+_ele_stream_attempted = False
+
+
+def get_ele_stream_module():
+    """The split block-scale element backward extension, or None if its toolchain is unavailable (warns once)."""
+    global _ele_stream_module, _ele_stream_attempted
+
+    if _ele_stream_attempted:
+        return _ele_stream_module
+
+    _ele_stream_attempted = True
+
+    if not ENABLE_CUDA_KERNELS:
+        return None
+
+    from pyjuice.layer.kernels.c import _compile_flags
+
+    flags = _compile_flags()
+    if flags is None:
+        return None
+
+    cuda_cflags, ldflags = flags
+
+    from pyjuice.utils.cuda_ext import jit_load
+    try:
+        _ele_stream_module = jit_load("pyjuice_blockscale_ele_stream_cuda",
+                                      sources = [os.path.join(_THIS_DIR, "blockscale_ele_backward_stream.cu")],
+                                      extra_cuda_cflags = cuda_cflags, extra_ldflags = ldflags,
+                                      verbose = False)
+    except Exception as e:
+        warnings.warn(
+            f"pyjuice CUDA kernel 'pyjuice_blockscale_ele_stream_cuda' failed to compile "
+            f"({type(e).__name__}: {e}). The block-scale element backward keeps its other kernels.", RuntimeWarning)
+        _ele_stream_module = None
+
+    return _ele_stream_module

@@ -165,6 +165,124 @@ class _BackwardMixin:
         pos = emitted[emitted >= 0]
         return int(torch.unique(pos).numel()) == int(pos.numel())
 
+    @staticmethod
+    def _eles_tables(gate_tile, ebase, kt, split, pmax):
+        """
+        The split element backward's tables (kernels/c/blockscale_ele_backward_stream.cu) for k-steps of `kt` parents
+        and `split` ranges, or None where an element block would have more than `pmax` pieces.
+
+        An element block's gated k-steps -- its k-tiles with a gate, `64 // kt` steps each -- are cut into `split`
+        equal ranges (the GEMM's third grid axis), and a range again wherever the gate changes or the k-steps stop
+        being consecutive: a PIECE, one stabilizer's and one gate's share of a range. Per element block: int32
+        `pc_k0` / `pc_k1` / `pc_gate` [n, pmax] (a piece's k-steps and gate; padding 0, 0, -1) and `sp_lo` / `sp_hi`
+        [n, split] (a range's pieces); element blocks of equal parents and pieces share the pre-pass's exponentials,
+        a GROUP: `ugrp` [n] (an element block's group) and `grep` (one element block of each group). `npc` is the
+        most pieces an element block has. The kernel takes them as one int32 tensor, `tables` (one argument instead of
+        seven); the named entries are views of it.
+
+        Every element block at once (numpy, on the host): positions are an element block's gated k-steps counted
+        from 0, a piece's bounds the union of its runs' first positions and its ranges' bounds. MEASURED: the 14
+        tables a plan may build at 10^4 element blocks in 0.3 s (a loop over element blocks took 4 s).
+        """
+        import numpy as np
+
+        sub = 64 // kt
+        g = gate_tile.cpu().numpy()
+        n = g.shape[0]
+        on = g >= 0
+        # a run starts at a gated k-tile whose predecessor is ungated, absent or under another gate
+        cont = np.zeros_like(on)
+        cont[:, 1:] = on[:, :-1] & on[:, 1:] & (g[:, :-1] == g[:, 1:])
+        start = on & ~cont
+        nruns = start.sum(1)
+        R = max(1, int(nruns.max()))
+        if R > pmax:
+            return None
+        ns = on.sum(1) * sub                                         # gated k-steps
+        vr = np.arange(R)[None, :] < nruns[:, None]
+        st_tile = np.argsort(~start, axis = 1, kind = "stable")[:, :R]   # the runs' first k-tiles, in order
+        st_pos = np.take_along_axis(np.cumsum(on, axis = 1) - 1, st_tile, 1) * sub
+        st_pos = np.where(vr, st_pos, ns[:, None])                   # (no such run: at the end, bounding nothing)
+        qb = np.arange(split + 1)[None, :] * ns[:, None] // split    # the ranges' bounds
+        bd = np.sort(np.concatenate([st_pos, qb], axis = 1), axis = 1)
+        a, b = bd[:, :-1], bd[:, 1:]
+        real = a < b
+        npc_eb = real.sum(1)
+        P = max(1, int(npc_eb.max()))
+        if P > pmax:
+            return None
+        o = np.argsort(~real, axis = 1, kind = "stable")[:, :P]     # the pieces, in order
+        pa, pb = np.take_along_axis(a, o, 1), np.take_along_axis(b, o, 1)
+        vp = np.arange(P)[None, :] < npc_eb[:, None]
+        ri = np.clip((st_pos[:, None, :] <= pa[:, :, None]).sum(-1) - 1, 0, R - 1)   # a piece's run
+        rt, rp = np.take_along_axis(st_tile, ri, 1), np.take_along_axis(st_pos, ri, 1)
+        k0 = np.zeros((n, pmax), np.int32)
+        k1 = np.zeros((n, pmax), np.int32)
+        pg = np.full((n, pmax), -1, np.int32)
+        k0[:, :P] = np.where(vp, rt * sub + (pa - rp), 0)
+        k1[:, :P] = np.where(vp, rt * sub + (pb - rp), 0)
+        pg[:, :P] = np.where(vp, np.take_along_axis(g, rt, 1), -1)
+        first = np.where(vp, pa, np.iinfo(np.int64).max)
+        lo = (first[:, None, :] < qb[:, :-1, None]).sum(-1).astype(np.int32)
+        hi = (first[:, None, :] < qb[:, 1:, None]).sum(-1).astype(np.int32)
+        keys = np.concatenate([ebase.cpu().numpy().astype(np.int64), k0, k1], axis = 1)
+        _, grep, ugrp = np.unique(keys, axis = 0, return_index = True, return_inverse = True)
+
+        parts = [k0, k1, pg, lo, hi, ugrp.reshape(-1).astype(np.int32), grep.astype(np.int32)]
+        tables = torch.from_numpy(np.concatenate([x.reshape(-1) for x in parts])).to(gate_tile.device)
+        ends = np.cumsum([x.size for x in parts]).tolist()
+        views = [tables[a:b].view(x.shape) for a, b, x in zip([0] + ends[:-1], ends, parts)]
+        return dict(zip(("pc_k0", "pc_k1", "pc_gate", "sp_lo", "sp_hi", "ugrp", "grep"), views), tables = tables,
+                    ngrp = int(grep.size), npc = P)
+
+    def _eles_code(self, eles_mod, ctx, gate_tile, scr, external_params, ext_base, gate_cbs, fit):
+        """
+        The split element backward's `config id * 64 + split` for this layer's shape and its tables, or (None, None)
+        where no split keeps within the piece limit. The rule's choice -- the first fitting tile at the split whose
+        grid fills its last wave best, at one block an SM -- or another (tile, split) where it measures faster
+        (`autotune.pick`, keyed by shape: equal layers share it), timed into the scratch flows without the gradient.
+        """
+        from pyjuice.layer.kernels import autotune
+        from .denominators import _sm_count
+
+        batch, blk, cbs, knt = ctx["batch_size"], ctx["block_size"], ctx["cs_block_size"], ctx["K_NUM_TILES"]
+        neb = ctx["chids"].numel()
+        cfgs = [tuple(int(v) for v in c) for c in eles_mod.configs()]
+        pmax = int(eles_mod.max_pieces())
+        sms = _sm_count(scr.device)
+        gated = int((gate_tile >= 0).sum(1).max())
+        tables, cands = dict(), []
+        for i in fit:
+            bm, bn, kt = cfgs[i]
+            tiles = (batch // bn) * neb * (cbs // bm)
+            splits = [s for s in (1, 2, 3, 4, 5, 6, 8) if s <= gated * (64 // kt) and s * tiles <= 8 * sms]
+            for s in splits:
+                if (kt, s) not in tables:
+                    tables[(kt, s)] = self._eles_tables(gate_tile, ctx["ele_ebase"], kt, s, pmax)
+            ok = [s for s in splits if tables[(kt, s)] is not None]
+            if ok:
+                best = max(ok, key = lambda s: s * tiles / (-(-s * tiles // sms) * sms))
+                cands += [i * 64 + s for s in [best] + [s for s in ok if s != best]]
+        if not cands:
+            return None, None
+        table = lambda code: tables[(cfgs[code // 64][2], code % 64)]
+        if len(cands) == 1:
+            return cands[0], table(cands[0])
+        none = external_params.new_empty(0)
+
+        def bench(code):
+            tb = table(code)
+            for _ in range(3):
+                eles_mod.blockscale_ele_backward_stream(
+                    scr, ctx["element_mars"], ctx["node_flows"], ctx["node_mars"], ctx["params"], external_params,
+                    ctx["chids"], ctx["ele_ebase"], ctx["ele_pbase"], none, batch, blk, cbs, knt, gate_cbs, ext_base,
+                    0, code, tb["tables"], tb["ngrp"], tb["npc"])
+
+        shape = tuple(sorted((k, t["npc"], t["ngrp"]) for k, t in tables.items() if t is not None))
+        key = ("bs_ele_stream", blk, cbs, batch, gate_cbs, knt, neb, shape, tuple(cands))
+        code = autotune.pick(key, cands, bench)
+        return code, table(code)
+
     def _par_write_flags(self, layer, cids, pfids):
         """
         `(PADDED, PF_ATOMIC)` for `_bs_triton_par_kernel`, cached per compiled partition.
@@ -297,7 +415,7 @@ class _BackwardMixin:
         state = self._bw_state(layer, node_mars, kwargs)
 
         from ..kernels.c import get_ele_bw_module, get_par_bw_module, get_sb_bw_module, get_ele_prepass_module
-        from ..kernels.c import get_par_deferred_module
+        from ..kernels.c import get_par_deferred_module, get_ele_stream_module
         from ..kernels.shift_logz import shift_logz
 
         # NO CUDA extension is required here. The CuTe and small-batch forks are accelerators, and
@@ -310,6 +428,7 @@ class _BackwardMixin:
         ele_mod, par_mod = get_ele_bw_module(), get_par_bw_module()
         sb_mod = get_sb_bw_module()
         elep_mod = get_ele_prepass_module()
+        eles_mod = get_ele_stream_module() if params.dtype == torch.bfloat16 else None
         # A tied group's parameter flows may be left to the end of the pass (`deferred_par`), if the backward allows it
         pd_mod = get_par_deferred_module()
         _set_attrs(layer, _bs_defer = bool(kwargs.get("defer_param_flows", False)))
@@ -357,6 +476,12 @@ class _BackwardMixin:
                 cache[key] = plan
             _launch_ele(ctx, plan, ctx["element_flows"])
 
+        def _scratch(ctx):
+            scr = layer._bk_ele_scratch
+            if scr is None or scr.shape != ctx["element_flows"].shape:
+                scr = layer._bk_ele_scratch = torch.empty_like(ctx["element_flows"])
+            return scr
+
         def _build_ele_plan(ctx):
             import pyjuice.layer.kernels.c as ck
 
@@ -396,6 +521,22 @@ class _BackwardMixin:
             if (elep_mod is not None and ctx["ele_cuda_ok"] and ctx.get("ele_loads_aligned", True) and tk == 64
                     and pinc == 1 and plan["gate_tile"] is not None):
                 kinds += [("elep", int(c)) for c in elep_mod.fitting_configs(cbs, batch, gate_cbs, knt)]
+
+            # The split element backward (kernels/c/blockscale_ele_backward_stream.cu), bf16 parameters, on the
+            # pre-pass fork's tables and contract: an element block's gated k-steps cut into ranges and pieces, each
+            # piece under one stabilizer and one gate, so each is a plain bf16 GEMM (the exponentials as hi + lo
+            # halves), merged after -- not the fork's bits (more accurate). One candidate, its (tile, split) and
+            # tables measured first (`_eles_code`); its own scope is `fitting_configs`' and the piece limit.
+            if (eles_mod is not None and ctx["params"].dtype == torch.bfloat16 and ctx["ele_cuda_ok"]
+                    and ctx.get("ele_loads_aligned", True) and tk == 64 and pinc == 1 and n_ngates_ == 1
+                    and plan["gate_tile"] is not None and external_params.data_ptr() % 16 == 0):
+                fit = [int(c) for c in eles_mod.fitting_configs(cbs, batch, gate_cbs)]
+                if fit:
+                    code, tables = self._eles_code(eles_mod, ctx, plan["gate_tile"], _scratch(ctx), external_params,
+                                                   ext_base, gate_cbs, fit)
+                    if code is not None:
+                        plan["eles"] = tables
+                        kinds.append(("eles", code))
 
             if (sb_mod is not None and batch < 16 and ne % blk == 0 and ctx["ele_cuda_ok"]
                     and pinc == 1):
@@ -459,9 +600,7 @@ class _BackwardMixin:
 
             # Measured into a SCRATCH clone. Every candidate STORES its output so a live trial would
             # be harmless today, but the choice is cached forever and the scratch keeps that true.
-            scr = layer._bk_ele_scratch
-            if scr is None or scr.shape != ctx["element_flows"].shape:
-                scr = layer._bk_ele_scratch = torch.empty_like(ctx["element_flows"])
+            scr = _scratch(ctx)
             # The gradient is OFF for the trials. Its writes are atomic ACCUMULATIONS into the real
             # gradient buffer, so measuring N candidates over warmup+reps would add the gradient tens
             # of times over -- which is exactly what it did: the value came out ~128x too large, and
@@ -502,6 +641,18 @@ class _BackwardMixin:
                     (layer._bs_grad_ext if layer._bs_grad_ext is not None
                      else external_params.new_empty(0)),
                     batch, blk, cbs, knt, gate_cbs, ext_base, 1 if layer._bs_grad_ext is not None else 0, kind[1])
+
+            elif isinstance(kind, tuple) and kind[0] == "eles":
+                if external_params.data_ptr() % 16:            # (its log-gate rows are 16-byte loads)
+                    return _launch_ele(ctx, plan, tgt, "triton")
+                tb = plan["eles"]
+                eles_mod.blockscale_ele_backward_stream(
+                    tgt, ctx["element_mars"], ctx["node_flows"], ctx["node_mars"], ctx["params"],
+                    external_params, chids, ctx["ele_ebase"], ctx["ele_pbase"],
+                    (layer._bs_grad_ext if layer._bs_grad_ext is not None
+                     else external_params.new_empty(0)),
+                    batch, blk, cbs, knt, gate_cbs, ext_base, 1 if layer._bs_grad_ext is not None else 0, kind[1],
+                    tb["tables"], tb["ngrp"], tb["npc"])
 
             elif isinstance(kind, tuple):                     # ("sb", cfg)
                 e0, p0 = plan["sb"]
