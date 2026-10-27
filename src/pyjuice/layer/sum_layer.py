@@ -1,6 +1,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import os
 import torch
 import torch.nn as nn
@@ -18,6 +19,7 @@ from typing import Sequence, List, Optional, Tuple
 from pyjuice.nodes import SumNodes
 from pyjuice.utils.parameter_list import FastParamList
 from pyjuice.utils.util import host_cdiv, host_next_power_of_2
+from pyjuice.utils.launch_plans import LaunchPlans
 from .kernels import sum_forward_block_sparse as fw_bsparse
 from .kernels import sum_forward_block_sparse_fused as fw_fused
 from .kernels import sum_forward_sparse as fw_sparse
@@ -471,6 +473,7 @@ class SumLayer(Layer, nn.Module):
                       self._cached_bk_ele_cuda, self._cached_bk_ele_sb, self._cached_bk_par_cuda,
                       self._cached_bk_par_trim, self._cached_param_align8, self._fw_fast):
             cache.clear()
+        LaunchPlans.of(self).clear()
         self._bk_ele_scratch = None
         self._bk_par_scratch = None
 
@@ -774,6 +777,25 @@ class SumLayer(Layer, nn.Module):
                           fused kernel of the `tlmm` regime). Element flows only, for a layer whose every partition
                           `fuses_children_backward` at this batch; another raises.
         """
+        # A launch plan (`pyjuice.utils.launch_plans`): what an earlier call with this signature launched, its decisions
+        # made once. The standard regime only -- LL, no tempering, whole partitions, flows not modified in place --,
+        # where the decisions below read nothing but what the key holds (`kwargs` by name: their values are read by
+        # the tempered kernels alone). A converted site adds one launcher per partition and kind of flow; any other
+        # leaves the count short, and the call is not planned.
+        pkey = None
+        if (partition_runs is None and compute_children is None and not allow_modify_flows and propagation_alg == "LL"
+                and pflow_temperature == 1.0 and not temper_eflow):
+            pkey = ("backward", node_flows.size(1), node_flows.device, node_flows.dtype, params.dtype,
+                    None if param_flows is None else param_flows.dtype, logspace_flows, negate_pflows,
+                    accumulate_ch_flows, allow_neg_flows, precision, self._ext_bw_ele_hook is not None,
+                    self._ext_bw_par_hook is not None, self._ext_bw_par_sb_hook is not None,
+                    self._ext_bw_par_triton_hook is not None, tuple(sorted(kwargs)))
+            plan = LaunchPlans.of(self).lookup(pkey)
+            if plan is not None:
+                for launch in plan:
+                    launch(node_flows, element_flows, node_mars, element_mars, params, param_flows)
+                return None
+
         if compute_children is not None and (param_flows is not None or allow_modify_flows):
             raise ValueError("`compute_children` serves a backward of element flows only.")
 
@@ -810,60 +832,64 @@ class SumLayer(Layer, nn.Module):
                     propagation_alg = propagation_alg, **kwargs
                 )
         
-        ## Compute flows w.r.t. elements (i.e., product nodes) ##
-        for partition_id in range(self.num_bk_partitions):
-            runs = None if partition_runs is None else partition_runs[partition_id]
-            if runs is not None and len(runs) == 0:
-                continue
-            chids = self.partitioned_chids[partition_id]
-            parids = self.partitioned_parids[partition_id]
-            parpids = self.partitioned_parpids[partition_id]
-            cs_block_size = self.cs_block_sizes[partition_id]
-
-            self._backward(
-                node_flows, element_flows, params, node_mars, 
-                element_mars, param_flows, 
-                chids = chids, parids = parids, parpids = parpids,
-                cs_block_size = cs_block_size,
-                partition_id = partition_id,
-                allow_modify_flows = allow_modify_flows,
-                propagation_alg = propagation_alg,
-                logspace_flows = logspace_flows,
-                negate_pflows = negate_pflows, 
-                accumulate_ch_flows = accumulate_ch_flows,
-                allow_neg_flows = allow_neg_flows,
-                force_use_fp32 = force_use_fp32,
-                pflow_temperature = pflow_temperature,
-                temper_eflow = temper_eflow,
-                runs = runs,
-                children = compute_children,
-                **kwargs
-            )
-
-        ## Compute flows w.r.t. sum parameters ##
-        if param_flows is not None:
-            for partition_id in range(self.num_fw_partitions):
-                nids = self.partitioned_nids[partition_id]
-                cids = self.partitioned_cids[partition_id]
-                pids = self.partitioned_pids[partition_id]
-                pfids = self.partitioned_pfids[partition_id]
+        with (LaunchPlans.record() if pkey is not None else contextlib.nullcontext()) as rec:
+            ## Compute flows w.r.t. elements (i.e., product nodes) ##
+            for partition_id in range(self.num_bk_partitions):
+                runs = None if partition_runs is None else partition_runs[partition_id]
+                if runs is not None and len(runs) == 0:
+                    continue
+                chids = self.partitioned_chids[partition_id]
+                parids = self.partitioned_parids[partition_id]
+                parpids = self.partitioned_parpids[partition_id]
+                cs_block_size = self.cs_block_sizes[partition_id]
 
                 self._backward(
                     node_flows, element_flows, params, node_mars, 
-                    element_mars, param_flows, nids = nids, 
-                    cids = cids, pids = pids, pfids = pfids, 
+                    element_mars, param_flows, 
+                    chids = chids, parids = parids, parpids = parpids,
+                    cs_block_size = cs_block_size,
                     partition_id = partition_id,
                     allow_modify_flows = allow_modify_flows,
                     propagation_alg = propagation_alg,
                     logspace_flows = logspace_flows,
                     negate_pflows = negate_pflows, 
-                    allow_neg_flows = allow_neg_flows, 
+                    accumulate_ch_flows = accumulate_ch_flows,
+                    allow_neg_flows = allow_neg_flows,
                     force_use_fp32 = force_use_fp32,
                     pflow_temperature = pflow_temperature,
                     temper_eflow = temper_eflow,
+                    runs = runs,
+                    children = compute_children,
                     **kwargs
                 )
 
+            ## Compute flows w.r.t. sum parameters ##
+            if param_flows is not None:
+                for partition_id in range(self.num_fw_partitions):
+                    nids = self.partitioned_nids[partition_id]
+                    cids = self.partitioned_cids[partition_id]
+                    pids = self.partitioned_pids[partition_id]
+                    pfids = self.partitioned_pfids[partition_id]
+
+                    self._backward(
+                        node_flows, element_flows, params, node_mars, 
+                        element_mars, param_flows, nids = nids, 
+                        cids = cids, pids = pids, pfids = pfids, 
+                        partition_id = partition_id,
+                        allow_modify_flows = allow_modify_flows,
+                        propagation_alg = propagation_alg,
+                        logspace_flows = logspace_flows,
+                        negate_pflows = negate_pflows, 
+                        allow_neg_flows = allow_neg_flows, 
+                        force_use_fp32 = force_use_fp32,
+                        pflow_temperature = pflow_temperature,
+                        temper_eflow = temper_eflow,
+                        **kwargs
+                    )
+
+        if pkey is not None:
+            LaunchPlans.of(self).store(pkey, rec, self.num_bk_partitions + (self.num_fw_partitions
+                                                                            if param_flows is not None else 0))
         return None
 
     def is_sum(self):
@@ -2200,9 +2226,8 @@ class SumLayer(Layer, nn.Module):
                     "accumulate_ch_flows off)."
                 )
             ele_ebase, ele_pbase, ele_cuda_ok = self._cached_bk_ele_cuda[signature]
-            self._ext_bw_ele_hook(dict(
-                element_flows = element_flows, element_mars = element_mars, node_flows = node_flows,
-                node_mars = node_mars, params = params, chids = chids,
+            static = dict(
+                chids = chids,
                 ele_ebase = ele_ebase, ele_pbase = ele_pbase, ele_cuda_ok = ele_cuda_ok,
                 # (the 8-parameter loads of a CUDA kernel reading `ele_pbase` -- `_cuda_param_loads_aligned`)
                 ele_loads_aligned = self._cuda_param_loads_aligned(params, ("ele", signature), ele_pbase,
@@ -2213,7 +2238,15 @@ class SumLayer(Layer, nn.Module):
                 cs_block_size = cs_block_size, num_edges = num_edges, signature = signature,
                 BLOCK_B = BLOCK_B, TILE_SIZE_K = TILE_SIZE_K, K_NUM_TILES = K_NUM_TILES,
                 TILE_SIZE_M = TILE_SIZE_M, TL_DOT = TL_DOT, grid = grid, partition_id = partition_id,
-            ))
+            )
+
+            def _hook(node_flows, element_flows, node_mars, element_mars, params, param_flows, static = static):
+                # (the hook installed for THIS call: the parameterization's `pre_backward_layer` sets it each backward)
+                self._ext_bw_ele_hook(dict(static, element_flows = element_flows, element_mars = element_mars,
+                                           node_flows = node_flows, node_mars = node_mars, params = params))
+
+            LaunchPlans.add(_hook)
+            _hook(node_flows, element_flows, node_mars, element_mars, params, None)
             return None
 
         # Optional CUDA (CuTe/fp16/TMA) fast path for the element-flow backward `tlmm` regime. It is
@@ -2676,16 +2709,21 @@ class SumLayer(Layer, nn.Module):
                 # way the element flows already do. Handing it only the CuTe operands forced that fork
                 # even where the ungated layer's own autotuner prefers Triton -- 63 -> 123 us at batch
                 # 1024, the single largest item in the gated backward's overhead.
-                self._ext_bw_par_hook(dict(
-                    param_flows = param_flows, node_flows = node_flows, node_mars = node_mars,
-                    element_mars = element_mars, params = params,
+                static = dict(
                     nbase = nbase, cbase = cbase, pbase = pbase, fbase = fbase, cute_ok = True,
                     nids = nids, cids = cids, pids = pids, pfids = pfids,
                     batch_size = batch_size, block_size = self.block_size, num_edges = num_edges,
                     TILE_SIZE_B = TILE_SIZE_B, B_NUM_TILES = B_NUM_TILES, TILE_SIZE_K = TILE_SIZE_K,
                     TILE_SIZE_M = TILE_SIZE_M, TL_DOT = TL_DOT, grid = grid,
                     partition_id = partition_id, signature = id(pfids),
-                ))
+                )
+
+                def _hook(node_flows, element_flows, node_mars, element_mars, params, param_flows, static = static):
+                    self._ext_bw_par_hook(dict(static, param_flows = param_flows, node_flows = node_flows,
+                                               node_mars = node_mars, element_mars = element_mars, params = params))
+
+                LaunchPlans.add(_hook)
+                _hook(node_flows, None, node_mars, element_mars, params, param_flows)
                 return None
 
             if par_ok:
@@ -2723,14 +2761,21 @@ class SumLayer(Layer, nn.Module):
         if self._ext_bw_par_triton_hook is not None:
             # The CuTe fork did not claim this shape (it needs num_edges % 128 and block_size % 64).
             # The Triton fork has neither requirement, so it covers what the CUDA forks cannot.
-            self._ext_bw_par_triton_hook(dict(
-                node_flows = node_flows, node_mars = node_mars, element_mars = element_mars,
-                params = params, param_flows = param_flows, nids = nids, cids = cids, pids = pids,
+            static = dict(
+                nids = nids, cids = cids, pids = pids,
                 pfids = pfids, batch_size = batch_size, num_edges = num_edges,
                 block_size = self.block_size, TILE_SIZE_B = TILE_SIZE_B, B_NUM_TILES = B_NUM_TILES,
                 TILE_SIZE_K = TILE_SIZE_K, TILE_SIZE_M = TILE_SIZE_M, TL_DOT = TL_DOT, grid = grid,
                 partition_id = partition_id,
-            ))
+            )
+
+            def _hook(node_flows, element_flows, node_mars, element_mars, params, param_flows, static = static):
+                self._ext_bw_par_triton_hook(dict(static, node_flows = node_flows, node_mars = node_mars,
+                                                  element_mars = element_mars, params = params,
+                                                  param_flows = param_flows))
+
+            LaunchPlans.add(_hook)
+            _hook(node_flows, None, node_mars, element_mars, params, param_flows)
             return None
 
         if self._ext_bw_par_hook is not None:
