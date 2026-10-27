@@ -90,7 +90,8 @@ class _LearningMixin:
             an EM caller always wants the default.
         :type _apply_denom_correction: bool
         """
-        assert not step_size_rescaling or self._cum_flow > 0.0, "Please perform a backward pass before calling `mini_batch_em`."
+        assert not step_size_rescaling or self._cum_flow > 0.0, \
+            "Please perform a backward pass before calling `mini_batch_em`."
         assert 0.0 < step_size <= 1.0, "`step_size` should be between 0 and 1."
 
         # `apply_z_correction` + `step_size_rescaling` (Anemone) now agree: `init_param_flows` scales
@@ -118,7 +119,8 @@ class _LearningMixin:
 
             # Update input layers
             for layer in self.input_layer_group:
-                layer.mini_batch_em(step_size = step_size, pseudocount = pseudocount, keep_zero_params = keep_zero_params)
+                layer.mini_batch_em(step_size = step_size, pseudocount = pseudocount,
+                                    keep_zero_params = keep_zero_params)
 
             # Accumulate parameter flows of tied nodes
             compute_cum_par_flows(self.param_flows, self.parflow_fusing_kwargs)
@@ -160,8 +162,8 @@ class _LearningMixin:
                     self.params.data[ps:pe].copy_(params[ps:pe])
 
             # The updates write `params` through Triton kernels, which do not move the tensor's version: signal it as an
-            # in-place update would, for the caches keyed on it (BlockScale's per-gate parameter sums -- MEASURED before:
-            # the gate gradient after an EM step used the sums from before it, 1.3e-2 off gradients of ~2.5e-2)
+            # in-place update would, for the caches keyed on it (BlockScale's per-gate parameter sums -- MEASURED
+            # before: the gate gradient after an EM step used the sums from before it, 1.3e-2 off gradients of ~2.5e-2)
             torch.autograd.graph.increment_version(self.params)
 
     # ---------------------------------------------------------------------------------------------
@@ -170,8 +172,9 @@ class _LearningMixin:
 
     def _params_for_update(self) -> torch.Tensor:
         """The tensor a parameter update writes: `params` themselves when stored in fp32; otherwise their fp32 master
-        copy -- made by the first update (an exact upcast), and brought in line with `params` wherever those were written
-        since it was last stored. After writing it, call `_store_updated_params` -- and nothing that calls this in
+        copy -- made by the first update (an exact upcast), and brought in line with `params` wherever those were
+        written since it was last stored. After writing it, call `_store_updated_params` -- and nothing that calls this
+        in
         between, which would take the not-yet-stored values for outside writes and undo them."""
         if self.params.dtype == torch.float32:
             return self.params
@@ -226,8 +229,8 @@ class _LearningMixin:
         """
         Initialize parameter flows.
 
-        :param flows_memory: the number that the current parameter flows (if any) will be multiplied by; equivalent to zeroling the flows if set to 0
-        :type flows_memory: float
+        :param flows_memory: the number that the current parameter flows (if any) will be multiplied by; equivalent to
+        zeroling the flows if set to 0 :type flows_memory: float
         """
 
         assert 0.0 <= flows_memory <= 1.0, f"`flows_memory` should be in [0.0, 1.0]"
@@ -239,8 +242,9 @@ class _LearningMixin:
             
         self._init_buffer(name = "param_flows", shape = pflow_shape)
 
-        # At 0 a write pass (`zero_`), not a read-scale-write one: the same zeros at half the traffic (MEASURED, HCLT-1024's
-        # sum and input-layer flows: 2.4 ms each scaled), and a NaN or inf left in the buffer is cleared rather than kept
+        # At 0 a write pass (`zero_`), not a read-scale-write one: the same zeros at half the traffic (MEASURED,
+        # HCLT-1024's sum and input-layer flows: 2.4 ms each scaled), and a NaN or inf left in the buffer is cleared
+        # rather than kept
         if flows_memory == 0.0:
             self.param_flows.zero_()
         elif flows_memory != 1.0:
@@ -343,7 +347,8 @@ class _LearningMixin:
         :param clone: whether to deepcopy parameters
         :type clone: bool
         """
-        params = self._params_in_fp32().detach().cpu()      # the nodes keep fp32 parameters, whatever the circuit stores
+        # (the nodes keep fp32 parameters, whatever the circuit stores)
+        params = self._params_in_fp32().detach().cpu()
 
         for ns in self.root_ns:
             if ns.is_sum() and not ns.is_tied():

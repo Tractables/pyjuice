@@ -2,10 +2,11 @@
 Mini-batch EM's sum-parameter update by node blocks, in the parameters' own layout.
 
 A node block's parameters (and their flows) are one contiguous ``[children, nodes]`` array -- nodes innermost --, and
-`par_update.em_par_update_kernel` walks them per (node, run of 32 children): it reads and WRITES 32 values ``block_size``
-floats apart, one per 32-byte sector, through offsets it loads from tables, so nothing coalesces. The reads survive it
-(`cum_pflow_kernel`, which only reads, runs at ~1 TB/s); the writes do not -- each partial sector costs the DRAM a read
-and a write, and the update ran 6.3x above its bandwidth floor (MEASURED, HCLT-1024: 24.5 ms against 3.9).
+`par_update.em_par_update_kernel` walks them per (node, run of 32 children): it reads and WRITES 32 values
+``block_size`` floats apart, one per 32-byte sector, through offsets it loads from tables, so nothing coalesces. The
+reads survive it (`cum_pflow_kernel`, which only reads, runs at ~1 TB/s); the writes do not -- each partial sector costs
+the DRAM a read and a write, and the update ran 6.3x above its bandwidth floor (MEASURED, HCLT-1024: 24.5 ms
+against 3.9).
 
 Here a program takes a tile of consecutive nodes of a node block, rows of consecutive values that coalesce, and computes
 every node's total (`cum_pflow_kernel`'s sum, without its atomics) and then every parameter's update, the expression of
@@ -17,15 +18,15 @@ every node's total (`cum_pflow_kernel`'s sum, without its atomics) and then ever
 * `_em_node_block_kernel` for any number of children: the flows read twice, once for the totals (fp32 5.06 ms, bf16
   6.41).
 
-Which one, and the one-pass tile, is a fixed rule (`_form`), not a timed choice: the forms sum a node's flows in different
-orders (~1e-10 apart, thousands of a layer's values differing in the last bits), and the update must come out to the
-same bits wherever it runs on the same values -- DDP's ranks each update from the same reduced flows, and with the form
-timed per process two of them could pick differently and drift apart (tests/optim/bf16_params_ddp_test.py, on busy
-GPUs). A node's total is summed in one order (the atomics added in none): the parameters agree with the per-block
+Which one, and the one-pass tile, is a fixed rule (`_form`), not a timed choice: the forms sum a node's flows in
+different orders (~1e-10 apart, thousands of a layer's values differing in the last bits), and the update must come out
+to the same bits wherever it runs on the same values -- DDP's ranks each update from the same reduced flows, and with
+the form timed per process two of them could pick differently and drift apart (tests/optim/bf16_params_ddp_test.py, on
+busy GPUs). A node's total is summed in one order (the atomics added in none): the parameters agree with the per-block
 kernels' to the last bits of fp32, and with themselves run to run and rank to rank to the bit.
 
-The same kernels serve the fp32 master copy of parameters stored below fp32 (`params_master`): the old value read through
-`params_master._em_par_update_master_kernel`'s external-write check, both copies written.
+The same kernels serve the fp32 master copy of parameters stored below fp32 (`params_master`): the old value read
+through `params_master._em_par_update_master_kernel`'s external-write check, both copies written.
 
 Node blocks of fewer than `MIN_BLOCK_SIZE` nodes (a node's children a few floats apart, the per-block kernels' reads and
 writes then sharing sectors) keep `par_update.em_par_update` / `params_master.em_par_update_master`.
@@ -59,8 +60,8 @@ ONE_PASS_TILE_MASTER = (8, 16)
 
 
 @triton.jit
-def _em_node_block_kernel(stored_ptr, master, param_flows, cum_pflows, t_par, t_pflow, t_rows, t_stride, t_nodes, t_gnid,
-                          step_size, pseudocount, HAS_MASTER: tl.constexpr, KEEP_ZERO: tl.constexpr,
+def _em_node_block_kernel(stored_ptr, master, param_flows, cum_pflows, t_par, t_pflow, t_rows, t_stride, t_nodes,
+                          t_gnid, step_size, pseudocount, HAS_MASTER: tl.constexpr, KEEP_ZERO: tl.constexpr,
                           BLOCK_C: tl.constexpr, BLOCK_N: tl.constexpr):
     """Program t: the tile's ``t_nodes[t]`` nodes, from parameter ``t_par[t]`` / flow ``t_pflow[t]``, ``t_rows[t]``
     children, rows ``t_stride[t]`` (the node block's size) apart; their totals stored at ``cum_pflows[t_gnid[t]:]`` (the
@@ -126,9 +127,9 @@ def _em_node_block_kernel(stored_ptr, master, param_flows, cum_pflows, t_par, t_
 
 
 @triton.jit
-def _em_node_block_one_pass_kernel(stored_ptr, master, param_flows, cum_pflows, t_par, t_pflow, t_rows, t_stride, t_nodes, t_gnid,
-                                   step_size, pseudocount, HAS_MASTER: tl.constexpr, KEEP_ZERO: tl.constexpr,
-                                   NCH: tl.constexpr, BLOCK_N: tl.constexpr):
+def _em_node_block_one_pass_kernel(stored_ptr, master, param_flows, cum_pflows, t_par, t_pflow, t_rows, t_stride,
+                                   t_nodes, t_gnid, step_size, pseudocount, HAS_MASTER: tl.constexpr,
+                                   KEEP_ZERO: tl.constexpr, NCH: tl.constexpr, BLOCK_N: tl.constexpr):
     """`_em_node_block_kernel` for tiles of at most ``NCH`` children (a power of two): the tile's flows read once, kept
     while their totals are summed."""
     t = tl.program_id(0)
@@ -192,8 +193,8 @@ class _Tables:
 
     def groups(self, pc, exclude: Sequence) -> tuple:
         """``(groups, per-block kwargs)`` without the parameter ranges ``exclude`` (each a whole `ns`'s): ``groups``
-        ``{children bucket: blocks}`` -- a bucket the power of two at or above the blocks' children up to `ONE_PASS_MAX`,
-        None past it --, every one's tiles made per width on demand (`tiles`)."""
+        ``{children bucket: blocks}`` -- a bucket the power of two at or above the blocks' children up to
+        `ONE_PASS_MAX`, None past it --, every one's tiles made per width on demand (`tiles`)."""
         key = tuple(sorted(exclude))
         hit = self.cache.get(key)
         if hit is not None:
@@ -271,15 +272,16 @@ def em_update(pc, param_flows: torch.Tensor, step_size: float, pseudocount: floa
               exclude: Sequence = (), master: Optional[torch.Tensor] = None) -> None:
     """Mini-batch EM's update of ``pc.params`` (and of their fp32 master copy ``master`` when given) from
     ``param_flows``, every sum node not in the parameter ranges ``exclude``: the node-block kernels for blocks of at
-    least `MIN_BLOCK_SIZE` nodes (which of them per group of children: `_form`), the per-block kernels for the others."""
+    least `MIN_BLOCK_SIZE` nodes (which of them per group of children: `_form`), the per-block kernels for the
+    others."""
     from .par_update import em_par_update
     from .params_master import em_par_update_master
     tables = _tables(pc)
     groups, small = tables.groups(pc, exclude)
     stored = pc.params.data
     step_size, pseudocount, keep_zero = float(step_size), float(pseudocount), bool(keep_zero_params)
-    # Every node's total in `par_update_kwargs`' buffer, as the per-block kernels leave it -- their call first: it zeroes
-    # the whole buffer (excluded nodes: 0), the node-block kernels then write their own nodes'
+    # Every node's total in `par_update_kwargs`' buffer, as the per-block kernels leave it -- their call first: it
+    # zeroes the whole buffer (excluded nodes: 0), the node-block kernels then write their own nodes'
     cum_pflows = pc.par_update_kwargs[6]
     if small[0].numel() > 0:
         if master is None:
@@ -290,7 +292,8 @@ def em_update(pc, param_flows: torch.Tensor, step_size: float, pseudocount: floa
     elif cum_pflows is not None:
         cum_pflows.zero_()
     if cum_pflows is None:
-        cum_pflows = torch.zeros([pc.par_update_kwargs[7]["tot_num_nodes"]], dtype = torch.float32, device = stored.device)
+        cum_pflows = torch.zeros([pc.par_update_kwargs[7]["tot_num_nodes"]], dtype = torch.float32,
+                                 device = stored.device)
     for nch_bucket, group in groups.items():
         cfg = _form(nch_bucket, master is not None)
         _launch(cfg, tables, group, nch_bucket, stored, master, param_flows, cum_pflows, step_size, pseudocount,

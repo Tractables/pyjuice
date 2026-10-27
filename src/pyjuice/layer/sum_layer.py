@@ -298,8 +298,9 @@ class SumLayer(Layer, nn.Module):
 
         # nids:      List[[partition_size]]                      stores node block ids
         # cids:      List[[partition_size, partition_max_n_chs]] stores indices of child node blocks
-        # pids:      List[[partition_size, partition_max_n_chs]] stores indices of edge parameters (1st parameter of every block)
-        # pfids:     List[[partition_size, partition_max_n_chs]] stores indices of edge parameter flows (1st parameter flow of every block)
+        # pids:      List[[partition_size, partition_max_n_chs]] stores indices of edge parameters (1st parameter of
+        # every block) pfids:     List[[partition_size, partition_max_n_chs]] stores indices of edge parameter flows
+        # (1st parameter flow of every block)
         nids, cids, pids, pfids, layer_pid_end, layer_pfid_end = sum_layer_forward_compilation(
             self.nodes, fw_partition_max_chs, fw_n_partition_ids, fw_n_id_in_partition, 
             fw_num_ngs_in_partition, n_chs, global_nid_start, global_pid_start, global_pfid_start, node2tiednodes,
@@ -387,8 +388,9 @@ class SumLayer(Layer, nn.Module):
                 min_n_pars = max_n_pars + 1
 
             # chids:      List[[partition_num_chs]]                         stores child block ids
-            # parids:     List[[partition_num_chs, partition_max_n_pargs]]  stores parent node blocks' ids for each child node
-            # parpids:    List[[partition_num_chs, partition_max_n_pargs]]  param id for the edges to parent (correspond to `parids`)
+            # parids:     List[[partition_num_chs, partition_max_n_pargs]]  stores parent node blocks' ids for each
+            # child node parpids:    List[[partition_num_chs, partition_max_n_pargs]]  param id for the edges to parent
+            # (correspond to `parids`)
             curr_chids, curr_parids, curr_parpids = sum_layer_backward_compilation(
                 nodes = ch_gsize2cs[ch_gsize], 
                 cs2parns = cs2parns,
@@ -537,7 +539,8 @@ class SumLayer(Layer, nn.Module):
             if fast is not None and self._fw_fast_launch(fast, node_mars, element_mars, params):
                 return None
 
-        assert not (propagation_alg != "LL" and abs(pflow_temperature - 1.0) > 1e-6), "`pflow_temperature` can only be 1 if `propagation_alg` is not 'LL'."
+        assert not (propagation_alg != "LL" and abs(pflow_temperature - 1.0) > 1e-6), \
+            "`pflow_temperature` can only be 1 if `propagation_alg` is not 'LL'."
         if precision not in PRECISIONS:
             raise ValueError(f"`precision` must be one of {PRECISIONS}, got {precision!r}.")
         if "force_use_bf16" in kwargs or "force_use_fp32" in kwargs:      # the shim only when needed: hot path
@@ -777,13 +780,20 @@ class SumLayer(Layer, nn.Module):
         if partition_runs is not None and (param_flows is not None or allow_modify_flows):
             raise ValueError("`partition_runs` restricts a backward's element flows: it takes neither "
                              "`param_flows` nor `allow_modify_flows`, which read whole partitions.")
-        assert not (allow_modify_flows and logspace_flows), "`allow_modify_flows` should be set to `False` when using `logspace_flows`."
-        assert not (accumulate_ch_flows and logspace_flows), "`accumulate_ch_flows` should be set to `False` when using `logspace_flows`."
-        assert not (accumulate_ch_flows and allow_modify_flows), "`accumulate_ch_flows` should be set to `False` when `allow_modify_flows=True`."
-        assert not (allow_neg_flows and logspace_flows), "`allow_neg_flows` should be set to `False` when using `logspace_flows`."
-        assert not (allow_neg_flows and allow_modify_flows), "`allow_neg_flows` should be set to `False` when `allow_modify_flows=True`."
-        assert not (propagation_alg != "LL" and abs(pflow_temperature - 1.0) > 1e-6), "`pflow_temperature` can only be 1 if `propagation_alg` is not 'LL'."
-        assert logspace_flows or abs(pflow_temperature - 1.0) < 1e-6, "`pflow_temperature` can only be enabled when `logspace_flows = True`."
+        assert not (allow_modify_flows and logspace_flows), \
+            "`allow_modify_flows` should be set to `False` when using `logspace_flows`."
+        assert not (accumulate_ch_flows and logspace_flows), \
+            "`accumulate_ch_flows` should be set to `False` when using `logspace_flows`."
+        assert not (accumulate_ch_flows and allow_modify_flows), \
+            "`accumulate_ch_flows` should be set to `False` when `allow_modify_flows=True`."
+        assert not (allow_neg_flows and logspace_flows), \
+            "`allow_neg_flows` should be set to `False` when using `logspace_flows`."
+        assert not (allow_neg_flows and allow_modify_flows), \
+            "`allow_neg_flows` should be set to `False` when `allow_modify_flows=True`."
+        assert not (propagation_alg != "LL" and abs(pflow_temperature - 1.0) > 1e-6), \
+            "`pflow_temperature` can only be 1 if `propagation_alg` is not 'LL'."
+        assert logspace_flows or abs(pflow_temperature - 1.0) < 1e-6, \
+            "`pflow_temperature` can only be enabled when `logspace_flows = True`."
         if precision not in PRECISIONS:
             raise ValueError(f"`precision` must be one of {PRECISIONS}, got {precision!r}.")
         if "force_use_bf16" in kwargs or "force_use_fp32" in kwargs:      # the shim only when needed: hot path
@@ -860,7 +870,8 @@ class SumLayer(Layer, nn.Module):
         return True
 
     def __repr__(self):
-        return f"SumLayer(nid_range=({self._layer_nid_range[0]}, {self._layer_nid_range[1]}), num_nodes={self.num_nodes}, num_edges={self.num_edges})"
+        return (f"SumLayer(nid_range=({self._layer_nid_range[0]}, {self._layer_nid_range[1]}), "
+                f"num_nodes={self.num_nodes}, num_edges={self.num_edges})")
 
     def _forward(self, node_mars: torch.Tensor, element_mars: torch.Tensor,
                  params: torch.Tensor, nids: torch.Tensor, cids: torch.Tensor,
@@ -926,7 +937,8 @@ class SumLayer(Layer, nn.Module):
             )
 
         elif mode == self.PYTORCH:
-            assert abs(pflow_temperature - 1.0) < 1e-6, "`pflow_temperature != 1.0` not supported by the PyTorch backend."
+            assert abs(pflow_temperature - 1.0) < 1e-6, \
+                "`pflow_temperature != 1.0` not supported by the PyTorch backend."
             if runs is not None:
                 raise NotImplementedError("The PyTorch forward computes whole partitions only.")
 
@@ -989,8 +1001,8 @@ class SumLayer(Layer, nn.Module):
         # Dense node blocks through cuBLAS where that is faster (see `_DENSE_MIN_BLOCK_SIZE`) -- fp32 parameters only:
         # `torch.mm` on bf16 operands returns bf16, too coarse for log-space node values, so bf16-stored parameters take
         # the block-sparse kernels, which read them as they are and accumulate in fp32
-        if (propagation_alg_id == 0 and not pflow_tempered_enabled and node_mars.is_cuda and params.dtype == torch.float32
-                and self.block_size >= _DENSE_MIN_BLOCK_SIZE and batch_size >= 16):
+        if (propagation_alg_id == 0 and not pflow_tempered_enabled and node_mars.is_cuda
+                and params.dtype == torch.float32 and self.block_size >= _DENSE_MIN_BLOCK_SIZE and batch_size >= 16):
             dense = self._dense_blocks(partition_id, nids, cids, pids)
             if dense is not None and dense[1] * batch_size >= _DENSE_MIN_WORK:
                 if children is not None:
@@ -1005,9 +1017,10 @@ class SumLayer(Layer, nn.Module):
                                                                         pflow_tempered_enabled)
         K_NUM_TILES = num_edges // TILE_SIZE_K
 
-        assert TILE_SIZE_K >= 4, f"`TILE_SIZE_K` should be greater than 4 (but got {TILE_SIZE_K}) in order to use the block-sparse kernel. " \
-                                  "This is an internal error of PyJuice. Please consider checking the kernel dispatching criterions and use the " \
-                                  "corresponding sparse kernel instead."
+        assert TILE_SIZE_K >= 4, f"`TILE_SIZE_K` should be greater than 4 (but got {TILE_SIZE_K}) in order to use " \
+                                  "the block-sparse kernel. This is an internal error of PyJuice. Please consider " \
+                                  "checking the kernel dispatching criterions and use the corresponding sparse " \
+                                  "kernel instead."
 
         signature = ("block_sparse", partition_id, TILE_SIZE_K)
         if signature not in self._cached_fw_pcids:
@@ -1173,15 +1186,15 @@ class SumLayer(Layer, nn.Module):
 
         # The heuristic default is part of the key so that the `OutOfResources` retry below -- which
         # re-enters with a smaller default -- looks up a fresh entry instead of the config that just
-        # failed (which would loop forever). The parameters' dtype too: the kernels read them as stored, and their speeds
-        # differ (as do the element- and parameter-flow keys below).
+        # failed (which would loop forever). The parameters' dtype too: the kernels read them as stored, and their
+        # speeds differ (as do the element- and parameter-flow keys below).
         fw_key = (fw_kernel, self.block_size, TILE_SIZE_K, K_NUM_TILES, batch_size, num_nblocks,
                   use_bf16, fp32_dot, propagation_alg_id, pflow_tempered_enabled, params.dtype, default_fw_cfg)
 
         # Optional CUDA (CuTe/TMA) fast path for the `tlmm` regime. It is numerically equivalent to
         # the Triton tlmm kernel and only valid here: LL propagation (`propagation_alg_id == 0`), the
-        # bf16 dot path (`use_bf16`), no pflow tempering, TILE_SIZE_K == 64 with num_edges a multiple of it, and a contiguous
-        # edge/param layout (`cuda_ok`). `is_available()` JIT-compiles on first call and self-disables
+        # bf16 dot path (`use_bf16`), no pflow tempering, TILE_SIZE_K == 64 with num_edges a multiple of it, and a
+        # contiguous edge/param layout (`cuda_ok`). `is_available()` JIT-compiles on first call and self-disables
         # (-> Triton) on an unsuitable GPU/toolchain/CUTLASS, so this is a no-op without the CUDA
         # prerequisites. The best tile config (or Triton) is measured once per launch SHAPE.
         if (FORWARD_SUM_CUDA and use_bf16 and propagation_alg_id == 0
@@ -1553,7 +1566,8 @@ class SumLayer(Layer, nn.Module):
     @staticmethod
     @torch.compile
     def _forward_pytorch_kernel(node_mars: torch.Tensor, element_mars: torch.Tensor, params: torch.Tensor, 
-                                nids: torch.Tensor, cids: torch.Tensor, pids: torch.Tensor, propagation_alg_id: int, alpha: float = 0.0):
+                                nids: torch.Tensor, cids: torch.Tensor, pids: torch.Tensor, propagation_alg_id: int,
+                                alpha: float = 0.0):
 
         num_nblocks = nids.size(0)
         num_edges = cids.size(1)
@@ -1561,7 +1575,8 @@ class SumLayer(Layer, nn.Module):
             torch.arange(0, self.block_size, device = nids.device)[None,:]).reshape(num_nblocks * self.block_size)
         cids = cids[:,None,:].repeat(1, self.block_size, 1).reshape(num_nblocks * self.block_size, num_edges)
         pids = (pids[:,None,:].repeat(1, self.block_size, 1) + \
-            torch.arange(0, self.block_size, device = cids.device)[None,:,None]).reshape(num_nblocks * self.block_size, num_edges)
+            torch.arange(0, self.block_size, device = cids.device)[None,:,None]).reshape(
+                num_nblocks * self.block_size, num_edges)
 
         ch_mars = element_mars[cids]
 
@@ -1581,7 +1596,8 @@ class SumLayer(Layer, nn.Module):
         return None
 
     def _forward_pytorch(node_mars: torch.Tensor, element_mars: torch.Tensor, params: torch.Tensor, 
-                         nids: torch.Tensor, cids: torch.Tensor, pids: torch.Tensor, propagation_alg: str = "LL", **kwargs):
+                         nids: torch.Tensor, cids: torch.Tensor, pids: torch.Tensor, propagation_alg: str = "LL",
+                         **kwargs):
 
         # Propagation algorithm
         propagation_alg_id = self.propagation_alg_mapping[propagation_alg]
@@ -1788,11 +1804,14 @@ class SumLayer(Layer, nn.Module):
     def _backward_block_sparse(self, node_flows: torch.Tensor, element_flows: torch.Tensor, 
                                params: torch.Tensor, node_mars: torch.Tensor, 
                                element_mars: torch.Tensor, param_flows: torch.Tensor, 
-                               nids: Optional[torch.Tensor], cids: Optional[torch.Tensor], pids: Optional[torch.Tensor], pfids: Optional[torch.Tensor],
-                               chids: Optional[torch.Tensor], parids: Optional[torch.Tensor], parpids: Optional[torch.Tensor], 
+                               nids: Optional[torch.Tensor], cids: Optional[torch.Tensor], pids: Optional[torch.Tensor],
+                               pfids: Optional[torch.Tensor],
+                               chids: Optional[torch.Tensor], parids: Optional[torch.Tensor],
+                               parpids: Optional[torch.Tensor],
                                cs_block_size: int,
                                partition_id: int = -1, allow_modify_flows: bool = False, propagation_alg: str = "LL", 
-                               logspace_flows: bool = False, negate_pflows: bool = False, accumulate_ch_flows: bool = False, 
+                               logspace_flows: bool = False, negate_pflows: bool = False,
+                               accumulate_ch_flows: bool = False,
                                allow_neg_flows: bool = False, force_use_fp32 = False, pflow_temperature: float = 1.0, 
                                temper_eflow: bool = False, runs: Optional[Sequence] = None,
                                children: Optional[torch.Tensor] = None, **kwargs) -> None:
@@ -1956,9 +1975,10 @@ class SumLayer(Layer, nn.Module):
                                                                eflow_temperature)
         K_NUM_TILES = num_edges // TILE_SIZE_K
 
-        assert TILE_SIZE_K >= 4, f"`TILE_SIZE_K` should be greater than 4 (but got {TILE_SIZE_K}) in order to use the block-sparse kernel. " \
-                                  "This is an internal error of PyJuice. Please consider checking the kernel dispatching criterions and use the " \
-                                  "corresponding sparse kernel instead."
+        assert TILE_SIZE_K >= 4, f"`TILE_SIZE_K` should be greater than 4 (but got {TILE_SIZE_K}) in order to use " \
+                                  "the block-sparse kernel. This is an internal error of PyJuice. Please consider " \
+                                  "checking the kernel dispatching criterions and use the corresponding sparse " \
+                                  "kernel instead."
 
         # A second tile family for the autotuner: the one this heuristic picks for a 16-wide batch tile
         # (`TILE_SIZE_K` 128 where the batch-sized one has 64). Neither family wins everywhere -- MEASURED,
@@ -2445,9 +2465,10 @@ class SumLayer(Layer, nn.Module):
 
         allow_modify_flows = 1 if allow_modify_flows else 0
 
-        assert TILE_SIZE_B >= 4, f"`TILE_SIZE_B` should be greater than 4 (but got {TILE_SIZE_B}) in order to use the block-sparse kernel. " \
-                                  "This is an internal error of PyJuice. Please consider checking the kernel dispatching criterions and use the " \
-                                  "corresponding sparse kernel instead."
+        assert TILE_SIZE_B >= 4, f"`TILE_SIZE_B` should be greater than 4 (but got {TILE_SIZE_B}) in order to use " \
+                                  "the block-sparse kernel. This is an internal error of PyJuice. Please consider " \
+                                  "checking the kernel dispatching criterions and use the corresponding sparse " \
+                                  "kernel instead."
 
         # `force_use_fp32` ("fp32") runs the same dots in three TF32 passes, as the element-flow backward
         # does (see `_PAR_DOT_IEEE`); unset otherwise, so the other modes launch exactly as before.
@@ -2746,8 +2767,9 @@ class SumLayer(Layer, nn.Module):
     def _backward_sparse(self, node_flows: torch.Tensor, element_flows: torch.Tensor, 
                          params: torch.Tensor, node_mars: torch.Tensor, 
                          element_mars: torch.Tensor, param_flows: torch.Tensor, 
-                         nids: Optional[torch.Tensor], cids: Optional[torch.Tensor], pids: Optional[torch.Tensor], pfids: Optional[torch.Tensor],
-                         chids: Optional[torch.Tensor], parids: Optional[torch.Tensor], parpids: Optional[torch.Tensor], 
+                         nids: Optional[torch.Tensor], cids: Optional[torch.Tensor], pids: Optional[torch.Tensor],
+                         pfids: Optional[torch.Tensor],
+                         chids: Optional[torch.Tensor], parids: Optional[torch.Tensor], parpids: Optional[torch.Tensor],
                          cs_block_size: int,
                          partition_id: int = -1, allow_modify_flows: bool = False, 
                          propagation_alg: str = "LL", logspace_flows: bool = False, 
@@ -3019,11 +3041,13 @@ class SumLayer(Layer, nn.Module):
         if num_edges <= 1024:
             BLOCK_B = max(min(2048 // num_edges, BATCH_SIZE_NP2), 1)
             BLOCK_K = num_edges
-            BLOCK_M = self.block_size # The kernel recovers the node block via `pid_m // BLOCK_M`, so this must equal `block_size`
+            # The kernel recovers the node block via `pid_m // BLOCK_M`, so this must equal `block_size`
+            BLOCK_M = self.block_size
         else:
             BLOCK_B = min(512, BATCH_SIZE_NP2)
             BLOCK_K = min(2048 // BLOCK_B, num_edges)
-            BLOCK_M = self.block_size # The kernel recovers the node block via `pid_m // BLOCK_M`, so this must equal `block_size`
+            # The kernel recovers the node block via `pid_m // BLOCK_M`, so this must equal `block_size`
+            BLOCK_M = self.block_size
         B_NUM_BLOCKS = host_cdiv(batch_size, BLOCK_B)
         K_NUM_BLOCKS = host_cdiv(num_edges, BLOCK_K)
 
@@ -3302,13 +3326,19 @@ class SumLayer(Layer, nn.Module):
 
         num_nblocks = chids.size(0)
         num_eblocks = parids.size(1)
-        parids = (parids[:,:,None].repeat(1, 1, self.block_size) + torch.arange(0, self.block_size, device = parids.device)).reshape(num_nblocks, num_eblocks * self.block_size)
+        parids = (parids[:,:,None].repeat(1, 1, self.block_size)
+                  + torch.arange(0, self.block_size, device = parids.device)).reshape(
+            num_nblocks, num_eblocks * self.block_size)
         parpids = (parpids[:,:,None] + torch.arange(0, self.block_size, device = parids.device)).reshape(
             num_nblocks, num_eblocks * self.block_size)
 
-        chids = (chids[:,None].repeat(1, cs_block_size) + torch.arange(0, cs_block_size, device = chids.device)).reshape(num_nblocks * cs_block_size)
-        parids = parids[:,None,:].repeat(1, cs_block_size, 1).reshape(num_nblocks * cs_block_size, num_eblocks * self.block_size)
-        parpids = (parpids[:,None,:].repeat(1, cs_block_size, 1) + torch.arange(0, cs_block_size * self.block_size, self.block_size, device = parpids.device)[None,:,None]).reshape(
+        chids = (chids[:,None].repeat(1, cs_block_size)
+                 + torch.arange(0, cs_block_size, device = chids.device)).reshape(num_nblocks * cs_block_size)
+        parids = parids[:,None,:].repeat(1, cs_block_size, 1).reshape(num_nblocks * cs_block_size,
+                                                                      num_eblocks * self.block_size)
+        parpids = (parpids[:,None,:].repeat(1, cs_block_size, 1)
+                   + torch.arange(0, cs_block_size * self.block_size, self.block_size,
+                                  device = parpids.device)[None,:,None]).reshape(
             num_nblocks * cs_block_size, num_eblocks * self.block_size
         )
         
@@ -3341,14 +3371,18 @@ class SumLayer(Layer, nn.Module):
             torch.arange(0, self.block_size, device = nids.device)[None,:]).reshape(num_nblocks * self.block_size)
         cids = cids[:,None,:].repeat(1, self.block_size, 1).reshape(num_nblocks * self.block_size, num_edges)
         pids = (pids[:,None,:].repeat(1, self.block_size, 1) + \
-            torch.arange(0, self.block_size, device = cids.device)[None,:,None]).reshape(num_nblocks * self.block_size, num_edges)
+            torch.arange(0, self.block_size, device = cids.device)[None,:,None]).reshape(
+                num_nblocks * self.block_size, num_edges)
         pfids = (pfids[:,None,:].repeat(1, self.block_size, 1) + \
-            torch.arange(0, self.block_size, device = cids.device)[None,:,None]).reshape(num_nblocks * self.block_size, num_edges)
+            torch.arange(0, self.block_size, device = cids.device)[None,:,None]).reshape(
+                num_nblocks * self.block_size, num_edges)
 
         if logspace_flows:
-            parflows = (node_flows[nids].exp().unsqueeze(1) * params[pids].unsqueeze(-1) * (element_mars[cids] - node_mars[nids].unsqueeze(1)).exp()).sum(dim = 2)
+            parflows = (node_flows[nids].exp().unsqueeze(1) * params[pids].unsqueeze(-1)
+                        * (element_mars[cids] - node_mars[nids].unsqueeze(1)).exp()).sum(dim = 2)
         else:
-            parflows = (node_flows[nids].unsqueeze(1) * params[pids].unsqueeze(-1) * (element_mars[cids] - node_mars[nids].unsqueeze(1)).exp()).sum(dim = 2)
+            parflows = (node_flows[nids].unsqueeze(1) * params[pids].unsqueeze(-1)
+                        * (element_mars[cids] - node_mars[nids].unsqueeze(1)).exp()).sum(dim = 2)
 
         for i in range(num_nblocks):
             sid, eid = ns_block_size * i, ns_block_size * (i + 1)

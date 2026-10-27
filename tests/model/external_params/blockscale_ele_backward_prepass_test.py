@@ -181,7 +181,8 @@ def _reference(em, nf, nm, prm, ext, chids, ebase, pbase, gate, B, blk, cbs, knt
             if gb < 0:
                 continue
             e0, p0 = int(ebase[eb, t]), int(pbase[eb, t])
-            lf = torch.where(nm[e0:e0 + 64] == NEG, torch.full_like(nf[e0:e0 + 64], NEG), nf[e0:e0 + 64] - nm[e0:e0 + 64])
+            lf = torch.where(nm[e0:e0 + 64] == NEG, torch.full_like(nf[e0:e0 + 64], NEG),
+                             nf[e0:e0 + 64] - nm[e0:e0 + 64])
             mxe = lf.max(0).values
             mxe = torch.where(torch.isfinite(mxe), mxe, torch.zeros_like(mxe))
             P = prm[p0 + rows[:, None] * blk + k[None, :]]
@@ -282,7 +283,8 @@ def test_a_backward_taking_it_matches_triton(name, builder, dt, B, neg_gates, ne
         autotune, seen = _pick(prefer)
         monkeypatch.setattr(ck, "autotune", autotune)
         grads = _backward(pc, phi, x)
-        return pc.param_flows.clone(), {ns: g.clone() for ns, g in grads.items()}, {p["kind"] for p in _ele_plans(pc)}, seen
+        return (pc.param_flows.clone(), {ns: g.clone() for ns, g in grads.items()}, {p["kind"] for p in _ele_plans(pc)},
+                seen)
 
     pf_t, g_t, kinds_t, _ = run("triton")
     pf_p, g_p, kinds_p, seen = run("elep")

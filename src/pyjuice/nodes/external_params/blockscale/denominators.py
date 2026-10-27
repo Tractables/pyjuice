@@ -341,8 +341,8 @@ class _DenominatorsMixin:
         pids = layer.partitioned_pids[pid].to(torch.int64)
         rows, num_edges = pids.shape
         ar = torch.arange(block_size, device = params.device, dtype = torch.int64)
-        # (summed in fp32 whatever the parameters are stored in, as the forward sums them -- MEASURED: summed in bf16, the
-        # gate gradient came out 0.4-0.5% off; `.to` is the identity at fp32)
+        # (summed in fp32 whatever the parameters are stored in, as the forward sums them -- MEASURED: summed in bf16,
+        # the gate gradient came out 0.4-0.5% off; `.to` is the identity at fp32)
         th = params[pids[:, :, None] + ar[None, None, :]].to(torch.float32)   # [rows, edges, block_size]
         n_gates = num_edges // gate_cbs
         sg = th.view(rows, n_gates, gate_cbs, block_size).sum(dim = 2)  # [rows, gates, block_size]

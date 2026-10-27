@@ -129,7 +129,8 @@ def test_the_gradient_follows_the_parameters_across_an_em_step(K, gate_cbs, batc
     """The log-Z term's per-gate parameter sums (`_sigma`) are kept until the parameters change, keyed on their version
     -- which an EM step, writing them with Triton kernels, did not move: the gradient after a step was built from the
     sums before it (MEASURED: 1.3e-2 off gradients of ~2.5e-2). The plain M-step (`apply_z_correction = False`: the
-    corrected one happened to write through torch, which moves the version), then the reference on the new parameters."""
+    corrected one happened to write through torch, which moves the version), then the reference on the new
+    parameters."""
     pc, ns, prod, data, phi = _run(K, gate_cbs, batch, 1.0, apply_z_correction = False)
     pc.mini_batch_em(step_size = 0.5, pseudocount = 0.1)
     pc(data, sum_external_params = {ns: phi})

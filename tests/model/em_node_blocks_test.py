@@ -3,8 +3,8 @@ Mini-batch EM's node-block update (`pyjuice.model.backend.em_blocks`) against fl
 it replaces (`par_update.em_par_update`, `params_master.em_par_update_master`), from one state: every kernel form (the
 two-pass one and both one-pass tiles, forced in turn), fp32 parameters and bf16 ones through their master copy,
 node blocks from 1 to 128 nodes (the small ones the per-block kernels'), step sizes, pseudocounts, keep-zero, ranges
-excluded (the corrected ones of the external-parameter M-step), the update agreeing with itself run to run to the bit (no
-atomics), and its form a rule of the shape, never a measurement.
+excluded (the corrected ones of the external-parameter M-step), the update agreeing with itself run to run to the bit
+(no atomics), and its form a rule of the shape, never a measurement.
 """
 
 import pytest
@@ -52,7 +52,8 @@ def _circuit(kind):
     torch.manual_seed(0)
     if kind == "hclt":
         x = torch.randint(0, 32, (512, 24))
-        ns = juice.structures.HCLT(x.float(), num_latents = 64, input_dist = dists.Categorical(num_cats = 32)); V, C = 24, 32
+        ns = juice.structures.HCLT(x.float(), num_latents = 64, input_dist = dists.Categorical(num_cats = 32))
+        V, C = 24, 32
     elif kind == "hmm":
         ns = juice.structures.HMM(seq_length = 16, num_latents = 128, num_emits = 32); V, C = 16, 32
     else:
@@ -78,7 +79,8 @@ def _run(pc, flows, start, step_size, pcount, kz, exclude, path):
     if path == "old":
         kwargs = pc._par_update_kwargs_excluding(list(exclude))
         if master is None:
-            em_par_update(pc.params.data, flows, kwargs, step_size = step_size, pseudocount = pcount, keep_zero_params = kz)
+            em_par_update(pc.params.data, flows, kwargs, step_size = step_size, pseudocount = pcount,
+                          keep_zero_params = kz)
         else:
             em_par_update_master(master, pc.params.data, flows, kwargs, step_size, pcount, kz)
     else:

@@ -4,9 +4,9 @@ exponentials once per element block, then a streaming kernel over the parameter 
 kernel it reproduces -- bit-identical at every config valid for the partition, at fp32 and bf16 parameters, on HCLT-128
 and HMMs of 128 and 896 latents (2 and 14 parent tiles: fewer than the stages, and refills ending part-way through a
 round), at B 64 and 128; on columns whose parents are dead (-inf node values) in an element block's first parent tile,
-have no flow (-inf) in its last, or are dead in all of them; and the layer's dispatch, told the gate chose it, reaches it
-on a whole backward and on runs, and offers its configs beside the other kernels'. Skipped where the CUDA kernels cannot
-build.
+have no flow (-inf) in its last, or are dead in all of them; and the layer's dispatch, told the gate chose it, reaches
+it on a whole backward and on runs, and offers its configs beside the other kernels'. Skipped where the CUDA kernels
+cannot build.
 """
 import pytest
 import torch
@@ -66,7 +66,8 @@ def _partitions(pc, B):
                 if not ok or sig[2] != 64:
                     continue
                 chids, cs = layer.partitioned_chids[sig[1]], int(layer.cs_block_sizes[sig[1]])
-                if cs % 128 or B % 64 or not layer._cuda_param_loads_aligned(pc.params, ("ele", sig), pbase, layer.block_size):
+                if (cs % 128 or B % 64
+                        or not layer._cuda_param_loads_aligned(pc.params, ("ele", sig), pbase, layer.block_size)):
                     continue
                 rows = (chids[:, None] + torch.arange(cs, device = DEV)[None, :]).reshape(-1)
                 yield layer, chids, cs, ebase, pbase, rows
@@ -172,7 +173,8 @@ def test_the_dispatch_reaches_the_prepass_element_backward(name, monkeypatch):
                 for on in (True, False):
                     asked = []
                     mp.setattr(ck, "ele_prepass_is_available", available if on else (lambda: False))
-                    mp.setattr(autotune, "best_of", lambda cands, *a, **k: asked.append([c for c, _ in cands]) or ("cuda", 0))
+                    mp.setattr(autotune, "best_of",
+                               lambda cands, *a, **k: asked.append([c for c, _ in cands]) or ("cuda", 0))
                     layer._cached_bk_ele_choice.clear()
                     layer.backward(pc.node_flows, ef, pc.node_mars, pc.element_mars, pc.params, **kw)
                     offered = [c for cands in asked for c in cands if c[0] == "cuda_prepass"]
