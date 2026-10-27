@@ -188,6 +188,19 @@ class Categorical(Distribution):
         sample_offsets = vids * batch_size + batch_offsets
         tl.store(samples_ptr + sample_offsets, sampled_id, mask = mask)
 
+    def em_layer_fn(self, layer, constexprs, keep_zero_params):
+        """
+        `small_ncats_em_fn`'s update of a whole layer in a kernel of its own (`pyjuice.layer.kernels.input_em`): the
+        same arithmetic in the same order -- the same bits --, its categories walked a chunk at a time, unrolled, 32
+        nodes a program. The template walks them one at a time, a node a thread and 1024 a program: MEASURED 263 us for
+        8192 source nodes of 64 categories, against 21 here. Only where the layer runs `small_ncats_em_fn`
+        (`get_em_fn`); False otherwise.
+        """
+        if layer.em_fn is not Categorical.small_ncats_em_fn:
+            return False
+        from pyjuice.layer.kernels.input_em import categorical_em
+        return categorical_em(layer, constexprs, keep_zero_params)
+
     @staticmethod
     def small_ncats_em_fn(local_offsets, params_ptr, param_flows_ptr, s_pids, s_pfids, metadata_ptr, s_mids_ptr, mask,
                           step_size, pseudocount, BLOCK_SIZE):

@@ -133,6 +133,7 @@ class InputLayer(Layer, nn.Module):
         self._bk_cuda_ok = None  # cached gate for the CUDA backward (computed once, see backward())
         self.sample_fn = self.dist.get_sample_fn()
         self.em_fn = self.dist.get_em_fn()
+        self.em_layer_fn = self.dist.get_em_layer_fn()  # optional kernel of its own for the EM update (or None)
 
         try:
             self.post_fw_fns = self.dist.post_fw_fns
@@ -960,10 +961,15 @@ class InputLayer(Layer, nn.Module):
 
                     layer_num_source_nodes = self.source_nids.size(0)
 
+                    constexprs = device_scalars([step_size, pseudocount], self.device, dtype = torch.float32)
+
+                    # The distribution's own kernel for the layer's update, where it has one and takes this layer
+                    # (`Distribution.get_em_layer_fn`); else `em_fn` in the template below
+                    if self.em_layer_fn is not None and self.em_layer_fn(self, constexprs, keep_zero_params):
+                        return None
+
                     if not self.provided("_em_kernel"):
                         self._em_kernel = self._compile_triton_kernel(self._em_kernel_template, em_fn = self.em_fn)
-
-                    constexprs = device_scalars([step_size, pseudocount], self.device, dtype = torch.float32)
 
                     if hasattr(self.dist, "em_block_size"):
                         BLOCK_SIZE = self.dist.em_block_size
