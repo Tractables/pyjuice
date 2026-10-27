@@ -601,16 +601,15 @@ class _BackwardMixin:
             # Measured into a SCRATCH clone. Every candidate STORES its output so a live trial would
             # be harmless today, but the choice is cached forever and the scratch keeps that true.
             scr = _scratch(ctx)
-            # The gradient is OFF for the trials. Its writes are atomic ACCUMULATIONS into the real
-            # gradient buffer, so measuring N candidates over warmup+reps would add the gradient tens
-            # of times over -- which is exactly what it did: the value came out ~128x too large, and
-            # the zero-sum invariant blew up. The flow output already goes to a scratch buffer for the
-            # same reason; the gradient needed the same treatment and did not have it.
-            #
-            # Choosing on flow cost alone is a small inaccuracy (it ignores the gradient's share of
-            # each candidate) and is the conservative trade against corrupting the answer.
+            # The trials write the gradient (where the backward wants one) into a SCRATCH buffer. Its writes
+            # are atomic ACCUMULATIONS, so into the real buffer N candidates over warmup + reps would add it
+            # tens of times over -- which is exactly what an earlier version did: the value came out ~128x
+            # too large and the zero-sum invariant blew up. The flow output goes to a scratch buffer for the
+            # same reason. Trials without the gradient compared the flows' cost alone, and that was not a
+            # small inaccuracy: MEASURED (HMM-4096 x4, gate width 64, B 128) the pre-pass fork 49 us without
+            # it, 58 with it; the split backward 49 and 42.
             saved_grad = layer._bs_grad_ext
-            layer._bs_grad_ext = None
+            layer._bs_grad_ext = None if saved_grad is None else torch.zeros_like(saved_grad)
             try:
                 trials = [(k, (lambda k = k: _launch_ele(ctx, plan, scr, k))) for k in kinds]
                 plan["kind"] = ck.autotune(trials) or kinds[0]
