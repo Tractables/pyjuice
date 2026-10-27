@@ -20,6 +20,37 @@ def _set_attrs(layer, **attrs) -> None:
     layer.__dict__.update(attrs)
 
 
+def _grad_kwargs():
+    """`(EXTERNAL_PARAMS_GRAD_KWARG, EXTERNAL_PARAMS_GRAD_BUFFER_KWARG)`, imported once (a module-level import would
+    be circular: `external_sum_layer` imports the parameterizations)."""
+    global _GRAD_KWARGS
+    if _GRAD_KWARGS is None:
+        from pyjuice.layer.external_sum_layer import EXTERNAL_PARAMS_GRAD_KWARG, EXTERNAL_PARAMS_GRAD_BUFFER_KWARG
+        _GRAD_KWARGS = (EXTERNAL_PARAMS_GRAD_KWARG, EXTERNAL_PARAMS_GRAD_BUFFER_KWARG)
+    return _GRAD_KWARGS
+
+
+_GRAD_KWARGS = None
+
+
+_MODS = {}
+
+
+def _mod(name: str):
+    """The module `..kernels.<name>`, imported on first use and then looked up (an import statement a call costs
+    ~0.5 us; read attributes off the module, so a test replacing one still takes effect)."""
+    m = _MODS.get(name)
+    if m is None:
+        import importlib
+        m = _MODS[name] = importlib.import_module(f"pyjuice.nodes.external_params.kernels.{name}")
+    return m
+
+
+def _shift_logz():
+    """`kernels.shift_logz.shift_logz` (read off its module each call)."""
+    return _mod("shift_logz").shift_logz
+
+
 def _host_extra(runs):
     """
     Each of a plan's candidates' host time a call beyond the cheapest's, in seconds: the best of a few bursts of calls
@@ -439,8 +470,7 @@ class _BackwardMixin:
         if external_params is None:
             raise RuntimeError("the external-parameter staging buffer was not supplied to the backward.")
 
-        from pyjuice.layer.external_sum_layer import EXTERNAL_PARAMS_GRAD_KWARG, \
-            EXTERNAL_PARAMS_GRAD_BUFFER_KWARG
+        EXTERNAL_PARAMS_GRAD_KWARG, EXTERNAL_PARAMS_GRAD_BUFFER_KWARG = _grad_kwargs()
         grads = kwargs.get(EXTERNAL_PARAMS_GRAD_KWARG, None)
         want_grad = grads is not None and any(ns_info.ns in grads for ns_info, _ in ns_tensors)
         _set_attrs(layer, _bs_grad_ext = kwargs.get(EXTERNAL_PARAMS_GRAD_BUFFER_KWARG, None) if want_grad else None)
@@ -462,9 +492,9 @@ class _BackwardMixin:
 
         state = self._bw_state(layer, node_mars, kwargs)
 
-        from ..kernels.c import get_ele_bw_module, get_par_bw_module, get_sb_bw_module, get_ele_prepass_module
-        from ..kernels.c import get_par_deferred_module, get_ele_stream_module
-        from ..kernels.shift_logz import shift_logz
+        # (the getters read off the module each call -- a test switches the extensions off by replacing them --, not
+        # imported per call: three `from ... import` statements were ~1.5 us a layer, every backward)
+        shift_logz = _shift_logz()
 
         # NO CUDA extension is required here. The CuTe and small-batch forks are accelerators, and
         # every kernel on this path also has a Triton fork: a gate table is always built, so
@@ -473,12 +503,12 @@ class _BackwardMixin:
         # gated backward to nvcc -- is now `shift_logz`, which falls back to Triton on its own.
         # Every use of `ele_mod` / `sb_mod` / `par_mod` below checks for itself, so a missing one
         # costs speed, not correctness.
-        ele_mod, par_mod = get_ele_bw_module(), get_par_bw_module()
-        sb_mod = get_sb_bw_module()
-        elep_mod = get_ele_prepass_module()
-        eles_mod = get_ele_stream_module() if params.dtype == torch.bfloat16 else None
+        ele_mod, par_mod = _mod("c").get_ele_bw_module(), _mod("c").get_par_bw_module()
+        sb_mod = _mod("c").get_sb_bw_module()
+        elep_mod = _mod("c").get_ele_prepass_module()
+        eles_mod = _mod("c").get_ele_stream_module() if params.dtype == torch.bfloat16 else None
         # A tied group's parameter flows may be left to the end of the pass (`deferred_par`), if the backward allows it
-        pd_mod = get_par_deferred_module()
+        pd_mod = _mod("c").get_par_deferred_module()
         _set_attrs(layer, _bs_defer = bool(kwargs.get("defer_param_flows", False)))
 
         batch_size, block_size = state["batch_size"], state["block_size"]
@@ -931,7 +961,7 @@ class _BackwardMixin:
         _set_attrs(layer, _ext_bw_ele_hook = None, _ext_bw_par_hook = None, _ext_bw_par_sb_hook = None,
                    _ext_bw_par_triton_hook = None)
 
-        from ..kernels.shift_logz import shift_logz
+        shift_logz = _shift_logz()
 
         state = layer._bs_bw_state
         grad_ext = getattr(layer, "_bs_grad_ext", None)

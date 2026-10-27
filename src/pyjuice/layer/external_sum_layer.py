@@ -108,7 +108,17 @@ def validate_external_tensors(ns, external_params, tensors: Any, batch_size: int
                                strides -- so the caller may hand over slices of whatever their own
                                head produced without paying for a `.contiguous()` per node.
     """
-    shapes = external_params.tensor_shapes(ns, batch_size)
+    # The declared shapes are a function of the node and the batch size: computed once per pair (~1-2 us a call, and
+    # every forward and backward validates each node's tensors), cached on the parameterization next to the node.
+    shape_cache = external_params.__dict__.setdefault("_tensor_shapes_cache", {})
+    hit = shape_cache.get((id(ns), batch_size))
+    if hit is not None and hit[0] is ns:
+        shapes = hit[1]
+    else:
+        shapes = external_params.tensor_shapes(ns, batch_size)
+        if len(shape_cache) >= 256:
+            shape_cache.clear()
+        shape_cache[(id(ns), batch_size)] = (ns, shapes)
 
     if torch.is_tensor(tensors):
         tensors = (tensors,)

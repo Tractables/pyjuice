@@ -94,8 +94,18 @@ class _ExternalParamsMixin:
             return None
 
         d, s = [], []
+        # A node's views of the gradient buffer are the same objects every call at a batch size
+        # (`_external_params_views` caches them), and `from_storage` is a layout mapping of them: kept per node
+        # against those views' identity (~3 us a node, every backward).
+        src_cache = self.__dict__.setdefault("_external_grad_src_cache", {})
         for ns, tensors in dsts.items():
-            src = ns.external_params.from_storage(ns, self._staged_external_params_grad[ns])
+            views = self._staged_external_params_grad[ns]
+            hit = src_cache.get(ns)
+            if hit is not None and hit[0] is views:
+                src = hit[1]
+            else:
+                src = ns.external_params.from_storage(ns, views)
+                src_cache[ns] = (views, src)
             if torch.is_tensor(tensors):
                 tensors = (tensors,)
             for dst, one in zip(tensors, src):
@@ -526,12 +536,9 @@ class _ExternalParamsMixin:
             # whichever it is, so the caller never has to know about it.
             #
             # When that layout change is exactly "rotate the batch axis to the end", the copy is a
-            # transpose and gets the tiled kernel. Recognized from the DECLARED permutation -- a tuple
-            # comparison -- rather than from the tensors, so the test costs nothing per forward.
-            perm = ns.external_params.storage_perm()
-            rotates_batch = (perm is not None
-                             and type(ns.external_params).to_storage is ExternalSumParams.to_storage
-                             and tuple(perm) == tuple(range(1, len(perm))) + (0,))
+            # transpose and gets the tiled kernel. Recognized from the DECLARED permutation rather than from
+            # the tensors, and kept per node (`_ext_ns_static`).
+            rotates_batch, _ = self._ext_ns_static(ns)
 
             if rotates_batch:
                 for dst, tensor in zip(views[ns], tensors):
@@ -557,16 +564,29 @@ class _ExternalParamsMixin:
         # is staged. Comparing node-by-node would keep only the one that was named and silently turn the
         # rest into plain sum layers -- correct-looking output with the correction applied to one
         # timestep out of many.
-        supplied_groups = {ns.external_params.storage_owner(ns)
-                           for ns in (set(ns2tensors) | group_done)}
+        supplied_groups = {self._ext_ns_static(ns)[1] for ns in (set(ns2tensors) | group_done)}
         for ns in list(views.keys()):
-            if ns.external_params.storage_owner(ns) not in supplied_groups:
+            if self._ext_ns_static(ns)[1] not in supplied_groups:
                 del views[ns]
 
         kwargs[EXTERNAL_PARAMS_KWARG] = views
         kwargs[EXTERNAL_PARAMS_BUFFER_KWARG] = self.__dict__[name]
         if owns_forward_state:
             self._staged_external_params = views
+
+    def _ext_ns_static(self, ns) -> tuple:
+        """`(rotates_batch, storage owner)` of an external-parameter node, both fixed by its parameterization: whether
+        its storage layout is the default `to_storage` moving the batch to the end (the staging copy's fast form) and
+        whose slots it uses. Kept per node (two method calls and a tuple comparison a node, every forward)."""
+        memo = self.__dict__.setdefault("_ext_ns_static_memo", {})
+        hit = memo.get(ns)
+        if hit is None:
+            ep = ns.external_params
+            perm = ep.storage_perm()
+            rotates = (perm is not None and type(ep).to_storage is ExternalSumParams.to_storage
+                       and tuple(perm) == tuple(range(1, len(perm))) + (0,))
+            hit = memo[ns] = (rotates, ep.storage_owner(ns))
+        return hit
 
     def _resolve_backward_external_params(self, kwargs: dict) -> None:
         """
