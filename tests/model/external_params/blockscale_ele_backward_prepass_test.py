@@ -120,11 +120,15 @@ def _instance(builder, dt, B, neg_gates, neg_children, seed = 0):
             p[: max(1, B // 8)] = NEG                        # samples whose gates are all -inf
         phi[ns] = p
     x = torch.randint(0, CATS, (B, V), device = DEV)
-    if neg_children:                                         # observations the emissions rule out
+    if neg_children:
+        # observations the emissions rule out: a quarter of the (node, category) entries at random -- not the first
+        # quarter of the parameters, which is the first variable's whole table when one layer holds every variable
+        # (every sample's likelihood -inf: no finite flow and no gradient left to compare)
         with torch.no_grad():
+            gen = torch.Generator(device = DEV).manual_seed(seed + 2)
             for layer in pc.input_layer_group:
                 prm = layer.params.view(-1)
-                prm[: prm.numel() // 4] = 0.0
+                prm[torch.rand(prm.shape, generator = gen, device = prm.device) < 0.25] = 0.0
     return pc, phi, x
 
 
@@ -233,15 +237,15 @@ def test_every_config_matches_float64(name, builder, dt, B, neg_gates, neg_child
                 assert not torch.isnan(y[known]).any(), f"{what}: NaN element flows"
                 assert torch.equal(r[known] == NEG, y[known] == NEG), f"{what}: the -inf pattern differs"
                 fin = known & torch.isfinite(r)
-                if bool(fin.any()):
-                    d = float((r[fin] - y[fin]).abs().max())
-                    assert d < 1e-3, f"{what}: element flows off by {d:.2e}"
+                assert bool(fin.any()), f"{what}: no finite element flow to compare"
+                d = float((r[fin] - y[fin]).abs().max())
+                assert d < 1e-3, f"{what}: element flows off by {d:.2e}"
                 if write_grad:
                     assert not torch.isnan(g).any(), f"{what}: NaN gradient"
                     scale = float(ref_g.abs().max())
-                    if scale > 0:
-                        d = float((g.double().view(-1) - ref_g).abs().max()) / scale
-                        assert d < 1e-3, f"{what}: the gradient off by {d:.2e} (relative)"
+                    assert scale > 0, f"{what}: the reference gradient is zero: nothing compared"
+                    d = float((g.double().view(-1) - ref_g).abs().max()) / scale
+                    assert d < 1e-3, f"{what}: the gradient off by {d:.2e} (relative)"
                 checked += 1
     assert checked > 0
 
