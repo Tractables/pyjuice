@@ -553,6 +553,83 @@ class ExternalSumParams():
                 out.append(c)
         return out
 
+    def _em_specs(self, sources, denom_param_flows):
+        """
+        Per forward partition `(mode, addends, n_groups, group_cbs, denom_base)` of the tie group `sources` -- its
+        members' `denom_kernel_spec`s, their statistics as the addends -- or None where one declines or they do not
+        add up elementwise. A structure property and views of `denom_param_flows`, so cached per (the group's layers,
+        that buffer), both held and compared by identity: the buffer persists across steps (zeroed in place), and
+        re-deriving the same views every M-step cost ~90 us of host time at a group of 15 (MEASURED).
+        """
+        layers = tuple(layer for layer, _ in sources)
+        cache = self.__dict__.setdefault("_em_specs_cache", {})
+        key = tuple(id(layer) for layer in layers)
+        hit = cache.get(key)
+        if hit is not None and hit[0] is denom_param_flows and all(a is b for a, b in zip(hit[1], layers)):
+            return hit[2]
+        layer, block_size = layers[0], layers[0].block_size
+        specs = []
+        for pid in range(layer.num_fw_partitions):
+            s0 = self.denom_kernel_spec(layer, denom_param_flows, pid)
+            if s0 is None:
+                specs = None
+                break
+            mode, tensor, n_groups, group_cbs, denom_base = s0
+            addends = [tensor]
+            for other in layers[1:]:
+                so = (self.denom_kernel_spec(other, denom_param_flows, pid)
+                      if other.num_fw_partitions == layer.num_fw_partitions and other.block_size == block_size
+                      else None)
+                if so is None or so[0] != mode or so[2] != n_groups or so[3] != group_cbs \
+                        or so[1].shape != tensor.shape:
+                    addends = None                   # not elementwise-addable onto the source's
+                    break
+                addends.append(so[1])
+            if addends is None:
+                specs = None
+                break
+            specs.append((mode, addends, n_groups, group_cbs, denom_base))
+        if len(cache) >= 16:
+            cache.clear()
+        cache[key] = (denom_param_flows, layers, specs)
+        return specs
+
+    def _sum_addends(self, addends):
+        """
+        `addends[0] + addends[1] + ...`, added in that order, as a new tensor: a tie group's `F-` statistics, one per
+        member. In ONE launch where they are contiguous fp32 views of one buffer -- each a slice of
+        `denom_param_flows`, as `denom_kernel_spec` returns them -- the same bits as the torch adds. MEASURED (a tied
+        gated HMM-2048 x4, 15 members): a clone and 14 adds per M-step, ~15 launches of host time. Their offsets in
+        that buffer are a structure property, cached by value; the pointer is the live tensor's every call. Else the
+        adds.
+        """
+        import triton
+
+        a0 = addends[0]
+        storage = a0.untyped_storage().data_ptr()
+        if a0.is_cuda and all(a.dtype == torch.float32 and a.is_contiguous() and a.shape == a0.shape
+                              and a.device == a0.device and a.untyped_storage().data_ptr() == storage
+                              for a in addends):
+            from .kernels.dual_em import _sum_slices_kernel
+            from pyjuice.utils.util import device_scalars
+
+            offs = tuple((a.data_ptr() - a0.data_ptr()) // a0.element_size() for a in addends)
+            cache = self.__dict__.setdefault("_sum_slices_offsets", {})
+            key = (offs, str(a0.device))
+            table = cache.get(key)
+            if table is None:
+                if len(cache) >= 32:
+                    cache.clear()
+                table = cache[key] = device_scalars(list(offs), a0.device, dtype = torch.int64)
+            out = torch.empty_like(a0)
+            n, BLOCK = a0.numel(), 1024
+            _sum_slices_kernel[(triton.cdiv(n, BLOCK),)](a0, table, out, n, len(addends), BLOCK = BLOCK)
+            return out
+        out = a0.clone()
+        for extra in addends[1:]:
+            out = out + extra
+        return out
+
     def _fused_em_correction(self, ns, params, param_flows, denom_param_flows, step_size,
                              pseudocount, keep_zero_params, denom_sources, out = None):
         """
@@ -576,23 +653,9 @@ class ExternalSumParams():
         block_size = layer.block_size
 
         # ---- gather the per-partition `F-` recipes, and the tie group's addends ----
-        specs = []
-        for pid in range(layer.num_fw_partitions):
-            s0 = self.denom_kernel_spec(layer, denom_param_flows, pid)
-            if s0 is None:
-                return None
-            mode, tensor, n_groups, group_cbs, denom_base = s0
-            addends = [tensor]
-            for other, _ in sources[1:]:
-                if (other.num_fw_partitions != layer.num_fw_partitions
-                        or other.block_size != block_size):
-                    return None
-                so = self.denom_kernel_spec(other, denom_param_flows, pid)
-                if so is None or so[0] != mode or so[2] != n_groups or so[3] != group_cbs \
-                        or so[1].shape != tensor.shape:
-                    return None                  # not elementwise-addable onto the source's
-                addends.append(so[1])
-            specs.append((mode, addends, n_groups, group_cbs, denom_base))
+        specs = self._em_specs(sources, denom_param_flows)
+        if specs is None:
+            return None
 
         plan = self._em_plan(ns, layer, dev)
         if plan is None:
@@ -647,11 +710,7 @@ class ExternalSumParams():
             num_edges = cids.size(1)
             n_rows = part["row_map"].numel()      # rows of THIS `ns`, not of the whole partition
 
-            denom = addends[0]
-            if len(addends) > 1:
-                denom = denom.clone()
-                for extra in addends[1:]:
-                    denom = denom + extra
+            denom = addends[0] if len(addends) == 1 else self._sum_addends(addends)
 
             common = dict(mparams = params, param_flows = param_flows, denom = denom,
                           cids = cids, pids = layer.partitioned_pids[pid],

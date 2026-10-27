@@ -179,3 +179,16 @@ def _dual_em_update_kernel(mparams, param_flows, denom, cum, out, cids, pids, pf
         off = pf[None,:] + offs_node[:,None] - out_base
     inside = real[None,:] & (off >= 0) & (off < out_size)
     tl.store(out + tl.maximum(tl.minimum(off, out_size - 1), 0), new, mask = inside)
+
+
+@triton_jit
+def _sum_slices_kernel(base, offsets, out, n, num_slices, BLOCK: tl.constexpr):
+    """`out[:n] = base[offsets[0]:][:n] + base[offsets[1]:][:n] + ...`, added in that order (each partial sum fp32,
+    as `((a0 + a1) + a2) + ...` is in torch: the same bits)."""
+    pid = tl.program_id(0)
+    idx = pid.to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
+    mask = idx < n
+    acc = tl.load(base + tl.load(offsets) + idx, mask = mask, other = 0.0)
+    for i in range(1, num_slices):
+        acc += tl.load(base + tl.load(offsets + i) + idx, mask = mask, other = 0.0)
+    tl.store(out + idx, acc, mask = mask)
