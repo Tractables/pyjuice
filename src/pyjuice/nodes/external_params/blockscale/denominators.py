@@ -328,7 +328,8 @@ class _DenominatorsMixin:
         the parameters do -- i.e. once per EM step, not once per batch. `Tensor._version` bumps on the
         in-place parameter update, which is exactly the invalidation signal. One entry per partition (a single entry
         for the layer had its partitions evict each other: a full gather of theta every backward), each holding which
-        tensor it was summed from (a weak reference: a `params` tensor assigned anew may start at an equal version).
+        tensor it was summed from (a weak reference: a `params` tensor assigned anew may start at an equal version);
+        and one for a tied group's layers, which read the same rows (`_sigma_slot`).
 
         Summed by `blockscale_sigma.cu` where it compiles (fp32 or bf16 parameters on the GPU): one read of theta.
         The torch gather below is the fallback -- an int64 index tensor the size of the partition's parameters and
@@ -341,6 +342,13 @@ class _DenominatorsMixin:
         hit = cache.get(pid)
         if hit is not None and hit[0] == key and hit[1]() is params:
             return hit[2], hit[3]
+        # A tied group's layers read the same parameter rows: one sum for all of them (`_sigma_slot`)
+        slot = self._sigma_slot(layer, pid, block_size, gate_cbs)
+        if slot is not None:
+            hit = slot[1]
+            if hit is not None and hit[0] == key and hit[1]() is params:
+                cache[pid] = hit
+                return hit[2], hit[3]
 
         pids = layer.partitioned_pids[pid].to(torch.int64)
         rows, num_edges = pids.shape
@@ -360,4 +368,36 @@ class _DenominatorsMixin:
             sigma = sg.permute(0, 2, 1).reshape(rows * block_size, n_gates).contiguous()
 
         cache[pid] = (key, weakref.ref(params), sigma, n_gates)
+        if slot is not None:
+            slot[1] = cache[pid]
         return sigma, n_gates
+
+    def _sigma_slot(self, layer, pid, block_size, gate_cbs):
+        """
+        The slot `[parameter ids, sigma entry]` that the layers of a tied group share for partition `pid`, or None.
+
+        Tied layers -- an HMM's steps -- are compiled onto the same parameter rows, so their `sigma` is the same sum;
+        cached per layer it was recomputed by each: MEASURED (a tied gated HMM-4096 x4, 7 layers, B 128) 7 x 18.8 us
+        a step, the kernel at its read floor each time. A group is the layers whose nodes have the same source nodes
+        (compilation's tie), and its slot is shared only after a member's `partitioned_pids[pid]` is found equal to the
+        first member's -- once (one device sync; not during a graph capture, where the layer keeps its own).
+        """
+        memo = layer.__dict__.get("_bs_sigma_slot")
+        if memo is None:
+            memo = layer.__dict__["_bs_sigma_slot"] = {}
+        slot = memo.get(pid)
+        if slot is not None:
+            return slot or None
+        if torch.cuda.is_current_stream_capturing():
+            return None
+        pids = layer.partitioned_pids[pid]
+        gkey = (tuple(ns.get_source_ns() for ns in layer.nodes), pid, block_size, gate_cbs, tuple(pids.shape),
+                pids.device)
+        groups = self.__dict__.setdefault("_bs_sigma_groups", {})
+        slot = groups.get(gkey)
+        if slot is None:
+            slot = groups[gkey] = [pids, None]
+        elif slot[0] is not pids and not torch.equal(slot[0], pids):
+            slot = False
+        memo[pid] = slot
+        return slot or None
