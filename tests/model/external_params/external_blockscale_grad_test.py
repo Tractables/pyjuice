@@ -320,20 +320,25 @@ def test_tied_gates_accumulate_across_every_layer_that_shares_them():
         pc, copies = build(tie)
         pc(data, sum_external_params = {n: phi for n in copies})
         pc.backward(data, flows_memory = 0.0)
-        return [pc.get_external_params_grad(n)[0].clone() for n in copies]
+        # the log-Z term in one launch with the denominator and the shift (`POST_FUSED`): its tile is
+        # `autotune.pick`'s, cached by shape, so the second arm takes the first arm's without a replay
+        fused = sum(len(l.__dict__.get("_bs_post_plans", {})) for g in pc.inner_layer_groups if g.is_sum()
+                    for l in g.layers)
+        return [pc.get_external_params_grad(n)[0].clone() for n in copies], fused
 
     try:
         _bs.BlockScaleSumParams._logz_tile, _ck.autotune = record, record_at
-        tied = run(True)
+        tied, fused_t = run(True)
         _bs.BlockScaleSumParams._logz_tile, _ck.autotune = replay, replay_at
-        untied = run(False)
+        untied, fused_u = run(False)
     finally:
         _bs.BlockScaleSumParams._logz_tile = original_tile
         _ck.autotune = original_autotune
 
-    assert recorded and replay.i == len(recorded), \
-        f"the two arms built different numbers of log-Z plans ({len(recorded)} vs {replay.i}), so " \
-        f"they did not take the same numerical path and the comparison below is not apples-to-apples"
+    assert (recorded or (fused_t and fused_u)) and replay.i == len(recorded), \
+        f"the two arms built different numbers of log-Z plans ({len(recorded)} vs {replay.i}; fused " \
+        f"{fused_t} vs {fused_u}), so they did not take the same numerical path and the comparison below " \
+        f"is not apples-to-apples"
 
     # Same requirement for the rest of the autotuned choices. A single live fallback here is enough to
     # put the two arms on differently-rounded kernels, so demand that every recorded choice was asked

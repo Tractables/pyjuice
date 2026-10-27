@@ -23,6 +23,10 @@ ELE_PREPASS = os.environ.get("PYJUICE_BLOCKSCALE_ELE_PREPASS", "1") != "0"
 #: instead (the denominator flow's switch is PYJUICE_BLOCKSCALE_DENOM_TF32).
 LOGZ_DOT_IEEE = 0 if os.environ.get("PYJUICE_BLOCKSCALE_LOGZ_TF32", "0") == "1" else 1
 
+#: After a layer's flows, the log-Z half of `d LL / d log phi`, the denominator flow and the `-log Z` shift as one
+#: launch per partition (kernels/blockscale_post_backward.py); PYJUICE_BLOCKSCALE_POST_FUSED=0 keeps three.
+POST_FUSED = os.environ.get("PYJUICE_BLOCKSCALE_POST_FUSED", "1") != "0"
+
 def _set_attrs(layer, **attrs) -> None:
     """Plain attributes of a layer -- functions, tensors, None: never a parameter, buffer or module -- written past
     `nn.Module.__setattr__`, whose registration checks cost ~1.5 us a write (a gated layer's backward makes fifteen)."""
@@ -741,14 +745,28 @@ class _BackwardMixin:
         from ..kernels.shift_logz import shift_logz
 
         state = layer._bs_bw_state
+        grad_ext = getattr(layer, "_bs_grad_ext", None)
+        external_params = kwargs.get(_buffer_kwarg(), None)
+        if denom_param_flows is not None and external_params is None:
+            raise RuntimeError("`apply_z_correction` needs the external-parameter staging buffer.")
+
+        # The three below in one launch per partition (`POST_FUSED`) -- the denominator flow's torch reference
+        # (PYJUICE_BLOCKSCALE_DENOM_REF=1) on its own: it reads `node_flows` and `log Z`, never `node_mars`
+        denom_ref = denom_param_flows is not None and os.environ.get("PYJUICE_BLOCKSCALE_DENOM_REF", "0") == "1"
+        fused_w = denom_param_flows is not None and not denom_ref
+        if POST_FUSED and (grad_ext is not None or fused_w):
+            self._post_fused(layer, state, node_flows, node_mars, params, external_params, grad_ext,
+                             denom_param_flows if fused_w else None)
+            if denom_ref:
+                self._accumulate_denom(layer, node_flows, params, external_params, denom_param_flows)
+            _set_attrs(layer, _bs_grad_ext = None)
+            return None
 
         # The log-Z half of `d LL / d log phi`. Runs here, not in the element kernel, because it shares
         # no operand with it. Uses `log Z` straight from the forward's cache, so nothing is recomputed.
-        grad_ext = getattr(layer, "_bs_grad_ext", None)
         if grad_ext is not None:
             from ..kernels.blockscale_backward import _bs_triton_phigrad_logz_kernel
 
-            external_params = kwargs.get(_buffer_kwarg(), None)
             bs_, gate_cbs = state["block_size"], state["gate_cbs"]
             batch = state["batch_size"]
 
@@ -775,15 +793,148 @@ class _BackwardMixin:
         # does nothing here. Uses the forward's cached `log Z`, so it is independent of the `node_mars`
         # shift about to be undone below.
         if denom_param_flows is not None:
-            external_params = kwargs.get(_buffer_kwarg(), None)
-            if external_params is None:
-                raise RuntimeError("`apply_z_correction` needs the external-parameter staging buffer.")
             self._accumulate_denom(layer, node_flows, params, external_params, denom_param_flows)
 
         for nids, log_z, rows in state["shift_args"]:
             shift_logz(node_mars, nids, log_z, state["block_size"], -1.0)
 
         return None
+
+    def _post_fused(self, layer, state, node_flows, node_mars, params, external_params, grad_ext, denom_param_flows):
+        """The log-Z gradient (with `grad_ext`), the denominator flow (with `denom_param_flows`) and the `-log Z` shift
+        of each partition in one launch of `_bs_post_backward_kernel`, its plan built once per batch (`_post_plan`)."""
+        from ..kernels.blockscale_post_backward import _bs_post_backward_kernel
+
+        bs_, gate_cbs, batch = state["block_size"], state["gate_cbs"], state["batch_size"]
+        want_grad, want_w = grad_ext is not None, denom_param_flows is not None
+        # fp32-level contractions -- three TF32 passes (`tf32x3`) -- or one, where the TF32 switches ask for it
+        grad_prec = 2 if LOGZ_DOT_IEEE else 0
+        w_prec = 0 if os.environ.get("PYJUICE_BLOCKSCALE_DENOM_TF32", "0") == "1" else 2
+
+        plans = layer.__dict__.setdefault("_bs_post_plans", {})
+        for pid, (nids, log_z, rows) in enumerate(state["shift_args"]):
+            if want_grad:
+                sigma, n_gates = self._sigma(layer, params, pid, bs_, gate_cbs)
+            else:
+                sigma, n_gates = log_z, self.denom_gate_geometry(layer)[pid][2]     # (`sigma` unread)
+            W = self._denom_slice(layer, denom_param_flows, pid) if want_w else log_z      # (unread without)
+            gb = layer.ext_slots[0][pid]
+            pkey = (batch, pid, bs_, gate_cbs, state["node_cbs"], state["ext_base"], want_grad, want_w, grad_prec,
+                    w_prec)
+            plan = plans.get(pkey)
+            if plan is None:
+                plan = plans[pkey] = self._post_plan(state, rows, n_gates, gb, nids, log_z, sigma, external_params,
+                                                     grad_ext, W, want_grad, want_w, grad_prec, w_prec)
+            grid, consts, shares = plan
+            if shares is not None:                 # the node tiles' gradient shares and their groups' tickets
+                partial, counter = self._post_scratch(log_z.device, *shares)
+            else:
+                partial = counter = log_z          # (unread)
+            _bs_post_backward_kernel[grid](
+                node_flows = node_flows, node_mars = node_mars, log_z = log_z, sigma = sigma, ext = external_params,
+                gate = gb, nids = nids, grad_ext = grad_ext if want_grad else log_z, W = W, partial = partial,
+                counter = counter, **consts)
+
+    def _post_scratch(self, device, n_shares, n_groups):
+        """`(shares, counters)` for `_bs_post_backward_kernel`'s gradient sum: one pair per (device, size) for every layer
+        -- they run one after another on the stream -- never reallocated, so a CUDA graph that captured one keeps a live
+        address. The counters must read 0 before a launch, and every launch leaves them so; zeroed when made, or -- made
+        inside a capture, whose zeroing runs only on replay -- by the first call outside one."""
+        bufs = self.__dict__.setdefault("_bs_post_scratch", {})
+        key = (device, n_shares, n_groups)
+        entry = bufs.get(key)
+        if entry is None:
+            entry = bufs[key] = [torch.empty(n_shares, device = device),
+                                 torch.zeros(n_groups, device = device, dtype = torch.int32),
+                                 not torch.cuda.is_current_stream_capturing()]
+        elif not entry[2] and not torch.cuda.is_current_stream_capturing():
+            entry[1].zero_()
+            entry[2] = True
+        return entry[0], entry[1]
+
+    def _post_plan(self, state, rows, n_gates, gb, nids, log_z, sigma, external_params, grad_ext, W, want_grad, want_w,
+                   grad_prec, w_prec):
+        """`(grid, constant arguments, shares)` of `_bs_post_backward_kernel` for one partition at this batch -- `shares`
+        the sizes `(gradient shares, groups)` of its scratch where a node block is several tiles, else None: a tile by
+        rule, or one of a few around it where it measures faster (`autotune.pick`, keyed by shape: equal layers share
+        it), timed into scratch buffers -- the gradient and `W` are accumulated, `node_mars` written -- read through
+        scratch node rows (`nids` of their own)."""
+        import triton
+        from pyjuice.layer.kernels import autotune
+        from ..kernels.blockscale_post_backward import _bs_post_backward_kernel
+        from .denominators import _sm_count
+
+        bs_, gate_cbs, batch = state["block_size"], state["gate_cbs"], state["batch_size"]
+        nb_ = triton.next_power_of_2(batch)
+        gmax = max(16, triton.next_power_of_2(n_gates))
+
+        def fits(c):
+            tm, tg, tb, bpp, _ = c
+            return tm <= bs_ and bs_ % tm == 0 and tg <= gmax and tb <= max(16, nb_) and bpp * tb <= max(16, nb_)
+
+        # The rule: 32 nodes x 32 gates x 32 samples, the batch tile and then the node tile halved while the grid is
+        # under two programs an SM. MEASURED (graph-timed, tf32x3, against a sweep of 3^4 x 3 tiles): the best tile
+        # or within 10% of it at HMM-4096 B 128 / 512, HMM-2048 B 64, HMM-1024 B 16 / 128 (gate width 64 and 8),
+        # HMM-512 B 1024, HMM-256 B 8. Then the tiles around it, adopted where they measure faster.
+        tg0 = min(gmax, 32)
+        tm0, tb0 = min(32, bs_), 32
+
+        def progs(tm, tb):
+            return rows * (bs_ // tm) * triton.cdiv(n_gates, tg0) * triton.cdiv(batch, tb)
+
+        if progs(tm0, tb0) < 2 * _sm_count(log_z.device):
+            tb0 = 16
+        if progs(tm0, tb0) < 2 * _sm_count(log_z.device):
+            tm0 = min(16, bs_)
+        # (a half node tile only while it keeps `tl.dot`: below 16 it is the broadcast-sum branch, never the faster)
+        cands = [c for c in [(tm0, tg0, tb0, 1, 4), (tm0 * 2, tg0, tb0, 1, 4), (tm0 // 2, tg0, tb0, 1, 4),
+                             (tm0, tg0, tb0, 1, 2)] if (c[0] >= 16 or c[0] == tm0) and fits(c)]
+        cands = list(dict.fromkeys(cands)) or [(min(16, bs_), 16, 16, 1, 4)]
+
+        def grid(c):
+            tm, tg, tb, bpp, _ = c
+            return (rows * (bs_ // tm), triton.cdiv(n_gates, tg), triton.cdiv(triton.cdiv(batch, tb), bpp))
+
+        def consts(c):
+            tm, tg, tb, bpp, warps = c
+            return dict(batch_size = batch, n_gates = n_gates, N_CHILD_GATES = state["node_cbs"] // gate_cbs,
+                        BLOCK_SIZE_M = bs_, gate_stride = gb.size(1), ext_base = state["ext_base"], TILE_M = tm,
+                        TILE_G = tg, TILE_B = tb, B_TILES_PER_PROG = bpp, WANT_GRAD = int(want_grad),
+                        WANT_W = int(want_w), W_ATOMIC = 1 if grid(c)[2] > 1 else 0,
+                        USE_DOT = 1 if min(tm, tg, tb) >= 16 else 0, GRAD_IEEE = grad_prec, W_IEEE = w_prec,
+                        GRAD_PARTIAL = 1 if (want_grad and bs_ // tm > 1) else 0, num_warps = warps, num_stages = 1)
+
+        def shares(c):
+            if not (want_grad and bs_ // c[0] > 1):
+                return None
+            g = grid(c)
+            return (rows * (bs_ // c[0]) * n_gates * batch, rows * g[1] * g[2])
+
+        key = ("bs_post", bs_, rows, n_gates, state["node_cbs"] // gate_cbs, gb.size(1), batch, want_grad, want_w,
+               grad_prec, w_prec, cands[0])
+        cfg = autotune.cached(key)
+        if cfg is None and autotune.should_tune(key, len(cands)):
+            dev = log_z.device
+            scr_rows = torch.zeros(rows * bs_, batch, device = dev)
+            scr_nm = torch.zeros(rows * bs_, batch, device = dev)
+            scr_nids = (torch.arange(rows, device = dev) * bs_).to(nids.dtype)
+            scr_g = torch.zeros_like(grad_ext) if want_grad else log_z
+            scr_w = torch.zeros_like(W) if want_w else log_z
+
+            scr_s = {c: (torch.empty(shares(c)[0], device = dev),
+                         torch.zeros(shares(c)[1], device = dev, dtype = torch.int32)) for c in cands
+                     if shares(c) is not None}
+
+            def bench(c):
+                part, counter = scr_s.get(c, (log_z, log_z))
+                _bs_post_backward_kernel[grid(c)](
+                    node_flows = scr_rows, node_mars = scr_nm, log_z = log_z, sigma = sigma, ext = external_params,
+                    gate = gb, nids = scr_nids, grad_ext = scr_g, W = scr_w, partial = part, counter = counter,
+                    **consts(c))
+
+            cfg = autotune.pick(key, cands, bench)
+        cfg = cfg or cands[0]
+        return grid(cfg), consts(cfg), shares(cfg)
 
     def _logz_plan(self, layer, grad_ext, node_flows, external_params, state, nids, log_z, rows, sigma, gb, n_gates):
         """`(grid, constant arguments)` of `_bs_triton_phigrad_logz_kernel` for one partition at this batch, its tile

@@ -360,10 +360,11 @@ class BlockScaleSumParams(_ForwardMixin, _BackwardMixin, _SampleMixin, _Denomina
     # What BlockScale keeps on a layer -- every one built when missing
     _LAYER_CACHES = ("_bs_nstride_cache", "_bs_bw_state", "_bs_fw_plans", "_bs_sample_nstride", "_bs_denom_geom",
                      "_bs_denom_td_gids", "_bs_sigma_cache", "_bs_bw_gate_cache", "_bs_grad_ext", "_bs_denom_plans",
-                     "_bs_logz_plans", "_bs_pd_member")
+                     "_bs_logz_plans", "_bs_pd_member", "_bs_post_plans")
 
     def drop_device_caches(self, layer) -> None:
         super().drop_device_caches(layer)
         for name in self._LAYER_CACHES:
             layer.__dict__.pop(name, None)
         self.__dict__.pop("_bs_fminus_scratch", None)
+        self.__dict__.pop("_bs_post_scratch", None)
