@@ -419,8 +419,17 @@ class SumNodes(CircuitNodes):
         assert edge_ids.size(0) == 2, "Expect `edge_ids.size(0) == 2`."
         assert torch.all(edge_ids[0,:] >= 0) and torch.all(edge_ids[1,:] >= 0), "Edge index underflow."
         assert torch.all(edge_ids[0,:] < self.num_node_blocks) and torch.all(edge_ids[1,:] < self.num_ch_node_blocks), "Edge index overflow."
-        par_ns = torch.unique(edge_ids[0,:])
-        assert par_ns.size(0) == self.num_node_blocks and par_ns.max() == self.num_node_blocks - 1, "Some node has no edge."
+        if (type(self) is SumNodes and type(self.num_node_blocks) is int
+                and type(edge_ids) is torch.Tensor and edge_ids.device.type == "cpu" and edge_ids.dtype == torch.long and edge_ids.dim() == 2):
+            # Bounds above already prove the sole parent of a one-edge block.
+            # The edge-count guard prevents a missing-parent input from asking
+            # bincount for an arbitrarily large output allocation.
+            if self.num_node_blocks != 1 or edge_ids.size(1) != 1:
+                assert (self.num_node_blocks <= edge_ids.size(1)
+                        and torch.all(torch.bincount(edge_ids[0,:], minlength=self.num_node_blocks) > 0)), "Some node has no edge."
+        else:
+            par_ns = torch.unique(edge_ids[0,:])
+            assert par_ns.size(0) == self.num_node_blocks and par_ns.max() == self.num_node_blocks - 1, "Some node has no edge."
 
         self.edge_ids = edge_ids
 
