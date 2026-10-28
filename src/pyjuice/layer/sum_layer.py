@@ -1293,10 +1293,12 @@ class SumLayer(Layer, nn.Module):
                     if prepass_cfgs:
                         tiles = self._tile_index("fw", signature, ebase)
                         cands += [(("cuda_prepass", c),
-                                   (lambda c=c: cuda_kernels.tlmm_forward_sum_prepass(
+                                   autotune.charged(lambda c=c: cuda_kernels.tlmm_forward_sum_prepass(
                                        node_mars, element_mars, params, nids, tiles[0], tiles[1], pbase,
-                                       batch_size, self.block_size, K_NUM_TILES, c, tiles[2])))
-                                  for c in prepass_cfgs]
+                                       batch_size, self.block_size, K_NUM_TILES, c, tiles[2]),
+                                                    autotune.LAUNCH_S if c >> 8 else 0.0))   # (a split: its merge launch)
+                                  for c in cuda_kernels.prepass_arms(self.block_size, batch_size, K_NUM_TILES,
+                                                                     nids.numel())]
                     choice = autotune.choose(tlmm_key, cands)
 
                 if choice[0] in ("cuda", "cuda_pipe", "cuda_prepass"):
@@ -1309,6 +1311,7 @@ class SumLayer(Layer, nn.Module):
                             # the run's own tiles -- a tile per (block, edge tile), flat)
                             cuda_kernels.tlmm_forward_sum_prepass(
                                 node_mars, element_mars, params, nids,
+                    # (and, where the grid is small, its configs cut into split-K ranges: `prepass_arms`)
                                 tiles[0] if tiles[2] else tiles[0].view(-1, knt)[a:b].reshape(-1),
                                 tiles[1][a:b], pbase, batch_size, block_size, knt, c, tiles[2])
                     else:
@@ -2374,7 +2377,11 @@ class SumLayer(Layer, nn.Module):
                         cands.append((("cuda", 0), (lambda: _cuda_ele(scr, cur))))
                         if cuda_kernels.ele_pipe_is_available():
                             cands.append((("cuda_pipe", 0), (lambda: _cuda_ele_pipe(scr, cur))))
-                    cands += [(("cuda_prepass", c), (lambda c=c: _cuda_ele_prepass(scr, c, cur))) for c in ele_pre_cfgs]
+                    # (the pre-pass configs and, where the grid is small, their split-K ranges: `ele_prepass_arms`)
+                    cands += [(("cuda_prepass", c), autotune.charged(lambda c=c: _cuda_ele_prepass(scr, c, cur),
+                                                                    autotune.LAUNCH_S if c >> 8 else 0.0))
+                              for c in (cuda_kernels.ele_prepass_arms(cs_block_size, batch_size, K_NUM_TILES,
+                                                                      chids.numel()) if ele_pre_cfgs else [])]
                     choice = autotune.best_of(cands) or ("triton", -1)
                     self._cached_bk_ele_choice[choice_key] = choice
                 if choice[0] in ("cuda", "cuda_pipe", "cuda_prepass"):

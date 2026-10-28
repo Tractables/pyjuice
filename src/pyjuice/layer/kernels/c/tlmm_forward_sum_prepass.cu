@@ -58,6 +58,7 @@ using namespace cute;
 
 #define BK 64
 #define PB 64           // the pre-pass's batch columns per thread block (and the streaming kernel's BN)
+#define MAX_SPLIT 8     // split-K ranges of a node block's edge tiles at most
 
 // Named barriers: all `count` threads of the participating warps take part; `arrive` does not wait.
 // ids: 1 + s = stage s FULL (producers arrive, consumers sync); 1 + ST + s = stage s EMPTY (consumers arrive, producers
@@ -118,7 +119,8 @@ template <int BM, int BN, int WM, int WN, int PW, int ST, bool TIX, typename TP>
 __global__ void __launch_bounds__((WM * WN + PW) * 32) tlmm_prepass_kernel(
         float* __restrict__ node_mars, const TP* __restrict__ mp, const long* __restrict__ nids,
         const long* __restrict__ pbase, const __nv_bfloat16* __restrict__ bx, const float* __restrict__ mx,
-        const int* __restrict__ tix, int batch, int block_size, int knt, int pid_m_offset) {
+        const int* __restrict__ tix, float* __restrict__ part, int batch, int block_size, int knt, int split,
+        long rows_total, int pid_m_offset) {
     constexpr int NC = WM * WN * 32;                 // consumer threads
     constexpr int NP = PW * 32;                      // producer threads
     constexpr int NTH = NC + NP;
@@ -129,7 +131,13 @@ __global__ void __launch_bounds__((WM * WN + PW) * 32) tlmm_prepass_kernel(
     int nblock = pid_m / mtiles, tile_id = pid_m % mtiles;
     int b0 = pid_b * BN;
     long off_nid = nids[nblock];
-    const long* pb = pbase + (long)nblock * knt;
+    // split-K: this CTA walks the edge tiles k0 .. k1 of its node block (blockIdx.z of `split` ranges; one range is the
+    // whole row), everything below over `knt` = the range's tiles; a range's partial sum and its maximum go to `part`
+    // for `merge_kernel`, a single range writes the output itself
+    const int sp = blockIdx.z, knt_all = knt;
+    const int k0 = (int)((long)sp * knt_all / split), k1 = (int)((long)(sp + 1) * knt_all / split);
+    knt = k1 - k0;
+    const long* pb = pbase + (long)nblock * knt_all + k0;
     int tid = threadIdx.x;
 
     // 64 consecutive m (or b) of one k per 128-byte row, Swizzle<3, 3, 3> over it; a node tile of 32 rows is half such
@@ -149,7 +157,7 @@ __global__ void __launch_bounds__((WM * WN + PW) * 32) tlmm_prepass_kernel(
     if (tid >= NC) {
         // ---------------- producers ----------------
         int ptid = tid - NC;
-        const long tile0 = (long)nblock * knt;
+        const long tile0 = (long)nblock * knt_all + k0;
         // warp 0's running max per column (lane + 32 j), and the next tile's maxima (loaded one issue ahead)
         float Mrun[BN / 32], mnext[BN / 32];
         CUTE_UNROLL
@@ -273,7 +281,6 @@ __global__ void __launch_bounds__((WM * WN + PW) * 32) tlmm_prepass_kernel(
     Tensor tCrS = thr.partition_fragment_C(cC);
     Tensor tCrL = thr.partition_fragment_C(cC);
     clear(tCrL);
-    float al[size(tCrS)], be[size(tCrS)], Mf[size(tCrS)];
 
     for (int kt = 0; kt < knt; kt++) {
         int s = kt % ST;
@@ -282,32 +289,64 @@ __global__ void __launch_bounds__((WM * WN + PW) * 32) tlmm_prepass_kernel(
         Tensor sBt = make_tensor(make_smem_ptr(stB(s)), sBl);
         copy(s2rA, s2rA.get_thread_slice(tid).partition_S(sAt), tXrA);
         copy(s2rB, s2rB.get_thread_slice(tid).partition_S(sBt), tXrB);
+        // bf16 tensor-core dot: tCrS[m, b] = sum_e params[m, e] * exp(emar[e, b] - max[b]); fp32 accumulate
+        clear(tCrS); cute::gemm(mma, tCrA, tCrB, tCrS);
+        // the merge factors read from the stage as they are used (per column: a register copy per accumulator element
+        // held the kernel to one thread block an SM -- MEASURED 102-108 registers at 384 threads), then the stage
+        // released
         const float* f = stF(s);
         CUTE_UNROLL
         for (int i = 0; i < size(tCrS); i++) {
             int b = get<1>(tCcC(i));
-            al[i] = f[b]; be[i] = f[BN + b];
-            if (kt == knt - 1) Mf[i] = f[2 * BN + b];
+            tCrL(i) = __fadd_rn(__fmul_rn(tCrL(i), f[b]), __fmul_rn(tCrS(i), f[BN + b]));
         }
         if (kt + ST < knt) bar_arrive(1 + ST + s, NTH);    // EMPTY: the stage is consumed (only where it is refilled)
-        // bf16 tensor-core dot: tCrS[m, b] = sum_e params[m, e] * exp(emar[e, b] - max[b]); fp32 accumulate
-        clear(tCrS); cute::gemm(mma, tCrA, tCrB, tCrS);
-        CUTE_UNROLL
-        for (int i = 0; i < size(tCrS); i++)
-            tCrL(i) = __fadd_rn(__fmul_rn(tCrL(i), al[i]), __fmul_rn(tCrS(i), be[i]));
     }
+    const float* fM = stF((knt - 1) % ST) + 2 * BN;  // the last tile's stage: the running maxima, never refilled
     CUTE_UNROLL
     for (int i = 0; i < size(tCrL); i++) {
         int m = get<0>(tCcC(i)), b = get<1>(tCcC(i));
-        node_mars[(off_nid + (long)tile_id * BM + m) * (long)batch + b0 + b] =
-            (Mf[i] == -INFINITY) ? -INFINITY : (logf(tCrL(i)) + Mf[i]);
+        const float Mf = fM[b];
+        if (split == 1) {
+            node_mars[(off_nid + (long)tile_id * BM + m) * (long)batch + b0 + b] =
+                (Mf == -INFINITY) ? -INFINITY : (logf(tCrL(i)) + Mf);
+        } else {
+            const long idx = ((long)sp * rows_total + (long)nblock * block_size + (long)tile_id * BM + m) * batch + b0 + b;
+            part[idx] = tCrL(i);
+            part[(long)split * rows_total * batch + idx] = Mf;
+        }
     }
+}
+
+// ---------------- the ranges' merge (split > 1): a thread per (node, column) ----------------
+// node_mars = log sum_z L_z exp(M_z - M) + M over the ranges, M their maximum (-inf where every M_z is), the sum in
+// range order. `part`: L [split, rows, batch] then M [split, rows, batch]; row = node block x block_size + node.
+__global__ void merge_kernel(float* __restrict__ node_mars, const float* __restrict__ part, const long* __restrict__ nids,
+                             int split, long rows_total, int block_size, int batch) {
+    const long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= rows_total * batch) return;
+    const long row = i / batch, stride = rows_total * (long)batch;
+    const int b = (int)(i - row * batch);
+    const float* Lp = part + row * batch + b;
+    const float* Mp = Lp + (long)split * stride;
+    float M = -INFINITY;
+    for (int z = 0; z < split; z++) M = fmaxf(M, Mp[(long)z * stride]);
+    float r = -INFINITY;
+    if (M != -INFINITY) {
+        float L = 0.f;
+        for (int z = 0; z < split; z++) {
+            const float mz = Mp[(long)z * stride];
+            if (mz != -INFINITY) L += Lp[(long)z * stride] * __expf(mz - M);
+        }
+        r = logf(L) + M;
+    }
+    node_mars[(nids[row / block_size] + row % block_size) * (long)batch + b] = r;
 }
 
 template <int BM, int BN, int WM, int WN, int PW, int ST, bool TIX, typename TP>
 static void launch_cfg(float* node_mars, const TP* params, const long* nids, int n_nblocks, const long* pbase,
-                       const __nv_bfloat16* bx, const float* mx, const int* tix, int batch, int block_size, int knt,
-                       cudaStream_t stream) {
+                       const __nv_bfloat16* bx, const float* mx, const int* tix, float* part, int split, int batch,
+                       int block_size, int knt, cudaStream_t stream) {
     constexpr int NTH = (WM * WN + PW) * 32;
     constexpr int smem = ST * (BM * BK * 2 + BN * BK * 2 + 3 * BN * 4);
     auto kernel = tlmm_prepass_kernel<BM, BN, WM, WN, PW, ST, TIX, TP>;
@@ -321,11 +360,19 @@ static void launch_cfg(float* node_mars, const TP* params, const long* nids, int
         if (dev < 64) attr_set[dev] = true;
     }
     int total_m = n_nblocks * (block_size / BM);
+    const long rows_total = (long)n_nblocks * block_size;
     const int MAX_Y = 65535;
     for (int off = 0; off < total_m; off += MAX_Y) {
         int chunk = (total_m - off < MAX_Y) ? (total_m - off) : MAX_Y;
-        dim3 grid(batch / BN, chunk);
-        kernel<<<grid, NTH, smem, stream>>>(node_mars, params, nids, pbase, bx, mx, tix, batch, block_size, knt, off);
+        dim3 grid(batch / BN, chunk, split);
+        kernel<<<grid, NTH, smem, stream>>>(node_mars, params, nids, pbase, bx, mx, tix, part, batch, block_size, knt,
+                                            split, rows_total, off);
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+    }
+    if (split > 1) {
+        const long n = rows_total * batch;
+        merge_kernel<<<(unsigned)((n + 255) / 256), 256, 0, stream>>>(node_mars, part, nids, split, rows_total,
+                                                                      block_size, batch);
         C10_CUDA_KERNEL_LAUNCH_CHECK();
     }
 }
@@ -338,22 +385,24 @@ static void launch_cfg(float* node_mars, const TP* params, const long* nids, int
 // (an HCLT's), which no other CUDA kernel takes.
 template <bool TIX, typename TP>
 static void dispatch_cfg(float* nm, const TP* p, const long* nids, int nb, const long* pb, const __nv_bfloat16* bx,
-                         const float* mx, const int* tix, int b, int bs, int k, int64_t cfg, cudaStream_t st) {
+                         const float* mx, const int* tix, float* part, int split, int b, int bs, int k, int64_t cfg,
+                         cudaStream_t st) {
     switch (cfg) {
-        case 0: launch_cfg<128, 64, 4, 2, 4, 3, TIX, TP>(nm, p, nids, nb, pb, bx, mx, tix, b, bs, k, st); break;
-        case 1: launch_cfg<128, 64, 8, 2, 4, 3, TIX, TP>(nm, p, nids, nb, pb, bx, mx, tix, b, bs, k, st); break;
-        case 2: launch_cfg<64, 64, 4, 2, 4, 4, TIX, TP>(nm, p, nids, nb, pb, bx, mx, tix, b, bs, k, st); break;
-        case 3: launch_cfg<64, 64, 4, 2, 2, 4, TIX, TP>(nm, p, nids, nb, pb, bx, mx, tix, b, bs, k, st); break;
-        case 4: launch_cfg<32, 64, 2, 2, 4, 4, TIX, TP>(nm, p, nids, nb, pb, bx, mx, tix, b, bs, k, st); break;
-        default: launch_cfg<32, 128, 2, 4, 4, 3, TIX, TP>(nm, p, nids, nb, pb, bx, mx, tix, b, bs, k, st); break;
+        case 0: launch_cfg<128, 64, 4, 2, 4, 3, TIX, TP>(nm, p, nids, nb, pb, bx, mx, tix, part, split, b, bs, k, st); break;
+        case 1: launch_cfg<128, 64, 8, 2, 4, 3, TIX, TP>(nm, p, nids, nb, pb, bx, mx, tix, part, split, b, bs, k, st); break;
+        case 2: launch_cfg<64, 64, 4, 2, 4, 4, TIX, TP>(nm, p, nids, nb, pb, bx, mx, tix, part, split, b, bs, k, st); break;
+        case 3: launch_cfg<64, 64, 4, 2, 2, 4, TIX, TP>(nm, p, nids, nb, pb, bx, mx, tix, part, split, b, bs, k, st); break;
+        case 4: launch_cfg<32, 64, 2, 2, 4, 4, TIX, TP>(nm, p, nids, nb, pb, bx, mx, tix, part, split, b, bs, k, st); break;
+        default: launch_cfg<32, 128, 2, 4, 4, 3, TIX, TP>(nm, p, nids, nb, pb, bx, mx, tix, part, split, b, bs, k, st); break;
     }
 }
 
 template <typename TP>
 static void dispatch_tix(float* nm, const TP* p, const long* nids, int nb, const long* pb, const __nv_bfloat16* bx,
-                         const float* mx, const int* tix, bool shared, int b, int bs, int k, int64_t cfg, cudaStream_t st) {
-    if (shared) dispatch_cfg<true, TP>(nm, p, nids, nb, pb, bx, mx, tix, b, bs, k, cfg, st);
-    else dispatch_cfg<false, TP>(nm, p, nids, nb, pb, bx, mx, tix, b, bs, k, cfg, st);
+                         const float* mx, const int* tix, bool shared, float* part, int split, int b, int bs, int k,
+                         int64_t cfg, cudaStream_t st) {
+    if (shared) dispatch_cfg<true, TP>(nm, p, nids, nb, pb, bx, mx, tix, part, split, b, bs, k, cfg, st);
+    else dispatch_cfg<false, TP>(nm, p, nids, nb, pb, bx, mx, tix, part, split, b, bs, k, cfg, st);
 }
 
 // The parameters in the dtype they are stored in (`TensorCircuit.param_dtype`): fp32 or bf16. The pre-pass's scratch
@@ -371,10 +420,19 @@ void tlmm_forward_sum_prepass(torch::Tensor node_mars, torch::Tensor element_mar
     // unread (a caller's word, not inferred from the sizes: a launch over some node blocks hands a slice of `tix`)
     long tiles = ebase.numel();
     TORCH_CHECK(shared || tiles == tix.numel(), "unshared tiles: one per (node block, edge tile)");
-    long bx_bytes = tiles * BK * batch * 2;
-    torch::Tensor scratch = torch::empty({bx_bytes + tiles * batch * 4}, element_mars.options().dtype(torch::kUInt8));
+    // `cfg`: the tile config's id in the low byte, the split-K range count above it (0 or 1: one range); the ranges'
+    // partials (L and M, [split, rows, batch] each) follow the pre-pass's scratch in the one allocation
+    const int split = cfg >> 8 ? (int)(cfg >> 8) : 1;
+    cfg &= 255;
+    TORCH_CHECK(split <= MAX_SPLIT && split <= knt, "the pre-pass forward's split: 1 .. ", MAX_SPLIT, ", at most the ",
+                knt, " edge tiles; got ", split);
+    const long rows_total = nids.numel() * block_size;
+    long bx_bytes = tiles * BK * batch * 2, mx_bytes = tiles * batch * 4;
+    long part_bytes = split > 1 ? 2L * split * rows_total * batch * 4 : 0;
+    torch::Tensor scratch = torch::empty({bx_bytes + mx_bytes + part_bytes}, element_mars.options().dtype(torch::kUInt8));
     auto* bx = reinterpret_cast<__nv_bfloat16*>(scratch.data_ptr());
     auto* mx = reinterpret_cast<float*>(reinterpret_cast<char*>(scratch.data_ptr()) + bx_bytes);
+    auto* part = reinterpret_cast<float*>(reinterpret_cast<char*>(scratch.data_ptr()) + bx_bytes + mx_bytes);
     cudaStream_t st = c10::cuda::getCurrentCUDAStream();
     dim3 grid(tiles, batch / PB);
     prepass_kernel<256><<<grid, 256, 0, st>>>(element_mars.data_ptr<float>(), ebase.data_ptr<long>(), bx, mx, (int)batch);
@@ -382,10 +440,11 @@ void tlmm_forward_sum_prepass(torch::Tensor node_mars, torch::Tensor element_mar
     int b = (int)batch, bs = (int)block_size, k = (int)knt, nb = (int)nids.size(0);
     if (params.scalar_type() == torch::kBFloat16)
         dispatch_tix<__nv_bfloat16>(node_mars.data_ptr<float>(), param_ptr<__nv_bfloat16>(params), nids.data_ptr<long>(),
-                                    nb, pbase.data_ptr<long>(), bx, mx, tix.data_ptr<int>(), shared, b, bs, k, cfg, st);
+                                    nb, pbase.data_ptr<long>(), bx, mx, tix.data_ptr<int>(), shared, part, split, b, bs,
+                                    k, cfg, st);
     else
         dispatch_tix<float>(node_mars.data_ptr<float>(), param_ptr<float>(params), nids.data_ptr<long>(), nb,
-                            pbase.data_ptr<long>(), bx, mx, tix.data_ptr<int>(), shared, b, bs, k, cfg, st);
+                            pbase.data_ptr<long>(), bx, mx, tix.data_ptr<int>(), shared, part, split, b, bs, k, cfg, st);
 }
 
 // (BM, BN) per config id; Python uses this to enumerate the configs valid for a layer shape.

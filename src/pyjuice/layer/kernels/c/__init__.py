@@ -444,6 +444,43 @@ def prepass_valid_configs(block_size: int, batch_size: int):
             if block_size % bm == 0 and batch_size % bn == 0]
 
 
+#: Split-K ranges a pre-pass kernel may cut a row's edge tiles into (`prepass_arms`): the kernels' MAX_SPLIT
+MAX_SPLIT = 8
+_SMS = {}
+
+
+def _sms() -> int:
+    """The current device's SM count (cached)."""
+    dev = torch.cuda.current_device()
+    n = _SMS.get(dev)
+    if n is None:
+        n = _SMS[dev] = torch.cuda.get_device_properties(dev).multi_processor_count
+    return n
+
+
+def _split_arms(configs, valid, rows, batch_size, k_num_tiles):
+    """`valid`'s config ids, then `id | split << 8` for the splits 2, 4, 8 (at most the tiles) where a config's grid --
+    `rows` tile rows x batch tiles x split -- stays under three waves of the SMs: a CTA walking its whole row of tiles
+    alone on an SM is latency-bound (MEASURED HMM-4096 B128 bf16: 128 CTAs on 188 SMs, the forward at a quarter of its
+    compute floor); more ranges, resident together, fill the machine, the merge is a thread per (row, column)."""
+    arms = list(valid)
+    for s in (2, 4, 8):
+        if s > k_num_tiles:
+            break
+        for c in valid:
+            bm, bn = configs[c]
+            if (rows // bm) * (batch_size // bn) * s <= 3 * _sms():
+                arms.append(c | (s << 8))
+    return arms
+
+
+def prepass_arms(block_size: int, batch_size: int, k_num_tiles: int, n_blocks: int):
+    """The pre-pass forward's tuner arms for a layer: its valid configs, and their splits where the grid is small
+    (`_split_arms`); an arm is the kernel's `cfg` code."""
+    return _split_arms(prepass_configs(), prepass_valid_configs(block_size, batch_size), n_blocks * block_size,
+                       batch_size, k_num_tiles)
+
+
 def ele_pipe_is_available() -> bool:
     """Whether the warp-specialized CUDA element-flow backward (ele_backward_sum_pipelined.cu) is usable (lazily
     JIT-compiles once). CuTe, so it needs CUTLASS; no TMA, but it shares the CuTe kernels' toolchain gate."""
@@ -504,6 +541,13 @@ def ele_prepass_valid_configs(cs_block_size: int, batch_size: int):
     batch)."""
     return [i for i, (bm, bn) in enumerate(ele_prepass_configs())
             if cs_block_size % bm == 0 and batch_size % bn == 0]
+
+
+def ele_prepass_arms(cs_block_size: int, batch_size: int, k_num_tiles: int, n_blocks: int):
+    """The pre-pass element backward's tuner arms for a partition: its valid configs, and their splits where the grid
+    is small (`_split_arms`); an arm is the kernel's `cfg` code."""
+    return _split_arms(ele_prepass_configs(), ele_prepass_valid_configs(cs_block_size, batch_size),
+                       n_blocks * cs_block_size, batch_size, k_num_tiles)
 
 
 def autotune(candidates, warmup: int = 3, reps: int = 7) -> int:

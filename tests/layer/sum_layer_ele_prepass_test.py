@@ -84,11 +84,24 @@ def _plain(pc, layer, chids, cs, ebase, pbase, rows, B):
 
 def _check_configs(pc, layer, chids, cs, ebase, pbase, rows, B, want, label):
     tiles, tix, shared = ck.tile_index(ebase)
+    knt = ebase.size(1)
     for cfg in ck.ele_prepass_valid_configs(cs, B):
         ef = torch.full_like(pc.element_flows, NAN)
         ck.ele_backward_sum_prepass(ef, pc.element_mars, pc.node_flows, pc.node_mars, pc.params, chids, tiles, tix,
-                                    pbase, B, layer.block_size, cs, ebase.size(1), cfg, shared)
+                                    pbase, B, layer.block_size, cs, knt, cfg, shared)
         assert torch.equal(ef[rows], want), (label, cfg)
+        # the split-K ranges (`cfg | split << 8`, the ranges merged in fp32): the same -inf pattern, within the
+        # merge's reassociation
+        for split in (2, 4, 8):
+            if split > knt:
+                break
+            ef = torch.full_like(pc.element_flows, NAN)
+            ck.ele_backward_sum_prepass(ef, pc.element_mars, pc.node_flows, pc.node_mars, pc.params, chids, tiles, tix,
+                                        pbase, B, layer.block_size, cs, knt, cfg | (split << 8), shared)
+            got = ef[rows]
+            fin = torch.isfinite(want)
+            assert torch.equal(fin, torch.isfinite(got)) and torch.equal(got[~fin], want[~fin]), (label, cfg, split)
+            assert float((got[fin] - want[fin]).abs().max()) < 1e-4, (label, cfg, split, "the split ranges' merge")
 
 
 @pytest.mark.parametrize("dts", list(DTYPES))

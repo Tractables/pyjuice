@@ -47,6 +47,7 @@ using namespace cute;
 
 #define BK 64
 #define PB 64
+#define MAX_SPLIT 8     // split-K ranges of an element block's parent tiles at most
 
 __device__ __forceinline__ void bar_sync(int id, int count) {
     asm volatile("bar.sync %0, %1;" ::"r"(id), "r"(count) : "memory");
@@ -121,8 +122,8 @@ template <int BM, int BN, int WM, int WN, int PW, int ST, int PBT, bool TIX, typ
 __global__ void __launch_bounds__((WM * WN + PW) * 32) ele_stream_kernel(
         float* __restrict__ eflows, const float* __restrict__ emars, const TP* __restrict__ mp,
         const long* __restrict__ chids, const long* __restrict__ pbase, const half_t* __restrict__ bx,
-        const float* __restrict__ mx, const int* __restrict__ tix, int batch, int BSK, int BSM, int knt,
-        int pid_m_offset) {
+        const float* __restrict__ mx, const int* __restrict__ tix, float* __restrict__ part, int batch, int BSK,
+        int BSM, int knt, int split, long rows_total, int pid_m_offset) {
     constexpr int NC = WM * WN * 32;
     constexpr int NP = PW * 32;
     constexpr int NTH = NC + NP;
@@ -131,10 +132,16 @@ __global__ void __launch_bounds__((WM * WN + PW) * 32) ele_stream_kernel(
     int eb = pid_m / mtiles, tile_id = pid_m % mtiles;
     int b0 = pid_b * BN;
     long off_ele = chids[eb] + (long)tile_id * BM;
+    // split-K: this CTA walks the parent tiles k0 .. k1 of its element block (blockIdx.z of `split` ranges; one range
+    // is the whole row), everything below over `knt` = the range's tiles; a range's partial sum and maximum go to
+    // `part` for `merge_kernel`, a single range writes the flows itself
+    const int sp = blockIdx.z, knt_all = knt;
+    const int k0 = (int)((long)sp * knt_all / split), k1 = (int)((long)(sp + 1) * knt_all / split);
+    knt = k1 - k0;
     // a parent tile's parameters: PBT blocks of BSK parents each (one where BSK >= BK; two where the parents' block
     // size is 32: the halves of a tile lie in different parameter blocks -- a template parameter: the one-block kernel
     // is the kernel it was, MEASURED a runtime count cost it a third)
-    const long* pbp = pbase + (long)eb * knt * PBT;
+    const long* pbp = pbase + ((long)eb * knt_all + k0) * PBT;
     int tid = threadIdx.x;
 
     // A: the plain kernels' K-major atom (written from registers); B: 64 consecutive parents of one column per 128-byte
@@ -150,7 +157,7 @@ __global__ void __launch_bounds__((WM * WN + PW) * 32) ele_stream_kernel(
 
     if (tid >= NC) {
         int ptid = tid - NC;
-        const long tile0 = (long)eb * knt;
+        const long tile0 = (long)eb * knt_all + k0;
         float Mrun[BN / 32], mnext[BN / 32];
         CUTE_UNROLL
         for (int j = 0; j < BN / 32; j++) Mrun[j] = -INFINITY;
@@ -256,7 +263,6 @@ __global__ void __launch_bounds__((WM * WN + PW) * 32) ele_stream_kernel(
     Tensor tCrS = thr.partition_fragment_C(cC);
     Tensor tCrL = thr.partition_fragment_C(cC);
     clear(tCrL);
-    float al[size(tCrS)], be[size(tCrS)], Mf[size(tCrS)];
 
     for (int kt = 0; kt < knt; kt++) {
         int s = kt % ST;
@@ -265,33 +271,66 @@ __global__ void __launch_bounds__((WM * WN + PW) * 32) ele_stream_kernel(
         Tensor sBt = make_tensor(make_smem_ptr(stB(s)), sBl);
         copy(s2rA, s2rA.get_thread_slice(tid).partition_S(sAt), tXrA);
         copy(s2rB, s2rB.get_thread_slice(tid).partition_S(sBt), tXrB);
+        clear(tCrS); cute::gemm(mma, tCrA, tCrB, tCrS);
+        // the merge factors read from the stage as they are used (per column: a register copy per accumulator element
+        // held the kernel to one thread block an SM -- MEASURED 102-108 registers at 384 threads), then the stage
+        // released
         const float* f = stF(s);
         CUTE_UNROLL
         for (int i = 0; i < size(tCrS); i++) {
             int b = get<1>(tCcC(i));
-            al[i] = f[b]; be[i] = f[BN + b];
-            if (kt == knt - 1) Mf[i] = f[2 * BN + b];
+            tCrL(i) = __fadd_rn(__fmul_rn(tCrL(i), f[b]), __fmul_rn(tCrS(i), f[BN + b]));
         }
         if (kt + ST < knt) bar_arrive(1 + ST + s, NTH);
-        clear(tCrS); cute::gemm(mma, tCrA, tCrB, tCrS);
-        CUTE_UNROLL
-        for (int i = 0; i < size(tCrS); i++)
-            tCrL(i) = __fadd_rn(__fmul_rn(tCrL(i), al[i]), __fmul_rn(tCrS(i), be[i]));
     }
+    const float* fM = stF((knt - 1) % ST) + 2 * BN;  // the last tile's stage: the running maxima, never refilled
     CUTE_UNROLL
     for (int i = 0; i < size(tCrL); i++) {
         int m = get<0>(tCcC(i)), b = get<1>(tCcC(i));
-        float r = (Mf[i] == -INFINITY) ? -INFINITY : (logf(tCrL(i)) + Mf[i]);
-        long off = (off_ele + m) * (long)batch + b0 + b;
-        if (r != -INFINITY) r += emars[off];
-        eflows[off] = r;
+        const float Mf = fM[b];
+        if (split == 1) {
+            float r = (Mf == -INFINITY) ? -INFINITY : (logf(tCrL(i)) + Mf);
+            long off = (off_ele + m) * (long)batch + b0 + b;
+            if (r != -INFINITY) r += emars[off];
+            eflows[off] = r;
+        } else {
+            const long idx = ((long)sp * rows_total + (long)eb * BSM + (long)tile_id * BM + m) * batch + b0 + b;
+            part[idx] = tCrL(i);
+            part[(long)split * rows_total * batch + idx] = Mf;
+        }
     }
+}
+
+// ---------------- the ranges' merge (split > 1): a thread per (element, column) ----------------
+// element_flows = emars + log sum_z L_z exp(M_z - M) + M over the ranges, M their maximum (-inf where every M_z is),
+// the sum in range order. `part`: L [split, rows, batch] then M [split, rows, batch]; row = element block x BSM + m.
+__global__ void merge_kernel(float* __restrict__ eflows, const float* __restrict__ emars, const float* __restrict__ part,
+                             const long* __restrict__ chids, int split, long rows_total, int BSM, int batch) {
+    const long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= rows_total * batch) return;
+    const long row = i / batch, stride = rows_total * (long)batch;
+    const int b = (int)(i - row * batch);
+    const float* Lp = part + row * batch + b;
+    const float* Mp = Lp + (long)split * stride;
+    float M = -INFINITY;
+    for (int z = 0; z < split; z++) M = fmaxf(M, Mp[(long)z * stride]);
+    const long off = (chids[row / BSM] + row % BSM) * (long)batch + b;
+    float r = -INFINITY;
+    if (M != -INFINITY) {
+        float L = 0.f;
+        for (int z = 0; z < split; z++) {
+            const float mz = Mp[(long)z * stride];
+            if (mz != -INFINITY) L += Lp[(long)z * stride] * __expf(mz - M);
+        }
+        r = logf(L) + M + emars[off];
+    }
+    eflows[off] = r;
 }
 
 template <int BM, int BN, int WM, int WN, int PW, int ST, int PBT, bool TIX, typename TP>
 static void launch_cfg(float* ef, const float* em, const TP* p, const long* chids, int neb, const long* pb,
-                       const half_t* bx, const float* mx, const int* tix, int batch, int BSK, int BSM, int knt,
-                       cudaStream_t st) {
+                       const half_t* bx, const float* mx, const int* tix, float* part, int split, int batch, int BSK,
+                       int BSM, int knt, cudaStream_t st) {
     constexpr int NTH = (WM * WN + PW) * 32;
     constexpr int smem = ST * (BM * BK * 2 + BN * BK * 2 + 3 * BN * 4);
     auto kernel = ele_stream_kernel<BM, BN, WM, WN, PW, ST, PBT, TIX, TP>;
@@ -305,11 +344,18 @@ static void launch_cfg(float* ef, const float* em, const TP* p, const long* chid
         if (dev < 64) attr_set[dev] = true;
     }
     int total_m = neb * (BSM / BM);
+    const long rows_total = (long)neb * BSM;
     const int MAX_Y = 65535;
     for (int off = 0; off < total_m; off += MAX_Y) {
         int chunk = (total_m - off < MAX_Y) ? (total_m - off) : MAX_Y;
-        dim3 grid(batch / BN, chunk);
-        kernel<<<grid, NTH, smem, st>>>(ef, em, p, chids, pb, bx, mx, tix, batch, BSK, BSM, knt, off);
+        dim3 grid(batch / BN, chunk, split);
+        kernel<<<grid, NTH, smem, st>>>(ef, em, p, chids, pb, bx, mx, tix, part, batch, BSK, BSM, knt, split, rows_total,
+                                        off);
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+    }
+    if (split > 1) {
+        const long n = rows_total * batch;
+        merge_kernel<<<(unsigned)((n + 255) / 256), 256, 0, st>>>(ef, em, part, chids, split, rows_total, BSM, batch);
         C10_CUDA_KERNEL_LAUNCH_CHECK();
     }
 }
@@ -321,25 +367,25 @@ static void launch_cfg(float* ef, const float* em, const TP* p, const long* chid
 // other CUDA kernel takes.
 template <int PBT, bool TIX, typename TP>
 static void dispatch_cfg(float* ef, const float* em, const TP* p, const long* chids, int neb, const long* pb,
-                         const half_t* bx, const float* mx, const int* tix, int b, int bsk, int bsm, int k, int64_t cfg,
-                         cudaStream_t st) {
+                         const half_t* bx, const float* mx, const int* tix, float* part, int split, int b, int bsk,
+                         int bsm, int k, int64_t cfg, cudaStream_t st) {
     switch (cfg) {
-        case 0: launch_cfg<128, 64, 4, 2, 4, 3, PBT, TIX, TP>(ef, em, p, chids, neb, pb, bx, mx, tix, b, bsk, bsm, k, st); break;
-        case 1: launch_cfg<128, 64, 4, 2, 8, 3, PBT, TIX, TP>(ef, em, p, chids, neb, pb, bx, mx, tix, b, bsk, bsm, k, st); break;
-        case 2: launch_cfg<64, 64, 4, 2, 4, 4, PBT, TIX, TP>(ef, em, p, chids, neb, pb, bx, mx, tix, b, bsk, bsm, k, st); break;
-        case 3: launch_cfg<32, 64, 2, 2, 4, 4, PBT, TIX, TP>(ef, em, p, chids, neb, pb, bx, mx, tix, b, bsk, bsm, k, st); break;
-        default: launch_cfg<32, 128, 2, 4, 4, 3, PBT, TIX, TP>(ef, em, p, chids, neb, pb, bx, mx, tix, b, bsk, bsm, k, st); break;
+        case 0: launch_cfg<128, 64, 4, 2, 4, 3, PBT, TIX, TP>(ef, em, p, chids, neb, pb, bx, mx, tix, part, split, b, bsk, bsm, k, st); break;
+        case 1: launch_cfg<128, 64, 4, 2, 8, 3, PBT, TIX, TP>(ef, em, p, chids, neb, pb, bx, mx, tix, part, split, b, bsk, bsm, k, st); break;
+        case 2: launch_cfg<64, 64, 4, 2, 4, 4, PBT, TIX, TP>(ef, em, p, chids, neb, pb, bx, mx, tix, part, split, b, bsk, bsm, k, st); break;
+        case 3: launch_cfg<32, 64, 2, 2, 4, 4, PBT, TIX, TP>(ef, em, p, chids, neb, pb, bx, mx, tix, part, split, b, bsk, bsm, k, st); break;
+        default: launch_cfg<32, 128, 2, 4, 4, 3, PBT, TIX, TP>(ef, em, p, chids, neb, pb, bx, mx, tix, part, split, b, bsk, bsm, k, st); break;
     }
 }
 
 template <typename TP>
 static void dispatch_pbt(float* ef, const float* em, const TP* p, const long* chids, int neb, const long* pb,
-                         const half_t* bx, const float* mx, const int* tix, bool shared, int b, int bsk, int bsm, int k,
-                         int pbt, int64_t cfg, cudaStream_t st) {
-    if (pbt == 1 && !shared) dispatch_cfg<1, false, TP>(ef, em, p, chids, neb, pb, bx, mx, tix, b, bsk, bsm, k, cfg, st);
-    else if (pbt == 1) dispatch_cfg<1, true, TP>(ef, em, p, chids, neb, pb, bx, mx, tix, b, bsk, bsm, k, cfg, st);
-    else if (!shared) dispatch_cfg<2, false, TP>(ef, em, p, chids, neb, pb, bx, mx, tix, b, bsk, bsm, k, cfg, st);
-    else dispatch_cfg<2, true, TP>(ef, em, p, chids, neb, pb, bx, mx, tix, b, bsk, bsm, k, cfg, st);
+                         const half_t* bx, const float* mx, const int* tix, bool shared, float* part, int split, int b,
+                         int bsk, int bsm, int k, int pbt, int64_t cfg, cudaStream_t st) {
+    if (pbt == 1 && !shared) dispatch_cfg<1, false, TP>(ef, em, p, chids, neb, pb, bx, mx, tix, part, split, b, bsk, bsm, k, cfg, st);
+    else if (pbt == 1) dispatch_cfg<1, true, TP>(ef, em, p, chids, neb, pb, bx, mx, tix, part, split, b, bsk, bsm, k, cfg, st);
+    else if (!shared) dispatch_cfg<2, false, TP>(ef, em, p, chids, neb, pb, bx, mx, tix, part, split, b, bsk, bsm, k, cfg, st);
+    else dispatch_cfg<2, true, TP>(ef, em, p, chids, neb, pb, bx, mx, tix, part, split, b, bsk, bsm, k, cfg, st);
 }
 
 // element-flow backward (writes element_flows in place). chids is int64 [neb]; pbase int64 [neb, knt * pbt]: a parent
@@ -363,10 +409,19 @@ void ele_backward_sum_prepass(torch::Tensor element_flows, torch::Tensor element
     // unread (a caller's word, not inferred from the sizes: a launch over some element blocks hands a slice of `tix`)
     long tiles = ebase.numel();
     TORCH_CHECK(shared || tiles == tix.numel(), "unshared tiles: one per (element block, parent tile)");
-    long bx_bytes = tiles * BK * batch * 2;
-    torch::Tensor scratch = torch::empty({bx_bytes + tiles * batch * 4}, element_mars.options().dtype(torch::kUInt8));
+    // `cfg`: the tile config's id in the low byte, the split-K range count above it (0 or 1: one range); the ranges'
+    // partials (L and M, [split, rows, batch] each) follow the pre-pass's scratch in the one allocation
+    const int split = cfg >> 8 ? (int)(cfg >> 8) : 1;
+    cfg &= 255;
+    TORCH_CHECK(split <= MAX_SPLIT && split <= knt, "the pre-pass element backward's split: 1 .. ", MAX_SPLIT,
+                ", at most the ", knt, " parent tiles; got ", split);
+    const long rows_total = chids.numel() * BSM;
+    long bx_bytes = tiles * BK * batch * 2, mx_bytes = tiles * batch * 4;
+    long part_bytes = split > 1 ? 2L * split * rows_total * batch * 4 : 0;
+    torch::Tensor scratch = torch::empty({bx_bytes + mx_bytes + part_bytes}, element_mars.options().dtype(torch::kUInt8));
     auto* bx = reinterpret_cast<half_t*>(scratch.data_ptr());
     auto* mx = reinterpret_cast<float*>(reinterpret_cast<char*>(scratch.data_ptr()) + bx_bytes);
+    auto* part = reinterpret_cast<float*>(reinterpret_cast<char*>(scratch.data_ptr()) + bx_bytes + mx_bytes);
     cudaStream_t st = c10::cuda::getCurrentCUDAStream();
     dim3 grid(tiles, batch / PB);
     ele_prepass_kernel<<<grid, 256, 0, st>>>(node_flows.data_ptr<float>(), node_mars.data_ptr<float>(),
@@ -376,12 +431,12 @@ void ele_backward_sum_prepass(torch::Tensor element_flows, torch::Tensor element
     if (params.scalar_type() == torch::kBFloat16)
         dispatch_pbt<__nv_bfloat16>(element_flows.data_ptr<float>(), element_mars.data_ptr<float>(),
                                     param_ptr<__nv_bfloat16>(params), chids.data_ptr<long>(), neb, pbase.data_ptr<long>(),
-                                    bx, mx, tix.data_ptr<int>(), shared, (int)batch, (int)BSK, (int)BSM, (int)knt, pbt,
-                                    cfg, st);
+                                    bx, mx, tix.data_ptr<int>(), shared, part, split, (int)batch, (int)BSK, (int)BSM,
+                                    (int)knt, pbt, cfg, st);
     else
         dispatch_pbt<float>(element_flows.data_ptr<float>(), element_mars.data_ptr<float>(), param_ptr<float>(params),
                             chids.data_ptr<long>(), neb, pbase.data_ptr<long>(), bx, mx, tix.data_ptr<int>(), shared,
-                            (int)batch, (int)BSK, (int)BSM, (int)knt, pbt, cfg, st);
+                            part, split, (int)batch, (int)BSK, (int)BSM, (int)knt, pbt, cfg, st);
 }
 
 // (BM, BN) per config id; Python uses this to enumerate the configs valid for a partition.

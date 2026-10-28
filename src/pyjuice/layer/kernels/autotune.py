@@ -55,6 +55,28 @@ MARGIN = float(os.environ.get("PYJUICE_AUTOTUNE_MARGIN", 1.10))
 # 10-30x slower than the dense one -- ten times over.
 PRUNE = float(os.environ.get("PYJUICE_AUTOTUNE_PRUNE", 2.0))
 
+# The host time of one more kernel launch issued from inside an extension call (seconds): what a candidate with an
+# extra launch costs a host-bound step, which a trial's event time does not see when the GPU work outlasts the host
+# (`charged`). MEASURED in the gated plans (three launches against two): 7.1 against 5.1 us a call; a host-bound
+# HMM-1024 B64 step took split arms in 17 of 31 layers at 2 us and lost 2%, none at 3.
+LAUNCH_S = 3e-6
+
+
+def charged(run, extra: float):
+    """`run` behind a host wait of `extra` seconds -- between a trial's first event and the launch, so the trial's event
+    time counts the host time the candidate costs beyond its rivals' (a split-K arm's merge launch: `LAUNCH_S`)."""
+    if extra <= 0:
+        return run
+    import time
+
+    def go():
+        end = time.perf_counter() + extra
+        while time.perf_counter() < end:
+            pass
+        run()
+
+    return go
+
 
 def _capturing() -> bool:
     """True while a CUDA graph is being captured. Benchmarking synchronizes (illegal during

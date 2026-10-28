@@ -88,6 +88,18 @@ def _check_configs(pc, layer, nids, ebase, pbase, B, want, label):
         ck.tlmm_forward_sum_prepass(pc.node_mars, pc.element_mars, pc.params, nids, tiles, tix, pbase, B, bs, knt, cfg,
                                     shared)
         assert torch.equal(pc.node_mars[a:b], want), (label, cfg)
+        # the split-K ranges (`cfg | split << 8`, the ranges merged in fp32): the same -inf pattern, within the
+        # merge's reassociation
+        for split in (2, 4, 8):
+            if split > knt:
+                break
+            pc.node_mars[a:b] = NAN
+            ck.tlmm_forward_sum_prepass(pc.node_mars, pc.element_mars, pc.params, nids, tiles, tix, pbase, B, bs, knt,
+                                        cfg | (split << 8), shared)
+            got = pc.node_mars[a:b]
+            fin = torch.isfinite(want)
+            assert torch.equal(fin, torch.isfinite(got)) and torch.equal(got[~fin], want[~fin]), (label, cfg, split)
+            assert float((got[fin] - want[fin]).abs().max()) < 1e-4, (label, cfg, split, "the split ranges' merge")
 
 
 @pytest.mark.parametrize("dts", list(DTYPES))
@@ -190,8 +202,13 @@ def test_the_gate_offers_the_prepass_configs(B, monkeypatch):
         assert tlmm, "no tlmm gate measured"
         for cands in tlmm:
             assert cands[0] == ("triton", -1)
-            want = [("cuda_prepass", c) for c in ck.prepass_valid_configs(128, B)] if on else []
-            assert [ch for ch in cands if ch[0] == "cuda_prepass"] == want
+            pre = [ch[1] for ch in cands if ch[0] == "cuda_prepass"]
+            want = ck.prepass_valid_configs(128, B) if on else []
+            assert [c for c in pre if c >> 8 == 0] == want, "the configs"
+            # the split arms (a small layer: under three waves) carry a valid config and a split of 2, 4 or 8, at most
+            # the layer's 2 edge tiles (a split past them would raise inside the tuner, which skips a raising arm)
+            assert all(c & 255 in want and c >> 8 in (2, 4, 8) and c >> 8 <= 2 for c in pre if c >> 8), "the split arms"
+            assert (on and B == 64) <= any(c >> 8 for c in pre), "a 2-tile layer at B 64 offers split 2"
 
 
 def _float64_block(pc, bs, cids_k, pids_k):
