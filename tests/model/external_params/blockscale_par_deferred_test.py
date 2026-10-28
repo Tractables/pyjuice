@@ -1,11 +1,12 @@
 """
 A tied group's gated parameter flows deferred to one contraction (blockscale/deferred_par.py, kernels/c/
-blockscale_par_deferred.cu): the flows a backward leaves against float64 recomputed from every captured step's inputs
--- tied gated HMMs of one and two blocks, fp32 and bf16 parameters, a batch past the slots' 32 columns, -inf
-log-gates, 39 steps, and more steps than the slots hold (flushes during the pass); the
-deferral an accumulation (two backwards with `flows_memory = 1` give twice one); a layer callback, an untied or a
-small layer keeping the per-step kernels; a CUDA graph replaying it to the bit; and a backward that raised
-part-way leaving nothing to the next. Skipped where the CUDA kernels cannot build.
+blockscale_par_deferred_fp16.cu): the flows a backward leaves against float64 recomputed from every captured step's
+inputs -- tied gated HMMs of one and two blocks, fp32 and bf16 parameters, a batch past the slots' 32 columns, a
+batch past 512 (two slots a step), -inf log-gates and log-gates spread wide (the rows' scales apart from slot to
+slot), 39 steps, and more steps than the slots hold (flushes during the pass), with the L2's bulk adds and with the
+threads' read-add-write; the deferral an accumulation (two backwards with `flows_memory = 1` give twice one); a layer
+callback, an untied or a small layer keeping the per-step kernels; a CUDA graph replaying it to the bit; and a
+backward that raised part-way leaving nothing to the next. Skipped where the CUDA kernels cannot build.
 """
 import pytest
 import torch
@@ -24,9 +25,9 @@ CATS = 16
 def _module():
     if not torch.cuda.is_available():
         return None
-    from pyjuice.nodes.external_params.kernels.c import get_par_deferred_module
+    from pyjuice.nodes.external_params.kernels.c import get_par_deferred_fp16_module
     try:
-        return get_par_deferred_module()
+        return get_par_deferred_fp16_module()
     except Exception:
         return None
 
@@ -61,7 +62,7 @@ def _hmm(L, nb, gcb, T, tied = True):
     return root, gated, T
 
 
-def _instance(L, nb, gcb, T, dt, B, neg_gates = False, tied = True, seed = 0, **compile_kw):
+def _instance(L, nb, gcb, T, dt, B, neg_gates = False, tied = True, seed = 0, gate_scale = 2.0, **compile_kw):
     torch.manual_seed(seed)
     root, gated, V = _hmm(L, nb, gcb, T, tied)
     root.init_parameters(perturbation = 2.0)
@@ -69,7 +70,7 @@ def _instance(L, nb, gcb, T, dt, B, neg_gates = False, tied = True, seed = 0, **
     torch.manual_seed(seed + 1)
     phi = {}
     for ns in gated:
-        p = torch.randn(ns.external_params.tensor_shapes(ns, B)[0], device = DEV) * 2.0
+        p = torch.randn(ns.external_params.tensor_shapes(ns, B)[0], device = DEV) * gate_scale
         if neg_gates:
             p[torch.rand_like(p) < 0.2] = NEG
         phi[ns] = p
@@ -83,15 +84,16 @@ def _record(monkeypatch):
     caps, flushes = [], []
     real_cap, real_flush = mod.capture, mod.flush
 
-    def capture(A, Bop, M, nf, nm, em, ext, nids, cids, gate, batch, slot, node_cbs, gate_cbs, ext_base):
+    def capture(A, Bop, fA, fB, M, nf, nm, em, ext, nids, cids, gate, batch, slot, node_cbs, gate_cbs, ext_base):
         caps.append(dict(A = A, nf = nf.clone(), nm = nm.clone(), em = em.clone(), ext = ext.clone(), nids = nids,
                          cids = cids, gate = gate, batch = batch, node_cbs = node_cbs, gate_cbs = gate_cbs,
-                         ext_base = ext_base, blk = A.size(1), ne = Bop.size(1)))
-        return real_cap(A, Bop, M, nf, nm, em, ext, nids, cids, gate, batch, slot, node_cbs, gate_cbs, ext_base)
+                         ext_base = ext_base, blk = A.size(1), ne = Bop.size(1), slot = slot))
+        return real_cap(A, Bop, fA, fB, M, nf, nm, em, ext, nids, cids, gate, batch, slot, node_cbs, gate_cbs,
+                        ext_base)
 
-    def flush(pf, A, Bop, pfids, pids, params, slots, Bp, cfg):
-        flushes.append(dict(A = A, pfids = pfids, pids = pids, params = params, slots = slots))
-        return real_flush(pf, A, Bop, pfids, pids, params, slots, Bp, cfg)
+    def flush(pf, A, Bop, fA, fB, pfids, pids, params, slots, cfg, bulk):
+        flushes.append(dict(A = A, pfids = pfids, pids = pids, params = params, slots = slots, bulk = bulk))
+        return real_flush(pf, A, Bop, fA, fB, pfids, pids, params, slots, cfg, bulk)
 
     monkeypatch.setattr(mod, "capture", capture)
     monkeypatch.setattr(mod, "flush", flush)
@@ -134,22 +136,30 @@ def _check(got, ref, what, tol = 1e-3):
     assert d < tol and rel < 3 * tol, f"{what}: flows off by {d:.2e} of the max, {rel:.2e} relative"
 
 
-# (name, L, node blocks, gate width, T, params dtype, B, -inf log-gates, slot budget MB or None)
+def _slots_mb(nb, blk, ne, W, S):
+    """The slot budget (MB) that holds S slots of W columns (fp16 values, a float scale a row)."""
+    return S * nb * (blk + ne) * (W * 2 + 4) / 2 ** 20
+
+
+# (name, L, node blocks, gate width, T, params dtype, B, -inf log-gates, log-gate scale, slot budget MB or None)
 CASES = [
-    ("hmm1024_T8", 1024, 1, 64, 8, "bf16", 128, False, None),
-    ("hmm1024_g8_fp32_B100", 1024, 1, 8, 8, "fp32", 100, True, None),
-    ("hmm2048x2_T6", 2048, 2, 64, 6, "bf16", 64, False, None),
-    ("hmm1024_T40", 1024, 1, 16, 40, "bf16", 64, False, None),                 # 39 copies, one flow block
-    ("hmm1024_T9_two_slots", 1024, 1, 64, 9, "fp32", 64, True, 2 * (1024 + 1024) * 64 * 4 / 2 ** 20),  # S = 2
+    ("hmm1024_T8", 1024, 1, 64, 8, "bf16", 128, False, 2.0, None),
+    ("hmm1024_g8_fp32_B100", 1024, 1, 8, 8, "fp32", 100, True, 2.0, None),
+    ("hmm2048x2_T6", 2048, 2, 64, 6, "bf16", 64, False, 2.0, None),
+    ("hmm1024_T40", 1024, 1, 16, 40, "bf16", 64, False, 2.0, None),                 # 39 copies, one flow block
+    ("hmm1024_T9_two_slots", 1024, 1, 64, 9, "fp32", 64, True, 2.0, _slots_mb(1, 1024, 1024, 64, 2)),  # S = 2
+    ("hmm1024_B600_two_slots_a_step", 1024, 1, 64, 6, "bf16", 600, False, 2.0, None),   # W = 320, 2 slots a step
+    ("hmm1024_B600_fp32_flushed", 1024, 1, 64, 7, "fp32", 600, True, 2.0, _slots_mb(1, 1024, 1024, 320, 5)),
+    ("hmm1024_wide_gates", 1024, 1, 64, 8, "bf16", 128, False, 12.0, None),          # log-gates ~ N(0, 144)
 ]
 
 
 @needs_kernels
-@pytest.mark.parametrize("name,L,nb,gcb,T,dt,B,neg,mb", CASES, ids = [c[0] for c in CASES])
-def test_the_deferred_flows_match_float64(name, L, nb, gcb, T, dt, B, neg, mb, monkeypatch):
+@pytest.mark.parametrize("name,L,nb,gcb,T,dt,B,neg,scale,mb", CASES, ids = [c[0] for c in CASES])
+def test_the_deferred_flows_match_float64(name, L, nb, gcb, T, dt, B, neg, scale, mb, monkeypatch):
     if mb is not None:
         monkeypatch.setattr(dpar, "PAR_DEFER_MB", mb)
-    pc, phi, x = _instance(L, nb, gcb, T, dt, B, neg_gates = neg)
+    pc, phi, x = _instance(L, nb, gcb, T, dt, B, neg_gates = neg, gate_scale = scale)
     caps, flushes = _record(monkeypatch)
     pc(x, sum_external_params = phi)
     pc.backward(x, flows_memory = 0.0)
@@ -168,9 +178,36 @@ def test_the_deferred_flows_match_float64(name, L, nb, gcb, T, dt, B, neg, mb, m
     assert len(groups) == 1
 
 
+EPILOGUES = pytest.mark.parametrize("bulk", [True, False], ids = ["bulk_adds", "threads_adds"])
+
+
 @needs_kernels
-def test_it_accumulates_like_the_per_step_kernels(monkeypatch):
-    """Two backwards into `flows_memory = 1` give twice one -- the flush adds to what the buffer holds."""
+@EPILOGUES
+@pytest.mark.parametrize("dt", ["bf16", "fp32"])
+def test_both_epilogues_match_float64(bulk, dt, monkeypatch):
+    """The flush's adds as the L2's bulk reductions and as the threads' read-add-write (where an edge's run of flows is
+    not 16-byte aligned) -- the same flows; and the default is the bulk adds where the runs are aligned."""
+    if not bulk:
+        monkeypatch.setattr(dpar, "_bulk_ok", lambda pfids, pf: False)
+    pc, phi, x = _instance(2048, 2, 64, 6, dt, 96, neg_gates = True)
+    caps, flushes = _record(monkeypatch)
+    pc(x, sum_external_params = phi)
+    pc.backward(x, flows_memory = 0.0)
+    torch.cuda.synchronize()
+    f = flushes[-1]
+    assert f["bulk"] == (bulk and bool((f["pfids"] % 4 == 0).all())), f"the flush took bulk = {f['bulk']}"
+    assert bulk == f["bulk"], "these circuits' runs of flows are aligned: the default is the bulk adds"
+    _check(_block(pc.param_flows, f["pfids"], caps[0]["blk"]), _reference(caps, f["pfids"], f["pids"], f["params"]),
+           f"bulk = {bulk}")
+
+
+@needs_kernels
+@EPILOGUES
+def test_it_accumulates_like_the_per_step_kernels(bulk, monkeypatch):
+    """Two backwards into `flows_memory = 1` give twice one -- the flush adds to what the buffer holds (either
+    epilogue)."""
+    if not bulk:
+        monkeypatch.setattr(dpar, "_bulk_ok", lambda pfids, pf: False)
     pc, phi, x = _instance(1024, 1, 64, 6, "bf16", 128)
     caps, flushes = _record(monkeypatch)
     pc(x, sum_external_params = phi)
@@ -179,9 +216,51 @@ def test_it_accumulates_like_the_per_step_kernels(monkeypatch):
     pc(x, sum_external_params = phi)
     pc.backward(x, flows_memory = 1.0)
     torch.cuda.synchronize()
-    assert len(caps) == 2 * 5
+    assert len(caps) == 2 * 5 and flushes[-1]["bulk"] == bulk
     pfids, blk = flushes[0]["pfids"], caps[0]["blk"]
     _check(_block(pc.param_flows, pfids, blk), 2 * _block(one, pfids, blk), "two backwards", tol = 1e-5)
+
+
+@needs_kernels
+@EPILOGUES
+def test_an_edge_without_a_gate_adds_nothing(bulk):
+    """The kernels on their own, two steps: an edge block whose gate table entry is -1 (a ragged partition's padding)
+    adds nothing -- whatever its element row and the gate rows hold (here finite) -- and the others match float64,
+    added to the flows already there."""
+    mod = _module()
+    torch.manual_seed(0)
+    nb, blk, ne, B, cbs, E = 2, 64, 256, 40, 64, 300
+    W, S = 64, 2
+    nids = torch.tensor([0, blk], device = DEV)
+    cids = torch.randint(1, E, (nb, ne), device = DEV)
+    gate = torch.tensor([[0, 1, 2, 3], [4, -1, 5, -1]], device = DEV)        # (node block, gate column of cbs edges)
+    cids[1, cbs:2 * cbs] = 0                                                 # (padding: the dummy element)
+    cids[1, 3 * cbs:] = 0
+    pfids = (torch.arange(nb * ne, device = DEV).view(nb, ne) * blk)
+    pids = pfids.clone()
+    params = torch.rand(nb * ne * blk, device = DEV, dtype = torch.bfloat16) + 0.01
+    pf = torch.rand(nb * ne * blk, device = DEV) * 3
+    pf0 = pf.clone()
+    A = torch.zeros(nb, blk, S * W, device = DEV, dtype = torch.half)
+    Bop = torch.zeros(nb, ne, S * W, device = DEV, dtype = torch.half)
+    fA, fB = torch.ones(nb, S, blk, device = DEV), torch.ones(nb, S, ne, device = DEV)
+    M = torch.empty(nb, W, device = DEV, dtype = torch.int32)
+    steps = []
+    for slot in range(S):
+        nf, nm = torch.randn(nb * blk, B, device = DEV) * 3, torch.randn(nb * blk, B, device = DEV) * 3
+        nm[torch.rand_like(nm) < 0.05] = NEG
+        em = torch.randn(E, B, device = DEV) * 2
+        ext = torch.randn(1 + 6, B, device = DEV) * 2                       # (ext_base 1: row 0 a finite stray)
+        mod.capture(A, Bop, fA, fB, M, nf, nm, em, ext, nids, cids, gate, B, slot, cbs, cbs, 1)
+        steps.append(dict(nf = nf, nm = nm, em = em, ext = ext, nids = nids, cids = cids, gate = gate, batch = B,
+                          node_cbs = cbs, gate_cbs = cbs, ext_base = 1, blk = blk, ne = ne))
+    mod.flush(pf, A, Bop, fA, fB, pfids, pids, params, S, mod.flush_configs().index([64, 64, 32]), bulk)
+    torch.cuda.synchronize()
+    got = _block(pf, pfids, blk) - _block(pf0, pfids, blk)
+    ungated = (gate < 0).repeat_interleave(cbs, dim = 1)                    # [nb, ne]
+    assert torch.equal(_block(pf, pfids, blk)[ungated], _block(pf0, pfids, blk)[ungated]), \
+        "an ungated edge's flows changed"
+    _check(got, _reference(steps, pfids, pids, params), f"bulk = {bulk}")
 
 
 @needs_kernels

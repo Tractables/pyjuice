@@ -1,5 +1,6 @@
 """
-A tied group's gated parameter flows, deferred to one contraction (kernels/c/blockscale_par_deferred.cu).
+A tied group's gated parameter flows, deferred to one contraction (kernels/c/blockscale_par_deferred_fp16.cu: fp16
+operands with a power-of-two scale per (row, slot)).
 
 Tied copies of a gated sum node -- a homogeneous HMM's steps -- write their parameter flows into ONE flow block
 (compilation gives up to `max_tied_ns_per_parflow_block` copies the same `_param_flow_range`). Step by step, each
@@ -19,6 +20,7 @@ A layer defers (`try_defer`) only when all of these hold, each checked, none ass
     smaller one's backward is host-bound, and there the flush after the last layer costs more than it saves);
   * the slots fit `PAR_DEFER_MB` with room for two steps (a full group flushes and goes on).
 A group's slots belong to the scope that filled them: a new backward -- also after one that raised -- starts empty.
+A slot is at most 512 of a step's columns (its rows' scales its own): a batch past 512 takes `cps` slots a step.
 """
 
 from __future__ import annotations
@@ -32,10 +34,12 @@ from pyjuice.utils.deferred import current_scope
 #: The operand slots a group may hold (MB).
 PAR_DEFER_MB = 128
 
-#: The smallest group (flows per step) that defers. The kernels win from ~1M flows (MEASURED, gate width 64, B 128,
-#: their time against the per-step Triton kernels': 262K flows (HMM-512 in 2 blocks, 15 steps) 67 -> 81 us; 1M
-#: (HMM-1024, 7 steps) 74 -> 56, 31 steps 345 -> 219; 16.8M (HMM-4096 in 4 blocks, 7 steps) 769 -> 364), but a
-#: host-bound backward hides the per-step kernels in the GPU's idle time and exposes the flush after its last layer:
+#: The smallest group (flows per step) that defers. The kernels win from ~1M flows (MEASURED with the TF32 operands
+#: of kernels/c/blockscale_par_deferred.cu -- the fp16 flush beats theirs 1.4-1.8x, not re-measured here --, gate
+#: width 64, B 128, their time against the per-step Triton kernels': 262K flows (HMM-512 in 2 blocks, 15 steps)
+#: 67 -> 81 us; 1M (HMM-1024, 7 steps) 74 -> 56, 31 steps 345 -> 219; 16.8M (HMM-4096 in 4 blocks, 7 steps)
+#: 769 -> 364), but a host-bound backward hides the per-step kernels in the GPU's idle time and exposes the flush
+#: after its last layer:
 #: the whole tied backward, off -> on, HMM-4096 in 4 blocks 7 steps 1.87 -> 1.47 ms (B 512 5.01 -> 3.99, fp32
 #: 2.11 -> 1.52) against HMM-2048 in 2 blocks (4M flows) 15 steps 2.26 -> 2.40 and HMM-1024 31 steps 4.64 -> 4.47.
 MIN_FLOWS = 1 << 23
@@ -57,23 +61,30 @@ def _groups_of(pf, create: bool):
 class _Group:
     """The operand slots of one flow block at one batch size, and the tables every member shares."""
 
-    def __init__(self, pfids, pids, nb, blk, ne, batch, device):
-        self.Bp = (batch + 31) // 32 * 32
-        per_slot = nb * (blk + ne) * self.Bp * 4
-        self.S = int(min(64, (PAR_DEFER_MB * 2 ** 20) // per_slot))
+    def __init__(self, pfids, pids, nb, blk, ne, batch, pf):
+        Bp = (batch + 31) // 32 * 32
+        self.cps = (Bp + 511) // 512                           # slots a step
+        self.W = (Bp // 32 + self.cps - 1) // self.cps * 32    # a slot's columns, a multiple of 32 up to 512
+        per_slot = nb * (blk + ne) * (self.W * 2 + 4)          # (fp16 values, a float scale a row)
+        self.S = int(min(64, (PAR_DEFER_MB * 2 ** 20) // per_slot)) // self.cps * self.cps
         self.pfids, self.pids = pfids, pids
+        self.bulk = _bulk_ok(pfids, pf)
         self.slots, self.scope, self.cfg = 0, None, None
-        if self.S >= 2:
-            self.A = torch.zeros(nb, blk, self.S * self.Bp, device = device)
-            self.Bop = torch.zeros(nb, ne, self.S * self.Bp, device = device)
-            self.M = torch.empty(nb, self.Bp, device = device, dtype = torch.int32)
+        if self.S >= 2 * self.cps:
+            dev = pf.device
+            self.A = torch.zeros(nb, blk, self.S * self.W, device = dev, dtype = torch.half)
+            self.Bop = torch.zeros(nb, ne, self.S * self.W, device = dev, dtype = torch.half)
+            self.fA = torch.ones(nb, self.S, blk, device = dev)
+            self.fB = torch.ones(nb, self.S, ne, device = dev)
+            self.M = torch.empty(nb, self.cps * self.W, device = dev, dtype = torch.int32)
 
     def flush(self, mod, pf, params):
         if self.slots == 0:
             return
         if self.cfg is None:
             self.cfg = self._pick_cfg(mod, pf, params)
-        mod.flush(pf, self.A, self.Bop, self.pfids, self.pids, params, self.slots, self.Bp, self.cfg)
+        mod.flush(pf, self.A, self.Bop, self.fA, self.fB, self.pfids, self.pids, params, self.slots, self.cfg,
+                  self.bulk)
         self.slots = 0
 
     def _pick_cfg(self, mod, pf, params):
@@ -82,13 +93,18 @@ class _Group:
 
         blk, ne = self.A.size(1), self.Bop.size(1)
         cands = [i for i, (bm, bn, bk) in enumerate(mod.flush_configs())
-                 if blk % bm == 0 and ne % bn == 0 and (self.slots * self.Bp) % bk == 0]
+                 if blk % bm == 0 and ne % bn == 0 and self.W % bk == 0]
         if len(cands) == 1 or torch.cuda.is_current_stream_capturing():
             return cands[0]
         scr = pf.clone()
-        trials = [(c, (lambda c = c: mod.flush(scr, self.A, self.Bop, self.pfids, self.pids, params, self.slots,
-                                                self.Bp, c))) for c in cands]
+        trials = [(c, (lambda c = c: mod.flush(scr, self.A, self.Bop, self.fA, self.fB, self.pfids, self.pids, params,
+                                                self.slots, c, self.bulk))) for c in cands]
         return ck.autotune(trials) or cands[0]
+
+
+def _bulk_ok(pfids, pf) -> bool:
+    """Whether the flush's adds can be the L2's bulk reductions: every edge's run of flows 16-byte aligned."""
+    return bool((pfids % 4 == 0).all()) and pf.data_ptr() % 16 == 0
 
 
 def _long(t):
@@ -128,8 +144,9 @@ def try_defer(mod, layer, ctx, gate_table, ext, node_cbs, gate_cbs, ext_base, n_
         groups = _groups_of(pf, create = True)
         group = groups.get(gkey)
         if group is None and tied:
-            group = groups[gkey] = _Group(pfids, pids, nb, blk, ne, batch, pf.device)
-        ok = (group is not None and group.S >= 2 and torch.equal(group.pfids, pfids) and torch.equal(group.pids, pids))
+            group = groups[gkey] = _Group(pfids, pids, nb, blk, ne, batch, pf)
+        ok = (group is not None and group.S >= 2 * group.cps and torch.equal(group.pfids, pfids)
+              and torch.equal(group.pids, pids))
         member = cache[mkey] = ((gkey, _long(ctx["nids"]).contiguous(), _long(ctx["cids"]).contiguous(),
                                  _long(gate_table).contiguous()) if ok else False)
     if member is False:
@@ -142,9 +159,9 @@ def try_defer(mod, layer, ctx, gate_table, ext, node_cbs, gate_cbs, ext_base, n_
     if group.scope is not scope:                               # a new backward: whatever a past one left is dropped
         group.slots, group.scope = 0, scope
         scope.defer(lambda: group.flush(mod, pf, params))
-    if group.slots == group.S:                                 # full: add what the slots hold, then go on
+    if group.slots + group.cps > group.S:                      # full: add what the slots hold, then go on
         group.flush(mod, pf, params)
-    mod.capture(group.A, group.Bop, group.M, ctx["node_flows"], ctx["node_mars"], ctx["element_mars"], ext, nids,
-                cids, gtab, batch, group.slots, node_cbs, gate_cbs, ext_base)
-    group.slots += 1
+    mod.capture(group.A, group.Bop, group.fA, group.fB, group.M, ctx["node_flows"], ctx["node_mars"],
+                ctx["element_mars"], ext, nids, cids, gtab, batch, group.slots, node_cbs, gate_cbs, ext_base)
+    group.slots += group.cps
     return True

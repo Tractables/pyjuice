@@ -546,7 +546,7 @@ class _BackwardMixin:
         elep_mod = _mod("c").get_ele_prepass_module()
         eles_mod = _mod("c").get_ele_stream_module() if params.dtype == torch.bfloat16 else None
         # A tied group's parameter flows may be left to the end of the pass (`deferred_par`), if the backward allows it
-        pd_mod = _mod("c").get_par_deferred_module()
+        pd_mod = _mod("c").get_par_deferred_fp16_module()
         _set_attrs(layer, _bs_defer = bool(kwargs.get("defer_param_flows", False)))
 
         batch_size, block_size = state["batch_size"], state["block_size"]
