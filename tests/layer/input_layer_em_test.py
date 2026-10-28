@@ -1,9 +1,12 @@
 """
 The input layer's mini-batch EM update in a kernel of its own (`pyjuice.layer.kernels.input_em`, `Categorical`'s
-`em_layer_fn`) against the layer's template running `em_fn`: the same bits, over Categorical layers of several shapes
--- an HMM's tied emissions (few source nodes, the tied nodes' flows accumulated first), variables of mixed category
-counts in one layer, 2 and 256 categories, many nodes, some parameters exactly zero -- with and without
-`keep_zero_params`. Past 256 categories the template's other `em_fn` runs, and the kernel is not taken.
+`em_layer_fn`) and the layer's template running `em_fn`, both against a float64 reference of the update computed
+from the same parameters and flows (the kernel sums a node's flows in another order than the template: the two agree
+to an fp32 sum's rounding, so the reference is the oracle, and the template is held to it too), over Categorical
+layers of several shapes -- an HMM's tied emissions (few source nodes, the tied nodes' flows accumulated first),
+variables of mixed category counts in one layer, 2 and 256 categories, many nodes, some parameters exactly zero --
+with and without `keep_zero_params`. Past 256 categories the template's other `em_fn` runs, and the kernel is not
+taken.
 """
 import pytest
 import torch
@@ -90,6 +93,26 @@ def _counted(monkeypatch):
     return calls
 
 
+def _reference(layer, params, flows, step_size, pseudocount, keep_zero_params):
+    """The template's update (`Categorical.small_ncats_em_fn`) in float64, node by node."""
+    p64, f64 = params.double(), flows.double()
+    out = p64.clone()
+    for i in layer.source_nids.tolist():
+        pid, pfid = int(layer.s_pids[i]), int(layer.s_pfids[i])
+        nc = int(layer.metadata[int(layer.s_mids[i])])
+        theta, fl = p64[pid:pid + nc], f64[pfid:pfid + nc]
+        num_pc = pseudocount / nc
+        if keep_zero_params:
+            zero = theta < 1e-12
+            cum = (fl + num_pc)[~zero].sum()
+            new = (1.0 - step_size) * theta + step_size * (fl + num_pc) / cum
+            new[zero] = 0.0
+        else:
+            new = (1.0 - step_size) * theta + step_size * (fl + num_pc) / (fl.sum() + pseudocount)
+        out[pid:pid + nc] = new
+    return out
+
+
 def _both(layer, keep_zero_params, monkeypatch):
     """The layer's update by its own kernel and by the template, from the same parameters and flows."""
     params, flows = layer.params.clone(), layer.param_flows.clone()
@@ -109,17 +132,23 @@ def _both(layer, keep_zero_params, monkeypatch):
 @cuda_only
 @pytest.mark.parametrize("keep_zero_params", [False, True])
 @pytest.mark.parametrize("name,builder", CASES, ids = [c[0] for c in CASES])
-def test_its_own_kernel_gives_the_templates_bits(name, builder, keep_zero_params, monkeypatch):
+def test_its_own_kernel_and_the_template_give_the_reference(name, builder, keep_zero_params, monkeypatch):
     pc = _instance(builder)
     layers = list(pc.input_layer_group)
     assert layers
     for layer in layers:
         calls = _counted(monkeypatch)
+        flows = layer.param_flows.clone()
         own, template, before = _both(layer, keep_zero_params, monkeypatch)
         assert calls[0] == 1, f"{name}: the layer's own kernel did not run"
         assert not torch.equal(own, before), f"{name}: nothing was updated"
-        assert torch.equal(own.view(torch.int32), template.view(torch.int32)), \
-            f"{name}: the update differs from the template's (max {float((own - template).abs().max()):.2e})"
+        ref = _reference(layer, before, flows, 0.3, 0.1, keep_zero_params)
+        for what, got in (("the kernel", own), ("the template", template)):
+            rel = float(((got.double() - ref).abs() / ref.abs().clamp_min(1e-30)).max())
+            assert rel < 2e-5, f"{name}: {what}'s update is {rel:.2e} from the float64 reference"
+        # (the two sum the flows in other orders: an fp32 sum's rounding apart at most)
+        rel = float(((own - template).abs() / template.abs().clamp_min(1e-30)).max())
+        assert rel < 2e-5, f"{name}: the kernel and the template differ by {rel:.2e}"
         if keep_zero_params:
             assert torch.all(own[before == 0] == 0), f"{name}: a zero parameter moved"
 
