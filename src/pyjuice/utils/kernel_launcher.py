@@ -44,6 +44,12 @@ class FastJITFunction3x:
     """
 
     def __init__(self, fn: Callable):
+        # Probe the optional launch ABI before constructing a JITFunction.
+        # Older Triton 3.x releases lack knobs; the caller then builds the
+        # stock fallback once instead of parsing every kernel's source twice.
+        from triton.runtime import driver as _driver
+        from triton import knobs as _knobs
+
         self.jit_fn = triton.jit(fn)
         self.params = self.jit_fn.params
         self.n_params = len(self.params)
@@ -52,10 +58,6 @@ class FastJITFunction3x:
         self.name_to_idx = {p.name: i for i, p in enumerate(self.params)}
         self.cache = dict()
         self.binders = dict()                                    # call pattern -> its binder (None: generic)
-        # Imported here (not at module load) so plain `import pyjuice` never depends on these triton
-        # internals on triton versions where this fast path is unused.
-        from triton.runtime import driver as _driver
-        from triton import knobs as _knobs
         self._driver = _driver
         self._knobs = _knobs
 
