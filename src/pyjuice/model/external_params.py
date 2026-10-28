@@ -45,8 +45,10 @@ def _staged_transposes_batched(fn, fast: list) -> bool:
     Every `fast` pair's transpose in ONE launch of the CUDA extension's batched sibling, where `fn` is the
     extension's own transpose (a test forcing another tier keeps it) and every pair is contiguous float32 of equal
     sizes on one device; False (nothing launched) otherwise. One call per pair was most of a forward's staging
-    host time: MEASURED 83 us at a tied gated HMM-2048 x4 (15 nodes). The launch's table holds the pairs' addresses
-    and sizes -- nothing derived from them --, kept by value for the next call with the same ones.
+    host time: MEASURED 83 us at a tied gated HMM-2048 x4 (15 nodes). The pairs' addresses and sizes go to the
+    launch by value -- nothing on the device to upload or to keep by address, so a caller handing fresh tensors
+    every call (a head's output, new gradient buffers) costs no more than one with stable ones, and what the
+    backward launches never depends on where the allocator put them.
     """
     from pyjuice.nodes.external_params.kernels.c import get_module
     mod = get_module()
@@ -62,20 +64,10 @@ def _staged_transposes_batched(fn, fast: list) -> bool:
             return False
         batch = src.size(0)
         n = src.numel() // max(batch, 1)
-        rows.append((src.data_ptr(), dst.data_ptr(), batch, n))
+        rows += (src.data_ptr(), dst.data_ptr(), batch, n)
         max_b, max_n = max(max_b, batch), max(max_n, n)
-    key = (device, tuple(rows))
-    table = _PAIR_TABLES.get(key)
-    if table is None:
-        from pyjuice.utils.util import device_scalars
-        if len(_PAIR_TABLES) >= 16:
-            _PAIR_TABLES.clear()
-        table = _PAIR_TABLES[key] = device_scalars(rows, device, dtype = torch.int64)
-    batched(table, max_b, max_n)
+    batched(rows, max_b, max_n)
     return True
-
-
-_PAIR_TABLES = dict()
 
 
 def _staged_copy(plain_d: list, plain_s: list, fast: list) -> None:
@@ -133,25 +125,45 @@ class _ExternalParamsMixin:
         if not dsts:
             return None
 
-        d, s = [], []
+        d, s, fast = [], [], []
         # A node's views of the gradient buffer are the same objects every call at a batch size
         # (`_external_params_views` caches them), and `from_storage` is a layout mapping of them: kept per node
-        # against those views' identity (~3 us a node, every backward).
+        # against those views' identity (~3 us a node, every backward). Where the storage layout rotates the batch
+        # axis to the end (`_ext_ns_static`) and the caller's tensor is contiguous fp32, the copy is the staging
+        # transpose the other way round -- `[N, B] -> [B, N]`, the same kernel with the sides swapped -- and every
+        # such pair goes in ONE launch: `_foreach_copy_` on the transposed views issued one copy kernel per tensor
+        # (MEASURED, a tied gated HMM-2048 x4, 15 nodes: 15 launches a backward, ~10 us of host each).
         src_cache = self.__dict__.setdefault("_external_grad_src_cache", {})
         for ns, tensors in dsts.items():
             views = self._staged_external_params_grad[ns]
             hit = src_cache.get(ns)
             if hit is not None and hit[0] is views:
-                src = hit[1]
+                src, flat = hit[1], hit[2]
             else:
                 src = ns.external_params.from_storage(ns, views)
-                src_cache[ns] = (views, src)
+                rotates, _ = self._ext_ns_static(ns)
+                # the storage views as `[N, B]`, the transpose's source (None where the layout is not that rotation)
+                flat = tuple(v.view(-1, v.size(-1)) for v in views) if rotates else None
+                src_cache[ns] = (views, src, flat)
             if torch.is_tensor(tensors):
                 tensors = (tensors,)
-            for dst, one in zip(tensors, src):
-                d.append(dst)
-                s.append(one)
+            for i, (dst, one) in enumerate(zip(tensors, src)):
+                if flat is not None and dst.is_contiguous() and dst.dtype == torch.float32 and dst.dim() >= 2:
+                    fast.append((dst, flat[i]))
+                else:
+                    d.append(dst)
+                    s.append(one)
 
+        if fast:
+            fn = _staging_transpose_fn()
+            if len(fast) > 1 and _staged_transposes_batched(fn, fast):
+                fast = []
+            for dst, src in fast:
+                if fn is not None:
+                    fn(dst, src, src.size(0), src.size(1))   # dst[b, n] = src[n, b]: the transpose, sides swapped
+                else:
+                    d.append(dst)
+                    s.append(src.permute(1, 0).view(dst.shape))
         if d:
             torch._foreach_copy_(d, s)
 

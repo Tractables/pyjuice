@@ -9,6 +9,7 @@
 // low-rank kernels down with it.
 
 #include <torch/extension.h>
+#include <vector>
 
 // ---- lowrank_forward.cu ----
 void lowrank_forward(torch::Tensor node_mars, torch::Tensor element_mars, torch::Tensor ext,
@@ -35,7 +36,7 @@ void lowrank_shift_logz(torch::Tensor node_mars, torch::Tensor nids, torch::Tens
 
 // ---- staging_transpose.cu ----
 void staging_transpose(torch::Tensor dst, torch::Tensor src, int64_t B, int64_t N);
-void staging_transpose_batched(torch::Tensor table, int64_t max_b, int64_t max_n);
+void staging_transpose_batched(const std::vector<int64_t>& rows, int64_t max_b, int64_t max_n);
 
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -48,5 +49,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("staging_transpose", &staging_transpose,
           "Tiled [B, N] -> [N, B] copy for staging batch-innermost external parameters");
     m.def("staging_transpose_batched", &staging_transpose_batched,
-          "Several staging transposes in one launch, from an int64 [pairs, 4] table (src, dst, B, N)");
+          "Several staging transposes in one launch, the pairs (src, dst, B, N) flat, by value");
 }
