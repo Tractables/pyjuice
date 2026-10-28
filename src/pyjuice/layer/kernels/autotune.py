@@ -200,6 +200,30 @@ def pick(key, candidates: list, bench, warmup: int = 3, reps: int = 7):
     return cfg
 
 
+def choose(key, candidates: list):
+    """The winner of a fast-path gate's comparison -- `candidates` as `best_of` takes them, ``(choice, run)``
+    pairs with the reference (the plain Triton launch) first --, measured at most ONCE per `key` and cached
+    process-wide as `pick` caches: `key` describes the launch's SHAPE, so structurally identical layers share one
+    answer. The arms of a {CUDA, Triton} gate are numerically equivalent but NOT bit-identical (~1e-6 apart),
+    so two identical models whose layers each measured their own could disagree in the last bits.
+
+    Unlike `pick`, it measures whatever `ENABLED` says, as these gates always have. During a CUDA graph capture
+    an unmeasured key takes the reference, uncached (measuring synchronizes). The reference too when no
+    candidate can run.
+    """
+    key = _full_key(key)
+    choice = _CACHE.get(key)
+    if choice is not None:
+        return choice
+    if _capturing():
+        return candidates[0][0]
+    choice = best_of(candidates)
+    if choice is None:
+        choice = candidates[0][0]
+    _CACHE[key] = choice
+    return choice
+
+
 def scratch_like(tensor: torch.Tensor):
     """A throwaway buffer to benchmark a read-accumulate-write kernel into, or None if it cannot
     be allocated (in which case the caller must skip tuning rather than touch the live output)."""

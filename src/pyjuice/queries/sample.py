@@ -447,7 +447,7 @@ def sample(pc: TensorCircuit, num_samples: Optional[int] = None, conditional: bo
     """
 
     # PIN THE CURRENT DEVICE to the circuit's own, the way `forward` / `backward` / `mini_batch_em`
-    # do (`device_grad_controller`, tensorcircuit.py). `pc.to("cuda:1")` does NOT move the current
+    # do (`device_grad_controller`, model/common.py). `pc.to("cuda:1")` does NOT move the current
     # device -- it stays wherever it was -- and this pass launches its own kernels rather than going
     # through `pc.forward`, so without this Triton validates the pointers against the wrong context.
     # It then either refuses them ("Pointer argument (at 0) cannot be accessed from Triton (cpu

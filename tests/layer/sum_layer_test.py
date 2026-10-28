@@ -151,7 +151,7 @@ def test_corner_case():
     batch_sizes = [4, 4, 8, 16, 8, 16,  8,  8, 16, 32]
     
     for block_size, batch_size in zip(block_sizes, batch_sizes):
-        for force_use_fp16, force_use_fp32 in ((False, False), (True, False), (False, True)):
+        for precision in ("auto", "tf32", "fp32"):
     
             with juice.set_block_size(block_size):
 
@@ -227,7 +227,7 @@ def test_corner_case():
 
             params = torch.rand([block_size ** 2 + 3 * 4 * block_size * block_size]).to(device)
 
-            layer(node_mars, element_mars, params, force_use_fp16 = force_use_fp16, force_use_fp32 = force_use_fp32)
+            layer(node_mars, element_mars, params, precision = precision)
 
             for i in range(block_size):
                 for j in range(6):

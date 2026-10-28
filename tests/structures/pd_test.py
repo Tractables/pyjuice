@@ -63,6 +63,7 @@ def full_batch_em_epoch(pc, train_loader, test_loader, device):
         print(f"[train LL: {train_ll:.2f}; test LL: {test_ll:.2f}].....[train forward+backward+step {t1-t0:.2f}; test forward {t2-t1:.2f}] ")
 
 
+@pytest.mark.slow
 def test_pd():
 
     device = torch.device("cuda:0")
@@ -139,6 +140,7 @@ def test_pd():
     assert test_ll > -765.0
 
 
+@pytest.mark.slow
 def test_homogeneous_pd():
 
     device = torch.device("cuda:0")

@@ -40,7 +40,8 @@ def test_hclt_forward():
     data_cpu = batch_data.cpu().long()
     batch_size = batch_data.size(0)
 
-    lls = pc(batch_data, force_use_fp32 = True)
+    pc.precision = "tf32"                       # no bf16 products: a tight comparison
+    lls = pc(batch_data)
 
     node_mars = pc.node_mars.cpu()
 

@@ -5,11 +5,11 @@ from sphinx_gallery.sorting import FileNameSortKey
 # -- Project information
 
 project = 'PyJuice'
-copyright = '2021, StarAI'
-author = 'StarAI'
+copyright = '2026, Anji Liu'
+author = 'Anji Liu'
 
-release = '2.6.3'
-version = '2.6.3'
+release = '2.7.0'
+version = '2.7.0'
 
 # -- General configuration
 

@@ -1,0 +1,949 @@
+"""
+The lifted forward pass (`cc.marginal`) against the reference in conftest.py, on every kind of PC there:
+HMMs (tied, untied, block-sparse transitions), their left-linear mirror, 1-D PDs (plain, sum-sharing with block-sparse sum edges,
+blockified) and hand-built circuits (three- and four-child products, a sum over an input node, permuted and
+node-level product edges, an edge block listed twice, block size 1). Also: the one-state constraint gives
+pyjuice's own marginal, an unsatisfiable constraint or evidence that breaks the constraint gives -inf, and
+TF32 products stay close to the fp32 default.
+"""
+import contextlib
+import math
+import random
+
+import pytest
+import torch
+import triton
+import triton.language as tl
+
+import pyjuice as juice
+import pyjuice.constraints as jc
+from pyjuice.constraints.inference.dfa_exact.kernels.common import _lse_step
+from pyjuice.constraints.inference.dfa_exact.kernels.prod import _lse_step_one_exp
+from pyjuice.constraints.inference.dfa_exact.queries.marginal import marginal
+
+V = 3
+KINDS = {"hmm": 6, "hmm_untied": 6, "hmm_block_sparse": 6, "left_linear": 6, "pd": 8, "pd_prod_dominated": 8, "pd_blockified": 8,
+         "hand": 5, "hand_permuted": 5, "hand_unit": 4, "hand_left": 5, "hand_shared": 4}   # see conftest.py
+
+CONSTRAINTS = {
+    "contains": lambda: jc.DFA.contains([[1, 2]], V),
+    "contains_either_and_not": lambda: jc.DFA.contains([[0, 1, 1], [2, 0]], V) & jc.Not(jc.DFA.contains([[2, 2]], V)),
+}
+
+
+def evidence(n, B, seed = 0):
+    """Row 0 all missing (p(C) alone), row 1 all observed, the rest random."""
+    g = torch.Generator().manual_seed(seed)
+    data = torch.randint(0, V, (B, n), generator = g)
+    missing = torch.rand(B, n, generator = g) < 0.5
+    missing[0] = True
+    if B > 1:
+        missing[1] = False
+    return data, missing
+
+
+def assert_close(got, want, n):
+    assert got.shape == want.shape
+    assert torch.equal(torch.isneginf(got), torch.isneginf(want))
+    fin = torch.isfinite(want)
+    assert torch.isfinite(got[fin]).all()
+    tol = 1e-5 * want[fin].abs() + n * 1e-6
+    assert ((got[fin] - want[fin]).abs() <= tol).all(), (got[fin] - want[fin]).abs().max()
+
+
+@pytest.fixture(params = ["fused", "dense"])
+def sum_path(request, monkeypatch):
+    """Run the sum layers' node blocks through the fused kernel only, or through the dense (cuBLAS) path wherever
+    they qualify -- the test circuits' blocks are far below the size the dense path is used from by default."""
+    from pyjuice.constraints.inference.dfa_exact.kernels import sum as lifted_sum
+    monkeypatch.setattr(lifted_sum, "DENSE_MIN_BLOCK", 1 if request.param == "dense" else 1 << 30)
+    return request.param
+
+
+@pytest.fixture(params = ["classes", "entries", "grouped"])
+def transitions(request, monkeypatch):
+    """A missing token's transitions one class at a time (every class of the automaton, or a column's live entries),
+    or grouped by successor through transition masses (the test automata have far fewer classes than grouping is
+    used from by default, and most of their (column, class) pairs are live)."""
+    import pyjuice.constraints.inference.dfa_exact.compiled.program as P
+    monkeypatch.setattr(P, "GROUP_MIN_RATIO", 0 if request.param == "grouped" else 1 << 30)
+    monkeypatch.setattr(P, "ENTRY_LOOP_MAX_LIVE", 2 if request.param == "entries" else 0)
+    return request.param
+
+
+@pytest.mark.parametrize("constraint", list(CONSTRAINTS))
+@pytest.mark.parametrize("B", [1, 3, 16])
+@pytest.mark.parametrize("kind", list(KINDS))
+def test_marginal_matches_the_reference(kind, B, constraint, sum_path, transitions, build_pc, reference):
+    n = KINDS[kind]
+    cc = jc.compile(CONSTRAINTS[constraint](), build_pc(kind, n, V))
+    data, missing = evidence(n, B)
+    assert_close(cc.marginal(data, missing, storage = "dense"), reference.marginal(cc, data, missing), n)
+
+
+#: no block @ block product: compact inside values are dense's bit for bit through the fused sums (a compact block @
+#: block product sums the live shared columns only, in other groups)
+BIT_EXACT_KINDS = ["hmm", "hmm_untied", "hmm_block_sparse", "left_linear", "hand_left"]
+
+
+def nan_storages(cc):
+    """Fill the inside values' storages with NaN: a lane read before it is written shows."""
+    for name in ("node_mars", "element_mars", "product_scratch"):
+        storage = cc.backend.state.storage(name)
+        if storage is not None:
+            storage.fill_(float("nan"))
+
+
+@pytest.mark.parametrize("kept", [False, True])
+@pytest.mark.parametrize("B", [1, 3, 16])
+@pytest.mark.parametrize("kind", list(KINDS))
+def test_compact_marginal_is_the_dense_one(kind, B, kept, sum_path, transitions, build_pc, reference):
+    """``storage = "compact"``: every sample's inside values over the pairs of its live columns only (see
+    kernels/compact.py), every lane written (the storage filled with NaN between two runs) -- the reference's
+    marginal, and the dense storage's, bit for bit through the fused sums, which compute each lane alone. ``kept``:
+    inside fast_inference, every sample observing positions 1 .. n / 2, the values of scopes before or after them
+    kept once, which the compact products read by slot. With block @ block products, up to fp32 rounding."""
+    n = KINDS[kind]
+    cc = jc.compile(CONSTRAINTS["contains"](), build_pc(kind, n, V))
+    data, missing = evidence(n, B)
+    if kept:
+        missing[:] = (torch.arange(n) < 1) | (torch.arange(n) >= n // 2)
+    with juice.fast_inference() if kept else contextlib.nullcontext():
+        dense = cc.marginal(data, missing)
+        report = {}
+        marginal(cc.backend, data, missing, report = report, storage = "compact")
+        nan_storages(cc)
+        got = marginal(cc.backend, data, missing, report = report, storage = "compact")
+    assert report["compact"] is not None and report["compact"].mars is not None
+    assert not kept or report["plan"].prior
+    assert_close(got, reference.marginal(cc, data, missing), n)
+    if sum_path == "fused" and kind in BIT_EXACT_KINDS:
+        assert torch.equal(got, dense)
+    else:
+        assert_close(got, dense, n)
+
+
+@pytest.mark.parametrize("kind", ["hmm", "left_linear", "hand_left"])
+def test_compact_inside_values_take_their_live_pairs_only(kind, build_pc):
+    """Compact, ``node_mars`` holds the input rows and the per-sample regions' rows of every sample's live pairs, and
+    ``element_mars`` its products' -- less than dense under a prefix, which leaves a column live per sample at every
+    boundary it covers."""
+    n = KINDS[kind]
+    cc = jc.compile(CONSTRAINTS["contains"](), build_pc(kind, n, V))
+    B = 8
+    data, missing = evidence(n, B)
+    missing[:] = torch.arange(n) >= n - 1
+    report = {}
+    marginal(cc.backend, data, missing, report = report, storage = "compact")
+    mars, dense = report["compact"].mars, cc.backend.state.batch_layout(B)
+    assert cc.backend.state.storage("node_mars").numel() == mars["node_size"] < dense["node_size"]
+    assert cc.backend.state.storage("element_mars").numel() == mars["element_size"] < dense["element_size"]
+
+
+@pytest.mark.parametrize("storage", ["dense", "compact"])
+@pytest.mark.parametrize("kind", ["pd", "pd_prod_dominated", "pd_blockified", "hand"])
+def test_a_wide_automaton_matches_the_reference(kind, storage, sum_path, build_pc, reference):
+    """A 48-state random automaton: interval nodes keep only the pairs of columns it joins -- a fraction of them on
+    some intervals -- and the marginal matches the reference, which keeps every pair. Compact, a sample observing
+    nothing has more than 32 live columns at a boundary: its rectangles span several tiles of a block @ block product
+    each way."""
+    rng = random.Random(0)
+    K, n = 48, KINDS[kind]
+    dfa = jc.DFA.from_dense(V, [[rng.randrange(K) for _ in range(V)] for _ in range(K)], 0, rng.sample(range(K), 12))
+    cc = jc.compile(dfa, build_pc(kind, n, V))
+    data, missing = evidence(n, 4)
+    got = cc.marginal(data, missing, storage = storage)
+    assert (cc.backend.program().intervals.info[:, 1] >= 0).any()           # some interval keeps a fraction
+    assert_close(got, reference.marginal(cc, data, missing), n)
+
+
+@pytest.mark.parametrize("kind", list(KINDS))
+def test_the_one_state_constraint_gives_pyjuices_marginal(kind, build_pc):
+    n = KINDS[kind]
+    pc = build_pc(kind, n, V)
+    data, missing = evidence(n, 8, seed = 1)
+    want = juice.queries.marginal(pc, data = data.cuda(), missing_mask = missing.cuda())
+    cc = jc.compile(jc.DFA.anything(V), pc)
+    assert_close(cc.marginal(data, missing), want.float(), n)
+
+
+@pytest.mark.parametrize("kind", ["hmm", "pd", "hand"])
+def test_missing_mask_forms(kind, build_pc):
+    n = KINDS[kind]
+    cc = jc.compile(CONSTRAINTS["contains"](), build_pc(kind, n, V))
+    data, _ = evidence(n, 4)
+    shared = torch.rand(n) < 0.5
+    assert torch.equal(cc.marginal(data, shared), cc.marginal(data, shared[None].expand(4, n)))
+    assert torch.equal(cc.marginal(data), cc.marginal(data, torch.zeros(4, n, dtype = torch.bool)))
+    with pytest.raises(ValueError, match = "missing_mask"):
+        cc.marginal(data, torch.zeros(4, n + 1, dtype = torch.bool))
+
+
+@pytest.mark.parametrize("storage", ["dense", "compact"])
+@pytest.mark.parametrize("kind", ["hmm", "pd", "hand_unit", "hand_left"])
+def test_impossible_is_minus_inf(kind, storage, build_pc):
+    """Compact, evidence that breaks the constraint leaves its samples no live pair, and when every sample's does, no
+    lane at all."""
+    n = KINDS[kind]
+    pc = build_pc(kind, n, V)
+    data, missing = evidence(n, 4)
+    assert torch.isneginf(jc.compile(jc.DFA.nothing(V), pc).marginal(data, missing, storage = storage)).all()
+    too_long = jc.DFA.contains([[1] * (n + 1)], V)                        # cannot fit in n tokens
+    assert torch.isneginf(jc.compile(too_long, pc).marginal(data, missing, storage = storage)).all()
+    cc = jc.compile(jc.Not(jc.DFA.contains([[1]], V)), pc)                 # no token 1 anywhere
+    data[:, 0], missing[:, 0] = 1, False                                   # ... but every row observed one
+    assert torch.isneginf(cc.marginal(data, missing, storage = storage)).all()
+    data[0, 0] = 0                                                         # ... but one
+    got = cc.marginal(data, missing, storage = storage)
+    assert torch.isfinite(got[0]).all() and torch.isneginf(got[1:]).all()
+
+
+@pytest.mark.parametrize("kind", ["hmm_block_sparse", "pd_prod_dominated", "hand_permuted"])
+def test_tf32_products_stay_close(kind, sum_path, build_pc):
+    """The tf32 and bf16 marginals within 1e-2 of fp32's, -inf where they are; an unknown precision is refused."""
+    n = KINDS[kind]
+    cc = jc.compile(CONSTRAINTS["contains"](), build_pc(kind, n, V))
+    data, missing = evidence(n, 16)
+    fp32 = cc.marginal(data, missing)
+    fin = torch.isfinite(fp32)
+    for precision in ("tf32", "bf16"):
+        got = cc.marginal(data, missing, precision = precision)
+        assert torch.equal(fin, torch.isfinite(got)), precision
+        assert ((fp32 - got)[fin].abs() <= 1e-2).all(), precision
+    with pytest.raises(ValueError, match = "precision"):
+        cc.marginal(data, missing, precision = "fp16")
+
+
+def sum_blocks(cc, B, data, missing):
+    """Run the marginal; every sum region's rows, B * slots columns (cloned: the buffers are reused). A region the
+    marginal's plan keeps once is read in prior_mars, its one block every sample's."""
+    cc.marginal(data, missing, storage = "dense")
+    prog = cc.backend.program()
+    plan = next(reversed(prog.plans.values()))                              # the marginal's plan (most recently used)
+    bufs, prior = cc.backend.state.buffers(B), cc.backend.state.prior_buffer()
+    lay, nm = bufs["layout"], bufs["node_mars"]
+    out = []
+    for r, (first, end, slots) in enumerate(cc.backend.sum_regions):
+        if not plan.reg_prior[r]:
+            off, wid = lay["sum_offsets"][r], lay["sum_widths"][r]
+            out.append(nm[off:off + (end - first) * wid].view(end - first, wid)[:, :B * slots].clone())
+        else:
+            off, wid = prior["offset"][r], prior["width"][r]
+            out.append(prior["mars"][off:off + (end - first) * wid].view(end - first, wid)[:, :slots].repeat(1, B))
+    return out
+
+
+@pytest.mark.parametrize("kind", ["hmm", "pd", "hand", "hand_left"])
+def test_every_sample_is_a_contiguous_block(kind, build_pc):
+    """Sample b's block of every sum node is columns [b * slots, (b + 1) * slots) of its row: what a batch of one
+    puts in columns [0, slots). Where sample b observes nothing of the scope, the batch of one keeps the region's
+    input-independent block, unpruned: the batch's block then differs only by the slots evidence pruning drops."""
+    n = KINDS[kind]
+    cc = jc.compile(CONSTRAINTS["contains"](), build_pc(kind, n, V))
+    prog = cc.backend.program()
+    data, missing = evidence(n, 3)
+    batched = sum_blocks(cc, 3, data, missing)
+    for b in range(3):
+        single = sum_blocks(cc, 1, data[b:b + 1], missing[b:b + 1])
+        for r, ((first, end, slots), rb, rs) in enumerate(zip(cc.backend.sum_regions, batched, single)):
+            got = rb[:, b * slots:(b + 1) * slots]
+            lo, hi = prog.sum_ivs[prog.reg_iv_host[r]]
+            if missing[b, lo:hi].all():                                 # the batch of one: unpruned
+                fin = torch.isfinite(got)
+                assert (torch.isfinite(rs) | ~fin).all()
+            else:
+                assert torch.equal(torch.isneginf(got), torch.isneginf(rs))
+                fin = torch.isfinite(rs)
+            assert torch.allclose(got[fin], rs[fin], rtol = 1e-6, atol = 1e-6), (kind, b, first)
+
+
+def test_skipping_empty_tiles_changes_nothing(build_pc, monkeypatch):
+    """A wide automaton, so that blocks span several tiles and some (output tile, shared chunk) pairs cannot be
+    joined: skipping them gives what computing them gives."""
+    from pyjuice.constraints.inference.dfa_exact.kernels import prod
+    from pyjuice.constraints.inference.dfa_exact.compiled.layout import Reachability
+    rng = random.Random(0)
+    K, n = 48, 8
+    dfa = jc.DFA.from_dense(V, [[rng.randrange(K) for _ in range(V)] for _ in range(K)], 0, rng.sample(range(K), 12))
+    cc = jc.compile(dfa, build_pc("pd", n, V))
+    prog = cc.backend.program()
+    assert prog.skip.tiles_i > 1                                         # blocks wider than one tile
+    reach = Reachability(cc.backend.layout)
+    kept = total = 0
+    for a, b, c in prog.skip_triples:
+        lt, rt = reach.occupancy(a, b).float(), reach.occupancy(b, c).float()
+        kept += float((lt @ rt).sum())
+        total += lt.size(0) * lt.size(1) * rt.size(1)
+    assert kept < total                                                  # something is skipped
+    data, missing = evidence(n, 4)
+    with_skip = cc.marginal(data, missing, storage = "dense")
+    monkeypatch.setattr(prod, "SKIP_EMPTY_TILES", False)
+    assert_close(with_skip, cc.marginal(data, missing, storage = "dense"), n)
+
+
+@pytest.mark.parametrize("kind", ["hmm", "left_linear", "hand_left"])
+def test_every_token_its_own_class(kind, transitions, build_pc, reference):
+    """An automaton that sends every token of a 600-token vocabulary its own way: 600 token classes, so the
+    class masses take the class-order pass and every column has far fewer successors than classes (an HMM reads
+    its inputs before a block, hand_left after one), one class at a time or grouped. The marginal still matches
+    the reference."""
+    from pyjuice.constraints.distributions import categorical
+    rng = random.Random(0)
+    V2, K, n = 600, 6, KINDS[kind]
+    dfa = jc.DFA.from_dense(V2, [[rng.randrange(K) for _ in range(V2)] for _ in range(K)], 0, rng.sample(range(K), 3))
+    cc = jc.compile(dfa, build_pc(kind, n, V2))
+    assert cc.backend.num_classes > categorical.NATURAL_ORDER_MAX_CLASSES             # the class-order pass
+    g = torch.Generator().manual_seed(0)
+    data = torch.randint(0, V2, (3, n), generator = g)
+    missing = torch.rand(3, n, generator = g) < 0.5
+    missing[0] = True
+    assert_close(cc.marginal(data, missing), reference.marginal(cc, data, missing), n)
+
+
+@pytest.mark.parametrize("kind", ["hmm", "pd"])
+def test_fast_inference_keeps_the_class_masses(kind, build_pc, reference, monkeypatch):
+    """Inside pyjuice.fast_inference (parameters do not change) the class masses are computed by the first query
+    and kept, through a nested scope, until the outer scope exits. Outside one every query computes them, so an
+    in-place parameter update -- here after the scope -- is read."""
+    from pyjuice.constraints.distributions import categorical
+    import pyjuice.constraints.inference.dfa_exact.compiled.program as P
+    monkeypatch.setattr(P, "GROUP_MIN_RATIO", 0)                       # transitions grouped (decided when compiling)
+    n = KINDS[kind]
+    pc, other = build_pc(kind, n, V, seed = 0), build_pc(kind, n, V, seed = 1)
+    cc = jc.compile(CONSTRAINTS["contains"](), pc)
+    data, missing = evidence(n, 4)
+    calls, computed = [], categorical.class_masses
+    monkeypatch.setattr(categorical, "class_masses", lambda *a, **k: calls.append(1) or computed(*a, **k))
+    builds, built = [], P.transition_masses                              # the transition masses follow them
+    monkeypatch.setattr(P, "transition_masses", lambda *a, **k: builds.append(1) or built(*a, **k))
+    per_query = len(pc.input_layer_group)                                # one call per input layer
+
+    want = reference.marginal(cc, data, missing)
+    for _ in range(2):
+        assert_close(cc.marginal(data, missing), want, n)
+    assert len(calls) == 2 * per_query and len(builds) == 2              # outside a scope: every query
+    with juice.fast_inference():
+        for _ in range(2):
+            assert_close(cc.marginal(data, missing), want, n)
+        with juice.fast_inference():
+            assert_close(cc.marginal(data, missing), want, n)
+        assert_close(cc.marginal(data, missing), want, n)
+    assert len(calls) == 3 * per_query and len(builds) == 3              # inside: the first query only
+
+    with torch.no_grad():                                                # an in-place update after the scope
+        pc.params.copy_(other.params)
+        for layer, src in zip(pc.input_layer_group, other.input_layer_group):
+            layer.params.copy_(src.params)
+    updated = reference.marginal(cc, data, missing)
+    assert (updated - want)[torch.isfinite(want)].abs().max() > 1e-2
+    assert_close(cc.marginal(data, missing), updated, n)
+    assert len(calls) == 4 * per_query and len(builds) == 4
+
+
+def blocks_hmm(n, tied, seed):
+    """An HMM whose 128 latents are two node blocks of 64 per position (dense at the library's own threshold): every
+    transition is a run of two node blocks over the same children."""
+    torch.manual_seed(seed)
+    ns = juice.structures.HMM(seq_length = n, num_latents = 128, num_emits = V, homogeneous = tied, block_size = 64)
+    ns.init_parameters(perturbation = 2.0)
+    return juice.compile(ns, verbose = False).to("cuda:0")
+
+
+def stack_keys(cc):
+    """The stack key of every dense run the forward multiplies (None where its node blocks cannot be stacked)."""
+    return [key for kind, _, layers in cc.backend.program().steps if kind == "sum" for _, parts in layers
+            for dense, _, _ in parts for _, key in dense.values()]
+
+
+def spy_dense_sums(monkeypatch):
+    """Record, per dense_sum call of the forward, whether it got stacked weights and live columns; and count the
+    stacked weights built."""
+    import pyjuice.constraints.inference.dfa_exact.queries.backend.forward as F
+    calls, builds = [], []
+    dense_sum, stacked_weights = F.dense_sum, F.stacked_weights
+    monkeypatch.setattr(F, "dense_sum", lambda *a, **k: calls.append((k["stacked"] is not None, k["live"] is not None))
+                        or dense_sum(*a, **k))
+    monkeypatch.setattr(F, "stacked_weights", lambda *a: builds.append(1) or stacked_weights(*a))
+    return calls, builds
+
+
+@pytest.mark.parametrize("dense_pruning", [False, True])
+@pytest.mark.parametrize("tied", [True, False])
+def test_stacked_dense_weights(tied, dense_pruning, reference, monkeypatch):
+    """Dense node blocks over the same children multiply their stacked weights in one product. Outside
+    pyjuice.fast_inference a query stacks only the weights it reads more than once (an HMM's tied transitions),
+    copying each once; inside a scope every run is stacked, by the first query, and kept until the scope exits --
+    an in-place parameter update after it is read. The marginal matches the reference throughout, on all columns
+    and on the live ones only (evidence pruning)."""
+    import pyjuice.constraints.inference.dfa_exact.queries.backend.forward as F
+    if dense_pruning:
+        monkeypatch.setattr(F, "prune_dense", lambda ncols, live: live < ncols)   # the live-column path, always
+    n = 6
+    pc, other = blocks_hmm(n, tied, seed = 0), blocks_hmm(n, tied, seed = 1)
+    cc = jc.compile(CONSTRAINTS["contains"](), pc)
+    data, missing = evidence(n, 4)
+    keys = [key for key in stack_keys(cc) if key is not None]
+    assert len(keys) == n - 1 and len(set(keys)) == (1 if tied else n - 1)       # one run per transition
+    calls, builds = spy_dense_sums(monkeypatch)
+    stacked = lambda: sum(s for s, _ in calls)
+
+    want = reference.marginal(cc, data, missing)
+    for _ in range(2):
+        assert_close(cc.marginal(data, missing, storage = "dense"), want, n)
+    assert any(p for _, p in calls) == dense_pruning
+    assert stacked() == (2 * len(keys) if tied else 0) and len(builds) == (2 if tied else 0)
+    calls.clear(), builds.clear()
+    with juice.fast_inference():
+        for _ in range(2):
+            assert_close(cc.marginal(data, missing, storage = "dense"), want, n)
+    assert stacked() == 2 * len(keys) and len(builds) == len(set(keys))      # built by the first query only
+    assert cc.backend.state._kept_stacks is None                              # and dropped when the scope exits
+
+    calls.clear(), builds.clear()
+    with torch.no_grad():                                                     # an in-place update after the scope
+        pc.params.copy_(other.params)
+        for layer, src in zip(pc.input_layer_group, other.input_layer_group):
+            layer.params.copy_(src.params)
+    updated = reference.marginal(cc, data, missing)
+    assert (updated - want)[torch.isfinite(want)].abs().max() > 1e-2
+    assert_close(cc.marginal(data, missing, storage = "dense"), updated, n)
+    assert len(builds) == (1 if tied else 0)
+
+
+@pytest.mark.parametrize("dense_pruning", [False, True])
+def test_wide_products_are_not_stacked(dense_pruning, reference, monkeypatch):
+    """A product wider than STACK_MAX_COLUMNS (here every one) runs one product per block, inside a
+    pyjuice.fast_inference scope too, and copies no weights."""
+    import pyjuice.constraints.inference.dfa_exact.queries.backend.forward as F
+    if dense_pruning:
+        monkeypatch.setattr(F, "prune_dense", lambda ncols, live: live < ncols)
+    monkeypatch.setattr(F, "STACK_MAX_COLUMNS", {"fp32": -1, "tf32": -1})
+    n = 6
+    cc = jc.compile(CONSTRAINTS["contains"](), blocks_hmm(n, tied = True, seed = 0))
+    data, missing = evidence(n, 4)
+    calls, builds = spy_dense_sums(monkeypatch)
+    want = reference.marginal(cc, data, missing)
+    assert_close(cc.marginal(data, missing, storage = "dense"), want, n)
+    with juice.fast_inference():
+        assert_close(cc.marginal(data, missing, storage = "dense"), want, n)
+    assert calls and not any(s for s, _ in calls) and not builds
+
+
+@pytest.mark.parametrize("dense_pruning", [False, True])
+def test_the_stacked_weights_are_what_is_multiplied(dense_pruning, monkeypatch):
+    """Doubling every stacked copy (and nothing else) doubles the sums of every stacked run: every path of the HMM
+    crosses each transition once, so the marginal moves by log 2 per run -- the product reads the copy."""
+    import pyjuice.constraints.inference.dfa_exact.queries.backend.forward as F
+    if dense_pruning:
+        monkeypatch.setattr(F, "prune_dense", lambda ncols, live: live < ncols)
+    n = 6
+    cc = jc.compile(CONSTRAINTS["contains"](), blocks_hmm(n, tied = True, seed = 0))
+    data, missing = evidence(n, 4)
+    want = cc.marginal(data, missing, storage = "dense")
+    stacked_weights = F.stacked_weights
+    monkeypatch.setattr(F, "stacked_weights", lambda *a: 2 * stacked_weights(*a))
+    runs = sum(key is not None for key in stack_keys(cc))
+    assert_close(cc.marginal(data, missing, storage = "dense"), want + runs * math.log(2), n)
+
+
+@pytest.mark.parametrize("stacked", [True, False])
+@pytest.mark.parametrize("tied", [True, False])
+def test_bf16_dense_products_multiply_bf16_weight_copies(tied, stacked, reference, monkeypatch):
+    """A ``precision = "bf16"`` query's dense products on the live columns multiply bf16 copies of the weights --
+    stacked, or block by block (a product wider than STACK_MAX_COLUMNS) --, one per distinct weights (an HMM's tied
+    transitions share theirs), kept in its weight stacks: inside a pyjuice.fast_inference scope, built by the first
+    query only. Every token observed (every run computed per sample, on the live columns): the marginal is within
+    bf16's error of the reference, and doubling every copy (nothing else) moves it by log 2 per run."""
+    import pyjuice.constraints.inference.dfa_exact.kernels.sum as lifted_sum
+    import pyjuice.constraints.inference.dfa_exact.queries.backend.forward as F
+    able = "out_dtype" in (torch.mm.__doc__ or "") and torch.cuda.is_bf16_supported()
+    assert lifted_sum._bf16_products(torch.device("cuda:0")) == able
+    if not able:
+        pytest.skip("torch.mm multiplies no bf16 matrices into fp32 ones here: bf16 queries' dense products run TF32")
+    if not stacked:
+        monkeypatch.setattr(F, "STACK_MAX_COLUMNS", {p: -1 for p in F.STACK_MAX_COLUMNS})
+    n = 6
+    cc = jc.compile(CONSTRAINTS["contains"](), blocks_hmm(n, tied = tied, seed = 0))
+    data, missing = evidence(n, 4)
+    data[:, 2:4] = torch.tensor([1, 2])
+    missing[:] = False
+    want = reference.marginal(cc, data, missing)
+    built, copy = [], lifted_sum._bf16_copy
+    monkeypatch.setattr(lifted_sum, "_bf16_copy", lambda copies, key, make: copy(copies, key,
+                                                                                lambda: built.append(key) or make()))
+    with juice.fast_inference():
+        got = cc.marginal(data, missing, storage = "compact", precision = "bf16")
+        first = len(built)
+        assert_close(cc.marginal(data, missing, storage = "compact", precision = "bf16"), got, n)
+        kept = [t for t in cc.backend.state._kept_stacks.values() if t.dtype == torch.bfloat16]
+    runs = 1 if tied else len(stack_keys(cc))
+    assert first == runs * (1 if stacked else 2) == len(built) == len(kept)   # a stack, or a run's two blocks
+    assert torch.equal(torch.isneginf(got), torch.isneginf(want)) and torch.isfinite(want).any()
+    fin = torch.isfinite(want)
+    assert (got[fin] - want[fin]).abs().max() < 1.5e-2
+    base = cc.marginal(data, missing, storage = "compact", precision = "bf16")
+    monkeypatch.setattr(lifted_sum, "_bf16_copy", lambda copies, key, make: 2 * copy(copies, key, make))
+    doubled = cc.marginal(data, missing, storage = "compact", precision = "bf16")
+    # not exactly: a layer's log 2 higher outputs give its children's exponentials other last bits, some rounding to
+    # another bf16 value (~1e-4 here) -- a run reading anything but the copies would be off by log 2
+    assert ((doubled - base - len(stack_keys(cc)) * math.log(2))[fin].abs() < 1e-3).all()
+
+
+@triton.jit
+def _lse_steps_kernel(x, out_m, out_acc, steps, LANES: tl.constexpr, ONE_EXP: tl.constexpr):
+    """Every lane's online log-sum-exp over ``steps`` terms, by the one-exp step or the two-exp one."""
+    lanes = tl.arange(0, LANES)
+    m = tl.full([LANES], float("-inf"), dtype = tl.float32)
+    acc = tl.zeros([LANES], dtype = tl.float32)
+    for k in range(steps):
+        v = tl.load(x + k * LANES + lanes)
+        if ONE_EXP:
+            m, acc = _lse_step_one_exp(m, acc, v)
+        else:
+            m, acc = _lse_step(m, acc, v)
+    tl.store(out_m + lanes, m)
+    tl.store(out_acc + lanes, acc)
+
+
+def test_one_exp_lse_step_is_the_two_exp_one():
+    """The one-exp log-sum-exp step (block @ input's) computes, bit for bit, what the two-exp one computes: on random
+    terms, rising and falling ones, ties, and -inf (leading, trailing, scattered, every term)."""
+    g = torch.Generator().manual_seed(0)
+    steps, per = 24, 64
+    cols = [torch.randn(steps, generator = g) * 10 for _ in range(per)]                      # random
+    cols += [torch.sort(torch.randn(steps, generator = g) * 10).values for _ in range(per)]   # rising
+    cols += [torch.sort(torch.randn(steps, generator = g) * 10, descending = True).values for _ in range(per)]
+    cols += [torch.full((steps,), float(torch.randn(1, generator = g))) for _ in range(per)]   # ties
+    for c in cols[:3 * per]:
+        c[torch.randperm(steps, generator = g)[:6]] = float("-inf")                          # scattered -inf
+    for k, c in enumerate(cols[per:2 * per]):
+        c[:k % steps] = float("-inf")                                                         # leading
+        cols[2 * per + k][steps - k % steps:] = float("-inf")                                 # trailing
+    cols += [torch.full((steps,), float("-inf"))] * per                                      # every term
+    cols += [torch.randn(steps, generator = g) * 10 for _ in range(512 - len(cols))]          # lanes: a power of 2
+    x = torch.stack(cols, 1).contiguous().cuda()
+    lanes = x.size(1)
+    out = {}
+    for one_exp in (True, False):
+        m, acc = torch.empty(lanes, device = "cuda"), torch.empty(lanes, device = "cuda")
+        _lse_steps_kernel[(1,)](x, m, acc, steps, LANES = lanes, ONE_EXP = one_exp)
+        out[one_exp] = (m.cpu(), acc.cpu())
+    assert torch.equal(out[True][0], out[False][0])
+    assert torch.equal(out[True][1], out[False][1])
+    assert torch.isfinite(out[True][1]).all() and (out[True][1][4 * per:5 * per] == 0).all()
+
+
+@pytest.mark.parametrize("rows, width, num_live", [(2500, 40, 5), (700, 400, 300), (130, 4200, 4100)])
+def test_live_columns_are_shifted_and_exponentiated(rows, width, num_live):
+    """The dense sum paths' pre-op (sum.py's ``_live_shifted_exp``): the first ``num_live`` columns of a pruning order,
+    gathered from a block with a row stride past its width, each shifted by its maximum and exponentiated, transposed;
+    a column of -inf gives zeros. A narrow pass (a program per column, the block taller than its row tile) and passes
+    wide enough for column tiles (``_LIVE_EXP_TILES``: rows past a row tile, or within one; the last tile partly past
+    the live columns), whose bits must be a program per column's."""
+    from pyjuice.constraints.inference.dfa_exact.kernels.sum import _live_shifted_exp, _live_shifted_exp_kernel
+    g = torch.Generator().manual_seed(0)
+    x = (torch.randn(rows, width + 8, generator = g) * 4).cuda()
+    x[:, 7] = float("-inf")
+    x[100:rows - 20, 3] = float("-inf")
+    block = x[:, :width]
+    rest = torch.randperm(width, generator = g)
+    rest = rest[(rest != 7) & (rest != 3)]
+    perm = torch.cat([torch.tensor([7, 3]), rest])[:num_live + 1].to(torch.int32).cuda()     # one past the live
+    ex_t, m = _live_shifted_exp(block, perm, num_live)
+    cols = block[:, perm[:num_live].long()]
+    top = cols.amax(0)
+    assert torch.equal(m, top)
+    torch.testing.assert_close(ex_t, torch.exp(cols - torch.where(torch.isneginf(top), 0.0, top)).t(), rtol = 1e-5,
+                               atol = 0)
+    one_t, one_m = torch.empty_like(ex_t), torch.empty_like(m)
+    _live_shifted_exp_kernel[(num_live,)](block, perm, one_t, one_m, rows, block.stride(0), TILE_R = 1024)
+    assert torch.equal(ex_t.view(torch.int32), one_t.view(torch.int32)) and torch.equal(m, one_m)
+
+
+def test_transition_masses_match_brute_force(build_pc, monkeypatch):
+    """Every transition mass -- log sum of the class masses that lead from a column to a successor -- against
+    float64, on an automaton whose columns have more successors than one pair tile takes and more classes than one
+    chunk, with token probabilities down to e^-100 and one emission row below e^-90 altogether (pairs whose class
+    masses are all below the fp32 normal range)."""
+    import pyjuice.constraints.inference.dfa_exact.compiled.program as P
+    from pyjuice.constraints.inference.dfa_exact.kernels import transitions
+    monkeypatch.setattr(P, "GROUP_MIN_RATIO", 0)
+    rng = random.Random(0)
+    V2, K, n = 600, 48, 6
+    dfa = jc.DFA.from_dense(V2, [[rng.randrange(K) for _ in range(V2)] for _ in range(K)], 0, rng.sample(range(K), 12))
+    pc = build_pc("hmm", n, V2)
+    g = torch.Generator(device = pc.params.device).manual_seed(0)
+    with torch.no_grad():
+        for layer in pc.input_layer_group:
+            layer.params.copy_(torch.exp(-torch.rand(layer.params.shape, device = pc.params.device, generator = g) * 100))
+            row = layer.s_pids[0]
+            layer.params[row:row + V2] = torch.exp(-90 - torch.rand(V2, device = pc.params.device, generator = g))
+    cc = jc.compile(dfa, pc)
+    cc.marginal(torch.zeros(1, n, dtype = torch.long), torch.ones(1, n, dtype = torch.bool))
+    prog = cc.backend.program()
+    tt, width, nc = prog.trans, prog.width, cc.backend.layout.next_col_table()
+    ptr, succ = tt.entry_ptr.long().cpu(), tt.entry_succ.long().cpu()
+    assert tt.grouped and prog.trans_persistent and tt.max_pairs > 16    # several pair tiles at the narrowest
+    assert nc.size(2) > transitions.TRANSITION_TILES["TC"]
+    assert cc.backend.token_classes.num_enumerated > 0                   # (most classes one token: enumerated)
+    T = prog.transition_buffer().double().cpu()
+    layer = next(iter(pc.input_layer_group))                             # the class masses, in float64 from the
+    tc = cc.backend.token_classes.token_class.long()                     # parameters (the table holds the stored
+    cm = torch.zeros(layer.params.numel() // V2, nc.size(2), dtype = torch.float64, device = tc.device)   # ones)
+    cm = cm.index_add_(1, tc, layer.params.double().view(-1, V2)).log().cpu()
+    mass_row = prog.mass_row.long().cpu()
+    assert (cm[torch.isfinite(cm)] < -87.4).any()                       # class masses below the normal range
+    assert (cm.max(dim = 1).values < -87.4).any()                       # ... every class of a row
+    pair_off, pairs = prog.pair_off.cpu(), prog.pairs_t.cpu()
+    for u, t, rk in prog.trans_job[0].long().cpu().tolist():                 # (input row, position, step rank)
+        off = int(pair_off[t]) + rk * int(pairs[t])                          # the step's block of the boundary's pairs
+        for q in range(width[t]):
+            to = nc[t, q].long()
+            for g in range(int(ptr[t, q]), int(ptr[t, q + 1])):
+                classes = (to >= 0) if t + 1 == n else (to == succ[g])
+                want = torch.logsumexp(cm[mass_row[u - prog.input_start], classes], dim = 0)
+                got = T[off + g - int(ptr[t, 0])]
+                assert abs(float(got - want)) < 1e-5, (u, t, q, g, float(got), float(want))
+
+
+@pytest.mark.parametrize("kind", ["hmm", "pd"])
+def test_transitions_over_the_budget_are_not_grouped(kind, build_pc, monkeypatch):
+    """Transitions grouped by the ratio, with a budget of one float (and no share of the device's memory): the
+    program reads the classes' masses instead (ungrouped tables), and gives the marginal of grouping them -- a wide
+    automaton; the buffers filled with NaN before each call, so a slot no program writes shows."""
+    import pyjuice.constraints.inference.dfa_exact.compiled.program as P
+    monkeypatch.setattr(P, "GROUP_MIN_RATIO", 0)
+    monkeypatch.setattr(P, "TRANSITION_MEMORY_SHARE", 0)
+    rng = random.Random(0)
+    K, n = 48, KINDS[kind]
+    dfa = jc.DFA.from_dense(V, [[rng.randrange(K) for _ in range(V)] for _ in range(K)], 0, rng.sample(range(K), 12))
+    cc = jc.compile(dfa, build_pc(kind, n, V))
+    data, missing = evidence(n, 4)
+
+    def marginal(budget):
+        monkeypatch.setattr(P, "TRANSITION_BUDGET", budget)
+        cc.backend._program = None
+        bufs = cc.backend.state.buffers(data.size(0))
+        bufs["node_mars"].fill_(float("nan"))
+        bufs["element_mars"].fill_(float("nan"))
+        out = cc.marginal(data, missing)
+        assert cc.backend.grouped == (budget > 1)
+        return out
+
+    assert torch.allclose(marginal(1), marginal(1 << 26), atol = 1e-5, rtol = 1e-5)
+
+
+def test_splitting_block_block_tiles_changes_nothing(build_pc, monkeypatch):
+    """Spreading every (step, sample)'s output tiles over as many programs as it has tiles gives what one program
+    per (step, sample) gives, bit for bit (a wide automaton: blocks of several tiles). The buffers are filled with
+    NaN before each call, so a tile no program writes shows."""
+    from pyjuice.constraints.inference.dfa_exact.kernels import prod
+    rng = random.Random(0)
+    K, n = 48, 8
+    dfa = jc.DFA.from_dense(V, [[rng.randrange(K) for _ in range(V)] for _ in range(K)], 0, rng.sample(range(K), 12))
+    cc = jc.compile(dfa, build_pc("pd", n, V))
+    assert cc.backend.program().skip.tiles_i > 1                          # blocks wider than one tile
+    data, missing = evidence(n, 4)
+
+    def marginal(per_sm):
+        monkeypatch.setattr(prod, "BLOCK_BLOCK_PROGRAMS_PER_SM", per_sm)
+        bufs = cc.backend.state.buffers(data.size(0))
+        bufs["node_mars"].fill_(float("nan"))
+        bufs["element_mars"].fill_(float("nan"))
+        return cc.marginal(data, missing, storage = "dense")
+
+    assert torch.equal(marginal(1 << 20), marginal(0))
+
+
+def input_block_launches(cc):
+    """Every ``input @ block`` launch: ``(kinds, steps, groups)``."""
+    return [(l.kinds, l.steps[0], l.steps[2]) for kind, _, layers in cc.backend.program().steps if kind == "prod"
+            for stages, _, _ in layers for launches in stages for l in launches if l.form == "input_block"]
+
+
+def input_block_groups(cc):
+    """``(steps [S, 7], {G: firsts})`` of every ``input @ block`` launch whose steps run in groups."""
+    return [(steps.cpu(), {G: f.cpu() for G, f in groups.items()}) for _, steps, groups in input_block_launches(cc)
+            if groups is not None]
+
+
+class CountingKernel:
+    """A Triton kernel that counts its launches."""
+
+    def __init__(self, kernel):
+        self.kernel, self.launches = kernel, 0
+
+    def __getitem__(self, grid):
+        self.launches += 1
+        return self.kernel[grid]
+
+
+@pytest.mark.parametrize("storage", ["dense", "compact"])
+@pytest.mark.parametrize("G", [3, 8])
+@pytest.mark.parametrize("B", [1, 3, 16])
+@pytest.mark.parametrize("kind", list(KINDS))
+def test_grouped_input_steps_change_nothing(kind, B, G, storage, build_pc, monkeypatch):
+    """Running ``input @ block`` steps G to a program (the class-by-class path) gives what one step per program gives,
+    bit for bit, with evidence (pruned) and without, dense or compact. Every launch whose block is not the identity
+    runs in groups (the PDs and the left-linear chain have none), here at any width. The buffers are filled with NaN
+    before each call, so an output no group writes shows."""
+    import pyjuice.constraints.inference.dfa_exact.compiled.program as P
+    from pyjuice.constraints.inference.dfa_exact.kernels import prod
+    from pyjuice.constraints.inference.dfa_exact.kernels import common
+    monkeypatch.setattr(P, "GROUP_MIN_RATIO", 1 << 30)                       # transitions class by class
+    monkeypatch.setattr(prod, "GROUP_MIN_LANES", 0)                          # groups however narrow the launch
+    kernel = CountingKernel(prod._input_block_group_kernel)
+    monkeypatch.setattr(prod, "_input_block_group_kernel", kernel)
+    n = KINDS[kind]
+    cc = jc.compile(CONSTRAINTS["contains"](), build_pc(kind, n, V))
+    data, missing = evidence(n, B)
+
+    def marginal(group, missing):
+        monkeypatch.setattr(P, "INPUT_BLOCK_GROUP", group)
+        cc.backend._program = None                                                    # built again with this grouping
+        cc.marginal(data, missing, storage = storage)                    # the storages, as the query sizes them
+        nan_storages(cc)
+        kernel.launches = 0
+        out = cc.marginal(data, missing, storage = storage)
+        blocks = sum(kinds[0] != common.IDENTITY for kinds, _, _ in input_block_launches(cc))
+        assert len(input_block_groups(cc)) == (blocks if group > 1 else 0)
+        assert (kernel.launches > 0) == (group > 1 and blocks > 0)                # (several when tuning)
+        return out
+
+    for miss in (missing, torch.ones_like(missing)):
+        assert torch.equal(marginal(G, miss), marginal(1, miss))
+
+
+@pytest.mark.parametrize("kind", ["hmm", "hmm_untied", "hmm_block_sparse", "hand_left"])
+def test_compact_groups_read_blocks_kept_once(kind, build_pc, monkeypatch):
+    """Grouped ``input @ block`` steps (class by class, at any width) of compact products whose blocks are kept once
+    -- inside fast_inference, every sample observing positions 1 .. n / 2 -- give the dense storage's marginal, bit
+    for bit (fused sums)."""
+    import pyjuice.constraints.inference.dfa_exact.compiled.program as P
+    from pyjuice.constraints.inference.dfa_exact.kernels import prod
+    monkeypatch.setattr(P, "GROUP_MIN_RATIO", 1 << 30)                       # transitions class by class
+    monkeypatch.setattr(prod, "GROUP_MIN_LANES", 0)                          # groups however narrow the launch
+    kernel = CountingKernel(prod._input_block_group_kernel)
+    monkeypatch.setattr(prod, "_input_block_group_kernel", kernel)
+    n = KINDS[kind]
+    cc = jc.compile(CONSTRAINTS["contains"](), build_pc(kind, n, V))
+    data, missing = evidence(n, 16)
+    missing[:] = (torch.arange(n) < 1) | (torch.arange(n) >= n // 2)
+    with juice.fast_inference():
+        dense = cc.marginal(data, missing)
+        report = {}
+        kernel.launches = 0
+        got = marginal(cc.backend, data, missing, report = report, storage = "compact")
+    assert report["compact"] is not None and report["plan"].prior and kernel.launches > 0
+    assert torch.equal(got, dense)
+
+
+def test_narrow_launches_run_one_step_per_program(build_pc, reference, monkeypatch):
+    """A launch whose steps' outputs have at most GROUP_MIN_LANES lanes runs one step per program even where the
+    Program grouped its steps; one just above it runs the groups."""
+    import pyjuice.constraints.inference.dfa_exact.compiled.program as P
+    from pyjuice.constraints.inference.dfa_exact.kernels import prod
+    monkeypatch.setattr(P, "GROUP_MIN_RATIO", 1 << 30)
+    kernel = CountingKernel(prod._input_block_group_kernel)
+    monkeypatch.setattr(prod, "_input_block_group_kernel", kernel)
+    n = KINDS["hmm"]
+    cc = jc.compile(CONSTRAINTS["contains"](), build_pc("hmm", n, V))
+    data, missing = evidence(n, 4)
+    assert input_block_groups(cc)
+    lanes = max(4 * l.S_max for kind, _, layers in cc.backend.program().steps if kind == "prod"
+                for stages, _, _ in layers for launches in stages for l in launches if l.form == "input_block" and l.steps[2] is not None)
+    want = reference.marginal(cc, data, missing)
+    for limit, launched in ((lanes, False), (lanes - 1, True)):
+        monkeypatch.setattr(prod, "GROUP_MIN_LANES", limit)
+        kernel.launches = 0
+        assert_close(cc.marginal(data, missing, storage = "dense"), want, n)
+        assert (kernel.launches > 0) == launched
+
+
+def tuned_sites(cc, B):
+    """The autotuned launch sites a query of ``B`` samples reaches (``GROUP_MIN_LANES`` 0): block @ block, and the
+    grouped input @ block steps."""
+    sites = set()
+    for kind, _, layers in cc.backend.program().steps:
+        for stages, _, _ in (layers if kind == "prod" else []):
+            for launch in (l for launches in stages for l in launches):
+                if launch.form == "block_block":
+                    sites.add("lifted_block_block")
+                elif launch.form == "input_block" and launch.steps[2] is not None:
+                    sites.add("lifted_input_block_group")
+    return sites
+
+
+@pytest.mark.parametrize("kind", list(KINDS))
+def test_every_tuned_candidate_gives_the_same_marginal(kind, build_pc, monkeypatch):
+    """The autotuned launch sites (block @ block's tiles; the grouped input @ block steps' group size and
+    log-sum-exp step) give the same marginal whichever candidate runs, and the chosen one is what launches: each
+    offered one forced in turn, with evidence (pruned) and without. The buffers are filled with NaN before each call.
+    Up to fp32 rounding: a block @ block tile sets its dots' accumulation order (on a 16-latent PD ~1e-7 relative);
+    the group candidates are bit-identical (test_grouped_input_steps_change_nothing,
+    test_one_exp_lse_step_is_the_two_exp_one)."""
+    import pyjuice.constraints.inference.dfa_exact.compiled.program as P
+    from pyjuice.constraints.inference.dfa_exact.kernels import prod
+    monkeypatch.setattr(P, "GROUP_MIN_RATIO", 1 << 30)                       # transitions class by class
+    monkeypatch.setattr(prod, "GROUP_MIN_LANES", 0)                          # groups however narrow the launch
+    n, B = KINDS[kind], 4
+    cc = jc.compile(CONSTRAINTS["contains"](), build_pc(kind, n, V))
+    data, missing = evidence(n, B)
+    offered, chosen, launched = {}, set(), set()
+    for name, fields in (("_block_block_kernel", ("TM", "TN", "TK", "num_warps")),
+                         ("_input_block_group_kernel", ("G", "ONE_EXP"))):
+        kernel = getattr(prod, name)
+        monkeypatch.setattr(prod, name, type("Recording", (), {"__getitem__": lambda self, grid, kernel = kernel,
+            fields = fields: lambda *a, **k: launched.add(tuple(k[f] for f in fields)) or kernel[grid](*a, **k)})())
+
+    def marginal(k, missing):
+        def pick(key, candidates, bench, **kw):
+            offered.setdefault(key[0], set()).add(len(candidates))
+            chosen.add(candidates[min(k, len(candidates) - 1)])
+            return candidates[min(k, len(candidates) - 1)]
+        monkeypatch.setattr(prod.autotune, "pick", pick)
+        chosen.clear(), launched.clear()
+        bufs = cc.backend.state.buffers(B)
+        bufs["node_mars"].fill_(float("nan"))
+        bufs["element_mars"].fill_(float("nan"))
+        out = cc.marginal(data, missing, storage = "dense")
+        expected = set()                                              # what was chosen reached the kernels:
+        for c in chosen:
+            if len(c) == 2:                                           # (group size: launched as a power of 2,
+                expected.add((triton.next_power_of_2(c[0]), c[1]))    # one exp)
+            else:                                                     # (TM, TN, TK, warps)
+                expected.add(c)
+        assert launched == expected, (launched, chosen)
+        return out
+
+    for miss in (missing, torch.ones_like(missing)):
+        want = marginal(0, miss)
+        for k in range(1, max((max(c) for c in offered.values()), default = 1)):
+            assert_close(marginal(k, miss), want, n)
+    assert set(offered) == tuned_sites(cc, B)
+    assert all(c == {len(prod.BLOCK_BLOCK_TILES)} for site, c in offered.items() if site == "lifted_block_block")
+    assert all(c == {2 * (1 + len(P.INPUT_BLOCK_GROUP_ALTERNATIVES))} for site, c in offered.items()
+               if site == "lifted_input_block_group")
+
+
+@pytest.mark.parametrize("kind", ["hmm", "pd"])
+def test_tuning_runs_once_per_launch_shape(kind, build_pc, monkeypatch):
+    """The first query benchmarks each tuned launch shape once; later ones reuse the choice. With autotuning off,
+    nothing is benchmarked."""
+    import pyjuice.constraints.inference.dfa_exact.compiled.program as P
+    from pyjuice.constraints.inference.dfa_exact.kernels import prod
+    from pyjuice.layer.kernels import autotune
+    monkeypatch.setattr(prod, "GROUP_MIN_LANES", 0)
+    monkeypatch.setattr(P, "GROUP_MIN_RATIO", 1 << 30)
+    monkeypatch.setattr(autotune, "_CACHE", {})                              # nothing tuned yet
+    timed, best_of = [], autotune.best_of
+    monkeypatch.setattr(autotune, "best_of", lambda *a, **k: timed.append(1) or best_of(*a, **k))
+    n = KINDS[kind]
+    cc = jc.compile(CONSTRAINTS["contains"](), build_pc(kind, n, V))
+    data, missing = evidence(n, 4)
+    monkeypatch.setattr(autotune, "ENABLED", False)
+    cc.marginal(data, missing, storage = "dense")
+    assert timed == []
+    monkeypatch.setattr(autotune, "ENABLED", True)
+    cc.marginal(data, missing, storage = "dense")
+    first = len(timed)
+    assert first > 0 and first == sum(1 for k in autotune._CACHE if k[1][0].startswith("lifted_"))
+    cc.marginal(data, missing, storage = "dense")
+    assert len(timed) == first
+
+
+@pytest.mark.parametrize("kind", ["hmm", "hand", "hand_permuted"])
+def test_input_steps_group_by_position(kind, build_pc, monkeypatch):
+    """Groups of ``input @ block`` steps never mix positions or block ends, hold at most their table's group size
+    (INPUT_BLOCK_GROUP's, then every alternative's), and cover every step once -- also where one launch holds steps
+    at several positions (one of "hand"'s)."""
+    import pyjuice.constraints.inference.dfa_exact.compiled.program as P
+    monkeypatch.setattr(P, "GROUP_MIN_RATIO", 1 << 30)
+    monkeypatch.setattr(P, "INPUT_BLOCK_GROUP", 3)
+    n = KINDS[kind]
+    cc = jc.compile(CONSTRAINTS["contains"](), build_pc(kind, n, V))
+    launches = input_block_groups(cc)
+    assert launches
+    mixed = False
+    for steps, tables in launches:
+        assert list(tables) == [3, *P.INPUT_BLOCK_GROUP_ALTERNATIVES]                # the default first
+        for G, firsts in tables.items():
+            assert firsts[0] == 0 and firsts[-1] == steps.size(0) and (firsts[1:] > firsts[:-1]).all()
+            assert (firsts[1:] - firsts[:-1] <= G).all()
+            for a, b in zip(firsts[:-1].tolist(), firsts[1:].tolist()):
+                assert len({(t, t2) for t, t2 in steps[a:b][:, [2, 5]].tolist()}) == 1
+        mixed |= len({(t, t2) for t, t2 in steps[:, [2, 5]].tolist()}) > 1
+    assert mixed == (kind == "hand")
+
+
+@pytest.mark.parametrize("storage", ["dense", "compact"])
+@pytest.mark.parametrize("kind", ["hmm", "left_linear", "pd", "hand_left"])
+def test_kernels_launch_past_the_grid_limits(kind, storage, sum_path, build_pc, monkeypatch):
+    """With CUDA's grid limits lowered to 3 programs on the first axis and 2 on the others, every kernel whose
+    program count grows with the batch or the automaton is launched in several parts: the same marginal, bit for
+    bit. A wide automaton gives each of them far more work than that (an HMM: input @ block; a PD: block
+    @ block; left_linear and hand_left: block @ input; the dense path keeps copies). The buffers are filled with NaN before each
+    call, so a slot left unwritten shows instead of keeping the previous call's value."""
+    from pyjuice.constraints.inference.dfa_exact.kernels import common
+    rng = random.Random(0)
+    K, n = 48, KINDS[kind]
+    dfa = jc.DFA.from_dense(V, [[rng.randrange(K) for _ in range(V)] for _ in range(K)], 0, rng.sample(range(K), 12))
+    cc = jc.compile(dfa, build_pc(kind, n, V))
+    data, missing = evidence(n, 4)
+    cc.marginal(data, missing, storage = storage)                          # the storages, as the query sizes them
+
+    def marginal():
+        nan_storages(cc)
+        return cc.marginal(data, missing, storage = storage)
+
+    want = marginal()
+    monkeypatch.setattr(common, "MAX_GRID", (3, 2))
+    assert torch.equal(marginal(), want)
+
+
+def marginal_with_aliasing(cc, on, data, missing, monkeypatch, storage = "dense"):
+    """The marginal with copies of sums aliased or materialized (the Program is rebuilt either way)."""
+    import pyjuice.constraints.inference.dfa_exact.compiled.program as P
+    monkeypatch.setattr(P, "ALIAS_COPIES", on)
+    cc.backend._program = None
+    return cc.marginal(data, missing, storage = storage), cc.backend.program()
+
+
+def copy_launches(prog):
+    return [l.steps for k, _, layers in prog.steps if k == "prod" for stages, _, _ in layers
+            for launches in stages for l in launches if l.form == "copy"]
+
+
+@pytest.mark.parametrize("storage", ["dense", "compact"])
+@pytest.mark.parametrize("kind", list(KINDS))
+def test_aliased_copies_give_the_materialized_marginal(kind, storage, sum_path, build_pc, monkeypatch):
+    """A sum layer reading a copied sum's row in place of the copy reads the same numbers (its aliased children
+    are mixed after the others, so up to the accumulation order); compact too (a copy's lanes are its sum's)."""
+    n = KINDS[kind]
+    cc = jc.compile(CONSTRAINTS["contains"](), build_pc(kind, n, V))
+    data, missing = evidence(n, 3)
+    copied, _ = marginal_with_aliasing(cc, False, data, missing, monkeypatch, storage)
+    aliased, prog = marginal_with_aliasing(cc, True, data, missing, monkeypatch, storage)
+    assert_close(aliased, copied, n)
+    # a dense node block reads its children as one run of rows: none of them may be aliased
+    for k, (kind_, prod_index, layers) in enumerate(prog.steps[:-1]):
+        if kind_ == "prod" and prod_index in prog.alias:
+            alias_row = prog.alias[prod_index][0].cpu()
+            first = cc.backend.element_regions[prod_index][0]
+            for _, parts in prog.steps[k + 1][2]:
+                for dense, E, _ in parts:
+                    for (_, c0) in dense:
+                        assert (alias_row[c0 - first:c0 - first + E] < 0).all()
+
+
+def test_copies_of_sums_are_not_materialized(build_pc, monkeypatch):
+    """On a PD (small node blocks: the fused sum path) every copy of a sum is aliased and no copy is launched."""
+    n = KINDS["pd"]
+    cc = jc.compile(CONSTRAINTS["contains"](), build_pc("pd", n, V))
+    data, missing = evidence(n, 2)
+    _, prog = marginal_with_aliasing(cc, False, data, missing, monkeypatch)
+    copies = sum(st.size(0) for st in copy_launches(prog))
+    assert copies > 0 and not prog.alias
+    _, prog = marginal_with_aliasing(cc, True, data, missing, monkeypatch)
+    assert copy_launches(prog) == []
+    assert sum(int((a >= 0).sum()) for a, _ in prog.alias.values()) == copies

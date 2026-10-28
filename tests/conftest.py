@@ -23,7 +23,19 @@ workers. Run the suite once to seed the cache; every run after that is balanced.
 _DURATIONS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".test_durations")
 _durations_seen = {}   # nodeid -> seconds (this run; accumulates setup+call+teardown)
 
-def pytest_configure(config):
+def _pin_gpu():
+    """Pin this process (the xdist controller, or one worker) to one GPU of the pool.
+
+    Runs when this conftest is IMPORTED, not in `pytest_configure`: pytest imports the conftests of the
+    directories on its command line (and of their parents, this one first) before `pytest_configure`
+    runs, and a nested conftest that imports pyjuice (`tests/constraints/inference/dfa_exact/conftest.py`)
+    initializes the CUDA driver through Triton as a side effect -- with whatever CUDA_VISIBLE_DEVICES the
+    process inherited, which for a worker is the controller's single pinned GPU. The driver's device list
+    is fixed for the process from then on, so pinning afterwards changed the environment variable but
+    not the device: `pytest -n 8 tests/constraints/inference/dfa_exact` ran every worker on GPU 0, while
+    `pytest -n 8 tests/constraints` (whose nested conftest is imported during collection, after
+    `pytest_configure`) spread them. At import time nothing has touched CUDA yet.
+    """
     worker = os.environ.get("PYTEST_XDIST_WORKER", "gw0")
     worker_id = int(worker.replace("gw", "")) if worker.startswith("gw") else 0
 
@@ -63,6 +75,11 @@ def pytest_configure(config):
     os.environ["OMP_NUM_THREADS"] = "8"
     os.environ["MKL_NUM_THREADS"] = "8"
 
+
+_pin_gpu()
+
+
+def pytest_configure(config):
     # Only now is it safe to import torch
     import torch
     torch.set_num_threads(8)

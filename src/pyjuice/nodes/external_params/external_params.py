@@ -126,6 +126,16 @@ class ExternalSumParams():
         """Put back what :func:`cuda_graph_state` returned after a graph of the pass was recorded."""
         pass
 
+    def drop_device_caches(self, layer) -> None:
+        """
+        Forget what this parameterization keeps for `layer` on a device -- plans, scratch buffers, per-pass
+        state: `layer` moved to another one (`TensorCircuit.to`), and its next pass rebuilds them there. Every
+        such cache must be rebuilt when missing. Here: the dual-flow EM plans; a parameterization with caches of
+        its own extends this.
+        """
+        layer.__dict__.pop("_dual_em_plan_cache", None)
+        self.__dict__.pop("_dual_em_consts", None)
+
     def denom_flow_sizes(self, layer) -> "list":
         """
         How many floats of `pc.denom_param_flows` this layer needs, one entry per FORWARD PARTITION.
