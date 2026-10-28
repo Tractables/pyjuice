@@ -50,6 +50,10 @@ _prepass_module = None  # forward (tlmm), exponentials pre-pass + streaming kern
 _prepass_attempted = False
 _eleprepass_module = None  # element-flow backward, exponentials pre-pass + streaming kernel
 _eleprepass_attempted = False
+_stream_module = None   # forward (tlmm, bf16 params): pre-pass per split range, a split GEMM, a merge
+_stream_attempted = False
+_elestream_module = None  # element-flow backward (bf16 params): the same three launches
+_elestream_attempted = False
 _pardef_module = None   # a tied group's deferred parameter flows (fp16 operands): capture + flush
 _pardef_attempted = False
 _flags_cache = "unset"  # cached (cuda_cflags, ldflags) or None; computed once
@@ -548,6 +552,143 @@ def ele_prepass_arms(cs_block_size: int, batch_size: int, k_num_tiles: int, n_bl
     is small (`_split_arms`); an arm is the kernel's `cfg` code."""
     return _split_arms(ele_prepass_configs(), ele_prepass_valid_configs(cs_block_size, batch_size),
                        n_blocks * cs_block_size, batch_size, k_num_tiles)
+
+
+def stream_is_available() -> bool:
+    """Whether the stream tlmm forward (tlmm_forward_sum_stream.cu: a pre-pass per split range, one split GEMM of
+    mbarrier'd cp.async stages, a merge; bf16 parameters) is usable (lazily JIT-compiles once)."""
+    global _stream_module, _stream_attempted
+    if not _stream_attempted:
+        _stream_attempted = True
+        _stream_module = _jit("pyjuice_sum_forward_stream_cuda", "tlmm_forward_sum_stream.cu")
+    return _stream_module is not None
+
+
+def tlmm_forward_sum_stream(node_mars: torch.Tensor, element_mars: torch.Tensor, params: torch.Tensor,
+                            nids: torch.Tensor, ebase: torch.Tensor, pbase: torch.Tensor, groups,
+                            batch_size: int, block_size: int, k_num_tiles: int, cfg: int) -> None:
+    """The tlmm forward of a layer with bf16 parameters as a pre-pass per split range (the range's children's maxima
+    and bf16 exponentials, shared by the node blocks of equal children: ``groups`` = `row_groups(ebase)`), a split GEMM
+    and a merge, in-place into ``node_mars``; ``cfg`` = config id * 16 + split (`stream_arms`). Numerically equivalent
+    to `tlmm_forward_sum` (the same bf16 operands under another stabilizer), not to its bits. Caller must guarantee the
+    plain kernel's dispatch conditions but the tile shape (the gate in ``sum_layer._forward_block_sparse``)."""
+    _stream_module.tlmm_forward_sum_stream(node_mars, element_mars, params, nids, ebase, pbase, groups[0], groups[1],
+                                           int(batch_size), int(block_size), int(k_num_tiles), int(cfg))
+
+
+def stream_configs():
+    """List of (BM, BN, KT) per config id of the stream forward."""
+    return [tuple(c) for c in _stream_module.configs()] if stream_is_available() else []
+
+
+def stream_arms(block_size: int, batch_size: int, k_num_tiles: int, n_blocks: int, grouped: int = 1):
+    """The stream forward's tuner arms for a layer (`cfg` codes = config id * 16 + split): every fitting config at
+    split 1, and at the splits (2 .. 8, within the k-steps) whose GEMM grid fills one wave of the SMs -- half to all of
+    them. ``grouped`` (`row_groups`): the node tiles may span that many consecutive blocks of one group, so tiles up
+    to ``grouped`` x the block size fit (an HCLT's 32-node blocks: 4 of a variable in a 128-row tile).
+    MEASURED (HMM-4096 B128 bf16, 32 node tiles of 128 x 128): splits 4 and 5 (128 / 160 blocks) 36 / 33 us, split 6
+    (192 blocks: a second wave) 44, split 2 55; the GEMM runs one block an SM."""
+    if not stream_is_available():
+        return []
+    cfgs = stream_configs()
+    fits = [int(c) for c in _stream_module.fitting_configs(int(block_size), int(batch_size), grouped > 1)
+            if cfgs[int(c)][0] <= block_size * grouped]
+    arms = [c * 16 + 1 for c in fits]
+    sms = _sms()
+    for c in fits:
+        bm, bn, kt = cfgs[c]
+        ctas = (n_blocks * block_size // bm) * (batch_size // bn)
+        for s in range(2, 9):
+            if s <= k_num_tiles * (64 // kt) and sms // 2 <= ctas * s <= sms:
+                arms.append(c * 16 + s)
+    return arms
+
+
+def ele_stream_is_available() -> bool:
+    """Whether the stream element-flow backward (ele_backward_sum_stream.cu; bf16 parameters) is usable (lazily
+    JIT-compiles once)."""
+    global _elestream_module, _elestream_attempted
+    if not _elestream_attempted:
+        _elestream_attempted = True
+        _elestream_module = _jit("pyjuice_sum_backward_ele_stream_cuda", "ele_backward_sum_stream.cu")
+    return _elestream_module is not None
+
+
+def ele_backward_sum_stream(element_flows: torch.Tensor, element_mars: torch.Tensor, node_flows: torch.Tensor,
+                            node_mars: torch.Tensor, params: torch.Tensor, chids: torch.Tensor, ebase: torch.Tensor,
+                            pbase: torch.Tensor, groups, batch_size: int, block_size: int, cs_block_size: int,
+                            k_num_tiles: int, cfg: int) -> None:
+    """The element-flow backward of a partition with bf16 parameters as a pre-pass per split range (the range's
+    parents' log ratios' maxima and bf16 exponentials, shared by the element blocks of equal parents: ``groups`` =
+    `row_groups(ebase)`), a split GEMM and a merge, in-place into ``element_flows``; ``pbase`` the per-tile parameter
+    offsets of `_cached_bk_ele_pre` ([neb, knt x blocks a tile]); ``cfg`` = config id * 16 + split (`ele_stream_arms`).
+    Numerically equivalent to `ele_backward_sum` (the stream forward's bf16 exponentials, under another stabilizer),
+    not to its bits. Caller must guarantee the plain kernel's dispatch conditions but the tile shape."""
+    _elestream_module.ele_backward_sum_stream(element_flows, element_mars, node_flows, node_mars, params, chids, ebase,
+                                              pbase, groups[0], groups[1], int(batch_size), int(block_size),
+                                              int(cs_block_size), int(k_num_tiles), int(cfg))
+
+
+def ele_stream_configs():
+    """List of (BM, BN, KT) per config id of the stream element backward."""
+    return [tuple(c) for c in _elestream_module.configs()] if ele_stream_is_available() else []
+
+
+def ele_stream_arms(cs_block_size: int, batch_size: int, block_size: int, k_num_tiles: int, n_blocks: int,
+                    grouped: int = 1):
+    """The stream element backward's tuner arms for a partition (`cfg` codes = config id * 16 + split): every fitting
+    config at split 1, and at the splits whose GEMM grid fills one wave of the SMs (`stream_arms`' rule); ``grouped``
+    (`row_groups`): the child tiles may span that many consecutive blocks of one group."""
+    if not ele_stream_is_available():
+        return []
+    cfgs = ele_stream_configs()
+    fits = [int(c) for c in _elestream_module.fitting_configs(int(cs_block_size), int(batch_size), int(block_size),
+                                                              grouped > 1) if cfgs[int(c)][0] <= cs_block_size * grouped]
+    arms = [c * 16 + 1 for c in fits]
+    sms = _sms()
+    for c in fits:
+        bm, bn, kt = cfgs[c]
+        ctas = (n_blocks * cs_block_size // bm) * (batch_size // bn)
+        for s in range(2, 9):
+            if s <= k_num_tiles * (64 // kt) and sms // 2 <= ctas * s <= sms:
+                arms.append(c * 16 + s)
+    return arms
+
+
+def _stream_fits(cfgs, code: int, block_rows: int, n_blocks: int, grouped: int) -> bool:
+    bm = cfgs[code // 16][0]
+    return block_rows % bm == 0 or (bm % block_rows == 0 and bm <= block_rows * grouped
+                                    and (n_blocks * block_rows) % bm == 0)
+
+
+def stream_run_fits(code: int, block_size: int, n_blocks: int, grouped: int) -> bool:
+    """Whether the stream forward's arm ``code`` serves a launch over ``n_blocks`` node blocks whose tiles may span
+    ``grouped`` consecutive blocks (`row_groups` of the launch's own rows of ebase): the tile's rows divide the block,
+    or whole tiles of same-group blocks fill the launch. A run of `partition_runs` may hold fewer blocks than the
+    partition's grouped tiles need (an HCLT's 32-node blocks under a 128-row tile): such a run takes another kernel."""
+    return _stream_fits(stream_configs(), code, block_size, n_blocks, grouped)
+
+
+def ele_stream_run_fits(code: int, cs_block_size: int, n_blocks: int, grouped: int) -> bool:
+    """`stream_run_fits` for the stream element backward: ``n_blocks`` child blocks of ``cs_block_size`` rows."""
+    return _stream_fits(ele_stream_configs(), code, cs_block_size, n_blocks, grouped)
+
+
+def row_groups(ebase: torch.Tensor):
+    """``(ugrp, grep, grouped)`` for the stream forward: int32 per node block its group -- node blocks whose rows of
+    ``ebase`` (an edge tile's first child row per tile) are equal share the pre-pass --, int32 per group its first
+    block, and how many consecutive blocks a node tile may span: the largest power of two g (1, 2, 4) such that every
+    aligned run of g blocks is one group (an HCLT's blocks of a variable are consecutive)."""
+    distinct, inverse = torch.unique(ebase, dim = 0, return_inverse = True)
+    first = torch.full((distinct.size(0),), ebase.size(0), dtype = torch.long, device = ebase.device)
+    first.scatter_reduce_(0, inverse, torch.arange(ebase.size(0), device = ebase.device), reduce = "amin")
+    grouped = 1
+    for g in (2, 4):
+        n = inverse.numel()
+        if n % g or not bool((inverse.view(-1, g) == inverse.view(-1, g)[:, :1]).all()):
+            break
+        grouped = g
+    return inverse.to(torch.int32).contiguous(), first.to(torch.int32).contiguous(), grouped
 
 
 def autotune(candidates, warmup: int = 3, reps: int = 7) -> int:

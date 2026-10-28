@@ -597,6 +597,9 @@ class SumLayer(Layer, nn.Module):
             if choice[0] == "cuda_prepass":
                 cuda_kernels.tlmm_forward_sum_prepass(node_mars, element_mars, params, nids, tiles[0], tiles[1], pbase,
                                                       batch_size, self.block_size, k_num_tiles, choice[1], tiles[2])
+            elif choice[0] == "cuda_stream":
+                cuda_kernels.tlmm_forward_sum_stream(node_mars, element_mars, params, nids, ebase, pbase, tiles,
+                                                     batch_size, self.block_size, k_num_tiles, choice[1])
             else:
                 kernel = (cuda_kernels.tlmm_forward_sum if choice[0] == "cuda" else
                           cuda_kernels.tlmm_forward_sum_pipelined)
@@ -613,6 +616,16 @@ class SumLayer(Layer, nn.Module):
         if tiles is None:
             tiles = cache[key] = cuda_kernels.tile_index(ebase)
         return tiles
+
+    def _row_groups(self, signature, ebase: torch.Tensor, kind: str = "fwg"):
+        """A stream kernel's ``(ugrp, grep, grouped)`` of ``ebase`` (`cuda_kernels.row_groups`: blocks of equal rows
+        share its pre-pass), built once per (``kind``, ``signature``) -- one device sync, at the first call."""
+        cache = self.__dict__.setdefault("_cached_tile_index", {})
+        key = (kind, signature)
+        groups = cache.get(key)
+        if groups is None:
+            groups = cache[key] = cuda_kernels.row_groups(ebase)
+        return groups
 
     def _fw_block_sparse_tiles(self, num_edges: int, batch_size: int, propagation_alg_id: int,
                                pflow_tempered_enabled: bool):
@@ -1258,7 +1271,13 @@ class SumLayer(Layer, nn.Module):
             # (the pre-pass copy has tile shapes of its own -- 32-node blocks among them, which no other kernel takes)
             prepass_cfgs = (cuda_kernels.prepass_valid_configs(self.block_size, batch_size)
                             if cuda_ok and cuda_kernels.prepass_is_available() else [])
-            if valid_cfgs or prepass_cfgs:
+            # (the stream copy: bf16 parameters, one stabilizer per split range -- c/tlmm_forward_sum_stream.cu; the
+            # pre-pass kernel beside it takes the runs its grouped tiles cannot)
+            stream_arms = (cuda_kernels.stream_arms(self.block_size, batch_size, K_NUM_TILES, nids.numel(),
+                                                    self._row_groups(signature, ebase)[2])
+                           if prepass_cfgs and params.dtype == torch.bfloat16 and cuda_kernels.stream_is_available()
+                           else [])
+            if valid_cfgs or prepass_cfgs or stream_arms:
                 # The best config depends on the shape (which tile shapes are valid, and their speed).
                 # Measured once per SHAPE and cached process-wide (`autotune.choose`), not per layer: the
                 # arms agree only to ~1e-6, so structurally identical layers that measured on their own
@@ -1290,6 +1309,7 @@ class SumLayer(Layer, nn.Module):
                     # maxima and exponentials computed once, then a streaming kernel over the parameter tiles), its
                     # configs as more arms -- MEASURED on HCLT-1024's widest layer at B 128, bf16 params: 385 against
                     # the pipelined kernel's 541 us; HMM-1024 at B 64: 18.3 against 35.7
+                    # (and, where the grid is small, its configs cut into split-K ranges: `prepass_arms`)
                     if prepass_cfgs:
                         tiles = self._tile_index("fw", signature, ebase)
                         cands += [(("cuda_prepass", c),
@@ -1299,9 +1319,20 @@ class SumLayer(Layer, nn.Module):
                                                     autotune.LAUNCH_S if c >> 8 else 0.0))   # (a split: its merge launch)
                                   for c in cuda_kernels.prepass_arms(self.block_size, batch_size, K_NUM_TILES,
                                                                      nids.numel())]
+                    # The stream copy (c/tlmm_forward_sum_stream.cu: a pre-pass per split range under ONE stabilizer,
+                    # a GEMM of mbarrier'd cp.async stages without per-tile merges, a merge of the ranges), its configs
+                    # and splits as more arms, each charged its two extra launches -- MEASURED HMM-4096 B128 bf16: 47.7
+                    # -> 33-36 us a layer against the pre-pass copy's best
+                    if stream_arms:
+                        groups = self._row_groups(signature, ebase)
+                        cands += [(("cuda_stream", c),
+                                   autotune.charged(lambda c=c: cuda_kernels.tlmm_forward_sum_stream(
+                                       node_mars, element_mars, params, nids, ebase, pbase, groups,
+                                       batch_size, self.block_size, K_NUM_TILES, c), 2 * autotune.LAUNCH_S))
+                                  for c in stream_arms]
                     choice = autotune.choose(tlmm_key, cands)
 
-                if choice[0] in ("cuda", "cuda_pipe", "cuda_prepass"):
+                if choice[0] in ("cuda", "cuda_pipe", "cuda_prepass", "cuda_stream"):
                     if choice[0] == "cuda_prepass":
                         tiles = self._tile_index("fw", signature, ebase)
 
@@ -1311,9 +1342,25 @@ class SumLayer(Layer, nn.Module):
                             # the run's own tiles -- a tile per (block, edge tile), flat)
                             cuda_kernels.tlmm_forward_sum_prepass(
                                 node_mars, element_mars, params, nids,
-                    # (and, where the grid is small, its configs cut into split-K ranges: `prepass_arms`)
                                 tiles[0] if tiles[2] else tiles[0].view(-1, knt)[a:b].reshape(-1),
                                 tiles[1][a:b], pbase, batch_size, block_size, knt, c, tiles[2])
+                    elif choice[0] == "cuda_stream":
+                        tiles = self._row_groups(signature, ebase)
+                        pre_tiles = self._tile_index("fw", signature, ebase)
+
+                        def kernel(node_mars, element_mars, params, nids, ebase, pbase, batch_size, block_size, knt, c,
+                                   a = None, b = None):
+                            # (a launch over some node blocks: the run's own groups -- its blocks' rows of ebase; a run
+                            # too short for the partition's grouped tiles takes the pre-pass kernel's first config)
+                            groups = tiles if a is None else cuda_kernels.row_groups(ebase)
+                            if a is None or cuda_kernels.stream_run_fits(c, block_size, nids.numel(), groups[2]):
+                                cuda_kernels.tlmm_forward_sum_stream(node_mars, element_mars, params, nids, ebase, pbase,
+                                                                     groups, batch_size, block_size, knt, c)
+                            else:
+                                cuda_kernels.tlmm_forward_sum_prepass(
+                                    node_mars, element_mars, params, nids,
+                                    pre_tiles[0] if pre_tiles[2] else pre_tiles[0].view(-1, knt)[a:b].reshape(-1),
+                                    pre_tiles[1][a:b], pbase, batch_size, block_size, knt, prepass_cfgs[0], pre_tiles[2])
                     else:
                         tiles = None
                         kernel = (cuda_kernels.tlmm_forward_sum if choice[0] == "cuda" else
@@ -2330,7 +2377,14 @@ class SumLayer(Layer, nn.Module):
             pre_pbase, pre_ok = self._cached_bk_ele_pre[signature]
             ele_plain_ok = ele_plain_ok and ele_cuda_ok
             ele_pre_cfgs = ele_pre_cfgs if pre_ok else []
-            if ((ele_plain_ok or ele_pre_cfgs)
+            # (the stream copy, c/ele_backward_sum_stream.cu: bf16 parameters, the pre-pass kernel's tables)
+            ele_groups = (self._row_groups(signature, ele_ebase, "eleg")
+                          if pre_ok and params.dtype == torch.bfloat16 and cuda_kernels.ele_stream_is_available() else None)
+            # (the pre-pass kernel beside it takes the runs its grouped tiles cannot)
+            ele_stream_arms = (cuda_kernels.ele_stream_arms(cs_block_size, batch_size, self.block_size, K_NUM_TILES,
+                                                            chids.numel(), ele_groups[2])
+                               if ele_groups is not None and ele_pre_cfgs else [])
+            if ((ele_plain_ok or ele_pre_cfgs or ele_stream_arms)
                     and self._cuda_param_loads_aligned(params, ("ele", signature), pre_pbase, self.block_size)):
                 ele_tiles = self._tile_index("ele", signature, ele_ebase) if ele_pre_cfgs else None
 
@@ -2363,6 +2417,16 @@ class SumLayer(Layer, nn.Module):
                         ele_tiles[1][a:b], pre_pbase[a:b], batch_size, self.block_size, cs_block_size, K_NUM_TILES, c,
                         ele_tiles[2])
 
+                def _cuda_ele_stream(tgt, c, t, a = None, b = None, groups = None):
+                    # (a launch over some element blocks: the run's own groups -- its blocks' rows of ebase)
+                    if a is None:
+                        groups = ele_groups
+                    elif groups is None:
+                        groups = cuda_kernels.row_groups(ele_ebase[a:b])
+                    cuda_kernels.ele_backward_sum_stream(
+                        tgt, t["element_mars"], t["node_flows"], t["node_mars"], t["params"], chids[a:b], ele_ebase[a:b],
+                        pre_pbase[a:b], groups, batch_size, self.block_size, cs_block_size, K_NUM_TILES, c)
+
                 choice_key = (signature, batch_size)
                 choice = self._cached_bk_ele_choice.get(choice_key)
                 if choice is None:
@@ -2382,9 +2446,13 @@ class SumLayer(Layer, nn.Module):
                                                                     autotune.LAUNCH_S if c >> 8 else 0.0))
                               for c in (cuda_kernels.ele_prepass_arms(cs_block_size, batch_size, K_NUM_TILES,
                                                                       chids.numel()) if ele_pre_cfgs else [])]
+                    # the stream copy's configs and splits, each charged its two extra launches
+                    cands += [(("cuda_stream", c), autotune.charged(lambda c=c: _cuda_ele_stream(scr, c, cur),
+                                                                   2 * autotune.LAUNCH_S))
+                              for c in ele_stream_arms]
                     choice = autotune.best_of(cands) or ("triton", -1)
                     self._cached_bk_ele_choice[choice_key] = choice
-                if choice[0] in ("cuda", "cuda_pipe", "cuda_prepass"):
+                if choice[0] in ("cuda", "cuda_pipe", "cuda_prepass", "cuda_stream"):
                     if runs is None:
                         kind, c = choice
 
@@ -2395,6 +2463,8 @@ class SumLayer(Layer, nn.Module):
                                 _cuda_ele_pipe(element_flows, t)
                             elif kind == "cuda_prepass":
                                 _cuda_ele_prepass(element_flows, c, t)
+                            elif kind == "cuda_stream":
+                                _cuda_ele_stream(element_flows, c, t)
                             else:
                                 _cuda_ele(element_flows, t)
 
@@ -2406,6 +2476,13 @@ class SumLayer(Layer, nn.Module):
                     elif choice[0] == "cuda_prepass":
                         for a, b in runs:
                             _cuda_ele_prepass(element_flows, choice[1], cur, a, b)
+                    elif choice[0] == "cuda_stream":
+                        for a, b in runs:
+                            groups = cuda_kernels.row_groups(ele_ebase[a:b])
+                            if cuda_kernels.ele_stream_run_fits(choice[1], cs_block_size, b - a, groups[2]):
+                                _cuda_ele_stream(element_flows, choice[1], cur, a, b, groups)
+                            else:                        # (a run too short for the partition's grouped tiles)
+                                _cuda_ele_prepass(element_flows, ele_pre_cfgs[0], cur, a, b)
                     else:
                         for a, b in runs:                    # (views of the tables: the grid comes from them)
                             cuda_kernels.ele_backward_sum(
