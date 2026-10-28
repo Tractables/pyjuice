@@ -424,6 +424,7 @@ class SumLayer(Layer, nn.Module):
         # Optional CUDA ele-backward fast path: per-signature (ebase, pbase, cuda_ok), per-(signature,
         # batch) autotuned choice, and a reused scratch output buffer for corruption-safe autotuning.
         self._cached_bk_ele_cuda = dict()
+        self._cached_bk_ele_pre = dict()
         self._cached_bk_ele_choice = dict()
         self._cached_bk_ele_sb = dict()
         self._bk_ele_scratch = None
@@ -471,8 +472,9 @@ class SumLayer(Layer, nn.Module):
         rebuilt on the tables' device by the next pass: after the tables moved, those would point at the old device.
         What the caches keep of the host only (tuning choices, dense plans) stays."""
         for cache in (self._cached_fw_pcids, self._cached_fw_cuda, self._cached_fw_sb, self._cached_bk_parids,
-                      self._cached_bk_ele_cuda, self._cached_bk_ele_sb, self._cached_bk_par_cuda,
-                      self._cached_bk_par_trim, self._cached_param_align8, self._fw_fast):
+                      self._cached_bk_ele_cuda, self._cached_bk_ele_pre, self._cached_bk_ele_sb, self._cached_bk_par_cuda,
+                      self._cached_bk_par_trim, self._cached_param_align8, self._fw_fast,
+                      self.__dict__.setdefault("_cached_tile_index", {})):
             cache.clear()
         LaunchPlans.of(self).clear()
         self._bk_ele_scratch = None
@@ -587,17 +589,30 @@ class SumLayer(Layer, nn.Module):
         among them: a choice the tuner holds runs, here as there.)"""
         if not FORWARD_SUM_CUDA:
             return False
-        for key, choice, _, _, _, _ in fast:
+        for key, choice, *_ in fast:
             if autotune.cached(key) != choice:
                 return False
         batch_size = node_mars.size(1)
-        for _, choice, nids, ebase, pbase, k_num_tiles in fast:
-            kernel = (cuda_kernels.tlmm_forward_sum if choice[0] == "cuda" else
-                      cuda_kernels.tlmm_forward_sum_pipelined if choice[0] == "cuda_pipe" else
-                      cuda_kernels.tlmm_forward_sum_prepass)
-            kernel(node_mars, element_mars, params, nids, ebase, pbase, batch_size, self.block_size, k_num_tiles,
-                   choice[1])
+        for _, choice, nids, ebase, pbase, k_num_tiles, tiles in fast:
+            if choice[0] == "cuda_prepass":
+                cuda_kernels.tlmm_forward_sum_prepass(node_mars, element_mars, params, nids, tiles[0], tiles[1], pbase,
+                                                      batch_size, self.block_size, k_num_tiles, choice[1], tiles[2])
+            else:
+                kernel = (cuda_kernels.tlmm_forward_sum if choice[0] == "cuda" else
+                          cuda_kernels.tlmm_forward_sum_pipelined)
+                kernel(node_mars, element_mars, params, nids, ebase, pbase, batch_size, self.block_size, k_num_tiles,
+                       choice[1])
         return True
+
+    def _tile_index(self, kind: str, signature, ebase: torch.Tensor):
+        """A pre-pass kernel's ``(tiles, tix, shared)`` of ``ebase`` (`cuda_kernels.tile_index`), built once per
+        (``kind``, ``signature``) -- one device sync, at the first call."""
+        cache = self.__dict__.setdefault("_cached_tile_index", {})
+        key = (kind, signature)
+        tiles = cache.get(key)
+        if tiles is None:
+            tiles = cache[key] = cuda_kernels.tile_index(ebase)
+        return tiles
 
     def _fw_block_sparse_tiles(self, num_edges: int, batch_size: int, propagation_alg_id: int,
                                pflow_tempered_enabled: bool):
@@ -1240,7 +1255,10 @@ class SumLayer(Layer, nn.Module):
             ebase, pbase, cuda_ok = self._cached_fw_cuda[signature]
             cuda_ok = cuda_ok and self._cuda_param_loads_aligned(params, ("fw", signature), pbase, self.block_size)
             valid_cfgs = cuda_kernels.valid_configs(self.block_size, batch_size) if cuda_ok else []
-            if valid_cfgs:
+            # (the pre-pass copy has tile shapes of its own -- 32-node blocks among them, which no other kernel takes)
+            prepass_cfgs = (cuda_kernels.prepass_valid_configs(self.block_size, batch_size)
+                            if cuda_ok and cuda_kernels.prepass_is_available() else [])
+            if valid_cfgs or prepass_cfgs:
                 # The best config depends on the shape (which tile shapes are valid, and their speed).
                 # Measured once per SHAPE and cached process-wide (`autotune.choose`), not per layer: the
                 # arms agree only to ~1e-6, so structurally identical layers that measured on their own
@@ -1268,32 +1286,46 @@ class SumLayer(Layer, nn.Module):
                                        node_mars, element_mars, params, nids, ebase, pbase,
                                        batch_size, self.block_size, K_NUM_TILES, c)))
                                   for c in cuda_kernels.pipe_valid_configs(self.block_size, batch_size)]
-                    # The pre-pass copy (c/tlmm_forward_sum_prepass.cu, bit-identical: the element tiles' maxima and
-                    # exponentials computed once per node block, then a streaming kernel over the parameter tiles), its
+                    # The pre-pass copy (c/tlmm_forward_sum_prepass.cu, bit-identical: the distinct element tiles'
+                    # maxima and exponentials computed once, then a streaming kernel over the parameter tiles), its
                     # configs as more arms -- MEASURED on HCLT-1024's widest layer at B 128, bf16 params: 385 against
                     # the pipelined kernel's 541 us; HMM-1024 at B 64: 18.3 against 35.7
-                    if cuda_kernels.prepass_is_available():
+                    if prepass_cfgs:
+                        tiles = self._tile_index("fw", signature, ebase)
                         cands += [(("cuda_prepass", c),
                                    (lambda c=c: cuda_kernels.tlmm_forward_sum_prepass(
-                                       node_mars, element_mars, params, nids, ebase, pbase,
-                                       batch_size, self.block_size, K_NUM_TILES, c)))
-                                  for c in cuda_kernels.prepass_valid_configs(self.block_size, batch_size)]
+                                       node_mars, element_mars, params, nids, tiles[0], tiles[1], pbase,
+                                       batch_size, self.block_size, K_NUM_TILES, c, tiles[2])))
+                                  for c in prepass_cfgs]
                     choice = autotune.choose(tlmm_key, cands)
 
                 if choice[0] in ("cuda", "cuda_pipe", "cuda_prepass"):
-                    kernel = (cuda_kernels.tlmm_forward_sum if choice[0] == "cuda" else
-                              cuda_kernels.tlmm_forward_sum_pipelined if choice[0] == "cuda_pipe" else
-                              cuda_kernels.tlmm_forward_sum_prepass)
+                    if choice[0] == "cuda_prepass":
+                        tiles = self._tile_index("fw", signature, ebase)
+
+                        def kernel(node_mars, element_mars, params, nids, ebase, pbase, batch_size, block_size, knt, c,
+                                   a = None, b = None):
+                            # (a launch over some node blocks: the shared tiles whole, their index sliced; unshared,
+                            # the run's own tiles -- a tile per (block, edge tile), flat)
+                            cuda_kernels.tlmm_forward_sum_prepass(
+                                node_mars, element_mars, params, nids,
+                                tiles[0] if tiles[2] else tiles[0].view(-1, knt)[a:b].reshape(-1),
+                                tiles[1][a:b], pbase, batch_size, block_size, knt, c, tiles[2])
+                    else:
+                        tiles = None
+                        kernel = (cuda_kernels.tlmm_forward_sum if choice[0] == "cuda" else
+                                  cuda_kernels.tlmm_forward_sum_pipelined)
                     if runs is None:
                         kernel(node_mars, element_mars, params, nids, ebase, pbase,
                                batch_size, self.block_size, K_NUM_TILES, choice[1])
                         recording = self.__dict__.get("_fw_recording")
                         if recording is not None and autotune.cached(tlmm_key) == choice:
-                            recording.append((tlmm_key, choice, nids, ebase, pbase, K_NUM_TILES))
+                            recording.append((tlmm_key, choice, nids, ebase, pbase, K_NUM_TILES, tiles))
                     else:
                         for a, b in runs:                    # (views of the tables: the grid comes from them)
                             kernel(node_mars, element_mars, params, nids[a:b], ebase[a:b], pbase[a:b],
-                                   batch_size, self.block_size, K_NUM_TILES, choice[1])
+                                   batch_size, self.block_size, K_NUM_TILES, choice[1],
+                                   **({} if tiles is None else dict(a = a, b = b)))
                     return None
                 # choice == ("triton", -1): fall through to the Triton launch below
 
@@ -2053,11 +2085,18 @@ class SumLayer(Layer, nn.Module):
             def _cumbase(start, incr):
                 c = torch.cumsum(incr.to(torch.int64), 1)
                 sh = torch.zeros_like(c); sh[:, 1:] = c[:, :-1]
-                return (start[:, None, :].to(torch.int64) + sh)[:, :, 0].contiguous()
-            ele_ebase = _cumbase(parids_start, parids_increment)    # [n_eleblocks, K_NUM_TILES]
-            ele_pbase = _cumbase(parpids_start, parpids_increment)
+                return (start[:, None, :].to(torch.int64) + sh).contiguous()  # [n_eleblocks, K_NUM_TILES, ptr_inc_step]
+            full_ebase, full_pbase = _cumbase(parids_start, parids_increment), _cumbase(parpids_start, parpids_increment)
+            ele_ebase = full_ebase[:, :, 0].contiguous()                # [n_eleblocks, K_NUM_TILES]
+            ele_pbase = full_pbase[:, :, 0].contiguous()
             ele_cuda_ok = (ptr_inc_step == 1)
             self._cached_bk_ele_cuda[signature] = [ele_ebase, ele_pbase, ele_cuda_ok]
+            # The pre-pass copy takes a tile of several parent blocks too (32-node blocks: two a tile), a parameter
+            # offset per block -- given the tile's parents are contiguous node rows across them
+            _ar = torch.arange(ptr_inc_step, device = ele_ebase.device, dtype = torch.int64) * self.block_size
+            pre_ok = ele_cuda_ok or (ptr_inc_step * self.block_size == TILE_SIZE_K
+                                     and torch.equal(full_ebase, ele_ebase[:, :, None] + _ar.view(1, 1, -1)))
+            self._cached_bk_ele_pre[signature] = [full_pbase.view(full_pbase.size(0), -1), pre_ok]
 
         # Keep `num_edges` consistent with the (possibly trimmed) tile count: the small-batch CUDA ele
         # backward iterates `edge in [0, num_edges)` off the per-block first child, so it must not run
@@ -2273,14 +2312,25 @@ class SumLayer(Layer, nn.Module):
         # {CUDA, Triton} is autotuned once per (signature, batch) -- INTO A SCRATCH buffer, never the
         # live element_flows (which is read-accumulate-write when accumulate_ch_flows is on) -- and
         # cached. Otherwise it falls through to the Triton launch below.
+        # The plain and pipelined kernels take child blocks of 128 rows; the pre-pass copy has tile shapes of its own
+        # (`ele_prepass_valid_configs`: 32-node blocks among them, an HCLT's, which the Triton kernel alone took)
+        ele_pre_cfgs = (cuda_kernels.ele_prepass_valid_configs(cs_block_size, batch_size)
+                        if BACKWARD_ELE_FLOW_CUDA and cuda_kernels.ele_prepass_is_available() else [])
+        ele_plain_ok = cs_block_size % 128 == 0
         if (BACKWARD_ELE_FLOW_CUDA and propagation_alg_id == 0 and abs(eflow_temperature - 1.0) < 1e-6
                 and allow_modify_flows == 0 and logspace_flows and not allow_neg_flows
                 and not accumulate_ch_flows and not force_use_fp32
                 and TILE_SIZE_K == 64 and num_edges % TILE_SIZE_K == 0
-                and cs_block_size % 128 == 0 and batch_size % 64 == 0
+                and (ele_plain_ok or ele_pre_cfgs) and batch_size % 64 == 0
                 and node_flows.is_cuda and cuda_kernels.ele_is_available()):
             ele_ebase, ele_pbase, ele_cuda_ok = self._cached_bk_ele_cuda[signature]
-            if ele_cuda_ok and self._cuda_param_loads_aligned(params, ("ele", signature), ele_pbase, self.block_size):
+            pre_pbase, pre_ok = self._cached_bk_ele_pre[signature]
+            ele_plain_ok = ele_plain_ok and ele_cuda_ok
+            ele_pre_cfgs = ele_pre_cfgs if pre_ok else []
+            if ((ele_plain_ok or ele_pre_cfgs)
+                    and self._cuda_param_loads_aligned(params, ("ele", signature), pre_pbase, self.block_size)):
+                ele_tiles = self._tile_index("ele", signature, ele_ebase) if ele_pre_cfgs else None
+
                 def _cuda_ele(tgt, t):
                     cuda_kernels.ele_backward_sum(
                         tgt, t["element_mars"], t["node_flows"], t["node_mars"], t["params"], chids, ele_ebase,
@@ -2302,9 +2352,13 @@ class SumLayer(Layer, nn.Module):
                 # more arms -- MEASURED, bf16 params: HMM-1024 at B 64 22.5 against the pipelined kernel's 46.4 us;
                 # HCLT-1024's largest partition at B 128 541 against 570
                 def _cuda_ele_prepass(tgt, c, t, a = None, b = None):
+                    # (a launch over some element blocks: the shared tiles whole, their index sliced; unshared, the
+                    # run's own tiles -- a tile per (block, parent tile), flat)
                     cuda_kernels.ele_backward_sum_prepass(
                         tgt, t["element_mars"], t["node_flows"], t["node_mars"], t["params"], chids[a:b],
-                        ele_ebase[a:b], ele_pbase[a:b], batch_size, self.block_size, cs_block_size, K_NUM_TILES, c)
+                        ele_tiles[0] if ele_tiles[2] else ele_tiles[0].view(-1, K_NUM_TILES)[a:b].reshape(-1),
+                        ele_tiles[1][a:b], pre_pbase[a:b], batch_size, self.block_size, cs_block_size, K_NUM_TILES, c,
+                        ele_tiles[2])
 
                 choice_key = (signature, batch_size)
                 choice = self._cached_bk_ele_choice.get(choice_key)
@@ -2315,13 +2369,12 @@ class SumLayer(Layer, nn.Module):
                             or self._bk_ele_scratch.dtype != element_flows.dtype):
                         self._bk_ele_scratch = torch.empty_like(element_flows)
                     scr = self._bk_ele_scratch
-                    cands = [(("triton", -1), (lambda: _triton_ele(scr))),
-                             (("cuda", 0), (lambda: _cuda_ele(scr, cur)))]
-                    if cuda_kernels.ele_pipe_is_available():
-                        cands.append((("cuda_pipe", 0), (lambda: _cuda_ele_pipe(scr, cur))))
-                    if cuda_kernels.ele_prepass_is_available():
-                        cands += [(("cuda_prepass", c), (lambda c=c: _cuda_ele_prepass(scr, c, cur)))
-                                  for c in cuda_kernels.ele_prepass_valid_configs(cs_block_size, batch_size)]
+                    cands = [(("triton", -1), (lambda: _triton_ele(scr)))]
+                    if ele_plain_ok:
+                        cands.append((("cuda", 0), (lambda: _cuda_ele(scr, cur))))
+                        if cuda_kernels.ele_pipe_is_available():
+                            cands.append((("cuda_pipe", 0), (lambda: _cuda_ele_pipe(scr, cur))))
+                    cands += [(("cuda_prepass", c), (lambda c=c: _cuda_ele_prepass(scr, c, cur))) for c in ele_pre_cfgs]
                     choice = autotune.best_of(cands) or ("triton", -1)
                     self._cached_bk_ele_choice[choice_key] = choice
                 if choice[0] in ("cuda", "cuda_pipe", "cuda_prepass"):

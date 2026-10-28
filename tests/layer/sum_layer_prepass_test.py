@@ -21,10 +21,11 @@ NAN = float("nan")
 DTYPES = {"fp32": torch.float32, "bf16": torch.bfloat16}
 
 
-def _hclt(latents, dt, cats = 16, V = 64):
+def _hclt(latents, dt, cats = 16, V = 64, block_size = None):
     torch.manual_seed(0)
     x = torch.randint(0, cats, (512, V))
-    ns = juice.structures.HCLT(x.float(), num_latents = latents, input_dist = dists.Categorical(num_cats = cats))
+    ns = juice.structures.HCLT(x.float(), num_latents = latents, input_dist = dists.Categorical(num_cats = cats),
+                               **({} if block_size is None else dict(block_size = block_size)))
     ns.init_parameters(perturbation = 2.0)
     return juice.compile(ns, verbose = False, param_dtype = dt).to(DEV), V, cats
 
@@ -81,9 +82,11 @@ def _reference(pc, layer, nids, ebase, pbase, B):
 def _check_configs(pc, layer, nids, ebase, pbase, B, want, label):
     a, b = layer.nid_range
     bs, knt = layer.block_size, ebase.size(1)
+    tiles, tix, shared = ck.tile_index(ebase)
     for cfg in ck.prepass_valid_configs(bs, B):
         pc.node_mars[a:b] = NAN
-        ck.tlmm_forward_sum_prepass(pc.node_mars, pc.element_mars, pc.params, nids, ebase, pbase, B, bs, knt, cfg)
+        ck.tlmm_forward_sum_prepass(pc.node_mars, pc.element_mars, pc.params, nids, tiles, tix, pbase, B, bs, knt, cfg,
+                                    shared)
         assert torch.equal(pc.node_mars[a:b], want), (label, cfg)
 
 
@@ -189,3 +192,60 @@ def test_the_gate_offers_the_prepass_configs(B, monkeypatch):
             assert cands[0] == ("triton", -1)
             want = [("cuda_prepass", c) for c in ck.prepass_valid_configs(128, B)] if on else []
             assert [ch for ch in cands if ch[0] == "cuda_prepass"] == want
+
+
+def _float64_block(pc, bs, cids_k, pids_k):
+    """Node block `k`'s rows in float64 from the layer's COMPILED tables (`partitioned_cids` / `pids`: an edge's child
+    row and node 0's parameter, padding 0 -- not the kernels' derived tables): log sum_e params[m, e] exp(emars[e, b])."""
+    real = cids_k != 0
+    par = pc.params.double()[pids_k[real][:, None] + torch.arange(bs, device = DEV)]              # [E, bs]
+    return torch.logsumexp(par.log()[:, :, None] + pc.element_mars.double()[cids_k[real]][:, None, :], dim = 0)
+
+
+@pytest.mark.parametrize("dts", list(DTYPES))
+@pytest.mark.parametrize("B", [64, 128])
+def test_the_prepass_forward_on_32_node_blocks(B, dts, monkeypatch):
+    """Layers of 32-node blocks (an HCLT's), which no other CUDA kernel takes: the 32-row configs against each other to
+    the bit and against float64; the pre-pass over the DISTINCT element tiles (a variable's 8 blocks share theirs); the
+    dispatch, told the gate chose one of them, reaching it."""
+    if not _available():
+        pytest.skip("the CUDA kernels are not available here")
+    monkeypatch.setattr(SL, "FORWARD_SUM_CUDA", False)
+    pc, V, C = _hclt(256, DTYPES[dts], block_size = 32)                # 8 blocks a variable: they share the pre-pass
+    x = torch.randint(0, C, (B, V), device = DEV)
+    pc(x)
+    checked = 0
+    for layer, nids, ebase, pbase in _cuda_layers(pc, B):
+        assert layer.block_size == 32 and not ck.valid_configs(32, B) and not ck.pipe_valid_configs(32, B)
+        tiles, tix, shared = ck.tile_index(ebase)
+        assert shared and tiles.numel() * 8 == ebase.numel() and torch.equal(tiles[tix.long()], ebase), "8 share a tile"
+        a, b = layer.nid_range
+        bs, knt = 32, ebase.size(1)
+        outs = []
+        for cfg in ck.prepass_valid_configs(bs, B):
+            pc.node_mars[a:b] = NAN
+            ck.tlmm_forward_sum_prepass(pc.node_mars, pc.element_mars, pc.params, nids, tiles, tix, pbase, B, bs, knt,
+                                        cfg, shared)
+            outs.append(pc.node_mars[a:b].clone())
+        assert outs and all(torch.equal(o, outs[0]) for o in outs[1:]), (dts, B, "the configs differ")   # (B 128: two)
+        cids, pids = layer.partitioned_cids[0], layer.partitioned_pids[0]
+        for k in range(nids.numel()):
+            r0 = int(nids[k]) - a
+            ref, got = _float64_block(pc, bs, cids[k].long(), pids[k].long()), outs[0][r0:r0 + bs].double()
+            fin = torch.isfinite(ref)
+            assert torch.equal(fin, torch.isfinite(got)), (dts, B, k, "finite pattern")
+            assert float((got[fin] - ref[fin]).abs().max()) < 1e-2, (dts, B, k, "against float64")
+        cfg0 = ck.prepass_valid_configs(bs, B)[0]
+        was = autotune.set_autotune(True, clear_cache = True)
+        try:
+            with monkeypatch.context() as mp:
+                mp.setattr(SL, "FORWARD_SUM_CUDA", True)
+                mp.setattr(autotune, "best_of", lambda cands, *args, **kw: ("cuda_prepass", cfg0))
+                pc.node_mars[a:b] = NAN
+                layer.forward(pc.node_mars, pc.element_mars, pc.params)
+                assert torch.equal(pc.node_mars[a:b], outs[0])
+        finally:
+            autotune.set_autotune(was, clear_cache = True)
+        pc.node_mars[a:b] = outs[0]
+        checked += 1
+    assert checked > 0, "no layer of 32-node blocks takes the pre-pass kernel"

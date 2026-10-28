@@ -24,10 +24,11 @@ NINF = -float("inf")
 DTYPES = {"fp32": torch.float32, "bf16": torch.bfloat16}
 
 
-def _hclt(latents, dt, cats = 16, V = 64):
+def _hclt(latents, dt, cats = 16, V = 64, block_size = None):
     torch.manual_seed(0)
     x = torch.randint(0, cats, (512, V))
-    ns = juice.structures.HCLT(x.float(), num_latents = latents, input_dist = dists.Categorical(num_cats = cats))
+    ns = juice.structures.HCLT(x.float(), num_latents = latents, input_dist = dists.Categorical(num_cats = cats),
+                               **({} if block_size is None else dict(block_size = block_size)))
     ns.init_parameters(perturbation = 2.0)
     return juice.compile(ns, verbose = False, param_dtype = dt).to(DEV), V, cats
 
@@ -82,10 +83,11 @@ def _plain(pc, layer, chids, cs, ebase, pbase, rows, B):
 
 
 def _check_configs(pc, layer, chids, cs, ebase, pbase, rows, B, want, label):
+    tiles, tix, shared = ck.tile_index(ebase)
     for cfg in ck.ele_prepass_valid_configs(cs, B):
         ef = torch.full_like(pc.element_flows, NAN)
-        ck.ele_backward_sum_prepass(ef, pc.element_mars, pc.node_flows, pc.node_mars, pc.params, chids, ebase, pbase, B,
-                                    layer.block_size, cs, ebase.size(1), cfg)
+        ck.ele_backward_sum_prepass(ef, pc.element_mars, pc.node_flows, pc.node_mars, pc.params, chids, tiles, tix,
+                                    pbase, B, layer.block_size, cs, ebase.size(1), cfg, shared)
         assert torch.equal(ef[rows], want), (label, cfg)
 
 
@@ -130,6 +132,77 @@ def test_the_prepass_element_backward_on_dead_columns(name, dts, monkeypatch):
         pc.node_mars.copy_(saved_m); pc.node_flows.copy_(saved_f)
         checked += 1
     assert checked > 0, "no partition of the circuit takes the CUDA path"
+
+
+def _float64_block(pc, bs, cs, chid, parids_k, parpids_k):
+    """Element block `k`'s flows in float64 from the layer's COMPILED tables (`partitioned_parids` / `parpids`: a parent
+    block's first node row and first parameter per child block, padding 0 -- not the kernels' derived tables, which a
+    wrong derivation would feed to both sides): element_mars + log sum_e params[m, e] exp(lf[e, b])."""
+    real = parids_k != 0
+    ar = torch.arange(bs, device = DEV)
+    e_rows = (parids_k[real][:, None] + ar).reshape(-1)                           # the parents
+    nf, nm = pc.node_flows.double()[e_rows], pc.node_mars.double()[e_rows]
+    lf = torch.where(nm == NINF, torch.full_like(nm, NINF), nf - nm)              # [E, B]
+    pidx = (parpids_k[real][:, None] + ar).reshape(-1)                            # element 0's parameter per parent
+    par = pc.params.double()[pidx[None, :] + torch.arange(cs, device = DEV)[:, None] * bs]     # [cs, E]
+    rows = chid + torch.arange(cs, device = DEV)
+    return pc.element_mars.double()[rows] + torch.logsumexp(par.log()[:, :, None] + lf[None], dim = 1)   # [cs, B]
+
+
+@pytest.mark.parametrize("dts", list(DTYPES))
+@pytest.mark.parametrize("B", [64, 128])
+def test_the_prepass_element_backward_on_32_node_blocks(B, dts, monkeypatch):
+    """Partitions of 32-node child blocks under 32-node parent blocks (an HCLT's), which no other CUDA kernel takes: a
+    parent tile spans two parameter blocks; the 32-row configs against each other to the bit and against float64; the
+    pre-pass over the DISTINCT parent tiles (a variable's 8 child blocks share theirs); the dispatch, told the gate chose
+    one of them, reaching it."""
+    if not _available():
+        pytest.skip("the CUDA kernels are not available here")
+    pc, V, C = _hclt(256, DTYPES[dts], block_size = 32)                # 8 blocks a variable: they share the pre-pass
+    x = torch.randint(0, C, (B, V), device = DEV)
+    monkeypatch.setattr(SL, "BACKWARD_ELE_FLOW_CUDA", False)
+    pc(x)
+    pc.backward(x, compute_param_flows = False)                     # the backward's caches, Triton throughout
+    monkeypatch.setattr(SL, "BACKWARD_ELE_FLOW_CUDA", True)
+    checked = 0
+    for lg in pc.inner_layer_groups:
+        if not lg.is_sum():
+            continue
+        for layer in lg:
+            for sig, (ebase, pbase, plain_ok) in list(layer._cached_bk_ele_cuda.items()):
+                pbase_full, pre_ok = layer._cached_bk_ele_pre[sig]
+                chids, cs = layer.partitioned_chids[sig[1]], int(layer.cs_block_sizes[sig[1]])
+                if sig[2] != 64 or cs != 32 or not pre_ok:
+                    continue
+                assert not plain_ok and layer.block_size == 32 and pbase_full.size(1) == 2 * ebase.size(1)
+                assert layer._cuda_param_loads_aligned(pc.params, ("ele", sig), pbase_full, layer.block_size)
+                tiles, tix, shared = ck.tile_index(ebase)
+                assert shared and tiles.numel() * 8 == ebase.numel() and torch.equal(tiles[tix.long()], ebase), "8 share"
+                rows = (chids[:, None] + torch.arange(cs, device = DEV)[None, :]).reshape(-1)
+                outs = []
+                for cfg in ck.ele_prepass_valid_configs(cs, B):
+                    ef = torch.full_like(pc.element_flows, NAN)
+                    ck.ele_backward_sum_prepass(ef, pc.element_mars, pc.node_flows, pc.node_mars, pc.params, chids, tiles,
+                                                tix, pbase_full, B, layer.block_size, cs, ebase.size(1), cfg, shared)
+                    outs.append(ef[rows].clone())
+                assert outs and all(torch.equal(o, outs[0]) for o in outs[1:]), (dts, B, "the configs differ")
+                parids, parpids = layer.partitioned_parids[sig[1]], layer.partitioned_parpids[sig[1]]
+                for k in range(chids.numel()):
+                    ref = _float64_block(pc, layer.block_size, cs, int(chids[k]), parids[k].long(), parpids[k].long())
+                    got = outs[0][k * cs:(k + 1) * cs].double()
+                    fin = torch.isfinite(ref)
+                    assert torch.equal(fin, torch.isfinite(got)), (dts, B, k, "finite pattern")
+                    assert float((got[fin] - ref[fin]).abs().max()) < 1e-2, (dts, B, k, "against float64")
+                cfg0 = ck.ele_prepass_valid_configs(cs, B)[0]
+                with monkeypatch.context() as mp:
+                    mp.setattr(autotune, "best_of", lambda cands, *a, **k: ("cuda_prepass", cfg0))
+                    layer._cached_bk_ele_choice.clear()
+                    ef = torch.full_like(pc.element_flows, NAN)
+                    layer.backward(pc.node_flows, ef, pc.node_mars, pc.element_mars, pc.params, logspace_flows = True)
+                    assert torch.equal(ef[rows], outs[0])
+                layer._cached_bk_ele_choice.clear()
+                checked += 1
+    assert checked > 0, "no partition of 32-node blocks takes the pre-pass kernel"
 
 
 @pytest.mark.parametrize("name", list(CIRCUITS))

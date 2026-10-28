@@ -111,11 +111,14 @@ __global__ void __launch_bounds__(NT) prepass_kernel(const float* __restrict__ e
 extern __shared__ char smem_raw[];
 
 // ---------------- streaming kernel: PW producer warps beside the WM x WN MMA warps, ST stages ----------------
-template <int BM, int BN, int WM, int WN, int PW, int ST, typename TP>
+// TIX: the pre-pass tile of (node block, edge tile) is `tix[...]` (node blocks sharing their children share tiles); false
+// where it is the entry's own index (no block shares: the table is never read -- MEASURED the read, prefetched a tile
+// ahead, cost the fp32 kernels 13%)
+template <int BM, int BN, int WM, int WN, int PW, int ST, bool TIX, typename TP>
 __global__ void __launch_bounds__((WM * WN + PW) * 32) tlmm_prepass_kernel(
         float* __restrict__ node_mars, const TP* __restrict__ mp, const long* __restrict__ nids,
         const long* __restrict__ pbase, const __nv_bfloat16* __restrict__ bx, const float* __restrict__ mx,
-        int batch, int block_size, int knt, int pid_m_offset) {
+        const int* __restrict__ tix, int batch, int block_size, int knt, int pid_m_offset) {
     constexpr int NC = WM * WN * 32;                 // consumer threads
     constexpr int NP = PW * 32;                      // producer threads
     constexpr int NTH = NC + NP;
@@ -129,8 +132,13 @@ __global__ void __launch_bounds__((WM * WN + PW) * 32) tlmm_prepass_kernel(
     const long* pb = pbase + (long)nblock * knt;
     int tid = threadIdx.x;
 
+    // 64 consecutive m (or b) of one k per 128-byte row, Swizzle<3, 3, 3> over it; a node tile of 32 rows is half such
+    // a row: 32 m of one k per 64-byte row, Swizzle<2, 3, 3> (two k per 128 bytes, so the transposed ldmatrix's 8 k rows
+    // still hit 8 distinct 16-byte bank groups)
     auto swz = composition(Swizzle<3, 3, 3>{}, Layout<Shape<_64, _8>, Stride<_1, _64>>{});
-    auto sAl = tile_to_shape(swz, make_shape(Int<BM>{}, Int<BK>{}));
+    auto swz32 = composition(Swizzle<2, 3, 3>{}, Layout<Shape<_32, _8>, Stride<_1, _32>>{});
+    auto sAl = tile_to_shape(std::conditional_t<(BM >= 64), decltype(swz), decltype(swz32)>{},
+                             make_shape(Int<BM>{}, Int<BK>{}));
     auto sBl = tile_to_shape(swz, make_shape(Int<BN>{}, Int<BK>{}));
     // a stage: the A operand (params, bf16), the B operand (exponentials, bf16), then alpha, beta, M per column
     constexpr int STAGE = BM * BK * 2 + BN * BK * 2 + 3 * BN * 4;
@@ -146,9 +154,12 @@ __global__ void __launch_bounds__((WM * WN + PW) * 32) tlmm_prepass_kernel(
         float Mrun[BN / 32], mnext[BN / 32];
         CUTE_UNROLL
         for (int j = 0; j < BN / 32; j++) Mrun[j] = -INFINITY;
+        // the pre-pass tiles of tiles t (tx1) and t + 1 (tx2), loaded a tile ahead (a load that waited on them a tile
+        // would sit on the producers' path)
+        int tx1 = TIX ? tix[tile0] : (int)tile0, tx2 = TIX ? (knt > 1 ? tix[tile0 + 1] : 0) : (int)tile0 + 1;
         if (ptid < 32) {
             CUTE_UNROLL
-            for (int j = 0; j < BN / 32; j++) mnext[j] = mx[tile0 * batch + b0 + ptid + 32 * j];
+            for (int j = 0; j < BN / 32; j++) mnext[j] = mx[(long)tx1 * batch + b0 + ptid + 32 * j];
         }
         // the parameter offsets two tiles ahead: pn1 tile t's, pn2 tile t + 1's (the next tile's fp32 loads need it)
         long pn1 = pb[0], pn2 = knt > 1 ? pb[1] : 0;
@@ -173,6 +184,9 @@ __global__ void __launch_bounds__((WM * WN + PW) * 32) tlmm_prepass_kernel(
             long pc = pn1 + (long)tile_id * BM;
             pn1 = pn2;
             if (t + 2 < knt) pn2 = pb[t + 2];
+            const int tcur = tx1;
+            tx1 = tx2;
+            if (t + 2 < knt) tx2 = TIX ? tix[tile0 + t + 2] : (int)tile0 + t + 2;
             if constexpr (BF16) {
                 // A operand[m, e] = params, 8 per 16-byte copy
                 constexpr int PA = (BM * BK) / 8 / NP;
@@ -187,7 +201,7 @@ __global__ void __launch_bounds__((WM * WN + PW) * 32) tlmm_prepass_kernel(
             // B operand[b, e] = the pre-pass's exponentials, 8 per 16-byte copy
             constexpr int PBC = (BN * BK) / 8 / NP;
             static_assert((BN * BK) / 8 % NP == 0, "exponential chunks per producer thread");
-            const __nv_bfloat16* bt = bx + (tile0 + t) * BK * (long)batch + b0;
+            const __nv_bfloat16* bt = bx + (long)tcur * BK * (long)batch + b0;
             CUTE_UNROLL
             for (int q = 0; q < PBC; q++) {
                 int i = ptid + q * NP;
@@ -224,7 +238,7 @@ __global__ void __launch_bounds__((WM * WN + PW) * 32) tlmm_prepass_kernel(
                 }
                 if (t + 1 < knt) {
                     CUTE_UNROLL
-                    for (int j = 0; j < BN / 32; j++) mnext[j] = mx[(tile0 + t + 1) * batch + b0 + ptid + 32 * j];
+                    for (int j = 0; j < BN / 32; j++) mnext[j] = mx[(long)tx1 * batch + b0 + ptid + 32 * j];
                 }
             }
         };
@@ -290,13 +304,13 @@ __global__ void __launch_bounds__((WM * WN + PW) * 32) tlmm_prepass_kernel(
     }
 }
 
-template <int BM, int BN, int WM, int WN, int PW, int ST, typename TP>
+template <int BM, int BN, int WM, int WN, int PW, int ST, bool TIX, typename TP>
 static void launch_cfg(float* node_mars, const TP* params, const long* nids, int n_nblocks, const long* pbase,
-                       const __nv_bfloat16* bx, const float* mx, int batch, int block_size, int knt,
+                       const __nv_bfloat16* bx, const float* mx, const int* tix, int batch, int block_size, int knt,
                        cudaStream_t stream) {
     constexpr int NTH = (WM * WN + PW) * 32;
     constexpr int smem = ST * (BM * BK * 2 + BN * BK * 2 + 3 * BN * 4);
-    auto kernel = tlmm_prepass_kernel<BM, BN, WM, WN, PW, ST, TP>;
+    auto kernel = tlmm_prepass_kernel<BM, BN, WM, WN, PW, ST, TIX, TP>;
     // the shared-memory attribute once per device and config (the call costs host time on every launch of a small
     // layer); the flags are this instantiation's own
     static bool attr_set[64] = {};
@@ -311,7 +325,7 @@ static void launch_cfg(float* node_mars, const TP* params, const long* nids, int
     for (int off = 0; off < total_m; off += MAX_Y) {
         int chunk = (total_m - off < MAX_Y) ? (total_m - off) : MAX_Y;
         dim3 grid(batch / BN, chunk);
-        kernel<<<grid, NTH, smem, stream>>>(node_mars, params, nids, pbase, bx, mx, batch, block_size, knt, off);
+        kernel<<<grid, NTH, smem, stream>>>(node_mars, params, nids, pbase, bx, mx, tix, batch, block_size, knt, off);
         C10_CUDA_KERNEL_LAUNCH_CHECK();
     }
 }
@@ -320,26 +334,43 @@ static void launch_cfg(float* node_mars, const TP* params, const long* nids, int
 // (MEASURED on HCLT-1024's widest layer at B 128, the streaming kernel alone: 306 us, against 322 with 16 MMA warps,
 // 323 with 2 producer warps on 4 stages, 416 with 16 MMA warps and 2 producer warps); 16 MMA warps as the alternative;
 // the (64, 64) tile on 4 stages for few node blocks (MEASURED HMM-1024 B 64, both launches: 4 producer warps 18.3 us,
-// 2 producer warps 19.1).
-template <typename TP>
+// 2 producer warps 19.1); the (32, 64) and (32, 128) tiles, 2 x 2 and 2 x 4 MMA warps, for layers of 32-node blocks
+// (an HCLT's), which no other CUDA kernel takes.
+template <bool TIX, typename TP>
 static void dispatch_cfg(float* nm, const TP* p, const long* nids, int nb, const long* pb, const __nv_bfloat16* bx,
-                         const float* mx, int b, int bs, int k, int64_t cfg, cudaStream_t st) {
+                         const float* mx, const int* tix, int b, int bs, int k, int64_t cfg, cudaStream_t st) {
     switch (cfg) {
-        case 0: launch_cfg<128, 64, 4, 2, 4, 3, TP>(nm, p, nids, nb, pb, bx, mx, b, bs, k, st); break;
-        case 1: launch_cfg<128, 64, 8, 2, 4, 3, TP>(nm, p, nids, nb, pb, bx, mx, b, bs, k, st); break;
-        case 2: launch_cfg<64, 64, 4, 2, 4, 4, TP>(nm, p, nids, nb, pb, bx, mx, b, bs, k, st); break;
-        default: launch_cfg<64, 64, 4, 2, 2, 4, TP>(nm, p, nids, nb, pb, bx, mx, b, bs, k, st); break;
+        case 0: launch_cfg<128, 64, 4, 2, 4, 3, TIX, TP>(nm, p, nids, nb, pb, bx, mx, tix, b, bs, k, st); break;
+        case 1: launch_cfg<128, 64, 8, 2, 4, 3, TIX, TP>(nm, p, nids, nb, pb, bx, mx, tix, b, bs, k, st); break;
+        case 2: launch_cfg<64, 64, 4, 2, 4, 4, TIX, TP>(nm, p, nids, nb, pb, bx, mx, tix, b, bs, k, st); break;
+        case 3: launch_cfg<64, 64, 4, 2, 2, 4, TIX, TP>(nm, p, nids, nb, pb, bx, mx, tix, b, bs, k, st); break;
+        case 4: launch_cfg<32, 64, 2, 2, 4, 4, TIX, TP>(nm, p, nids, nb, pb, bx, mx, tix, b, bs, k, st); break;
+        default: launch_cfg<32, 128, 2, 4, 4, 3, TIX, TP>(nm, p, nids, nb, pb, bx, mx, tix, b, bs, k, st); break;
     }
+}
+
+template <typename TP>
+static void dispatch_tix(float* nm, const TP* p, const long* nids, int nb, const long* pb, const __nv_bfloat16* bx,
+                         const float* mx, const int* tix, bool shared, int b, int bs, int k, int64_t cfg, cudaStream_t st) {
+    if (shared) dispatch_cfg<true, TP>(nm, p, nids, nb, pb, bx, mx, tix, b, bs, k, cfg, st);
+    else dispatch_cfg<false, TP>(nm, p, nids, nb, pb, bx, mx, tix, b, bs, k, cfg, st);
 }
 
 // The parameters in the dtype they are stored in (`TensorCircuit.param_dtype`): fp32 or bf16. The pre-pass's scratch
 // is ONE allocation: the exponentials, then the maxima (16-byte aligned: the exponentials are tiles x 64 x batch bf16).
+// `ebase`: the DISTINCT element tiles' first rows; `tix` (int32 [node blocks, edge tiles]): which of them each node
+// block's edge tile is -- node blocks sharing their children (an HCLT's 32 blocks of a variable) share the pre-pass.
 void tlmm_forward_sum_prepass(torch::Tensor node_mars, torch::Tensor element_mars, torch::Tensor params,
-                              torch::Tensor nids, torch::Tensor ebase, torch::Tensor pbase, int64_t batch,
-                              int64_t block_size, int64_t knt, int64_t cfg) {
+                              torch::Tensor nids, torch::Tensor ebase, torch::Tensor tix, torch::Tensor pbase,
+                              int64_t batch, int64_t block_size, int64_t knt, int64_t cfg, bool shared) {
     TORCH_CHECK(batch % PB == 0, "the pre-pass forward needs a batch that is a multiple of ", PB);
-    TORCH_CHECK(ebase.is_contiguous() && ebase.numel() == nids.numel() * knt, "ebase: [node blocks, edge tiles]");
+    TORCH_CHECK(ebase.is_contiguous() && ebase.dim() == 1, "ebase: [distinct element tiles]");
+    TORCH_CHECK(tix.is_contiguous() && tix.scalar_type() == torch::kInt32 && tix.numel() == nids.numel() * knt,
+                "tix: int32 [node blocks, edge tiles]");
+    // `shared`: the blocks share tiles, `tix` read; else `ebase` is every entry's own tile in order and `tix` is
+    // unread (a caller's word, not inferred from the sizes: a launch over some node blocks hands a slice of `tix`)
     long tiles = ebase.numel();
+    TORCH_CHECK(shared || tiles == tix.numel(), "unshared tiles: one per (node block, edge tile)");
     long bx_bytes = tiles * BK * batch * 2;
     torch::Tensor scratch = torch::empty({bx_bytes + tiles * batch * 4}, element_mars.options().dtype(torch::kUInt8));
     auto* bx = reinterpret_cast<__nv_bfloat16*>(scratch.data_ptr());
@@ -350,16 +381,16 @@ void tlmm_forward_sum_prepass(torch::Tensor node_mars, torch::Tensor element_mar
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     int b = (int)batch, bs = (int)block_size, k = (int)knt, nb = (int)nids.size(0);
     if (params.scalar_type() == torch::kBFloat16)
-        dispatch_cfg<__nv_bfloat16>(node_mars.data_ptr<float>(), param_ptr<__nv_bfloat16>(params), nids.data_ptr<long>(),
-                                    nb, pbase.data_ptr<long>(), bx, mx, b, bs, k, cfg, st);
+        dispatch_tix<__nv_bfloat16>(node_mars.data_ptr<float>(), param_ptr<__nv_bfloat16>(params), nids.data_ptr<long>(),
+                                    nb, pbase.data_ptr<long>(), bx, mx, tix.data_ptr<int>(), shared, b, bs, k, cfg, st);
     else
-        dispatch_cfg<float>(node_mars.data_ptr<float>(), param_ptr<float>(params), nids.data_ptr<long>(), nb,
-                            pbase.data_ptr<long>(), bx, mx, b, bs, k, cfg, st);
+        dispatch_tix<float>(node_mars.data_ptr<float>(), param_ptr<float>(params), nids.data_ptr<long>(), nb,
+                            pbase.data_ptr<long>(), bx, mx, tix.data_ptr<int>(), shared, b, bs, k, cfg, st);
 }
 
 // (BM, BN) per config id; Python uses this to enumerate the configs valid for a layer shape.
 std::vector<std::vector<int64_t>> configs() {
-    return {{128, 64}, {128, 64}, {64, 64}, {64, 64}};
+    return {{128, 64}, {128, 64}, {64, 64}, {64, 64}, {32, 64}, {32, 128}};
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {

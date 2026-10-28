@@ -114,11 +114,15 @@ __global__ void __launch_bounds__(256) ele_prepass_kernel(const float* __restric
 
 extern __shared__ char smem_raw[];
 
-template <int BM, int BN, int WM, int WN, int PW, int ST, typename TP>
+// TIX: the pre-pass tile of (element block, parent tile) is `tix[...]` (element blocks sharing their parents share
+// tiles); false where it is the entry's own index (the table is never read -- MEASURED the read, prefetched a tile
+// ahead, cost the fp32 kernel 13%)
+template <int BM, int BN, int WM, int WN, int PW, int ST, int PBT, bool TIX, typename TP>
 __global__ void __launch_bounds__((WM * WN + PW) * 32) ele_stream_kernel(
         float* __restrict__ eflows, const float* __restrict__ emars, const TP* __restrict__ mp,
         const long* __restrict__ chids, const long* __restrict__ pbase, const half_t* __restrict__ bx,
-        const float* __restrict__ mx, int batch, int BSK, int BSM, int knt, int pid_m_offset) {
+        const float* __restrict__ mx, const int* __restrict__ tix, int batch, int BSK, int BSM, int knt,
+        int pid_m_offset) {
     constexpr int NC = WM * WN * 32;
     constexpr int NP = PW * 32;
     constexpr int NTH = NC + NP;
@@ -127,7 +131,10 @@ __global__ void __launch_bounds__((WM * WN + PW) * 32) ele_stream_kernel(
     int eb = pid_m / mtiles, tile_id = pid_m % mtiles;
     int b0 = pid_b * BN;
     long off_ele = chids[eb] + (long)tile_id * BM;
-    const long* pbp = pbase + (long)eb * knt;
+    // a parent tile's parameters: PBT blocks of BSK parents each (one where BSK >= BK; two where the parents' block
+    // size is 32: the halves of a tile lie in different parameter blocks -- a template parameter: the one-block kernel
+    // is the kernel it was, MEASURED a runtime count cost it a third)
+    const long* pbp = pbase + (long)eb * knt * PBT;
     int tid = threadIdx.x;
 
     // A: the plain kernels' K-major atom (written from registers); B: 64 consecutive parents of one column per 128-byte
@@ -147,32 +154,43 @@ __global__ void __launch_bounds__((WM * WN + PW) * 32) ele_stream_kernel(
         float Mrun[BN / 32], mnext[BN / 32];
         CUTE_UNROLL
         for (int j = 0; j < BN / 32; j++) Mrun[j] = -INFINITY;
+        // the pre-pass tiles of tiles t (tx1) and t + 1 (tx2), loaded a tile ahead (a load that waited on them a tile
+        // would sit on the producers' path)
+        int tx1 = TIX ? tix[tile0] : (int)tile0, tx2 = TIX ? (knt > 1 ? tix[tile0 + 1] : 0) : (int)tile0 + 1;
         if (ptid < 32) {
             CUTE_UNROLL
-            for (int j = 0; j < BN / 32; j++) mnext[j] = mx[tile0 * batch + b0 + ptid + 32 * j];
+            for (int j = 0; j < BN / 32; j++) mnext[j] = mx[(long)tx1 * batch + b0 + ptid + 32 * j];
         }
-        long pn1 = pbp[0], pn2 = knt > 1 ? pbp[1] : 0;
+        // the parameter blocks of tiles t (pn1a, and pn1b: the second block of a two-block tile) and t + 1 (pn2a / b),
+        // the next tile's fp32/bf16 loads one issue ahead -- scalars, not an array the lambda takes by address (MEASURED
+        // that at fp32: local memory, +18% on the kernel)
+        long pn1a = pbp[0], pn1b = PBT > 1 ? pbp[1] : 0;
+        long pn2a = knt > 1 ? pbp[PBT] : 0, pn2b = (PBT > 1 && knt > 1) ? pbp[PBT + 1] : 0;
         constexpr int PA = (BM * BK) / 8 / NP;            // 8-parameter chunks per producer thread
         static_assert((BM * BK) / 8 % NP == 0, "params chunks per producer thread");
         float ra[PA][8];
-        auto loadA = [&](long pcv) {
+        auto loadA = [&](long pa, long pb) {
             CUTE_UNROLL
             for (int q = 0; q < PA; q++) {
                 int i = ptid + q * NP;
                 int m = i / (BK / 8), ee = (i % (BK / 8)) * 8;
-                ParamLoad<TP>::load8(&mp[pcv + (long)m * BSK + ee], ra[q]);
+                int h = PBT > 1 ? ee / (BK / PBT) : 0, e = PBT > 1 ? ee % (BK / PBT) : ee;
+                ParamLoad<TP>::load8(&mp[(h ? pb : pa) + (long)tile_id * BM * BSK + (long)m * BSK + e], ra[q]);
             }
         };
-        loadA(pn1 + (long)tile_id * BM * BSK);
+        loadA(pn1a, pn1b);
         auto issue = [&](int t) {
             int s = t % ST;
             Tensor sAt = make_tensor(make_smem_ptr(stA(s)), sAl);
             Tensor sBt = make_tensor(make_smem_ptr(stB(s)), sBl);
-            pn1 = pn2;
-            if (t + 2 < knt) pn2 = pbp[t + 2];
+            const int tcur = tx1;
+            tx1 = tx2;
+            if (t + 2 < knt) tx2 = TIX ? tix[tile0 + t + 2] : (int)tile0 + t + 2;
+            pn1a = pn2a; pn1b = pn2b;
+            if (t + 2 < knt) { pn2a = pbp[(t + 2) * PBT]; if (PBT > 1) pn2b = pbp[(t + 2) * PBT + 1]; }
             constexpr int PBC = (BN * BK) / 8 / NP;
             static_assert((BN * BK) / 8 % NP == 0, "exponential chunks per producer thread");
-            const half_t* bt = bx + ((tile0 + t) * batch + b0) * (long)BK;
+            const half_t* bt = bx + ((long)tcur * batch + b0) * (long)BK;
             CUTE_UNROLL
             for (int q = 0; q < PBC; q++) {
                 int i = ptid + q * NP;
@@ -188,7 +206,7 @@ __global__ void __launch_bounds__((WM * WN + PW) * 32) ele_stream_kernel(
                 for (int j = 0; j < 8; j++) r[j] = static_cast<half_t>(ra[q][j]);
                 *(float4*)&sAt(m, ee) = *(const float4*)r;
             }
-            if (t + 1 < knt) loadA(pn1 + (long)tile_id * BM * BSK);
+            if (t + 1 < knt) loadA(pn1a, pn1b);
             if (ptid < 32) {
                 float* f = stF(s);
                 CUTE_UNROLL
@@ -205,7 +223,7 @@ __global__ void __launch_bounds__((WM * WN + PW) * 32) ele_stream_kernel(
                 }
                 if (t + 1 < knt) {
                     CUTE_UNROLL
-                    for (int j = 0; j < BN / 32; j++) mnext[j] = mx[(tile0 + t + 1) * batch + b0 + ptid + 32 * j];
+                    for (int j = 0; j < BN / 32; j++) mnext[j] = mx[(long)tx1 * batch + b0 + ptid + 32 * j];
                 }
             }
         };
@@ -270,12 +288,13 @@ __global__ void __launch_bounds__((WM * WN + PW) * 32) ele_stream_kernel(
     }
 }
 
-template <int BM, int BN, int WM, int WN, int PW, int ST, typename TP>
+template <int BM, int BN, int WM, int WN, int PW, int ST, int PBT, bool TIX, typename TP>
 static void launch_cfg(float* ef, const float* em, const TP* p, const long* chids, int neb, const long* pb,
-                       const half_t* bx, const float* mx, int batch, int BSK, int BSM, int knt, cudaStream_t st) {
+                       const half_t* bx, const float* mx, const int* tix, int batch, int BSK, int BSM, int knt,
+                       cudaStream_t st) {
     constexpr int NTH = (WM * WN + PW) * 32;
     constexpr int smem = ST * (BM * BK * 2 + BN * BK * 2 + 3 * BN * 4);
-    auto kernel = ele_stream_kernel<BM, BN, WM, WN, PW, ST, TP>;
+    auto kernel = ele_stream_kernel<BM, BN, WM, WN, PW, ST, PBT, TIX, TP>;
     // the shared-memory attribute once per device and config (its host time counts on small layers); this
     // instantiation's own flags
     static bool attr_set[64] = {};
@@ -290,32 +309,60 @@ static void launch_cfg(float* ef, const float* em, const TP* p, const long* chid
     for (int off = 0; off < total_m; off += MAX_Y) {
         int chunk = (total_m - off < MAX_Y) ? (total_m - off) : MAX_Y;
         dim3 grid(batch / BN, chunk);
-        kernel<<<grid, NTH, smem, st>>>(ef, em, p, chids, pb, bx, mx, batch, BSK, BSM, knt, off);
+        kernel<<<grid, NTH, smem, st>>>(ef, em, p, chids, pb, bx, mx, tix, batch, BSK, BSM, knt, off);
         C10_CUDA_KERNEL_LAUNCH_CHECK();
     }
 }
 
 // Config table (id -> {BM, BN, WM, WN, PW, ST}): 8 MMA warps on a (128, 64) tile, 3 stages, with 4 or 8 producer warps
 // (MEASURED on HCLT-1024's largest partition at B 128: the stream 433 / 421 us, against 627 with 16 MMA warps); the
-// (64, 64) tile on 4 stages for few element blocks (HMM-1024 B 64: 22.5 us against 27.5 for the best (128, 64)).
-template <typename TP>
+// (64, 64) tile on 4 stages for few element blocks (HMM-1024 B 64: 22.5 us against 27.5 for the best (128, 64)); the
+// (32, 64) and (32, 128) tiles, 2 x 2 and 2 x 4 MMA warps, for partitions of 32-node child blocks (an HCLT's), which no
+// other CUDA kernel takes.
+template <int PBT, bool TIX, typename TP>
 static void dispatch_cfg(float* ef, const float* em, const TP* p, const long* chids, int neb, const long* pb,
-                         const half_t* bx, const float* mx, int b, int bsk, int bsm, int k, int64_t cfg, cudaStream_t st) {
+                         const half_t* bx, const float* mx, const int* tix, int b, int bsk, int bsm, int k, int64_t cfg,
+                         cudaStream_t st) {
     switch (cfg) {
-        case 0: launch_cfg<128, 64, 4, 2, 4, 3, TP>(ef, em, p, chids, neb, pb, bx, mx, b, bsk, bsm, k, st); break;
-        case 1: launch_cfg<128, 64, 4, 2, 8, 3, TP>(ef, em, p, chids, neb, pb, bx, mx, b, bsk, bsm, k, st); break;
-        default: launch_cfg<64, 64, 4, 2, 4, 4, TP>(ef, em, p, chids, neb, pb, bx, mx, b, bsk, bsm, k, st); break;
+        case 0: launch_cfg<128, 64, 4, 2, 4, 3, PBT, TIX, TP>(ef, em, p, chids, neb, pb, bx, mx, tix, b, bsk, bsm, k, st); break;
+        case 1: launch_cfg<128, 64, 4, 2, 8, 3, PBT, TIX, TP>(ef, em, p, chids, neb, pb, bx, mx, tix, b, bsk, bsm, k, st); break;
+        case 2: launch_cfg<64, 64, 4, 2, 4, 4, PBT, TIX, TP>(ef, em, p, chids, neb, pb, bx, mx, tix, b, bsk, bsm, k, st); break;
+        case 3: launch_cfg<32, 64, 2, 2, 4, 4, PBT, TIX, TP>(ef, em, p, chids, neb, pb, bx, mx, tix, b, bsk, bsm, k, st); break;
+        default: launch_cfg<32, 128, 2, 4, 4, 3, PBT, TIX, TP>(ef, em, p, chids, neb, pb, bx, mx, tix, b, bsk, bsm, k, st); break;
     }
 }
 
-// element-flow backward (writes element_flows in place). chids / ebase / pbase are int64 [neb] / [neb, knt]; the parameters
-// in the dtype they are stored in (fp32 or bf16).
+template <typename TP>
+static void dispatch_pbt(float* ef, const float* em, const TP* p, const long* chids, int neb, const long* pb,
+                         const half_t* bx, const float* mx, const int* tix, bool shared, int b, int bsk, int bsm, int k,
+                         int pbt, int64_t cfg, cudaStream_t st) {
+    if (pbt == 1 && !shared) dispatch_cfg<1, false, TP>(ef, em, p, chids, neb, pb, bx, mx, tix, b, bsk, bsm, k, cfg, st);
+    else if (pbt == 1) dispatch_cfg<1, true, TP>(ef, em, p, chids, neb, pb, bx, mx, tix, b, bsk, bsm, k, cfg, st);
+    else if (!shared) dispatch_cfg<2, false, TP>(ef, em, p, chids, neb, pb, bx, mx, tix, b, bsk, bsm, k, cfg, st);
+    else dispatch_cfg<2, true, TP>(ef, em, p, chids, neb, pb, bx, mx, tix, b, bsk, bsm, k, cfg, st);
+}
+
+// element-flow backward (writes element_flows in place). chids is int64 [neb]; pbase int64 [neb, knt * pbt]: a parent
+// tile's first parameter offset per parameter block it spans (pbt = BK / BSK blocks where the parents' block size BSK is
+// below the tile's BK, else one); `ebase` the DISTINCT parent tiles' first rows (a tile's parents contiguous node rows,
+// whatever their blocks), `tix` (int32 [neb, knt]) which of them each element block's parent tile is (element blocks
+// sharing their parents -- an HCLT's 32 blocks of a variable -- share the pre-pass); the parameters in the dtype they are
+// stored in (fp32 or bf16).
 void ele_backward_sum_prepass(torch::Tensor element_flows, torch::Tensor element_mars, torch::Tensor node_flows,
                               torch::Tensor node_mars, torch::Tensor params, torch::Tensor chids, torch::Tensor ebase,
-                              torch::Tensor pbase, int64_t batch, int64_t BSK, int64_t BSM, int64_t knt, int64_t cfg) {
+                              torch::Tensor tix, torch::Tensor pbase, int64_t batch, int64_t BSK, int64_t BSM, int64_t knt,
+                              int64_t cfg, bool shared) {
     TORCH_CHECK(batch % PB == 0, "the pre-pass element backward needs a batch that is a multiple of ", PB);
-    TORCH_CHECK(ebase.is_contiguous() && ebase.numel() == chids.numel() * knt, "ebase: [element blocks, parent tiles]");
+    TORCH_CHECK(ebase.is_contiguous() && ebase.dim() == 1, "ebase: [distinct parent tiles]");
+    TORCH_CHECK(tix.is_contiguous() && tix.scalar_type() == torch::kInt32 && tix.numel() == chids.numel() * knt,
+                "tix: int32 [element blocks, parent tiles]");
+    const int pbt = BSK >= BK ? 1 : (int)(BK / BSK);
+    TORCH_CHECK((BSK >= BK ? BSK % BK == 0 : BK % BSK == 0) && pbt <= 2 && pbase.is_contiguous()
+                && pbase.numel() == chids.numel() * knt * pbt, "pbase: [element blocks, parent tiles x parameter blocks]");
+    // `shared`: the blocks share tiles, `tix` read; else `ebase` is every entry's own tile in order and `tix` is
+    // unread (a caller's word, not inferred from the sizes: a launch over some element blocks hands a slice of `tix`)
     long tiles = ebase.numel();
+    TORCH_CHECK(shared || tiles == tix.numel(), "unshared tiles: one per (element block, parent tile)");
     long bx_bytes = tiles * BK * batch * 2;
     torch::Tensor scratch = torch::empty({bx_bytes + tiles * batch * 4}, element_mars.options().dtype(torch::kUInt8));
     auto* bx = reinterpret_cast<half_t*>(scratch.data_ptr());
@@ -327,18 +374,19 @@ void ele_backward_sum_prepass(torch::Tensor element_flows, torch::Tensor element
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     int neb = (int)chids.size(0);
     if (params.scalar_type() == torch::kBFloat16)
-        dispatch_cfg<__nv_bfloat16>(element_flows.data_ptr<float>(), element_mars.data_ptr<float>(),
+        dispatch_pbt<__nv_bfloat16>(element_flows.data_ptr<float>(), element_mars.data_ptr<float>(),
                                     param_ptr<__nv_bfloat16>(params), chids.data_ptr<long>(), neb, pbase.data_ptr<long>(),
-                                    bx, mx, (int)batch, (int)BSK, (int)BSM, (int)knt, cfg, st);
+                                    bx, mx, tix.data_ptr<int>(), shared, (int)batch, (int)BSK, (int)BSM, (int)knt, pbt,
+                                    cfg, st);
     else
-        dispatch_cfg<float>(element_flows.data_ptr<float>(), element_mars.data_ptr<float>(), param_ptr<float>(params),
-                            chids.data_ptr<long>(), neb, pbase.data_ptr<long>(), bx, mx, (int)batch, (int)BSK, (int)BSM,
-                            (int)knt, cfg, st);
+        dispatch_pbt<float>(element_flows.data_ptr<float>(), element_mars.data_ptr<float>(), param_ptr<float>(params),
+                            chids.data_ptr<long>(), neb, pbase.data_ptr<long>(), bx, mx, tix.data_ptr<int>(), shared,
+                            (int)batch, (int)BSK, (int)BSM, (int)knt, pbt, cfg, st);
 }
 
 // (BM, BN) per config id; Python uses this to enumerate the configs valid for a partition.
 std::vector<std::vector<int64_t>> configs() {
-    return {{128, 64}, {128, 64}, {64, 64}};
+    return {{128, 64}, {128, 64}, {64, 64}, {32, 64}, {32, 128}};
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {

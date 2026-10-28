@@ -400,14 +400,37 @@ def prepass_is_available() -> bool:
 
 
 def tlmm_forward_sum_prepass(node_mars: torch.Tensor, element_mars: torch.Tensor, params: torch.Tensor,
-                             nids: torch.Tensor, ebase: torch.Tensor, pbase: torch.Tensor,
-                             batch_size: int, block_size: int, k_num_tiles: int, cfg: int = 0) -> None:
-    """The tlmm forward as a pre-pass over the element tiles (their maxima and exponentials, once per node block) and a
-    streaming kernel over the parameter tiles (in-place into ``node_mars``, bit-identical to `tlmm_forward_sum`), with
-    tile config ``cfg`` (`prepass_configs`). Caller must guarantee the plain kernel's dispatch conditions (the gate in
-    ``sum_layer._forward_block_sparse``)."""
-    _prepass_module.tlmm_forward_sum_prepass(node_mars, element_mars, params, nids, ebase, pbase,
-                                             int(batch_size), int(block_size), int(k_num_tiles), int(cfg))
+                             nids: torch.Tensor, ebase: torch.Tensor, tix: torch.Tensor, pbase: torch.Tensor,
+                             batch_size: int, block_size: int, k_num_tiles: int, cfg: int = 0,
+                             shared: bool = False) -> None:
+    """The tlmm forward as a pre-pass over the element tiles (``ebase``: their first rows; their maxima and exponentials
+    once each) and a streaming kernel over the parameter tiles (in-place into ``node_mars``, bit-identical to
+    `tlmm_forward_sum`), with tile config ``cfg`` (`prepass_configs`). ``shared``: node blocks share tiles, ``tix``
+    (int32 [node blocks, edge tiles]) saying which each entry is; else ``ebase`` holds every entry's own tile in order
+    (`tile_index` gives all three). Caller must guarantee the plain kernel's dispatch conditions but the tile shape
+    (the gate in ``sum_layer._forward_block_sparse``)."""
+    _prepass_module.tlmm_forward_sum_prepass(node_mars, element_mars, params, nids, ebase, tix, pbase,
+                                             int(batch_size), int(block_size), int(k_num_tiles), int(cfg), bool(shared))
+
+
+#: Blocks sharing a tile before a pre-pass kernel shares it among them (`tile_index`). MEASURED (HMM-4096 B128, 4 blocks
+#: of 1024 sharing their children): the stream kernels' read of the table -- prefetched a tile ahead, the same register
+#: count -- costs the fp32 element kernel 45 -> 51.5 us a layer, the bf16 one ~1%, against ~2 us of pre-pass saved at
+#: 4:1; at 32:1 (an HCLT of 32-node blocks) the pre-pass over every entry would be 369 MB of exponentials a layer.
+TILE_SHARING_MIN = 8
+
+
+def tile_index(ebase: torch.Tensor):
+    """``(tiles, tix, shared)`` for a pre-pass kernel: the tiles its pre-pass covers (a tile's first row each); int32 of
+    ``ebase``'s shape ([blocks, tiles]: a tile's first row per block and tile), which of them each entry is; and
+    whether the blocks share tiles. Where at least `TILE_SHARING_MIN` blocks share a tile (an HCLT's 32 node blocks of
+    a variable share their children), the tiles are ``ebase``'s distinct values and the blocks share their pre-pass;
+    else every entry is its own tile, in order, and the kernel never reads the table."""
+    distinct, inverse = torch.unique(ebase.reshape(-1), return_inverse = True)
+    if distinct.numel() * TILE_SHARING_MIN > ebase.numel():
+        return (ebase.reshape(-1).contiguous(),
+                torch.arange(ebase.numel(), dtype = torch.int32, device = ebase.device).view(ebase.shape), False)
+    return distinct.contiguous(), inverse.to(torch.int32).view(ebase.shape).contiguous(), True
 
 
 def prepass_configs():
@@ -455,15 +478,20 @@ def ele_prepass_is_available() -> bool:
 
 def ele_backward_sum_prepass(element_flows: torch.Tensor, element_mars: torch.Tensor, node_flows: torch.Tensor,
                              node_mars: torch.Tensor, params: torch.Tensor, chids: torch.Tensor,
-                             ebase: torch.Tensor, pbase: torch.Tensor,
-                             batch_size: int, block_size: int, cs_block_size: int, k_num_tiles: int, cfg: int = 0) -> None:
-    """The element-flow backward as a pre-pass over the parents' node tiles (their log ratios' maxima and exponentials,
-    once per element block) and a streaming kernel over the parameter tiles (in-place into ``element_flows``,
-    bit-identical to `ele_backward_sum`), with tile config ``cfg`` (`ele_prepass_configs`). Caller must guarantee the
-    plain kernel's dispatch conditions (the gate in ``sum_layer._backward_block_sparse_ele_flows``)."""
+                             ebase: torch.Tensor, tix: torch.Tensor, pbase: torch.Tensor,
+                             batch_size: int, block_size: int, cs_block_size: int, k_num_tiles: int, cfg: int = 0,
+                             shared: bool = False) -> None:
+    """The element-flow backward as a pre-pass over the parent tiles (``ebase``: their first rows; their log ratios'
+    maxima and exponentials once each) and a streaming kernel over the parameter tiles (in-place into
+    ``element_flows``, bit-identical to `ele_backward_sum`), with tile config ``cfg`` (`ele_prepass_configs`).
+    ``shared``: element blocks share tiles, ``tix`` (int32 [element blocks, parent tiles]) saying which each entry is;
+    else ``ebase`` holds every entry's own tile in order (`tile_index` gives all three). ``pbase``: int64 [element
+    blocks, parent tiles x parameter blocks a tile] (two where the parents' block size is 32). Caller must guarantee
+    the plain kernel's dispatch conditions but the tile shape (the gate in
+    ``sum_layer._backward_block_sparse_ele_flows``)."""
     _eleprepass_module.ele_backward_sum_prepass(element_flows, element_mars, node_flows, node_mars, params, chids,
-                                                ebase, pbase, int(batch_size), int(block_size), int(cs_block_size),
-                                                int(k_num_tiles), int(cfg))
+                                                ebase, tix, pbase, int(batch_size), int(block_size), int(cs_block_size),
+                                                int(k_num_tiles), int(cfg), bool(shared))
 
 
 def ele_prepass_configs():
