@@ -264,6 +264,56 @@ def test_an_edge_without_a_gate_adds_nothing(bulk):
 
 
 @needs_kernels
+def test_each_capture_takes_its_own_column_maxima():
+    """The kernels on their own: each capture takes its own column maxima -- two steps whose node flows sit 120 nats
+    apart, each step's products near 1; a maximum left over from the first would scale the second's node operands
+    below the floats' range."""
+    mod = _module()
+    torch.manual_seed(1)
+    nb, blk, ne, B, E = 2, 64, 128, 64, 200
+    W, S = 64, 2
+    nids, cids = torch.tensor([0, blk], device = DEV), torch.randint(1, E, (nb, ne), device = DEV)
+    gate = torch.tensor([[0, 1], [0, 1]], device = DEV)
+    pfids = torch.arange(nb * ne, device = DEV).view(nb, ne) * blk
+    pids = pfids.clone()
+    params = torch.rand(nb * ne * blk, device = DEV, dtype = torch.bfloat16) + 0.01
+    pf = torch.zeros(nb * ne * blk, device = DEV)
+    A = torch.zeros(nb, blk, S * W, device = DEV, dtype = torch.half)
+    Bop = torch.zeros(nb, ne, S * W, device = DEV, dtype = torch.half)
+    fA, fB = torch.ones(nb, S, blk, device = DEV), torch.ones(nb, S, ne, device = DEV)
+    M = torch.empty(nb, W, device = DEV, dtype = torch.int32)
+    steps = []
+    for slot, shift in enumerate((60.0, -60.0)):                              # lf ~ +60, then ~ -60
+        nm = torch.randn(nb * blk, B, device = DEV) - 5.0
+        nf = nm + shift + torch.randn(nb * blk, B, device = DEV)
+        em = torch.randn(E, B, device = DEV) - shift                           # (the products near 1)
+        ext = torch.randn(3, B, device = DEV)
+        mod.capture(A, Bop, fA, fB, M, nf, nm, em, ext, nids, cids, gate, B, slot, 64, 64, 1)
+        steps.append(dict(nf = nf, nm = nm, em = em, ext = ext, nids = nids, cids = cids, gate = gate, batch = B,
+                          node_cbs = 64, gate_cbs = 64, ext_base = 1, blk = blk, ne = ne))
+    mod.flush(pf, A, Bop, fA, fB, pfids, pids, params, S, mod.flush_configs().index([64, 64, 32]), True)
+    _check(_block(pf, pfids, blk), _reference(steps, pfids, pids, params), "two captures 120 nats apart")
+
+
+@needs_kernels
+@pytest.mark.parametrize("B,defers", [(256, True), (64, False)])
+def test_a_group_below_MIN_FLOWS_defers_on_its_flows_times_samples(B, defers, monkeypatch):
+    """A group under `MIN_FLOWS` defers where its flows x samples reach `MIN_FLOW_SAMPLES` (HMM-1024: 1M flows x 256),
+    and not below both lines (x 64)."""
+    monkeypatch.setattr(dpar, "MIN_FLOWS", 1 << 23)
+    monkeypatch.setattr(dpar, "MIN_FLOW_SAMPLES", 1 << 28)
+    pc, phi, x = _instance(1024, 1, 64, 6, "bf16", B)
+    caps, flushes = _record(monkeypatch)
+    pc(x, sum_external_params = phi)
+    pc.backward(x, flows_memory = 0.0)
+    torch.cuda.synchronize()
+    assert len(caps) == (5 if defers else 0), f"B {B}: {len(caps)} steps deferred"
+    if defers:
+        _check(_block(pc.param_flows, flushes[-1]["pfids"], caps[0]["blk"]),
+               _reference(caps, flushes[-1]["pfids"], flushes[-1]["pids"], flushes[-1]["params"]), f"B {B}")
+
+
+@needs_kernels
 @pytest.mark.parametrize("label", ["a layer callback", "untied", "below MIN_FLOWS"])
 def test_what_keeps_the_per_step_kernels(label, monkeypatch):
     if label == "below MIN_FLOWS":
@@ -288,7 +338,8 @@ def test_the_deferred_flows_equal_the_per_step_ones_within_their_rounding(monkey
     pc(x, sum_external_params = phi)
     pc.backward(x, flows_memory = 0.0)
     deferred = pc.param_flows.clone()
-    monkeypatch.setattr(dpar, "MIN_FLOWS", 1 << 62)                     # no group reaches it: the per-step kernels
+    monkeypatch.setattr(dpar, "MIN_FLOWS", 1 << 62)                     # no group reaches them: the per-step kernels
+    monkeypatch.setattr(dpar, "MIN_FLOW_SAMPLES", 1 << 62)
     pc(x, sum_external_params = phi)
     pc.backward(x, flows_memory = 0.0)
     fin = torch.isfinite(deferred)

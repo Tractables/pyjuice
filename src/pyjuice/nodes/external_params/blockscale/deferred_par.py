@@ -16,8 +16,9 @@ A layer defers (`try_defer`) only when all of these hold, each checked, none ass
   * the layer is tied, or its flow block already has a group this backward -- the group's operands and tables
     (`pfids`, `pids`) verified equal to the member's once (one device sync; never during a graph capture);
   * the step's kernel writes without either hazard (`_par_hook`'s guard, or `_par_write_flags` (0, 0)), one gate
-    per node block, `blk % 64 == 0` and `num_edges % 64 == 0`, and the group is at least `MIN_FLOWS` flows (a
-    smaller one's backward is host-bound, and there the flush after the last layer costs more than it saves);
+    per node block, `blk % 64 == 0` and `num_edges % 64 == 0`, and the group's step is enough work -- at least
+    `MIN_FLOWS` flows, or `MIN_FLOW_SAMPLES` flows x samples (a smaller step's backward is host-bound, and there
+    the captures' launches cost more than the per-step kernels they replace);
   * the slots fit `PAR_DEFER_MB` with room for two steps (a full group flushes and goes on).
 A group's slots belong to the scope that filled them: a new backward -- also after one that raised -- starts empty.
 A slot is at most 512 of a step's columns (its rows' scales its own): a batch past 512 takes `cps` slots a step.
@@ -31,10 +32,14 @@ import torch
 
 from pyjuice.utils.deferred import current_scope
 
-#: The operand slots a group may hold (MB).
-PAR_DEFER_MB = 128
+#: The operand slots a group may hold (MB; device memory a deferring group keeps from its first backward on, up to 64
+#: slots). MEASURED (the training step, 128 -> 512 MB): HMM-8192 in 8 blocks, 7 steps, B 512 19.97 -> 13.00 ms (a
+#: 76 MB slot: at 128 MB no room for two, the group did not defer); HMM-4096 in 4 blocks B 512 (a 21 MB slot) 7 steps
+#: 4.091 -> 3.989 (one flush, not two), 15 steps 8.092 -> 7.996.
+PAR_DEFER_MB = 512
 
-#: The smallest group (flows per step) that defers. The kernels win from ~1M flows (MEASURED with the TF32-operand
+#: The smallest group (flows per step) that defers on its flows alone -- the per-step kernels' read-add-write of the
+#: flow block, whatever the batch. The kernels win from ~1M flows (MEASURED with the TF32-operand
 #: kernels the fp16 ones replaced in 4f535bfd -- the fp16 flush beats theirs 1.4-1.8x, not re-measured here --, gate
 #: width 64, B 128, their time against the per-step Triton kernels': 262K flows (HMM-512 in 2 blocks, 15 steps)
 #: 67 -> 81 us; 1M (HMM-1024, 7 steps) 74 -> 56, 31 steps 345 -> 219; 16.8M (HMM-4096 in 4 blocks, 7 steps)
@@ -43,6 +48,14 @@ PAR_DEFER_MB = 128
 #: the whole tied backward, off -> on, HMM-4096 in 4 blocks 7 steps 1.87 -> 1.47 ms (B 512 5.01 -> 3.99, fp32
 #: 2.11 -> 1.52) against HMM-2048 in 2 blocks (4M flows) 15 steps 2.26 -> 2.40 and HMM-1024 31 steps 4.64 -> 4.47.
 MIN_FLOWS = 1 << 23
+
+#: ... or on its flows x samples, the per-step kernels' contraction: a smaller group defers where the batch makes its
+#: step's kernels the GPU's work. MEASURED (the fp16 kernels, the training step, deferring or not): HMM-2048 in 2 blocks
+#: (4.2M flows), 15 steps, B 256 2.831 -> 2.32 ms, B 128 (2^29) 2.216 -> 2.07; in 4 blocks B 256 2.854 -> 2.41;
+#: HMM-1024 (1M), 31 steps, B 512 (2^29) 4.18 -> 3.69 -- against, below the line, the host-bound HMM-2048 in 4 blocks
+#: B 64 (2^28) 1.93 -> 2.04 and HMM-1024 B 128 (2^27) 3.42 -> 3.45: there a capture's 8 us of host (a memset, two
+#: launches) is more than the per-step kernel it replaces.
+MIN_FLOW_SAMPLES = 1 << 29
 
 # id(param_flows buffer) -> (a weak reference to it, {group key: _Group}); by identity, not equality (a tensor's `==`
 # is elementwise), the entry gone with the buffer
@@ -115,8 +128,9 @@ def may_defer(mod, ctx, n_node_gates) -> bool:
     """Whether a partition of this shape (`ctx`: its tables and sizes) defers at all -- the conditions fixed by it,
     which `try_defer` checks first; the rest are a call's."""
     blk, ne = ctx["block_size"], ctx["num_edges"]
+    flows = ctx["nids"].numel() * blk * ne
     return (mod is not None and n_node_gates == 1 and blk % 64 == 0 and ne % 64 == 0
-            and ctx["nids"].numel() * blk * ne >= MIN_FLOWS)
+            and (flows >= MIN_FLOWS or flows * ctx["batch_size"] >= MIN_FLOW_SAMPLES))
 
 
 def try_defer(mod, layer, ctx, gate_table, ext, node_cbs, gate_cbs, ext_base, n_node_gates) -> bool:
