@@ -152,14 +152,12 @@ class _LearningMixin:
             # range, which the call above no longer touches, so the ordering is safe either way round.
             for ns, sources in corrections:
                 ps, pe = ns._param_range
-                if params is not self.params:    # the range's master values in line with `params`, before reading them
-                    sync_master(params[ps:pe], self.params.data[ps:pe])
+                # Below fp32 the update also takes the stored range where it was written since the master copy was
+                # last stored, and stores its result there (`stored`): in its own passes, not a sync and a copy around
                 ns.external_params.compute_em_correction(
                     ns, params, self.param_flows, denom_param_flows,
                     step_size, pseudocount, keep_zero_params, denom_sources = sources,
-                    out = params[ps:pe])
-                if params is not self.params:
-                    self.params.data[ps:pe].copy_(params[ps:pe])
+                    out = params[ps:pe], stored = None if params is self.params else self.params.data[ps:pe])
 
             # The updates write `params` through Triton kernels, which do not move the tensor's version: signal it as an
             # in-place update would, for the caches keyed on it (BlockScale's per-gate parameter sums -- MEASURED

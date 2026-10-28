@@ -440,6 +440,41 @@ def test_blockscale_at_bf16(B):
 
 
 @cuda_only
+@pytest.mark.parametrize("fold", [True, False], ids = ["fused_passes", "passes_of_their_own"])
+def test_blockscale_em_at_bf16_keeps_a_write_between_steps(fold, monkeypatch):
+    """`pc.params.data[...] = x` on a gated range between two EM steps of a bf16 circuit: its conditional M-step starts
+    from x -- the master copy's check in the update's own passes (a range past the L2: forced here) or a pass of its
+    own -- against an fp32 twin given the same write; and `params` is the master copy's rounding after each step. The
+    write is not uniform within a node's children (x1.5 / x0.5 alternating), so a renormalization cannot undo it."""
+    from pyjuice.nodes.external_params.external_params import ExternalSumParams
+    monkeypatch.setattr(ExternalSumParams, "_fold_master", staticmethod(lambda params, n: fold))
+    B = 64
+    pc32, pc16, gates = _blockscale_pair(B)
+    x = torch.randint(0, 8, (2 * B, 6), device = DEV)
+
+    def step(pc, xb):
+        pc.init_param_flows(flows_memory = 0.0)
+        pc(xb, sum_external_params = gates)
+        pc.backward(xb, flows_memory = 1.0, sum_external_params = gates)
+        pc.mini_batch_em(step_size = 0.5, pseudocount = 0.1)
+
+    for pc in (pc32, pc16):
+        step(pc, x[:B])                                                # (the master copy exists)
+    assert torch.equal(pc16.params, pc16.params_master.to(BF16))
+    ns = next(iter(pc16._denom_correction_nss()))                       # a gated range the M-step corrects
+    ps, pe = ns._param_range
+    factor = torch.tensor([1.5, 0.5], device = DEV).repeat((pe - ps) // 2)
+    written = (pc16.params.data[ps:pe].float() * factor).to(BF16)
+    pc16.params.data[ps:pe] = written
+    pc32.params.data[ps:pe] = written.float()
+    for pc in (pc32, pc16):
+        step(pc, x[B:])
+    rel = (pc16.params_master[ps:pe] - pc32.params[ps:pe]).abs() / pc32.params[ps:pe].clamp_min(1e-12)
+    assert rel.median() < 1e-3 and rel.max() < 1e-2, (float(rel.median()), float(rel.max()))
+    assert torch.equal(pc16.params, pc16.params_master.to(BF16))
+
+
+@cuda_only
 @pytest.mark.parametrize("B", [8, 64])
 def test_blockscale_gate_gradients_at_bf16(B):
     """`d LL / d log phi` on bf16-stored parameters against the same values in fp32. Its log-Z term sums theta per gate

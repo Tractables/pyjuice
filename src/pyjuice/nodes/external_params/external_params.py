@@ -13,6 +13,7 @@ _EM_TILE_BUDGET = int(os.environ.get("PYJUICE_DUAL_EM_TILE",
                                      os.environ.get("PYJUICE_BLOCKSCALE_EM_TILE", "1024")))
 
 _SM_COUNT = {}
+_L2_BYTES = {}                           # device -> its L2's bytes (`ExternalSumParams._fold_master`)
 
 
 def _sm_count(device):
@@ -525,6 +526,21 @@ class ExternalSumParams():
         return plan
 
     @staticmethod
+    def _fold_master(params, n) -> bool:
+        """Whether the fp32 master copy's check and store go into the update's own passes
+        (`kernels/dual_em_master.py`) for a range of `n` parameters: where its master copy is larger than the L2.
+        Below, the separate sync leaves the copy in the L2 for the update's first pass and the copy back reads it from
+        there, and the fused passes, reading the stored values too, are the slower (MEASURED: HMM-4096's 64 MB copy of
+        a 128 MB L2, 297 -> 309 us an M-step; HMM-6144's 144 MB 874 -> 776). A property of the device, not a timed
+        choice: every process makes the same one (the two orders' bits differ by ~1e-7)."""
+        dev = params.device
+        l2 = _L2_BYTES.get(dev)
+        if l2 is None:
+            l2 = _L2_BYTES[dev] = (torch.cuda.get_device_properties(dev).L2_cache_size if dev.type == "cuda"
+                                   else 0)
+        return n * 4 > l2
+
+    @staticmethod
     def _em_tile_candidates(block_size, num_edges, n_rows, dev):
         """
         `(TILE_SIZE_M, TILE_SIZE_K)` candidates for the shared dual-EM kernels, heuristic default first.
@@ -651,7 +667,7 @@ class ExternalSumParams():
         return out
 
     def _fused_em_correction(self, ns, params, param_flows, denom_param_flows, step_size,
-                             pseudocount, keep_zero_params, denom_sources, out = None):
+                             pseudocount, keep_zero_params, denom_sources, out = None, stored = None):
         """
         The conditional M-step as two shared Triton kernels, or `None` when this shape is not served
         (:func:`compute_em_correction` then runs the generic torch path, which is also what this is
@@ -661,9 +677,16 @@ class ExternalSumParams():
         :func:`denom_kernel_spec` selects, and `F-` is never materialized -- it is computed inside the
         kernels from whatever statistic was stored. A parameterization gets all of this by
         implementing that one method.
+
+        With `stored` (see :func:`compute_em_correction`), the two kernels of `kernels/dual_em_master.py`: the master
+        copy's check against the stored values in the first pass, the store back in the second.
         """
         import triton
-        from .kernels.dual_em import _dual_em_cum_kernel, _dual_em_update_kernel
+        if stored is None:
+            from .kernels.dual_em import _dual_em_cum_kernel, _dual_em_update_kernel
+        else:
+            from .kernels.dual_em_master import _dual_em_cum_sync_kernel as _dual_em_cum_kernel
+            from .kernels.dual_em_master import _dual_em_update_store_kernel as _dual_em_update_kernel
 
         sources = list(denom_sources)
         if len(sources) == 0:
@@ -690,6 +713,7 @@ class ExternalSumParams():
         # every element of a node's parameter range is covered by exactly one real edge slot, so each
         # is written exactly once.
         by_par = out is not None
+        assert stored is None or (by_par and stored.numel() == pe - ps), "`stored` comes with `out`, both `[ps:pe]`"
         if by_par:
             assert out.numel() == pe - ps, (out.numel(), pe - ps)
             out_base, out_size_ = ps, pe - ps
@@ -740,13 +764,16 @@ class ExternalSumParams():
                           BLOCK_SIZE_M = block_size, GROUP_CBS = group_cbs,
                           consts = consts, cum_base = plan["cum_base"], denom_base = denom_base,
                           DENOM_MODE = mode, num_stages = 1)
+            # (the first pass with `stored`: the copy's check in it, and the copy's taking of a write from outside --
+            # idempotent, so the tile trials below may run it on the live copy)
+            cum_master = {} if stored is None else dict(stored = stored, out_base = out_base)
             cands = self._em_tile_candidates(block_size, num_edges, n_rows, dev)
-            akey = (num_edges, n_groups, block_size, group_cbs, n_rows, mode)
+            akey = (num_edges, n_groups, block_size, group_cbs, n_rows, mode, stored is not None)
 
             def _cum(cfg, target_cum):
                 tm, tk = cfg
                 _dual_em_cum_kernel[(triton.cdiv(num_edges, tk), n_rows * (block_size // tm))](
-                    cum = target_cum, TILE_SIZE_K = tk, TILE_SIZE_M = tm, **common)
+                    cum = target_cum, TILE_SIZE_K = tk, TILE_SIZE_M = tm, **common, **cum_master)
 
             # BENCHMARK INTO A SCRATCH. This kernel is read-accumulate-write (`tl.atomic_add` into
             # `cum`), so timing it on the live buffer would add its contribution once per trial and
@@ -770,30 +797,32 @@ class ExternalSumParams():
         for common, cands, akey, n_rows in staged:
             num_edges = common["num_edges"]
 
-            def _upd(cfg, target_out):
+            def _upd(cfg, target_out, target_stored = None):
                 tm, tk = cfg
+                extra = dict(OUT_BY_PAR = 1 if by_par else 0) if stored is None else dict(stored = target_stored)
                 _dual_em_update_kernel[(triton.cdiv(num_edges, tk),
                                         n_rows * (block_size // tm))](
                     cum = cum, out = target_out, out_base = out_base,
                     out_size = out_size_, KEEP_ZERO = 1 if keep_zero_params else 0,
-                    OUT_BY_PAR = 1 if by_par else 0,
-                    TILE_SIZE_K = tk, TILE_SIZE_M = tm, **common)
+                    TILE_SIZE_K = tk, TILE_SIZE_M = tm, **common, **extra)
 
             # A pure overwrite, so re-running it is harmless -- but it is still benchmarked into a
             # scratch, because it reads `cum` and writes the buffer this function RETURNS, and a trial
             # left in `out` for a partition the real launch then skips would be returned as a result.
+            # (With `stored`, into a scratch of that too.)
             key = ("dual_em_upd",) + akey + (bool(keep_zero_params), by_par)
             cfg = autotune.cached(key)
             if cfg is None:
                 so = autotune.scratch_like(out) if autotune.should_tune(key, len(cands)) else None
-                cfg = cands[0] if so is None else autotune.pick(key, cands,
-                                                                lambda c: _upd(c, so))
-            _upd(cfg, out)
+                ss = None if so is None or stored is None else autotune.scratch_like(stored)
+                cfg = cands[0] if so is None or (stored is not None and ss is None) else autotune.pick(
+                    key, cands, lambda c: _upd(c, so, ss))
+            _upd(cfg, out, stored)
 
         return out
 
     def compute_em_correction(self, ns, params, param_flows, denom_param_flows, step_size,
-                              pseudocount, keep_zero_params, denom_sources = (), out = None):
+                              pseudocount, keep_zero_params, denom_sources = (), out = None, stored = None):
         """
         The conditional dual-flow EM update for `ns`: `theta <- normalize(theta * F+ / F-)`, in the
         multiplicative MAP form. Returns the new parameters for `ns._param_range` as a flat tensor --
@@ -819,18 +848,35 @@ class ExternalSumParams():
         :param out: a `pe - ps` tensor to write the result into, in place of allocating one. The PC
             passes `params[ps:pe]`, i.e. the very range being updated, which is safe because every
             element of it is written exactly once and this is the only writer.
+        :param stored: with `out`, for parameters stored below fp32 (`params` then their fp32 master copy): the
+            stored parameters' `[ps:pe]`. The update then is the one `sync_master(params[ps:pe], stored)` before and
+            `stored.copy_(out)` after would make -- `theta` the stored value where that is no longer the master's
+            rounding, the result stored, rounded -- and the fused kernels do both in their own passes where the
+            range's master copy is larger than the L2 (:func:`_fold_master`).
         """
         if not self.requests_denom_param_flows:
             return None
 
-        fused = self._fused_em_correction(ns, params, param_flows, denom_param_flows, step_size,
-                                          pseudocount, keep_zero_params, denom_sources, out = out)
-        if fused is not None:
-            return fused
+        ps, pe = ns._param_range
+        if stored is not None:
+            assert out is not None and out.numel() == stored.numel() == pe - ps, \
+                "`stored` comes with `out`, both `[ps:pe]`"
+        if stored is None or self._fold_master(params, pe - ps):
+            fused = self._fused_em_correction(ns, params, param_flows, denom_param_flows, step_size, pseudocount,
+                                              keep_zero_params, denom_sources, out = out, stored = stored)
+            if fused is not None:
+                return fused
+        if stored is not None:                                  # the master copy's passes of their own around it
+            from pyjuice.model.backend.params_master import sync_master
+
+            sync_master(params[ps:pe], stored)
+            self.compute_em_correction(ns, params, param_flows, denom_param_flows, step_size, pseudocount,
+                                       keep_zero_params, denom_sources = denom_sources, out = out)
+            stored.copy_(out)
+            return out
 
         import torch
 
-        ps, pe = ns._param_range
         pfs, pfe = ns._param_flow_range
         bs, cbs = ns.block_size, ns.ch_block_size
         E = ns.edge_ids.size(1)
