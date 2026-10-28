@@ -34,8 +34,8 @@ from pyjuice.utils.deferred import current_scope
 #: The operand slots a group may hold (MB).
 PAR_DEFER_MB = 128
 
-#: The smallest group (flows per step) that defers. The kernels win from ~1M flows (MEASURED with the TF32 operands
-#: of kernels/c/blockscale_par_deferred.cu -- the fp16 flush beats theirs 1.4-1.8x, not re-measured here --, gate
+#: The smallest group (flows per step) that defers. The kernels win from ~1M flows (MEASURED with the TF32-operand
+#: kernels the fp16 ones replaced in 4f535bfd -- the fp16 flush beats theirs 1.4-1.8x, not re-measured here --, gate
 #: width 64, B 128, their time against the per-step Triton kernels': 262K flows (HMM-512 in 2 blocks, 15 steps)
 #: 67 -> 81 us; 1M (HMM-1024, 7 steps) 74 -> 56, 31 steps 345 -> 219; 16.8M (HMM-4096 in 4 blocks, 7 steps)
 #: 769 -> 364), but a host-bound backward hides the per-step kernels in the GPU's idle time and exposes the flush

@@ -1,8 +1,8 @@
 // A tied group's `BlockScaleSumParams` parameter flows, deferred to one contraction (`deferred_par`), with fp16
-// operands: the TF32 module's (blockscale_par_deferred.cu) contraction, its operands at half the bytes and its MMAs at
-// twice the rate. The capture and the flush:
+// operands: the contraction of the TF32-operand kernels it replaced (fp32 slots, mma m16n8k8 TF32; until 4f535bfd), its
+// operands at half the bytes and its MMAs at twice the rate. The capture and the flush:
 //   capture   per step (`capture`): the column maxima M[nb, b] = max_n lf over the node block (lf = node_flows -
-//             node_mars, -inf where node_mars is; 0 where every node is -inf), as the TF32 module's; then both
+//             node_mars, -inf where node_mars is; 0 where every node is -inf), as the TF32 kernels'; then both
 //             operands' rows, A = exp(lf - M) and Bop = exp(emars[cid] + log phi[gate row] + M) (0 without a gate), in
 //             fp32 and stored as fp16 with a power-of-two scale per (row, slot): the row's max over the slot's columns
 //             m = f 2^x (f in [0.5, 1)), the stored values v 2^(15 - x) (the max in [2^14, 2^15): 2^-29 of it at full
@@ -17,7 +17,7 @@
 //             the SM goes on (theta prefetched into L2 at the start); where the runs are not 16-byte aligned, the
 //             flows' read-add-write by the threads, a chunk's loads first. Each flow is added once either way: the
 //             flows are deterministic.
-// fp16's 10-bit mantissa is TF32's: against float64 the flows' error is the TF32 module's (MEASURED, HMM-4096 in 4
+// fp16's 10-bit mantissa is TF32's: against float64 the flows' error is the TF32 kernels' (MEASURED, HMM-4096 in 4
 // blocks, gate width 64, 7 steps, bf16 parameters: max relative error over flows >= 1e-6 of their block's max 6.70e-4
 // vs 6.80e-4 at B 128, 4.35e-4 vs 4.38e-4 at B 512, none lost). An fp16 tile is half a TF32 one's bytes, and the
 // flush is bound by its operands' L2 re-reads -- `tot` beside `acc` caps a tile at 128 x 128 (the registers).
