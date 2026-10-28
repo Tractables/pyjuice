@@ -50,6 +50,8 @@ _prepass_module = None  # forward (tlmm), exponentials pre-pass + streaming kern
 _prepass_attempted = False
 _eleprepass_module = None  # element-flow backward, exponentials pre-pass + streaming kernel
 _eleprepass_attempted = False
+_pardef_module = None   # a tied group's deferred parameter flows (fp16 operands): capture + flush
+_pardef_attempted = False
 _flags_cache = "unset"  # cached (cuda_cflags, ldflags) or None; computed once
 _plain_flags_cache = "unset"  # cached plain (no-CUTLASS) cuda_cflags or None
 
@@ -200,6 +202,16 @@ def par_is_available() -> bool:
         _par_attempted = True
         _par_module = _jit("pyjuice_sum_backward_par_cuda", "par_backward_sum.cu")
     return _par_module is not None
+
+
+def get_par_deferred_module():
+    """The deferred parameter-flow extension (`par_deferred_fp16.cu`: a tied group's capture and flush, see
+    `pyjuice.layer.deferred_par`), or None if its toolchain is unavailable (warns once)."""
+    global _pardef_module, _pardef_attempted
+    if not _pardef_attempted:
+        _pardef_attempted = True
+        _pardef_module = _jit("pyjuice_sum_par_deferred_cuda", "par_deferred_fp16.cu")
+    return _pardef_module
 
 
 def smallbatch_fw_is_available() -> bool:

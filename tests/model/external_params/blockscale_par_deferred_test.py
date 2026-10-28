@@ -1,6 +1,6 @@
 """
-A tied group's gated parameter flows deferred to one contraction (blockscale/deferred_par.py, kernels/c/
-blockscale_par_deferred_fp16.cu): the flows a backward leaves against float64 recomputed from every captured step's
+A tied group's gated parameter flows deferred to one contraction (pyjuice/layer/deferred_par.py, layer/kernels/c/
+par_deferred_fp16.cu): the flows a backward leaves against float64 recomputed from every captured step's
 inputs -- tied gated HMMs of one and two blocks, fp32 and bf16 parameters, a batch past the slots' 32 columns, a
 batch past 512 (two slots a step), -inf log-gates and log-gates spread wide (the rows' scales apart from slot to
 slot), 39 steps, and more steps than the slots hold (flushes during the pass), with the L2's bulk adds and with the
@@ -14,7 +14,7 @@ import torch
 import pyjuice as juice
 import pyjuice.nodes.distributions as dists
 from pyjuice.nodes import inputs, multiply, summate, BlockScaleSumParams
-from pyjuice.nodes.external_params.blockscale import deferred_par as dpar
+from pyjuice.layer import deferred_par as dpar
 
 DEV = torch.device("cuda:0")
 NEG = -float("inf")
@@ -25,9 +25,9 @@ CATS = 16
 def _module():
     if not torch.cuda.is_available():
         return None
-    from pyjuice.nodes.external_params.kernels.c import get_par_deferred_fp16_module
+    from pyjuice.layer.kernels.c import get_par_deferred_module
     try:
-        return get_par_deferred_fp16_module()
+        return get_par_deferred_module()
     except Exception:
         return None
 
@@ -84,12 +84,14 @@ def _record(monkeypatch):
     caps, flushes = [], []
     real_cap, real_flush = mod.capture, mod.flush
 
-    def capture(A, Bop, fA, fB, M, nf, nm, em, ext, nids, cids, gate, batch, slot, node_cbs, gate_cbs, ext_base):
+    def capture(A, Bop, fA, fB, M, nf, nm, em, ext, nids, cids, gate, batch, slot, node_cbs, gate_cbs, ext_base,
+                gated):
+        assert gated, "a gated layer's capture reads its gates"
         caps.append(dict(A = A, nf = nf.clone(), nm = nm.clone(), em = em.clone(), ext = ext.clone(), nids = nids,
                          cids = cids, gate = gate, batch = batch, node_cbs = node_cbs, gate_cbs = gate_cbs,
                          ext_base = ext_base, blk = A.size(1), ne = Bop.size(1), slot = slot))
         return real_cap(A, Bop, fA, fB, M, nf, nm, em, ext, nids, cids, gate, batch, slot, node_cbs, gate_cbs,
-                        ext_base)
+                        ext_base, gated)
 
     def flush(pf, A, Bop, fA, fB, pfids, pids, params, slots, cfg, bulk):
         flushes.append(dict(A = A, pfids = pfids, pids = pids, params = params, slots = slots, bulk = bulk))
@@ -251,7 +253,7 @@ def test_an_edge_without_a_gate_adds_nothing(bulk):
         nm[torch.rand_like(nm) < 0.05] = NEG
         em = torch.randn(E, B, device = DEV) * 2
         ext = torch.randn(1 + 6, B, device = DEV) * 2                       # (ext_base 1: row 0 a finite stray)
-        mod.capture(A, Bop, fA, fB, M, nf, nm, em, ext, nids, cids, gate, B, slot, cbs, cbs, 1)
+        mod.capture(A, Bop, fA, fB, M, nf, nm, em, ext, nids, cids, gate, B, slot, cbs, cbs, 1, True)
         steps.append(dict(nf = nf, nm = nm, em = em, ext = ext, nids = nids, cids = cids, gate = gate, batch = B,
                           node_cbs = cbs, gate_cbs = cbs, ext_base = 1, blk = blk, ne = ne))
     mod.flush(pf, A, Bop, fA, fB, pfids, pids, params, S, mod.flush_configs().index([64, 64, 32]), bulk)
@@ -288,7 +290,7 @@ def test_each_capture_takes_its_own_column_maxima():
         nf = nm + shift + torch.randn(nb * blk, B, device = DEV)
         em = torch.randn(E, B, device = DEV) - shift                           # (the products near 1)
         ext = torch.randn(3, B, device = DEV)
-        mod.capture(A, Bop, fA, fB, M, nf, nm, em, ext, nids, cids, gate, B, slot, 64, 64, 1)
+        mod.capture(A, Bop, fA, fB, M, nf, nm, em, ext, nids, cids, gate, B, slot, 64, 64, 1, True)
         steps.append(dict(nf = nf, nm = nm, em = em, ext = ext, nids = nids, cids = cids, gate = gate, batch = B,
                           node_cbs = 64, gate_cbs = 64, ext_base = 1, blk = blk, ne = ne))
     mod.flush(pf, A, Bop, fA, fB, pfids, pids, params, S, mod.flush_configs().index([64, 64, 32]), True)

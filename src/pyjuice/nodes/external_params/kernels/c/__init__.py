@@ -337,49 +337,6 @@ def get_ele_prepass_module():
     return _ele_prepass_module
 
 
-# A tied group's deferred parameter flows (blockscale_par_deferred_fp16.cu: fp16 operands, a power-of-two scale per
-# (row, slot)): CuTe (MMA atoms, ldmatrix), the same toolchain gate. Its own extension, so a failure leaves the per-step
-# parameter-flow forks in place.
-_par_deferred_fp16_module = None
-_par_deferred_fp16_attempted = False
-
-
-def get_par_deferred_fp16_module():
-    """The deferred block-scale parameter-flow extension with fp16 operands, or None if its toolchain is unavailable
-    (warns once)."""
-    global _par_deferred_fp16_module, _par_deferred_fp16_attempted
-
-    if _par_deferred_fp16_attempted:
-        return _par_deferred_fp16_module
-
-    _par_deferred_fp16_attempted = True
-
-    if not ENABLE_CUDA_KERNELS:
-        return None
-
-    from pyjuice.layer.kernels.c import _compile_flags
-
-    flags = _compile_flags()
-    if flags is None:
-        return None
-
-    cuda_cflags, ldflags = flags
-
-    from pyjuice.utils.cuda_ext import jit_load
-    try:
-        _par_deferred_fp16_module = jit_load("pyjuice_blockscale_par_deferred_fp16_cuda",
-                                             sources = [os.path.join(_THIS_DIR, "blockscale_par_deferred_fp16.cu")],
-                                             extra_cuda_cflags = cuda_cflags, extra_ldflags = ldflags,
-                                             verbose = False)
-    except Exception as e:
-        warnings.warn(
-            f"pyjuice CUDA kernel 'pyjuice_blockscale_par_deferred_fp16_cuda' failed to compile "
-            f"({type(e).__name__}: {e}). The block-scale parameter flows stay per step.", RuntimeWarning)
-        _par_deferred_fp16_module = None
-
-    return _par_deferred_fp16_module
-
-
 # The per-gate parameter sums sigma (blockscale_sigma.cu): plain CUDA, no CuTe. Its own extension, so a failure leaves
 # `_sigma` with its torch gather.
 _sigma_module = None

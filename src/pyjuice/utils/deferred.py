@@ -3,7 +3,7 @@ Work a layer defers to the end of a backward's inner layers (:func:`deferred_sco
 backward opens a scope around its inner layers and runs what they deferred after the last of them -- inside the same
 pass, so a CUDA graph recorded from it replays the deferred launches too. A tied group's parameter flows use it: each
 tied layer captures its step's operands, and one contraction after the pass adds the whole group's flows (see
-`pyjuice.nodes.external_params.blockscale.deferred_par`).
+`pyjuice.layer.deferred_par`).
 
 Outside a scope (a layer's backward called directly) nothing can be deferred: :func:`current_scope` is None and the
 caller runs its work at once. A scope that ends in an exception drops what it held -- state a layer keeps for a scope

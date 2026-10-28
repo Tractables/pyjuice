@@ -12,6 +12,7 @@ import pyjuice.nodes.distributions as dists
 import pyjuice.layer.kernels.sum_backward_param_block_sparse as parmod
 from pyjuice.layer.sum_layer import SumLayer
 from pyjuice.layer.kernels import autotune
+from pyjuice.utils.launch_plans import LaunchPlans
 
 
 def _build_small_hclt(num_latents=64, num_cats=8, num_vars=16, device="cuda:0"):
@@ -92,8 +93,10 @@ def test_par_flow_oom_fallback(tuning):
 
     for g in pc.inner_layer_groups:
         for l in g:
-            if l.is_sum() and hasattr(l, "_par_tuning_oom"):
-                del l._par_tuning_oom
+            if l.is_sum():
+                LaunchPlans.of(l).clear()                 # (a plan would replay the kernel it recorded, not the proxy)
+                if hasattr(l, "_par_tuning_oom"):
+                    del l._par_tuning_oom
 
     was_enabled, cache = autotune.ENABLED, dict(autotune._CACHE)
     try:

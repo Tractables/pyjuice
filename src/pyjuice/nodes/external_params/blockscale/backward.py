@@ -13,7 +13,6 @@ import torch
 
 from pyjuice.utils.launch_plans import LaunchPlans
 from .common import _buffer_kwarg
-from . import deferred_par
 
 def _set_attrs(layer, **attrs) -> None:
     """Plain attributes of a layer -- functions, tensors, None: never a parameter, buffer or module -- written past
@@ -44,6 +43,16 @@ def _mod(name: str):
     if m is None:
         import importlib
         m = _MODS[name] = importlib.import_module(f"pyjuice.nodes.external_params.kernels.{name}")
+    return m
+
+
+def _deferred_par():
+    """`pyjuice.layer.deferred_par`, imported on first use (`pyjuice.layer` imports `pyjuice.nodes`, which is importing
+    this module: a top-level import would be circular)."""
+    m = _MODS.get("deferred_par")
+    if m is None:
+        import importlib
+        m = _MODS["deferred_par"] = importlib.import_module("pyjuice.layer.deferred_par")
     return m
 
 
@@ -546,8 +555,9 @@ class _BackwardMixin:
         elep_mod = _mod("c").get_ele_prepass_module()
         eles_mod = _mod("c").get_ele_stream_module() if params.dtype == torch.bfloat16 else None
         # A tied group's parameter flows may be left to the end of the pass (`deferred_par`), if the backward allows it
-        pd_mod = _mod("c").get_par_deferred_fp16_module()
-        _set_attrs(layer, _bs_defer = bool(kwargs.get("defer_param_flows", False)))
+        import pyjuice.layer.kernels.c as _ck
+        pd_mod = _ck.get_par_deferred_module()
+        _set_attrs(layer, _defer_param_flows = bool(kwargs.get("defer_param_flows", False)))
 
         batch_size, block_size = state["batch_size"], state["block_size"]
         ext_base, gate_cbs, node_cbs = state["ext_base"], state["gate_cbs"], state["node_cbs"]
@@ -561,11 +571,11 @@ class _BackwardMixin:
         want_grad = layer._bs_grad_ext is not None
         bk, gbk = _buffer_kwarg(), _grad_kwargs()[1]
         if planning:
-            defer = layer._bs_defer
+            defer = layer._defer_param_flows
 
             def _pre(node_flows, element_flows, node_mars, element_mars, params, param_flows, denom_param_flows,
                      kwargs):
-                _set_attrs(layer, _bs_defer = defer)
+                _set_attrs(layer, _defer_param_flows = defer)
                 shift = _shift_logz()
                 for nids, log_z, rows in layer.__dict__["_bs_bw_state"]["shift_args"]:
                     shift(node_mars, nids, log_z, block_size, 1.0)
@@ -983,7 +993,7 @@ class _BackwardMixin:
             """`defer(param_flows, node_flows, node_mars, element_mars, params, ext)`: whether `deferred_par.try_defer`
             took this call's flows of the partition into its tied group's slots -- or None where its shape never
             defers (`deferred_par.may_defer`)."""
-            if not deferred_par.may_defer(pd_mod, ctx, n_ngates_):
+            if not _deferred_par().may_defer(pd_mod, ctx, n_ngates_):
                 return None
             static = {k: v for k, v in ctx.items()
                       if k not in ("node_flows", "element_flows", "node_mars", "element_mars", "params", "param_flows")}
@@ -991,7 +1001,7 @@ class _BackwardMixin:
             def defer(param_flows, node_flows, node_mars, element_mars, params, ext):
                 c = dict(static, param_flows = param_flows, node_flows = node_flows, node_mars = node_mars,
                          element_mars = element_mars, params = params)
-                return deferred_par.try_defer(pd_mod, layer, c, gb, ext, node_cbs, gate_cbs, ext_base, n_ngates_)
+                return _deferred_par().try_defer(pd_mod, layer, c, gb, ext, node_cbs, gate_cbs, ext_base, n_ngates_)
 
             return defer
 

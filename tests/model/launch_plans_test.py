@@ -22,7 +22,7 @@ import torch
 import pyjuice as juice
 import pyjuice.utils.launch_plans as lp
 from pyjuice.nodes import BlockScaleSumParams
-from pyjuice.nodes.external_params.blockscale import deferred_par as dpar
+from pyjuice.layer import deferred_par as dpar
 from pyjuice.utils.launch_plans import LaunchPlans
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "external_params"))
@@ -614,3 +614,142 @@ def test_an_unplanned_call_inside_a_recording_fails_it(monkeypatch):
     assert recs and all(r.failed for r in recs), "an unplanned gated layer left the recording around it replayable"
     recs = around_gated_layers(False)
     assert recs and not any(r.failed for r in recs), "a planned gated layer failed the recording around it"
+
+
+# --------------------------------------------------------------------------------- regular sum layers
+
+T_REG = 6
+
+
+def _regular_hmm(L, nb, tied = True):
+    """A plain HMM (no external parameters) of T_REG - 1 transitions in `nb` blocks; `tied`: one transition and one
+    emission node, the others their copies (one flow block)."""
+    return juice.structures.HMM(seq_length = T_REG, num_latents = L, num_emits = CATS, homogeneous = tied,
+                                block_size = L // nb)
+
+
+def _regular_instance(builder, dt, seed = 0):
+    torch.manual_seed(seed)
+    ns = builder()
+    ns.init_parameters(perturbation = 2.0)
+    return juice.compile(ns, verbose = False, param_dtype = dt).to(DEV)
+
+
+def _regular_step(pc, x, param_flows = True, **backward_kw):
+    """A forward and backward; copies of the flows and parameter flows (None without) it leaves."""
+    pc(x)
+    pc.backward(x, flows_memory = 0.0, compute_param_flows = param_flows, **backward_kw)
+    torch.cuda.synchronize()
+    return pc.node_flows.clone(), pc.element_flows.clone(), pc.param_flows.clone() if param_flows else None
+
+
+def _regular_same(ref, got, what):
+    bits = lambda t: t.view(torch.int32)
+    assert torch.equal(bits(got[0]), bits(ref[0])), f"{what}: node flows differ"
+    assert torch.equal(bits(got[1]), bits(ref[1])), f"{what}: element flows differ"
+    if ref[2] is not None:
+        _close(ref[2], got[2], f"{what}: parameter flows")
+
+
+def _planned_layers(pc):
+    """The sum layers with a plan of their backward (`SumLayer.backward`'s key)."""
+    return {l for l in _sum_layers(pc) if any(k[0] == "backward" for k in LaunchPlans.of(l).plans)}
+
+
+def _plannable_layers(pc):
+    """The sum layers whose backward the converted sites cover at these batches: the block-sparse ones (a layer of
+    block size 1 takes the sparse kernels, which no site plans)."""
+    return {l for l in _sum_layers(pc) if l.block_size > 1}
+
+
+def _count_regular_full_paths(monkeypatch):
+    """`[n]`: how many block-sparse backward partitions take the full path (`SumLayer._backward_block_sparse`, which
+    only it reaches) from now on."""
+    from pyjuice.layer.sum_layer import SumLayer
+    n = [0]
+    real = SumLayer._backward_block_sparse
+
+    def counted(self, *args, **kwargs):
+        n[0] += 1
+        return real(self, *args, **kwargs)
+
+    monkeypatch.setattr(SumLayer, "_backward_block_sparse", counted)
+    return n
+
+
+# (name, builder, params dtype, batches, whether the tied group defers at MIN_FLOWS 1M)
+REGULAR_CASES = [
+    ("tied_hmm1024", lambda: _regular_hmm(1024, 1), "bf16", (128,), True),          # deferral + the CUDA element kernels
+    ("tied_hmm512x2_fp32", lambda: _regular_hmm(512, 2), "fp32", (64, 128), False),  # 262K flows: the CUDA par choice
+    ("untied_hmm256", lambda: _regular_hmm(256, 1, tied = False), "bf16", (64,), False),
+    ("hmm96_block32", lambda: _regular_hmm(96, 3), "bf16", (128,), False),           # block 32: the Triton launches
+]
+
+
+@cuda_only
+@pytest.mark.parametrize("param_flows", [True, False], ids = ["flows", "no_param_flows"])
+@pytest.mark.parametrize("name,builder,dt,batches,defers", REGULAR_CASES, ids = [c[0] for c in REGULAR_CASES])
+def test_a_regular_backward_is_planned(name, builder, dt, batches, defers, param_flows, monkeypatch):
+    """A plain sum layer's backward is planned too -- the element flows' CUDA choice or Triton launch, the parameter
+    flows' deferral / CUDA choice / Triton launch, one launcher each --: every call after the first replays it, with the
+    full path's results and kernels; a tied group defers from a replay as from the full path."""
+    monkeypatch.setattr(dpar, "MIN_FLOWS", 1 << 20)
+    deferred = _count_deferred(monkeypatch)
+    pc = _regular_instance(builder, {"bf16": torch.bfloat16, "fp32": torch.float32}[dt])
+    xs = [torch.randint(0, CATS, (B, T_REG), generator = torch.Generator().manual_seed(i)).to(DEV)
+          for i, B in enumerate(batches)]
+
+    monkeypatch.setattr(lp, "ENABLED", False)
+    for x in xs:                                           # (warm: every choice tuned and cached)
+        _regular_step(pc, x, param_flows)
+    refs = [_regular_step(pc, x, param_flows) for x in xs]
+    assert all(not LaunchPlans.of(l).plans for l in _sum_layers(pc)), "plans stored while off"
+    assert (deferred[0] > 0) == (defers and param_flows), f"{deferred[0]} partitions deferred on the full path"
+
+    monkeypatch.setattr(lp, "ENABLED", True)
+    full = _count_regular_full_paths(monkeypatch)
+    for rnd in range(3):                                   # round 0 records, the later ones replay
+        for x, ref, B in zip(xs, refs, batches):
+            _regular_same(ref, _regular_step(pc, x, param_flows), f"{name} B {B} round {rnd}")
+        if rnd == 0:
+            recorded, deferred[0] = full[0], 0
+    assert recorded > 0 and full[0] == recorded, "a backward took the full path after its plan was recorded"
+    assert _planned_layers(pc) == _plannable_layers(pc), "the block-sparse sum layers' backwards were not all planned"
+    assert (deferred[0] > 0) == (defers and param_flows), f"{deferred[0]} partitions deferred from the replays"
+
+    x = xs[0]
+
+    def profiled():                                        # (after a call at the same batch: no buffer resized)
+        _regular_step(pc, x, param_flows)
+        pc(x)
+        return _kernels(lambda: pc.backward(x, flows_memory = 0.0, compute_param_flows = param_flows))
+
+    with_plans = profiled()
+    monkeypatch.setattr(lp, "ENABLED", False)
+    without = profiled()
+    assert with_plans == without, "a planned backward launched other kernels than the full path"
+
+
+@cuda_only
+def test_a_regular_plan_reads_the_buffers_of_its_call(monkeypatch):
+    """A batch big enough to move the circuit's buffers to new storage between a plan's recording and its replay, and
+    other inputs at the replay: the replayed backward reads and writes the buffers of its call, not those it was
+    recorded with (which, held, would still hold the recorded call's values)."""
+    pc = _regular_instance(lambda: _regular_hmm(512, 2), torch.bfloat16)
+    x_a, x_b = (torch.randint(0, CATS, (64, T_REG), generator = torch.Generator().manual_seed(s)).to(DEV) for s in (0, 2))
+    x_big = torch.randint(0, CATS, (1024, T_REG), generator = torch.Generator().manual_seed(1)).to(DEV)
+    monkeypatch.setattr(lp, "ENABLED", False)
+    for x_ in (x_b, x_big):                                # (warm: every choice tuned and cached)
+        _regular_step(pc, x_)
+    ref = _regular_step(pc, x_b)
+    monkeypatch.setattr(lp, "ENABLED", True)
+    for _ in range(2):
+        _regular_step(pc, x_a)                             # recorded, then replayed
+    old = (pc.node_flows, pc.element_flows)                # (held: the new storage cannot land at the old addresses)
+    _regular_step(pc, x_big)                               # the buffers' storage grows ...
+    full = _count_regular_full_paths(monkeypatch)
+    got = _regular_step(pc, x_b)                           # ... and batch 64 is cut from a new one
+    assert full[0] == 0, "the backward was not replayed"
+    assert all(n.data_ptr() != o.data_ptr() for n, o in zip((pc.node_flows, pc.element_flows), old)), \
+        "the flow buffers did not move"
+    _regular_same(ref, got, "buffers moved")

@@ -1,6 +1,8 @@
-// A tied group's `BlockScaleSumParams` parameter flows, deferred to one contraction (`deferred_par`), with fp16
-// operands: the contraction of the TF32-operand kernels it replaced (fp32 slots, mma m16n8k8 TF32; until 4f535bfd), its
-// operands at half the bytes and its MMAs at twice the rate. The capture and the flush:
+// A tied group's parameter flows, deferred to one contraction (`pyjuice.layer.deferred_par`): a regular sum layer's,
+// or a `BlockScaleSumParams` layer's with its gates (`gated`: log phi from the gate table and `ext`; a regular layer's
+// log phi is 0 and the two are unread) -- with fp16 operands: the contraction of the TF32-operand kernels it replaced
+// (fp32 slots, mma m16n8k8 TF32; until 4f535bfd), its operands at half the bytes and its MMAs at twice the rate. The
+// capture and the flush:
 //   capture   per step (`capture`): the column maxima M[nb, b] = max_n lf over the node block (lf = node_flows -
 //             node_mars, -inf where node_mars is; 0 where every node is -inf), as the TF32 kernels'; then both
 //             operands' rows, A = exp(lf - M) and Bop = exp(emars[cid] + log phi[gate row] + M) (0 without a gate), in
@@ -31,7 +33,7 @@
 // Scope (the Python side checks it): blk % 64 == 0, num_edges % 64 == 0, a slot's columns W % 32 == 0 and <= 512.
 
 #include <torch/extension.h>
-#include "../../../../layer/kernels/c/param_load.cuh"   // `param_ptr<TP>`, `ParamLoad<TP>`: the stored dtype
+#include "param_load.cuh"                                   // `param_ptr<TP>`, `ParamLoad<TP>`: the stored dtype
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <c10/cuda/CUDAStream.h>
@@ -97,7 +99,7 @@ __global__ void __launch_bounds__(256) capture_ab_kernel(
         const float* __restrict__ ext, const long* __restrict__ nids, const long* __restrict__ cids,
         const long* __restrict__ gate, const unsigned* __restrict__ Mord, __half* __restrict__ A, __half* __restrict__ Bop,
         float* __restrict__ fA, float* __restrict__ fB, int blk, int ne, int batch, int Mp, long Ks, int W, int S,
-        int slot0, int node_cbs, int gate_cbs, int gate_stride, long ext_base) {
+        int slot0, int node_cbs, int gate_cbs, int gate_stride, long ext_base, bool gated) {
     const int nb = blockIdx.x, lane = threadIdx.x % 32, r0 = (blockIdx.y * 8 + threadIdx.x / 32) * R, c = blockIdx.z;
     const int vpl = W / 32, cb = c * W, slot = slot0 + c;
     float M[VPL];
@@ -129,13 +131,17 @@ __global__ void __launch_bounds__(256) capture_ab_kernel(
 #pragma unroll
             for (int j = 0; j < VPL; j++) v[u][j] = nm[u][j] == -INFINITY ? 0.f : __expf(nf[u][j] - nm[u][j] - M[j]);
     } else {
-        long cid[R], grow[R];
+        long cid[R], grow[R];                                            // (grow: -2 = no gate table, log phi 0)
 #pragma unroll
         for (int u = 0; u < R; u++) {
             const int e = r0 - blk + u, gcol = e / node_cbs;
             cid[u] = cids[(long)nb * ne + e];
-            const long gb = gcol < gate_stride ? gate[(long)nb * gate_stride + gcol] : -1;
-            grow[u] = gb < 0 ? -1 : gb + ext_base + (e % node_cbs) / gate_cbs;
+            if (gated) {
+                const long gb = gcol < gate_stride ? gate[(long)nb * gate_stride + gcol] : -1;
+                grow[u] = gb < 0 ? -1 : gb + ext_base + (e % node_cbs) / gate_cbs;
+            } else {
+                grow[u] = -2;
+            }
         }
         float em[R][VPL], lp[R][VPL];
 #pragma unroll
@@ -144,9 +150,9 @@ __global__ void __launch_bounds__(256) capture_ab_kernel(
             for (int j = 0; j < VPL; j++) {
                 const int b = cb + lane + 32 * j;
                 em[u][j] = -INFINITY; lp[u][j] = 0.f;
-                if (j < vpl && b < batch && grow[u] >= 0) {
+                if (j < vpl && b < batch && grow[u] != -1) {
                     em[u][j] = emars[cid[u] * (long)batch + b];
-                    lp[u][j] = ext[grow[u] * (long)batch + b];
+                    if (grow[u] >= 0) lp[u][j] = ext[grow[u] * (long)batch + b];
                 }
             }
 #pragma unroll
@@ -431,11 +437,12 @@ std::vector<std::vector<int64_t>> flush_configs() {
 }
 
 // One step's operands into slots slot0 .. slot0 + cps - 1 (cps = M.size(1) / W chunks of the step's columns, W = a
-// slot's columns = A.size(2) / S) and their rows' scales; M: int32 [nb, cps W], scratch
+// slot's columns = A.size(2) / S) and their rows' scales; M: int32 [nb, cps W], scratch; `gated`: log phi from `gate`
+// and `ext` (else both unread: any tensors)
 void capture(torch::Tensor A, torch::Tensor Bop, torch::Tensor fA, torch::Tensor fB, torch::Tensor M,
              torch::Tensor node_flows, torch::Tensor node_mars, torch::Tensor element_mars, torch::Tensor ext,
              torch::Tensor nids, torch::Tensor cids, torch::Tensor gate, int64_t batch, int64_t slot0, int64_t node_cbs,
-             int64_t gate_cbs, int64_t ext_base) {
+             int64_t gate_cbs, int64_t ext_base, bool gated) {
     const int nbk = (int)A.size(0), blk = (int)A.size(1), ne = (int)Bop.size(1), S = (int)fA.size(1);
     const long Ks = A.size(2);
     const int W = (int)(Ks / S), Mp = (int)M.size(1), cps = Mp / W;
@@ -461,7 +468,7 @@ void capture(torch::Tensor A, torch::Tensor Bop, torch::Tensor fA, torch::Tensor
         nids.data_ptr<long>(), cids.data_ptr<long>(), gate.data_ptr<long>(), Mord,                                     \
         reinterpret_cast<__half*>(A.data_ptr<at::Half>()), reinterpret_cast<__half*>(Bop.data_ptr<at::Half>()),        \
         fA.data_ptr<float>(), fB.data_ptr<float>(), blk, ne, (int)batch, Mp, Ks, W, S, (int)slot0, (int)node_cbs,      \
-        (int)gate_cbs, (int)gate.size(1), (long)ext_base)
+        (int)gate_cbs, gated ? (int)gate.size(1) : 0, (long)ext_base, gated)
     if (vmax == 4) {
         if (R == 1) CAP(1, 4); else if (R == 2) CAP(2, 4); else if (R == 4) CAP(4, 4); else CAP(8, 4);
     } else if (vmax == 8) {
@@ -507,7 +514,7 @@ void flush(torch::Tensor pf, torch::Tensor A, torch::Tensor Bop, torch::Tensor f
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("capture", &capture, "one step's operands into its fp16 slots and their rows' scales (M: int32, scratch)");
+    m.def("capture", &capture, "one step's operands into its fp16 slots and their rows' scales (M: int32, scratch; gated: log phi read)");
     m.def("flush", &flush, "pf[pfids + n] += theta * sum over the slots of (fA fB 2^-30) (A16 . Bop16^T)");
     m.def("flush_configs", &flush_configs, "(BM, BN, BK) per flush config");
 }

@@ -1,8 +1,8 @@
 """
-A tied group's gated parameter flows, deferred to one contraction (kernels/c/blockscale_par_deferred_fp16.cu: fp16
-operands with a power-of-two scale per (row, slot)).
+A tied group's parameter flows, deferred to one contraction (kernels/c/par_deferred_fp16.cu: fp16 operands with a
+power-of-two scale per (row, slot)) -- a regular sum layer's, or a `BlockScaleSumParams` layer's with its gates.
 
-Tied copies of a gated sum node -- a homogeneous HMM's steps -- write their parameter flows into ONE flow block
+Tied copies of a sum node -- a homogeneous HMM's steps -- write their parameter flows into ONE flow block
 (compilation gives up to `max_tied_ns_per_parflow_block` copies the same `_param_flow_range`). Step by step, each
 copy's kernel read-adds-writes the whole block and reads the parameters again: at a 4096-state HMM that is 168 MB a
 step, the step's kernel at the DRAM's rate. Deferred, a step only captures its two operands into its group's slots,
@@ -15,8 +15,9 @@ A layer defers (`try_defer`) only when all of these hold, each checked, none ass
     scope is open (a layer's backward called on its own defers nothing);
   * the layer is tied, or its flow block already has a group this backward -- the group's operands and tables
     (`pfids`, `pids`) verified equal to the member's once (one device sync; never during a graph capture);
-  * the step's kernel writes without either hazard (`_par_hook`'s guard, or `_par_write_flags` (0, 0)), one gate
-    per node block, `blk % 64 == 0` and `num_edges % 64 == 0`, and the group's step is enough work -- at least
+  * the step's kernel writes without either hazard (a regular layer's CUDA regime: contiguous tables, collision-free
+    flows; a gated one's `_par_hook` guard), one gate per node block, `blk % 64 == 0` and `num_edges % 64 == 0`, and
+    the group's step is enough work -- at least
     `MIN_FLOWS` flows, or `MIN_FLOW_SAMPLES` flows x samples (a smaller step's backward is host-bound, and there
     the captures' launches cost more than the per-step kernels they replace);
   * the slots fit `PAR_DEFER_MB` with room for two steps (a full group flushes and goes on).
@@ -96,6 +97,8 @@ class _Group:
             return
         if self.cfg is None:
             self.cfg = self._pick_cfg(mod, pf, params)
+        if self.slots == 0:                                   # (nothing captured since: the trials above are no adds)
+            return
         mod.flush(pf, self.A, self.Bop, self.fA, self.fB, self.pfids, self.pids, params, self.slots, self.cfg,
                   self.bulk)
         self.slots = 0
@@ -135,8 +138,9 @@ def may_defer(mod, ctx, n_node_gates) -> bool:
 
 def try_defer(mod, layer, ctx, gate_table, ext, node_cbs, gate_cbs, ext_base, n_node_gates) -> bool:
     """Capture this step's parameter flows into its tied group's slots (the flush deferred to the end of the pass)
-    and return True; or return False, the caller then launching the step's own kernel."""
-    if not may_defer(mod, ctx, n_node_gates) or not getattr(layer, "_bs_defer", False):
+    and return True; or return False, the caller then launching the step's own kernel. `gate_table` / `ext`: a gated
+    layer's gate table and log-gates (None for a regular layer: log phi 0)."""
+    if not may_defer(mod, ctx, n_node_gates) or not getattr(layer, "_defer_param_flows", False):
         return False
     scope = current_scope()
     if scope is None:
@@ -152,7 +156,7 @@ def try_defer(mod, layer, ctx, gate_table, ext, node_cbs, gate_cbs, ext_base, n_
     if member is None:
         if torch.cuda.is_current_stream_capturing():
             return False                                       # (the checks below sync)
-        tied = any(info.ns.is_tied() for info in layer.external_node_infos)
+        tied = any(ns.is_tied() for ns in layer.nodes)
         pfids, pids = _long(ctx["pfids"]).contiguous(), _long(ctx["pids"]).contiguous()
         gkey = (int(pfids.min()), int(pfids.max()), nb, blk, ne, batch, params.dtype)
         groups = _groups_of(pf, create = True)
@@ -162,7 +166,7 @@ def try_defer(mod, layer, ctx, gate_table, ext, node_cbs, gate_cbs, ext_base, n_
         ok = (group is not None and group.S >= 2 * group.cps and torch.equal(group.pfids, pfids)
               and torch.equal(group.pids, pids))
         member = cache[mkey] = ((gkey, _long(ctx["nids"]).contiguous(), _long(ctx["cids"]).contiguous(),
-                                 _long(gate_table).contiguous()) if ok else False)
+                                 _long(gate_table).contiguous() if gate_table is not None else None) if ok else False)
     if member is False:
         return False
     gkey, nids, cids, gtab = member
@@ -175,7 +179,9 @@ def try_defer(mod, layer, ctx, gate_table, ext, node_cbs, gate_cbs, ext_base, n_
         scope.defer(lambda: group.flush(mod, pf, params))
     if group.slots + group.cps > group.S:                      # full: add what the slots hold, then go on
         group.flush(mod, pf, params)
+    gated = gtab is not None                                   # (a regular layer's gate table and log-gates: unread)
     mod.capture(group.A, group.Bop, group.fA, group.fB, group.M, ctx["node_flows"], ctx["node_mars"],
-                ctx["element_mars"], ext, nids, cids, gtab, batch, group.slots, node_cbs, gate_cbs, ext_base)
+                ctx["element_mars"], ext if gated else ctx["node_mars"], nids, cids, gtab if gated else nids, batch,
+                group.slots, node_cbs, gate_cbs, ext_base, gated)
     group.slots += group.cps
     return True

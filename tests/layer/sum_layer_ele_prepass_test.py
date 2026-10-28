@@ -13,6 +13,7 @@ import torch
 
 import pyjuice as juice
 import pyjuice.nodes.distributions as dists
+import pyjuice.utils.launch_plans as lp
 from pyjuice.layer import sum_layer as SL
 from pyjuice.layer.kernels import autotune
 from pyjuice.layer.kernels import c as ck
@@ -140,6 +141,7 @@ def test_the_dispatch_reaches_the_prepass_element_backward(name, monkeypatch):
         pytest.skip("the CUDA kernels are not available here")
     B = 64
     pc = _state(name, "bf16", B, monkeypatch)
+    monkeypatch.setattr(lp, "ENABLED", False)          # (every call below must take the dispatch, not replay a plan)
     checked = 0
     kw = dict(logspace_flows = True)
     for lg in pc.inner_layer_groups:
