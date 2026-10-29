@@ -273,6 +273,88 @@ def smallbatch_fw_bt_configs():
     return _sbfwbt_cfg_cache
 
 
+_sbmma_module = None
+_sbmma_attempted = False
+_sbmma_cfg_cache = None
+
+
+def smallbatch_fw_mma_is_available() -> bool:
+    """Whether the tensor-core small-batch forward (`smallbatch_forward_sum_mma.cu`, CuTe: a node tile x a batch tile of
+    16-64 x an edge range per block, the ranges merged by a dependent launch) is usable (lazily JIT-compiles once)."""
+    global _sbmma_module, _sbmma_attempted
+    if not _sbmma_attempted:
+        _sbmma_attempted = True
+        _sbmma_module = _jit("pyjuice_sum_forward_smallbatch_mma_cuda", "smallbatch_forward_sum_mma.cu")
+    return _sbmma_module is not None
+
+
+def smallbatch_forward_sum_mma(node_mars: torch.Tensor, element_mars: torch.Tensor, params: torch.Tensor,
+                               nids: torch.Tensor, ebase: torch.Tensor, pbase: torch.Tensor,
+                               batch_size: int, block_size: int, num_edges: int, code: int = 0,
+                               scratch: torch.Tensor = None) -> None:
+    """The tensor-core small-batch forward (in-place into ``node_mars``); ``code`` = config id | split << 8 (an arm of
+    `smallbatch_fw_mma_arms`); ``scratch`` a float buffer for a split's partials (`smallbatch_fw_mma_scratch`), reused when
+    it is large enough. The small-batch forward's contract (`smallbatch_forward_sum`) plus num_edges % 64 == 0."""
+    if scratch is None:
+        scratch = _EMPTY_F32.get(node_mars.device)
+        if scratch is None:                                  # (never `tensor or ...`: an empty tensor's truth value raises)
+            scratch = _EMPTY_F32[node_mars.device] = torch.empty(0, device = node_mars.device)
+    _sbmma_module.smallbatch_forward_sum_mma(node_mars, element_mars, params, nids, ebase, pbase, scratch,
+                                             int(batch_size), int(block_size), int(num_edges), int(code))
+
+
+_EMPTY_F32 = {}
+
+
+def smallbatch_fw_mma_scratch(code: int, batch_size: int, block_size: int, n_blocks: int) -> int:
+    """The partials buffer an arm needs, in floats (0 for one range): 2 x split x rows x the batch padded to the tile."""
+    split = code >> 8
+    if split <= 1:
+        return 0
+    bn = smallbatch_fw_mma_configs()[code & 255][1]
+    return 2 * split * n_blocks * block_size * (((batch_size + bn - 1) // bn) * bn)
+
+
+def smallbatch_fw_mma_configs():
+    """(BM, BN) per config id. Memoized (constant)."""
+    global _sbmma_cfg_cache
+    if _sbmma_cfg_cache is None:
+        _sbmma_cfg_cache = [(int(c[0]), int(c[1])) for c in _sbmma_module.smallbatch_fw_mma_configs()] \
+            if smallbatch_fw_mma_is_available() else []
+    return _sbmma_cfg_cache
+
+
+def smallbatch_fw_mma_arms(block_size: int, batch_size: int, num_edges: int, n_blocks: int):
+    """The tensor-core small-batch forward's `code`s for a layer shape: every config whose node tile divides the block
+    size and whose batch tile is not wider than the batch needs (one tile of the next width up at most), with the
+    split-K range counts 1, 2, 4, 8 (at most the edge tiles) whose grid -- node tiles x batch tiles x ranges -- stays
+    within four waves of the SMs: a CTA walking its whole row alone is latency-bound (MEASURED HMM-4096 batch 16: 128
+    CTAs 14 us of bare stream, 256 CTAs 10). Empty where the kernel does not apply (num_edges % 64, block_size % 64)."""
+    if num_edges % 64 or block_size % 64 or batch_size >= 64 or not smallbatch_fw_mma_is_available():
+        return []
+    key = (block_size, batch_size, num_edges, n_blocks, torch.cuda.current_device())
+    arms = _sbmma_arms_cache.get(key)
+    if arms is not None:
+        return arms
+    knt = num_edges // 64
+    sms = _sms()                                                         # (cached: a device-properties query per call is host time)
+    cover = min(bn for bn in (16, 32, 64) if bn >= batch_size)           # the narrowest tile that takes the batch whole
+    arms = []
+    for c, (bm, bn) in enumerate(smallbatch_fw_mma_configs()):
+        if block_size % bm or bn > cover:
+            continue
+        tiles = n_blocks * (block_size // bm) * ((batch_size + bn - 1) // bn)
+        for s in (1, 2, 4, 8):
+            if s > knt or (s > 1 and tiles * s > 4 * sms):
+                continue
+            arms.append(c | (s << 8))
+    _sbmma_arms_cache[key] = arms
+    return arms
+
+
+_sbmma_arms_cache = {}
+
+
 _sbfw_cfg_cache = None
 def smallbatch_fw_configs():
     """List of SPLIT values per config id (index = the ``cfg`` arg). Memoized (constant) -- the value

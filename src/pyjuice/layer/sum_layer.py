@@ -367,6 +367,7 @@ class SumLayer(Layer, nn.Module):
         # where sb_ebase/sb_pbase are the per-node-block first child / first param and sb_ok records
         # whether the layer's children are GLOBALLY contiguous + params block_size-strided.
         self._cached_fw_sb = dict()
+        self._cached_fw_sb_scratch = dict()           # the tensor-core small-batch forward's partials, per signature
         # Below fp32 only: whether the CUDA kernels' 8-parameter loads are aligned for this layer's parameter bases,
         # per (kind, signature) -- see `_cuda_param_loads_aligned`. Never consulted at fp32.
         self._cached_param_align8 = dict()
@@ -509,7 +510,8 @@ class SumLayer(Layer, nn.Module):
         """Forget the tensors derived from the layer's tables (index tables, CUDA operands, scratch buffers), to be
         rebuilt on the tables' device by the next pass: after the tables moved, those would point at the old device.
         What the caches keep of the host only (tuning choices, dense plans) stays."""
-        for cache in (self._cached_fw_pcids, self._cached_fw_cuda, self._cached_fw_sb, self._cached_bk_parids,
+        for cache in (self._cached_fw_pcids, self._cached_fw_cuda, self._cached_fw_sb, self._cached_fw_sb_scratch,
+                      self._cached_bk_parids,
                       self._cached_bk_ele_cuda, self._cached_bk_ele_pre, self._cached_bk_ele_sb, self._cached_bk_par_cuda,
                       self._cached_bk_par_trim, self._cached_param_align8, self._fw_fast,
                       self.__dict__.setdefault("_cached_tile_index", {})):
@@ -1455,12 +1457,34 @@ class SumLayer(Layer, nn.Module):
                 # columns instead of once per sample. Its configs are arms of the same pick; it wins from a few
                 # samples on (HMM-4096 layer: batch 4 57 -> 27 us, 8 110 -> 33, 16 Triton 77 -> 49).
                 n_bt_cfg = len(cuda_kernels.smallbatch_fw_bt_configs()) if cuda_kernels.smallbatch_fw_bt_is_available() else 0
-                sb_launch = {"cuda": cuda_kernels.smallbatch_forward_sum, "cuda_bt": cuda_kernels.smallbatch_forward_sum_bt}
+                # The tensor-core copy (`smallbatch_forward_sum_mma.cu`): the element tile shared by a node tile, split-K
+                # ranges merged by a dependent launch; its arms are (config, split) codes for this shape. It takes the
+                # batches from 4 to 63 on the tied HMMs (HMM-4096 layer, bf16: batch 16 Triton 75 -> 18 us, 32 -> 27).
+                sb_launch = {"cuda": cuda_kernels.smallbatch_forward_sum, "cuda_bt": cuda_kernels.smallbatch_forward_sum_bt,
+                             "cuda_mma": cuda_kernels.smallbatch_forward_sum_mma}
+
+                def _mma_scratch(code):
+                    # the partials buffer of a split arm, cached per shape (an allocation per call is host time)
+                    n = cuda_kernels.smallbatch_fw_mma_scratch(code, batch_size, self.block_size, nids.numel())
+                    buf = self._cached_fw_sb_scratch.get(signature)
+                    if n and (buf is None or buf.numel() < n or buf.device != node_mars.device):
+                        buf = self._cached_fw_sb_scratch[signature] = torch.empty(n, device = node_mars.device)
+                    return buf
+
+                def _sb_run(cfg, nids_, ebase_, pbase_):
+                    if cfg[0] == "cuda_mma":
+                        cuda_kernels.smallbatch_forward_sum_mma(node_mars, element_mars, params, nids_, ebase_, pbase_,
+                                                                batch_size, self.block_size, num_edges, cfg[1],
+                                                                _mma_scratch(cfg[1]))
+                    else:
+                        sb_launch[cfg[0]](node_mars, element_mars, params, nids_, ebase_, pbase_,
+                                          batch_size, self.block_size, num_edges, cfg[1])
 
                 def _launch_sb(cfg):
                     if cfg[0] in sb_launch:
-                        sb_launch[cfg[0]](node_mars, element_mars, params, nids, sb_ebase, sb_pbase,
-                                          batch_size, self.block_size, num_edges, cfg[1])
+                        # a split arm's merge is a second launch: charged its host time in the trial (see `charged`)
+                        extra = autotune.LAUNCH_S if (cfg[0] == "cuda_mma" and cfg[1] >> 8 > 1) else 0.0
+                        autotune.charged(lambda: _sb_run(cfg, nids, sb_ebase, sb_pbase), extra)()
                     else:
                         _launch_fw(default_fw_cfg)
 
@@ -1473,19 +1497,17 @@ class SumLayer(Layer, nn.Module):
                 sb_key = ("sum_fw_smallbatch_cuda", num_edges) + fw_key
                 choice = autotune.cached(sb_key)
                 if choice is None:
+                    mma_arms = cuda_kernels.smallbatch_fw_mma_arms(self.block_size, batch_size, num_edges, nids.numel())
                     choice = ("triton", -1) if runs is not None else autotune.pick(
                         sb_key, [("triton", -1)] + [("cuda", c) for c in range(n_sb_cfg)]
-                        + [("cuda_bt", c) for c in range(n_bt_cfg)], _launch_sb)
+                        + [("cuda_bt", c) for c in range(n_bt_cfg)] + [("cuda_mma", c) for c in mma_arms], _launch_sb)
 
                 if choice[0] in sb_launch:
-                    launch = sb_launch[choice[0]]
                     if runs is None:
-                        launch(node_mars, element_mars, params, nids, sb_ebase, sb_pbase,
-                               batch_size, self.block_size, num_edges, choice[1])
+                        _sb_run(choice, nids, sb_ebase, sb_pbase)
                     else:
                         for a, b in runs:
-                            launch(node_mars, element_mars, params, nids[a:b], sb_ebase[a:b], sb_pbase[a:b],
-                                   batch_size, self.block_size, num_edges, choice[1])
+                            _sb_run(choice, nids[a:b], sb_ebase[a:b], sb_pbase[a:b])
                     return None
                 # choice == ("triton", -1): fall through to the Triton launch below
 
