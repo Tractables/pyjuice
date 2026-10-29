@@ -14,12 +14,13 @@
 //   GEMM      per (batch tile, node tile, split): L_p = params[tile, range] . u, bf16 MMA in fp32 over the whole range
 //             -- producer warps cp.async the parameters and u into mbarrier'd stages from offsets computed once per
 //             thread, the consumers ldmatrix and MMA, no per-tile merges -- stored as the range's partial;
-//   merge     per 4 columns of a node: L = sum_p L_p exp(Mp - M), M = max_p Mp; node_mars = log L + M (-inf where M is).
+//   merge     per 4 columns of a node: L = sum_p L_p exp(Mp - M), M = max_p Mp; node_mars = log L + M (-inf where M is);
+//             one range (split 1): the GEMM's epilogue does it, no partials, no third launch.
 // Every sum is in a fixed order: the same bits from run to run.
 //
 // Scope (`fitting_configs`, and the Python dispatch for the rest): bf16 parameters with 8-aligned runs (the tlmm gate's
 // contiguous children per tile and block_size-strided parameters per edge), batch % 64 == 0, block_size % 64 == 0 and a
-// multiple of the tile's rows, split 1 .. 8. Scratch: one allocation per call (inside a CUDA graph capture, from its
+// multiple of the tile's rows, split 1 .. 12. Scratch: one allocation per call (inside a CUDA graph capture, from its
 // pool).
 
 #include <torch/extension.h>
@@ -38,7 +39,7 @@ using namespace cute;
 
 #define BK 64           // edge tile: one run of children (ebase / pbase one entry each)
 #define CH 32           // the pre-pass's chunk: half an edge tile
-#define MAX_SPLIT 8
+#define MAX_SPLIT 12
 
 __device__ __forceinline__ void cpa16(uint32_t smem, const void* gmem) {
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(smem), "l"(gmem) : "memory");
@@ -133,11 +134,16 @@ template <int BM, int BN, int WM, int WN, int PW, int ST, int KT>
 __global__ void __launch_bounds__((WM * WN + PW) * 32) stream_gemm_kernel(
         const bfloat16_t* __restrict__ params, const long* __restrict__ pbase, const bfloat16_t* __restrict__ u,
         const int* __restrict__ ugrp, float* __restrict__ part, int knt, int mtiles, int block_size, int batch,
-        int num_edges, int split, long rows_total) {
+        int num_edges, int split, long rows_total, float* __restrict__ node_mars, const float* __restrict__ mp,
+        const long* __restrict__ nids) {
     constexpr int NC = WM * WN * 32, NP = PW * 32;
     constexpr int ABYTES = KT * BM * 2, BBYTES = KT * BN * 2;
     constexpr int STAGE = (ABYTES + BBYTES + 1023) / 1024 * 1024;
     constexpr int SUB = BK / KT;                         // k-steps an edge tile is
+    // 16 consumer warps (the 256-row tile, 640 threads) run under a 96-register cap: the tile's columns in NH halves of
+    // BNH, each half's fragments loaded as they are multiplied; the 8-warp tiles (NH 1) keep their fragments a k-block
+    // ahead, their code as it was
+    constexpr int NH = (WM * WN >= 16) ? 2 : 1, BNH = BN / NH, HBYTES = BBYTES / NH;
     const int nbt = batch / BN, nmt = (int)(rows_total / BM);
     const int pid_b = blockIdx.x % nbt, pid_m = (blockIdx.x / nbt) % nmt, sp = blockIdx.x / (nbt * nmt);
     // the node tile: one of `mtiles` of a node block, or -- a block smaller than the tile (an HCLT's 32-node blocks)
@@ -150,9 +156,9 @@ __global__ void __launch_bounds__((WM * WN + PW) * 32) stream_gemm_kernel(
     uint64_t* empty = full + ST;
     const int tid = threadIdx.x;
     auto sAl = tile_to_shape(Atom64{}, make_shape(Int<BM>{}, Int<KT>{}));
-    auto sBl = tile_to_shape(Atom64{}, make_shape(Int<BN>{}, Int<KT>{}));
+    auto sBl = tile_to_shape(Atom64{}, make_shape(Int<BNH>{}, Int<KT>{}));      // (a half's u tile)
     auto stA = [&](int s) { return (bfloat16_t*)(smem_raw + s * STAGE); };
-    auto stB = [&](int s) { return (bfloat16_t*)(smem_raw + s * STAGE + ABYTES); };
+    auto stB = [&](int s, int h) { return (bfloat16_t*)(smem_raw + s * STAGE + ABYTES + h * HBYTES); };
     if (tid == 0)
         for (int s = 0; s < ST; s++) { mbar_init(&full[s], NP); mbar_init(&empty[s], NC); }
     __syncthreads();
@@ -167,7 +173,7 @@ __global__ void __launch_bounds__((WM * WN + PW) * 32) stream_gemm_kernel(
         const long* prA[CA];                             // a chunk's node block's parameter table (its slab of the tile)
         {
             Tensor sAt = make_tensor(make_smem_ptr(stA(0)), sAl);
-            Tensor sBt = make_tensor(make_smem_ptr(stB(0)), sBl);
+            Tensor sBt = make_tensor(make_smem_ptr(stB(0, 0)), sBl);
             CUTE_UNROLL
             for (int q = 0; q < CA; q++) {
                 int i = ptid + q * NP, e = i / (BM / 8), mm = (i % (BM / 8)) * 8;
@@ -178,8 +184,8 @@ __global__ void __launch_bounds__((WM * WN + PW) * 32) stream_gemm_kernel(
             }
             CUTE_UNROLL
             for (int q = 0; q < CB; q++) {
-                int i = ptid + q * NP, e = i / (BN / 8), bb = (i % (BN / 8)) * 8;
-                oB[q] = i < TB ? (uint32_t)((char*)&sBt(bb, e) - smem_raw) : ~0u;
+                int i = ptid + q * NP, e = i / (BN / 8), bb = (i % (BN / 8)) * 8, h = bb / BNH;
+                oB[q] = i < TB ? (uint32_t)((char*)&sBt(bb % BNH, e) - smem_raw) + h * HBYTES : ~0u;
                 gB[q] = e * batch + bb;
             }
         }
@@ -205,7 +211,7 @@ __global__ void __launch_bounds__((WM * WN + PW) * 32) stream_gemm_kernel(
     TiledMMA mma = make_tiled_mma(SM80_16x8x16_F32BF16BF16F32_TN{}, Layout<Shape<Int<WM>, Int<WN>, _1>>{});
     ThrMMA thr = mma.get_thread_slice(tid);
     Tensor sAt0 = make_tensor(make_smem_ptr(stA(0)), sAl);
-    Tensor sBt0 = make_tensor(make_smem_ptr(stB(0)), sBl);
+    Tensor sBt0 = make_tensor(make_smem_ptr(stB(0, 0)), sBl);
     Tensor tCrA = thr.partition_fragment_A(sAt0);
     Tensor tCrB = thr.partition_fragment_B(sBt0);
     auto s2rA = make_tiled_copy_A(Copy_Atom<SM75_U16x8_LDSM_T, bfloat16_t>{}, mma);
@@ -214,35 +220,73 @@ __global__ void __launch_bounds__((WM * WN + PW) * 32) stream_gemm_kernel(
     auto tB = s2rB.get_thread_slice(tid);
     Tensor tXrA = tA.retile_D(tCrA);
     Tensor tXrB = tB.retile_D(tCrB);
-    Tensor cC = make_identity_tensor(Shape<Int<BM>, Int<BN>>{});
+    Tensor cC = make_identity_tensor(Shape<Int<BM>, Int<BNH>>{});
     Tensor tCcC = thr.partition_C(cC);
     Tensor tCrL = thr.partition_fragment_C(cC);
+    Tensor tCrL1 = thr.partition_fragment_C(cC);         // (the second half's accumulator; unused where NH is 1)
     clear(tCrL);
+    clear(tCrL1);
     constexpr int KB = size<2>(tCrA);
     for (int t = k0; t < k1; t++) {
         const int j = t - k0, s = j % ST;
         mbar_wait(&full[s], (j / ST) & 1);
         Tensor sAt = make_tensor(make_smem_ptr(stA(s)), sAl);
-        Tensor sBt = make_tensor(make_smem_ptr(stB(s)), sBl);
+        Tensor sBt = make_tensor(make_smem_ptr(stB(s, 0)), sBl);
         auto tXsA = tA.partition_S(sAt);
         auto tXsB = tB.partition_S(sBt);
-        copy(s2rA, tXsA(_, _, 0), tXrA(_, _, 0));
-        copy(s2rB, tXsB(_, _, 0), tXrB(_, _, 0));
-        CUTE_UNROLL
-        for (int kb = 0; kb < KB; kb++) {                // block kb + 1's fragments load while block kb multiplies
-            if (kb + 1 < KB) {
-                copy(s2rA, tXsA(_, _, kb + 1), tXrA(_, _, kb + 1));
-                copy(s2rB, tXsB(_, _, kb + 1), tXrB(_, _, kb + 1));
-            } else {
-                mbar_arrive(&empty[s]);                  // the stage is read
+        if constexpr (NH == 1) {
+            copy(s2rA, tXsA(_, _, 0), tXrA(_, _, 0));
+            copy(s2rB, tXsB(_, _, 0), tXrB(_, _, 0));
+            CUTE_UNROLL
+            for (int kb = 0; kb < KB; kb++) {            // block kb + 1's fragments load while block kb multiplies
+                if (kb + 1 < KB) {
+                    copy(s2rA, tXsA(_, _, kb + 1), tXrA(_, _, kb + 1));
+                    copy(s2rB, tXsB(_, _, kb + 1), tXrB(_, _, kb + 1));
+                } else {
+                    mbar_arrive(&empty[s]);              // the stage is read
+                }
+                cute::gemm(mma, tCrA(_, _, kb), tCrB(_, _, kb), tCrL);
             }
-            cute::gemm(mma, tCrA(_, _, kb), tCrB(_, _, kb), tCrL);
+        } else {
+            auto tXsB1 = tB.partition_S(make_tensor(make_smem_ptr(stB(s, 1)), sBl));
+            CUTE_UNROLL
+            for (int kb = 0; kb < KB; kb++) {            // a k-block: A once, each half's u as it is multiplied
+                copy(s2rA, tXsA(_, _, kb), tXrA(_, _, kb));
+                copy(s2rB, tXsB(_, _, kb), tXrB(_, _, kb));
+                cute::gemm(mma, tCrA(_, _, kb), tCrB(_, _, kb), tCrL);
+                copy(s2rB, tXsB1(_, _, kb), tXrB(_, _, kb));
+                if (kb + 1 == KB) mbar_arrive(&empty[s]);   // the stage is read
+                cute::gemm(mma, tCrA(_, _, kb), tCrB(_, _, kb), tCrL1);
+            }
         }
     }
-    float* o = part + ((long)sp * rows_total + (long)r * block_size + (long)tile_id * BM) * batch + pid_b * BN;
-    CUTE_UNROLL
-    for (int i = 0; i < size(tCrL); i += 2) {            // (i, i + 1): columns b, b + 1 of one row
-        *(float2*)&o[(long)get<0>(tCcC(i)) * batch + get<1>(tCcC(i))] = make_float2(tCrL(i), tCrL(i + 1));
+    if (split > 1) {                                     // the range's partial, merged by the merge kernel
+        CUTE_UNROLL
+        for (int h = 0; h < NH; h++) {
+            float* o = part + ((long)sp * rows_total + (long)r * block_size + (long)tile_id * BM) * batch + pid_b * BN
+                       + h * BNH;
+            auto& L = h == 0 ? tCrL : tCrL1;
+            CUTE_UNROLL
+            for (int i = 0; i < size(L); i += 2) {       // (i, i + 1): columns b, b + 1 of one row
+                *(float2*)&o[(long)get<0>(tCcC(i)) * batch + get<1>(tCcC(i))] = make_float2(L(i), L(i + 1));
+            }
+        }
+    } else {                                             // one range: the merge in the epilogue (its S = 1 arithmetic)
+        const float* mpg = mp + (long)ugrp[r] * batch + (long)pid_b * BN;
+        CUTE_UNROLL
+        for (int h = 0; h < NH; h++) {
+            auto& L = h == 0 ? tCrL : tCrL1;
+            CUTE_UNROLL
+            for (int i = 0; i < size(L); i += 2) {
+                const int m = get<0>(tCcC(i)), c = get<1>(tCcC(i)) + h * BNH;
+                const int bq = bpt > 1 ? m / block_size : 0;
+                const long nid = nids[r + bq] + (bpt > 1 ? m - bq * block_size : tile_id * BM + m);
+                const float2 M = *(const float2*)&mpg[c];
+                const float o0 = M.x == -INFINITY ? -INFINITY : (logf(L(i)) + M.x);
+                const float o1 = M.y == -INFINITY ? -INFINITY : (logf(L(i + 1)) + M.y);
+                *(float2*)&node_mars[nid * batch + pid_b * BN + c] = make_float2(o0, o1);
+            }
+        }
     }
 }
 
@@ -284,7 +328,8 @@ __global__ void __launch_bounds__(256) stream_merge_kernel(
 // ---------------- host ----------------
 template <int BM, int BN, int WM, int WN, int PW, int ST, int KT>
 static void launch_gemm(const bfloat16_t* params, const long* pbase, const bfloat16_t* u, const int* ugrp, float* part,
-                        int knt, int rows, int block_size, int batch, int num_edges, int split, cudaStream_t st) {
+                        int knt, int rows, int block_size, int batch, int num_edges, int split, float* node_mars,
+                        const float* mp, const long* nids, cudaStream_t st) {
     constexpr int STAGE = (KT * BM * 2 + KT * BN * 2 + 1023) / 1024 * 1024;
     constexpr int SMEM = ST * STAGE + 2 * ST * 8;
     constexpr int NTH = (WM * WN + PW) * 32;
@@ -302,20 +347,25 @@ static void launch_gemm(const bfloat16_t* params, const long* pbase, const bfloa
     const long n_gemm = (long)(batch / BN) * ((long)rows * block_size / BM) * split;
     TORCH_CHECK(n_gemm < (1L << 31), "sum forward stream: a grid past 2^31 blocks");
     kernel<<<(unsigned)n_gemm, NTH, SMEM, st>>>(params, pbase, u, ugrp, part, knt, mtiles, block_size, batch, num_edges,
-                                                 split, (long)rows * block_size);
+                                                 split, (long)rows * block_size, node_mars, mp, nids);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
 // id -> {BM, BN, WM, WN, PW, ST, KT}: the BlockScale forward stream's table (MEASURED there: the 128 x 128 tiles take
 // B >= 128 at most shapes -- 64-row k-steps in 3 stages, or 32-row ones in 6 --, 128 x 64 B 64 and the 512-node blocks,
-// 64 x 128 the 256-node blocks at B 512, 64 x 64 the 64-node blocks at a batch that is no multiple of 128)
+// 64 x 128 the 256-node blocks at B 512, 64 x 64 the 64-node blocks at a batch that is no multiple of 128); 256 x 128
+// (16 consumer warps in two column halves under the 96-register cap, the u tile read once per 256 rows) for blocks of
+// 256 and more -- MEASURED HMM-4096: B512 96.6 -> 90.5 us a layer (split 2), B128 loses (26 vs 19 us GEMM: a CTA's
+// MMA/ingest overlap, not its bytes, paces it); the tuner picks
 #define CFG_TABLE(X)                     \
     X(0, 128, 128, 4, 2, 4, 3, 64)       \
     X(1, 128, 128, 2, 4, 4, 6, 32)       \
     X(2, 128, 64, 4, 2, 4, 4, 64)        \
     X(3, 64, 128, 2, 4, 4, 4, 64)        \
     X(4, 128, 64, 4, 2, 4, 8, 32)        \
-    X(5, 64, 64, 2, 2, 4, 6, 64)
+    X(5, 64, 64, 2, 2, 4, 6, 64)         \
+    X(6, 256, 128, 8, 2, 4, 4, 32)       \
+    X(7, 256, 128, 8, 2, 4, 2, 64)
 
 std::vector<std::vector<int64_t>> configs() {
     std::vector<std::vector<int64_t>> out;
@@ -371,7 +421,7 @@ void tlmm_forward_sum_stream(torch::Tensor node_mars, torch::Tensor element_mars
     // (every region 16-byte aligned: B % 64 == 0)
     const long o_mp = (long)ngrp * num_edges * batch * 2;
     const long o_part = o_mp + (long)ngrp * split * batch * 4;
-    const long total = o_part + (long)split * rows * block_size * batch * 4;
+    const long total = o_part + (split > 1 ? (long)split * rows * block_size * batch * 4 : 0);   // (split 1: no partials)
     torch::Tensor scratch = torch::empty({total}, element_mars.options().dtype(torch::kUInt8));
     char* base = reinterpret_cast<char*>(scratch.data_ptr());
     auto* u = reinterpret_cast<__nv_bfloat16*>(base);
@@ -388,11 +438,12 @@ void tlmm_forward_sum_stream(torch::Tensor node_mars, torch::Tensor element_mars
     switch (cfg_id) {
 #define X(id, bm, bn, wm, wn, pw, stg, ktt) \
         case id: launch_gemm<bm, bn, wm, wn, pw, stg, ktt>(pp, pbase.data_ptr<long>(), (const bfloat16_t*)u, \
-                     ugrp.data_ptr<int>(), part, knt, rows, (int)block_size, batch, num_edges, split, st); break;
+                     ugrp.data_ptr<int>(), part, knt, rows, (int)block_size, batch, num_edges, split, \
+                     node_mars.data_ptr<float>(), mp, nids.data_ptr<long>(), st); break;
         CFG_TABLE(X)
 #undef X
     }
-    {
+    if (split > 1) {                                     // (split 1: the GEMM's epilogue merged, nothing to launch)
         const long rt = (long)rows * block_size, n = rt * (batch / 4);
         const unsigned grid = (unsigned)((n + 255) / 256);
         float* nm = node_mars.data_ptr<float>();
@@ -401,7 +452,7 @@ void tlmm_forward_sum_stream(torch::Tensor node_mars, torch::Tensor element_mars
         switch (split) {
 #define M_(S) case S: stream_merge_kernel<S><<<grid, 256, 0, st>>>(nm, part, mp, np, ug, batch, (int)block_size, rt); \
                       break;
-            M_(1) M_(2) M_(3) M_(4) M_(5) M_(6) M_(7) M_(8)
+            M_(2) M_(3) M_(4) M_(5) M_(6) M_(7) M_(8) M_(9) M_(10) M_(11) M_(12)
 #undef M_
         }
         C10_CUDA_KERNEL_LAUNCH_CHECK();

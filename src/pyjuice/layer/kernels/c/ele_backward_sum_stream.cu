@@ -190,22 +190,34 @@ __global__ void __launch_bounds__((WM * WN + PW) * 32) eles_gemm_kernel(
         }
         const uint32_t sbase = (uint32_t)__cvta_generic_to_shared(smem_raw);
         const long ub = (long)ugrp[eb] * knt * BK * batch + (long)pid_b * BN;
-        for (int t = k0; t < k1; t++) {
-            const int j = t - k0, s = j % ST;
-            if (j >= ST) mbar_wait(&empty[s], ((j / ST) - 1) & 1);
-            const uint32_t ss = sbase + s * STAGE;
+        // a chunk's parameter offset at k-step t: the parents sub * KT + kA .. + 7 of tile t64 -- parameter block (t64,
+        // their block among pbt), the row's slab of BSK parents, the parents within the block. The table entries are
+        // dependent loads, a thread's chunks spanning the tile's child blocks (an HCLT's 4): fetched a step AHEAD, their
+        // latency under this step's copies -- MEASURED HCLT-1024 B128 cold, the element pass of the 1408-block layer
+        // 151 -> 137 us, of the 672-block layer 78 -> 70; flat on an HMM (one block, one row a thread)
+        auto offsets = [&](int t, long* out) {
             const int t64 = t / SUB, sub = t % SUB;
             CUTE_UNROLL
             for (int q = 0; q < CA; q++) {
-                if (oA[q] != ~0u) {
-                    // the parents sub * KT + kA .. + 7 of tile t64: parameter block (t64, their block among pbt), the
-                    // row's slab of BSK parents, the parents within the block. (The table entry is a dependent load a
-                    // step; fetching it a step ahead MEASURED flat on HMM-4096 B128: the stage round trip, not this
-                    // latency, paces the pipeline)
-                    const int pp = sub * KT + kA[q];
-                    const int blk = pbt > 1 ? pp / BSK : 0, pin = pbt > 1 ? pp - blk * BSK : pp;
-                    cpa16(ss + oA[q], params + prA[q][(long)t64 * pbt + blk] + (long)mA[q] * BSK + pin);
-                }
+                const int pp = sub * KT + kA[q];
+                const int blk = pbt > 1 ? pp / BSK : 0, pin = pbt > 1 ? pp - blk * BSK : pp;
+                out[q] = oA[q] != ~0u ? prA[q][(long)t64 * pbt + blk] + (long)mA[q] * BSK + pin : 0;
+            }
+        };
+        long pA[CA];
+        offsets(k0, pA);
+        for (int t = k0; t < k1; t++) {
+            const int j = t - k0, s = j % ST;
+            long nA[CA];
+            if (t + 1 < k1) offsets(t + 1, nA);
+            if (j >= ST) mbar_wait(&empty[s], ((j / ST) - 1) & 1);
+            const uint32_t ss = sbase + s * STAGE;
+            CUTE_UNROLL
+            for (int q = 0; q < CA; q++)
+                if (oA[q] != ~0u) cpa16(ss + oA[q], params + pA[q]);
+            if (t + 1 < k1) {
+                CUTE_UNROLL
+                for (int q = 0; q < CA; q++) pA[q] = nA[q];
             }
             const bfloat16_t* pb = u + ub + (long)t * KT * batch;
             CUTE_UNROLL
@@ -252,6 +264,8 @@ __global__ void __launch_bounds__((WM * WN + PW) * 32) eles_gemm_kernel(
             cute::gemm(mma, tCrA(_, _, kb), tCrB(_, _, kb), tCrL);
         }
     }
+    // (the partial of one range too: merging in the epilogue MEASURED slower -- the emars reads and the scattered
+    // stores land in the GEMM's tail, where nothing overlaps them; the merge kernel streams them at full rate)
     float* o = part + ((long)sp * rows_total + (long)eb * BSM + (long)tile_id * BM) * batch + pid_b * BN;
     CUTE_UNROLL
     for (int i = 0; i < size(tCrL); i += 2)              // (i, i + 1): columns b, b + 1 of one row

@@ -598,10 +598,15 @@ def stream_arms(block_size: int, batch_size: int, k_num_tiles: int, n_blocks: in
     for c in fits:
         bm, bn, kt = cfgs[c]
         ctas = (n_blocks * block_size // bm) * (batch_size // bn)
-        for s in range(2, 9):
+        for s in range(2, STREAM_MAX_SPLIT + 1):
             if s <= k_num_tiles * (64 // kt) and sms // 2 <= ctas * s <= sms:
                 arms.append(c * 16 + s)
     return arms
+
+
+#: Split-K ranges the stream forward may cut a row's k-steps into (its kernel's MAX_SPLIT; the 256-row tile needs more
+#: ranges than the 128-row one to fill a wave)
+STREAM_MAX_SPLIT = 12
 
 
 def ele_stream_is_available() -> bool:

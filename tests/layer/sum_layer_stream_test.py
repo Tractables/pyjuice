@@ -3,7 +3,7 @@ The stream CUDA tlmm forward (c/tlmm_forward_sum_stream.cu: a pre-pass over a no
 under one stabilizer, shared by the node blocks of equal children; a GEMM of mbarrier'd cp.async stages; a merge of the
 ranges) against float64 from the compiled tables and against the pre-pass kernel it stands beside -- every fitting tile
 config at every split arm, bf16 parameters, on HMMs of 128 (two edge tiles), 448 (blocks of 64, 7 tiles) and 896
-latents (14 tiles) and HCLT-128 and -256 at blocks of 64 and 32 (a variable's blocks sharing their children: a
+latents (14 tiles), 512 latents in blocks of 256 (the 256-row tiles) and HCLT-128 and -256 at blocks of 64 and 32 (a variable's blocks sharing their children: a
 128-row tile over 2 or 4 of them), at B 64 and 128; columns whose children are
 all -inf in a range or in every range; and the layer's dispatch, told the gate chose it, reaching it on a whole launch
 and on runs, and its settled replay. Skipped where the CUDA kernels cannot build.
@@ -32,16 +32,18 @@ def _hclt(latents, cats = 16, V = 64, block_size = None):
     return juice.compile(ns, verbose = False, param_dtype = torch.bfloat16).to(DEV), V, cats
 
 
-def _hmm(latents, T = 8):
+def _hmm(latents, T = 8, block_size = None):
     torch.manual_seed(0)
-    ns = juice.structures.HMM(seq_length = T, num_latents = latents, num_emits = 16)
+    ns = juice.structures.HMM(seq_length = T, num_latents = latents, num_emits = 16,
+                              **({} if block_size is None else dict(block_size = block_size)))
     ns.init_parameters(perturbation = 2.0)
     return juice.compile(ns, verbose = False, param_dtype = torch.bfloat16).to(DEV), T, 16
 
 
 CIRCUITS = {"hclt128": lambda: _hclt(128), "hclt256_b64": lambda: _hclt(256, block_size = 64),
             "hclt256_b32": lambda: _hclt(256, block_size = 32),
-            "hmm128": lambda: _hmm(128), "hmm448": lambda: _hmm(448, T = 4), "hmm896": lambda: _hmm(896, T = 4)}
+            "hmm128": lambda: _hmm(128), "hmm448": lambda: _hmm(448, T = 4), "hmm896": lambda: _hmm(896, T = 4),
+            "hmm512_b256": lambda: _hmm(512, T = 4, block_size = 256)}     # (blocks of 256: the 256-row tiles)
 
 
 def _available():
