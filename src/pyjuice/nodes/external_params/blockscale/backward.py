@@ -640,7 +640,7 @@ class _BackwardMixin:
             chids, ebase, pbase = ctx["chids"], ctx["ele_ebase"], ctx["ele_pbase"]
             batch, blk, cbs = ctx["batch_size"], ctx["block_size"], ctx["cs_block_size"]
             ne, knt, tk = ctx["num_edges"], ctx["K_NUM_TILES"], ctx["TILE_SIZE_K"]
-            plan = {"gate_tile": None, "gate_sb": None, "sb": None}
+            plan = {"gate_tile": None, "gate_sb": None, "sb": None, "gate_sbm": None, "sbm": None}
             kinds = []
 
             # ONE GATE ROW PER (k-tile, PARENT GROUP). `ele_ebase` from the layer is the group-0
@@ -702,6 +702,39 @@ class _BackwardMixin:
                 plan["gate_sb"] = self._gate_bw_table(layer, chids, starts)
                 plan["sb"] = (ebase.contiguous(), pbase.contiguous())
                 kinds += [("sb", c) for c in range(len(sb_mod.blockscale_sb_ele_configs()))]
+
+            # The tensor-core small-batch fork (kernels/c/blockscale_smallbatch_ele_mma.cu), batch 16 .. 63: per 64-parent
+            # tile a tensor-core product under the tile's own stabilizer, folded in under its parent block's gates (bf16
+            # parameters exact, fp32 ones as hi + lo halves), on 64-parent tile tables: the layer's own where its tile
+            # is 64 parents of one group, else cut from the full walk -- a tile is `pinc` groups of tk / pinc parents,
+            # each group contiguous rows of one parent block (the walk's structure), so each splits into 64s where its
+            # width is a multiple of 64 (at batch 16 the layer's tile is 128). Parent blocks of whole 64-tiles; the
+            # 16-byte loads of bf16 parameters aligned at every base; child tiles, gates a tile and shared memory
+            # `blockscale_sb_ele_mma_arms`'.
+            ne_eff = knt * tk
+            w = tk // pinc if tk % pinc == 0 else 0
+            if (16 <= batch < 64 and w > 0 and w % 64 == 0 and blk % 64 == 0 and ne_eff % blk == 0
+                    and n_ngates_ == 1):
+                arms = _mod("c").blockscale_sb_ele_mma_arms(cbs, blk, batch, ne_eff, chids.numel(), gate_cbs,
+                                                            ctx["params"].dtype == torch.float32)
+                if arms:
+                    if tk == 64 and pinc == 1:
+                        e64, p64 = ebase.contiguous(), pbase.contiguous()
+                    else:
+                        _cp = torch.cumsum(ctx["parpids_increment"].to(torch.int64), 1)
+                        _shp = torch.zeros_like(_cp)
+                        _shp[:, 1:] = _cp[:, :-1]
+                        full_pbase = ctx["parpids_start"][:, None, :].to(torch.int64) + _shp   # [n, K, pinc]
+                        off = torch.arange(0, w, 64, device = ebase.device, dtype = torch.int64)
+                        e64 = (full_ebase[:, :, :, None] + off).reshape(full_ebase.size(0), -1).contiguous()
+                        p64 = (full_pbase[:, :, :, None] + off).reshape(full_pbase.size(0), -1).contiguous()
+                    # (one sync, at the plan's build)
+                    if ctx["params"].dtype == torch.float32 or bool((p64 % 8 == 0).all()):
+                        # one gate row per (element block, parent block): the block's first 64-tile's first parent's
+                        jj = torch.arange(ne_eff // blk, device = ebase.device, dtype = torch.int64) * (blk // 64)
+                        plan["gate_sbm"] = self._gate_bw_table(layer, chids, e64[:, jj].contiguous())
+                        plan["sbm"] = (e64, p64, ne_eff)
+                        kinds += [("sbm", c) for c in arms]
 
             if plan["gate_tile"] is not None:
                 kinds.append("triton")
@@ -818,6 +851,33 @@ class _BackwardMixin:
                         tgt, element_mars, node_flows, node_mars, params, ext, chids, ebase, pbase,
                         no_grad if grad is None else grad, batch, blk, cbs, knt, gate_cbs, ext_base,
                         0 if grad is None else 1, code, tb["tables"], tb["ngrp"], tb["npc"])
+
+            elif isinstance(kind, tuple) and kind[0] == "sbm":
+                (e0, p0, ne64), gsb, code = plan["sbm"], plan["gate_sbm"], kind[1]
+                sbm_mod = _mod("c").get_sb_ele_mma_module()
+                split = code >> 8
+                # the gradient's shares a (child, unit): a unit a parent block, or a range where ranges slice the blocks
+                rk, tpb = (ne64 // 64) // split, blk // 64
+                gp_shape = chids.numel() * cbs * (ne64 // blk) * (tpb // rk if rk < tpb else 1) * batch
+                # the ranges' partials: (L, R) per (range, element, padded column); one buffer a plan, as the shares
+                bn = sbm_mod.blockscale_sb_ele_mma_configs()[code & 255][1]
+                scr_n = 2 * split * chids.numel() * cbs * (-(-batch // bn) * bn) if split > 1 else 0
+
+                def run(tgt, node_flows, node_mars, element_mars, params, ext, grad):
+                    if grad is None:
+                        gp = no_grad
+                    else:
+                        gp = plan.get("sb_gpart")
+                        if gp is None or gp.numel() < gp_shape or gp.device != grad.device:
+                            gp = plan["sb_gpart"] = torch.empty(gp_shape, device = grad.device)
+                    scr = no_grad
+                    if scr_n:
+                        scr = plan.get("sbm_scratch")
+                        if scr is None or scr.numel() < scr_n or scr.device != tgt.device:
+                            scr = plan["sbm_scratch"] = torch.empty(scr_n, device = tgt.device)
+                    sbm_mod.blockscale_sb_ele_backward_mma(
+                        tgt, element_mars, node_flows, node_mars, params, ext, chids, e0, p0, gsb,
+                        no_grad if grad is None else grad, gp, scr, batch, blk, cbs, ne64, gate_cbs, ext_base, code)
 
             elif isinstance(kind, tuple):                     # ("sb", cfg)
                 (e0, p0), gsb, cfg = plan["sb"], plan["gate_sb"], kind[1]

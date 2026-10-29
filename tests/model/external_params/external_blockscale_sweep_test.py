@@ -162,9 +162,34 @@ def test_sweep_large_batch(num_latents, block_size, gate_cbs, batch):
 @cuda_only
 @needs_cute
 @pytest.mark.parametrize("num_latents,block_size,gate_cbs,batch", SMALL)
-def test_sweep_small_batch(num_latents, block_size, gate_cbs, batch):
-    """The plain-CUDA forks. These are fp32 throughout, so the bar is far tighter."""
+def test_sweep_small_batch(num_latents, block_size, gate_cbs, batch, monkeypatch):
+    """The plain-CUDA forks. These are fp32 throughout, so the bar is far tighter -- the tensor-core small-batch forward
+    (bf16 operands, `test_sweep_small_batch_tensor_cores`) taken out, as if its extension had not built."""
+    import pyjuice.nodes.external_params.kernels.c as bs_c
+    monkeypatch.setattr(bs_c, "get_sb_mma_module", lambda: None)
     _check(num_latents, block_size, gate_cbs, batch, tol_val = 1e-5, tol_ef = 1e-5, tol_pf = 1e-4)
+
+
+SMALL_TC = [(K, K, g, b) for K in (128, 512) for g in (8, 64) for b in (16, 33, 63)]   # (offered from batch 16)
+
+
+@cuda_only
+@needs_cute
+@pytest.mark.parametrize("num_latents,block_size,gate_cbs,batch", SMALL_TC)
+def test_sweep_small_batch_tensor_cores(num_latents, block_size, gate_cbs, batch, monkeypatch):
+    """The tensor-core small-batch forward (blockscale_smallbatch_forward_mma.cu) forced: bf16 operands, so the large
+    batch's bar."""
+    import pyjuice.layer.kernels.c as ck
+    real = ck.autotune
+
+    def forced(cands, *args, **kwargs):
+        mma = [k for k, _ in cands if isinstance(k, tuple) and k[0] == "sbmma"]
+        if any(isinstance(k, tuple) and k[0] == "sbbt" for k, _ in cands):          # (the forward's pick only)
+            assert mma, "the tensor-core small-batch forward was not offered"
+            return mma[0]
+        return real(cands, *args, **kwargs)
+    monkeypatch.setattr(ck, "autotune", forced)
+    _check(num_latents, block_size, gate_cbs, batch, tol_val = 2e-3, tol_ef = 3e-3, tol_pf = 5e-3)
 
 
 def _check(num_latents, block_size, gate_cbs, batch, tol_val, tol_ef, tol_pf, seed = 0):

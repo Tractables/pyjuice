@@ -58,7 +58,8 @@ class _ForwardMixin:
         All three are collected here and the choice is MEASURED, so where they overlap the faster one
         wins rather than the one that happened to be checked first.
         """
-        from ..kernels.c import get_cute_module, get_sb_module, get_sb_bt_module, get_prepass_module, get_stream_module
+        from ..kernels.c import get_cute_module, get_sb_module, get_sb_bt_module, get_sb_mma_module, get_prepass_module, get_stream_module
+        from ..kernels import c as ck_ext
         import pyjuice.layer.kernels.c as ck
 
         # NEITHER CUDA extension is required any more. The CuTe forward needs nvcc, CUTLASS and
@@ -403,6 +404,19 @@ class _ForwardMixin:
             if sbbt_mod is not None:
                 for i in range(len(sbbt_mod.blockscale_sb_bt_configs())):
                     cands.append((("sbbt", i), _runner(sbbt_mod.blockscale_sb_forward_bt, sb_calls, i)))
+            # The tensor-core copy (blockscale_smallbatch_forward_mma.cu: N and Z both products of the parameter tile,
+            # split-K ranges merged by a dependent launch), its (config, split) codes common to every partition, the
+            # same launch tuples; below fp32 its 16-byte parameter loads need the edge blocks' first parameters at
+            # multiples of 8 (as the CuTe fork's)
+            sbmma_mod = get_sb_mma_module()
+            if sbmma_mod is not None and (params.dtype == torch.float32
+                                          or (block_size % 8 == 0 and all(bool((c[2] % 8 == 0).all()) for c in sb_calls))):
+                codes = None
+                for c in sb_calls:
+                    arms = ck_ext.blockscale_sb_mma_arms(block_size, batch_size, c[6], c[0].numel(), node_cbs, bool(c[10]))
+                    codes = list(arms) if codes is None else [a for a in codes if a in arms]
+                for code in codes or []:
+                    cands.append((("sbmma", code), _runner(sbmma_mod.blockscale_sb_forward_mma, sb_calls, code)))
 
         # The portable fork is a CANDIDATE only where the CuTe fork is ineligible -- which is where
         # the small-batch one otherwise takes shapes it was never meant for. Its grid is one block per
@@ -434,6 +448,8 @@ class _ForwardMixin:
             out_mod, fname, calls = stream_mod, "blockscale_forward_stream", _with_cfg(calls, best_cfg)
         elif kind == "sbbt":
             out_mod, fname, calls = get_sb_bt_module(), "blockscale_sb_forward_bt", _with_cfg(sb_calls, best_cfg)
+        elif kind == "sbmma":
+            out_mod, fname, calls = get_sb_mma_module(), "blockscale_sb_forward_mma", _with_cfg(sb_calls, best_cfg)
         else:
             out_mod, fname, calls = sb_mod, "blockscale_sb_forward", _with_cfg(sb_calls, best_cfg)
 

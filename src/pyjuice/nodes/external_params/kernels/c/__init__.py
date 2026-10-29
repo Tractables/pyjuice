@@ -296,6 +296,141 @@ _prepass_module = None
 _prepass_attempted = False
 
 
+_sb_mma_module = None
+_sb_mma_attempted = False
+
+
+def get_sb_mma_module():
+    """The tensor-core small-batch block-scale forward extension (`blockscale_smallbatch_forward_mma.cu`: N and Z both
+    products of the parameter tile, split-K ranges merged), or None if its toolchain is unavailable (warns once)."""
+    global _sb_mma_module, _sb_mma_attempted
+    if _sb_mma_attempted:
+        return _sb_mma_module
+    _sb_mma_attempted = True
+    if not ENABLE_CUDA_KERNELS:
+        return None
+    from pyjuice.layer.kernels.c import _compile_flags
+    flags = _compile_flags()
+    if flags is None:
+        return None
+    cuda_cflags, ldflags = flags
+    from pyjuice.utils.cuda_ext import jit_load
+    try:
+        _sb_mma_module = jit_load("pyjuice_blockscale_sb_mma_cuda",
+                                  sources = [os.path.join(_THIS_DIR, "blockscale_smallbatch_forward_mma.cu")],
+                                  extra_cuda_cflags = cuda_cflags, extra_ldflags = ldflags, verbose = False)
+    except Exception as e:
+        warnings.warn(
+            f"pyjuice CUDA kernel 'pyjuice_blockscale_sb_mma_cuda' failed to compile ({type(e).__name__}: {e}). "
+            "The block-scale forward keeps its other kernels.", RuntimeWarning)
+        _sb_mma_module = None
+    return _sb_mma_module
+
+
+_bs_sb_mma_arms_cache = {}
+
+
+def blockscale_sb_mma_arms(block_size: int, batch_size: int, num_edges: int, n_blocks: int, node_cbs: int,
+                           row_contig: bool):
+    """The tensor-core small-batch block-scale forward's codes (config id | split << 8) for a partition shape: node
+    tiles dividing the block, batch tiles no wider than the narrowest that covers the batch, splits 1/2/4/8 within four
+    waves of the SMs (`pyjuice.layer.kernels.c.smallbatch_fw_mma_arms`' rule). Empty where it does not apply: batch
+    below 16 (fp32 there) or 64 or more, edges not whole 64-tiles, a row of edge blocks narrower than 64 that is not one
+    contiguous run."""
+    # Below batch 16 the gated path stays fp32 (the per-sample and batch-tiled kernels), as the tests hold it to; from 16
+    # the other gated forwards already use tensor-core precision
+    if batch_size < 16 or batch_size >= 64 or num_edges % 64 or not (row_contig or node_cbs % 64 == 0):
+        return []
+    mod = get_sb_mma_module()
+    if mod is None:
+        return []
+    key = (block_size, batch_size, num_edges, n_blocks, torch.cuda.current_device())
+    arms = _bs_sb_mma_arms_cache.get(key)
+    if arms is not None:
+        return arms
+    from pyjuice.layer.kernels.c import _sms
+    sms, knt = _sms(), num_edges // 64
+    cover = min(bn for bn in (16, 32, 64) if bn >= batch_size)
+    arms = []
+    for c, (bm, bn) in enumerate([(int(v[0]), int(v[1])) for v in mod.blockscale_sb_mma_configs()]):
+        if block_size % bm or bn > cover:
+            continue
+        tiles = n_blocks * (block_size // bm) * ((batch_size + bn - 1) // bn)
+        for sp in (1, 2, 4, 8):
+            if sp > knt or (sp > 1 and tiles * sp > 4 * sms):
+                continue
+            arms.append(c | (sp << 8))
+    _bs_sb_mma_arms_cache[key] = arms
+    return arms
+
+
+_sb_ele_mma_module = None
+_sb_ele_mma_attempted = False
+
+
+def get_sb_ele_mma_module():
+    """The tensor-core small-batch block-scale element backward (`blockscale_smallbatch_ele_mma.cu`: per-tile stabilizers
+    folded under the gates, split ranges of whole parent blocks merged), or None if its toolchain is unavailable."""
+    global _sb_ele_mma_module, _sb_ele_mma_attempted
+    if _sb_ele_mma_attempted:
+        return _sb_ele_mma_module
+    _sb_ele_mma_attempted = True
+    if not ENABLE_CUDA_KERNELS:
+        return None
+    from pyjuice.layer.kernels.c import _compile_flags
+    flags = _compile_flags()
+    if flags is None:
+        return None
+    cuda_cflags, ldflags = flags
+    from pyjuice.utils.cuda_ext import jit_load
+    try:
+        _sb_ele_mma_module = jit_load("pyjuice_blockscale_sb_ele_mma_cuda",
+                                      sources = [os.path.join(_THIS_DIR, "blockscale_smallbatch_ele_mma.cu")],
+                                      extra_cuda_cflags = cuda_cflags, extra_ldflags = ldflags, verbose = False)
+    except Exception as e:
+        warnings.warn(
+            f"pyjuice CUDA kernel 'pyjuice_blockscale_sb_ele_mma_cuda' failed to compile ({type(e).__name__}: {e}). "
+            "The block-scale element backward keeps its other kernels.", RuntimeWarning)
+        _sb_ele_mma_module = None
+    return _sb_ele_mma_module
+
+
+_bs_sb_ele_mma_arms_cache = {}
+
+
+def blockscale_sb_ele_mma_arms(cs_block_size: int, block_size: int, batch_size: int, num_edges: int, n_blocks: int,
+                               gate_cbs: int, fp32: bool):
+    """The tensor-core small-batch block-scale element backward's codes (config id | split << 8, `split` equal ranges of
+    the 64-parent tiles, each whole parent blocks or inside one): child tiles dividing the child block under at most 16
+    gates within the shared memory (`blockscale_sb_ele_mma_fits`), batch tiles no wider than the narrowest covering the
+    batch, splits 1/2/4/8/16 within four waves of the SMs. Empty where it does not apply: batch below 16 (fp32 there, as the gated forward) or 64 or more,
+    parent blocks not whole 64-tiles."""
+    if batch_size < 16 or batch_size >= 64 or block_size % 64 or num_edges % block_size:
+        return []
+    mod = get_sb_ele_mma_module()
+    if mod is None:
+        return []
+    key = (cs_block_size, block_size, batch_size, num_edges, n_blocks, gate_cbs, bool(fp32), torch.cuda.current_device())
+    arms = _bs_sb_ele_mma_arms_cache.get(key)
+    if arms is not None:
+        return arms
+    from pyjuice.layer.kernels.c import _sms
+    sms, knt, tpb = _sms(), num_edges // 64, block_size // 64
+    cover = min(bn for bn in (16, 32, 64) if bn >= batch_size)
+    arms = []
+    for c, (bm, bn) in enumerate([(int(v[0]), int(v[1])) for v in mod.blockscale_sb_ele_mma_configs()]):
+        if bn > cover or not mod.blockscale_sb_ele_mma_fits(c, bool(fp32), cs_block_size, gate_cbs):
+            continue
+        tiles = n_blocks * (cs_block_size // bm) * ((batch_size + bn - 1) // bn)
+        for sp in (1, 2, 4, 8, 16):
+            rk = knt // sp
+            if knt % sp or not (rk % tpb == 0 or tpb % rk == 0) or (sp > 1 and tiles * sp > 4 * sms):
+                continue
+            arms.append(c | (sp << 8))
+    _bs_sb_ele_mma_arms_cache[key] = arms
+    return arms
+
+
 def get_prepass_module():
     """The pre-pass block-scale forward extension, or None if its toolchain is unavailable (warns once)."""
     global _prepass_module, _prepass_attempted

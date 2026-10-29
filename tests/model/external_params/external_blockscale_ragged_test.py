@@ -176,7 +176,10 @@ def _fw_fork(layer):
     plans = getattr(layer, "_bs_fw_plans", None)
     assert plans, "no forward plan was built"
     fname = next(iter(plans.values()))[0][1]
-    return {"blockscale_forward": "cute", "blockscale_sb_forward": "sb", "blockscale_forward_prepass": "pre"}[fname]
+    # (the small-batch family: the per-sample kernel, its batch-tiled and tensor-core copies -- the same tables and the
+    # same per-edge-block bases)
+    return {"blockscale_forward": "cute", "blockscale_sb_forward": "sb", "blockscale_sb_forward_bt": "sb",
+            "blockscale_sb_forward_mma": "sb", "blockscale_forward_prepass": "pre"}[fname]
 
 
 def _run(name, batch = 64, gate_cbs = 8, scale = 0.7, seed = 0):
@@ -545,7 +548,7 @@ def test_a_ragged_gated_layer_runs_end_to_end():
 @cuda_only
 @needs_cute
 @pytest.mark.parametrize("name", RAGGED)
-def test_ragged_small_batch_computes_correct_param_flows(name):
+def test_ragged_small_batch_computes_correct_param_flows(name, monkeypatch):
     """Below batch 16 the param flows route to `_backward_sparse_par_flows`, whose only gated hook
     used to sit behind `_par_flow_collision_free` -- which padding defeats -- so the layer RAISED.
 
@@ -556,7 +559,10 @@ def test_ragged_small_batch_computes_correct_param_flows(name):
     would race a real one for pfid 0) and `PF_ATOMIC` covers slots that still collide afterwards.
 
     The bar here is TIGHT -- ~1e-4 rather than the fp16 dot's ~1e-3 -- because at this batch the
-    small-batch fork is pure fp32, so a real defect has nowhere to hide."""
+    small-batch fork is pure fp32, so a real defect has nowhere to hide -- the tensor-core small-batch forward (bf16
+    operands, its own tests) taken out, as if its extension had not built."""
+    import pyjuice.nodes.external_params.kernels.c as bs_c
+    monkeypatch.setattr(bs_c, "get_sb_mma_module", lambda: None)
     gate_cbs, batch = 8, 8
     pc, root, ns, layer, data, phi = _run(name, batch = batch, gate_cbs = gate_cbs)
     pc(data, sum_external_params = {ns: phi})
