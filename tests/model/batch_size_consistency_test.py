@@ -399,7 +399,7 @@ def test_small_batch_ele_backward_cuda_matches_triton():
         # Confirm the small-batch CUDA ele dispatch was actually reached (an "sb" choice was cached),
         # so this test is not silently validating Triton-vs-Triton.
         reached = any(
-            any(isinstance(k, tuple) and len(k) == 3 and k[2] == "sb"
+            any(isinstance(k, tuple) and len(k) >= 3 and k[2] == "sb"
                 for k in getattr(layer, "_cached_bk_ele_choice", {}))
             for lg in pc.inner_layer_groups for layer in lg
             if type(layer).__name__ == "SumLayer"

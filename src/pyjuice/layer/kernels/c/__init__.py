@@ -324,15 +324,16 @@ def smallbatch_fw_mma_configs():
     return _sbmma_cfg_cache
 
 
-def smallbatch_fw_mma_arms(block_size: int, batch_size: int, num_edges: int, n_blocks: int):
+def smallbatch_fw_mma_arms(block_size: int, batch_size: int, num_edges: int, n_blocks: int, grouped: int = 1):
     """The tensor-core small-batch forward's `code`s for a layer shape: every config whose node tile divides the block
-    size and whose batch tile is not wider than the batch needs (one tile of the next width up at most), with the
-    split-K range counts 1, 2, 4, 8 (at most the edge tiles) whose grid -- node tiles x batch tiles x ranges -- stays
-    within four waves of the SMs: a CTA walking its whole row alone is latency-bound (MEASURED HMM-4096 batch 16: 128
-    CTAs 14 us of bare stream, 256 CTAs 10). Empty where the kernel does not apply (num_edges % 64, block_size % 64)."""
-    if num_edges % 64 or block_size % 64 or batch_size >= 64 or not smallbatch_fw_mma_is_available():
+    size -- or, ``grouped`` (`row_groups`: aligned runs of that many node blocks share their children), spans at most
+    that many whole blocks -- and whose batch tile is not wider than the batch needs (the narrowest tile that covers
+    it), with the split-K range counts 1, 2, 4, 8 (at most the edge tiles) whose grid -- node tiles x batch tiles x
+    ranges -- stays within four waves of the SMs: a CTA walking its whole row alone is latency-bound (MEASURED HMM-4096
+    batch 16: 128 CTAs 14 us of bare stream, 256 CTAs 10). Empty where the kernel does not apply."""
+    if num_edges % 64 or block_size % 8 or batch_size >= 64 or not smallbatch_fw_mma_is_available():
         return []
-    key = (block_size, batch_size, num_edges, n_blocks, torch.cuda.current_device())
+    key = (block_size, batch_size, num_edges, n_blocks, grouped, torch.cuda.current_device())
     arms = _sbmma_arms_cache.get(key)
     if arms is not None:
         return arms
@@ -341,9 +342,13 @@ def smallbatch_fw_mma_arms(block_size: int, batch_size: int, num_edges: int, n_b
     cover = min(bn for bn in (16, 32, 64) if bn >= batch_size)           # the narrowest tile that takes the batch whole
     arms = []
     for c, (bm, bn) in enumerate(smallbatch_fw_mma_configs()):
-        if block_size % bm or bn > cover:
+        if bn > cover:
             continue
-        tiles = n_blocks * (block_size // bm) * ((batch_size + bn - 1) // bn)
+        if block_size % bm:
+            g = bm // block_size
+            if bm % block_size or g > grouped or n_blocks % g:
+                continue
+        tiles = n_blocks * block_size // bm * ((batch_size + bn - 1) // bn)
         for s in (1, 2, 4, 8):
             if s > knt or (s > 1 and tiles * s > 4 * sms):
                 continue
@@ -352,7 +357,104 @@ def smallbatch_fw_mma_arms(block_size: int, batch_size: int, num_edges: int, n_b
     return arms
 
 
+def smallbatch_fw_mma_rows(code: int, block_size: int) -> int:
+    """The node blocks one tile of an arm spans (1 unless grouped): a launch over some rows (`runs`) must cover whole
+    multiples of it."""
+    bm = smallbatch_fw_mma_configs()[code & 255][0]
+    return bm // block_size if block_size < bm else 1
+
+
 _sbmma_arms_cache = {}
+
+
+_sbmmae_module = None
+_sbmmae_attempted = False
+_sbmmae_cfg_cache = None
+_sbmmae_arms_cache = {}
+
+
+def smallbatch_ele_mma_is_available() -> bool:
+    """Whether the tensor-core small-batch element backward (`smallbatch_ele_backward_mma.cu`) is usable (lazily
+    JIT-compiles once)."""
+    global _sbmmae_module, _sbmmae_attempted
+    if not _sbmmae_attempted:
+        _sbmmae_attempted = True
+        _sbmmae_module = _jit("pyjuice_sum_backward_ele_smallbatch_mma_cuda", "smallbatch_ele_backward_mma.cu")
+    return _sbmmae_module is not None
+
+
+def smallbatch_ele_backward_sum_mma(element_flows: torch.Tensor, element_mars: torch.Tensor, node_flows: torch.Tensor,
+                                    node_mars: torch.Tensor, params: torch.Tensor, chids: torch.Tensor,
+                                    ebase: torch.Tensor, pbase: torch.Tensor, batch_size: int, block_size: int,
+                                    cs_block_size: int, num_edges: int, code: int = 0,
+                                    scratch: torch.Tensor = None, pbt: int = 1) -> None:
+    """The tensor-core small-batch element-flow backward (overwrites ``element_flows``); ``ebase`` the layer's
+    [element blocks, num_edges / 64] first parent per tile, ``pbase`` its [element blocks, num_edges / 64 * pbt] parameter
+    bases (``pbt`` 2: a tile over two parameter blocks of 32); ``code`` = config id | split << 8
+    (`smallbatch_ele_mma_arms`); ``scratch`` a float buffer for a split's partials (`smallbatch_ele_mma_scratch`)."""
+    if scratch is None:
+        scratch = _EMPTY_F32.get(element_flows.device)
+        if scratch is None:
+            scratch = _EMPTY_F32[element_flows.device] = torch.empty(0, device = element_flows.device)
+    _sbmmae_module.smallbatch_ele_backward_sum_mma(element_flows, element_mars, node_flows, node_mars, params, chids,
+                                                   ebase, pbase, scratch, int(batch_size), int(block_size),
+                                                   int(cs_block_size), int(num_edges), int(pbt), int(code))
+
+
+def smallbatch_ele_mma_configs():
+    """(BM, BN) per config id. Memoized (constant)."""
+    global _sbmmae_cfg_cache
+    if _sbmmae_cfg_cache is None:
+        _sbmmae_cfg_cache = [(int(c[0]), int(c[1])) for c in _sbmmae_module.smallbatch_ele_mma_configs()] \
+            if smallbatch_ele_mma_is_available() else []
+    return _sbmmae_cfg_cache
+
+
+def smallbatch_ele_mma_arms(cs_block_size: int, block_size: int, batch_size: int, num_edges: int, n_blocks: int,
+                            grouped: int = 1):
+    """The tensor-core small-batch element backward's `code`s for a partition shape: `smallbatch_fw_mma_arms`' rule over
+    the element blocks (child tiles dividing the child block size, or -- ``grouped``: aligned runs of that many element
+    blocks share their parents -- spanning at most that many whole blocks). Empty where it does not apply."""
+    if (num_edges % 64 or cs_block_size % 8 or block_size % 8 or batch_size >= 64
+            or not smallbatch_ele_mma_is_available()):
+        return []
+    key = (cs_block_size, block_size, batch_size, num_edges, n_blocks, grouped, torch.cuda.current_device())
+    arms = _sbmmae_arms_cache.get(key)
+    if arms is not None:
+        return arms
+    knt = num_edges // 64
+    sms = _sms()
+    cover = min(bn for bn in (16, 32, 64) if bn >= batch_size)
+    arms = []
+    for c, (bm, bn) in enumerate(smallbatch_ele_mma_configs()):
+        if bn > cover:
+            continue
+        if cs_block_size % bm:
+            g = bm // cs_block_size
+            if bm % cs_block_size or g > grouped or n_blocks % g:
+                continue
+        tiles = n_blocks * cs_block_size // bm * ((batch_size + bn - 1) // bn)
+        for s in (1, 2, 4, 8):
+            if s > knt or (s > 1 and tiles * s > 4 * sms):
+                continue
+            arms.append(c | (s << 8))
+    _sbmmae_arms_cache[key] = arms
+    return arms
+
+
+def smallbatch_ele_mma_rows(code: int, cs_block_size: int) -> int:
+    """The element blocks one tile of an arm spans (1 unless grouped)."""
+    bm = smallbatch_ele_mma_configs()[code & 255][0]
+    return bm // cs_block_size if cs_block_size < bm else 1
+
+
+def smallbatch_ele_mma_scratch(code: int, batch_size: int, cs_block_size: int, n_blocks: int) -> int:
+    """The partials buffer an element arm needs, in floats (0 for one range)."""
+    split = code >> 8
+    if split <= 1:
+        return 0
+    bn = smallbatch_ele_mma_configs()[code & 255][1]
+    return 2 * split * n_blocks * cs_block_size * (((batch_size + bn - 1) // bn) * bn)
 
 
 _sbfw_cfg_cache = None

@@ -23,7 +23,8 @@ def _available():
     return torch.cuda.is_available() and ck.smallbatch_fw_is_available() and ck.smallbatch_fw_mma_is_available()
 
 
-def _layout(ng, block_size, num_edges, batch, dt, neg_inf):
+def _layout(ng, block_size, num_edges, batch, dt, neg_inf, group = 1):
+    """`group` > 1: aligned runs of that many node blocks share their children (an HCLT's 32-node blocks)."""
     node_mars = torch.full((ng * block_size + 7, batch), float("nan"), device = DEV)
     element_mars = torch.randn(ng * num_edges + 3, batch, device = DEV) * 3
     if neg_inf:
@@ -36,7 +37,7 @@ def _layout(ng, block_size, num_edges, batch, dt, neg_inf):
             element_mars[:, -1] = -float("inf")                              # last column: every child -inf
     params = (torch.rand(ng * num_edges * block_size, device = DEV) + 1e-3).to(dt)
     nids = torch.arange(ng, device = DEV) * block_size + 7
-    ebase = torch.arange(ng, device = DEV) * num_edges + 3
+    ebase = (torch.arange(ng, device = DEV) // group) * group * num_edges + 3
     pbase = torch.arange(ng, device = DEV) * (num_edges * block_size)
     return node_mars, element_mars, params, nids, ebase, pbase
 
@@ -53,12 +54,13 @@ def _reference(element_mars, params, nids, ebase, pbase, block_size, num_edges):
     return torch.cat(out)
 
 
-LAYOUTS = {"3x128x256": (3, 128, 256), "2x64x192": (2, 64, 192), "1x1024x512": (1, 1024, 512), "2x256x64": (2, 256, 64)}
+LAYOUTS = {"3x128x256": (3, 128, 256), "2x64x192": (2, 64, 192), "1x1024x512": (1, 1024, 512), "2x256x64": (2, 256, 64),
+           "8x32x256-g4": (8, 32, 256, 4), "4x32x128-g2": (4, 32, 128, 2), "6x32x64-g2": (6, 32, 64, 2)}
 BATCHES = [1, 3, 5, 8, 15, 16, 17, 33, 48, 63]
 
 
-def _codes(block_size, batch, num_edges, ng):
-    codes = ck.smallbatch_fw_mma_arms(block_size, batch, num_edges, ng)
+def _codes(block_size, batch, num_edges, ng, group = 1):
+    codes = ck.smallbatch_fw_mma_arms(block_size, batch, num_edges, ng, group)
     assert codes, (block_size, batch, num_edges)
     return codes
 
@@ -69,12 +71,16 @@ def _codes(block_size, batch, num_edges, ng):
 @pytest.mark.parametrize("layout", list(LAYOUTS))
 def test_every_arm_matches_float64(layout, neg_inf, dtype):
     torch.manual_seed(0)
-    ng, bs, ne = LAYOUTS[layout]
+    ng, bs, ne, *grp = LAYOUTS[layout]
+    group = grp[0] if grp else 1
     dt = DTYPES[dtype]
     for batch in BATCHES:
-        node_mars, element_mars, params, nids, ebase, pbase = _layout(ng, bs, ne, batch, dt, neg_inf)
+        node_mars, element_mars, params, nids, ebase, pbase = _layout(ng, bs, ne, batch, dt, neg_inf, group)
         ref = _reference(element_mars, params, nids, ebase, pbase, bs, ne)
-        for code in _codes(bs, batch, ne, ng):
+        codes = _codes(bs, batch, ne, ng, group)
+        if group > 1:                                                    # (the grouped tiles are among them)
+            assert any(ck.smallbatch_fw_mma_rows(c, bs) > 1 for c in codes)
+        for code in codes:
             nm = node_mars.clone()
             ck.smallbatch_forward_sum_mma(nm, element_mars, params, nids, ebase, pbase, batch, bs, ne, code)
             got = nm[7:].double()
@@ -89,11 +95,12 @@ def test_every_arm_matches_float64(layout, neg_inf, dtype):
 @pytest.mark.skipif(not _available(), reason = "the tensor-core small-batch forward cannot build here")
 def test_agrees_with_the_fma_kernel():
     torch.manual_seed(1)
-    for (ng, bs, ne), batch, dt in itertools.product(LAYOUTS.values(), [2, 7, 16, 40, 63], DTYPES.values()):
-        node_mars, element_mars, params, nids, ebase, pbase = _layout(ng, bs, ne, batch, dt, True)
+    for (ng, bs, ne, *grp), batch, dt in itertools.product(LAYOUTS.values(), [2, 7, 16, 40, 63], DTYPES.values()):
+        group = grp[0] if grp else 1
+        node_mars, element_mars, params, nids, ebase, pbase = _layout(ng, bs, ne, batch, dt, True, group)
         old = node_mars.clone()
         ck.smallbatch_forward_sum(old, element_mars, params, nids, ebase, pbase, batch, bs, ne, 0)
-        for code in _codes(bs, batch, ne, ng):
+        for code in _codes(bs, batch, ne, ng, group):
             new = node_mars.clone()
             ck.smallbatch_forward_sum_mma(new, element_mars, params, nids, ebase, pbase, batch, bs, ne, code)
             a, b = old[7:], new[7:]
@@ -106,7 +113,9 @@ def test_arms_follow_the_shape():
     if not _available():
         pytest.skip("the tensor-core small-batch forward cannot build here")
     assert ck.smallbatch_fw_mma_arms(1024, 16, 4096, 4)                      # the HMM-4096 layer
-    assert not ck.smallbatch_fw_mma_arms(32, 16, 4096, 4)                    # 32-node blocks: no tile divides them
+    assert not ck.smallbatch_fw_mma_arms(32, 16, 4096, 4)                    # 32-node blocks, ungrouped: no tile fits
+    assert all(ck.smallbatch_fw_mma_rows(c, 32) <= 2 for c in ck.smallbatch_fw_mma_arms(32, 16, 4096, 4, 2))
+    assert any(ck.smallbatch_fw_mma_rows(c, 32) == 4 for c in ck.smallbatch_fw_mma_arms(32, 16, 4096, 8, 4))
     assert not ck.smallbatch_fw_mma_arms(1024, 16, 4000, 4)                  # not whole edge tiles
     assert not ck.smallbatch_fw_mma_arms(1024, 64, 4096, 4)                  # the large-batch kernels' regime
     for code in ck.smallbatch_fw_mma_arms(1024, 16, 4096, 4):

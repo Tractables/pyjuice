@@ -368,6 +368,8 @@ class SumLayer(Layer, nn.Module):
         # whether the layer's children are GLOBALLY contiguous + params block_size-strided.
         self._cached_fw_sb = dict()
         self._cached_fw_sb_scratch = dict()           # the tensor-core small-batch forward's partials, per signature
+        self._cached_bk_ele_mma = dict()              # the tensor-core small-batch element backward's 64-parent tables
+        self._cached_bk_ele_mma_scratch = dict()      # ... and its partials, per signature
         # Below fp32 only: whether the CUDA kernels' 8-parameter loads are aligned for this layer's parameter bases,
         # per (kind, signature) -- see `_cuda_param_loads_aligned`. Never consulted at fp32.
         self._cached_param_align8 = dict()
@@ -511,6 +513,7 @@ class SumLayer(Layer, nn.Module):
         rebuilt on the tables' device by the next pass: after the tables moved, those would point at the old device.
         What the caches keep of the host only (tuning choices, dense plans) stays."""
         for cache in (self._cached_fw_pcids, self._cached_fw_cuda, self._cached_fw_sb, self._cached_fw_sb_scratch,
+                      self._cached_bk_ele_mma, self._cached_bk_ele_mma_scratch,
                       self._cached_bk_parids,
                       self._cached_bk_ele_cuda, self._cached_bk_ele_pre, self._cached_bk_ele_sb, self._cached_bk_par_cuda,
                       self._cached_bk_par_trim, self._cached_param_align8, self._fw_fast,
@@ -656,6 +659,23 @@ class SumLayer(Layer, nn.Module):
         if tiles is None:
             tiles = cache[key] = cuda_kernels.tile_index(ebase)
         return tiles
+
+    def _sb_mma_grouped(self, signature, ebase: torch.Tensor, pbase: torch.Tensor, kind: str = "fwg") -> int:
+        """How many consecutive node (or element) blocks a tensor-core small-batch tile may span: `row_groups`' grouping
+        of ``ebase`` (an edge tile's first row per tile), capped where the blocks' parameter offsets would not fit the
+        kernel's int deltas (``pbase``: a block's first parameter). Built once per (``kind``, ``signature``)."""
+        cache = self.__dict__.setdefault("_cached_tile_index", {})
+        key = ("sbmma", kind, signature)
+        g = cache.get(key)
+        if g is None:
+            g = self._row_groups(signature, ebase, kind)[2] if ebase.size(0) > 1 else 1
+            while g > 1:
+                d = pbase.reshape(-1)[:pbase.size(0) // g * g].view(-1, g, *pbase.shape[1:])
+                if int((d - d[:, :1]).abs().max()) < (1 << 31) - (1 << 24):
+                    break
+                g //= 2
+            cache[key] = g
+        return g
 
     def _row_groups(self, signature, ebase: torch.Tensor, kind: str = "fwg"):
         """A stream kernel's ``(ugrp, grep, grouped)`` of ``ebase`` (`cuda_kernels.row_groups`: blocks of equal rows
@@ -1472,7 +1492,11 @@ class SumLayer(Layer, nn.Module):
                     return buf
 
                 def _sb_run(cfg, nids_, ebase_, pbase_):
-                    if cfg[0] == "cuda_mma":
+                    if cfg[0] == "cuda_mma" and nids_.numel() % cuda_kernels.smallbatch_fw_mma_rows(cfg[1], self.block_size):
+                        # (a run that splits a grouped tile's blocks: the batch-tiled FMA kernel takes it)
+                        cuda_kernels.smallbatch_forward_sum_bt(node_mars, element_mars, params, nids_, ebase_, pbase_,
+                                                               batch_size, self.block_size, num_edges, 0)
+                    elif cfg[0] == "cuda_mma":
                         cuda_kernels.smallbatch_forward_sum_mma(node_mars, element_mars, params, nids_, ebase_, pbase_,
                                                                 batch_size, self.block_size, num_edges, cfg[1],
                                                                 _mma_scratch(cfg[1]))
@@ -1502,7 +1526,8 @@ class SumLayer(Layer, nn.Module):
                 sb_key = ("sum_fw_smallbatch_cuda", num_edges, mma_ok) + fw_key
                 choice = autotune.cached(sb_key)
                 if choice is None:
-                    mma_arms = (cuda_kernels.smallbatch_fw_mma_arms(self.block_size, batch_size, num_edges, nids.numel())
+                    mma_arms = (cuda_kernels.smallbatch_fw_mma_arms(self.block_size, batch_size, num_edges, nids.numel(),
+                                                                     self._sb_mma_grouped(signature, self._cached_fw_cuda[signature][0], sb_pbase))
                                 if mma_ok and not torch.cuda.is_current_stream_capturing() else [])
                     choice = ("triton", -1) if runs is not None else autotune.pick(
                         sb_key, [("triton", -1)] + [("cuda", c) for c in range(n_sb_cfg)]
@@ -2567,46 +2592,104 @@ class SumLayer(Layer, nn.Module):
                     return None
                 # choice == ("triton", -1): fall through to the Triton launch below
 
-        # Small-batch (batch < 16) CUDA element-flow backward. The block-sparse Triton kernel (csmm2)
-        # under-tiles the node dimension at tiny batch; this plain-CUDA kernel gives each child node
-        # its own warp and streams its flows directly from global -- no shared staging, no barrier
-        # (a component ablation showed the staged variant spent ~88% of its time in that barrier),
-        # numerically equivalent ~3e-6. Gated to the same regime as the small-batch tiling heuristic
-        # above (batch<16, block_size>=128), LL, no tempering/partial-eval, contiguous layout, and
-        # allow_modify_flows / allow_neg_flows / accumulate_ch_flows off. Autotuned vs the Triton
-        # small-batch launch INTO A SCRATCH buffer (corruption-safe: the live element_flows is touched
-        # only by the single real run below); used only when it wins, else falls through to Triton.
-        if (BACKWARD_ELE_FLOW_CUDA and batch_size < 16 and self.block_size >= _SMALL_BATCH_MIN_BLOCK_SIZE
+        # Small-batch (batch < 64) CUDA element-flow backwards, autotuned against the Triton launch that would run on
+        # fall-through, INTO A SCRATCH buffer (corruption-safe: the live element_flows is touched only by the single
+        # real run below), used only where one wins. Gated to LL, no tempering, contiguous layout, and
+        # allow_modify_flows / allow_neg_flows / accumulate_ch_flows off.
+        #   * ("cuda", WARPS cfg), batch < 16: the plain-CUDA kernel giving each child node its own warp, streaming its
+        #     flows from global -- no shared staging, no barrier (a component ablation showed the staged variant spent
+        #     ~88% of its time in that barrier); numerically equivalent ~3e-6. It re-reads every parent's flows per
+        #     child: the batch-1 kernel (HMM-4096 layer: batch 1 37 us, 4 70, 8 189).
+        #   * ("cuda_mma", cfg | split << 8): the tensor-core copy (c/smallbatch_ele_backward_mma.cu: a child tile x a
+        #     batch tile x a range of 64-parent tiles per block, bf16 operands, the ranges merged by a dependent
+        #     launch) on 64-parent tile tables -- the layer's own where its tile is 64, else built for 64; the fp16 /
+        #     bf16 dot regime of the other CUDA element kernels (not "fp32" precision) and the parameter bases
+        #     aligned for its 16-byte loads. HMM-4096 layer, bf16: batch 4 Triton ~67 -> 21 us, 16 ~60 -> 27.
+        if (BACKWARD_ELE_FLOW_CUDA and batch_size < 64 and self.block_size >= _SMALL_BATCH_MIN_BLOCK_SIZE
                 and propagation_alg_id == 0 and abs(eflow_temperature - 1.0) < 1e-6
                 and allow_modify_flows == 0 and logspace_flows and not allow_neg_flows
-                and not accumulate_ch_flows and not force_use_fp32
-                and num_edges % TILE_SIZE_K == 0 and cs_block_size % 32 == 0
-                and node_flows.is_cuda and cuda_kernels.smallbatch_ele_is_available()):
-            sb = self._cached_bk_ele_sb.get(signature)
-            if sb is None:
-                # The kernel takes the cached per-tile ebase / pbase tables themselves (a tile's first parent and
-                # first parameter), so it needs only what `cuda_ok` already states: one parameter-block group per
-                # tile. (It used to take one base per node block and require the tiles to chain across the whole
-                # row, which no layer of more than one parent block satisfies -- it never ran on an HMM-4096.)
-                ele_ebase, ele_pbase, cuda_ok = self._cached_bk_ele_cuda[signature]
-                sb = (ele_ebase.contiguous(), ele_pbase.contiguous(), bool(cuda_ok))
-                self._cached_bk_ele_sb[signature] = sb
-            sb_ebase, sb_pbase, sb_ok = sb
-            if sb_ok:
-                n_sb_cfg = len(cuda_kernels.smallbatch_ele_configs())
+                and not accumulate_ch_flows and not force_use_fp32 and node_flows.is_cuda):
+            sb_ok = False
+            if (batch_size < 16 and num_edges % TILE_SIZE_K == 0 and cs_block_size % 32 == 0
+                    and cuda_kernels.smallbatch_ele_is_available()):
+                sb = self._cached_bk_ele_sb.get(signature)
+                if sb is None:
+                    # The kernel takes the cached per-tile ebase / pbase tables themselves (a tile's first parent and
+                    # first parameter), so it needs only what `cuda_ok` already states: one parameter-block group per
+                    # tile. (It used to take one base per node block and require the tiles to chain across the whole
+                    # row, which no layer of more than one parent block satisfies -- it never ran on an HMM-4096.)
+                    ele_ebase, ele_pbase, cuda_ok = self._cached_bk_ele_cuda[signature]
+                    sb = (ele_ebase.contiguous(), ele_pbase.contiguous(), bool(cuda_ok))
+                    self._cached_bk_ele_sb[signature] = sb
+                sb_ebase, sb_pbase, sb_ok = sb
+            # The tensor-core copy's tables: 64-parent tiles of contiguous parent rows over one parameter block, or two
+            # of 32 (an HCLT's) -- the layer's own where its tile is 64, else built for 64; with the element blocks'
+            # grouping (`row_groups`: blocks sharing their parents). Built at the first use, cached; None where the
+            # kernel does not apply (or its 16-byte parameter loads would be misaligned).
+            def _mma_tables():
+                if not (self.block_size % 8 == 0 and num_edges_full >= 64 and num_edges_full % 64 == 0
+                        and cs_block_size % 8 == 0 and cuda_kernels.smallbatch_ele_mma_is_available()):
+                    return None
+                sig64 = ("block_sparse", partition_id, 64)
+                mma = self._cached_bk_ele_mma.get(sig64)
+                if mma is None:
+                    if TILE_SIZE_K == 64:
+                        e64 = self._cached_bk_ele_cuda[signature][0]
+                        full_p, pre_ok = self._cached_bk_ele_pre[signature]
+                        pinc, k64 = ptr_inc_step, K_NUM_TILES
+                        ok = pinc == 1 or (pinc == 2 and pre_ok)
+                    else:
+                        ps, pi, pps, ppi, pinc = _parent_tables(64)
+                        def _cumbase(start, incr):
+                            c = torch.cumsum(incr.to(torch.int64), 1)
+                            sh = torch.zeros_like(c); sh[:, 1:] = c[:, :-1]
+                            return (start[:, None, :].to(torch.int64) + sh).contiguous()   # [n, K, pinc]
+                        full_e, full_pp = _cumbase(ps, pi), _cumbase(pps, ppi)
+                        e64, k64 = full_e[:, :, 0].contiguous(), pi.size(1)
+                        full_p = full_pp.view(full_pp.size(0), -1)
+                        ok = pinc == 1 or (pinc == 2 and bool(torch.equal(full_e[:, :, 1], full_e[:, :, 0] + self.block_size)))
+                    ok = ok and pinc * self.block_size >= 64 and (pinc == 1 or pinc * self.block_size == 64)
+                    grouped = (self._row_groups(sig64, e64, "sbele")[2] if ok and e64.size(0) > 1 else 1)
+                    mma = self._cached_bk_ele_mma[sig64] = (e64.contiguous(), full_p.contiguous(), int(pinc), bool(ok),
+                                                            k64 * 64, grouped)
+                if not (mma[3] and self._cuda_param_loads_aligned(params, ("ele_sb_mma", sig64), mma[1], self.block_size)):
+                    return None
+                return mma
+
+            choice_key = (signature, batch_size, "sb", params.dtype)   # (a choice must not outlive `set_param_dtype`)
+            choice = self._cached_bk_ele_choice.get(choice_key)
+            mma = _mma_tables() if (choice is None or choice[0] == "cuda_mma") else None
+            if choice is not None and choice[0] == "cuda_mma" and mma is None:
+                choice = ("triton", -1)                          # (defensive: its tables no longer apply)
+            mma_arms = (cuda_kernels.smallbatch_ele_mma_arms(cs_block_size, self.block_size, batch_size, mma[4],
+                                                             chids.numel(), mma[5])
+                        if (mma is not None and choice is None) else [])
+            if sb_ok or mma_arms or (choice is not None and choice[0] != "triton"):
+                n_sb_cfg = len(cuda_kernels.smallbatch_ele_configs()) if sb_ok else 0
 
                 def _cuda_ele_sb(tgt, c, t):
                     cuda_kernels.smallbatch_ele_backward_sum(
                         tgt, t["element_mars"], t["node_flows"], t["node_mars"], t["params"], chids, sb_ebase,
                         sb_pbase, batch_size, self.block_size, cs_block_size, num_edges, TILE_SIZE_K, c)
 
+                def _mma_scratch(code):
+                    n = cuda_kernels.smallbatch_ele_mma_scratch(code, batch_size, cs_block_size, chids.numel())
+                    buf = self._cached_bk_ele_mma_scratch.get(signature)
+                    if n and (buf is None or buf.numel() < n or buf.device != node_flows.device):
+                        buf = self._cached_bk_ele_mma_scratch[signature] = torch.empty(n, device = node_flows.device)
+                    return buf
+
+                def _cuda_ele_mma(tgt, code, t, a = None, b = None):
+                    cuda_kernels.smallbatch_ele_backward_sum_mma(
+                        tgt, t["element_mars"], t["node_flows"], t["node_mars"], t["params"], chids[a:b],
+                        mma[0][a:b], mma[1][a:b], batch_size, self.block_size, cs_block_size, mma[4], code,
+                        _mma_scratch(code), mma[2])
+
                 # Compare against the Triton launch that would actually run on fall-through (the
                 # tuned config and the kernel `ele_kernel` selects), not a hard-coded csmm2 one.
                 def _triton_ele_sb(tgt):
                     _launch_ele(default_ele_cfg, tgt, cur)
 
-                choice_key = (signature, batch_size, "sb")
-                choice = self._cached_bk_ele_choice.get(choice_key)
                 if choice is None:
                     # autotune into a SCRATCH clone (corruption-safe); the live element_flows is
                     # touched only by the single real run below.
@@ -2616,24 +2699,41 @@ class SumLayer(Layer, nn.Module):
                     scr = self._bk_ele_scratch
                     cands = [(("triton", -1), (lambda: _triton_ele_sb(scr)))]
                     cands += [(("cuda", c), (lambda c = c: _cuda_ele_sb(scr, c, cur))) for c in range(n_sb_cfg)]
+                    # (a split arm's merge is a second launch: charged its host time in the trial)
+                    cands += [(("cuda_mma", c), autotune.charged(lambda c = c: _cuda_ele_mma(scr, c, cur),
+                                                                 autotune.LAUNCH_S if c >> 8 > 1 else 0.0))
+                              for c in mma_arms]
                     choice = autotune.best_of(cands) or ("triton", -1)
                     self._cached_bk_ele_choice[choice_key] = choice
-                if choice[0] == "cuda":
+                if choice[0] in ("cuda", "cuda_mma"):
                     if runs is None:
                         c = choice[1]
-
-                        def _ele_sb(node_flows, element_flows, node_mars, element_mars, params, param_flows):
-                            _cuda_ele_sb(element_flows, c, dict(node_flows = node_flows, node_mars = node_mars,
-                                                                element_mars = element_mars, params = params))
+                        if choice[0] == "cuda":
+                            def _ele_sb(node_flows, element_flows, node_mars, element_mars, params, param_flows):
+                                _cuda_ele_sb(element_flows, c, dict(node_flows = node_flows, node_mars = node_mars,
+                                                                    element_mars = element_mars, params = params))
+                        else:
+                            def _ele_sb(node_flows, element_flows, node_mars, element_mars, params, param_flows):
+                                _cuda_ele_mma(element_flows, c, dict(node_flows = node_flows, node_mars = node_mars,
+                                                                     element_mars = element_mars, params = params))
 
                         LaunchPlans.add(_ele_sb)
                         _ele_sb(node_flows, element_flows, node_mars, element_mars, params, None)
-                    else:
+                    elif choice[0] == "cuda":
                         for a, b in runs:
                             cuda_kernels.smallbatch_ele_backward_sum(
                                 element_flows, element_mars, node_flows, node_mars, params, chids[a:b],
                                 sb_ebase[a:b], sb_pbase[a:b], batch_size, self.block_size, cs_block_size,
                                 num_edges, TILE_SIZE_K, choice[1])
+                    else:
+                        g = cuda_kernels.smallbatch_ele_mma_rows(choice[1], cs_block_size)
+                        for a, b in runs:
+                            if a % g or b % g:                   # (a run that splits a grouped tile's blocks: Triton)
+                                cfg = _tuned_ele_cfg(element_flows, cur)
+                                per = BLOCK_SIZE_M // cfg[1]
+                                _launch_ele(cfg, element_flows, cur, a * per, (b - a) * per)
+                            else:
+                                _cuda_ele_mma(element_flows, choice[1], cur, a, b)
                     return None
                 # choice == ("triton", -1): fall through to the Triton launch below
 

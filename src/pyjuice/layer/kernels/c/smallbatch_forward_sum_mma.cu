@@ -24,8 +24,10 @@
 // values against float64; the FMA kernels ~1e-7) -- the class of the other tensor-core forwards.
 //
 // Contract (the small-batch forward's): a node block's children are CONTIGUOUS (child(e) = ebase[nb] + e), its
-// parameters block_size-strided (params[pbase[nb] + e * block_size + m]), num_edges a multiple of 64, block_size a
-// multiple of BM; the caller verifies (`sb_ok`) and keeps the other kernels otherwise.
+// parameters block_size-strided (params[pbase[nb] + e * block_size + m]), num_edges a multiple of 64; block_size a
+// multiple of BM, or BM a multiple of block_size with every aligned run of BM / block_size node blocks sharing its
+// children (`row_groups`; an HCLT's 32-node blocks) and the runs' parameter offsets within an int of each other; the
+// caller verifies (`sb_ok`, `smallbatch_fw_mma_arms`' `grouped`) and keeps the other kernels otherwise.
 //
 // TRAPS met building it: a static `__shared__` variable shifts the dynamic shared memory off its 128-byte alignment and
 // misaligns the swizzled stages (the bare stream 13 -> 17 us); the dynamic shared memory cap here is 99 KB (sm_120);
@@ -66,16 +68,27 @@ __global__ void __launch_bounds__((WM * WN + PW) * 32) sbmma_kernel(
     constexpr int NC = WM * WN * 32, NP = PW * 32, NTH = NC + NP;
     constexpr bool BF16 = std::is_same<TP, __nv_bfloat16>::value;
     static_assert(BN % 8 == 0 && BN <= 64 && 2 * ST + 1 <= 15, "columns; named barriers (15 is the producers' own)");
-    const int mtiles = block_size / BM;
+    // A node tile is BM rows of one node block (block_size >= BM: block_size / BM tiles a block) or, GROUPED, the
+    // block_size-row blocks nb0 .. nb0 + BM / block_size - 1, which share their children (the caller verifies: an
+    // HCLT's 32-node blocks of a variable) -- one exponential tile serves them all
+    const bool grouped = block_size < BM;
+    const int mtiles = grouped ? 1 : block_size / BM;
     const int pid_b = blockIdx.x, pid_m = blockIdx.y, sp = blockIdx.z;
-    const int nblock = pid_m / mtiles, tile_id = pid_m % mtiles;
+    const int nb0 = grouped ? pid_m * (BM / block_size) : pid_m / mtiles;
+    const int row_off = grouped ? 0 : (pid_m % mtiles) * BM;            // the tile's first row in its block
     const int b0 = pid_b * BN;
-    const long off_nid = nids[nblock];
     const int k0 = (int)((long)sp * knt_all / split), k1 = (int)((long)(sp + 1) * knt_all / split);
     const int knt = k1 - k0;
-    const long eb = ebase[nblock] + (long)k0 * BK;                                   // the range's first child
-    const long pbr = pbase[nblock] + (long)k0 * BK * block_size + (long)tile_id * BM; // its first parameter (this node tile)
+    const long eb = ebase[nb0] + (long)k0 * BK;                                      // the range's first child
+    const long pb_base = pbase[nb0] + (long)k0 * BK * block_size;                   // its first parameter (block nb0)
     const int tid = threadIdx.x;
+    // tile row r -> its parameter offset from pb_base at edge 0 (the caller checks it fits an int), and its node
+    auto row_delta = [&](int r) -> int {
+        return grouped ? (int)(pbase[nb0 + r / block_size] - pbase[nb0]) + r % block_size : row_off + r;
+    };
+    auto row_node = [&](int r) -> long {
+        return grouped ? nids[nb0 + r / block_size] + r % block_size : nids[nb0] + row_off + r;
+    };
 
     // smem: A (BM, BK) MN-major swizzled (64 consecutive m of one k per 128-byte row; 32 for 32-row tiles); B (BN, BK)
     // K-major (64 consecutive k of one column per 128-byte row); then the range maxima per column and the producer
@@ -155,13 +168,21 @@ __global__ void __launch_bounds__((WM * WN + PW) * 32) sbmma_kernel(
         constexpr int PA4 = BF16 ? 1 : (BM * BK) / 4 / NP;
         static_assert(BF16 || (BM * BK) / 4 % NP == 0, "fp32 params float4s per producer thread");
         float4 ra[PA4];
+        constexpr int PA = BF16 ? (BM * BK) / 8 / NP : 1;
+        static_assert(!BF16 || (BM * BK) / 8 % NP == 0, "params chunks per producer thread");
+        int rd[BF16 ? PA : PA4];                                         // each chunk's row offset (`row_delta`), once
+        CUTE_UNROLL
+        for (int q = 0; q < (BF16 ? PA : PA4); q++) {
+            const int i = ptid + q * NP;
+            rd[q] = row_delta(BF16 ? (i % (BM / 8)) * 8 : (i % (BM / 4)) * 4);
+        }
         auto load_fp32 = [&](int t) {
             if constexpr (!BF16) {
-                const TP* pc = params + pbr + (long)t * BK * block_size;
+                const TP* pc = params + pb_base + (long)t * BK * block_size;
                 CUTE_UNROLL
                 for (int q = 0; q < PA4; q++) {
-                    const int i = ptid + q * NP, e = i / (BM / 4), mm = (i % (BM / 4)) * 4;
-                    ra[q] = *(const float4*)&pc[(long)e * block_size + mm];
+                    const int i = ptid + q * NP, e = i / (BM / 4);
+                    ra[q] = *(const float4*)&pc[(long)e * block_size + rd[q]];
                 }
             }
         };
@@ -185,13 +206,11 @@ __global__ void __launch_bounds__((WM * WN + PW) * 32) sbmma_kernel(
             Tensor sAt = make_tensor(make_smem_ptr(stA(s)), sAl);
             Tensor sBt = make_tensor(make_smem_ptr(stB(s)), sBl);
             if constexpr (BF16) {
-                const TP* pc = params + pbr + (long)t * BK * block_size;
-                constexpr int PA = (BM * BK) / 8 / NP;
-                static_assert((BM * BK) / 8 % NP == 0, "params chunks per producer thread");
+                const TP* pc = params + pb_base + (long)t * BK * block_size;
                 CUTE_UNROLL
                 for (int q = 0; q < PA; q++) {
                     const int i = ptid + q * NP, e = i / (BM / 8), mm = (i % (BM / 8)) * 8;
-                    cpa16(&sAt(mm, e), &pc[(long)e * block_size + mm]);
+                    cpa16(&sAt(mm, e), &pc[(long)e * block_size + rd[q]]);
                 }
             } else {
                 CUTE_UNROLL
@@ -265,10 +284,11 @@ __global__ void __launch_bounds__((WM * WN + PW) * 32) sbmma_kernel(
         const float Mf = sM[b];
         if (split == 1) {
             if (b0 + b < batch)
-                node_mars[(off_nid + (long)tile_id * BM + m) * (long)batch + b0 + b] =
+                node_mars[row_node(m) * (long)batch + b0 + b] =
                     (Mf == -INFINITY || tCrL(i) <= 0.f) ? -INFINITY : (logf(tCrL(i)) + Mf);
         } else {
-            const long idx = ((long)sp * rows_total + (long)nblock * block_size + (long)tile_id * BM + m) * bpad + b0 + b;
+            // (row = node block x block_size + node: a grouped tile's blocks are consecutive)
+            const long idx = ((long)sp * rows_total + (long)nb0 * block_size + row_off + m) * bpad + b0 + b;
             part[idx] = tCrL(i);
             part[(long)split * rows_total * bpad + idx] = Mf;
         }
@@ -317,7 +337,8 @@ static void launch_cfg(torch::Tensor node_mars, torch::Tensor element_mars, torc
         C10_CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
         if (dev < 64) attr_set[dev] = true;
     }
-    const int nb = (int)nids.size(0), total_m = nb * (block_size / BM);
+    const int nb = (int)nids.size(0);
+    const int total_m = block_size >= BM ? nb * (block_size / BM) : nb / (BM / block_size);   // (grouped: whole groups)
     const long rows_total = (long)nb * block_size;
     const int btiles = (batch + BN - 1) / BN, bpad = btiles * BN;
     cudaStream_t st = c10::cuda::getCurrentCUDAStream();
@@ -371,7 +392,9 @@ void smallbatch_forward_sum_mma(torch::Tensor node_mars, torch::Tensor element_m
     auto run = [&](auto tag) {
         using TP = decltype(tag);
         switch (cfg) {
-#define SBMMA_CASE(ID, BM_, BN_, WM_, WN_, PW_, ST_) case ID: TORCH_CHECK(bs % BM_ == 0, "smallbatch_forward_sum_mma: block_size % BM"); \
+#define SBMMA_CASE(ID, BM_, BN_, WM_, WN_, PW_, ST_) case ID: \
+            TORCH_CHECK(bs % BM_ == 0 || (bs % 8 == 0 && BM_ % bs == 0 && nids.size(0) % (BM_ / bs) == 0), \
+                        "smallbatch_forward_sum_mma: block_size % BM, or BM % block_size over whole groups of blocks"); \
             launch_cfg<BM_, BN_, WM_, WN_, PW_, ST_, TP>(node_mars, element_mars, params, nids, ebase, pbase, scratch, b, bs, knt, split); break;
             SBMMA_CONFIGS(SBMMA_CASE)
 #undef SBMMA_CASE
