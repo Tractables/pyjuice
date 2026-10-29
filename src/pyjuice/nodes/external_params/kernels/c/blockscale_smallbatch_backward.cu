@@ -57,7 +57,7 @@ __global__ void bs_sb_ele_kernel(float* __restrict__ element_flows, const float*
                                  const TP* __restrict__ params, const float* __restrict__ ext,
                                  const long* __restrict__ chids, const long* __restrict__ ebase,
                                  const long* __restrict__ pbase, const long* __restrict__ gate,
-                                 float* __restrict__ grad_ext,
+                                 float* __restrict__ grad_ext, float* __restrict__ gpart,
                                  int batch, int block_size, int cs_block_size, int tk, int ktiles,
                                  int gate_sh, int gstride, long ext_base) {
     const int lane = threadIdx.x;                       // 0..31  -> a 1/32 stride of the edges
@@ -111,9 +111,13 @@ __global__ void bs_sb_ele_kernel(float* __restrict__ element_flows, const float*
     #pragma unroll
     for (int b = 0; b < BMAX; b++) { mj[b] = -INFINITY; lj[b] = 0.f; }
 
-    // sum over {parents in the block} x {children in this gate} of the edge flows, atomically into the gate's row.
-    // Children of one gate live in DIFFERENT warps here (one warp per child), so the sum across a gate is the atomic;
-    // the sum across parents is the warp reduction.
+    // sum over {parents in the block} x {children in this gate} of the edge flows into the gate's row. Children of
+    // one gate live in DIFFERENT warps here (one warp per child), so the sum across parents is the warp reduction and
+    // the sum across a gate's children is either atomic (`gpart` null: run-to-run rounding differences) or, with
+    // `gpart`, DETERMINISTIC: each child stores its share of each parent block, [element block, child, parent block,
+    // sample], and `grad_reduce_kernel` sums a gate's children in order (the gradient the same from run to run, as the
+    // other gated kernels keep it).
+    const int nblk = tk * ktiles / block_size;                  // parent blocks (the host checks num_edges % block_size)
     auto flush_block = [&]() {
         if (WGRAD && cur_j >= 0) {
             #pragma unroll
@@ -124,9 +128,13 @@ __global__ void bs_sb_ele_kernel(float* __restrict__ element_flows, const float*
                 for (int off = 16; off > 0; off >>= 1)
                     lse_merge(m, l, __shfl_xor_sync(0xffffffff, m, off),
                                     __shfl_xor_sync(0xffffffff, l, off));
-                if (lane == 0 && gb >= 0 && m != -INFINITY)
-                    atomicAdd(grad_ext + (gb + ext_base + gidx) * (long)batch + b,
-                              l * __expf(m + emb[b]));
+                if (lane == 0) {
+                    const float v = (gb >= 0 && m != -INFINITY) ? l * __expf(m + emb[b]) : 0.f;
+                    if (gpart != nullptr)
+                        gpart[(((long)eb * cs_block_size + m_local) * nblk + cur_j) * batch + b] = v;
+                    else if (v != 0.f)
+                        atomicAdd(grad_ext + (gb + ext_base + gidx) * (long)batch + b, v);
+                }
                 mj[b] = -INFINITY; lj[b] = 0.f;
             }
         }
@@ -185,11 +193,34 @@ __global__ void bs_sb_ele_kernel(float* __restrict__ element_flows, const float*
     }
 }
 
+// The gate gradient from the children's per-parent-block shares (`gpart`): a thread per (element block, parent block,
+// gate, sample) sums its gate's children IN ORDER and adds the sum into the gate's row (an atomic add, but one writer a
+// row unless two edge blocks share a gate's storage -- tied gates -- which every gated kernel adds atomically).
+__global__ void grad_reduce_kernel(float* __restrict__ grad_ext, const float* __restrict__ gpart,
+                                   const long* __restrict__ gate, int neb, int cs, int nblk, int gate_cbs,
+                                   int batch, long ext_base) {
+    const int ngates = cs / gate_cbs;
+    const long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (long)neb * nblk * ngates * batch) return;
+    const int b = (int)(i % batch);
+    long r = i / batch;
+    const int g = (int)(r % ngates); r /= ngates;
+    const int j = (int)(r % nblk);
+    const int eb = (int)(r / nblk);
+    const long gb = gate[(long)eb * nblk + j];
+    if (gb < 0) return;
+    float s = 0.f;
+    const float* p = gpart + (((long)eb * cs + (long)g * gate_cbs) * nblk + j) * batch + b;
+#pragma unroll 8
+    for (int m = 0; m < gate_cbs; m++) s += p[(long)m * nblk * batch];   // (in order; unrolled so the loads overlap)
+    if (s != 0.f) atomicAdd(grad_ext + (gb + ext_base + g) * (long)batch + b, s);
+}
+
 template <int WARPS, int BMAX, typename TP>
 static void launch_sb_ele(torch::Tensor element_flows, torch::Tensor element_mars, torch::Tensor node_flows,
                           torch::Tensor node_mars, torch::Tensor params, torch::Tensor ext,
                           torch::Tensor chids, torch::Tensor ebase, torch::Tensor pbase, torch::Tensor gate,
-                          torch::Tensor grad_ext,
+                          torch::Tensor grad_ext, torch::Tensor gpart,
                           int batch, int block_size, int cs_block_size, int tk, int ktiles,
                           int gate_sh, long ext_base) {
     const long neb = chids.size(0);
@@ -204,32 +235,42 @@ static void launch_sb_ele(torch::Tensor element_flows, torch::Tensor element_mar
             element_flows.data_ptr<float>(), element_mars.data_ptr<float>(), node_flows.data_ptr<float>(),
             node_mars.data_ptr<float>(), param_ptr<TP>(params), ext.data_ptr<float>(),
             chids.data_ptr<long>(), ebase.data_ptr<long>(), pbase.data_ptr<long>(), gate.data_ptr<long>(),
-            grad_ext.data_ptr<float>(),
+            grad_ext.data_ptr<float>(), gpart.numel() ? gpart.data_ptr<float>() : nullptr,
             batch, block_size, cs_block_size, tk, ktiles, gate_sh, (int)gate.size(1), ext_base);
     else
         bs_sb_ele_kernel<WARPS, BMAX, false, TP><<<grid, blk, 0, c10::cuda::getCurrentCUDAStream()>>>(
             element_flows.data_ptr<float>(), element_mars.data_ptr<float>(), node_flows.data_ptr<float>(),
             node_mars.data_ptr<float>(), param_ptr<TP>(params), ext.data_ptr<float>(),
             chids.data_ptr<long>(), ebase.data_ptr<long>(), pbase.data_ptr<long>(), gate.data_ptr<long>(),
-            nullptr,
+            nullptr, nullptr,
             batch, block_size, cs_block_size, tk, ktiles, gate_sh, (int)gate.size(1), ext_base);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
+    if (grad_ext.numel() > 0 && gpart.numel() > 0) {
+        const int nblk = tk * ktiles / block_size, gcb = 1 << gate_sh;
+        TORCH_CHECK(gpart.numel() >= neb * cs_block_size * (long)nblk * batch, "blockscale_sb_ele_backward: gpart too small");
+        TORCH_CHECK(gate.size(1) >= nblk, "blockscale_sb_ele_backward: the gate table's columns");
+        const long n = neb * (long)nblk * (cs_block_size / gcb) * batch;
+        grad_reduce_kernel<<<(unsigned)((n + 255) / 256), 256, 0, c10::cuda::getCurrentCUDAStream()>>>(
+            grad_ext.data_ptr<float>(), gpart.data_ptr<float>(), gate.data_ptr<long>(), (int)neb, cs_block_size, nblk,
+            gcb, batch, ext_base);
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+    }
 }
 
 #define BS_SB_ELE_DISPATCH_BMAX(WW)                                                                    \
     switch (bmax) {                                                                                     \
-        case 1:  launch_sb_ele<WW, 1 , TP>(element_flows, element_mars, node_flows, node_mars, params, ext, chids, ebase, pbase, gate, grad_ext, b, bs, cs, tk, kt, gsh, eb_); break; \
-        case 2:  launch_sb_ele<WW, 2 , TP>(element_flows, element_mars, node_flows, node_mars, params, ext, chids, ebase, pbase, gate, grad_ext, b, bs, cs, tk, kt, gsh, eb_); break; \
-        case 4:  launch_sb_ele<WW, 4 , TP>(element_flows, element_mars, node_flows, node_mars, params, ext, chids, ebase, pbase, gate, grad_ext, b, bs, cs, tk, kt, gsh, eb_); break; \
-        case 8:  launch_sb_ele<WW, 8 , TP>(element_flows, element_mars, node_flows, node_mars, params, ext, chids, ebase, pbase, gate, grad_ext, b, bs, cs, tk, kt, gsh, eb_); break; \
-        case 16: launch_sb_ele<WW, 16, TP>(element_flows, element_mars, node_flows, node_mars, params, ext, chids, ebase, pbase, gate, grad_ext, b, bs, cs, tk, kt, gsh, eb_); break; \
+        case 1:  launch_sb_ele<WW, 1 , TP>(element_flows, element_mars, node_flows, node_mars, params, ext, chids, ebase, pbase, gate, grad_ext, gpart, b, bs, cs, tk, kt, gsh, eb_); break; \
+        case 2:  launch_sb_ele<WW, 2 , TP>(element_flows, element_mars, node_flows, node_mars, params, ext, chids, ebase, pbase, gate, grad_ext, gpart, b, bs, cs, tk, kt, gsh, eb_); break; \
+        case 4:  launch_sb_ele<WW, 4 , TP>(element_flows, element_mars, node_flows, node_mars, params, ext, chids, ebase, pbase, gate, grad_ext, gpart, b, bs, cs, tk, kt, gsh, eb_); break; \
+        case 8:  launch_sb_ele<WW, 8 , TP>(element_flows, element_mars, node_flows, node_mars, params, ext, chids, ebase, pbase, gate, grad_ext, gpart, b, bs, cs, tk, kt, gsh, eb_); break; \
+        case 16: launch_sb_ele<WW, 16, TP>(element_flows, element_mars, node_flows, node_mars, params, ext, chids, ebase, pbase, gate, grad_ext, gpart, b, bs, cs, tk, kt, gsh, eb_); break; \
         default: TORCH_CHECK(false, "blockscale_sb_ele_backward: invalid batch ", b);                   \
     }
 
 void blockscale_sb_ele_backward(torch::Tensor element_flows, torch::Tensor element_mars,
                                 torch::Tensor node_flows, torch::Tensor node_mars, torch::Tensor params,
                                 torch::Tensor ext, torch::Tensor chids, torch::Tensor ebase,
-                                torch::Tensor pbase, torch::Tensor gate, torch::Tensor grad_ext,
+                                torch::Tensor pbase, torch::Tensor gate, torch::Tensor grad_ext, torch::Tensor gpart,
                                 int64_t batch, int64_t block_size, int64_t cs_block_size,
                                 int64_t num_edges, int64_t tile_k,
                                 // `cfg` stays LAST: the Python autotuner substitutes the last argument when trying configs.

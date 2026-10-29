@@ -823,11 +823,21 @@ class _BackwardMixin:
                 (e0, p0), gsb, cfg = plan["sb"], plan["gate_sb"], kind[1]
 
                 tk_sb = ctx["TILE_SIZE_K"]
+                # The gradient's per-child shares ([element block, child, parent block, sample]): the kernel stores them
+                # and sums a gate's children in order, so equal backwards give equal gradients (its atomic add across
+                # the children did not). One buffer a plan, made at its first launch with a gradient.
+                gp_shape = chids.numel() * cbs * (ne // blk) * batch
 
                 def run(tgt, node_flows, node_mars, element_mars, params, ext, grad):
+                    if grad is None:
+                        gp = no_grad
+                    else:
+                        gp = plan.get("sb_gpart")
+                        if gp is None or gp.numel() < gp_shape or gp.device != grad.device:
+                            gp = plan["sb_gpart"] = torch.empty(gp_shape, device = grad.device)
                     sb_mod.blockscale_sb_ele_backward(
                         tgt, element_mars, node_flows, node_mars, params, ext, chids, e0, p0, gsb,
-                        no_grad if grad is None else grad, batch, blk, cbs, ne, tk_sb, gate_cbs, ext_base, cfg)
+                        no_grad if grad is None else grad, gp, batch, blk, cbs, ne, tk_sb, gate_cbs, ext_base, cfg)
 
             else:                                             # "triton"
                 from ..kernels.blockscale_backward import _bs_triton_ele_kernel
