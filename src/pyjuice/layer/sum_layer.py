@@ -2556,17 +2556,12 @@ class SumLayer(Layer, nn.Module):
                 and node_flows.is_cuda and cuda_kernels.smallbatch_ele_is_available()):
             sb = self._cached_bk_ele_sb.get(signature)
             if sb is None:
-                # Per-node-block first parent / first param (column 0 of the cached per-tile
-                # ebase/pbase) and verify GLOBAL contiguity: parents step by 1 across edges and by
-                # TILE_SIZE_K across tiles; per-child params are edge-contiguous (the pbase steps by
-                # TILE_SIZE_K across tiles). cuda_ok already checked within-tile contiguity; here we
-                # also require the tiles to chain globally.
+                # The kernel takes the cached per-tile ebase / pbase tables themselves (a tile's first parent and
+                # first parameter), so it needs only what `cuda_ok` already states: one parameter-block group per
+                # tile. (It used to take one base per node block and require the tiles to chain across the whole
+                # row, which no layer of more than one parent block satisfies -- it never ran on an HMM-4096.)
                 ele_ebase, ele_pbase, cuda_ok = self._cached_bk_ele_cuda[signature]
-                _art = torch.arange(K_NUM_TILES, device = ele_ebase.device, dtype = torch.int64).view(1, -1)
-                sb_ok = bool(cuda_ok
-                             and torch.equal(ele_ebase, ele_ebase[:, :1] + _art * TILE_SIZE_K)
-                             and torch.equal(ele_pbase, ele_pbase[:, :1] + _art * TILE_SIZE_K))
-                sb = (ele_ebase[:, 0].contiguous(), ele_pbase[:, 0].contiguous(), sb_ok)
+                sb = (ele_ebase.contiguous(), ele_pbase.contiguous(), bool(cuda_ok))
                 self._cached_bk_ele_sb[signature] = sb
             sb_ebase, sb_pbase, sb_ok = sb
             if sb_ok:
@@ -2575,7 +2570,7 @@ class SumLayer(Layer, nn.Module):
                 def _cuda_ele_sb(tgt, c, t):
                     cuda_kernels.smallbatch_ele_backward_sum(
                         tgt, t["element_mars"], t["node_flows"], t["node_mars"], t["params"], chids, sb_ebase,
-                        sb_pbase, batch_size, self.block_size, cs_block_size, num_edges, c)
+                        sb_pbase, batch_size, self.block_size, cs_block_size, num_edges, TILE_SIZE_K, c)
 
                 # Compare against the Triton launch that would actually run on fall-through (the
                 # tuned config and the kernel `ele_kernel` selects), not a hard-coded csmm2 one.
@@ -2610,7 +2605,7 @@ class SumLayer(Layer, nn.Module):
                             cuda_kernels.smallbatch_ele_backward_sum(
                                 element_flows, element_mars, node_flows, node_mars, params, chids[a:b],
                                 sb_ebase[a:b], sb_pbase[a:b], batch_size, self.block_size, cs_block_size,
-                                num_edges, choice[1])
+                                num_edges, TILE_SIZE_K, choice[1])
                     return None
                 # choice == ("triton", -1): fall through to the Triton launch below
 

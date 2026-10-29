@@ -690,17 +690,18 @@ class _BackwardMixin:
                         plan["eles"] = tables
                         kinds.append(("eles", code))
 
+            # The small-batch fork takes the per-tile tables themselves (a tile's first parent and first parameter),
+            # so it needs only `ele_cuda_ok` (one parameter-block group per tile) and whole parent blocks for its
+            # gate rows. (It used to require the tiles to chain across the whole row, which no layer of more than one
+            # parent block satisfies -- it never ran on a gated HMM-4096.)
             if (sb_mod is not None and batch < 16 and ne % blk == 0 and ctx["ele_cuda_ok"]
-                    and pinc == 1):
-                art = torch.arange(knt, device = ebase.device, dtype = torch.int64).view(1, -1)
-                if (torch.equal(ebase, ebase[:, :1] + art * tk)
-                        and torch.equal(pbase, pbase[:, :1] + art * tk)):
-                    nblk = ne // blk
-                    starts = (ebase[:, :1]
-                              + torch.arange(nblk, device = ebase.device).view(1, -1) * blk)
-                    plan["gate_sb"] = self._gate_bw_table(layer, chids, starts)
-                    plan["sb"] = (ebase[:, 0].contiguous(), pbase[:, 0].contiguous())
-                    kinds += [("sb", c) for c in range(len(sb_mod.blockscale_sb_ele_configs()))]
+                    and pinc == 1 and ne == knt * tk):
+                nblk = ne // blk
+                jj = torch.arange(nblk, device = ebase.device, dtype = torch.int64) * blk
+                starts = ebase[:, jj // tk] + (jj % tk).view(1, -1)              # each parent block's first parent
+                plan["gate_sb"] = self._gate_bw_table(layer, chids, starts)
+                plan["sb"] = (ebase.contiguous(), pbase.contiguous())
+                kinds += [("sb", c) for c in range(len(sb_mod.blockscale_sb_ele_configs()))]
 
             if plan["gate_tile"] is not None:
                 kinds.append("triton")
@@ -821,10 +822,12 @@ class _BackwardMixin:
             elif isinstance(kind, tuple):                     # ("sb", cfg)
                 (e0, p0), gsb, cfg = plan["sb"], plan["gate_sb"], kind[1]
 
+                tk_sb = ctx["TILE_SIZE_K"]
+
                 def run(tgt, node_flows, node_mars, element_mars, params, ext, grad):
                     sb_mod.blockscale_sb_ele_backward(
                         tgt, element_mars, node_flows, node_mars, params, ext, chids, e0, p0, gsb,
-                        no_grad if grad is None else grad, batch, blk, cbs, ne, gate_cbs, ext_base, cfg)
+                        no_grad if grad is None else grad, batch, blk, cbs, ne, tk_sb, gate_cbs, ext_base, cfg)
 
             else:                                             # "triton"
                 from ..kernels.blockscale_backward import _bs_triton_ele_kernel

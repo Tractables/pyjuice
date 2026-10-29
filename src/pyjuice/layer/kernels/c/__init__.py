@@ -297,15 +297,16 @@ def smallbatch_ele_backward_sum(element_flows: torch.Tensor, element_mars: torch
                                 node_flows: torch.Tensor, node_mars: torch.Tensor, params: torch.Tensor,
                                 chids: torch.Tensor, ebase: torch.Tensor, pbase: torch.Tensor,
                                 batch_size: int, block_size: int, cs_block_size: int, num_edges: int,
-                                cfg: int = 0) -> None:
+                                tile_k: int, cfg: int = 0) -> None:
     """Small-batch block-sparse sum-layer element-flow backward (overwrites ``element_flows``) using
-    WARPS config ``cfg``. Caller must guarantee the dispatch conditions hold (see
-    ``smallbatch_ele_is_available`` + the small-batch gate in
-    ``sum_layer._backward_block_sparse_ele_flows``): contiguous parents + edge-contiguous params (the
-    verified global-contiguity layout), LL propagation, ``allow_modify_flows`` off."""
+    WARPS config ``cfg``. ``ebase`` / ``pbase`` are the layer's per-tile tables, ``[node blocks, num_edges //
+    tile_k]``: a tile's first parent node and first parameter (the CUDA ele kernels' operands). Caller must
+    guarantee the dispatch conditions hold (see ``smallbatch_ele_is_available`` + the small-batch gate in
+    ``sum_layer._backward_block_sparse_ele_flows``): one parameter-block group per tile (``ptr_inc_step == 1``), LL
+    propagation, ``allow_modify_flows`` off."""
     _sbele_module.smallbatch_ele_backward_sum(element_flows, element_mars, node_flows, node_mars, params,
                                               chids, ebase, pbase, int(batch_size), int(block_size),
-                                              int(cs_block_size), int(num_edges), int(cfg))
+                                              int(cs_block_size), int(num_edges), int(tile_k), int(cfg))
 
 
 _sbele_cfg_cache = None

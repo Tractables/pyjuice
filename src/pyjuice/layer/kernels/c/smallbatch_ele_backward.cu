@@ -49,7 +49,7 @@ __global__ void sb_ele_kernel(float* __restrict__ element_flows, const float* __
                               const float* __restrict__ node_flows, const float* __restrict__ node_mars,
                               const TP* __restrict__ params, const long* __restrict__ chids,
                               const long* __restrict__ ebase, const long* __restrict__ pbase,
-                              int batch, int block_size, int cs_block_size, int num_edges) {
+                              int batch, int block_size, int cs_block_size, int tk, int ktiles) {
     const int lane = threadIdx.x;                       // 0..31  -> a 1/32 stride of the edges
     const int w = threadIdx.y;                          // 0..WARPS-1  -> child within this block's tile
     const int tiles_per_eb = cs_block_size / WARPS;     // child-tiles per node-block
@@ -57,23 +57,31 @@ __global__ void sb_ele_kernel(float* __restrict__ element_flows, const float* __
     const int tile = blockIdx.x - eb * tiles_per_eb;    // child-tile within the node-block
     const int m_local = tile * WARPS + w;               // child offset within the node-block
 
-    const long eb0 = ebase[eb];                          // first parent node of this node-block
-    const long pb0 = pbase[eb] + (long)m_local * block_size;  // first param of this child's row
+    // The parents come in `ktiles` tiles of `tk`; each tile's first parent node and first parameter are a table
+    // entry (`[node-block, tile]`, the layer's compiled walk), because a child's parameters are contiguous WITHIN a
+    // tile only -- across parent blocks they jump. (An earlier version took one base per node-block and was gated
+    // on the tiles chaining, which no layer of more than one parent block satisfies.)
+    const long* ebt = ebase + (long)eb * ktiles;
+    const long* pbt = pbase + (long)eb * ktiles;
 
     float mm[BMAX], ll[BMAX];                            // per-batch running max / linear-sum
     #pragma unroll
     for (int b = 0; b < BMAX; b++) { mm[b] = -INFINITY; ll[b] = 0.f; }
 
-    for (int e = lane; e < num_edges; e += 32) {
-        const float wgt = ParamLoad<TP>::at(&params[pb0 + e]);   // epar[m_local, e]; coalesced across lanes
-        const float* nf = node_flows + (eb0 + e) * (long)batch;
-        const float* nm = node_mars + (eb0 + e) * (long)batch;
-        #pragma unroll
-        for (int b = 0; b < BMAX; b++) {
-            if (b >= batch) break;
-            float nmar = nm[b];
-            float term = (nmar == -INFINITY) ? nf[b] : (nf[b] - nmar);   // log_n_fdm[par, b]
-            lse_merge(mm[b], ll[b], term, wgt);
+    for (int t = 0; t < ktiles; t++) {
+        const long eb0 = ebt[t];                                  // the tile's first parent node
+        const long pb0 = pbt[t] + (long)m_local * block_size;    // the first param of this child's row in the tile
+        for (int e = lane; e < tk; e += 32) {
+            const float wgt = ParamLoad<TP>::at(&params[pb0 + e]);   // epar[m_local, e]; coalesced across lanes
+            const float* nf = node_flows + (eb0 + e) * (long)batch;
+            const float* nm = node_mars + (eb0 + e) * (long)batch;
+            #pragma unroll
+            for (int b = 0; b < BMAX; b++) {
+                if (b >= batch) break;
+                float nmar = nm[b];
+                float term = (nmar == -INFINITY) ? nf[b] : (nf[b] - nmar);   // log_n_fdm[par, b]
+                lse_merge(mm[b], ll[b], term, wgt);
+            }
         }
     }
 
@@ -97,7 +105,7 @@ template <int WARPS, int BMAX, typename TP>
 static void launch_ele(torch::Tensor element_flows, torch::Tensor element_mars, torch::Tensor node_flows,
                        torch::Tensor node_mars, torch::Tensor params, torch::Tensor chids,
                        torch::Tensor ebase, torch::Tensor pbase,
-                       int batch, int block_size, int cs_block_size, int num_edges) {
+                       int batch, int block_size, int cs_block_size, int tk, int ktiles) {
     const long neb = chids.size(0);
     dim3 grid((unsigned int)(neb * (cs_block_size / WARPS)));   // neb*tiles << 2^31 in practice
     dim3 blk(32, WARPS);
@@ -106,18 +114,18 @@ static void launch_ele(torch::Tensor element_flows, torch::Tensor element_mars, 
     sb_ele_kernel<WARPS, BMAX, TP><<<grid, blk, 0, c10::cuda::getCurrentCUDAStream()>>>(
         element_flows.data_ptr<float>(), element_mars.data_ptr<float>(), node_flows.data_ptr<float>(),
         node_mars.data_ptr<float>(), param_ptr<TP>(params), chids.data_ptr<long>(),
-        ebase.data_ptr<long>(), pbase.data_ptr<long>(), batch, block_size, cs_block_size, num_edges);
+        ebase.data_ptr<long>(), pbase.data_ptr<long>(), batch, block_size, cs_block_size, tk, ktiles);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
 // Dispatch on (WARPS from `cfg`) x (BMAX = next pow2 of batch, for register-tight state).
 #define SB_ELE_DISPATCH_BMAX(WW)                                                                       \
     switch (bmax) {                                                                                     \
-        case 1:  launch_ele<WW, 1, TP>(element_flows, element_mars, node_flows, node_mars, params, chids, ebase, pbase, b, bs, cs, ne); break; \
-        case 2:  launch_ele<WW, 2, TP>(element_flows, element_mars, node_flows, node_mars, params, chids, ebase, pbase, b, bs, cs, ne); break; \
-        case 4:  launch_ele<WW, 4, TP>(element_flows, element_mars, node_flows, node_mars, params, chids, ebase, pbase, b, bs, cs, ne); break; \
-        case 8:  launch_ele<WW, 8, TP>(element_flows, element_mars, node_flows, node_mars, params, chids, ebase, pbase, b, bs, cs, ne); break; \
-        case 16: launch_ele<WW, 16, TP>(element_flows, element_mars, node_flows, node_mars, params, chids, ebase, pbase, b, bs, cs, ne); break; \
+        case 1:  launch_ele<WW, 1, TP>(element_flows, element_mars, node_flows, node_mars, params, chids, ebase, pbase, b, bs, cs, tk, kt); break; \
+        case 2:  launch_ele<WW, 2, TP>(element_flows, element_mars, node_flows, node_mars, params, chids, ebase, pbase, b, bs, cs, tk, kt); break; \
+        case 4:  launch_ele<WW, 4, TP>(element_flows, element_mars, node_flows, node_mars, params, chids, ebase, pbase, b, bs, cs, tk, kt); break; \
+        case 8:  launch_ele<WW, 8, TP>(element_flows, element_mars, node_flows, node_mars, params, chids, ebase, pbase, b, bs, cs, tk, kt); break; \
+        case 16: launch_ele<WW, 16, TP>(element_flows, element_mars, node_flows, node_mars, params, chids, ebase, pbase, b, bs, cs, tk, kt); break; \
         default: TORCH_CHECK(false, "smallbatch_ele_backward_sum: invalid batch ", b);                  \
     }
 
@@ -128,12 +136,17 @@ static void smallbatch_ele_backward_sum_t(torch::Tensor element_flows, torch::Te
                                           torch::Tensor node_flows, torch::Tensor node_mars, torch::Tensor params,
                                           torch::Tensor chids, torch::Tensor ebase, torch::Tensor pbase,
                                           int64_t batch, int64_t block_size, int64_t cs_block_size,
-                                          int64_t num_edges, int64_t cfg) {
-    int b = (int)batch, bs = (int)block_size, cs = (int)cs_block_size, ne = (int)num_edges;
+                                          int64_t num_edges, int64_t tile_k, int64_t cfg) {
+    int b = (int)batch, bs = (int)block_size, cs = (int)cs_block_size, ne = (int)num_edges, tk = (int)tile_k;
     int warps = (cfg == 0) ? 8 : (cfg == 1) ? 16 : (cfg == 2) ? 4 : -1;
     TORCH_CHECK(warps > 0, "smallbatch_ele_backward_sum: invalid cfg ", cfg);
     TORCH_CHECK(b >= 1 && b < 16, "smallbatch_ele_backward_sum: batch must be in [1, 16) (got ", b, ")");
     TORCH_CHECK(cs % warps == 0, "smallbatch_ele_backward_sum: cs_block_size must be a multiple of WARPS");
+    TORCH_CHECK(tk > 0 && ne % tk == 0, "smallbatch_ele_backward_sum: num_edges (", ne, ") must be whole tiles of ", tk);
+    const int kt = ne / tk;
+    TORCH_CHECK(ebase.dim() == 2 && ebase.size(0) == chids.size(0) && ebase.size(1) == kt && ebase.is_contiguous()
+                && pbase.sizes() == ebase.sizes() && pbase.is_contiguous(),
+                "smallbatch_ele_backward_sum: ebase / pbase must be contiguous [node blocks, ", kt, "] tables");
     int bmax = 1;
     while (bmax < b) bmax <<= 1;                          // next power of two >= batch
     // No silent default: an unknown cfg must not run zero kernels (a no-op launch can masquerade as
@@ -153,11 +166,11 @@ void smallbatch_ele_backward_sum(torch::Tensor element_flows, torch::Tensor elem
                                  torch::Tensor node_flows, torch::Tensor node_mars, torch::Tensor params,
                                  torch::Tensor chids, torch::Tensor ebase, torch::Tensor pbase,
                                  int64_t batch, int64_t block_size, int64_t cs_block_size,
-                                 int64_t num_edges, int64_t cfg) {
+                                 int64_t num_edges, int64_t tile_k, int64_t cfg) {
     if (params.scalar_type() == torch::kBFloat16)
-        smallbatch_ele_backward_sum_t<__nv_bfloat16>(element_flows, element_mars, node_flows, node_mars, params, chids, ebase, pbase, batch, block_size, cs_block_size, num_edges, cfg);
+        smallbatch_ele_backward_sum_t<__nv_bfloat16>(element_flows, element_mars, node_flows, node_mars, params, chids, ebase, pbase, batch, block_size, cs_block_size, num_edges, tile_k, cfg);
     else
-        smallbatch_ele_backward_sum_t<float>(element_flows, element_mars, node_flows, node_mars, params, chids, ebase, pbase, batch, block_size, cs_block_size, num_edges, cfg);
+        smallbatch_ele_backward_sum_t<float>(element_flows, element_mars, node_flows, node_mars, params, chids, ebase, pbase, batch, block_size, cs_block_size, num_edges, tile_k, cfg);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
