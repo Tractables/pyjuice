@@ -414,7 +414,8 @@ def smallbatch_ele_mma_arms(cs_block_size: int, block_size: int, batch_size: int
                             grouped: int = 1):
     """The tensor-core small-batch element backward's `code`s for a partition shape: `smallbatch_fw_mma_arms`' rule over
     the element blocks (child tiles dividing the child block size, or -- ``grouped``: aligned runs of that many element
-    blocks share their parents -- spanning at most that many whole blocks). Empty where it does not apply."""
+    blocks share their parents -- spanning at most that many whole blocks), each under the range's stabilizer and
+    under each tile's own (code bit 7). Empty where it does not apply."""
     if (num_edges % 64 or cs_block_size % 8 or block_size % 8 or batch_size >= 64
             or not smallbatch_ele_mma_is_available()):
         return []
@@ -437,14 +438,14 @@ def smallbatch_ele_mma_arms(cs_block_size: int, block_size: int, batch_size: int
         for s in (1, 2, 4, 8):
             if s > knt or (s > 1 and tiles * s > 4 * sms):
                 continue
-            arms.append(c | (s << 8))
+            arms += [c | (s << 8), c | 128 | (s << 8)]           # (bit 7: each tile under its own stabilizer)
     _sbmmae_arms_cache[key] = arms
     return arms
 
 
 def smallbatch_ele_mma_rows(code: int, cs_block_size: int) -> int:
     """The element blocks one tile of an arm spans (1 unless grouped)."""
-    bm = smallbatch_ele_mma_configs()[code & 255][0]
+    bm = smallbatch_ele_mma_configs()[code & 127][0]
     return bm // cs_block_size if cs_block_size < bm else 1
 
 
@@ -453,7 +454,7 @@ def smallbatch_ele_mma_scratch(code: int, batch_size: int, cs_block_size: int, n
     split = code >> 8
     if split <= 1:
         return 0
-    bn = smallbatch_ele_mma_configs()[code & 255][1]
+    bn = smallbatch_ele_mma_configs()[code & 127][1]
     return 2 * split * n_blocks * cs_block_size * (((batch_size + bn - 1) // bn) * bn)
 
 

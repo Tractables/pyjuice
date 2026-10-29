@@ -9,12 +9,17 @@
 // params[pbase[eb, t * PBT + h] + m * BSK + e'] for the parents e = h * 64 / PBT + e' (BSK the parents' block size; a
 // tile over PBT = 1 parameter block, or 2 of 32).
 //
-// The block's PW producer warps first take each column's maximum of lf over the range (whole rows a thread), then
-// stage per tile the bf16 parameter tile, K-MAJOR (cp.async; fp32 parameters through registers, rounded to bf16) and
-// the bf16 exponentials exp(lf - M), K-major (8 consecutive parents of one column per 16-byte store); the WM x WN MMA
-// warps accumulate in fp32. A range writes its partial (L, M); `merge_kernel` (a programmatic dependent launch: its
-// launch overlaps the primary's tail) combines the ranges and adds element_mars; one range writes the flows itself.
-// Columns past the batch are computed on -inf (terms 0) and never stored.
+// The block's PW producer warps stage per tile the bf16 parameter tile, K-MAJOR (cp.async; fp32 parameters through
+// registers) and the exponentials exp(lf - M), K-major (8 consecutive parents of one column per 16-byte store); the
+// WM x WN MMA warps accumulate in fp32. M, by the arm (`PT`, code bit 7):
+//   * the range's column maximum of lf, taken first by the producers (whole rows a thread) -- one accumulator;
+//   * each tile's own column maximum (a 3-step shuffle across the 8 lanes holding a column; no pass ahead), the tile's
+//     product folded into a running (L, R) per (child, column) by an online log-sum-exp -- MEASURED on an HMM-4096
+//     layer (block 1024) 16-27% faster from batch 32 (fp32 B48 104 -> 76 us), 4-7% below; on an HCLT's short rows
+//     (1024 parents) the prologue's kernel is as fast or ~2 us faster, so both are arms and the pick measures.
+// A range writes its partial (L, M); `merge_kernel` (a programmatic dependent launch: its launch overlaps the
+// primary's tail) combines the ranges and adds element_mars; one range writes the flows itself. Columns past the batch
+// are computed on -inf (terms 0) and never stored.
 //
 // Why: the small-batch CUDA element kernel (smallbatch_ele_backward.cu) gives a warp to each child and re-reads every
 // parent's flows per child -- fine at a sample or two, not past (HMM-4096 layer: batch 1 37 us, 4 70, 8 189); Triton's
@@ -65,7 +70,7 @@ extern __shared__ char smem_raw[];
 // the stages a config runs: one fewer (two at the least) for the split fp32 operands, whose stage is twice the bytes
 template <int ST, bool SPL> struct EleStages { static constexpr int value = SPL ? (ST >= 4 ? ST - 1 : 2) : ST; };
 
-template <int BM, int BN, int WM, int WN, int PW, int ST_, int PBT, typename TP>
+template <int BM, int BN, int WM, int WN, int PW, int ST_, int PBT, bool PT, typename TP>
 __global__ void __launch_bounds__((WM * WN + PW) * 32) sbmma_ele_kernel(
         float* __restrict__ eflows, const float* __restrict__ emars, const float* __restrict__ nflows,
         const float* __restrict__ nmars, const TP* __restrict__ params, const long* __restrict__ chids,
@@ -106,13 +111,14 @@ __global__ void __launch_bounds__((WM * WN + PW) * 32) sbmma_ele_kernel(
     auto stB = [&](int s) { return (bfloat16_t*)(smem_raw + s * STAGE + BM * BK * 2); };
     auto stA2 = [&](int s) { return (bfloat16_t*)(smem_raw + s * STAGE + HALF); };                  // (SPL: the lo halves)
     auto stB2 = [&](int s) { return (bfloat16_t*)(smem_raw + s * STAGE + HALF + BM * BK * 2); };
-    float* sM = (float*)(smem_raw + ST * STAGE);                        // [BN] the range maxima
-    float* sMp = sM + BN;                                                // [PW x BN] the warps' partial maxima
+    float* sM = (float*)(smem_raw + ST * STAGE);                        // [BN] the range maxima (!PT)
+    float* sMp = sM + BN;                                                // [PW x BN] the warps' partial maxima (!PT)
+    auto stG = [&](int s) { return (float*)(smem_raw + ST * STAGE) + s * BN; };   // [BN] a stage's tile maxima (PT)
 
     if (tid >= NC) {
         // ---------------- producers ----------------
         const int ptid = tid - NC;
-        // the range maximum of lf per column: a thread takes whole parent ROWS (its BN columns, float4s where aligned)
+        if constexpr (!PT) // the range maximum of lf per column: a thread takes whole parent ROWS (its BN columns, float4s where aligned)
         {
             const int ncols = min(BN, batch - b0);
             float mx[BN];
@@ -167,9 +173,14 @@ __global__ void __launch_bounds__((WM * WN + PW) * 32) sbmma_ele_kernel(
         }
         constexpr int CH = (BN * BK) / 8;                                // exponential chunks (8 parents of a column)
         constexpr int PBC = (CH + NP - 1) / NP;
+        static_assert(!PT || (CH % 32 == 0 && NP % 8 == 0), "a column's 8 chunks in 8 adjacent lanes; whole warps past CH");
         float Mc[PBC];
         CUTE_UNROLL
-        for (int q = 0; q < PBC; q++) { const int i = ptid + q * NP; Mc[q] = (i < CH) ? sM[i / (BK / 8)] : 0.f; }
+        for (int q = 0; q < PBC; q++) {
+            const int i = ptid + q * NP;
+            Mc[q] = 0.f;
+            if constexpr (!PT) Mc[q] = (i < CH) ? sM[i / (BK / 8)] : 0.f;
+        }
         constexpr int PA = (BM * BK) / 8 / NP;                           // 8-parameter chunks per producer thread
         static_assert((BM * BK) / 8 % NP == 0, "params chunks per producer thread");
         // Each chunk (child row m, parents e8 .. e8 + 7) reads its parameter base from the table once a tile -- the
@@ -248,8 +259,17 @@ __global__ void __launch_bounds__((WM * WN + PW) * 32) sbmma_ele_kernel(
             CUTE_UNROLL
             for (int q = 0; q < PBC; q++) {
                 const int i = ptid + q * NP, c = i / (BK / 8), e8 = (i % (BK / 8)) * 8;
-                if (i >= CH) continue;
-                const float M = Mc[q];
+                if (i >= CH) continue;                                   // (PT: whole warps, CH a multiple of 32)
+                float M = Mc[q];
+                if constexpr (PT) {                                      // the tile's column maximum: 8 adjacent lanes
+                    M = xv[q][0];
+                    CUTE_UNROLL
+                    for (int j = 1; j < 8; j++) M = fmaxf(M, xv[q][j]);
+                    M = fmaxf(M, __shfl_xor_sync(0xffffffffu, M, 1));
+                    M = fmaxf(M, __shfl_xor_sync(0xffffffffu, M, 2));
+                    M = fmaxf(M, __shfl_xor_sync(0xffffffffu, M, 4));
+                    if ((i % (BK / 8)) == 0) stG(s)[c] = M;
+                }
                 __align__(16) bfloat16_t u[8], u2[8];
                 CUTE_UNROLL
                 for (int j = 0; j < 8; j++) {
@@ -295,7 +315,14 @@ __global__ void __launch_bounds__((WM * WN + PW) * 32) sbmma_ele_kernel(
     Tensor cC = make_identity_tensor(Shape<Int<BM>, Int<BN>>{});
     Tensor tCcC = thr.partition_C(cC);
     Tensor tCrL = thr.partition_fragment_C(cC);
-    clear(tCrL);
+    Tensor tCrS = thr.partition_fragment_C(cC);                          // (PT: a tile's product)
+    Tensor tCrR = thr.partition_fragment_C(cC);                          // (PT: the running stabilizer)
+    constexpr int NE = decltype(size(tCrL))::value;
+    float Gv[PT ? NE : 1];
+    CUTE_UNROLL
+    for (int i = 0; i < NE; i++) { tCrL(i) = 0.f; tCrR(i) = -INFINITY; }
+    // !PT accumulates straight into L under the range's stabilizer; PT into S, folded in after each tile
+    auto& acc = PT ? tCrS : tCrL;
     for (int kt = 0; kt < knt; kt++) {
         const int s = kt % ST;
         bar_sync(1 + s, NTH);
@@ -303,21 +330,35 @@ __global__ void __launch_bounds__((WM * WN + PW) * 32) sbmma_ele_kernel(
         Tensor sBt = make_tensor(make_smem_ptr(stB(s)), sBl);
         copy(s2rA, s2rA.get_thread_slice(tid).partition_S(sAt), tXrA);
         copy(s2rB, s2rB.get_thread_slice(tid).partition_S(sBt), tXrB);
+        if constexpr (PT) clear(tCrS);
         if constexpr (SPL) {
             Tensor sAt2 = make_tensor(make_smem_ptr(stA2(s)), sAl);
             Tensor sBt2 = make_tensor(make_smem_ptr(stB2(s)), sBl);
             copy(s2rA, s2rA.get_thread_slice(tid).partition_S(sAt2), tXrA2);
             copy(s2rB, s2rB.get_thread_slice(tid).partition_S(sBt2), tXrB2);
-            cute::gemm(mma, tCrA2, tCrB, tCrL);                          // the small terms first: lo.hi, hi.lo, hi.hi
-            cute::gemm(mma, tCrA, tCrB2, tCrL);
+            cute::gemm(mma, tCrA2, tCrB, acc);                           // the small terms first: lo.hi, hi.lo, hi.hi
+            cute::gemm(mma, tCrA, tCrB2, acc);
         }
-        cute::gemm(mma, tCrA, tCrB, tCrL);                               // L[m, b] += sum_e params[m, e] exp(lf[e, b] - M[b])
+        if constexpr (PT) {
+            CUTE_UNROLL
+            for (int i = 0; i < NE; i++) Gv[i] = stG(s)[get<1>(tCcC(i))];
+        }
+        cute::gemm(mma, tCrA, tCrB, acc);                                // += sum_e params[m, e] exp(lf[e, b] - M[b])
         if (kt + ST < knt) bar_arrive(1 + ST + s, NTH);
+        if constexpr (PT) {
+            CUTE_UNROLL
+            for (int i = 0; i < NE; i++) {                               // into the running (L, R): online log-sum-exp
+                const float G = Gv[i], S = tCrS(i);
+                if (G == -INFINITY) continue;
+                if (G > tCrR(i)) { tCrL(i) = fmaf(tCrL(i), __expf(tCrR(i) - G), S); tCrR(i) = G; }
+                else tCrL(i) = fmaf(S, __expf(G - tCrR(i)), tCrL(i));
+            }
+        }
     }
     CUTE_UNROLL
     for (int i = 0; i < size(tCrL); i++) {
         const int m = get<0>(tCcC(i)), b = get<1>(tCcC(i));
-        const float Mf = sM[b];
+        const float Mf = PT ? tCrR(i) : sM[b];
         if (split == 1) {
             if (b0 + b < batch) {
                 const long off = row_ele(m) * (long)batch + b0 + b;
@@ -360,15 +401,16 @@ __global__ void ele_merge_kernel(float* __restrict__ eflows, const float* __rest
     eflows[off] = r;
 }
 
-template <int BM, int BN, int WM, int WN, int PW, int ST, int PBT, typename TP>
+template <int BM, int BN, int WM, int WN, int PW, int ST, int PBT, bool PT, typename TP>
 static void launch_cfg(torch::Tensor eflows, torch::Tensor emars, torch::Tensor nflows, torch::Tensor nmars,
                        torch::Tensor params, torch::Tensor chids, torch::Tensor ebase, torch::Tensor pbase,
                        torch::Tensor scratch, int batch, int bsk, int cs, int knt, int split) {
     constexpr int NTH = (WM * WN + PW) * 32;
     constexpr bool SPL = !std::is_same<TP, __nv_bfloat16>::value;
-    constexpr int smem = EleStages<ST, SPL>::value * (BM * BK * 2 + BN * BK * 2) * (SPL ? 2 : 1) + (BN + PW * BN) * 4;
+    constexpr int STE = EleStages<ST, SPL>::value;
+    constexpr int smem = STE * (BM * BK * 2 + BN * BK * 2) * (SPL ? 2 : 1) + (PT ? STE * BN : BN + PW * BN) * 4;
     static_assert(smem <= 99 * 1024, "sm_120's 99 KB of dynamic shared memory");
-    auto kernel = sbmma_ele_kernel<BM, BN, WM, WN, PW, ST, PBT, TP>;
+    auto kernel = sbmma_ele_kernel<BM, BN, WM, WN, PW, ST, PBT, PT, TP>;
     static bool attr_set[64] = {};
     int dev = 0;
     C10_CUDA_CHECK(cudaGetDevice(&dev));
@@ -413,14 +455,16 @@ static void launch_cfg(torch::Tensor eflows, torch::Tensor emars, torch::Tensor 
     X(0, 128, 16, 4, 1, 4, 3) X(1, 64, 16, 2, 1, 4, 4) X(2, 128, 32, 4, 1, 4, 3) X(3, 64, 32, 2, 1, 4, 4) \
     X(4, 128, 16, 4, 1, 8, 3) X(5, 128, 64, 4, 2, 4, 3) X(6, 64, 64, 2, 2, 4, 4)
 
-// `cfg`: the tile config's id in the low byte, the split-K range count above it. `ebase` / `pbase`: int64
+// `cfg`: the tile config's id in bits 0-6, bit 7 each tile under its own stabilizer (`PT`), the split-K range count
+// above. `ebase` / `pbase`: int64
 // [element blocks, num_edges / 64]. `scratch`: a float buffer for a split's partials, reused when large enough.
 void smallbatch_ele_backward_sum_mma(torch::Tensor eflows, torch::Tensor emars, torch::Tensor nflows, torch::Tensor nmars,
                                      torch::Tensor params, torch::Tensor chids, torch::Tensor ebase, torch::Tensor pbase,
                                      torch::Tensor scratch, int64_t batch, int64_t block_size, int64_t cs_block_size,
                                      int64_t num_edges, int64_t pbt, int64_t cfg) {
     const int split = cfg >> 8 ? (int)(cfg >> 8) : 1;
-    cfg &= 255;
+    const bool pt = (cfg & 128) != 0;                                    // bit 7: each tile under its own stabilizer
+    cfg &= 127;
     TORCH_CHECK(num_edges % BK == 0, "smallbatch_ele_backward_sum_mma: num_edges must be whole tiles of ", BK);
     const int knt = (int)(num_edges / BK);
     TORCH_CHECK(split >= 1 && split <= MAX_SPLIT && split <= knt, "smallbatch_ele_backward_sum_mma: split 1 .. ",
@@ -440,10 +484,14 @@ void smallbatch_ele_backward_sum_mma(torch::Tensor eflows, torch::Tensor emars, 
 #define SBMMA_ELE_CASE(ID, BM_, BN_, WM_, WN_, PW_, ST_) case ID: \
             TORCH_CHECK(cs % BM_ == 0 || (BM_ % cs == 0 && chids.size(0) % (BM_ / cs) == 0), \
                         "smallbatch_ele_backward_sum_mma: cs_block_size % BM, or BM % cs_block_size over whole groups"); \
-            if (pbt == 2) launch_cfg<BM_, BN_, WM_, WN_, PW_, ST_, 2, TP>(eflows, emars, nflows, nmars, params, chids, ebase, \
-                                                                          pbase, scratch, b, bsk, cs, knt, split); \
-            else launch_cfg<BM_, BN_, WM_, WN_, PW_, ST_, 1, TP>(eflows, emars, nflows, nmars, params, chids, ebase, pbase, \
-                                                                 scratch, b, bsk, cs, knt, split); \
+            if (pbt == 2 && pt) launch_cfg<BM_, BN_, WM_, WN_, PW_, ST_, 2, true, TP>(eflows, emars, nflows, nmars, params, \
+                                                                       chids, ebase, pbase, scratch, b, bsk, cs, knt, split); \
+            else if (pbt == 2) launch_cfg<BM_, BN_, WM_, WN_, PW_, ST_, 2, false, TP>(eflows, emars, nflows, nmars, params, \
+                                                                       chids, ebase, pbase, scratch, b, bsk, cs, knt, split); \
+            else if (pt) launch_cfg<BM_, BN_, WM_, WN_, PW_, ST_, 1, true, TP>(eflows, emars, nflows, nmars, params, chids, \
+                                                                       ebase, pbase, scratch, b, bsk, cs, knt, split); \
+            else launch_cfg<BM_, BN_, WM_, WN_, PW_, ST_, 1, false, TP>(eflows, emars, nflows, nmars, params, chids, ebase, \
+                                                                       pbase, scratch, b, bsk, cs, knt, split); \
             break;
             SBMMA_ELE_CONFIGS(SBMMA_ELE_CASE)
 #undef SBMMA_ELE_CASE
