@@ -239,6 +239,40 @@ def smallbatch_forward_sum(node_mars: torch.Tensor, element_mars: torch.Tensor, 
                                         int(batch_size), int(block_size), int(num_edges), int(cfg))
 
 
+_sbfwbt_module = None
+_sbfwbt_attempted = False
+_sbfwbt_cfg_cache = None
+
+
+def smallbatch_fw_bt_is_available() -> bool:
+    """Whether the batch-tiled small-batch CUDA forward (`smallbatch_forward_sum_bt.cu`: the parameters loaded once
+    per BT batch columns, for batch < 64) is usable (lazily JIT-compiles once). Plain CUDA, like the kernel above."""
+    global _sbfwbt_module, _sbfwbt_attempted
+    if not _sbfwbt_attempted:
+        _sbfwbt_attempted = True
+        _sbfwbt_module = _jit_plain("pyjuice_sum_forward_smallbatch_bt_cuda", "smallbatch_forward_sum_bt.cu")
+    return _sbfwbt_module is not None
+
+
+def smallbatch_forward_sum_bt(node_mars: torch.Tensor, element_mars: torch.Tensor, params: torch.Tensor,
+                              nids: torch.Tensor, ebase: torch.Tensor, pbase: torch.Tensor,
+                              batch_size: int, block_size: int, num_edges: int, cfg: int = 0) -> None:
+    """The batch-tiled small-batch forward (in-place into ``node_mars``) with config ``cfg`` (an index into
+    `smallbatch_fw_bt_configs`). The same dispatch conditions as `smallbatch_forward_sum`; bit-identical to it at the
+    same SPLIT, column by column."""
+    _sbfwbt_module.smallbatch_forward_sum_bt(node_mars, element_mars, params, nids, ebase, pbase,
+                                             int(batch_size), int(block_size), int(num_edges), int(cfg))
+
+
+def smallbatch_fw_bt_configs():
+    """(SPLIT, BT) per config id (index = the ``cfg`` arg). Memoized (constant)."""
+    global _sbfwbt_cfg_cache
+    if _sbfwbt_cfg_cache is None:
+        _sbfwbt_cfg_cache = [(int(c) // 100, int(c) % 100) for c in _sbfwbt_module.smallbatch_fw_bt_configs()] \
+            if smallbatch_fw_bt_is_available() else []
+    return _sbfwbt_cfg_cache
+
+
 _sbfw_cfg_cache = None
 def smallbatch_fw_configs():
     """List of SPLIT values per config id (index = the ``cfg`` arg). Memoized (constant) -- the value

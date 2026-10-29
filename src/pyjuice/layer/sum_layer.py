@@ -1451,37 +1451,41 @@ class SumLayer(Layer, nn.Module):
             sb_ebase, sb_pbase, sb_ok = sb
             if sb_ok:
                 n_sb_cfg = len(cuda_kernels.smallbatch_fw_configs())
+                # The batch-tiled copy (`smallbatch_forward_sum_bt.cu`): the parameters loaded once per BT batch
+                # columns instead of once per sample. Its configs are arms of the same pick; it wins from a few
+                # samples on (HMM-4096 layer: batch 4 57 -> 27 us, 8 110 -> 33, 16 Triton 77 -> 49).
+                n_bt_cfg = len(cuda_kernels.smallbatch_fw_bt_configs()) if cuda_kernels.smallbatch_fw_bt_is_available() else 0
+                sb_launch = {"cuda": cuda_kernels.smallbatch_forward_sum, "cuda_bt": cuda_kernels.smallbatch_forward_sum_bt}
 
                 def _launch_sb(cfg):
-                    if cfg[0] == "cuda":
-                        cuda_kernels.smallbatch_forward_sum(
-                            node_mars, element_mars, params, nids, sb_ebase, sb_pbase,
-                            batch_size, self.block_size, num_edges, cfg[1])
+                    if cfg[0] in sb_launch:
+                        sb_launch[cfg[0]](node_mars, element_mars, params, nids, sb_ebase, sb_pbase,
+                                          batch_size, self.block_size, num_edges, cfg[1])
                     else:
                         _launch_fw(default_fw_cfg)
 
-                # Autotune the CUDA SPLIT configs against the Triton launch that would run on
-                # fall-through. Every candidate overwrites node_mars with the same result, so it stays
-                # correct. Keyed by SHAPE and cached process-wide (`autotune.pick`), not per layer: the
-                # two sides agree only to ~1.5e-6, so structurally identical layers that tuned on their
-                # own could each take a different one and disagree in the last bits -- a cross-model
-                # bit-identity test caught exactly that (2.4e-7) once this path reached batch 32.
+                # Autotune the CUDA configs against the Triton launch that would run on fall-through. Every
+                # candidate overwrites node_mars with the same result, so it stays correct. Keyed by SHAPE and
+                # cached process-wide (`autotune.pick`), not per layer: the arms agree only to ~1.5e-6, so
+                # structurally identical layers that tuned on their own could each take a different one and
+                # disagree in the last bits -- a cross-model bit-identity test caught exactly that (2.4e-7) once
+                # this path reached batch 32.
                 sb_key = ("sum_fw_smallbatch_cuda", num_edges) + fw_key
                 choice = autotune.cached(sb_key)
                 if choice is None:
                     choice = ("triton", -1) if runs is not None else autotune.pick(
-                        sb_key, [("triton", -1)] + [("cuda", c) for c in range(n_sb_cfg)], _launch_sb)
+                        sb_key, [("triton", -1)] + [("cuda", c) for c in range(n_sb_cfg)]
+                        + [("cuda_bt", c) for c in range(n_bt_cfg)], _launch_sb)
 
-                if choice[0] == "cuda":
+                if choice[0] in sb_launch:
+                    launch = sb_launch[choice[0]]
                     if runs is None:
-                        cuda_kernels.smallbatch_forward_sum(
-                            node_mars, element_mars, params, nids, sb_ebase, sb_pbase,
-                            batch_size, self.block_size, num_edges, choice[1])
+                        launch(node_mars, element_mars, params, nids, sb_ebase, sb_pbase,
+                               batch_size, self.block_size, num_edges, choice[1])
                     else:
                         for a, b in runs:
-                            cuda_kernels.smallbatch_forward_sum(
-                                node_mars, element_mars, params, nids[a:b], sb_ebase[a:b], sb_pbase[a:b],
-                                batch_size, self.block_size, num_edges, choice[1])
+                            launch(node_mars, element_mars, params, nids[a:b], sb_ebase[a:b], sb_pbase[a:b],
+                                   batch_size, self.block_size, num_edges, choice[1])
                     return None
                 # choice == ("triton", -1): fall through to the Triton launch below
 

@@ -58,7 +58,7 @@ class _ForwardMixin:
         All three are collected here and the choice is MEASURED, so where they overlap the faster one
         wins rather than the one that happened to be checked first.
         """
-        from ..kernels.c import get_cute_module, get_sb_module, get_prepass_module, get_stream_module
+        from ..kernels.c import get_cute_module, get_sb_module, get_sb_bt_module, get_prepass_module, get_stream_module
         import pyjuice.layer.kernels.c as ck
 
         # NEITHER CUDA extension is required any more. The CuTe forward needs nvcc, CUTLASS and
@@ -397,6 +397,12 @@ class _ForwardMixin:
         if sb_calls:
             for i in range(len(sb_mod.blockscale_sb_configs())):
                 cands.append((("sb", i), _runner(sb_mod.blockscale_sb_forward, sb_calls, i)))
+            # The batch-tiled copy of that kernel (the parameters loaded once per BT columns): the same launch tuples.
+            # It wins from a few samples on (gated HMM-4096: batch 4 54 us a layer -> ~25, batch 16 Triton's 174 -> ~50).
+            sbbt_mod = get_sb_bt_module()
+            if sbbt_mod is not None:
+                for i in range(len(sbbt_mod.blockscale_sb_bt_configs())):
+                    cands.append((("sbbt", i), _runner(sbbt_mod.blockscale_sb_forward_bt, sb_calls, i)))
 
         # The portable fork is a CANDIDATE only where the CuTe fork is ineligible -- which is where
         # the small-batch one otherwise takes shapes it was never meant for. Its grid is one block per
@@ -426,6 +432,8 @@ class _ForwardMixin:
             out_mod, fname, calls = pre_mod, "blockscale_forward_prepass", _with_cfg(calls, best_cfg)
         elif kind == "stream":
             out_mod, fname, calls = stream_mod, "blockscale_forward_stream", _with_cfg(calls, best_cfg)
+        elif kind == "sbbt":
+            out_mod, fname, calls = get_sb_bt_module(), "blockscale_sb_forward_bt", _with_cfg(sb_calls, best_cfg)
         else:
             out_mod, fname, calls = sb_mod, "blockscale_sb_forward", _with_cfg(sb_calls, best_cfg)
 

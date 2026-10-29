@@ -39,6 +39,42 @@ _sb_module = None
 _sb_attempted = False
 
 
+_sb_bt_module = None
+_sb_bt_attempted = False
+
+
+def get_sb_bt_module():
+    """The BATCH-TILED small-batch block-scale forward extension (`blockscale_smallbatch_forward_bt.cu`: the
+    parameters loaded once per BT batch columns), or None if unavailable (warns once). Plain CUDA, like
+    `get_sb_module`; its configs are arms of the same pick as that kernel's."""
+    global _sb_bt_module, _sb_bt_attempted
+
+    if _sb_bt_attempted:
+        return _sb_bt_module
+
+    _sb_bt_attempted = True
+
+    if not ENABLE_CUDA_KERNELS:
+        return None
+
+    flags = _compile_flags()
+    if flags is None:
+        return None
+
+    from pyjuice.utils.cuda_ext import jit_load
+    try:
+        _sb_bt_module = jit_load(
+            "pyjuice_blockscale_sb_bt_cuda",
+            sources = [os.path.join(_THIS_DIR, "blockscale_smallbatch_forward_bt.cu")],
+            extra_cuda_cflags = flags, verbose = False)
+    except Exception as e:
+        warnings.warn(
+            f"pyjuice CUDA kernel 'pyjuice_blockscale_sb_bt_cuda' failed to compile ({type(e).__name__}: {e}). "
+            "The per-sample small-batch kernel and Triton remain.", RuntimeWarning)
+        _sb_bt_module = None
+    return _sb_bt_module
+
+
 def get_sb_module():
     """The SMALL-BATCH block-scale extension, or None if unavailable (warns once).
 
