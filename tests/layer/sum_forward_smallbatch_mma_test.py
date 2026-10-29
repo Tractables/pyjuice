@@ -165,3 +165,72 @@ def test_dispatch_reaches_it_and_agrees_with_triton(batch, dtype, monkeypatch):
             assert ((got - ref).abs() / ref.abs().clamp_min(1.0)).max() < 2e-3, (batch, dtype, code)
     finally:
         SL.FORWARD_SUM_CUDA = saved
+
+
+class _Recorder:
+    """`autotune` recording the small-batch gate's keys and candidate lists (the real pick runs)."""
+
+    def __init__(self, real):
+        self.real, self.seen = real, []
+
+    def __getattr__(self, name):
+        return getattr(self.real, name)
+
+    def cached(self, key):
+        if isinstance(key, tuple) and key and key[0] == "sum_fw_smallbatch_cuda":
+            return None                                                  # always reach the pick
+        return self.real.cached(key)
+
+    def pick(self, key, candidates, bench, *args, **kwargs):
+        if isinstance(key, tuple) and key and key[0] == "sum_fw_smallbatch_cuda":
+            self.seen.append((key, list(candidates)))
+        return self.real.pick(key, candidates, bench, *args, **kwargs)
+
+
+@pytest.mark.skipif(not _available(), reason = "the tensor-core small-batch forward cannot build here")
+@pytest.mark.parametrize("precision", ["auto", "tf32", "fp32"])
+def test_offered_only_at_the_default_precision(precision, monkeypatch):
+    """The tensor-core arms round the operands to bf16: like the other tensor-core forwards they are candidates under
+    `precision = "auto"` only, and the choice is keyed on it ("tf32" and "auto" share the rest of the key here)."""
+    torch.manual_seed(0)
+    ns = juice.structures.HMM(seq_length = 4, num_latents = 256, num_emits = 16, homogeneous = True, block_size = 128)
+    ns.init_parameters(perturbation = 2.0)
+    pc = juice.compile(ns, verbose = False, precision = precision).to(DEV)
+    rec = _Recorder(autotune)
+    monkeypatch.setattr(SL, "autotune", rec)
+    pc(torch.randint(0, 16, (8, 4), device = DEV))
+    assert rec.seen, "the small-batch gate was not reached"
+    offered = any(c[0] == "cuda_mma" for _, cands in rec.seen for c in cands)
+    assert offered == (precision == "auto"), (precision, offered)
+    assert all(key[2] == (precision == "auto") for key, _ in rec.seen)
+
+
+@pytest.mark.skipif(not _available(), reason = "the tensor-core small-batch forward cannot build here")
+def test_not_offered_on_misaligned_bf16_parameters(monkeypatch):
+    """Its 16-byte parameter loads take 8 bf16: a layer whose parameter range starts at 4 mod 8 (compilation packs the
+    ranges without padding) must not take it -- and the forward agrees with the same values stored in fp32."""
+    from pyjuice.nodes import inputs, multiply, summate
+    import pyjuice.nodes.distributions as dists
+    torch.manual_seed(0)
+    C = dists.Categorical(num_cats = 16)
+    s0 = summate(inputs(0, num_node_blocks = 3, block_size = 1, dist = C), num_node_blocks = 16, block_size = 4)
+    s1 = summate(inputs(1, num_node_blocks = 3, block_size = 1, dist = C), num_node_blocks = 16, block_size = 4)
+    t2 = summate(inputs(2, num_node_blocks = 3, block_size = 1, dist = C), num_node_blocks = 1, block_size = 4)
+    u3 = summate(inputs(3, num_node_blocks = 2, block_size = 2, dist = C), num_node_blocks = 1, block_size = 4)
+    a = summate(multiply(s0, s1), num_node_blocks = 16, block_size = 4)
+    b = summate(multiply(t2, u3), num_node_blocks = 16, block_size = 4)
+    top = summate(multiply(a, b), num_node_blocks = 4, block_size = 64)
+    root = summate(multiply(top), num_node_blocks = 1, block_size = 1)
+    root.init_parameters(perturbation = 2.0)
+    pc16 = juice.compile(root, verbose = False, param_dtype = torch.bfloat16).to(DEV)
+    pc32 = juice.compile(root, verbose = False, param_dtype = torch.bfloat16).to(DEV).set_param_dtype(torch.float32)
+    assert top._param_range[0] % 8 == 4                                  # (the construction holds)
+    rec = _Recorder(autotune)
+    monkeypatch.setattr(SL, "autotune", rec)
+    x = torch.randint(0, 16, (8, 4), device = DEV)
+    ll16 = pc16(x)
+    keys64 = [(key, cands) for key, cands in rec.seen if key[4] == 64]   # (name, num_edges, mma_ok, kernel, block_size, ...)
+    assert keys64, "the 64-node layer did not reach the small-batch gate"
+    assert all(not key[2] and not any(c[0] == "cuda_mma" for c in cands) for key, cands in keys64)
+    ll32 = pc32(x)
+    assert torch.allclose(ll16, ll32, atol = 1e-3, rtol = 1e-4), float((ll16 - ll32).abs().max())

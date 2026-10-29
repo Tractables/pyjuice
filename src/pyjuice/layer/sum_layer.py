@@ -1494,10 +1494,16 @@ class SumLayer(Layer, nn.Module):
                 # structurally identical layers that tuned on their own could each take a different one and
                 # disagree in the last bits -- a cross-model bit-identity test caught exactly that (2.4e-7) once
                 # this path reached batch 32.
-                sb_key = ("sum_fw_smallbatch_cuda", num_edges) + fw_key
+                # The tensor-core arms round the operands to bf16: only under the circuit's default precision ("auto",
+                # as the other tensor-core forwards), and with the parameter bases aligned for its 16-byte loads. Part
+                # of the key: "tf32" and "auto" share the rest of it at these batches.
+                mma_ok = (precision == "auto"
+                          and self._cuda_param_loads_aligned(params, ("fw_sb_mma", signature), sb_pbase, self.block_size))
+                sb_key = ("sum_fw_smallbatch_cuda", num_edges, mma_ok) + fw_key
                 choice = autotune.cached(sb_key)
                 if choice is None:
-                    mma_arms = cuda_kernels.smallbatch_fw_mma_arms(self.block_size, batch_size, num_edges, nids.numel())
+                    mma_arms = (cuda_kernels.smallbatch_fw_mma_arms(self.block_size, batch_size, num_edges, nids.numel())
+                                if mma_ok and not torch.cuda.is_current_stream_capturing() else [])
                     choice = ("triton", -1) if runs is not None else autotune.pick(
                         sb_key, [("triton", -1)] + [("cuda", c) for c in range(n_sb_cfg)]
                         + [("cuda_bt", c) for c in range(n_bt_cfg)] + [("cuda_mma", c) for c in mma_arms], _launch_sb)
