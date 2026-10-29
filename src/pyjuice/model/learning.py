@@ -223,12 +223,15 @@ class _LearningMixin:
             self.forward(inputs, params)
             self.backward(inputs = inputs, compute_param_flows = True, flows_memory = 1.0)
 
-    def init_param_flows(self, flows_memory: float = 1.0, batch_size: Optional[int] = None):
+    def init_param_flows(self, flows_memory: float = 1.0, batch_size: Optional[int] = None, _zero_ranges = None):
         """
         Initialize parameter flows.
 
         :param flows_memory: the number that the current parameter flows (if any) will be multiplied by; equivalent to
         zeroling the flows if set to 0 :type flows_memory: float
+
+        `_zero_ranges` (the circuit's backward, at 0): the `[start, end)` slot ranges of the sum layers' flows to zero
+        -- the rest the pass's first writers store (`_plan_param_flow_stores`); None zeroes them all.
         """
 
         assert 0.0 <= flows_memory <= 1.0, f"`flows_memory` should be in [0.0, 1.0]"
@@ -244,7 +247,11 @@ class _LearningMixin:
         # HCLT-1024's sum and input-layer flows: 2.4 ms each scaled), and a NaN or inf left in the buffer is cleared
         # rather than kept
         if flows_memory == 0.0:
-            self.param_flows.zero_()
+            if _zero_ranges is None:
+                self.param_flows.zero_()
+            else:
+                for a, b in _zero_ranges:
+                    self.param_flows[a:b].zero_()
         elif flows_memory != 1.0:
             self.param_flows[:] *= flows_memory
 

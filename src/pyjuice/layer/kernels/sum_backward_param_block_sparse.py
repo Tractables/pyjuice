@@ -160,7 +160,8 @@ def _bk_triton_block_sparse_par_kernel_rmw(node_flows, node_mars, element_mars, 
                                            logspace_flows: tl.constexpr, TILE_SIZE_B: tl.constexpr, B_NUM_TILES: tl.constexpr,
                                            TILE_SIZE_K: tl.constexpr, TILE_SIZE_M: tl.constexpr, BLOCK_SIZE_M: tl.constexpr,
                                            TL_DOT: tl.constexpr, DOT_IEEE: tl.constexpr, propagation_alg_id: tl.constexpr, negate_pflows: tl.constexpr,
-                                           allow_neg_flows: tl.constexpr, pid_m_offset = 0, alpha = 0.0, DOT_TF32X3: tl.constexpr = False):
+                                           allow_neg_flows: tl.constexpr, pid_m_offset = 0, alpha = 0.0, DOT_TF32X3: tl.constexpr = False,
+                                           PF_STORE: tl.constexpr = False):
     """
     Faster variant of `_bk_triton_block_sparse_par_kernel`: identical computation, but the
     final accumulation into `param_flows` uses a non-atomic read-add-store instead of
@@ -168,6 +169,7 @@ def _bk_triton_block_sparse_par_kernel_rmw(node_flows, node_mars, element_mars, 
     slot (collision-free / untied param flows); the caller is responsible for guaranteeing
     this, falling back to the atomic kernel otherwise. On Blackwell the atomic is ~25% of the
     kernel, so this is ~1.3x faster. The body below mirrors the atomic kernel verbatim.
+    `PF_STORE`: the pass's first writer of these slots -- stores, the buffer's reset folded in.
     """
 
     pid_k = tl.program_id(0) # ID of size-`TILE_SIZE_K` edges
@@ -287,12 +289,22 @@ def _bk_triton_block_sparse_par_kernel_rmw(node_flows, node_mars, element_mars, 
     parflow_start = tl.load(pfids + nblock_id * num_edges + offs_edge)
     eparflows_offsets = offs_node[:,None] + parflow_start[None,:] # [TILE_SIZE_M, TILE_SIZE_K]
 
-    # Non-atomic accumulation (safe only when `eparflows_offsets` are collision-free across programs)
-    cur_pflows = tl.load(param_flows + eparflows_offsets)
-    if negate_pflows:
-        tl.store(param_flows + eparflows_offsets, cur_pflows - pflows)
+    if PF_STORE:
+        # The pass's first writer of these slots stores: the buffer's reset (`flows_memory = 0`) folded into the write
+        # (`SumLayer.param_flow_slot_plan`). A padding edge (child row 0) addresses slot 0's block, which a real edge
+        # owns: it stores nothing (the accumulating form adds its exact zero)
+        real_edge = edge_start != 0
+        if negate_pflows:
+            tl.store(param_flows + eparflows_offsets, -pflows, mask = real_edge[None, :])
+        else:
+            tl.store(param_flows + eparflows_offsets, pflows, mask = real_edge[None, :])
     else:
-        tl.store(param_flows + eparflows_offsets, cur_pflows + pflows)
+        # Non-atomic accumulation (safe only when `eparflows_offsets` are collision-free across programs)
+        cur_pflows = tl.load(param_flows + eparflows_offsets)
+        if negate_pflows:
+            tl.store(param_flows + eparflows_offsets, cur_pflows - pflows)
+        else:
+            tl.store(param_flows + eparflows_offsets, cur_pflows + pflows)
 
 
 # @triton.jit

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import contextlib
 import os
+import numpy as np
 import torch
 import torch.nn as nn
 import triton
@@ -230,6 +231,43 @@ def _sm_count(device) -> int:
     if n is None:
         n = _SM_COUNT[idx] = torch.cuda.get_device_properties(idx).multi_processor_count
     return n
+
+
+def _merge_ranges(r: np.ndarray) -> np.ndarray:
+    """Sorted disjoint `[start, end)` ranges (int64 [n, 2]) covering the union of `r`'s (adjacent ones joined)."""
+    if r.shape[0] == 0:
+        return np.zeros((0, 2), dtype = np.int64)
+    r = r[np.argsort(r[:, 0], kind = "stable")]
+    out = [list(r[0])]
+    for s, e in r[1:]:
+        if s <= out[-1][1]:
+            out[-1][1] = max(out[-1][1], e)
+        else:
+            out.append([s, e])
+    return np.asarray(out, dtype = np.int64)
+
+
+def _ranges_overlap(a: np.ndarray, b: np.ndarray) -> bool:
+    """Whether two sorted disjoint range sets share a slot."""
+    if a.shape[0] == 0 or b.shape[0] == 0:
+        return False
+    # a range of `a` holding b's start, or an `a` start inside a `b` range
+    i = np.searchsorted(a[:, 0], b[:, 0], side = "right") - 1
+    if bool(np.any((i >= 0) & (a[np.maximum(i, 0), 1] > b[:, 0]))):
+        return True
+    return bool(np.any(np.searchsorted(a[:, 0], b[:, 1], side = "left") > np.searchsorted(a[:, 0], b[:, 0], side = "right")))
+
+
+def _ranges_complement(a: np.ndarray, n: int):
+    """The `[start, end)` gaps of sorted disjoint ranges `a` within `[0, n)`, as a list of pairs."""
+    out, pos = [], 0
+    for s, e in a.tolist():
+        if s > pos:
+            out.append((pos, s))
+        pos = max(pos, e)
+    if pos < n:
+        out.append((pos, n))
+    return out
 
 
 class SumLayer(Layer, nn.Module):
@@ -825,7 +863,10 @@ class SumLayer(Layer, nn.Module):
                     None if param_flows is None else param_flows.dtype, logspace_flows, negate_pflows,
                     accumulate_ch_flows, allow_neg_flows, precision, self._ext_bw_ele_hook is not None,
                     self._ext_bw_par_hook is not None, self._ext_bw_par_sb_hook is not None,
-                    self._ext_bw_par_triton_hook is not None, tuple(sorted(kwargs)))
+                    self._ext_bw_par_triton_hook is not None, tuple(sorted(kwargs)),
+                    # the pass's first-writer stores (`_plan_param_flow_stores`): a launcher bakes its partition's
+                    # decision, so the key holds every partition's
+                    self.__dict__.get("_pf_store_key") if kwargs.get("pf_store_first", False) else None)
             plan = LaunchPlans.of(self).lookup(pkey)
             if plan is not None:
                 for launch in plan:
@@ -1791,6 +1832,8 @@ class SumLayer(Layer, nn.Module):
         else:
             mode = self.BLOCK_SPARSE
 
+        if mode == self.PYTORCH and param_flows is not None and self._pf_planned_store(partition_id, kwargs):
+            self._pf_reset(partition_id, param_flows)        # (the PyTorch reference accumulates)
         if mode != self.BLOCK_SPARSE and (self._ext_bw_ele_hook is not None
                                           or self._ext_bw_par_hook is not None
                                           or self._ext_bw_par_sb_hook is not None):
@@ -2605,6 +2648,87 @@ class SumLayer(Layer, nn.Module):
             self._par_collision_free_cache[key] = collision_free
         return self._par_collision_free_cache[key]
 
+    def _par_tile_sizes(self, batch_size: int, num_edges: int, propagation_alg_id: int):
+        """`(TILE_SIZE_M, TILE_SIZE_K, TILE_SIZE_B)` of the block-sparse parameter-flow kernels for a partition of
+        `num_edges` edges at `batch_size` -- the heuristic the dispatch applies (and `param_flow_slot_plan` predicts)."""
+        BATCH_SIZE_NP2 = host_next_power_of_2(batch_size)
+        base_size = min(self.block_size, num_edges, BATCH_SIZE_NP2)
+        if base_size >= 64:
+            TILE_SIZE_B = min(2048 // 32, BATCH_SIZE_NP2)
+        else:
+            remainder = 2048 // (base_size ** 2)
+            TILE_SIZE_B = min(2048 // remainder, base_size * remainder, BATCH_SIZE_NP2)
+        TILE_SIZE_M = min(2048 // TILE_SIZE_B, self.block_size)
+        TILE_SIZE_K = min(2048 // TILE_SIZE_B, num_edges)
+        if propagation_alg_id == 1:
+            # The kernel will stall if the tile sizes are too large
+            TILE_SIZE_M = min(TILE_SIZE_M, 16)
+            TILE_SIZE_K = min(TILE_SIZE_K, 16)
+            TILE_SIZE_B = min(TILE_SIZE_B, 16)
+        return TILE_SIZE_M, TILE_SIZE_K, TILE_SIZE_B
+
+    def param_flow_slot_ranges(self, partition_id: int) -> np.ndarray:
+        """The `param_flows` slots a backward partition writes, as sorted disjoint `[start, end)` ranges (int64
+        [n, 2], host): every real edge block (child row not 0) writes the `block_size` slots from its `pfids` entry.
+        Computed once per partition."""
+        cache = self.__dict__.setdefault("_pf_slot_ranges", {})
+        ranges = cache.get(partition_id)
+        if ranges is None:
+            pfids, cids = self.partitioned_pfids[partition_id], self.partitioned_cids[partition_id]
+            starts = torch.unique(pfids[cids != 0]).cpu().numpy().astype(np.int64)
+            ranges = _merge_ranges(np.stack([starts, starts + self.block_size], axis = 1)) if starts.size else \
+                np.zeros((0, 2), dtype = np.int64)
+            cache[partition_id] = ranges
+        return ranges
+
+    def _pf_planned_store(self, partition_id: int, kwargs) -> bool:
+        """Whether the circuit's plan for this pass (`pf_store_first` given, `_pf_store_flags` set) left this
+        partition's slots un-reset for its kernel to store."""
+        return bool(kwargs.get("pf_store_first", False)) and \
+            bool(self.__dict__.get("_pf_store_flags", {}).get(partition_id, False))
+
+    def _pf_reset(self, partition_id: int, param_flows: torch.Tensor) -> None:
+        """The safety net of the plan: a path that ACCUMULATES into slots the plan expected stored resets them first
+        (the plan predicts the dispatch; a prediction a path does not honour costs this reset, never correctness)."""
+        for a, b in self.param_flow_slot_ranges(partition_id).tolist():
+            param_flows[a:b].zero_()
+        self.__dict__["_pf_fallback_resets"] = self.__dict__.get("_pf_fallback_resets", 0) + 1
+
+    def param_flow_slot_plan(self, batch_size: int, pflow_temperature: float, propagation_alg: str, defer: bool,
+                             mode = None):
+        """Per backward partition `(ranges, capable)`: the slots it writes (`param_flow_slot_ranges`) and whether its
+        kernel can STORE them -- the pass's first writer of a slot then folds the buffer's reset into its write, and
+        the circuit zeroes only what no storing writer covers (`TensorCircuit._plan_param_flow_stores`). Capable: the
+        block-sparse regime (batch at least `_BLOCK_SPARSE_PAR_MIN_BATCH`; 16 with an external hook, which keeps the
+        small-batch path), no external-parameter hook (its kernels accumulate), untempered flows, tiles of 8 or more
+        (the dot kernels; csmm2 adds atomically), collision-free slots (the read-add-store kernel, or the CUDA kernel's
+        store mode) and no deferral (a deferred tied group's flush adds at the end of the pass). The same conditions
+        the dispatch applies, so a partition told to store runs a storing kernel; a path it mispredicts resets the slots
+        itself (`_pf_reset`). An external-parameter layer's partitions (its hooks accumulate) and a backward forced to
+        another `mode` are never capable."""
+        out = []
+        alg_id = self.propagation_alg_mapping[propagation_alg]
+        if getattr(self, "external_params", None) is not None or (mode is not None and mode != "block_sparse"):
+            return [(self.param_flow_slot_ranges(p), False) for p in range(self.num_bk_partitions)]
+        for partition_id in range(self.num_bk_partitions):
+            ranges = self.param_flow_slot_ranges(partition_id)
+            nids, cids, pids, pfids = (self.partitioned_nids[partition_id], self.partitioned_cids[partition_id],
+                                       self.partitioned_pids[partition_id], self.partitioned_pfids[partition_id])
+            num_edges = cids.size(1)
+            ext = (self._ext_bw_par_hook is not None or self._ext_bw_par_triton_hook is not None
+                   or self._ext_bw_par_sb_hook is not None)
+            capable = (not ext and batch_size >= _BLOCK_SPARSE_PAR_MIN_BATCH and abs(pflow_temperature - 1.0) < 1e-6
+                       and ranges.shape[0] > 0 and self._par_flow_collision_free(pfids))
+            if capable:
+                tm, tk, tb = self._par_tile_sizes(batch_size, num_edges, alg_id)
+                capable = tm >= 8 and tk >= 8 and tb >= 8
+            if capable and defer:
+                ctx = dict(partition_id = partition_id, batch_size = batch_size, block_size = self.block_size,
+                           num_edges = num_edges, nids = nids, cids = cids, pids = pids, pfids = pfids)
+                capable = not deferred_par.may_defer(cuda_kernels.get_par_deferred_module(), ctx, 1)
+            out.append((ranges, bool(capable)))
+        return out
+
     def _backward_block_sparse_par_flows(self, node_flows: torch.Tensor, params: torch.Tensor, node_mars: torch.Tensor,
                                          element_mars: torch.Tensor, param_flows: torch.Tensor, nids: torch.Tensor,
                                          cids: torch.Tensor, pids: torch.Tensor, pfids: torch.Tensor,
@@ -2640,21 +2764,9 @@ class SumLayer(Layer, nn.Module):
         propagation_alg_id = self.propagation_alg_mapping[propagation_alg]
         propagation_alg_kwargs = self._get_propagation_alg_kwargs(propagation_alg, **kwargs)
 
-        # Heuristic to set `TILE_SIZE_M`, `TILE_SIZE_K`, and `BLOCK_B`
-        base_size = min(self.block_size, num_edges, BATCH_SIZE_NP2)
-        if base_size >= 64:
-            TILE_SIZE_B = min(2048 // 32, BATCH_SIZE_NP2)
-        else:
-            remainder = 2048 // (base_size ** 2)
-            TILE_SIZE_B = min(2048 // remainder, base_size * remainder, BATCH_SIZE_NP2)
-        TILE_SIZE_M = min(2048 // TILE_SIZE_B, self.block_size)
-        TILE_SIZE_K = min(2048 // TILE_SIZE_B, num_edges)
-        
-        if propagation_alg_id == 1:
-            # The kernel will stall if the tile sizes are too large
-            TILE_SIZE_M = min(TILE_SIZE_M, 16)
-            TILE_SIZE_K = min(TILE_SIZE_K, 16)
-            TILE_SIZE_B = min(TILE_SIZE_B, 16)
+        # Heuristic to set `TILE_SIZE_M`, `TILE_SIZE_K`, and `BLOCK_B` (`_par_tile_sizes`: the plan of the pass's
+        # parameter-flow stores reads it too)
+        TILE_SIZE_M, TILE_SIZE_K, TILE_SIZE_B = self._par_tile_sizes(batch_size, num_edges, propagation_alg_id)
 
         # CEIL, not floor. With floor the trailing `batch_size % TILE_SIZE_B` samples are never
         # visited by the kernel's batch loop and their parameter flows are SILENTLY DROPPED -- at
@@ -2773,6 +2885,12 @@ class SumLayer(Layer, nn.Module):
                     dict(allow_modify_flows = allow_modify_flows, logspace_flows = logspace_flows,
                          propagation_alg_id = propagation_alg_id, allow_neg_flows = allow_neg_flows,
                          **propagation_alg_kwargs)
+        # The pass's first writer of this partition's flow slots STORES them -- the buffer's reset folded into the
+        # write (`param_flow_slot_plan`; the circuit's backward sets `_pf_store_flags` from every layer's plan before
+        # the pass, and keys its launch plans on it): the read-add-store Triton kernel with `PF_STORE`, the CUDA kernel
+        # in its store mode. Any other kernel accumulates, and the circuit zeroes its slots.
+        pf_planned = self._pf_planned_store(partition_id, kwargs)
+        pf_store = pf_planned and par_kernel is bk_par_bsparse._bk_triton_block_sparse_par_kernel_rmw
 
         # The launches below take the call's tensors (`t`: node_flows, node_mars, element_mars, params) as an argument
         # -- `cur` for this call; a launch plan's launcher (`LaunchPlans`) passes those of the call it replays for, and
@@ -2781,6 +2899,8 @@ class SumLayer(Layer, nn.Module):
         node_mars_tempered = kwargs["node_mars_tempered"] if par_tempered else None
 
         def _launch_par(cfg, out, t):
+            if pf_planned and not pf_store:
+                self._pf_reset(partition_id, out)        # (an accumulating kernel on slots the plan left un-reset)
             tk, warps = cfg
             ne, cs, ps, fs = _par_edges(tk)
             g = (host_cdiv(ne, tk), host_cdiv(layer_n_nodes, TILE_SIZE_M))
@@ -2811,6 +2931,7 @@ class SumLayer(Layer, nn.Module):
                     **({"node_mars_tempered": node_mars_tempered} if par_tempered
                        else {"node_mars": t["node_mars"]}),
                     **par_extra,
+                    **({"PF_STORE": True} if pf_store else {}),
                     **({} if warps is None else {"num_warps": warps})
                 )
 
@@ -2903,6 +3024,8 @@ class SumLayer(Layer, nn.Module):
                 )
 
                 def _hook(node_flows, element_flows, node_mars, element_mars, params, param_flows, static = static):
+                    if pf_planned:
+                        self._pf_reset(partition_id, param_flows)   # (the external hooks accumulate)
                     self._ext_bw_par_hook(dict(static, param_flows = param_flows, node_flows = node_flows,
                                                node_mars = node_mars, element_mars = element_mars, params = params))
 
@@ -2912,12 +3035,12 @@ class SumLayer(Layer, nn.Module):
 
             if par_ok:
                 def _cuda_par(tgt, t):
-                    # mode 0 = read-accumulate-write (RMW): always correct (accumulates onto prior
-                    # param_flows, e.g. multi-batch). The kernel also has a store-only mode that skips
-                    # the RMW read, but that is only valid when param_flows is freshly zeroed; not used
-                    # here to keep the path unconditionally correct.
+                    # mode 0 = read-accumulate-write (RMW: accumulates onto prior param_flows, e.g. multi-batch);
+                    # mode 2 = store-only, for the pass's first writer of these slots (`pf_store`: the reset folded in)
+                    if pf_planned and not pf_store:
+                        self._pf_reset(partition_id, tgt)
                     cuda_kernels.par_backward_sum(tgt, t["node_flows"], t["node_mars"], t["element_mars"], t["params"],
-                        nbase, cbase, pbase, fbase, batch_size, self.block_size, num_edges, 0)
+                        nbase, cbase, pbase, fbase, batch_size, self.block_size, num_edges, 2 if pf_store else 0)
 
                 def _triton_par(tgt, t):
                     _launch_par(default_par_cfg, tgt, t)
@@ -2955,6 +3078,8 @@ class SumLayer(Layer, nn.Module):
                 blk = self.block_size
 
                 def _defer(param_flows, t):
+                    if defers and pf_planned:
+                        self._pf_reset(partition_id, param_flows)   # (the deferred flush accumulates at the pass's end)
                     return defers and deferred_par.try_defer(pd_mod, self, dict(ctx, param_flows = param_flows, **t),
                                                              None, None, blk, blk, 0, 1)
 
@@ -2991,6 +3116,8 @@ class SumLayer(Layer, nn.Module):
             )
 
             def _hook(node_flows, element_flows, node_mars, element_mars, params, param_flows, static = static):
+                if pf_planned:
+                    self._pf_reset(partition_id, param_flows)       # (the external hooks accumulate)
                 self._ext_bw_par_triton_hook(dict(static, node_flows = node_flows, node_mars = node_mars,
                                                   element_mars = element_mars, params = params,
                                                   param_flows = param_flows))
@@ -3298,6 +3425,8 @@ class SumLayer(Layer, nn.Module):
         `pids`:          [ng, c]
         """
 
+        if self._pf_planned_store(partition_id, kwargs):
+            self._pf_reset(partition_id, param_flows)            # (every kernel of this path accumulates)
         assert params.dim() == 1, "Expecting a 1D `params`."
 
         num_nblocks = nids.size(0)

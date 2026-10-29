@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import numpy as np
 import torch
 import torch.nn as nn
 from collections import OrderedDict
@@ -481,6 +482,63 @@ class TensorCircuit(_BuildMixin, _CudaGraphsMixin, _ExternalParamsMixin, _Learni
         else:
             return lls.clone()
 
+    def _plan_param_flow_stores(self, B: int, flows_memory: float, pflow_temperature: float, propagation_alg,
+                                defer: bool, mode = None):
+        """The pass's parameter-flow STORES. At `flows_memory = 0` every slot of `param_flows` is reset before the
+        layers add their flows; instead, walking the sum layers in backward order, a partition whose kernel can store
+        (`SumLayer.param_flow_slot_plan`) and whose slots no earlier writer of the pass touched STORES them -- the reset
+        folded into its write --, and only the slots no storing writer covers are zeroed (`init_param_flows`'s
+        `_zero_ranges`; among them every slot written by an accumulating kernel and every slot nobody writes). Sets each
+        layer's `_pf_store_flags` (partition -> stores) for the pass -- read only by a backward given `pf_store_first`, the
+        circuit's option for this pass, so a layer's backward called on its own accumulates; the plan is cached per (batch, options). At any
+        other memory the flows are scaled as before and nothing stores. Returns the ranges to zero, or None for all.
+        The input layers' flow buffers are separate and untouched."""
+        groups = self.inner_layer_groups
+        sums = self.__dict__.get("_pf_sum_layers")
+        if sums is None:                                   # (the sum layers in backward order, once)
+            sums = self.__dict__["_pf_sum_layers"] = [(lid, layer) for lid in range(len(groups) - 1, -1, -1)
+                                                       if groups[lid].is_sum() for layer in groups[lid]]
+        if flows_memory != 0.0 or not sums:
+            if self.__dict__.get("_pf_applied_key") is not None:
+                for _, layer in sums:
+                    layer.__dict__["_pf_store_flags"] = {}
+                    layer.__dict__["_pf_store_key"] = None
+                self.__dict__["_pf_applied_key"] = None
+            return None
+        key = (B, float(pflow_temperature), propagation_alg if isinstance(propagation_alg, str) else tuple(propagation_alg),
+               bool(defer), mode, self.num_param_flows)
+        plans = self.__dict__.setdefault("_pf_store_plans", {})
+        plan = plans.get(key)
+        if plan is None:
+            from pyjuice.layer.sum_layer import _merge_ranges, _ranges_overlap, _ranges_complement
+            seen = np.zeros((0, 2), dtype = np.int64)
+            stored, flags = [], []
+            for lid, layer in sums:
+                alg = propagation_alg if isinstance(propagation_alg, str) else propagation_alg[lid]
+                f = {}
+                for pid, (ranges, capable) in enumerate(layer.param_flow_slot_plan(B, pflow_temperature, alg, defer, mode)):
+                    store = capable and not _ranges_overlap(seen, ranges)
+                    f[pid] = store
+                    if store:
+                        stored.append(ranges)
+                    if ranges.shape[0]:
+                        seen = _merge_ranges(np.concatenate([seen, ranges]))
+                flags.append(f)
+            covered = _merge_ranges(np.concatenate(stored)) if stored else np.zeros((0, 2), dtype = np.int64)
+            zero = _ranges_complement(covered, self.num_param_flows)
+            if len(zero) > 256 or zero == [(0, self.num_param_flows)]:   # (too fragmented, or nothing stored: one zero pass)
+                zero = None
+            # (each layer's decisions as the tuple its launch-plan key holds, built once here)
+            plan = plans[key] = (flags, [tuple(sorted(f.items())) for f in flags], zero)
+            self.__dict__["_pf_applied_key"] = None        # (a new plan: the layers take its decisions below)
+        flags, keys, zero = plan
+        if self.__dict__.get("_pf_applied_key") != key:   # (the layers hold the last plan's decisions)
+            for (_, layer), f, k in zip(sums, flags, keys):
+                layer.__dict__["_pf_store_flags"] = f
+                layer.__dict__["_pf_store_key"] = k
+            self.__dict__["_pf_applied_key"] = key
+        return zero
+
     def backward(self, inputs: Optional[torch.Tensor] = None, 
                  ll_weights: Optional[torch.Tensor] = None,
                  compute_param_flows: bool = True, 
@@ -581,8 +639,15 @@ class TensorCircuit(_BuildMixin, _CudaGraphsMixin, _ExternalParamsMixin, _Learni
                 self.node_flows[:,:] = cache["node_flows"]
 
             ## Initialize parameter flows ##
+            # (`flows_memory = 0`: the pass's first writer of a slot stores it, the reset folded into its write --
+            # `_plan_param_flow_stores`; only the slots no storing writer covers are zeroed here)
+            pf_defer = sum_layer_pre_backward_callback is None and sum_layer_post_backward_callback is None
             if compute_param_flows:
-                self.init_param_flows(flows_memory = flows_memory)
+                zero_ranges = self._plan_param_flow_stores(B, flows_memory, pflow_temperature, propagation_alg, pf_defer,
+                                                           kwargs.get("mode"))
+                self.init_param_flows(flows_memory = flows_memory, _zero_ranges = zero_ranges)
+            else:
+                self._plan_param_flow_stores(B, 1.0, pflow_temperature, propagation_alg, pf_defer)   # (flags cleared)
 
             ## External parameters: reuse what the forward staged; reset the gradient buffers ##
             self._check_external_params_kwargs(kwargs)
@@ -604,8 +669,8 @@ class TensorCircuit(_BuildMixin, _CudaGraphsMixin, _ExternalParamsMixin, _Learni
                             allow_modify_flows = allow_modify_flows, logspace_flows = logspace_flows,
                             negate_pflows = negate_pflows, precision = self.precision,
                             pflow_temperature = pflow_temperature, temper_eflow = temper_eflow,
-                            defer_param_flows = (compute_param_flows and sum_layer_pre_backward_callback is None
-                                                 and sum_layer_post_backward_callback is None))
+                            defer_param_flows = compute_param_flows and pf_defer,
+                            pf_store_first = compute_param_flows and flows_memory == 0.0)
 
             def _inner_layers():
 
