@@ -1317,7 +1317,10 @@ class _BackwardMixin:
         # or within 10% of it at HMM-4096 B 128 / 512, HMM-2048 B 64, HMM-1024 B 16 / 128 (gate width 64 and 8),
         # HMM-512 B 1024, HMM-256 B 8. Then the tiles around it, adopted where they measure faster.
         tg0 = min(gmax, 32)
-        tm0, tb0 = min(32, bs_), 32
+        # (the batch tile no wider than the batch's: a tile of 32 samples never `fits` a batch of 16 or below, and every
+        # candidate dropped left the 16 x 16 x 16 fallback -- 64 node tiles a block of 1024, each storing its gradient
+        # shares for the last ticket to add: MEASURED ~9 us a layer at a gated HMM-4096 B 16)
+        tm0, tb0 = min(32, bs_), min(32, max(16, nb_))
 
         def progs(tm, tb):
             return rows * (bs_ // tm) * triton.cdiv(n_gates, tg0) * triton.cdiv(batch, tb)
