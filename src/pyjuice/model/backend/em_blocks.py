@@ -15,6 +15,13 @@ every node's total (`cum_pflow_kernel`'s sum, without its atomics) and then ever
 * `_em_node_block_one_pass_kernel` for tiles of at most `ONE_PASS_MAX` children: the tile read once and kept while its
   totals are summed -- the update at its floor (MEASURED, HCLT-1024, 1024 children: fp32 3.95 ms against 3.88; bf16
   with the master copy 5.39 against 5.2);
+* `_em_block_kernel` for a node block of 32-64 nodes and at most `ONE_PASS_MAX` children whose parameters have a master
+  copy: a program per whole block, its contiguous ``[children, nodes]`` slab walked twice in linear steps of
+  `BLOCK_STEP` children -- the totals, then the update, the second walk read back from the L2 (32 warps a program: at
+  most two programs an SM, the slabs in flight well inside the L2). The one-pass kernel's master-copy tile is 8 nodes
+  (a 16-byte row of bf16 values; wider tiles spill), 86% of the bytes' floor on HCLT-1024 (block 32: 1911 us against
+  a copy of the bytes 1644; block 64: 1888), where this form is at it (1642 / 1711; MEASURED, toast; fp32's one-pass
+  tile is 16 nodes and at the floor already, 1259 / 1263 against 1234, so fp32 keeps it);
 * the split kernels for any number of children, a program per (node tile, `SPLIT_CHUNK` children): the chunks'
   partial totals (`_em_split_partials_kernel`), summed in chunk order (`_em_split_merge_kernel`), then the update
   (`_em_split_update_kernel`) -- the flows read twice. A two-pass kernel whose programs were the node tiles alone, each
@@ -56,6 +63,13 @@ MIN_BLOCK_SIZE = 16
 BLOCK_N = 64
 BLOCK_C = 32
 SPLIT_CHUNK = 256
+
+#: The whole-block kernel's children a step and warps (see the module docstring), and the blocks it takes: nodes within
+#: ``BLOCK_FORM_NODES`` (a slab of at most 64 x 1024 floats, 256 KB, so that two programs an SM on 188 SMs hold under
+#: 100 MB of the L2 between the walks)
+BLOCK_STEP = 128
+BLOCK_WARPS = 32
+BLOCK_FORM_NODES = (32, 64)
 
 #: The most children the one-pass kernel holds (a tile's whole column of flows in registers)
 ONE_PASS_MAX = 1024
@@ -109,6 +123,72 @@ def _em_node_block_one_pass_kernel(stored_ptr, master, param_flows, cum_pflows, 
     if HAS_MASTER:
         tl.store(master + par0 + rel, upd, mask = mask)
     tl.store(stored_ptr + par0 + rel, upd.to(stored_ptr.dtype.element_ty), mask = mask)
+
+
+@triton.jit
+def _em_block_kernel(stored_ptr, master, param_flows, cum_pflows, t_par, t_pflow, t_rows, t_stride, t_nodes,
+                          t_gnid, step_size, pseudocount, HAS_MASTER: tl.constexpr, KEEP_ZERO: tl.constexpr,
+                          BLOCK_C: tl.constexpr, BLOCK_N: tl.constexpr):
+    """Program t: a whole node block (the one-pass kernel's tables, a tile the block), its flows walked twice,
+    ``BLOCK_C`` children a step -- the totals, then the update; the block's ``[children, nodes]`` slab is contiguous, so
+    a step is one linear stream, and the second walk reads it back from the L2 (see `_form`)."""
+    t = tl.program_id(0)
+    par0 = tl.load(t_par + t).to(tl.int64)
+    pf0 = tl.load(t_pflow + t).to(tl.int64)
+    nch = tl.load(t_rows + t)                                          # the nodes' children (int64, as `nchs`)
+    nch32 = nch.to(tl.int32)
+    stride = tl.load(t_stride + t).to(tl.int64)
+    nv = tl.load(t_nodes + t).to(tl.int32)
+    gnid = tl.load(t_gnid + t).to(tl.int64)
+
+    offs_n = tl.arange(0, BLOCK_N)
+    mask_n = offs_n < nv
+    offs_c0 = tl.arange(0, BLOCK_C)
+
+    # The nodes' totals: `cum_pflow_kernel`'s sum (with `keep_zero_params`, over the children not at zero, each flow
+    # plus its share of the pseudocount)
+    tot = tl.zeros([BLOCK_N], dtype = tl.float32)
+    for c0 in range(0, nch32, BLOCK_C):
+        offs_c = c0 + offs_c0
+        mask = (offs_c < nch32)[:, None] & mask_n[None, :]
+        rel = offs_c.to(tl.int64)[:, None] * stride + offs_n[None, :]
+        pflows = tl.load(param_flows + pf0 + rel, mask = mask, other = 0)
+        if KEEP_ZERO:
+            if HAS_MASTER:
+                stored = tl.load(stored_ptr + par0 + rel, mask = mask, other = 0)
+                mval = tl.load(master + par0 + rel, mask = mask, other = 0)
+                old = tl.where(stored != mval.to(stored.dtype), stored.to(tl.float32), mval)
+            else:
+                old = tl.load(stored_ptr + par0 + rel, mask = mask, other = 0).to(tl.float32)
+            pflows += pseudocount / nch
+            tot += tl.sum(tl.where(mask & ~(old < 1e-12), pflows, 0.0), axis = 0)      # (the original's test)
+        else:
+            tot += tl.sum(pflows, axis = 0)
+    tl.store(cum_pflows + gnid + offs_n, tot, mask = mask_n)
+
+    # The update, as `em_par_update_kernel` computes it
+    for c0 in range(0, nch32, BLOCK_C):
+        offs_c = c0 + offs_c0
+        mask = (offs_c < nch32)[:, None] & mask_n[None, :]
+        rel = offs_c.to(tl.int64)[:, None] * stride + offs_n[None, :]
+        pflows = tl.load(param_flows + pf0 + rel, mask = mask, other = 0)
+        if KEEP_ZERO:
+            new_param = (pflows + pseudocount / nch) / tot[None, :]
+        else:
+            new_param = (pflows + pseudocount / nch) / (tot[None, :] + pseudocount)
+        if HAS_MASTER:
+            stored = tl.load(stored_ptr + par0 + rel, mask = mask, other = 0)
+            mval = tl.load(master + par0 + rel, mask = mask, other = 0)
+            old = tl.where(stored != mval.to(stored.dtype), stored.to(tl.float32), mval)
+        else:
+            old = tl.load(stored_ptr + par0 + rel, mask = mask, other = 0).to(tl.float32)
+        if KEEP_ZERO:
+            upd = tl.where(old < 1e-12, 0.0, (1.0 - step_size) * old + step_size * new_param)
+        else:
+            upd = (1.0 - step_size) * old + step_size * new_param
+        if HAS_MASTER:
+            tl.store(master + par0 + rel, upd, mask = mask)
+        tl.store(stored_ptr + par0 + rel, upd.to(stored_ptr.dtype.element_ty), mask = mask)
 
 
 @triton.jit
@@ -245,8 +325,9 @@ class _Tables:
 
     def groups(self, pc, exclude: Sequence) -> tuple:
         """``(groups, per-block kwargs)`` without the parameter ranges ``exclude`` (each a whole `ns`'s): ``groups``
-        ``{children bucket: blocks}`` -- a bucket the power of two at or above the blocks' children up to
-        `ONE_PASS_MAX`, None past it --, every one's tiles made per width on demand (`tiles`)."""
+        ``{(children bucket, nodes bucket): blocks}`` -- the children's bucket the power of two at or above the blocks'
+        children up to `ONE_PASS_MAX`, None past it; the nodes' the power of two at or above the blocks' size up to
+        `BLOCK_N`, None past it --, every one's tiles made per width on demand (`tiles`)."""
         key = tuple(sorted(exclude))
         hit = self.cache.get(key)
         if hit is not None:
@@ -257,9 +338,11 @@ class _Tables:
             keep &= ~((b[:, 4] >= ps) & (b[:, 4] < pe))
         b = b[keep]
         bucket = np.where(b[:, 2] <= ONE_PASS_MAX, 1 << np.ceil(np.log2(np.maximum(b[:, 2], 1))).astype(np.int64), 0)
+        nbucket = np.where(b[:, 3] <= BLOCK_N, 1 << np.ceil(np.log2(np.maximum(b[:, 3], 1))).astype(np.int64), 0)
         groups = {}
-        for v in np.unique(bucket):
-            groups[None if v == 0 else int(v)] = {"blocks": b[bucket == v], "tiles": {}}
+        for v, w in sorted(set(zip(bucket.tolist(), nbucket.tolist()))):
+            groups[(None if v == 0 else v, None if w == 0 else w)] = {"blocks": b[(bucket == v) & (nbucket == w)],
+                                                                     "tiles": {}}
         par_start_ids, pflow_start_ids, blk_sizes, blk_intervals, global_nids, nchs, cum_pflows, metadata = \
             pc.par_update_kwargs
         small = blk_intervals < MIN_BLOCK_SIZE
@@ -293,18 +376,22 @@ def _tables(pc) -> _Tables:
     return t
 
 
-def _form(nch_bucket, has_master: bool) -> tuple:
-    """The kernel form for a group of node blocks of ``nch_bucket`` children (None: past `ONE_PASS_MAX`), as `_launch`
-    takes it: a function of the shape alone, so every process updating the same values gets the same bits."""
+def _form(nch_bucket, nodes_bucket, has_master: bool) -> tuple:
+    """The kernel form for a group of node blocks of ``nch_bucket`` children (None: past `ONE_PASS_MAX`) and
+    ``nodes_bucket`` nodes (None: past `BLOCK_N`), as `_launch` takes it: a function of the shape alone, so every
+    process updating the same values gets the same bits."""
     if nch_bucket is None:
         return ("split", BLOCK_N, 4)
+    if has_master and nodes_bucket is not None and BLOCK_FORM_NODES[0] <= nodes_bucket <= BLOCK_FORM_NODES[1]:
+        return ("block", nodes_bucket, BLOCK_WARPS)
     width, warps = ONE_PASS_TILE_MASTER if has_master else ONE_PASS_TILE
     return ("one", width, warps)
 
 
 def _launch(cfg, tables, group, nch_bucket, stored, master, param_flows, cum_pflows, step_size, pseudocount, keep_zero):
     """One group's update with ``cfg``: ``("split", BLOCK_N, 4)`` the split kernels (`SPLIT_CHUNK` children a program,
-    the partial totals merged), ``("one", nodes, warps)`` the one-pass one (its children ``nch_bucket``)."""
+    the partial totals merged), ``("block", nodes, warps)`` the whole-block kernel (a tile the block), ``("one", nodes,
+    warps)`` the one-pass one (its children ``nch_bucket``)."""
     kind, width, warps = cfg
     tiles = tables.tiles(group, width)
     if tiles[0].numel() == 0:
@@ -323,6 +410,10 @@ def _launch(cfg, tables, group, nch_bucket, stored, master, param_flows, cum_pfl
         _em_split_update_kernel[(tiles[0].numel(), chunks)](
             stored, m, param_flows, cum_pflows, *tiles, step_size, pseudocount, HAS_MASTER = master is not None,
             KEEP_ZERO = keep_zero, CHUNK = SPLIT_CHUNK, BLOCK_C = BLOCK_C, BLOCK_N = width, num_warps = warps)
+    elif kind == "block":
+        _em_block_kernel[(tiles[0].numel(),)](
+            stored, m, param_flows, cum_pflows, *tiles, step_size, pseudocount, HAS_MASTER = master is not None,
+            KEEP_ZERO = keep_zero, BLOCK_C = BLOCK_STEP, BLOCK_N = width, num_warps = warps)
     else:
         _em_node_block_one_pass_kernel[(tiles[0].numel(),)](
             stored, m, param_flows, cum_pflows, *tiles, step_size, pseudocount, HAS_MASTER = master is not None,
@@ -355,7 +446,7 @@ def em_update(pc, param_flows: torch.Tensor, step_size: float, pseudocount: floa
     if cum_pflows is None:
         cum_pflows = torch.zeros([pc.par_update_kwargs[7]["tot_num_nodes"]], dtype = torch.float32,
                                  device = stored.device)
-    for nch_bucket, group in groups.items():
-        cfg = _form(nch_bucket, master is not None)
+    for (nch_bucket, nodes_bucket), group in groups.items():
+        cfg = _form(nch_bucket, nodes_bucket, master is not None)
         _launch(cfg, tables, group, nch_bucket, stored, master, param_flows, cum_pflows, step_size, pseudocount,
                 keep_zero)
