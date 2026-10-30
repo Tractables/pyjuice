@@ -19,8 +19,10 @@
 // The producer warps stage per tile the parameters (K-major; bf16 by cp.async) and the exponentials -- the tile's column
 // maxima a 3-step shuffle across the 8 threads that hold a column's 64 parents -- and G_t for the tile's gates; the MMA
 // warps keep S, L, R in fp32. Operands as the regular twin: bf16 parameters exact with one-bf16 exponentials; fp32
-// parameters both operands a bf16 hi + lo pair, three MMAs (one stage fewer, two at the least). A range writes its
-// partial (L, R); `bs_ele_merge_kernel` (a programmatic dependent launch) combines the ranges.
+// parameters both operands a bf16 hi + lo pair, three MMAs (one stage fewer, two at the least). The HIGH-PRECISION form
+// (`HP`, code bit 7: what batches below 16 run, where the gated path's other forks are fp32) splits bf16 parameters'
+// exponentials too (two MMAs; fp32 parameters' form is already split). A range writes its partial (L, R);
+// `bs_ele_merge_kernel` (a programmatic dependent launch) combines the ranges.
 //
 // Contract: the layer's k-tiles are 64 parents, each tile's parents contiguous node rows over one parameter block
 // (`ele_cuda_ok`, ptr_inc_step 1); parent blocks of block_size a multiple of 64 (a tile in one block); cs_block_size a
@@ -58,7 +60,7 @@ extern __shared__ char smem_raw[];
 // the stages a config runs: one fewer (two at the least) for the split fp32 operands, whose stage is twice the bytes
 template <int ST, bool SPL> struct BsEleStages { static constexpr int value = SPL ? (ST >= 4 ? ST - 1 : 2) : ST; };
 
-template <int BM, int BN, int WM, int WN, int PW, int ST_, bool WGRAD, typename TP>
+template <int BM, int BN, int WM, int WN, int PW, int ST_, bool WGRAD, bool HP, typename TP>
 __global__ void __launch_bounds__((WM * WN + PW) * 32) bs_sbmma_ele_kernel(
         float* __restrict__ eflows, const float* __restrict__ emars, const float* __restrict__ nflows,
         const float* __restrict__ nmars, const TP* __restrict__ params, const float* __restrict__ ext,
@@ -69,6 +71,7 @@ __global__ void __launch_bounds__((WM * WN + PW) * 32) bs_sbmma_ele_kernel(
     constexpr int NC = WM * WN * 32, NP = PW * 32, NTH = NC + NP;
     constexpr bool BF16 = std::is_same<TP, __nv_bfloat16>::value;
     constexpr bool SPL = !BF16;                                          // fp32 parameters: hi + lo operands
+    constexpr bool SPB = SPL || HP;                                      // the exponentials' lo half
     constexpr int ST = BsEleStages<ST_, SPL>::value;
     static_assert(BN % 8 == 0 && BN <= 64 && 2 * ST <= 15, "columns; named barriers");
     const int mtiles = CS / BM;
@@ -83,17 +86,17 @@ __global__ void __launch_bounds__((WM * WN + PW) * 32) bs_sbmma_ele_kernel(
     const int g0 = row_off >> gate_sh;                                   // the tile's first child gate
     const int tid = threadIdx.x;
 
-    // smem per stage: A (BM, BK), B (BN, BK) K-major Swizzle<3,3,3> (SPL: then the lo halves' A and B); after the
+    // smem per stage: A (BM, BK), B (BN, BK) K-major Swizzle<3,3,3> (then the lo halves: SPL A's, SPB B's); after the
     // stages, G_t [ng][BN] per stage
     auto swzK = composition(Swizzle<3, 3, 3>{}, Layout<Shape<_8, _64>, Stride<_64, _1>>{});
     auto sAl = tile_to_shape(swzK, make_shape(Int<BM>{}, Int<BK>{}));
     auto sBl = tile_to_shape(swzK, make_shape(Int<BN>{}, Int<BK>{}));
     constexpr int HALF = BM * BK * 2 + BN * BK * 2;
-    constexpr int STAGE = SPL ? 2 * HALF : HALF;
+    constexpr int STAGE = HALF + (SPL ? BM * BK * 2 : 0) + (SPB ? BN * BK * 2 : 0);
     auto stA = [&](int s) { return (bfloat16_t*)(smem_raw + s * STAGE); };
     auto stB = [&](int s) { return (bfloat16_t*)(smem_raw + s * STAGE + BM * BK * 2); };
     auto stA2 = [&](int s) { return (bfloat16_t*)(smem_raw + s * STAGE + HALF); };
-    auto stB2 = [&](int s) { return (bfloat16_t*)(smem_raw + s * STAGE + HALF + BM * BK * 2); };
+    auto stB2 = [&](int s) { return (bfloat16_t*)(smem_raw + s * STAGE + HALF + (SPL ? BM * BK * 2 : 0)); };
     auto stG = [&](int s) { return (float*)(smem_raw + ST * STAGE) + s * ng * BN; };
 
     if (tid >= NC) {
@@ -179,10 +182,10 @@ __global__ void __launch_bounds__((WM * WN + PW) * 32) bs_sbmma_ele_kernel(
                 for (int j = 0; j < 8; j++) {
                     const float x = (M == -INFINITY || xv[q][j] == -INFINITY) ? 0.f : __expf(xv[q][j] - M);
                     u[j] = static_cast<bfloat16_t>(x);
-                    if constexpr (SPL) u2[j] = static_cast<bfloat16_t>(x - static_cast<float>(u[j]));
+                    if constexpr (SPB) u2[j] = static_cast<bfloat16_t>(x - static_cast<float>(u[j]));
                 }
                 *(uint4*)&sBt(c, e8) = *(const uint4*)u;
-                if constexpr (SPL) *(uint4*)&sBt2(c, e8) = *(const uint4*)u2;
+                if constexpr (SPB) *(uint4*)&sBt2(c, e8) = *(const uint4*)u2;
                 CUTE_UNROLL
                 for (int h = 0; h < 2; h++) {
                     const int g = kk + 8 * h;
@@ -258,6 +261,10 @@ __global__ void __launch_bounds__((WM * WN + PW) * 32) bs_sbmma_ele_kernel(
             copy(s2rB, s2rB.get_thread_slice(tid).partition_S(sBt2), tXrB2);
             cute::gemm(mma, tCrA2, tCrB, tCrS);                          // the small terms first: lo.hi, hi.lo, hi.hi
             cute::gemm(mma, tCrA, tCrB2, tCrS);
+        } else if constexpr (SPB) {
+            Tensor sBt2 = make_tensor(make_smem_ptr(stB2(s)), sBl);
+            copy(s2rB, s2rB.get_thread_slice(tid).partition_S(sBt2), tXrB2);
+            cute::gemm(mma, tCrA, tCrB2, tCrS);                          // hi.lo, then hi.hi
         }
         cute::gemm(mma, tCrA, tCrB, tCrS);
         if (kt + ST < knt) bar_arrive(1 + ST + s, NTH);
@@ -358,12 +365,12 @@ __global__ void bs_ele_grad_reduce_kernel(float* __restrict__ grad_ext, const fl
 
 #define SMEM_CAP (99 * 1024)                           // sm_120's dynamic shared memory a block
 // a config's dynamic shared memory: its stages' tiles, then G_t of each stage for `ng` gates
-template <int BM, int BN, int ST, bool SPL> static int cfg_smem(int ng) {
+template <int BM, int BN, int ST, bool SPL, bool SPB> static int cfg_smem(int ng) {
     constexpr int STE = BsEleStages<ST, SPL>::value;
-    return STE * (BM * BK * 2 + BN * BK * 2) * (SPL ? 2 : 1) + STE * ng * BN * 4;
+    return STE * (BM * BK * 2 * (SPL ? 2 : 1) + BN * BK * 2 * (SPB ? 2 : 1)) + STE * ng * BN * 4;
 }
 
-template <int BM, int BN, int WM, int WN, int PW, int ST, typename TP>
+template <int BM, int BN, int WM, int WN, int PW, int ST, bool HP, typename TP>
 static void launch_cfg(torch::Tensor eflows, torch::Tensor emars, torch::Tensor nflows, torch::Tensor nmars,
                        torch::Tensor params, torch::Tensor ext, torch::Tensor chids, torch::Tensor ebase, torch::Tensor pbase,
                        torch::Tensor gate, torch::Tensor grad, torch::Tensor gpart, torch::Tensor scratch, int batch,
@@ -372,12 +379,12 @@ static void launch_cfg(torch::Tensor eflows, torch::Tensor emars, torch::Tensor 
     constexpr bool SPL = !std::is_same<TP, __nv_bfloat16>::value;
     const int ng = (BM >> gate_sh) > 0 ? (BM >> gate_sh) : 1;
     TORCH_CHECK(ng <= MAX_GATES, "blockscale tensor-core ele: at most ", MAX_GATES, " child gates a tile");
-    const int smem = cfg_smem<BM, BN, ST, SPL>(ng);
+    const int smem = cfg_smem<BM, BN, ST, SPL, SPL || HP>(ng);
     TORCH_CHECK(smem <= SMEM_CAP, "blockscale tensor-core ele: ", smem, " bytes of shared memory past the ", SMEM_CAP,
                 " (`blockscale_sb_ele_mma_fits`)");
     const bool wgrad = grad.numel() > 0;
-    auto kernel = wgrad ? bs_sbmma_ele_kernel<BM, BN, WM, WN, PW, ST, true, TP>
-                        : bs_sbmma_ele_kernel<BM, BN, WM, WN, PW, ST, false, TP>;
+    auto kernel = wgrad ? bs_sbmma_ele_kernel<BM, BN, WM, WN, PW, ST, true, HP, TP>
+                        : bs_sbmma_ele_kernel<BM, BN, WM, WN, PW, ST, false, HP, TP>;
     static int attr_bytes[2][64] = {};                   // the attribute as last set, per device (it grows with ng)
     int dev = 0;
     C10_CUDA_CHECK(cudaGetDevice(&dev));
@@ -438,7 +445,7 @@ static void launch_cfg(torch::Tensor eflows, torch::Tensor emars, torch::Tensor 
 // `ebase` / `pbase` int64 [element blocks, num_edges / 64] (a 64-parent tile's first parent / first parameter), `gate`
 // int64 [element blocks, parent blocks] (the gate's staging row, -1 unconnected), `grad` the gate gradient (0 elements:
 // none) and `gpart` its shares (>= rows x parent blocks x batch floats), `scratch` the ranges' partials (allocated here
-// if smaller than 2 x split x rows x padded batch); `cfg` = id | split << 8: `split` equal ranges of the 64-parent tiles,
+// if smaller than 2 x split x rows x padded batch); `cfg` = id | HP << 7 | split << 8: `split` equal ranges of the 64-parent tiles,
 // each whole parent blocks or inside one (then `gpart` holds split / blocks units a block: >= rows x max(blocks, split)
 // x batch floats).
 void blockscale_sb_ele_backward_mma(torch::Tensor eflows, torch::Tensor emars, torch::Tensor nflows, torch::Tensor nmars,
@@ -447,7 +454,8 @@ void blockscale_sb_ele_backward_mma(torch::Tensor eflows, torch::Tensor emars, t
                                     torch::Tensor scratch, int64_t batch, int64_t block_size, int64_t cs_block_size,
                                     int64_t num_edges, int64_t gate_cbs, int64_t ext_base, int64_t cfg) {
     const int split = cfg >> 8 ? (int)(cfg >> 8) : 1;
-    cfg &= 255;
+    const bool hp = (cfg & 128) != 0;
+    cfg &= 127;
     const int b = (int)batch, bsk = (int)block_size, cs = (int)cs_block_size, ne = (int)num_edges, gcb = (int)gate_cbs;
     TORCH_CHECK(b >= 1 && b < 64, "blockscale tensor-core ele: batch in [1, 64)");
     TORCH_CHECK(bsk % BK == 0 && ne % bsk == 0, "blockscale tensor-core ele: parent blocks of whole 64-tiles, whole blocks");
@@ -468,8 +476,15 @@ void blockscale_sb_ele_backward_mma(torch::Tensor eflows, torch::Tensor emars, t
         switch (cfg) {
 #define BS_ELE_MMA_CASE(ID, BM_, BN_, WM_, WN_, PW_, ST_) case ID: \
             TORCH_CHECK(cs % BM_ == 0, "blockscale tensor-core ele: cs_block_size % BM"); \
-            launch_cfg<BM_, BN_, WM_, WN_, PW_, ST_, TP>(eflows, emars, nflows, nmars, params, ext, chids, ebase, pbase, \
-                gate, grad, gpart, scratch, b, bsk, cs, knt, nblk, split, upb, gate_sh, (long)ext_base); \
+            if constexpr (std::is_same<TP, __nv_bfloat16>::value) { \
+                if (hp) launch_cfg<BM_, BN_, WM_, WN_, PW_, ST_, true, TP>(eflows, emars, nflows, nmars, params, ext, chids, \
+                    ebase, pbase, gate, grad, gpart, scratch, b, bsk, cs, knt, nblk, split, upb, gate_sh, (long)ext_base); \
+                else launch_cfg<BM_, BN_, WM_, WN_, PW_, ST_, false, TP>(eflows, emars, nflows, nmars, params, ext, chids, \
+                    ebase, pbase, gate, grad, gpart, scratch, b, bsk, cs, knt, nblk, split, upb, gate_sh, (long)ext_base); \
+            } else { /* fp32 parameters: the form is split already */ \
+                launch_cfg<BM_, BN_, WM_, WN_, PW_, ST_, false, TP>(eflows, emars, nflows, nmars, params, ext, chids, \
+                    ebase, pbase, gate, grad, gpart, scratch, b, bsk, cs, knt, nblk, split, upb, gate_sh, (long)ext_base); \
+            } \
             break;
             BS_ELE_MMA_CONFIGS(BS_ELE_MMA_CASE)
 #undef BS_ELE_MMA_CASE
@@ -480,14 +495,16 @@ void blockscale_sb_ele_backward_mma(torch::Tensor eflows, torch::Tensor emars, t
 }
 
 // whether config `cfg` runs a child block of `cs_block_size` under gates of `gate_cbs` (its rows divide the block, its
-// gates a tile within MAX_GATES, its shared memory within the cap) for fp32 (`fp32`) or bf16 parameters
-bool blockscale_sb_ele_mma_fits(int64_t cfg, bool fp32, int64_t cs_block_size, int64_t gate_cbs) {
+// gates a tile within MAX_GATES, its shared memory within the cap) for fp32 (`fp32`) or bf16 parameters, in the
+// high-precision form (`hp`) or not
+bool blockscale_sb_ele_mma_fits(int64_t cfg, bool fp32, int64_t cs_block_size, int64_t gate_cbs, bool hp) {
     if (gate_cbs <= 0 || (gate_cbs & (gate_cbs - 1)) || cs_block_size % gate_cbs) return false;
     switch (cfg) {
 #define BS_ELE_MMA_FITS(ID, BM_, BN_, WM_, WN_, PW_, ST_) case ID: { \
             const int ng = BM_ / gate_cbs > 0 ? (int)(BM_ / gate_cbs) : 1; \
             if (cs_block_size % BM_ || ng > MAX_GATES) return false; \
-            return (fp32 ? cfg_smem<BM_, BN_, ST_, true>(ng) : cfg_smem<BM_, BN_, ST_, false>(ng)) <= SMEM_CAP; }
+            return (fp32 ? cfg_smem<BM_, BN_, ST_, true, true>(ng) \
+                         : hp ? cfg_smem<BM_, BN_, ST_, false, true>(ng) : cfg_smem<BM_, BN_, ST_, false, false>(ng)) <= SMEM_CAP; }
         BS_ELE_MMA_CONFIGS(BS_ELE_MMA_FITS)
 #undef BS_ELE_MMA_FITS
         default: return false;
@@ -506,5 +523,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("blockscale_sb_ele_backward_mma", &blockscale_sb_ele_backward_mma,
           "small-batch block-scale element backward on tensor cores (per-tile stabilizers, online merge under the gates)");
     m.def("blockscale_sb_ele_mma_configs", &blockscale_sb_ele_mma_configs, "(BM, BN) per config id");
-    m.def("blockscale_sb_ele_mma_fits", &blockscale_sb_ele_mma_fits, "whether a config runs this block / gate / dtype");
+    m.def("blockscale_sb_ele_mma_fits", &blockscale_sb_ele_mma_fits, "whether a config runs this block / gate / dtype / form");
 }

@@ -703,17 +703,17 @@ class _BackwardMixin:
                 plan["sb"] = (ebase.contiguous(), pbase.contiguous())
                 kinds += [("sb", c) for c in range(len(sb_mod.blockscale_sb_ele_configs()))]
 
-            # The tensor-core small-batch fork (kernels/c/blockscale_smallbatch_ele_mma.cu), batch 16 .. 63: per 64-parent
-            # tile a tensor-core product under the tile's own stabilizer, folded in under its parent block's gates (bf16
-            # parameters exact, fp32 ones as hi + lo halves), on 64-parent tile tables: the layer's own where its tile
-            # is 64 parents of one group, else cut from the full walk -- a tile is `pinc` groups of tk / pinc parents,
+            # The tensor-core small-batch fork (kernels/c/blockscale_smallbatch_ele_mma.cu), batch below 64 (below 16 its
+            # high-precision form): per 64-parent tile a tensor-core product under the tile's own stabilizer, folded in
+            # under its parent block's gates (bf16 parameters exact, fp32 ones as hi + lo halves), on 64-parent tile
+            # tables: the layer's own where its tile is 64 parents of one group, else cut from the full walk -- a tile is `pinc` groups of tk / pinc parents,
             # each group contiguous rows of one parent block (the walk's structure), so each splits into 64s where its
             # width is a multiple of 64 (at batch 16 the layer's tile is 128). Parent blocks of whole 64-tiles; the
             # 16-byte loads of bf16 parameters aligned at every base; child tiles, gates a tile and shared memory
             # `blockscale_sb_ele_mma_arms`'.
             ne_eff = knt * tk
             w = tk // pinc if tk % pinc == 0 else 0
-            if (16 <= batch < 64 and w > 0 and w % 64 == 0 and blk % 64 == 0 and ne_eff % blk == 0
+            if (batch < 64 and w > 0 and w % 64 == 0 and blk % 64 == 0 and ne_eff % blk == 0
                     and n_ngates_ == 1):
                 arms = _mod("c").blockscale_sb_ele_mma_arms(cbs, blk, batch, ne_eff, chids.numel(), gate_cbs,
                                                             ctx["params"].dtype == torch.float32)
@@ -860,7 +860,7 @@ class _BackwardMixin:
                 rk, tpb = (ne64 // 64) // split, blk // 64
                 gp_shape = chids.numel() * cbs * (ne64 // blk) * (tpb // rk if rk < tpb else 1) * batch
                 # the ranges' partials: (L, R) per (range, element, padded column); one buffer a plan, as the shares
-                bn = sbm_mod.blockscale_sb_ele_mma_configs()[code & 255][1]
+                bn = sbm_mod.blockscale_sb_ele_mma_configs()[code & 127][1]
                 scr_n = 2 * split * chids.numel() * cbs * (-(-batch // bn) * bn) if split > 1 else 0
 
                 def run(tgt, node_flows, node_mars, element_mars, params, ext, grad):

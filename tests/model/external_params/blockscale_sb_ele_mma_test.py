@@ -3,7 +3,8 @@ The tensor-core small-batch block-scale element-flow backward (kernels/c/blocksc
 tile a product under the tile's own stabilizer, folded in under the parent block's gates) against float64 -- the
 element flows and d LL / d log phi at every arm the dispatch offers a layer (config x split: ranges of whole parent
 blocks and ranges slicing one), the gradient on and off,
-on each gated layer's real inputs captured from a backward: batches 16 to 63 (partial batch tiles), parent blocks of 64
+on each gated layer's real inputs captured from a backward: batches 1 to 63 (partial batch tiles; below 16 the
+high-precision form, held to the fp32 bar), parent blocks of 64
 to 1024 (one to sixteen tiles a block), one to sixteen gates a child tile and gates wider than the child block; fp32
 parameters (hi + lo operands) and bf16 ones; log-gates -inf in places and in whole columns, children -inf; padded
 (phantom k-tiles), block-sparse and two-node layers. Then the plan: a backward taking the fork gives the Triton fork's
@@ -25,8 +26,9 @@ NEG = -float("inf")
 DTYPES = {"fp32": torch.float32, "bf16": torch.bfloat16}
 CATS = 16
 # element flows (log space, absolute) and gradients (relative to the largest) against float64: bf16 parameters are
-# exact and the exponentials one bf16 (2^-9 a term); fp32 parameters both operands hi + lo (~2^-16)
-TOL = {"bf16": 2.5e-3, "fp32": 1e-4}
+# exact and the exponentials one bf16 (2^-9 a term); fp32 parameters both operands hi + lo (~2^-16), and so the
+# high-precision form's exponentials ("hp", code bit 7: below batch 16)
+TOL = {"bf16": 2.5e-3, "fp32": 1e-4, "hp": 1e-4}
 
 
 def _ext():
@@ -104,6 +106,13 @@ CASES = [
     ("pad_big_fp32", lambda: _topology(PAD_BIG, 128, 64, 16, n_ch = 8), "fp32", 24, True, False),
     ("sparse_fp32", lambda: _topology(SPARSE, 64, 64, 8), "fp32", 31, True, False),
     ("two_nodes_bf16", lambda: _two(8), "bf16", 50, True, False),
+    # below 16: the high-precision form
+    ("hmm1024x16_g32_bf16_b4", lambda: _hmm(1024, 16, 32), "bf16", 4, True, False),
+    ("hmm1024x4_g128_fp32_b7", lambda: _hmm(1024, 4, 128), "fp32", 7, True, True),
+    ("hmm4096x4_g8_bf16_b8", lambda: _hmm(4096, 4, 8, T = 3), "bf16", 8, True, False),
+    ("pad_bf16_b1", lambda: _topology(PAD, 64, 64, 8), "bf16", 1, False, False),
+    ("sparse_bf16_b15", lambda: _topology(SPARSE, 64, 64, 8), "bf16", 15, True, True),
+    ("two_nodes_bf16_b13", lambda: _two(8), "bf16", 13, True, False),
 ]
 
 
@@ -235,8 +244,9 @@ def test_every_arm_matches_float64(name, builder, dt, B, neg_gates, neg_children
         rows = ~torch.isnan(ref_ef).all(1)
         arms = ext_c.blockscale_sb_ele_mma_arms(cbs, blk, batch, ne, chids.numel(), gc, prm.dtype == torch.float32)
         assert arms, f"{name}: no arm serves the layer"
-        tol = TOL["fp32" if prm.dtype == torch.float32 else "bf16"]
+        assert all(bool(code & 128) == (batch < 16) for code in arms), f"{name}: the high-precision form iff below 16"
         for code in arms:
+            tol = TOL["hp" if code & 128 else "fp32" if prm.dtype == torch.float32 else "bf16"]
             for write_grad in (1, 0):
                 ef = torch.full_like(tgt, NAN)
                 g = torch.zeros_like(ext) if write_grad else ext.new_empty(0)
@@ -245,8 +255,8 @@ def test_every_arm_matches_float64(name, builder, dt, B, neg_gates, neg_children
                 real(ef, em, nf, nm, prm, ext, chids, ebase, pbase, gate, g, gpart, ext.new_empty(0), batch, blk, cbs,
                      ne, gc, ext_base, code)
                 torch.cuda.synchronize()
-                what = (f"{name}: config {code & 255} {tuple(mod.blockscale_sb_ele_mma_configs()[code & 255])} split "
-                        f"{code >> 8} (gradient {'on' if write_grad else 'off'})")
+                what = (f"{name}: config {code & 127} {tuple(mod.blockscale_sb_ele_mma_configs()[code & 127])}"
+                        f"{' hp' if code & 128 else ''} split {code >> 8} (gradient {'on' if write_grad else 'off'})")
                 r, y = ref_ef[rows], ef[rows].double()
                 known = ~torch.isnan(r)
                 assert not torch.isnan(y[known]).any(), f"{what}: NaN element flows"
@@ -273,6 +283,7 @@ PLAN_CASES = [
     ("hmm1024x4_g128_fp32", lambda: _hmm(1024, 4, 128), "fp32", 33, False, True),
     ("pad_big_fp32", lambda: _topology(PAD_BIG, 128, 64, 16, n_ch = 8), "fp32", 24, False, False),
     ("two_nodes_bf16", lambda: _two(8), "bf16", 16, False, False),
+    ("hmm1024x16_g32_bf16_b8", lambda: _hmm(1024, 16, 32), "bf16", 8, False, False),   # the high-precision form
 ]
 
 
@@ -316,7 +327,6 @@ def test_a_backward_taking_it_matches_triton(name, builder, dt, B, neg_gates, ne
 
 @needs_kernels
 @pytest.mark.parametrize("label,builder,B", [
-    ("batch 8", lambda: _hmm(256, 4, 16), 8),                             # below 16: the fp32 small-batch forks
     ("batch 64", lambda: _hmm(256, 4, 16), 64),
     ("parent blocks of 32", lambda: _topology(PAD, 32, 64, 8), 32),      # a 64-parent tile spans two blocks
     ("child blocks of 32", lambda: _topology(PAD, 64, 32, 8), 32),       # under the smallest child tile

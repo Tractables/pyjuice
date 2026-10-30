@@ -331,35 +331,36 @@ _bs_sb_mma_arms_cache = {}
 
 
 def blockscale_sb_mma_arms(block_size: int, batch_size: int, num_edges: int, n_blocks: int, node_cbs: int,
-                           row_contig: bool):
-    """The tensor-core small-batch block-scale forward's codes (config id | split << 8) for a partition shape: node
-    tiles dividing the block, batch tiles no wider than the narrowest that covers the batch, splits 1/2/4/8 within four
-    waves of the SMs (`pyjuice.layer.kernels.c.smallbatch_fw_mma_arms`' rule). Empty where it does not apply: batch
-    below 16 (fp32 there) or 64 or more, edges not whole 64-tiles, a row of edge blocks narrower than 64 that is not one
-    contiguous run."""
-    # Below batch 16 the gated path stays fp32 (the per-sample and batch-tiled kernels), as the tests hold it to; from 16
-    # the other gated forwards already use tensor-core precision
-    if batch_size < 16 or batch_size >= 64 or num_edges % 64 or not (row_contig or node_cbs % 64 == 0):
+                           row_contig: bool, fp32: bool):
+    """The tensor-core small-batch block-scale forward's codes (config id | HP << 7 | split << 8) for a partition shape:
+    node tiles dividing the block, batch tiles no wider than the narrowest that covers the batch, splits 1/2/4/8 within
+    four waves of the SMs (`pyjuice.layer.kernels.c.smallbatch_fw_mma_arms`' rule). Below batch 16 only the
+    high-precision form (every operand a bf16 hi + lo pair, ~2^-16 a term): the gated path's other forks there are fp32
+    (the per-sample and batch-tiled kernels), from 16 the other gated forwards already use tensor-core precision. Empty
+    where it does not apply: batch 64 or more, edges not whole 64-tiles, a row of edge blocks narrower than 64 that is
+    not one contiguous run."""
+    if batch_size >= 64 or num_edges % 64 or not (row_contig or node_cbs % 64 == 0):
         return []
     mod = get_sb_mma_module()
     if mod is None:
         return []
-    key = (block_size, batch_size, num_edges, n_blocks, torch.cuda.current_device())
+    key = (block_size, batch_size, num_edges, n_blocks, bool(fp32), torch.cuda.current_device())
     arms = _bs_sb_mma_arms_cache.get(key)
     if arms is not None:
         return arms
     from pyjuice.layer.kernels.c import _sms
     sms, knt = _sms(), num_edges // 64
     cover = min(bn for bn in (16, 32, 64) if bn >= batch_size)
+    hp = batch_size < 16
     arms = []
     for c, (bm, bn) in enumerate([(int(v[0]), int(v[1])) for v in mod.blockscale_sb_mma_configs()]):
-        if block_size % bm or bn > cover:
+        if block_size % bm or bn > cover or (hp and not mod.blockscale_sb_mma_hp_fits(c, bool(fp32))):
             continue
         tiles = n_blocks * (block_size // bm) * ((batch_size + bn - 1) // bn)
         for sp in (1, 2, 4, 8):
             if sp > knt or (sp > 1 and tiles * sp > 4 * sms):
                 continue
-            arms.append(c | (sp << 8))
+            arms.append(c | (128 if hp else 0) | (sp << 8))
     _bs_sb_mma_arms_cache[key] = arms
     return arms
 
@@ -400,12 +401,13 @@ _bs_sb_ele_mma_arms_cache = {}
 
 def blockscale_sb_ele_mma_arms(cs_block_size: int, block_size: int, batch_size: int, num_edges: int, n_blocks: int,
                                gate_cbs: int, fp32: bool):
-    """The tensor-core small-batch block-scale element backward's codes (config id | split << 8, `split` equal ranges of
-    the 64-parent tiles, each whole parent blocks or inside one): child tiles dividing the child block under at most 16
-    gates within the shared memory (`blockscale_sb_ele_mma_fits`), batch tiles no wider than the narrowest covering the
-    batch, splits 1/2/4/8/16 within four waves of the SMs. Empty where it does not apply: batch below 16 (fp32 there, as the gated forward) or 64 or more,
+    """The tensor-core small-batch block-scale element backward's codes (config id | HP << 7 | split << 8, `split` equal
+    ranges of the 64-parent tiles, each whole parent blocks or inside one): child tiles dividing the child block under
+    at most 16 gates within the shared memory (`blockscale_sb_ele_mma_fits`), batch tiles no wider than the narrowest
+    covering the batch, splits 1/2/4/8/16 within four waves of the SMs. Below batch 16 only the high-precision form
+    (bf16 parameters' exponentials hi + lo too), as the gated forward's. Empty where it does not apply: batch 64 or more,
     parent blocks not whole 64-tiles."""
-    if batch_size < 16 or batch_size >= 64 or block_size % 64 or num_edges % block_size:
+    if batch_size >= 64 or block_size % 64 or num_edges % block_size:
         return []
     mod = get_sb_ele_mma_module()
     if mod is None:
@@ -417,16 +419,17 @@ def blockscale_sb_ele_mma_arms(cs_block_size: int, block_size: int, batch_size: 
     from pyjuice.layer.kernels.c import _sms
     sms, knt, tpb = _sms(), num_edges // 64, block_size // 64
     cover = min(bn for bn in (16, 32, 64) if bn >= batch_size)
+    hp = batch_size < 16
     arms = []
     for c, (bm, bn) in enumerate([(int(v[0]), int(v[1])) for v in mod.blockscale_sb_ele_mma_configs()]):
-        if bn > cover or not mod.blockscale_sb_ele_mma_fits(c, bool(fp32), cs_block_size, gate_cbs):
+        if bn > cover or not mod.blockscale_sb_ele_mma_fits(c, bool(fp32), cs_block_size, gate_cbs, hp):
             continue
         tiles = n_blocks * (cs_block_size // bm) * ((batch_size + bn - 1) // bn)
         for sp in (1, 2, 4, 8, 16):
             rk = knt // sp
             if knt % sp or not (rk % tpb == 0 or tpb % rk == 0) or (sp > 1 and tiles * sp > 4 * sms):
                 continue
-            arms.append(c | (sp << 8))
+            arms.append(c | (128 if hp else 0) | (sp << 8))
     _bs_sb_ele_mma_arms_cache[key] = arms
     return arms
 

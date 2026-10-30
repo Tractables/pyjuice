@@ -23,7 +23,10 @@
 // gate is -1: its terms are 0 in N and Z alike (its dummy children and parameters are read and multiplied by 0).
 //
 // Numerically: bf16 operands (the exponentials and the parameters), fp32 accumulation -- the class of the other
-// tensor-core block-scale forwards; N and Z share the parameter rounding.
+// tensor-core block-scale forwards; N and Z share the parameter rounding. The HIGH-PRECISION form (`HP`, code bit 7:
+// what batches below 16 run, where the gated path's other forks are fp32) splits every operand into a bf16 hi + lo pair
+// -- B_N as B_Z, fp32 parameters too (bf16 ones are exact) -- each product the hi.hi term plus the two cross terms
+// (~2^-16 a term), within fewer stages where the lo halves do not fit (`FwSmem`).
 
 #include <torch/extension.h>
 #include "../../../../layer/kernels/c/param_load.cuh"
@@ -51,7 +54,20 @@ template <int N> __device__ __forceinline__ void cpa_wait() { asm volatile("cp.a
 
 extern __shared__ char smem_raw[];
 
-template <int BM, int BN, int WM, int WN, int PW, int ST, typename TP>
+#define SMEM_CAP (99 * 1024)                           // sm_120's dynamic shared memory a block
+
+// A config's shared memory: per stage A (BM, BK) and B_N, B_Z, B_Z's lo half (BN, BK); HP adds B_N's lo half, and with
+// fp32 parameters A's. The stages: ST, fewer where they do not fit (0: the form does not run this config).
+template <int BM, int BN, int PW, int ST, bool HP, bool BF16> struct FwSmem {
+    static constexpr int A = BM * BK * 2, B = BN * BK * 2;
+    static constexpr int STAGE = A * ((HP && !BF16) ? 2 : 1) + B * (HP ? 4 : 3);
+    static constexpr int TAIL = (2 * BN + 2 * PW * BN) * 4;
+    static constexpr int stages(int s) { return s < 2 ? 0 : (s * STAGE + TAIL <= SMEM_CAP ? s : stages(s - 1)); }
+    static constexpr int NST = stages(ST);
+    static constexpr int BYTES = NST * STAGE + TAIL;
+};
+
+template <int BM, int BN, int WM, int WN, int PW, int ST_, bool HP, typename TP>
 __global__ void __launch_bounds__((WM * WN + PW) * 32) bs_sbmma_kernel(
         float* __restrict__ node_mars, const float* __restrict__ element_mars, const TP* __restrict__ params,
         const float* __restrict__ ext, const long* __restrict__ nids, const long* __restrict__ cids,
@@ -60,7 +76,10 @@ __global__ void __launch_bounds__((WM * WN + PW) * 32) bs_sbmma_kernel(
         int node_cbs, int node_sh, int gate_sh, int gate_stride, int n_eblks, long ext_base, int row_contig) {
     constexpr int NC = WM * WN * 32, NP = PW * 32, NTH = NC + NP;
     constexpr bool BF16 = std::is_same<TP, __nv_bfloat16>::value;
-    static_assert(BN % 8 == 0 && BN <= 64 && 2 * ST + 1 <= 15, "columns; named barriers (15 is the producers' own)");
+    constexpr bool SPA = HP && !BF16;                                    // fp32 parameters' lo half too
+    using SM = FwSmem<BM, BN, PW, ST_, HP, BF16>;
+    constexpr int ST = SM::NST;
+    static_assert(ST >= 2 && BN % 8 == 0 && BN <= 64 && 2 * ST + 1 <= 15, "stages; columns; named barriers (15 is the producers' own)");
     const int mtiles = block_size / BM;
     const int pid_b = blockIdx.x, pid_m = blockIdx.y, sp = blockIdx.z;
     const int nb = pid_m / mtiles, row_off = (pid_m % mtiles) * BM;
@@ -87,17 +106,20 @@ __global__ void __launch_bounds__((WM * WN + PW) * 32) bs_sbmma_kernel(
         return gb >= 0 ? gb + ext_base + d : -1;
     };
 
-    // smem: A (BM, BK) MN-major swizzled; B_N and B_Z (BN, BK) K-major; then the range maxima (M_N, M_Z per column) and
-    // the producer warps' partial maxima. No static shared memory (it would shift this buffer off its alignment).
+    // smem: A (BM, BK) MN-major swizzled; B_N and B_Z (BN, BK) K-major (B_Z's lo half; HP: B_N's, then A's); then the
+    // range maxima (M_N, M_Z per column) and the producer warps' partial maxima. No static shared memory (it would shift
+    // this buffer off its alignment).
     auto swz = composition(Swizzle<3, 3, 3>{}, Layout<Shape<_64, _8>, Stride<_1, _64>>{});
     auto sAl = tile_to_shape(swz, make_shape(Int<BM>{}, Int<BK>{}));
     auto swzK = composition(Swizzle<3, 3, 3>{}, Layout<Shape<_8, _64>, Stride<_64, _1>>{});
     auto sBl = tile_to_shape(swzK, make_shape(Int<BN>{}, Int<BK>{}));
-    constexpr int STAGE = BM * BK * 2 + 3 * BN * BK * 2;
+    constexpr int STAGE = SM::STAGE;
     auto stA = [&](int s) { return (bfloat16_t*)(smem_raw + s * STAGE); };
     auto stBn = [&](int s) { return (bfloat16_t*)(smem_raw + s * STAGE + BM * BK * 2); };
     auto stBz = [&](int s) { return (bfloat16_t*)(smem_raw + s * STAGE + BM * BK * 2 + BN * BK * 2); };
     auto stBz2 = [&](int s) { return (bfloat16_t*)(smem_raw + s * STAGE + BM * BK * 2 + 2 * BN * BK * 2); };
+    auto stBn2 = [&](int s) { return (bfloat16_t*)(smem_raw + s * STAGE + BM * BK * 2 + 3 * BN * BK * 2); };
+    auto stA2 = [&](int s) { return (bfloat16_t*)(smem_raw + s * STAGE + BM * BK * 2 + 4 * BN * BK * 2); };
     float* sMn = (float*)(smem_raw + ST * STAGE);                       // [BN]
     float* sMz = sMn + BN;                                               // [BN]
     float* sMp = sMz + BN;                                               // [2 x PW x BN] the warps' partial maxima
@@ -247,6 +269,14 @@ __global__ void __launch_bounds__((WM * WN + PW) * 32) bs_sbmma_kernel(
                     bfloat16_t r[4] = {static_cast<bfloat16_t>(ra[q].x), static_cast<bfloat16_t>(ra[q].y),
                                        static_cast<bfloat16_t>(ra[q].z), static_cast<bfloat16_t>(ra[q].w)};
                     *(uint2*)&sAt(mm, e) = *(const uint2*)r;
+                    if constexpr (SPA) {
+                        Tensor sAt2 = make_tensor(make_smem_ptr(stA2(s)), sAl);
+                        bfloat16_t r2[4] = {static_cast<bfloat16_t>(ra[q].x - static_cast<float>(r[0])),
+                                            static_cast<bfloat16_t>(ra[q].y - static_cast<float>(r[1])),
+                                            static_cast<bfloat16_t>(ra[q].z - static_cast<float>(r[2])),
+                                            static_cast<bfloat16_t>(ra[q].w - static_cast<float>(r[3]))};
+                        *(uint2*)&sAt2(mm, e) = *(const uint2*)r2;
+                    }
                 }
                 if (t + 1 < knt) load_fp32(t + 1);
             }
@@ -255,11 +285,13 @@ __global__ void __launch_bounds__((WM * WN + PW) * 32) bs_sbmma_kernel(
                 const int i = ptid + q * NP, c = i / (BK / 8), e8 = (i % (BK / 8)) * 8;
                 if (i >= CH) continue;
                 const float Mn = Mnc[q], Mz = Mzc[q];
-                __align__(16) bfloat16_t un[8], uz[8], uz2[8];
+                __align__(16) bfloat16_t un[8], uz[8], uz2[8], un2[8];
                 CUTE_UNROLL
                 for (int j = 0; j < 8; j++) {
                     const float l = lv[q][j], a = xv[q][j] + l;
-                    un[j] = static_cast<bfloat16_t>((Mn == -INFINITY || a == -INFINITY) ? 0.f : __expf(a - Mn));
+                    const float v = (Mn == -INFINITY || a == -INFINITY) ? 0.f : __expf(a - Mn);
+                    un[j] = static_cast<bfloat16_t>(v);
+                    if constexpr (HP) un2[j] = static_cast<bfloat16_t>(v - static_cast<float>(un[j]));
                     const float w = (Mz == -INFINITY || l == -INFINITY) ? 0.f : __expf(l - Mz);
                     uz[j] = static_cast<bfloat16_t>(w);
                     uz2[j] = static_cast<bfloat16_t>(w - static_cast<float>(uz[j]));
@@ -267,6 +299,10 @@ __global__ void __launch_bounds__((WM * WN + PW) * 32) bs_sbmma_kernel(
                 *(uint4*)&sBn(c, e8) = *(const uint4*)un;
                 *(uint4*)&sBz(c, e8) = *(const uint4*)uz;
                 *(uint4*)&sBz2(c, e8) = *(const uint4*)uz2;
+                if constexpr (HP) {
+                    Tensor sBn2 = make_tensor(make_smem_ptr(stBn2(s)), sBl);
+                    *(uint4*)&sBn2(c, e8) = *(const uint4*)un2;
+                }
             }
             if (t + 1 < knt) load_x(t + 1);
         };
@@ -298,6 +334,10 @@ __global__ void __launch_bounds__((WM * WN + PW) * 32) bs_sbmma_kernel(
     Tensor tXrA = s2rA.get_thread_slice(tid).retile_D(tCrA);
     Tensor tXrBn = s2rB.get_thread_slice(tid).retile_D(tCrBn);
     Tensor tXrBz = s2rB.get_thread_slice(tid).retile_D(tCrBz);
+    Tensor tCrA2 = thr.partition_fragment_A(sAt0);                      // HP: the lo halves
+    Tensor tCrB2 = thr.partition_fragment_B(sBt0);
+    Tensor tXrA2 = s2rA.get_thread_slice(tid).retile_D(tCrA2);
+    Tensor tXrB2 = s2rB.get_thread_slice(tid).retile_D(tCrB2);
     Tensor cC = make_identity_tensor(Shape<Int<BM>, Int<BN>>{});
     Tensor tCcC = thr.partition_C(cC);
     Tensor tCrN = thr.partition_fragment_C(cC);
@@ -313,10 +353,27 @@ __global__ void __launch_bounds__((WM * WN + PW) * 32) bs_sbmma_kernel(
         copy(s2rA, s2rA.get_thread_slice(tid).partition_S(sAt), tXrA);
         copy(s2rB, s2rB.get_thread_slice(tid).partition_S(sBn), tXrBn);
         copy(s2rB, s2rB.get_thread_slice(tid).partition_S(sBz), tXrBz);
-        cute::gemm(mma, tCrA, tCrBn, tCrN);
-        cute::gemm(mma, tCrA, tCrBz, tCrZ);
-        copy(s2rB, s2rB.get_thread_slice(tid).partition_S(sBz2), tXrBz);
-        cute::gemm(mma, tCrA, tCrBz, tCrZ);
+        if constexpr (HP) {
+            // the small terms first: (fp32 parameters) lo.hi, then hi.lo, then hi.hi
+            if constexpr (SPA) {
+                Tensor sAt2 = make_tensor(make_smem_ptr(stA2(s)), sAl);
+                copy(s2rA, s2rA.get_thread_slice(tid).partition_S(sAt2), tXrA2);
+                cute::gemm(mma, tCrA2, tCrBn, tCrN);
+                cute::gemm(mma, tCrA2, tCrBz, tCrZ);
+            }
+            Tensor sBn2 = make_tensor(make_smem_ptr(stBn2(s)), sBl);
+            copy(s2rB, s2rB.get_thread_slice(tid).partition_S(sBn2), tXrB2);
+            cute::gemm(mma, tCrA, tCrB2, tCrN);
+            copy(s2rB, s2rB.get_thread_slice(tid).partition_S(sBz2), tXrB2);
+            cute::gemm(mma, tCrA, tCrB2, tCrZ);
+            cute::gemm(mma, tCrA, tCrBn, tCrN);
+            cute::gemm(mma, tCrA, tCrBz, tCrZ);
+        } else {
+            cute::gemm(mma, tCrA, tCrBn, tCrN);
+            cute::gemm(mma, tCrA, tCrBz, tCrZ);
+            copy(s2rB, s2rB.get_thread_slice(tid).partition_S(sBz2), tXrBz);
+            cute::gemm(mma, tCrA, tCrBz, tCrZ);
+        }
         if (kt + ST < knt) bar_arrive(1 + ST + s, NTH);
     }
     CUTE_UNROLL
@@ -370,14 +427,14 @@ __global__ void bs_merge_kernel(float* __restrict__ node_mars, float* __restrict
     if (log_z_out != nullptr) log_z_out[row * (long)batch + b] = lz;
 }
 
-template <int BM, int BN, int WM, int WN, int PW, int ST, typename TP>
+template <int BM, int BN, int WM, int WN, int PW, int ST, bool HP, typename TP>
 static void launch_cfg(torch::Tensor node_mars, torch::Tensor element_mars, torch::Tensor params, torch::Tensor ext,
                        torch::Tensor nids, torch::Tensor cids, torch::Tensor pids, torch::Tensor gate, torch::Tensor log_z,
                        int batch, int block_size, int knt, int split, int node_cbs, int node_sh, int gate_sh,
                        long ext_base, int row_contig) {
     constexpr int NTH = (WM * WN + PW) * 32;
-    constexpr int smem = ST * (BM * BK * 2 + 3 * BN * BK * 2) + (2 * BN + 2 * PW * BN) * 4;
-    auto kernel = bs_sbmma_kernel<BM, BN, WM, WN, PW, ST, TP>;
+    constexpr int smem = FwSmem<BM, BN, PW, ST, HP, std::is_same<TP, __nv_bfloat16>::value>::BYTES;
+    auto kernel = bs_sbmma_kernel<BM, BN, WM, WN, PW, ST, HP, TP>;
     static bool attr_set[64] = {};
     int dev = 0;
     C10_CUDA_CHECK(cudaGetDevice(&dev));
@@ -422,14 +479,15 @@ static void launch_cfg(torch::Tensor node_mars, torch::Tensor element_mars, torc
     X(0, 128, 16, 4, 1, 4, 3) X(1, 64, 16, 2, 1, 4, 4) X(2, 128, 32, 4, 1, 4, 3) X(3, 64, 32, 2, 1, 4, 4) \
     X(4, 128, 16, 4, 1, 8, 3) X(5, 128, 64, 4, 2, 4, 2) X(6, 64, 64, 2, 2, 4, 3)
 
-// The per-sample kernel's arguments (`blockscale_sb_forward`), `cfg` = config id | split << 8 last.
+// The per-sample kernel's arguments (`blockscale_sb_forward`), `cfg` = config id | HP << 7 | split << 8 last.
 void blockscale_sb_forward_mma(torch::Tensor node_mars, torch::Tensor element_mars, torch::Tensor params,
                                torch::Tensor ext, torch::Tensor nids, torch::Tensor cids, torch::Tensor pids,
                                torch::Tensor gate, torch::Tensor log_z, int64_t block_size, int64_t num_edges,
                                int64_t node_cbs, int64_t gate_cbs, int64_t ext_base, int64_t row_contig, int64_t cfg) {
     const int batch = node_mars.size(1);
     const int split = cfg >> 8 ? (int)(cfg >> 8) : 1;
-    cfg &= 255;
+    const bool hp = (cfg & 128) != 0;
+    cfg &= 127;
     const int bs = (int)block_size, ne = (int)num_edges, ncbs = (int)node_cbs, gcbs = (int)gate_cbs;
     TORCH_CHECK(batch >= 1 && batch < 64, "blockscale tensor-core small-batch forward: batch in [1, 64)");
     TORCH_CHECK(ne % BK == 0, "blockscale tensor-core small-batch forward: num_edges must be whole tiles of ", BK);
@@ -447,15 +505,33 @@ void blockscale_sb_forward_mma(torch::Tensor node_mars, torch::Tensor element_ma
         switch (cfg) {
 #define BS_SBMMA_CASE(ID, BM_, BN_, WM_, WN_, PW_, ST_) case ID: \
             TORCH_CHECK(bs % BM_ == 0, "blockscale tensor-core small-batch forward: block_size % BM"); \
-            launch_cfg<BM_, BN_, WM_, WN_, PW_, ST_, TP>(node_mars, element_mars, params, ext, nids, cids, pids, gate, log_z, \
-                                                         batch, bs, knt, split, ncbs, node_sh, gate_sh, (long)ext_base, \
-                                                         (int)row_contig); break;
+            if (!hp) { \
+                launch_cfg<BM_, BN_, WM_, WN_, PW_, ST_, false, TP>(node_mars, element_mars, params, ext, nids, cids, pids, \
+                    gate, log_z, batch, bs, knt, split, ncbs, node_sh, gate_sh, (long)ext_base, (int)row_contig); \
+            } else if constexpr (BN_ == 16 && FwSmem<BM_, BN_, PW_, ST_, true, std::is_same<TP, __nv_bfloat16>::value>::NST >= 2) { \
+                launch_cfg<BM_, BN_, WM_, WN_, PW_, ST_, true, TP>(node_mars, element_mars, params, ext, nids, cids, pids, \
+                    gate, log_z, batch, bs, knt, split, ncbs, node_sh, gate_sh, (long)ext_base, (int)row_contig); \
+            } else { \
+                TORCH_CHECK(false, "blockscale tensor-core small-batch forward: no high-precision form of cfg ", cfg); \
+            } break;
             BS_SBMMA_CONFIGS(BS_SBMMA_CASE)
 #undef BS_SBMMA_CASE
             default: TORCH_CHECK(false, "blockscale tensor-core small-batch forward: invalid cfg ", cfg);
         }
     };
     if (params.scalar_type() == torch::kBFloat16) run(__nv_bfloat16{}); else run(float{});
+}
+
+// Whether config `cfg` has a high-precision form for these parameters (instantiated for the 16-column tiles, the
+// batches below 16 it serves; within the shared memory).
+bool blockscale_sb_mma_hp_fits(int64_t cfg, bool fp32) {
+    switch (cfg) {
+#define BS_SBMMA_HPFITS(ID, BM_, BN_, WM_, WN_, PW_, ST_) case ID: \
+        return BN_ == 16 && (fp32 ? FwSmem<BM_, BN_, PW_, ST_, true, false>::NST : FwSmem<BM_, BN_, PW_, ST_, true, true>::NST) >= 2;
+        BS_SBMMA_CONFIGS(BS_SBMMA_HPFITS)
+#undef BS_SBMMA_HPFITS
+        default: return false;
+    }
 }
 
 std::vector<std::vector<int64_t>> blockscale_sb_mma_configs() {
@@ -470,4 +546,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("blockscale_sb_forward_mma", &blockscale_sb_forward_mma,
           "small-batch block-scale forward on tensor cores (log N - log Z, both as products of the parameter tile)");
     m.def("blockscale_sb_mma_configs", &blockscale_sb_mma_configs, "(BM, BN) per config id");
+    m.def("blockscale_sb_mma_hp_fits", &blockscale_sb_mma_hp_fits, "whether a config has a high-precision form");
 }
