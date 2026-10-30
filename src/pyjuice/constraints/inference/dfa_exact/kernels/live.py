@@ -610,8 +610,10 @@ def _stored_support_kernel(table, row, stride, nodes, class_of_stored, allowed, 
     tl.store(allowed + (b * n + t) * C + c, hit.to(tl.int8), mask = cm)
 
 
-#: the input nodes and the stored classes a program of :func:`_stored_support_kernel` reads at a time
-SUPPORT_TILE_NODES = 32
+#: the input nodes a program of :func:`_stored_support_kernel` reads at a time (with every stored class), its warps
+#: (MEASURED, Codpula-4096 x JSON hard_0 B8: class_support 1.59 ms at 32 nodes -- ncu: 108 registers, 29% occupancy,
+#: bound by its loads' latency -- 1.14 at 16; 8 / 4 nodes 1.18 / 1.16, 8 warps 1.15-1.18; the read's floor ~0.86)
+SUPPORT_TILE_NODES = 16
 SUPPORT_WARPS = 4
 
 

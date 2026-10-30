@@ -51,13 +51,16 @@ MASS_TILES = dict(TU = 32, TN = 32, TV = 64)
 MASS_PROGRAMS = 1024
 #: ... and keeps every split's partial sums only while they take at most this many floats (beyond, fewer splits)
 MASS_PARTIAL_BUDGET = 1 << 26
-#: the top-k pass's tiles (:func:`_topk_kernel`): rows of the parameter table, candidates a step, classes a fill.
+#: the top-k pass's tiles (:func:`_topk_kernel`): rows of the parameter table, candidates a step, classes a fill, warps.
 #: MEASURED (Codpula-4096 x JSON hard_0 B8, LLaDA vocabulary: 75 stored classes, a column's 1024 candidates in ~16 of
 #: them, 744 in the largest): every stored class's candidates summed on their own (sorted by class, a class's run a
 #: sum) take one multiply-add a candidate and row; the one-hot product over a tile of 64 classes this replaced (until
 #: 2026-10-30) multiplied every candidate's probabilities by the whole tile -- 18 G instructions, 203 registers,
-#: 46.8 ms under ncu, against 6.2.
-TOPK_TILES = dict(TU = 32, TK = 64, TF = 32)
+#: 46.8 ms under ncu, against 6.2. At 4 warps (ncu: 80 registers, 50% occupancy, the candidates' sum across the
+#: warps through shared memory with 48 M bank conflicts of 82 M wavefronts) 7.25 ms on the launch's captured inputs; at
+#: 2 warps 4.32 (fill 32: 4.40; candidates 32 / 128: 5.55 / 6.18; 1 warp 5.23, 128 candidates 4.61). The sums' order
+#: follows the tile: the masses move within fp32 rounding (7.6e-6 at most there).
+TOPK_TILES = dict(TU = 32, TK = 64, TF = 16, warps = 2)
 
 
 def check_inputs(layer, inputs: dict):
@@ -223,7 +226,7 @@ def _topk_masses(layer, classes, inputs, ev, ids, shift, st, out, logz):
             table, table if table_t is None else table_t, table.size(0), ev, ids, shift, bounds, st["rows"], cols, tiles,
             st["pair_index"], out, logz, shift if vm is None else vm, 0 if vm is None or vm.size(0) == 1 else Vl,
             num_cats, K, Vl, st["num_pairs"], C, first, TRANSPOSED = table_t is not None, VM = vm is not None,
-            TU = cfg["TU"], TK = cfg["TK"], TF = cfg["TF"], num_warps = 4)
+            TU = cfg["TU"], TK = cfg["TK"], TF = cfg["TF"], num_warps = cfg["warps"])
 
 
 @triton_jit
