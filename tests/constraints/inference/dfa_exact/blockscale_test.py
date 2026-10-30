@@ -321,10 +321,10 @@ def test_gates_far_from_the_values(node_gate, child_gate):
 @pytest.mark.parametrize("kind", ["hmm", "hmm_block_sparse", "pd"])
 def test_log_normalizers_against_float64(kind, child_gate, node_gate, build_pc, reference):
     """Every gated node's log Z of every sample (``block_scale.log_normalizers``) against ``log sum_c w[n, c]
-    phi_b[gate(n, c)]`` in float64, straight from the weights: gates N(0, 2^2), every other child gate 200 nats up,
-    and -- where a gate row has a gate its nodes have no edge in (block-sparse sums) -- that gate 1000 nats above the
-    row's others, so the nodes' Z is 1000 nats below the row's largest gate: a sum that underflows even in float64,
-    computed exactly."""
+    phi_b[gate(n, c)]`` in float64, straight from the weights, within the normalizers' error bound
+    (``block_scale.logz_error_bound``): gates N(0, 2^2), every other child gate 200 nats up, and -- where a gate row
+    has a gate its nodes have no edge in (block-sparse sums) -- that gate 1000 nats above the row's others, so the
+    nodes' Z is 1000 nats below the row's largest gate: a sum that underflows even in float64, computed exactly."""
     from pyjuice.constraints.inference.dfa_exact.external_params import block_scale
     pc = gated_pc(build_pc, kind, child_gate = child_gate, node_gate = node_gate)
     layout = jc.compile(jc.DFA.anything(V), pc).backend.program().gate_cells
@@ -345,20 +345,55 @@ def test_log_normalizers_against_float64(kind, child_gate, node_gate, build_pc, 
                     if hit.numel():
                         gates[owner][:, r, hit[0]] += 1000.0
                         deep += 1
-        session = block_scale.session_inputs(pc, layout, gates)
-        got = block_scale.log_normalizers(pc, layout, session)
-        for ns in session.nodes:
-            ng, cg = ns.external_params.gate_sizes(ns)
-            W = reference.sum_weights(pc, ns).double()
-            lphi = gates[ns.external_params.storage_owner(ns)].double()
-            g = lphi[:, torch.arange(W.size(0), device = DEV) // ng][:, :, torch.arange(W.size(1), device = DEV) // cg]
-            want = torch.logsumexp(torch.log(W)[None] + g, dim = 2)                        # [B, nodes]
-            first = ns._output_ind_range[0]
-            have = got[:, first:first + ns.num_nodes].double()
-            assert torch.equal(torch.isneginf(have), torch.isneginf(want)), (kind, case)
-            fin = torch.isfinite(want)
-            assert ((have[fin] - want[fin]).abs() <= 1e-6 * (1 + want[fin].abs())).all(), (kind, case)
+        check_normalizers(pc, layout, gates, reference, (kind, case))
     assert kind != "hmm_block_sparse" or deep > 0
+
+
+def check_normalizers(pc, layout, gates, reference, label):
+    """``block_scale.log_normalizers`` of ``gates`` against float64 straight from the weights, within its bound."""
+    from pyjuice.constraints.inference.dfa_exact.external_params import block_scale
+    session = block_scale.session_inputs(pc, layout, gates)
+    got = block_scale.log_normalizers(pc, layout, session)
+    worst = 0.0
+    for ns in session.nodes:
+        ng, cg = ns.external_params.gate_sizes(ns)
+        W = reference.sum_weights(pc, ns).double()
+        lphi = gates[ns.external_params.storage_owner(ns)].double()
+        g = lphi[:, torch.arange(W.size(0), device = DEV) // ng][:, :, torch.arange(W.size(1), device = DEV) // cg]
+        want = torch.logsumexp(torch.log(W)[None] + g, dim = 2)                            # [B, nodes]
+        first = ns._output_ind_range[0]
+        have = got[:, first:first + ns.num_nodes].double()
+        assert torch.equal(torch.isneginf(have), torch.isneginf(want)), label
+        fin = torch.isfinite(want)
+        err = (have[fin] - want[fin]).abs()
+        bound = block_scale.logz_error_bound(W.size(1) // cg, want[fin])
+        assert (err <= bound).all(), (label, float((err / bound).max()))
+        worst = max(worst, float((err / bound).max()) if err.numel() else 0.0)
+    return worst
+
+
+@pytest.mark.parametrize("nats", [40, 60, 70, 80, 90, 95, 100, 110])
+def test_log_normalizers_across_the_exact_threshold(nats, build_pc, reference):
+    """A gate each row's nodes have no edge in (block-sparse sums) ``nats`` above the row's others: the nodes' fp32
+    sums, their terms shifted by the row's largest gate, ``nats`` below 1 -- in the normal range, subnormal, and zero
+    -- within the bound either way: computed in fp32 above the normalizers' threshold, exactly below it (a subnormal
+    sum keeps a few bits: 95-100 nats would be off by 1e-4 to 1e-2)."""
+    pc = gated_pc(build_pc, "hmm_block_sparse", child_gate = "fine", node_gate = "block")
+    layout = jc.compile(jc.DFA.anything(V), pc).backend.program().gate_cells
+    gates, raised = make_gates(pc, 3, seed = 2), 0
+    for ns in pc.external_params_nodes:
+        owner = ns.external_params.storage_owner(ns)
+        ng, cg = ns.external_params.gate_sizes(ns)
+        W = reference.sum_weights(pc, ns)
+        empty = (W.view(W.size(0), -1, cg) == 0).all(dim = 2)                               # [nodes, child gates]
+        for r in range(gates[owner].size(1)):
+            rows = empty[r * ng:(r + 1) * ng]
+            hit = rows.all(dim = 0).nonzero().view(-1) if (~rows).any() else rows.new_zeros(0)
+            if hit.numel():
+                gates[owner][:, r, hit[0]] = gates[owner][:, r].max(dim = 1).values + float(nats)
+                raised += 1
+    assert raised > 0
+    check_normalizers(pc, layout, gates, reference, nats)
 
 
 def test_children_in_another_order(reference):

@@ -282,6 +282,20 @@ def log_normalizers(pc, layout: Cells, gates: SessionGates) -> torch.Tensor:
     the PC's node row (0 for an ungated row) -- ``log sum_g phi_b[g] sigma[n, g]`` over node ``n``'s gates ``g``,
     ``sigma[n, g]`` the sum of its weights in ``g``. Computed on first use, then kept with the gates (the parameters do
     not change within a session).
+
+    Each gate row's ``log phi`` and each node's ``log sigma`` shifted by their maxima, ``Z`` is a product per gate row
+    ([samples, child gates] x [child gates, the row's nodes]) in fp32 (no TF32), its terms ``a_g b_g`` at most 1; a
+    node whose sum ``s`` falls below :data:`LOGZ_EXACT_BELOW` x its ``Ck`` child gates is computed exactly instead (a
+    float64 log-sum-exp over its gates). ERROR BOUND (``u = 2^-24``, first order; float64 straight from the weights the
+    reference): a term flushed or subnormal is off by at most ``2^-126``, so above the threshold the ``Ck`` of them
+    are at most ``s / 4 u``; a term's exponent ``d = log phi - max`` rounded in fp32 costs ``|d| u / 2`` relative, and
+    a term that counts (``>= u s / Ck``) has ``|d| <= |log s| + log Ck + 17 <= 87`` above the threshold, so at most
+    ``44 u``; ``exp`` (2 ulp: ``4 u``), ``b_g`` (rounded from float64) and the product ``2 u``; the sum ``(Ck - 1) u``
+    in any order -- in all, ``|log Z - log Z~| <= (Ck + 49) u`` (1.06e-5 at 128 child gates), then the fp32 result's
+    own rounding, ``u |log Z|`` (:func:`logz_error_bound`). MEASURED against the float64 product it replaced
+    (Codpula-4096 x JSON hard_0 B8, 128 child gates; RTX PRO 6000, float64 at 1/64 of the fp32 rate): 2.72 -> 1.38 ms
+    a session (the product 0.72 -> 0.05; left: the gates' gather, the weights' float64 sums, float64 logs), the
+    normalizers off the float64 product's by 1.2e-6 at most (mean 6.7e-8: 0.11 of the bound), -inf where they were.
     """
     if gates._logz is not None:
         return gates._logz
@@ -295,28 +309,32 @@ def log_normalizers(pc, layout: Cells, gates: SessionGates) -> torch.Tensor:
         Nk, Ck = layout.shape[members[0].external_params.storage_owner(members[0])]
         N = members[0].num_nodes
         node = torch.arange(N, device = dev)
-        # Z = sum_g phi[g] sigma[n, g], each node's sigma and each gate row's phi shifted by its maximum: a product of
-        # [samples, Ck] by [Ck, nodes] per gate row, in float64
         top = lsig.max(dim = 1).values
         top = torch.where(torch.isfinite(top), top, 0.0)                         # (a node of no edge: Z 0)
-        sig = torch.zeros(Nk * gate_bs, Ck, dtype = torch.float64, device = dev)
-        sig[:N] = torch.exp(lsig - top[:, None])
+        sig = torch.zeros(Nk * gate_bs, Ck, dtype = torch.float32, device = dev)
+        sig[:N] = torch.exp(lsig - top[:, None])                                 # (in float64, then rounded)
         sig = sig.view(Nk, gate_bs, Ck).transpose(1, 2)                          # [Nk, Ck, gate_bs]
+        exact_below = LOGZ_EXACT_BELOW * Ck
         step = max(1, LOGZ_CHUNK // (gates.batch * Nk * Ck))
         for k in range(0, len(members), step):
             chunk = members[k:k + step]
             cells = torch.tensor([layout.base[ns.external_params.storage_owner(ns)] for ns in chunk], device = dev)
-            lphi = gates.values[:, cells[:, None] + torch.arange(Nk * Ck, device = dev)[None, :]].double()
+            lphi = gates.values[:, cells[:, None] + torch.arange(Nk * Ck, device = dev)[None, :]]
             lphi = lphi.view(gates.batch * len(chunk), Nk, Ck)                    # (sample, member) major
             m = lphi.max(dim = 2, keepdim = True).values
             m = torch.where(torch.isfinite(m), m, 0.0)                           # (a row of no gate: Z 0)
-            tot = torch.bmm(torch.exp(lphi - m).transpose(0, 1), sig)            # [Nk, samples x members, gate_bs]
+            prev = torch.get_float32_matmul_precision()
+            torch.set_float32_matmul_precision("highest")                        # (fp32 products, not TF32)
+            try:
+                tot = torch.bmm(torch.exp(lphi - m).transpose(0, 1), sig)        # [Nk, samples x members, gate_bs]
+            finally:
+                torch.set_float32_matmul_precision(prev)
             tot = tot.transpose(0, 1).reshape(lphi.size(0), Nk * gate_bs)[:, :N]
-            lz = torch.log(tot) + m[:, node // gate_bs, 0] + top[None]
-            low = tot == 0                                                       # underflowed (or no mass): exactly
+            lz = torch.log(tot.double()) + m[:, node // gate_bs, 0].double() + top[None]
+            low = tot < exact_below                                              # underflowing, or no mass: exactly
             if bool(low.any()):
                 at, n = low.nonzero(as_tuple = True)
-                lz[at, n] = torch.logsumexp(lphi[at, n // gate_bs] + lsig[n], dim = 1)
+                lz[at, n] = torch.logsumexp(lphi[at, n // gate_bs].double() + lsig[n], dim = 1)
             rows = torch.tensor([ns._output_ind_range[0] for ns in chunk], device = dev)[:, None] + node[None, :]
             out[:, rows.reshape(-1)] = lz.view(gates.batch, -1).float()
     gates._logz = out
@@ -325,6 +343,15 @@ def log_normalizers(pc, layout: Cells, gates: SessionGates) -> torch.Tensor:
 
 #: gates :func:`log_normalizers` works on at once (a chunk of node groups' every sample's)
 LOGZ_CHUNK = 1 << 24
+#: a node whose fp32 sum (its terms shifted to at most 1) falls below this times its number of child gates is computed
+#: exactly: its flushed and subnormal terms (each off by at most 2^-126) are then at most a quarter of an ulp of it
+LOGZ_EXACT_BELOW = 2.0 ** -100
+
+
+def logz_error_bound(child_gates: int, log_z: torch.Tensor) -> torch.Tensor:
+    """The bound on ``|log Z - log Z~|`` of :func:`log_normalizers` (see there) for a node of ``child_gates`` child
+    gates and ``log Z`` (the reference's, or the result's)."""
+    return (child_gates + 49) * 2.0 ** -24 + 2.0 ** -24 * log_z.abs()
 
 
 def _log_gate_sums(pc, ns, gate_cbs: int) -> torch.Tensor:
