@@ -301,7 +301,9 @@ def live_lists(prog, live, allowed, stored, t, b):
 @pytest.mark.parametrize("pattern", ["none", "prefix", "mixed"])
 @pytest.mark.parametrize("storage", ["dense", "compact"])
 @pytest.mark.parametrize("kind", ["hmm", "pd", "hand_left", "left_linear", "walks"])
-def test_live_class_rows_match_a_brute_force(kind, storage, pattern, one_pair, classes, shared, build_pc, monkeypatch):
+@pytest.mark.parametrize("constraint", ["either", "contains"])
+def test_live_class_rows_match_a_brute_force(constraint, kind, storage, pattern, one_pair, classes, shared, build_pc,
+                                             monkeypatch):
     """A query keeps its class weights in their live rows alone: a target column's (position ``t``, sample ``b``)
     class ``c`` is live exactly when a column live at ``t`` for the sample leads by ``c`` to one live at ``t + 1``
     (``next_col``; at the last position the sequence end's one column) -- every column live where the query prunes
@@ -309,13 +311,16 @@ def test_live_class_rows_match_a_brute_force(kind, storage, pattern, one_pair, c
     column with the same live pairs and kind (stored or enumerated) share one row, their representative the first of
     them in the boundary's class order, a column's representatives on consecutive rows in that order; unshared, every
     live class a row of its own in that order. A row group's columns in order. Also reading a class's pairs one at a
-    time (``one_pair``: every list walked over several tiles), and under a session's per-sample classes (``classes``,
-    stood in for the session's): a class the sample rules out has none."""
+    time (``one_pair``: every list walked over several tiles; and a column's candidates found 2 classes a step, a key's
+    first place carried over the steps), and under a session's per-sample classes (``classes``, stood in for the
+    session's): a class the sample rules out has none. ``contains``: boundaries whose class order (most columns
+    first) is not the classes', with classes of different rows there."""
     monkeypatch.setattr(S, "CLASS_ROWS_SHARED", shared)
     if one_pair:
         monkeypatch.setattr(S, "LIVE_CLASS_LANES", 1)
+        monkeypatch.setattr(S, "CLASS_CANDIDATE_TILE", 2)
     n = {"walks": 6}.get(kind, KINDS.get(kind))
-    cc = jc.compile(CONSTRAINTS["either"](), build_pc(kind, n, V))
+    cc = jc.compile(CONSTRAINTS[constraint](), build_pc(kind, n, V))
     data, missing = evidence(pattern, n)
     B, dev = data.size(0), cc.pc.params.device
     allowed = None
@@ -367,7 +372,8 @@ def test_shared_rows_are_exact_whatever_the_keys(kind, storage, pattern, build_p
     same (``CLASS_ROW_KEY_MASK`` 0: every live class of a column a candidate for the first) the rows are still checked
     exactly -- classes sharing a row have the same live pairs, and the first class of the column is shared by every
     class with its pairs --, and every class's weights are those it gets with rows of its own (unshared) and with the
-    keys in full: the same -inf, the finite ones equal to their rounding (the walks' tiles follow the rows' number)."""
+    keys in full: the same -inf, the finite ones equal to their rounding (the walks' tiles follow the rows' number).
+    The candidates found 2 classes a step where every key is the same (one key over every step)."""
     n = KINDS[kind]
     cc = jc.compile(CONSTRAINTS["either"](), build_pc(kind, n, V))
     data, missing = evidence(pattern, n)
@@ -378,6 +384,7 @@ def test_shared_rows_are_exact_whatever_the_keys(kind, storage, pattern, build_p
                                ("collide", True, 0)):
         monkeypatch.setattr(S, "CLASS_ROWS_SHARED", shared)
         monkeypatch.setattr(S, "CLASS_ROW_KEY_MASK", mask)
+        monkeypatch.setattr(S, "CLASS_CANDIDATE_TILE", 2 if mask == 0 else 1024)
         report = {}
         with torch.no_grad():
             groups, _ = class_weights(cc.backend, data, missing.to(dev), positions, storage = storage, report = report)

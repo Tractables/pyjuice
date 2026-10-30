@@ -693,6 +693,50 @@ def _live_classes_kernel(live, cls_ptr, cls_col, cls_succ, col_pos, col_K, row, 
         tl.atomic_add(floats + m, tl.sum(on.to(tl.int64), axis = 0) * tl.load(col_K + m))
 
 
+#: classes a step of :func:`_class_candidates_kernel` (one program per target column, every class of its boundary)
+CLASS_CANDIDATE_TILE = 1024
+
+
+@triton_jit
+def _ordered_keys_kernel(key, cls_order, col_pos, out, C, B, TC: tl.constexpr):
+    """One program per target column ``m`` and tile of ``TC`` ranks: ``out[m, r] = key[m, cls_order[t, r]]``, the
+    column's keys in its boundary's class order (``t = col_pos[m // B]``)."""
+    m = tl.program_id(0).to(tl.int64)
+    t = tl.load(col_pos + m // B)
+    r = tl.program_id(1) * TC + tl.arange(0, TC)
+    rm = r < C
+    c = tl.load(cls_order + t * C + r, mask = rm, other = 0)
+    tl.store(out + m * C + r, tl.load(key + m * C + c, mask = rm), mask = rm)
+
+
+@triton.jit
+def _max_combine(a, b):
+    return tl.maximum(a, b)
+
+
+@triton_jit
+def _class_candidates_kernel(keys, sidx, cls_order, col_pos, rep, C, B, TC: tl.constexpr):
+    """One program per target column ``m``: from its keys in class order sorted, stably (``keys``, and ``sidx`` their
+    ranks), every class's candidate -- the first class in the boundary's order (``cls_order[t]``) with its key --
+    into ``rep[m, c]`` (int32), ``TC`` sorted keys a step: a key's first place carried over the steps."""
+    m = tl.program_id(0).to(tl.int64)
+    t = tl.load(col_pos + m // B)
+    order, row = cls_order + t * C, m * C
+    first = tl.zeros([], dtype = tl.int32)                         # the last key's first place so far
+    for p0 in range(0, C, TC):
+        p = p0 + tl.arange(0, TC)
+        pm = p < C
+        k = tl.load(keys + row + p, mask = pm, other = 0)
+        prev = tl.load(keys + row + p - 1, mask = pm & (p > 0), other = 0)
+        start = tl.where(k != prev, p, 0)                            # (a key's first place; 0's anyway)
+        start = tl.maximum(tl.associative_scan(start, 0, _max_combine), first)
+        first = tl.max(tl.where(pm, start, 0), axis = 0)
+        r = tl.load(sidx + row + p, mask = pm, other = 0)
+        cand = tl.load(sidx + row + start, mask = pm, other = 0)
+        tl.store(rep + row + tl.load(order + r, mask = pm, other = 0),
+                 tl.load(order + cand, mask = pm, other = 0), mask = pm)
+
+
 @triton_jit
 def _class_reps_kernel(live, cls_ptr, cls_col, cls_succ, col_pos, col_K, row, rep, elen, stored, floats, next_col,
                        delta, state_id, col_of_state, n, W, C, B, K, TC: tl.constexpr, TP: tl.constexpr,
@@ -827,13 +871,11 @@ def class_weight_rows(prog, liveness, col_pos: torch.Tensor, col_K: torch.Tensor
                                                      TC = TC, TP = TP, PRUNE = prune, ALLOWED = classes, KEYS = shared,
                                                      num_warps = 4)
         if shared:                                  # every class's candidate: the first of its key in class order
-            order = tt.cls_order.long()[col_pos.repeat_interleave(B)]      # [N, C]: every column's classes in order
-            keys, sidx = torch.sort(key.gather(1, order), dim = 1, stable = True)
-            first = torch.ones_like(keys, dtype = torch.bool)
-            first[:, 1:] = keys[:, 1:] != keys[:, :-1]
-            start = torch.where(first, torch.arange(C, device = dev), 0).cummax(dim = 1).values
-            cand = torch.empty_like(sidx).scatter_(1, sidx, sidx.gather(1, start))   # by rank: its candidate's rank
-            rep.scatter_(1, order, order.gather(1, cand).to(torch.int32))           # by class: its candidate
+            ordered = torch.empty(N, C, dtype = torch.int64, device = dev)
+            TK = min(CLASS_CANDIDATE_TILE, host_next_power_of_2(C))
+            _ordered_keys_kernel[(N, host_cdiv(C, TK))](key, tt.cls_order, col_pos, ordered, C, B, TC = TK)
+            keys, sidx = torch.sort(ordered, dim = 1, stable = True)
+            _class_candidates_kernel[(N,)](keys, sidx, tt.cls_order, col_pos, rep, C, B, TC = TK, num_warps = 4)
             _class_reps_kernel[(N, host_cdiv(C, TC))](liveness.live if prune else row, tt.cls_ptr, tt.cls_col,
                                                       tt.cls_succ, col_pos, col_K, row, rep, elen, stored, floats,
                                                       prog.next_col_arg, prog.delta, prog.state_id, prog.col_of_state,
