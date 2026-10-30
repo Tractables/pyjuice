@@ -77,6 +77,7 @@ class QueryPlan:
     :ivar reg_prior: int32 [sum regions] (device): 1 where a region's values are in ``prior_mars`` for this query
     :ivar sample: bool [sum intervals] (host): the inside values the query computes per sample
     :ivar top_down: None, or the query's :class:`TopDownPlan`
+    :ivar busy: the indices of the steps with anything to run, ascending (the others' parts are all empty)
     """
 
     steps: list
@@ -87,6 +88,7 @@ class QueryPlan:
     reg_prior: torch.Tensor
     sample: np.ndarray
     top_down: Optional["TopDownPlan"] = None
+    busy: Optional[list] = None
 
 
 @dataclass
@@ -114,6 +116,7 @@ class TopDownPlan:
         (see :class:`~.top_down_program.TopDownProgram`), and ``dead_regions``, their regions
     :ivar cw_fill: a scoring plan's: whether ``dfa_class_flow`` must hold -inf before its class weight launches run
         (:func:`~.planners.class_weight_writes`; their entries ``(launch, index list, store)``)
+    :ivar busy: the indices of the steps with anything to run, ascending (the others' parts are all empty)
     """
 
     steps: list
@@ -127,6 +130,7 @@ class TopDownPlan:
     dead: Optional[torch.Tensor]
     dead_regions: list
     cw_fill: bool = True
+    busy: Optional[list] = None
 
 
 def _prefix(mask: np.ndarray) -> np.ndarray:
@@ -235,12 +239,12 @@ def query_plan(prog, observed: np.ndarray, targets: Optional[np.ndarray], valid:
     prior_read = read | todo
 
     lists = IndexLists()                                 # every index list, copied to the device together
-    steps = _forward_steps(prog, todo, sample, lists)
+    steps, busy = _forward_steps(prog, todo, sample, lists)
     reg_prior = lists.add(prior[prog.reg_iv_np].astype(np.int32))
     lists.upload(prog.dev)
     plan = QueryPlan(steps = steps, todo = torch.from_numpy(todo), prior_read = prior_read,
                      prior = bool(prior_read.any()), root_prior = bool(prior[prog.reg_iv_host[prog.root_region]]),
-                     reg_prior = reg_prior.tensor, sample = sample, top_down = td)
+                     reg_prior = reg_prior.tensor, sample = sample, top_down = td, busy = busy)
     _keep(prog, key, plan)
     return plan
 
@@ -255,14 +259,14 @@ def kept_plan(prog, todo: np.ndarray, prior: np.ndarray, keep: np.ndarray) -> Qu
     """
     lists = IndexLists()
     sample = np.zeros_like(todo)
-    steps = _forward_steps(prog, todo, sample, lists)
+    steps, busy = _forward_steps(prog, todo, sample, lists)
     reg_prior = lists.add(prior[prog.reg_iv_np].astype(np.int32))
     lists.upload(prog.dev)
     read = todo.copy()
     for k in np.nonzero(todo)[0]:
         read[prog.iv_children[k]] = True
     return QueryPlan(steps = steps, todo = torch.from_numpy(todo), prior_read = (read & prior) | keep, prior = True,
-                     root_prior = False, reg_prior = reg_prior.tensor, sample = sample)
+                     root_prior = False, reg_prior = reg_prior.tensor, sample = sample, busy = busy)
 
 
 def read_regions(prog, plan: QueryPlan, root: bool = False) -> np.ndarray:
@@ -388,8 +392,8 @@ def top_down_plan(prog, td, targets: Optional[np.ndarray], once: np.ndarray, val
     t, index = _top_down_tables(prog, td)
     m = _top_down_modes(req, positions, once, scoring, t.data, t.offsets, *_mode_workspace(t, td))
     lists = IndexLists()                                 # every index list, copied to the device together
-    out = _top_down_steps(td, t, index, m, scoring, lists)
-    cw_fill = class_weight_writes(prog, out, positions) if scoring else True
+    out, busy = _top_down_steps(td, t, index, m, scoring, lists)
+    cw_fill = class_weight_writes(prog, [out[si] for si in busy], positions) if scoring else True
     prior = m[-1]
     root = prog.root_region
     sample = req & ~r_once
@@ -403,4 +407,5 @@ def top_down_plan(prog, td, targets: Optional[np.ndarray], once: np.ndarray, val
                        per_sample = needed[td.reg_iv] & ~r_once,
                        once_iv = once_iv.tensor, prior = reads,
                        dead = None if dead_rows is None else dead_rows.tensor.view(-1, 2),
-                       dead_regions = np.nonzero(sample & td.dead_region)[0].tolist(), cw_fill = cw_fill)
+                       dead_regions = np.nonzero(sample & td.dead_region)[0].tolist(), cw_fill = cw_fill,
+                       busy = busy)

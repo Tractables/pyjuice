@@ -108,7 +108,8 @@ def run_backward(backend, bufs: dict, flows: dict, plan, x: torch.Tensor, missin
         if dead_width > 0:
             fill_dead_rows(node_flows, td.dead, fregions, dead_width)
 
-    for kind, prod_index, layers in td.steps:
+    for si in range(len(td.steps)) if td.busy is None or visit is not None else td.busy:   # (the others run nothing)
+        kind, prod_index, layers = td.steps[si]
         elem_first = backend.element_regions[prod_index][0]
         elem_width = lay["element_widths"][prod_index]                         # the products' inside values'
         ew = elem_width if compact is None else compact.elem_width[prod_index]   # ... and top-down values'

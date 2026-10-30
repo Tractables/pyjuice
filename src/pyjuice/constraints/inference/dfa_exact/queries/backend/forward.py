@@ -187,7 +187,8 @@ def run_forward(backend, bufs: dict, plan, x: torch.Tensor, missing: torch.Tenso
     prog.transitions(masses)
     stacks, kept = backend.state.weight_stacks()
 
-    for kind, prod_index, layers in plan.steps:
+    for si in range(len(plan.steps)) if plan.busy is None else plan.busy:      # (the others run nothing)
+        kind, prod_index, layers = plan.steps[si]
         elem_first = backend.element_regions[prod_index][0]
         elem_width = lay["element_widths"][prod_index]
         if kind == "prod":
