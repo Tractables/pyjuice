@@ -13,6 +13,7 @@ weight (``enum_logw``, see :class:`~..state.ClassMasses`) over the row's ``Z``.
 """
 
 import hashlib
+import math
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
@@ -259,7 +260,16 @@ def transition_tables(tr, grouped: bool, enum: Optional[EnumeratedTokens] = None
 #: :func:`transition_masses`' tiles: the most rows (input steps at one position) and columns per program, classes per
 #: product, warps. Rows and columns shrink until there are enough programs (they never change a result); the pairs
 #: per product follow the widest column, up to 64.
-TRANSITION_TILES = dict(TS = 64, QT = 4, TC = 16, warps = 4, programs = 1024)
+#: :func:`_transition_kernel`'s tiles: TS rows a program (MEASURED on an HMM-4096 x hard_0 session at the pair tile 8:
+#: 64 rows 320 ms a launch, 128 120, 256 285 -- a column's class successors and one-hot are per program, so more rows
+#: amortize them until the registers run out; the rows' sums are the same whatever the tile), QT columns, TC classes
+TRANSITION_TILES = dict(TS = 128, QT = 4, TC = 16, warps = 4, programs = 1024)
+#: :func:`_transition_kernel`'s pair tile: None, the boundaries' mean pairs a column rounded up to a power of two
+#: within [8, 64] -- a column's pairs are walked ``TP`` at a time, each pass over its masses and class successors
+#: again, and the one-hot dot is ``TP`` wide, so a tile much wider than the columns' pairs is work on zeros (MEASURED
+#: on an HMM-4096 x hard_0 session, 4.4 pairs a column: TP 64 321 ms a launch, 32 199, 16 178, 8 166, the same bits);
+#: an int forces one (tests).
+TRANSITION_PAIR_TILE = None
 
 
 def transition_job(rows: torch.Tensor, dev):
@@ -398,7 +408,11 @@ def transition_masses(trans, job, masses, prog):
     while QT > 1 and tiles.size(0) * host_cdiv(max(prog.width), QT) < cfg["programs"]:
         QT //= 2
     num_qtiles = host_cdiv(max(prog.width), QT)
-    TP = min(64, max(16, host_next_power_of_2(tt.max_pairs)))
+    if TRANSITION_PAIR_TILE is None:
+        mean_pairs = sum(tt.num_pairs) / max(1, sum(int(w) for w in prog.width[:prog.n]))
+        TP = min(64, max(8, host_next_power_of_2(max(1, math.ceil(mean_pairs)))))
+    else:
+        TP = TRANSITION_PAIR_TILE
     sample = masses.batch > 1
     stride = masses.stride if sample else masses.row
     enum = en.num > 0
