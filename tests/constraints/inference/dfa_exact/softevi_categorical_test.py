@@ -291,9 +291,10 @@ def test_grouping_is_the_querys(build_pc, monkeypatch):
     prog.trans_budget = prog.trans_size
     cc.backend.marginal(data[:1], missing[:1])                                # one set of masses: grouped again
     assert prog.trans.grouped and prog.trans_layout is None and cc.backend.grouped
-    prog.trans_budget = prog.trans_size - 1                                   # over the budget: the per-class tables
+    need = prog.trans_sig.size if prog.trans_sig is not None else prog.trans_size   # (by column signature: fewer)
+    prog.trans_budget = need - 1                                              # over the budget: the per-class tables
     cc.backend.marginal(data[:1], missing[:1])
-    assert not prog.grouped_for(prog.trans_size) and not prog.trans.grouped
+    assert not prog.grouped_for(need) and not prog.trans.grouped
 
 
 def test_a_plain_query_inside_a_session(build_pc):

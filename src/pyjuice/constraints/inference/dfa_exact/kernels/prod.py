@@ -1292,7 +1292,7 @@ def run_products(stages, bufs, prog, regions, element_mars, node_mars, masses, o
                             _input_block_kernel[(cnt, size)](
                                 element_mars, node_mars, temp, obs_class, prog.next_col_arg, prog.delta, prog.state_id,
                                     prog.col_of_state, **margs, entry_ptr = tt.entry_ptr, entry_succ = tt.entry_succ,
-                                entry_x = tt.entry_x, width = prog.width_t, iv_of = ivs.of, iv_info = ivs.info,
+                                entry_x = prog.mass_x("entry_x"), width = prog.width_t, iv_of = ivs.of, iv_info = ivs.info,
                                 iv_table = ivs.table, live = live, steps = part, B = B, n = n, W = W,
                                 C = C, K = prog.K, input_start = prog.input_start, pid0 = first, HOMOGENEOUS = prog.homogeneous, R_KIND = r_kind,
                                 OUT_TEMP = out_temp, GROUPED = tt.grouped, PRUNE = prune, OUT_FULL = out_full,
@@ -1306,7 +1306,7 @@ def run_products(stages, bufs, prog, regions, element_mars, node_mars, masses, o
                             _block_input_kernel[(cnt, size)](
                                 element_mars, node_mars, temp, obs_class, prog.next_col_arg, prog.delta, prog.state_id,
                                     prog.col_of_state, **margs, pred_ptr = tt.pred_ptr, pred_col = tt.pred_col,
-                                pred_x = tt.pred_x, width = prog.width_t, iv_of = ivs.of, iv_info = ivs.info,
+                                pred_x = prog.mass_x("pred_x"), width = prog.width_t, iv_of = ivs.of, iv_info = ivs.info,
                                 iv_table = ivs.table, live = live, steps = part, B = B, n = n, W = W,
                                 C = C, K = prog.K, input_start = prog.input_start, pid0 = first, HOMOGENEOUS = prog.homogeneous, L_KIND = l_kind,
                                 OUT_TEMP = out_temp, GROUPED = tt.grouped, PRUNE = prune, OUT_FULL = out_full,

@@ -361,6 +361,8 @@ class Program:
         self.trans_job = transition_job(torch.cat(rows), dev) if rows else None
         self._trans, self._trans_version, self._sample_layout = None, None, None
         self.trans_layout: Optional[SampleMasses] = None                    # the query's masses: one set, or a sample's
+        self.trans_sig = None                                               # ... one set by column signature, or not
+        self._sig = None                                                    # (the signature layout and its row map)
         self.trans = self.succ if self.grouped_for(self.trans_size) else self.ungrouped_tables()
         self.trans_persistent = self.trans.grouped                  # (grouped transitions are always kept whole)
 
@@ -403,8 +405,10 @@ class Program:
         whose kernels read no masses, a float."""
         if not self.trans.grouped:
             size = 1
+        elif self.trans_layout is not None:
+            size = self.trans_layout.size
         else:
-            size = self.trans_size if self.trans_layout is None else self.trans_layout.size
+            size = self.trans_size if self.trans_sig is None else self.trans_sig.size
         if self._trans is None or self._trans.numel() < size:
             self._trans = None
             self._trans = torch.empty(max(1, size), dtype = torch.float32, device = self.dev)
@@ -430,15 +434,32 @@ class Program:
         boundary's pairs for one set of masses (``mb_stride`` 0), the sample's first and its entries' count under
         per-sample ones --, the entry's place there its pair's number ``x`` (``entry_x``), or ``SAMPLE_MASSES``: the
         sample's ``mrank[b mrank_stride + bbase[t] + x]`` (-1: no mass, see :class:`~..kernels.transitions.SampleMasses`)."""
-        lay = self.trans_layout
+        lay, sig = self.trans_layout, self.trans_sig
         if lay is None:
-            return dict(trans = self.transition_buffer(), mbase = self.pair_off, mcount = self.pairs_t,
-                        mrank = self.pairs_t, bbase = self.succ.boundary_base, mb_stride = 0, mrank_stride = 0,
-                        SAMPLE_MASSES = False)
+            mbase, mcount = (self.pair_off, self.pairs_t) if sig is None else (sig.pair_off, sig.pairs)
+            return dict(trans = self.transition_buffer(), mbase = mbase, mcount = mcount, mrank = mcount,
+                        bbase = self.succ.boundary_base, mb_stride = 0, mrank_stride = 0, SAMPLE_MASSES = False)
         own = lay.Be > 1
         return dict(trans = self.transition_buffer(), mbase = lay.base, mcount = lay.count, mrank = lay.rank,
                     bbase = self.succ.boundary_base, mb_stride = self.n if own else 0,
                     mrank_stride = lay.rank.size(1) if own else 0, SAMPLE_MASSES = True)
+
+    def mass_x(self, kind: str) -> torch.Tensor:
+        """The query's tables' ``entry_x`` or ``pred_x`` (``kind``) as the grouped kernels index the masses with them:
+        the pairs' signature slots under masses by column signature (:attr:`trans_sig`), else the tables' own."""
+        if self.trans.grouped and self.trans_layout is None and self.trans_sig is not None:
+            return getattr(self.trans_sig, kind)
+        return getattr(self.trans, kind)
+
+    def signature_layout(self, masses):
+        """The :class:`~..kernels.transition_signatures.SignatureMasses` of ``masses``' row map (one set), or None
+        (no saving, or per-sample masses): built once a row map (the state's, which a query's one set reads)."""
+        from ..kernels import transition_signatures as TS
+        if not TS.SIGNATURE_MASSES or masses.batch != 1 or masses.enum_logw is not None:
+            return None
+        if self._sig is None or self._sig[0] is not masses.row:
+            self._sig = (masses.row, TS.signature_masses(self, masses, self.trans_size))
+        return self._sig[1]
 
     def ungrouped_tables(self):
         """The ungrouped transition tables (one entry per live class), built when first needed."""
@@ -460,14 +481,20 @@ class Program:
         call this before its liveness (whose successor lists follow ``trans``) and its passes."""
         succ = live_successors(self, masses)
         layout = None if succ is None else self.sample_layout(masses, succ)
-        grouped = self.grouped_for(self.trans_size if layout is None else layout.size)
-        if grouped != self.trans.grouped or (grouped and layout is not self.trans_layout):
+        sig = self.signature_layout(masses) if layout is None else None    # one set: by column signature, if it saves
+        size = layout.size if layout is not None else (self.trans_size if sig is None else sig.size)
+        grouped = self.grouped_for(size)
+        if grouped != self.trans.grouped or (grouped and (layout is not self.trans_layout or sig is not self.trans_sig)):
             self.trans = self.succ if grouped else self.ungrouped_tables()
             self.trans_persistent = grouped
             self.trans_layout = layout if grouped else None
+            self.trans_sig = sig if grouped else None
             self._trans, self._trans_version = None, None               # (the masses go with the grouped tables)
         if grouped and self.trans_job is not None and self._trans_version != masses.version:
-            if layout is None:
+            if layout is None and self.trans_sig is not None:
+                from ..kernels.transition_signatures import signature_transition_masses
+                signature_transition_masses(self.transition_buffer(), self.trans_sig, masses, self)
+            elif layout is None:
                 transition_masses(self.transition_buffer(), self.trans_job, masses, self)
             else:
                 if layout.cls_ptr is None:
