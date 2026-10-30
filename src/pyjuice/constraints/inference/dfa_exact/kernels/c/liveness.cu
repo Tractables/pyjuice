@@ -5,10 +5,12 @@
 // for each of the two sweeps, at once (they do not depend on each other), into `live` and `back`, then their AND.
 //
 // A boundary's step is latency-bound: a column's successors are dependent reads (`entry_ptr`, then `entry_succ`, or,
-// for an observed token, the column's state, its successor in `delta`, that one's column) after the live row. Here the rows live in shared memory, and every step's tables --
-// the next boundary's successor lists (or observed successors) and, going back, its forward row -- are read into
-// registers during the step before and stored to shared memory after it, so a step waits for no global read.
-// Columns past a boundary's width are never written, as by the Triton kernel.
+// for an observed token, the column's state, its successor in `delta`, that one's column) after the live row. Here
+// the rows live in shared memory, and every step's tables -- the next boundary's successor lists (or observed
+// successors) -- are read into registers during the step before and stored to shared memory after it, so a step
+// waits for no global read. Two barriers a step: one after the step's row, one after the next tables' store (the
+// forward row a step reads is cleared by the threads reading it, for its use two steps on). Columns past a
+// boundary's width are never written, as by the Triton kernel.
 //
 // `liveness_wide_forward_kernel` / `liveness_wide_backward_kernel`, below: the same sweeps for automata the shared
 // memory does not take, the rows in global memory, with shortcuts where the sweep saturates.
@@ -19,9 +21,14 @@
 #include <c10/cuda/CUDAStream.h>
 #include <c10/cuda/CUDAException.h>
 
-#define LT 1024            // threads per CTA
-#define LQ 4               // columns a thread owns, at most: W <= LQ * LT
-#define LS 16              // successor entries a thread stages per boundary, at most: LS * LT a boundary's
+#define LT 1024            // threads per CTA of the sweeps in global memory
+
+// The shared-memory sweep: threads per CTA, columns a thread owns (W <= LSQ * LST), successor entries a thread
+// stages per boundary (LSS * LST a boundary's, at most). Codpula-4096 x JSON hard_0 l2r B8 (1763 columns): 512
+// threads 105 us, 1024 119; hard_1 (121 columns): 512 70 us, 128 63.
+#define LST 512
+#define LSQ 8
+#define LSS 32
 
 struct LiveArgs {
     signed char* live;
@@ -38,71 +45,77 @@ struct LiveArgs {
 };
 
 // The tables of boundary t a step reads, into registers: an observed token's successor of every owned column, or the
-// successor lists' offsets and this thread's share of the boundary's entries.
+// successor lists' offsets and this thread's share of the boundary's entries (as many as the boundary has).
 struct Stage {
-    int nc[LQ];
-    int pq[LQ + 1];
-    int sc[LS];
+    int nc[LSQ];
+    int pq[LSQ + 1];
+    int sc[LSS];
 };
 
 __device__ __forceinline__ void stage_load(const LiveArgs& a, const int* ptr, const int* succ, int t, int w, int oc,
                                            int base, int count, int tid, Stage& s) {
     if (oc >= 0) {
 #pragma unroll
-        for (int k = 0; k < LQ; ++k) {
-            int q = tid + k * LT;
+        for (int k = 0; k < LSQ; ++k) {
+            int q = tid + k * LST;
+            if (q >= w) break;
             if (a.next_col != nullptr) {
-                s.nc[k] = q < w ? a.next_col[((long long)t * a.W + q) * a.C + oc] : -1;
+                s.nc[k] = a.next_col[((long long)t * a.W + q) * a.C + oc];
             } else {                                        // the column's state, its successor, that one's column
-                int st = q < w ? a.state_id[(long long)t * a.W + q] : -1;
+                int st = a.state_id[(long long)t * a.W + q];
                 s.nc[k] = st >= 0 ? a.col_of_state[(long long)(t + 1) * a.K + a.delta[(long long)st * a.C + oc]] : -1;
             }
         }
     } else {
 #pragma unroll
-        for (int k = 0; k <= LQ; ++k) {
-            int q = tid + k * LT;
-            s.pq[k] = q <= w ? ptr[(long long)t * (a.W + 1) + q] : 0;
+        for (int k = 0; k <= LSQ; ++k) {
+            int q = tid + k * LST;
+            if (q > w) break;
+            s.pq[k] = ptr[(long long)t * (a.W + 1) + q];
         }
 #pragma unroll
-        for (int j = 0; j < LS; ++j) {
-            int i = tid + j * LT;
-            s.sc[j] = i < count ? succ[base + i] : 0;
+        for (int j = 0; j < LSS; ++j) {
+            int i = tid + j * LST;
+            if (i >= count) break;
+            s.sc[j] = succ[base + i];
         }
     }
 }
 
-__device__ __forceinline__ void stage_store(int w, int oc, int count, int tid, const Stage& s, int* nc, int* pq,
-                                            int* sc) {
+// Into `tab` (W + 1 + smax ints): an observed token's successors [w], or the lists' offsets [w + 1], then from
+// tab + W + 1 on the boundary's entries [count].
+__device__ __forceinline__ void stage_store(int w, int oc, int count, int tid, const Stage& s, int* tab, int W) {
     if (oc >= 0) {
 #pragma unroll
-        for (int k = 0; k < LQ; ++k) {
-            int q = tid + k * LT;
-            if (q < w) nc[q] = s.nc[k];
+        for (int k = 0; k < LSQ; ++k) {
+            int q = tid + k * LST;
+            if (q >= w) break;
+            tab[q] = s.nc[k];
         }
     } else {
 #pragma unroll
-        for (int k = 0; k <= LQ; ++k) {
-            int q = tid + k * LT;
-            if (q <= w) pq[q] = s.pq[k];
+        for (int k = 0; k <= LSQ; ++k) {
+            int q = tid + k * LST;
+            if (q > w) break;
+            tab[q] = s.pq[k];
         }
+        int* sc = tab + W + 1;
 #pragma unroll
-        for (int j = 0; j < LS; ++j) {
-            int i = tid + j * LT;
-            if (i < count) sc[i] = s.sc[j];
+        for (int j = 0; j < LSS; ++j) {
+            int i = tid + j * LST;
+            if (i >= count) break;
+            sc[i] = s.sc[j];
         }
     }
 }
 
 // One CTA per (sample, direction): blockIdx.y 0 the forward sweep into `live`, 1 the backward one into `back` -- the
 // two chains are independent, so they run at once; `liveness_and_kernel` then ANDs them.
-__global__ void __launch_bounds__(LT) liveness_kernel(LiveArgs a, signed char* back_all) {
+__global__ void __launch_bounds__(LST) liveness_kernel(LiveArgs a, signed char* back_all) {
     extern __shared__ int smem[];
     const int n = a.n, W = a.W, tid = threadIdx.x;
-    int* nc = smem;                                      // [W]: an observed token's successors
-    int* pq = nc + W;                                    // [W + 1]: the successor lists' offsets
-    int* sc = pq + W + 1;                                // [smax]: the boundary's successor entries
-    int* oc = sc + a.smax;                               // [n]: the sample's observed classes
+    int* tab = smem;                                     // [W + 1 + smax]: the step's tables (`stage_store`)
+    int* oc = tab + W + 1 + a.smax;                      // [n]: the sample's observed classes
     int* sbase = oc + n;                                 // [n]: every boundary's first entry
     int* scount = sbase + n;                             // [n]: and its entries
     int* wd = scount + n;                                // [n + 1]: every boundary's columns
@@ -111,7 +124,7 @@ __global__ void __launch_bounds__(LT) liveness_kernel(LiveArgs a, signed char* b
     const long long b = blockIdx.x;
     const int* ptr = a.ptr + b * a.ps;                    // the sample's successor lists
     const int* succ = a.succ + b * a.ss;
-    for (int t = tid; t <= n; t += LT) {
+    for (int t = tid; t <= n; t += LST) {
         int w = a.width[t];
         wd[t] = w;
         if (t == n) continue;
@@ -120,72 +133,94 @@ __global__ void __launch_bounds__(LT) liveness_kernel(LiveArgs a, signed char* b
         sbase[t] = s0;
         scount[t] = ptr[(long long)t * (W + 1) + w] - s0;
     }
+    const bool forward = blockIdx.y == 0;
+    if (forward) {                                       // rowa boundary 0, rowb clear: every row's columns
+        for (int q = tid; q < W; q += LST) {
+            rowa[q] = q == 0;
+            rowb[q] = 0;
+        }
+    } else if (tid == 0) {
+        rowa[0] = 1;                                     // the sequence end
+    }
     __syncthreads();
     Stage st;
 
-    if (blockIdx.y == 0) {                               // forward: rowa boundary t, rowb boundary t + 1
+    if (forward) {                                       // rowa boundary t, rowb boundary t + 1
         signed char* live = a.live + b * (long long)(n + 1) * W;
-        stage_load(a, ptr, succ, 0, wd[0], oc[0], sbase[0], scount[0], tid, st);
-        stage_store(wd[0], oc[0], scount[0], tid, st, nc, pq, sc);
-        for (int q = tid; q < wd[0]; q += LT) {
-            rowa[q] = q == 0;
-            live[q] = q == 0;
+        if (n == 0) {
+            for (int q = tid; q < wd[0]; q += LST) live[q] = q == 0;
+            return;
         }
+        stage_load(a, ptr, succ, 0, wd[0], oc[0], sbase[0], scount[0], tid, st);
+        stage_store(wd[0], oc[0], scount[0], tid, st, tab, W);
+        if (n > 1) stage_load(a, ptr, succ, 1, wd[1], oc[1], sbase[1], scount[1], tid, st);
         __syncthreads();
         for (int t = 0; t < n; ++t) {
             const int w = wd[t], ot = oc[t];
-            const int nxt = t + 1 == n ? 1 : wd[t + 1];
-            if (t + 1 < n) stage_load(a, ptr, succ, t + 1, wd[t + 1], oc[t + 1], sbase[t + 1], scount[t + 1], tid, st);
-            for (int q = tid; q < nxt; q += LT) rowb[q] = 0;
-            __syncthreads();
-            for (int q = tid; q < w; q += LT) {
-                if (!rowa[q]) continue;
+            const int* sc = tab + W + 1 - sbase[t];
+            signed char* out = live + (long long)t * W;
+#pragma unroll
+            for (int k = 0; k < LSQ; ++k) {
+                int q = tid + k * LST;
+                if (q >= W) break;
+                const unsigned char v = rowa[q];
+                rowa[q] = 0;                             // (the row is rowb again the step after: clear)
+                if (q >= w) continue;
+                out[q] = v;
+                if (!v) continue;
                 if (ot >= 0) {
-                    int s = nc[q];
+                    int s = tab[q];
                     if (t + 1 == n && s >= 0) s = 0;
                     if (s >= 0) rowb[s] = 1;
                 } else {
-                    const int base = sbase[t];
-                    for (int k = pq[q]; k < pq[q + 1]; ++k) rowb[sc[k - base]] = 1;
+                    for (int e = tab[q]; e < tab[q + 1]; ++e) rowb[sc[e]] = 1;
                 }
             }
             __syncthreads();
-            if (t + 1 < n) stage_store(wd[t + 1], oc[t + 1], scount[t + 1], tid, st, nc, pq, sc);
-            signed char* out = live + (long long)(t + 1) * W;
-            for (int q = tid; q < nxt; q += LT) out[q] = rowb[q];
-            unsigned char* tmp = rowa; rowa = rowb; rowb = tmp;
+            if (t + 1 < n) {
+                stage_store(wd[t + 1], oc[t + 1], scount[t + 1], tid, st, tab, W);
+                if (t + 2 < n) stage_load(a, ptr, succ, t + 2, wd[t + 2], oc[t + 2], sbase[t + 2], scount[t + 2], tid, st);
+            }
             __syncthreads();
+            unsigned char* tmp = rowa; rowa = rowb; rowb = tmp;
         }
+        if (tid == 0) live[(long long)n * W] = rowa[0];   // the sequence end: its one column
         return;
     }
 
     // backward: rowa acceptance from boundary t + 1, rowb from t, into `back`
     signed char* back = back_all + b * (long long)(n + 1) * W;
-    if (tid == 0) rowa[0] = 1;                                                  // the sequence end
+    if (n == 0) return;
     stage_load(a, ptr, succ, n - 1, wd[n - 1], oc[n - 1], sbase[n - 1], scount[n - 1], tid, st);
-    stage_store(wd[n - 1], oc[n - 1], scount[n - 1], tid, st, nc, pq, sc);
+    stage_store(wd[n - 1], oc[n - 1], scount[n - 1], tid, st, tab, W);
+    if (n > 1) stage_load(a, ptr, succ, n - 2, wd[n - 2], oc[n - 2], sbase[n - 2], scount[n - 2], tid, st);
     __syncthreads();
     for (int t = n - 1; t >= 0; --t) {
         const int w = wd[t], ot = oc[t];
-        if (t > 0) stage_load(a, ptr, succ, t - 1, wd[t - 1], oc[t - 1], sbase[t - 1], scount[t - 1], tid, st);
+        const int* sc = tab + W + 1 - sbase[t];
         signed char* out = back + (long long)t * W;
-        for (int q = tid; q < w; q += LT) {
+#pragma unroll
+        for (int k = 0; k < LSQ; ++k) {
+            int q = tid + k * LST;
+            if (q >= w) break;
             bool g = false;
             if (ot >= 0) {
-                int s = nc[q];
+                int s = tab[q];
                 if (t + 1 == n && s >= 0) s = 0;
                 g = s >= 0 && rowa[s];
             } else {
-                const int base = sbase[t];
-                for (int e = pq[q]; e < pq[q + 1] && !g; ++e) g = rowa[sc[e - base]];
+                for (int e = tab[q]; e < tab[q + 1] && !g; ++e) g = rowa[sc[e]];
             }
             rowb[q] = g;
             out[q] = g;
         }
         __syncthreads();
-        if (t > 0) stage_store(wd[t - 1], oc[t - 1], scount[t - 1], tid, st, nc, pq, sc);
-        unsigned char* tmp = rowa; rowa = rowb; rowb = tmp;
+        if (t > 0) {
+            stage_store(wd[t - 1], oc[t - 1], scount[t - 1], tid, st, tab, W);
+            if (t > 1) stage_load(a, ptr, succ, t - 2, wd[t - 2], oc[t - 2], sbase[t - 2], scount[t - 2], tid, st);
+        }
         __syncthreads();
+        unsigned char* tmp = rowa; rowa = rowb; rowb = tmp;
     }
 }
 
@@ -198,13 +233,13 @@ __global__ void liveness_and_kernel(signed char* live, const signed char* back, 
 }
 
 static size_t liveness_smem(int n, int W, int smax) {
-    return sizeof(int) * ((size_t)W + W + 1 + smax + 4 * (size_t)n + 1) + 2 * (size_t)W;
+    return sizeof(int) * ((size_t)W + 1 + smax + 4 * (size_t)n + 1) + 2 * (size_t)W;
 }
 
 // Whether the shared-memory sweep takes an automaton of W columns, at most smax successor entries a boundary (a
 // sample's lists of fewer classes have no more), over n positions on this device.
 bool liveness_fits(int64_t n, int64_t W, int64_t smax) {
-    if (W > (int64_t)LQ * LT || smax > (int64_t)LS * LT) return false;
+    if (W > (int64_t)LSQ * LST || smax > (int64_t)LSS * LST) return false;
     int dev, optin;
     C10_CUDA_CHECK(cudaGetDevice(&dev));
     C10_CUDA_CHECK(cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev));
@@ -225,7 +260,7 @@ void liveness_cuda(torch::Tensor live, torch::Tensor back, torch::Tensor obs_cla
     TORCH_CHECK(live.is_contiguous() && obs_class.is_contiguous() && next_col.is_contiguous() && delta.is_contiguous() &&
                 state_id.is_contiguous() && col_of_state.is_contiguous() && entry_ptr.is_contiguous() &&
                 entry_succ.is_contiguous() && width.is_contiguous(), "liveness_cuda: contiguous tensors");
-    TORCH_CHECK(W <= (int64_t)LQ * LT && smax <= (int64_t)LS * LT, "liveness_cuda: automaton too wide");
+    TORCH_CHECK(W <= (int64_t)LSQ * LST && smax <= (int64_t)LSS * LST, "liveness_cuda: automaton too wide");
     const int B = (int)live.size(0);
     if (B == 0) return;
     TORCH_CHECK(ps == 0 || entry_ptr.numel() >= (int64_t)B * ps, "liveness_cuda: a successor list per sample");
@@ -243,7 +278,7 @@ void liveness_cuda(torch::Tensor live, torch::Tensor back, torch::Tensor obs_cla
         allowed[dev % 64] = smem;
     }
     auto stream = at::cuda::getCurrentCUDAStream();
-    liveness_kernel<<<dim3(B, 2), LT, smem, stream>>>(a, back.data_ptr<signed char>());
+    liveness_kernel<<<dim3(B, 2), LST, smem, stream>>>(a, back.data_ptr<signed char>());
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     liveness_and_kernel<<<dim3(B, (unsigned)n), 256, 0, stream>>>(live.data_ptr<signed char>(),
                                                                     back.data_ptr<signed char>(),

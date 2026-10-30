@@ -354,6 +354,38 @@ def test_per_boundary_liveness_equals_per_sample(kind, build_pc, monkeypatch):
             assert torch.equal(oa.perm, ob.perm) and torch.equal(oa.rank, ob.rank) and torch.equal(oa.counts, ob.counts)
 
 
+def test_the_shared_memory_sweep_over_wide_boundaries(build_pc, monkeypatch):
+    """The CUDA sweep in shared memory over boundaries of over a thousand columns and successor entries -- several of
+    each a thread -- gives the launches per boundary's live columns, through every class and through every sample's
+    own, under every pattern of evidence (a 3000-state automaton over 9 positions)."""
+    from pyjuice.constraints.inference.dfa_exact.kernels import live
+    from pyjuice.constraints.inference.dfa_exact.kernels.c import get_module
+    if get_module() is None:
+        pytest.skip("the dfa_exact CUDA extension is unavailable")
+    rng = random.Random(0)
+    K, n, B = 3000, 9, 6
+    dfa = jc.DFA.from_dense(V, [[rng.randrange(K) for _ in range(V)] for _ in range(K)], 0, rng.sample(range(K), K // 3))
+    cc = jc.compile(dfa, build_pc("hmm", n, V))
+    prog = cc.backend.program()
+    widths = [int(w) for w in cc.backend.layout.width.tolist()[:n]] + [1]
+    monkeypatch.setattr(live, "LIVE_STEPS_MIN_WIDTH", 1 << 30)
+    assert live._cuda_sweep(prog) is not None                                   # (the shared-memory sweep takes it)
+    assert max(widths) > 1024 and prog.live_smax > 1024, (widths, prog.live_smax)
+    g = torch.Generator().manual_seed(0)
+    for pattern in PATTERNS:
+        data, missing = evidence(pattern, n, B = B)
+        oc = obs_classes(cc, data, missing)
+        for classes in (None, torch.rand(B, n, prog.C, generator = g) < 0.6):
+            succ = None if classes is None else sample_successors(prog, classes.to(prog.dev))
+            got = {}
+            for name, min_width, cuda in (("cuda", 1 << 30, True), ("per_boundary", 0, False)):
+                monkeypatch.setattr(live, "LIVE_STEPS_MIN_WIDTH", min_width)
+                monkeypatch.setattr(live, "LIVE_CUDA", cuda)
+                got[name] = liveness(prog, oc, B, succ).live
+            for t, w in enumerate(widths):
+                assert torch.equal(got["cuda"][:, t, :w], got["per_boundary"][:, t, :w]), (pattern, classes is None, t)
+
+
 def listed(lv):
     """Every (sample, boundary) row's live columns as :meth:`Liveness.lists` lists them, on the host."""
     count, start, columns = (x.cpu() for x in lv.lists())
