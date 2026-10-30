@@ -81,10 +81,11 @@ _dl_arms_cache = {}
 
 def dense_live_arms(M: int, K: int, L: int):
     """The tensor-core dense live-column product's codes (config id | split << 8) for a product of M rows over K at L live
-    lanes: the configs whose column tile is the narrowest that covers L, either row tile, each at the split of K that
-    brings the grid nearest two waves of the SMs and at half of it (at most 16, at most the K tiles) -- a few to measure
-    against the chain. Empty from 64 lanes on (the chain's products are cuBLAS's strength there) or without the
-    module."""
+    lanes: every config whose column tile is the narrowest that covers L and whose shared memory fits THIS device
+    (`dense_live_mma_fits`: row tiles, warp layouts and stage counts), each at the split of K that brings the grid
+    nearest two waves of the SMs, at half of it and at twice (at most 16, at most the K tiles) -- measured against the
+    chain by the caller, so the choice is the running GPU's. Empty from 64 lanes on (the chain's products are cuBLAS's
+    strength there) or without the module."""
     if not 1 <= L < 64 or M < 1 or K < 1:
         return []
     mod = get_dense_live_module()
@@ -98,14 +99,15 @@ def dense_live_arms(M: int, K: int, L: int):
     sms, knt = _sms(), -(-K // 64)
     cover = min(bn for bn in (16, 32, 64) if bn >= L)
     arms = []
-    for c, (bm, bn) in enumerate([(int(v[0]), int(v[1])) for v in mod.dense_live_mma_configs()]):
-        if bn != cover:
+    for c, v in enumerate(mod.dense_live_mma_configs()):
+        bm, bn = int(v[0]), int(v[1])
+        if bn != cover or not mod.dense_live_mma_fits(c):
             continue
         tiles = -(-L // bn) * -(-M // bm)
         split = 1
         while split * 2 <= min(16, knt) and tiles * split * 2 <= 2 * sms:
             split *= 2
-        for sp in sorted({split, max(1, split // 2)}):
+        for sp in sorted({max(1, split // 2), split, min(split * 2, 16, knt)}):
             arms.append(c | (sp << 8))
     _dl_arms_cache[key] = arms
     return arms

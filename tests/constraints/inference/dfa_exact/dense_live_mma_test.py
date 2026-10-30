@@ -1,7 +1,8 @@
 """
 The fused dense live-column product (kernels/c/dense_live_mma.cu: a bf16 query's ``log(W @ exp(x[:, perm] - m)) + m``
-over the live lanes, gathered, exponentiated, multiplied on tensor cores, logged and scattered in two launches) against
-float64 at every arm the dispatch offers (config x split), both weight layouts (K-major, MN-major), the three modes
+over the live lanes on tensor cores, in two forms -- the gather fused into every row tile, or the exponentials computed
+once --, the log and scatter fused) against float64 at every arm the dispatch offers (form x config x split), both weight
+layouts (K-major, MN-major), the three modes
 (overwrite with -inf at the dead columns, keep them, log-add), rows and K off the tiles, a live column of -inf, a row
 of zero weights, a single live lane -- held to the chain's own bf16 class (its operands are bf16 too). Then the
 dispatch: a bf16 HMM decode session with the fused kernel forced against the float64 reference (strong_check's bars)
@@ -89,8 +90,8 @@ def test_every_arm_matches_float64(M, K, L, ncols, scattered, k_major):
     arms = dfa_c.dense_live_arms(M, K, L)
     assert arms, "no arm offered"
     knt = -(-K // 64)
-    codes = sorted({c | (sp << 8) for c in range(len(mod.dense_live_mma_configs())) for sp in (1, 2, min(16, knt))
-                    if sp <= knt} | set(arms))
+    codes = sorted({c | (sp << 8) for c in range(len(mod.dense_live_mma_configs())) if mod.dense_live_mma_fits(c)
+                    for sp in (1, 2, min(16, knt)) if sp <= knt} | set(arms))
     for mode in (0, 1, 2):
         out0 = torch.randn(M, ncols + 3, device = DEV)
         out0[:, ::5] = NEG
@@ -104,7 +105,7 @@ def test_every_arm_matches_float64(M, K, L, ncols, scattered, k_major):
             out = out0.clone()
             mod.dense_live_mma(out, out.stride(0), A, op[1], k_major, x, x.stride(0), perm, rank, M, K, L, ncols, mode, code)
             torch.cuda.synchronize()
-            what = f"mode {mode}, config {code & 255} split {code >> 8}"
+            what = f"mode {mode}, config {code & 255} {tuple(int(v) for v in mod.dense_live_mma_configs()[code & 255][:3])} split {code >> 8}"
             assert not torch.isnan(out).any(), f"{what}: NaN"
             assert torch.equal(torch.isneginf(out), torch.isneginf(want)), f"{what}: the -inf pattern differs"
             d = float((out.double() - want)[fin].abs().max())
@@ -128,15 +129,19 @@ def test_same_bits_twice():
 # --------------------------------------------------------------------------------- the dispatch
 
 def _force(monkeypatch, which):
-    """`autotune.choose` picking ``which`` ("chain", or "fused": the first arm) at the dense live gate without a trial,
-    the real one elsewhere; returns the keys it saw."""
+    """`autotune.choose` picking ``which`` at the dense live gate without a trial -- "chain", or "form0" / "form1": the
+    first arm of that form (the gather fused, or the exponentials once) --, the real one elsewhere; returns the keys
+    it saw."""
     real, seen = autotune.choose, []
+    forms = [int(v[4]) for v in dfa_c.get_dense_live_module().dense_live_mma_configs()]
 
     def choose(key, candidates):
         if isinstance(key, tuple) and key and key[0] == "dfa_dense_live":
             seen.append(key)
             keys = [k for k, _ in candidates]
-            return "chain" if which == "chain" else next(k for k in keys if k != "chain")
+            if which == "chain":
+                return "chain"
+            return next(k for k in keys if k != "chain" and forms[k & 255] == int(which[-1]))
         return real(key, candidates)
 
     monkeypatch.setattr(autotune, "choose", choose)
@@ -158,9 +163,10 @@ def _calls(monkeypatch):
 
 
 @needs_kernel
+@pytest.mark.parametrize("form", ["form0", "form1"])
 @pytest.mark.parametrize("storage", ["dense", "compact"])
 @pytest.mark.parametrize("mode", ["diffusion", "l2r"])
-def test_a_bf16_session_against_float64_and_the_chain(mode, storage, monkeypatch):
+def test_a_bf16_session_against_float64_and_the_chain(mode, storage, form, monkeypatch):
     """A bf16 HMM session with the fused kernel forced: within strong_check's bf16 bars of the float64 reference, -inf
     where it has it; and within bf16's rounding of the same session with the chain forced. On compact rows every dense
     step is a live step (the row's lanes); in dense storage only the steps liveness prunes are, which this small case
@@ -169,7 +175,7 @@ def test_a_bf16_session_against_float64_and_the_chain(mode, storage, monkeypatch
     cc = jc.compile(dfa, pc)
     masks = schedule(mode, data.size(0), data.size(1))
     calls = _calls(monkeypatch)
-    _force(monkeypatch, "fused")
+    _force(monkeypatch, form)
     check_against_reference(cc, Float64Reference(pc, dfa, data.size(1)), data, masks, inputs, storage, "bf16")
     assert bool(calls) == (storage == "compact"), "the fused kernel serves every compact step, no step of this dense case"
     fused = run_session(cc, data, masks, inputs, storage, "bf16")
@@ -191,7 +197,7 @@ def test_it_declines_what_it_does_not_serve(monkeypatch):
     pc, dfa, data, inputs = small_case("hmm")
     cc = jc.compile(dfa, pc)
     calls = _calls(monkeypatch)
-    _force(monkeypatch, "fused")
+    _force(monkeypatch, "form0")
     run_session(cc, data, inputs = inputs, masks = schedule("l2r", data.size(0), data.size(1)), storage = "compact",
                 precision = "tf32")
     assert not calls
