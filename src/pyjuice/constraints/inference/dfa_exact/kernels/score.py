@@ -27,6 +27,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Optional
 
+import os
+
 import numpy as np
 import torch
 import triton
@@ -41,6 +43,7 @@ from .common import (IDENTITY, NODE_TILE, _block_ptr, _exit_width, _interval, _n
 from .prod import _lse_step_one_exp
 from .prod_top_down import _once, _out_flows_ptr, _parent_base, _parent_lane
 from .sum import _num_sms
+from .c import get_class_weights_module
 
 
 
@@ -436,6 +439,89 @@ def _class_weight_kernel(dfa_class_flow, cw_col, cw_K, cw_count, cw_cls, cw_off,
         tl.store(dest, _logaddexp_tile(tl.load(dest, mask = dm, other = float("-inf")), val), mask = dm)
 
 
+#: Whether the class weights of ``input @ block`` steps with one exit column and one step a destination run the CUDA
+#: kernels (kernels/c/class_weights.cu, :func:`_class_weight_cuda`: the destinations' rows staged in shared memory, the
+#: class lists pre-filtered and interleaved by lane) where they apply -- compact storage under evidence pruning, a
+#: non-identity block, at most ``CLASS_WEIGHT_CUDA_CLASSES`` classes, the launch's longest live walk (the most live
+#: columns of a sample at its positions) at least ``CLASS_WEIGHT_CUDA_WALK`` --, the Triton kernel elsewhere. The two
+#: give the same bits (the kernels' terms in the Triton kernel's order with its arithmetic). The CUDA launch has a floor
+#: (~70 us: 16k CTAs staging their rows) where the Triton one costs ~16-26 us on a few live columns; past ~40 live
+#: columns the Triton kernel is bound by the L2 traffic of its per-lane gathers (ncu: 77% of the L2's peak, 5 of every
+#: 32 bytes used) and the CUDA kernels are 2-5x faster. MEASURED (HMM-4096 x hard_0 B8 diffusion, 32 calls, nsys,
+#: RTX PRO 6000; launches paired between the two sessions): class weights 1230 ms on Triton, 783 on CUDA, 457 under the
+#: rule (walk >= 41: the best threshold; the per-launch best of both 454).
+CLASS_WEIGHT_CUDA = os.environ.get("PYJUICE_CW_CUDA", "1") == "1"
+CLASS_WEIGHT_CUDA_CLASSES = 4096
+CLASS_WEIGHT_CUDA_WALK = int(os.environ.get("PYJUICE_CW_WALK", "40"))
+#: destinations a CTA (1, 2 or 4, the most whose rows fit in shared memory) and threads a CTA; the entry tables'
+#: work space at most (bytes)
+CLASS_WEIGHT_CUDA_DESTS = int(os.environ.get("PYJUICE_CW_DESTS", "2"))
+CLASS_WEIGHT_CUDA_THREADS = int(os.environ.get("PYJUICE_CW_THREADS", "256"))
+CLASS_WEIGHT_CUDA_TABLE_MAX = 1 << 28
+#: the shared memory a CTA's staged rows may take (bytes; sm_80+ opt in to ~99 KB, less the kernel's own 128 B)
+CLASS_WEIGHT_CUDA_SMEM = 96 * 1024
+
+
+def _long_walk(la, rows) -> bool:
+    """Whether the launch's longest live walk reaches :data:`CLASS_WEIGHT_CUDA_WALK` (host values, no wait)."""
+    bounds = la.host.get("bounds")
+    if bounds is None:
+        bounds = la.host["bounds"] = sorted(set(la.host["dests"][:, 0].tolist()))
+    walk = rows.walk
+    return max(walk[t] for t in bounds) >= CLASS_WEIGHT_CUDA_WALK
+
+
+def _class_weight_cuda(mod, la, tiles, height, cw, rows, prog, bufs, element_flows, temp_flows, node_mars, liveness,
+                       compact, prior, regions, elem_first, elem_width, temp_width, tflow_width, B, s_kind, out_temp,
+                       out_full, s_full, inside, store) -> bool:
+    """One launch on the CUDA kernels (see :data:`CLASS_WEIGHT_CUDA`), or False where they do not apply (several steps
+    a destination, rows too wide for shared memory, entry tables past :data:`CLASS_WEIGHT_CUDA_TABLE_MAX`, a CUDA graph
+    being captured before the launch's tables exist): the caller runs the Triton kernel then."""
+    h = la.host
+    st = h.get("cw_cuda")
+    if st is None:
+        if torch.cuda.is_current_stream_capturing():
+            return False
+        d = h["dests"]
+        ptr = np.asarray(h["ptr"])
+        ts = sorted(set(d[:, 0].tolist()))
+        maxl = getattr(prog, "_cw_max_list", None)
+        if maxl is None:                                               # every boundary's longest class list (once)
+            cp = prog.trans.cls_ptr.view(-1, prog.C + 1)
+            maxl = prog._cw_max_list = (cp[:, 1:] - cp[:, :-1]).amax(1).cpu().numpy()
+        t2i = np.full(prog.n + 1, -1, dtype = np.int32)
+        t2i[ts] = np.arange(len(ts), dtype = np.int32)
+        st = h["cw_cuda"] = dict(
+            steps = int((ptr[1:] - ptr[:-1]).max(initial = 0)),
+            tlist = torch.tensor(ts, dtype = torch.int32, device = prog.dev),
+            t2i = torch.from_numpy(t2i).to(prog.dev), T = len(ts), maxl = max(1, int(max(maxl[t] for t in ts))),
+            wt = max(prog.width[t] for t in ts), wt1 = max(prog.width[t + 1] for t in ts))
+    if st["steps"] != 1:
+        return False
+    lanes = host_cdiv(max(rows.most, 1), 32) * 32
+    if st["T"] * B * lanes * st["maxl"] * 4 > CLASS_WEIGHT_CUDA_TABLE_MAX:
+        return False
+    fits = [g for g in (4, 2, 1) if g <= CLASS_WEIGHT_CUDA_DESTS and height % g == 0 and
+            mod.cw_stage_smem(g, st["wt"], st["wt1"]) <= CLASS_WEIGHT_CUDA_SMEM]
+    if not fits:
+        return False
+    TN = fits[0]
+    temp, once_iv = bufs
+    count, start, columns = liveness.lists()
+    tab = torch.empty(st["T"] * B * lanes * st["maxl"], dtype = torch.int32, device = prog.dev)
+    cnt = torch.empty(st["T"] * B * lanes, dtype = torch.int32, device = prog.dev)
+    mod.cw_class_cuda(cw["buf"], cw["col"], cw["K"], rows.count, rows.cls, rows.off, element_flows, temp_flows,
+                      node_mars, prior["mars"], temp, prog.width_t, prog.intervals.of, prog.intervals.info,
+                      prog.intervals.table, once_iv, prog.trans.cls_ptr, prog.trans.cls_col, prog.trans.cls_succ,
+                      liveness.live, count, start, columns, compact.rank, compact.off, la.dests, tiles, la.ptr,
+                      la.parents, regions["offset"], regions["width"], regions["first"], prior["offset"],
+                      prior["width"], prior["reg_prior"], st["tlist"], st["t2i"], tab, cnt, int(elem_first),
+                      int(elem_width), int(temp_width), int(tflow_width), B, prog.n, prog.W, prog.C, lanes,
+                      st["maxl"], st["wt"], st["wt1"], height // TN, TN, CLASS_WEIGHT_CUDA_THREADS, int(s_kind),
+                      bool(out_temp), bool(out_full), bool(s_full), bool(inside), bool(store))
+    return True
+
+
 #: :func:`_class_weight_kernel`'s walk: 0, every program chooses (its lanes' longest class list against the columns
 #: it would walk otherwise); 1, the classes' columns; 2, the sample's columns (tests)
 CLASS_WEIGHT_WALK = 0
@@ -482,6 +568,8 @@ class ClassWeightRows:
     :ivar starts: every row group's first float, then the size (host; read on first use, see :attr:`most`)
     :ivar most: the most rows of any column (host): copied with :attr:`starts` as the rows are built, and waited for
         on first use -- a query asks after its forward pass's launches, so the wait is the rows' alone
+    :ivar walk: per boundary, the most live columns of any sample there (host, with :attr:`most`; every column under
+        no pruning): the class weights' longest walk at a position (:data:`CLASS_WEIGHT_CUDA_WALK`)
     """
 
     count: torch.Tensor
@@ -490,6 +578,7 @@ class ClassWeightRows:
     row: torch.Tensor
     _host: torch.Tensor
     _done: Any
+    _groups: int
     rep: Optional[torch.Tensor] = None
     _read: Optional[tuple] = None
 
@@ -497,7 +586,8 @@ class ClassWeightRows:
         if self._read is None:
             self._done.synchronize()
             v = self._host.tolist()
-            self._read = (v[:-1], int(v[-1]))
+            g = self._groups
+            self._read = (v[:g + 1], int(v[g + 1]), v[g + 2:])
         return self._read
 
     @property
@@ -507,6 +597,10 @@ class ClassWeightRows:
     @property
     def most(self) -> int:
         return self._sizes()[1]
+
+    @property
+    def walk(self) -> list:
+        return self._sizes()[2]
 
 
 #: whether the live classes of a target column with the same live pairs share one row of class weights (see
@@ -749,11 +843,15 @@ def class_weight_rows(prog, liveness, col_pos: torch.Tensor, col_K: torch.Tensor
     TC = min(LIVE_CLASS_TILE, host_next_power_of_2(C))
     _class_rows_kernel[(max(N, G + 1),)](off, tt.cls_order, col_pos, col_K, col_first, group_first, row, rep, count,
                                          cls, sizes, N, G, C, B, TC = TC, SHARED = shared)
-    host = torch.empty(G + 2, dtype = torch.int64, pin_memory = True)
-    host.copy_(sizes, non_blocking = True)
+    # the longest walk at every boundary (the most live columns of any sample; every column without pruning), copied
+    # with the sizes: the class weights' kernel choice (:data:`CLASS_WEIGHT_CUDA_WALK`)
+    walk = liveness.lists()[0].view(B, n + 1).amax(0) if liveness is not None else prog.width_t[:n + 1]
+    host = torch.empty(G + 2 + n + 1, dtype = torch.int64, pin_memory = True)
+    host[:G + 2].copy_(sizes, non_blocking = True)
+    host[G + 2:].copy_(walk, non_blocking = True)
     done = torch.cuda.Event()
     done.record(torch.cuda.current_stream(dev.index))
-    return ClassWeightRows(count = count, cls = cls, off = off, row = row, _host = host, _done = done,
+    return ClassWeightRows(count = count, cls = cls, off = off, row = row, _host = host, _done = done, _groups = G,
                            rep = rep if shared else None)
 
 
@@ -789,11 +887,18 @@ def run_class_weights(launches, cw: dict, prog, bufs, element_flows, temp_flows,
     ctables = (compact.off, compact.rank) if compact is not None else (cw["K"],) * 2
     rows = cw["rows"]
     TC = min(64, host_next_power_of_2(max(rows.most, 1)))                   # (a lane a live class of a column)
+    mod = get_class_weights_module() if CLASS_WEIGHT_CUDA and prune and compact is not None else None
     for la, item, store in launches:
         idx = tensor(item)
         tiles, height = (la.tiles, la.tile_height) if idx is None else (idx, item.height)
         s_kind, out_temp, (out_full, *s_full) = la.kinds
         identity = la.form == "input_block" and s_kind == IDENTITY
+        if mod is not None and la.form == "input_block" and not identity and la.J_max == 1 and \
+                C <= CLASS_WEIGHT_CUDA_CLASSES and prog.W < 65535 and _long_walk(la, rows) and \
+                _class_weight_cuda(mod, la, tiles, height, cw, rows, prog, (temp, once_iv), element_flows, temp_flows,
+                                   node_mars, liveness, compact, prior, regions, elem_first, elem_width, temp_width,
+                                   tflow_width, B, s_kind, out_temp, out_full, all(s_full), inside, store):
+            continue
         TJ = 1 if identity else min(64, host_next_power_of_2(la.J_max))
         TN = min(height, CLASS_WEIGHT_NODES, max(1, CLASS_WEIGHT_LANES // (TC * TJ)))   # (powers of 2)
         TB = max(1, min(host_next_power_of_2(B), 128 // TC, CLASS_WEIGHT_LANES // (TC * TJ * TN)))

@@ -46,6 +46,36 @@ def get_module():
     return _module
 
 
+_cw_module = None
+_cw_attempted = False
+
+
+def get_class_weights_module():
+    """The class weights by class (``class_weights.cu``: ``cw_class_cuda``), its own extension, or None if it is
+    unavailable (warns once): the class weights then run their Triton kernel."""
+    global _cw_module, _cw_attempted
+    if _cw_attempted:
+        return _cw_module
+    _cw_attempted = True
+    if not ENABLE_CUDA_KERNELS or not torch.cuda.is_available():
+        return None
+    from torch.utils.cpp_extension import CUDA_HOME
+    cc = torch.cuda.get_device_capability()
+    if CUDA_HOME is None or cc < (8, 0):
+        return None
+    from pyjuice.utils.cuda_ext import jit_load
+    try:
+        _cw_module = jit_load("pyjuice_dfa_exact_class_weights_cuda",
+                              sources = [os.path.join(_THIS_DIR, "class_weights.cu")],
+                              extra_cuda_cflags = ["-O3", f"-arch=sm_{cc[0]}{cc[1]}", "--use_fast_math", "-DNDEBUG"],
+                              verbose = False)
+    except Exception as e:
+        warnings.warn(f"pyjuice CUDA kernel 'pyjuice_dfa_exact_class_weights_cuda' failed to compile "
+                      f"({type(e).__name__}: {e}). The class weights run their Triton kernel instead.", RuntimeWarning)
+        _cw_module = None
+    return _cw_module
+
+
 _dl_module = None
 _dl_attempted = False
 
