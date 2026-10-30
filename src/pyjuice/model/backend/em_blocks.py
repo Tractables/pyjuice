@@ -15,8 +15,13 @@ every node's total (`cum_pflow_kernel`'s sum, without its atomics) and then ever
 * `_em_node_block_one_pass_kernel` for tiles of at most `ONE_PASS_MAX` children: the tile read once and kept while its
   totals are summed -- the update at its floor (MEASURED, HCLT-1024, 1024 children: fp32 3.95 ms against 3.88; bf16
   with the master copy 5.39 against 5.2);
-* `_em_node_block_kernel` for any number of children: the flows read twice, once for the totals (fp32 5.06 ms, bf16
-  6.41).
+* the split kernels for any number of children, a program per (node tile, `SPLIT_CHUNK` children): the chunks'
+  partial totals (`_em_split_partials_kernel`), summed in chunk order (`_em_split_merge_kernel`), then the update
+  (`_em_split_update_kernel`) -- the flows read twice. A two-pass kernel whose programs were the node tiles alone, each
+  walking every child, ran 64 programs on HMM-4096 (block 1024, 4096 children): 2.4-2.8x above the bytes' floor
+  (MEASURED, toast, mini_batch_em: bf16 with the master copy 675 us, fp32 419, against a copy of the bytes 243 / 194);
+  split by chunks of 256, 293 / 155 (chunks of 128-1024 and node tiles of 32 within 10%). HCLT-1024 (1024 children,
+  the one-pass form): fp32 5.06 ms, bf16 6.41 forced to the split form.
 
 Which one, and the one-pass tile, is a fixed rule (`_form`), not a timed choice: the forms sum a node's flows in
 different orders (~1e-10 apart, thousands of a layer's values differing in the last bits), and the update must come out
@@ -45,9 +50,12 @@ import triton.language as tl
 #: Node blocks of at least this many nodes take the node-block kernel; smaller ones the per-block kernels
 MIN_BLOCK_SIZE = 16
 
-#: The two-pass kernel's tile: nodes a program takes (a power of two), children per step
+#: The split kernels' tile: nodes a program takes (a power of two), children per step, children a program (a power of
+#: two; the chunks' partial totals summed in chunk order) -- a node block's programs = node tiles x chunks (see the
+#: module docstring)
 BLOCK_N = 64
 BLOCK_C = 32
+SPLIT_CHUNK = 256
 
 #: The most children the one-pass kernel holds (a tile's whole column of flows in registers)
 ONE_PASS_MAX = 1024
@@ -60,78 +68,14 @@ ONE_PASS_TILE_MASTER = (8, 16)
 
 
 @triton.jit
-def _em_node_block_kernel(stored_ptr, master, param_flows, cum_pflows, t_par, t_pflow, t_rows, t_stride, t_nodes,
-                          t_gnid, step_size, pseudocount, HAS_MASTER: tl.constexpr, KEEP_ZERO: tl.constexpr,
-                          BLOCK_C: tl.constexpr, BLOCK_N: tl.constexpr):
-    """Program t: the tile's ``t_nodes[t]`` nodes, from parameter ``t_par[t]`` / flow ``t_pflow[t]``, ``t_rows[t]``
-    children, rows ``t_stride[t]`` (the node block's size) apart; their totals stored at ``cum_pflows[t_gnid[t]:]`` (the
-    per-block kernels' buffer, as they leave it). ``stored_ptr``: the parameters as stored (an argument named
-    ``params`` breaks Triton 3.7's binder)."""
-    t = tl.program_id(0)
-    par0 = tl.load(t_par + t).to(tl.int64)
-    pf0 = tl.load(t_pflow + t).to(tl.int64)
-    nch = tl.load(t_rows + t)                                          # the nodes' children (int64, as `nchs`)
-    nch32 = nch.to(tl.int32)
-    stride = tl.load(t_stride + t).to(tl.int64)
-    nv = tl.load(t_nodes + t).to(tl.int32)
-    gnid = tl.load(t_gnid + t).to(tl.int64)
-
-    offs_n = tl.arange(0, BLOCK_N)
-    mask_n = offs_n < nv
-    offs_c0 = tl.arange(0, BLOCK_C)
-
-    # The nodes' totals: `cum_pflow_kernel`'s sum (with `keep_zero_params`, over the children not at zero, each flow
-    # plus its share of the pseudocount)
-    tot = tl.zeros([BLOCK_N], dtype = tl.float32)
-    for c0 in range(0, nch32, BLOCK_C):
-        offs_c = c0 + offs_c0
-        mask = (offs_c < nch32)[:, None] & mask_n[None, :]
-        rel = offs_c.to(tl.int64)[:, None] * stride + offs_n[None, :]
-        pflows = tl.load(param_flows + pf0 + rel, mask = mask, other = 0)
-        if KEEP_ZERO:
-            if HAS_MASTER:
-                stored = tl.load(stored_ptr + par0 + rel, mask = mask, other = 0)
-                mval = tl.load(master + par0 + rel, mask = mask, other = 0)
-                old = tl.where(stored != mval.to(stored.dtype), stored.to(tl.float32), mval)
-            else:
-                old = tl.load(stored_ptr + par0 + rel, mask = mask, other = 0).to(tl.float32)
-            pflows += pseudocount / nch
-            tot += tl.sum(tl.where(mask & ~(old < 1e-12), pflows, 0.0), axis = 0)      # (the original's test)
-        else:
-            tot += tl.sum(pflows, axis = 0)
-    tl.store(cum_pflows + gnid + offs_n, tot, mask = mask_n)
-
-    # The update, as `em_par_update_kernel` computes it
-    for c0 in range(0, nch32, BLOCK_C):
-        offs_c = c0 + offs_c0
-        mask = (offs_c < nch32)[:, None] & mask_n[None, :]
-        rel = offs_c.to(tl.int64)[:, None] * stride + offs_n[None, :]
-        pflows = tl.load(param_flows + pf0 + rel, mask = mask, other = 0)
-        if KEEP_ZERO:
-            new_param = (pflows + pseudocount / nch) / tot[None, :]
-        else:
-            new_param = (pflows + pseudocount / nch) / (tot[None, :] + pseudocount)
-        if HAS_MASTER:
-            stored = tl.load(stored_ptr + par0 + rel, mask = mask, other = 0)
-            mval = tl.load(master + par0 + rel, mask = mask, other = 0)
-            old = tl.where(stored != mval.to(stored.dtype), stored.to(tl.float32), mval)
-        else:
-            old = tl.load(stored_ptr + par0 + rel, mask = mask, other = 0).to(tl.float32)
-        if KEEP_ZERO:
-            upd = tl.where(old < 1e-12, 0.0, (1.0 - step_size) * old + step_size * new_param)
-        else:
-            upd = (1.0 - step_size) * old + step_size * new_param
-        if HAS_MASTER:
-            tl.store(master + par0 + rel, upd, mask = mask)
-        tl.store(stored_ptr + par0 + rel, upd.to(stored_ptr.dtype.element_ty), mask = mask)
-
-
-@triton.jit
 def _em_node_block_one_pass_kernel(stored_ptr, master, param_flows, cum_pflows, t_par, t_pflow, t_rows, t_stride,
                                    t_nodes, t_gnid, step_size, pseudocount, HAS_MASTER: tl.constexpr,
                                    KEEP_ZERO: tl.constexpr, NCH: tl.constexpr, BLOCK_N: tl.constexpr):
-    """`_em_node_block_kernel` for tiles of at most ``NCH`` children (a power of two): the tile's flows read once, kept
-    while their totals are summed."""
+    """Program t: the tile's ``t_nodes[t]`` nodes, from parameter ``t_par[t]`` / flow ``t_pflow[t]``, ``t_rows[t]``
+    children (at most ``NCH``, a power of two), rows ``t_stride[t]`` (the node block's size) apart; their totals stored
+    at ``cum_pflows[t_gnid[t]:]`` (the per-block kernels' buffer, as they leave it). The tile's flows read once, kept
+    while their totals are summed. ``stored_ptr``: the parameters as stored (an argument named ``params`` breaks Triton
+    3.7's binder)."""
     t = tl.program_id(0)
     par0 = tl.load(t_par + t).to(tl.int64)
     pf0 = tl.load(t_pflow + t).to(tl.int64)
@@ -167,6 +111,108 @@ def _em_node_block_one_pass_kernel(stored_ptr, master, param_flows, cum_pflows, 
     tl.store(stored_ptr + par0 + rel, upd.to(stored_ptr.dtype.element_ty), mask = mask)
 
 
+@triton.jit
+def _em_split_partials_kernel(stored_ptr, master, param_flows, partials, t_par, t_pflow, t_rows, t_stride, t_nodes,
+                              t_gnid, G, pseudocount, HAS_MASTER: tl.constexpr, KEEP_ZERO: tl.constexpr,
+                              CHUNK: tl.constexpr, BLOCK_C: tl.constexpr, BLOCK_N: tl.constexpr):
+    """Program (t, c): the partial totals of tile ``t``'s nodes (the one-pass kernel's tables) over its children
+    ``[c * CHUNK, (c + 1) * CHUNK)`` -- `cum_pflow_kernel`'s sum over them (with ``keep_zero_params``, over the children
+    not at zero, each flow plus its share of the pseudocount) -- at ``partials[c * G + gnid + node]`` (``G`` the
+    circuit's nodes); `_em_split_merge_kernel` sums the chunks."""
+    t = tl.program_id(0)
+    c = tl.program_id(1)
+    nch = tl.load(t_rows + t)
+    nch32 = nch.to(tl.int32)
+    if c * CHUNK < nch32:
+        par0 = tl.load(t_par + t).to(tl.int64)
+        pf0 = tl.load(t_pflow + t).to(tl.int64)
+        stride = tl.load(t_stride + t).to(tl.int64)
+        nv = tl.load(t_nodes + t).to(tl.int32)
+        gnid = tl.load(t_gnid + t).to(tl.int64)
+        offs_n = tl.arange(0, BLOCK_N)
+        mask_n = offs_n < nv
+        offs_c0 = c * CHUNK + tl.arange(0, BLOCK_C)
+        tot = tl.zeros([BLOCK_N], dtype = tl.float32)
+        for c0 in range(0, CHUNK, BLOCK_C):
+            offs_c = c0 + offs_c0
+            mask = (offs_c < nch32)[:, None] & mask_n[None, :]
+            rel = offs_c.to(tl.int64)[:, None] * stride + offs_n[None, :]
+            pflows = tl.load(param_flows + pf0 + rel, mask = mask, other = 0)
+            if KEEP_ZERO:
+                if HAS_MASTER:
+                    stored = tl.load(stored_ptr + par0 + rel, mask = mask, other = 0)
+                    mval = tl.load(master + par0 + rel, mask = mask, other = 0)
+                    old = tl.where(stored != mval.to(stored.dtype), stored.to(tl.float32), mval)
+                else:
+                    old = tl.load(stored_ptr + par0 + rel, mask = mask, other = 0).to(tl.float32)
+                pflows += pseudocount / nch
+                tot += tl.sum(tl.where(mask & ~(old < 1e-12), pflows, 0.0), axis = 0)
+            else:
+                tot += tl.sum(pflows, axis = 0)
+        tl.store(partials + c.to(tl.int64) * G + gnid + offs_n, tot, mask = mask_n)
+
+
+@triton.jit
+def _em_split_merge_kernel(partials, cum_pflows, t_rows, t_nodes, t_gnid, G, CHUNK: tl.constexpr,
+                           BLOCK_N: tl.constexpr):
+    """Program t: tile ``t``'s nodes' totals, their chunks' partials summed in chunk order (one order: the same bits
+    on every rank), at ``cum_pflows[gnid:]`` (the per-block kernels' buffer, as they leave it)."""
+    t = tl.program_id(0)
+    nch32 = tl.load(t_rows + t).to(tl.int32)
+    nv = tl.load(t_nodes + t).to(tl.int32)
+    gnid = tl.load(t_gnid + t).to(tl.int64)
+    offs_n = tl.arange(0, BLOCK_N)
+    mask_n = offs_n < nv
+    tot = tl.zeros([BLOCK_N], dtype = tl.float32)
+    for c in range(0, tl.cdiv(nch32, CHUNK)):
+        tot += tl.load(partials + c.to(tl.int64) * G + gnid + offs_n, mask = mask_n, other = 0)
+    tl.store(cum_pflows + gnid + offs_n, tot, mask = mask_n)
+
+
+@triton.jit
+def _em_split_update_kernel(stored_ptr, master, param_flows, cum_pflows, t_par, t_pflow, t_rows, t_stride, t_nodes,
+                            t_gnid, step_size, pseudocount, HAS_MASTER: tl.constexpr, KEEP_ZERO: tl.constexpr,
+                            CHUNK: tl.constexpr, BLOCK_C: tl.constexpr, BLOCK_N: tl.constexpr):
+    """Program (t, c): the update of tile ``t``'s parameters over its children ``[c * CHUNK, (c + 1) * CHUNK)`` from the
+    totals at ``cum_pflows``, as `em_par_update_kernel` computes it."""
+    t = tl.program_id(0)
+    c = tl.program_id(1)
+    nch = tl.load(t_rows + t)
+    nch32 = nch.to(tl.int32)
+    if c * CHUNK < nch32:
+        par0 = tl.load(t_par + t).to(tl.int64)
+        pf0 = tl.load(t_pflow + t).to(tl.int64)
+        stride = tl.load(t_stride + t).to(tl.int64)
+        nv = tl.load(t_nodes + t).to(tl.int32)
+        gnid = tl.load(t_gnid + t).to(tl.int64)
+        offs_n = tl.arange(0, BLOCK_N)
+        mask_n = offs_n < nv
+        tot = tl.load(cum_pflows + gnid + offs_n, mask = mask_n, other = 1.0)
+        offs_c0 = c * CHUNK + tl.arange(0, BLOCK_C)
+        for c0 in range(0, CHUNK, BLOCK_C):
+            offs_c = c0 + offs_c0
+            mask = (offs_c < nch32)[:, None] & mask_n[None, :]
+            rel = offs_c.to(tl.int64)[:, None] * stride + offs_n[None, :]
+            pflows = tl.load(param_flows + pf0 + rel, mask = mask, other = 0)
+            if KEEP_ZERO:
+                new_param = (pflows + pseudocount / nch) / tot[None, :]
+            else:
+                new_param = (pflows + pseudocount / nch) / (tot[None, :] + pseudocount)
+            if HAS_MASTER:
+                stored = tl.load(stored_ptr + par0 + rel, mask = mask, other = 0)
+                mval = tl.load(master + par0 + rel, mask = mask, other = 0)
+                old = tl.where(stored != mval.to(stored.dtype), stored.to(tl.float32), mval)
+            else:
+                old = tl.load(stored_ptr + par0 + rel, mask = mask, other = 0).to(tl.float32)
+            if KEEP_ZERO:
+                upd = tl.where(old < 1e-12, 0.0, (1.0 - step_size) * old + step_size * new_param)
+            else:
+                upd = (1.0 - step_size) * old + step_size * new_param
+            if HAS_MASTER:
+                tl.store(master + par0 + rel, upd, mask = mask)
+            tl.store(stored_ptr + par0 + rel, upd.to(stored_ptr.dtype.element_ty), mask = mask)
+
+
 class _Tables:
     """A circuit's node blocks for the update, structure only: those of at least `MIN_BLOCK_SIZE` nodes (each its first
     parameter and flow, children, size, and its `ns`'s parameter range start, for exclusions), cut into tiles per tile
@@ -190,6 +236,12 @@ class _Tables:
         self.blocks = np.asarray(blocks, dtype = np.int64).reshape(-1, 6)
         self.device = pc.params.device
         self.cache = dict()
+        self.partials = None                       # the split kernels' scratch, grown to the largest launch
+
+    def scratch(self, floats: int) -> torch.Tensor:
+        if self.partials is None or self.partials.numel() < floats:
+            self.partials = torch.empty(floats, dtype = torch.float32, device = self.device)
+        return self.partials
 
     def groups(self, pc, exclude: Sequence) -> tuple:
         """``(groups, per-block kwargs)`` without the parameter ranges ``exclude`` (each a whole `ns`'s): ``groups``
@@ -245,23 +297,32 @@ def _form(nch_bucket, has_master: bool) -> tuple:
     """The kernel form for a group of node blocks of ``nch_bucket`` children (None: past `ONE_PASS_MAX`), as `_launch`
     takes it: a function of the shape alone, so every process updating the same values gets the same bits."""
     if nch_bucket is None:
-        return ("two", BLOCK_N, 4)
+        return ("split", BLOCK_N, 4)
     width, warps = ONE_PASS_TILE_MASTER if has_master else ONE_PASS_TILE
     return ("one", width, warps)
 
 
 def _launch(cfg, tables, group, nch_bucket, stored, master, param_flows, cum_pflows, step_size, pseudocount, keep_zero):
-    """One group's update with ``cfg``: ``("two", BLOCK_N, 4)`` the two-pass kernel, ``("one", nodes, warps)`` the
-    one-pass one (its children ``nch_bucket``)."""
+    """One group's update with ``cfg``: ``("split", BLOCK_N, 4)`` the split kernels (`SPLIT_CHUNK` children a program,
+    the partial totals merged), ``("one", nodes, warps)`` the one-pass one (its children ``nch_bucket``)."""
     kind, width, warps = cfg
     tiles = tables.tiles(group, width)
     if tiles[0].numel() == 0:
         return
     m = master if master is not None else stored
-    if kind == "two":
-        _em_node_block_kernel[(tiles[0].numel(),)](
+    if kind == "split":
+        G = cum_pflows.numel()
+        chunks = -(-int(group["blocks"][:, 2].max()) // SPLIT_CHUNK)
+        partials = tables.scratch(chunks * G)
+        t_par, t_pflow, t_rows, t_stride, t_nodes, t_gnid = tiles
+        _em_split_partials_kernel[(tiles[0].numel(), chunks)](
+            stored, m, param_flows, partials, *tiles, G, pseudocount, HAS_MASTER = master is not None,
+            KEEP_ZERO = keep_zero, CHUNK = SPLIT_CHUNK, BLOCK_C = BLOCK_C, BLOCK_N = width, num_warps = warps)
+        _em_split_merge_kernel[(tiles[0].numel(),)](partials, cum_pflows, t_rows, t_nodes, t_gnid, G,
+                                                    CHUNK = SPLIT_CHUNK, BLOCK_N = width, num_warps = 1)
+        _em_split_update_kernel[(tiles[0].numel(), chunks)](
             stored, m, param_flows, cum_pflows, *tiles, step_size, pseudocount, HAS_MASTER = master is not None,
-            KEEP_ZERO = keep_zero, BLOCK_C = BLOCK_C, BLOCK_N = width, num_warps = warps)
+            KEEP_ZERO = keep_zero, CHUNK = SPLIT_CHUNK, BLOCK_C = BLOCK_C, BLOCK_N = width, num_warps = warps)
     else:
         _em_node_block_one_pass_kernel[(tiles[0].numel(),)](
             stored, m, param_flows, cum_pflows, *tiles, step_size, pseudocount, HAS_MASTER = master is not None,

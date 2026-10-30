@@ -1,7 +1,7 @@
 """
 Mini-batch EM's node-block update (`pyjuice.model.backend.em_blocks`) against float64 and against the per-block kernels
 it replaces (`par_update.em_par_update`, `params_master.em_par_update_master`), from one state: every kernel form (the
-two-pass one and both one-pass tiles, forced in turn), fp32 parameters and bf16 ones through their master copy,
+split kernels and both one-pass tiles, forced in turn), fp32 parameters and bf16 ones through their master copy,
 node blocks from 1 to 128 nodes (the small ones the per-block kernels'), step sizes, pseudocounts, keep-zero, ranges
 excluded (the corrected ones of the external-parameter M-step), the update agreeing with itself run to run to the bit
 (no atomics), and its form a rule of the shape, never a measurement.
@@ -19,7 +19,7 @@ from pyjuice.model.backend.params_master import em_par_update_master
 
 DEV = torch.device("cuda:0")
 cuda_only = pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs a GPU")
-CFGS = [("two", em_blocks.BLOCK_N, 4), ("one",) + em_blocks.ONE_PASS_TILE, ("one",) + em_blocks.ONE_PASS_TILE_MASTER]
+CFGS = [("split", em_blocks.BLOCK_N, 4), ("one",) + em_blocks.ONE_PASS_TILE, ("one",) + em_blocks.ONE_PASS_TILE_MASTER]
 
 
 def _ref64(pc, params, flows, step_size, pseudocount, keep_zero, exclude = ()):
@@ -97,8 +97,9 @@ def _run(pc, flows, start, step_size, pcount, kz, exclude, path):
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16], ids = ["fp32", "bf16"])
 @pytest.mark.parametrize("kind", ["hclt", "hmm", "pd"])
 def test_every_form_is_the_update(cfg, dtype, kind, monkeypatch):
-    monkeypatch.setattr(em_blocks, "_form",
-                        lambda nch_bucket, has_master: cfg if nch_bucket is not None else ("two", em_blocks.BLOCK_N, 4))
+    monkeypatch.setattr(em_blocks, "_form",                           # (the one-pass forms need a children bucket)
+                        lambda nch_bucket, has_master: cfg if cfg[0] != "one" or nch_bucket is not None
+                        else ("split", em_blocks.BLOCK_N, 4))
     ns, V, C = _circuit(kind)
     pc, flows = _state(ns, V, C, dtype)
     sums = [n for n in pc.root_ns if n.is_sum() and not n.is_tied()]
@@ -143,7 +144,7 @@ def test_the_form_is_the_shapes_not_a_timing(dtype, monkeypatch):
     em_blocks.em_update(pc, flows, 0.5, 0.1, False, master = master)
     want = ("one",) + (em_blocks.ONE_PASS_TILE_MASTER if master is not None else em_blocks.ONE_PASS_TILE)
     assert launched and all(c == want for c in launched), launched
-    assert em_blocks._form(None, master is not None) == ("two", em_blocks.BLOCK_N, 4)
+    assert em_blocks._form(None, master is not None) == ("split", em_blocks.BLOCK_N, 4)
 
 
 @cuda_only
