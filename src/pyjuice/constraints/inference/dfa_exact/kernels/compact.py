@@ -344,18 +344,20 @@ def _mars_layout(backend, prog, total: np.ndarray, lanes: np.ndarray, inside: np
                 lanes = int(lanes[inside].max(initial = 0)), ivs = ivs, regions = inside)
 
 
-#: rows of a region one re-gather program copies, and its lanes; floats a segment copy's program copies
-REGATHER_ROWS, REGATHER_TILE = 16, 512
+#: a re-gather program's lanes -- a region's most, rounded up to a power of 2 of at least 16, up to REGATHER_TILE --,
+#: its rows of the region, and the floats it copies a step (rows x lanes); floats a segment copy's program copies.
+#: Codpula-4096 x JSON hard_0 l2r B8 (8-16 lanes, 4096 rows): 87 -> 10.5 us; B32 (32-60 lanes): 95 -> 25 us
+REGATHER_TILE, REGATHER_ROWS, REGATHER_FLOATS = 512, 256, 1024
 COPY_TILE = 1024
 
 
 @triton_jit
 def _regather_kernel(src, dst, table, parents, old_off, old_count, old_rank, off, count, start, columns, B_old, B, n,
-                     W, steps, ROWS: tl.constexpr, TILE: tl.constexpr):
+                     W, steps, ROWS: tl.constexpr, STEP: tl.constexpr, TILE: tl.constexpr):
     """One program per (``TILE`` of a region's lanes, region, ``ROWS`` of its rows; ``table`` as :func:`regather`'s --
     the lanes first, the grid's only axis long enough for every lane of a wide batch): every lane of the new layout
     -- sample ``b``, pair ``(i, j)`` -- gets the old one of sample ``parents[b]`` at the same pair (-inf where the old
-    layout has none)."""
+    layout has none). The lanes' old places are found once, then the rows copied ``STEP`` at a time."""
     t = tl.program_id(1).to(tl.int64) * 8
     r0 = tl.program_id(2).to(tl.int64) * ROWS
     rows, k = tl.load(table + t + 4), tl.load(table + t + 5)
@@ -369,9 +371,14 @@ def _regather_kernel(src, dst, table, parents, old_off, old_count, old_rank, off
         old = _lane(old_off, old_count, old_rank, k, p, a, i, e, j, m, B_old, n, W)
         sw, dw = tl.load(table + t + 1), tl.load(table + t + 3)
         so, do = tl.load(table + t) + r0 * sw, tl.load(table + t + 2) + r0 * dw
-        for r in range(tl.minimum(ROWS, rows - r0)):
-            tl.store(dst + do + r * dw + idx, tl.load(src + so + r * sw + old, mask = m & (old >= 0),
-                                                      other = float("-inf")), mask = m)
+        held = m & (old >= 0)
+        left = tl.minimum(ROWS, rows - r0)
+        for r in range(0, left, STEP):
+            rs = r + tl.arange(0, STEP).to(tl.int64)
+            rm = (rs < left)[:, None]
+            tl.store(dst + do + rs[:, None] * dw + idx[None, :],
+                     tl.load(src + so + rs[:, None] * sw + old[None, :], mask = rm & held[None, :],
+                             other = float("-inf")), mask = rm & m[None, :])
 
 
 def regather(prog, old: "CompactLayout", src: torch.Tensor, new: "CompactLayout", dst: torch.Tensor,
@@ -395,10 +402,12 @@ def regather(prog, old: "CompactLayout", src: torch.Tensor, new: "CompactLayout"
     table = np.stack([old_offset[regs], old_width[regs], dst_offset, new_width[regs], prog.reg_rows[regs], k,
                       ends[:, 0], ends[:, 1]], axis = 1)
     table = torch.from_numpy(np.ascontiguousarray(table, dtype = np.int64)).to(prog.dev)
-    grid = (-(-max(new.lanes(k), 1) // REGATHER_TILE), regs.size, -(-int(prog.reg_rows[regs].max()) // REGATHER_ROWS))
+    lanes = max(new.lanes(k), 1)
+    tile = min(REGATHER_TILE, max(16, host_next_power_of_2(lanes)))
+    grid = (-(-lanes // tile), regs.size, -(-int(prog.reg_rows[regs].max()) // REGATHER_ROWS))
     _regather_kernel[grid](src, dst, table, parents, old.off, old.count, old.rank, new.off, new.count, new.start,
                            new.columns, old.B, new.B, prog.n, prog.W, new.steps, ROWS = REGATHER_ROWS,
-                           TILE = REGATHER_TILE, num_warps = 4)
+                           STEP = max(1, REGATHER_FLOATS // tile), TILE = tile, num_warps = 4)
 
 
 @triton_jit

@@ -387,9 +387,14 @@ def test_sums_compute_the_lanes_of_the_rows_computing_theirs(kind, path, build_p
 @pytest.mark.parametrize("kind", ["hmm", "pd"])
 def test_a_compact_decoder_over_a_wide_batch(kind, build_pc, monkeypatch):
     """24 rows left to right, then beams: compact, the held values' blocks span many tiles of the copies that carry
-    them over into a call's layout (a tile of 16 floats here); the rows are the circuit's own."""
+    them over into a call's layout (a tile of 16 floats here), and the re-gathers' programs take 16 of a region's
+    lanes (up to 64 here) and 3 of its rows (4 or 8 here), 2 a step: the last program of a region and the last step
+    of a program take fewer; the rows are the circuit's own."""
     from pyjuice.constraints.inference.dfa_exact.kernels import compact as CP
     monkeypatch.setattr(CP, "COPY_TILE", 16)
+    monkeypatch.setattr(CP, "REGATHER_TILE", 16)
+    monkeypatch.setattr(CP, "REGATHER_ROWS", 3)
+    monkeypatch.setattr(CP, "REGATHER_FLOATS", 32)
     n = KINDS[kind]
     cc = jc.compile(jc.DFA.contains([[1, 2]], V), build_pc(kind, n, V))
     for steps in (left_to_right(n, B = 24), beams(n)):
