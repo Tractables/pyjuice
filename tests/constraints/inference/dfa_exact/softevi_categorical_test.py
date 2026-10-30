@@ -928,6 +928,63 @@ def test_class_masses_match_a_float64_brute_force(kind, Be, classes, evidence_ki
             assert (got[fin] - want[fin]).abs().max() < 1e-5
 
 
+@pytest.mark.parametrize("B", [1, 5, 24])
+@pytest.mark.parametrize("evidence_kind", ["none", "dense", "topk", "topk_transposed"])
+@pytest.mark.parametrize("kind", ["hmm", "hmm_untied", "hand_permuted"])
+def test_input_values_are_the_observed_tokens_against_float64(kind, evidence_kind, B, build_pc):
+    """Every node's value of the token its sample observes, 0 where missing: ``log p(d)``, under evidence ``+ log w(d)
+    - log Z`` (dense on the first 30 of 150 tokens, or top-k on 30 others), against float64 -- and with the library's
+    transposed table (top-k, in fast_inference) the same bits as from the parameter table; batches of one sample,
+    part of a tile of samples, and several tiles."""
+    Vb = 150
+    pc = build_pc(kind, 5 if kind != "hmm_untied" else 4, Vb, input_dist = dists.SoftEvidenceCategorical)
+    layer = next(iter(pc.input_layer_group))
+    first, end = layer._output_ind_range
+    g = torch.Generator().manual_seed(2)
+    n = 5 if kind != "hmm_untied" else 4
+    nv = int(torch.unique(layer.vids.view(-1)).numel())
+    x = torch.randint(0, Vb, (B, n), generator = g).to(DEV)
+    missing = (torch.rand(B, n, generator = g) < 0.3).to(DEV)
+    E = (torch.randn(B, nv, 30, generator = g) * 3).to(DEV)
+    tokens = TokenClasses(torch.zeros(Vb, dtype = torch.long, device = DEV), 1)
+    p = layer.params.view(-1, Vb).double()
+    w = torch.ones(B, nv, Vb, device = DEV, dtype = torch.float64)
+    if evidence_kind == "dense":
+        inputs = dict(categorical_evidence_logp = E)
+        w = torch.cat([E.double().exp(), torch.zeros(B, nv, Vb - 30, device = DEV, dtype = torch.float64)], dim = 2)
+    elif evidence_kind != "none":
+        ids = torch.argsort(torch.rand(B, nv, Vb, generator = g), dim = 2)[..., :30].to(DEV)
+        inputs = dict(categorical_evidence_logp = E, soft_evidence_cat_ids = ids)
+        w = torch.zeros(B, nv, Vb, device = DEV, dtype = torch.float64).scatter_(2, ids, E.double().exp())
+
+    def values(fast):
+        out = torch.full((end, B), float("nan"), device = DEV)
+        with juice.fast_inference() if fast else torch.no_grad():
+            si = None
+            if evidence_kind != "none":
+                masses = torch.empty((B, softevi_categorical.sample_rows(layer, inputs), 1), device = DEV)
+                si = softevi_categorical.sample_inputs(layer, tokens, inputs, masses)
+            assert (softevi_categorical._transposed_table(layer) is not None) == fast   # (built by the top-k masses)
+            softevi_categorical.input_values(layer, x, missing, out, si)
+        return out[first:end]
+
+    got = values(False)
+    rows = softevi_categorical.class_mass_rows(layer)
+    lvid = layer.var_idmapping[layer.vids.view(-1).long()]
+    var = layer.vids.view(-1).long()
+    d = x[:, var]                                                               # [B, nodes]: every node's token
+    pw = p[rows][None] * w[:, lvid]                                             # [B, nodes, V]
+    want = pw.gather(2, d[..., None]).squeeze(2).log()
+    if evidence_kind != "none":
+        want = want - pw.sum(dim = 2).log()
+    want = torch.where(missing[:, var], 0.0, want).t()
+    assert torch.equal(torch.isneginf(got), torch.isneginf(want)) and not got.isnan().any()
+    fin = torch.isfinite(want)
+    assert (got[fin].double() - want[fin]).abs().max() < 1e-5
+    if evidence_kind == "topk_transposed":
+        assert torch.equal(values(True).view(torch.int32), got.view(torch.int32))
+
+
 # -------------------------------------------------------------------------------------------------
 # What a session refuses
 # -------------------------------------------------------------------------------------------------

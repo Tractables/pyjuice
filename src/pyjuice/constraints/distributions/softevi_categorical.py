@@ -297,12 +297,15 @@ def _topk_kernel(table, table_t, num_rows, ev, ids, shift, bounds, rows, cols, t
             tl.store(at, tl.load(at, mask = fm) - lz[:, None], mask = fm)
 
 
-def _transposed_table(layer, inputs):
+def _transposed_table(layer, inputs = None):
     """The layer's parameter table transposed ([num_cats, rows]), where the library keeps one for its top-k forward:
-    inside a :func:`pyjuice.fast_inference` scope that allows parameter copies (built on first use there); else
-    None."""
-    ensure = getattr(layer, "_ensure_fast_inference_params", None)
-    table = ensure(inputs) if ensure is not None else None
+    inside a :func:`pyjuice.fast_inference` scope that allows parameter copies (built on first use there, under
+    ``inputs``; None: only one built already); else None."""
+    if inputs is None:
+        table = getattr(layer, "_fast_inference_params", None)
+    else:
+        ensure = getattr(layer, "_ensure_fast_inference_params", None)
+        table = ensure(inputs) if ensure is not None else None
     if table is None or table.dim() != 2 or table.size(0) != layer.dist.num_cats or \
             table.numel() != layer.params.numel():
         return None
@@ -314,7 +317,8 @@ def input_values(layer, x: torch.Tensor, missing: torch.Tensor, out: torch.Tenso
     token is missing): ``log p(d)``, and under soft evidence (``sample``, :func:`sample_inputs`') ``+ log w(d) - log
     Z`` (top-k: -inf for a token that is not a candidate; under a value mask, True wherever a token is observed, no
     ``Z``). The weight of the token a sample observes at a variable is looked up once (:func:`_token_weights_kernel`),
-    for all the nodes over the variable."""
+    for all the nodes over the variable. The probabilities from the table transposed where the session keeps one (see
+    :func:`_transposed_table`): a token's nodes' probabilities contiguous."""
     B, n = x.shape
     first, end = layer._output_ind_range
     nodes = end - first
@@ -336,10 +340,12 @@ def input_values(layer, x: torch.Tensor, missing: torch.Tensor, out: torch.Tenso
     else:
         w = logz = lvid = srow = prow
         Be = Vl = R_s = 1
-    TN, TB = 32, max(16, min(64, host_next_power_of_2(B)))
+    table_t = _transposed_table(layer)
+    TN, TB = INPUT_TILES["TN"], min(INPUT_TILES["TB"], host_next_power_of_2(B))
     _input_values_kernel[(host_cdiv(nodes, TN), host_cdiv(B, TB))](
-        out, table, x, miss, layer.vids, prow, lvid, srow, w, logz, first, nodes, B, n, num_cats, Vl, R_s,
-        HAS_EV = has_ev, PER_SAMPLE = Be > 1, NORMALIZE = normalize, TN = TN, TB = TB)
+        out, table if table_t is None else table_t, x, miss, layer.vids, prow, lvid, srow, w, logz, first, nodes, B, n,
+        num_cats, table.size(0), Vl, R_s, HAS_EV = has_ev, PER_SAMPLE = Be > 1, NORMALIZE = normalize,
+        TRANSPOSED = table_t is not None, TN = TN, TB = TB, num_warps = INPUT_TILES["warps"])
 
 
 # -------------------------------------------------------------------------------------------------
@@ -580,32 +586,43 @@ def _token_weights_kernel(w, x, missing, variables, ev, ids, B, n, Vl, K, PER_SA
     tl.store(w + b[:, None].to(tl.int64) * Vl + v[None, :], val, mask = mask)
 
 
+#: :func:`_input_values_kernel`'s nodes and samples (at most) a program, and warps. Codpula-4096 x LLaDA (JSON hard_0,
+#: transposed table, 60 of 128 positions observed): B8 65.7 -> 26.9 us, B32 337.6 -> 102.3 (the [32 nodes, 16
+#: samples] tiles before, nodes apart in the table); 128 / 256 nodes and 8 / 32 samples within 8%
+INPUT_TILES = dict(TN = 64, TB = 16, warps = 4)
+
+
 @triton_jit
-def _input_values_kernel(out, table, x, missing, vids, prow, lvid, srow, w, logz, first, nodes, B, n, num_cats, Vl,
-                         R_s, HAS_EV: tl.constexpr, PER_SAMPLE: tl.constexpr, NORMALIZE: tl.constexpr,
-                         TN: tl.constexpr, TB: tl.constexpr):
-    """One program per (tile of the layer's nodes, tile of samples): every observed token's ``log p(d)`` (``HAS_EV``:
-    ``+ log w(d)``, the sample's at the node's variable from ``w`` (:func:`_token_weights_kernel`), ``- log Z`` if
-    ``NORMALIZE``), 0 where it is missing."""
+def _input_values_kernel(out, table, x, missing, vids, prow, lvid, srow, w, logz, first, nodes, B, n, num_cats,
+                         num_rows, Vl, R_s, HAS_EV: tl.constexpr, PER_SAMPLE: tl.constexpr, NORMALIZE: tl.constexpr,
+                         TRANSPOSED: tl.constexpr, TN: tl.constexpr, TB: tl.constexpr):
+    """One program per (tile of the layer's nodes, tile of samples), the nodes the fast axis: every observed token's
+    ``log p(d)`` (``HAS_EV``: ``+ log w(d)``, the sample's at the node's variable from ``w``
+    (:func:`_token_weights_kernel`), ``- log Z`` if ``NORMALIZE``), 0 where it is missing -- ``p(d)`` from ``table``
+    [num_rows, num_cats], or ``TRANSPOSED`` [num_cats, num_rows] (a token's rows contiguous)."""
     i = tl.program_id(0) * TN + tl.arange(0, TN)
     b = tl.program_id(1) * TB + tl.arange(0, TB)
     im, bm = i < nodes, b < B
-    mask = im[:, None] & bm[None, :]
+    mask = bm[:, None] & im[None, :]
     var = tl.load(vids + i, mask = im, other = 0).to(tl.int64)
-    at = b[None, :].to(tl.int64) * n + var[:, None]
+    at = b[:, None].to(tl.int64) * n + var[None, :]
     d = tl.load(x + at, mask = mask, other = 0)
     miss = tl.load(missing + at, mask = mask, other = 1) != 0
     obs = mask & ~miss
     r = tl.load(prow + i, mask = im, other = 0).to(tl.int64)
-    val = tl.log(tl.load(table + r[:, None] * num_cats + d, mask = obs, other = 1.0))
+    if TRANSPOSED:
+        p = tl.load(table + d.to(tl.int64) * num_rows + r[None, :], mask = obs, other = 1.0)
+    else:
+        p = tl.load(table + r[None, :] * num_cats + d, mask = obs, other = 1.0)
+    val = tl.log(p)
     if HAS_EV:
         lv = tl.load(lvid + i, mask = im, other = 0).to(tl.int64)
-        wd = tl.load(w + b[None, :].to(tl.int64) * Vl + lv[:, None], mask = obs, other = float("-inf"))
+        wd = tl.load(w + b[:, None].to(tl.int64) * Vl + lv[None, :], mask = obs, other = float("-inf"))
         if NORMALIZE:
             be = b.to(tl.int64) if PER_SAMPLE else tl.zeros_like(b).to(tl.int64)
-            z = tl.load(logz + be[None, :] * R_s + tl.load(srow + i, mask = im, other = 0)[:, None], mask = obs,
+            z = tl.load(logz + be[:, None] * R_s + tl.load(srow + i, mask = im, other = 0)[None, :], mask = obs,
                         other = 0.0)
             val = tl.where(z == float("-inf"), float("-inf"), val + wd - z)  # no token weighs: an impossible sample
         else:
             val = val + wd
-    tl.store(out + (first + i[:, None]).to(tl.int64) * B + b[None, :], tl.where(miss, 0.0, val), mask = mask)
+    tl.store(out + (first + i[None, :]).to(tl.int64) * B + b[:, None], tl.where(miss, 0.0, val), mask = mask)
