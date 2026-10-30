@@ -54,6 +54,14 @@ MASS_PARTIAL_BUDGET = 1 << 26
 #: the top-k pass's tiles (:func:`_topk_kernel`): rows of the parameter table and candidates per product, and the most
 #: classes per program (more: the candidates sorted by tile of classes, a tile at a time)
 TOPK_TILES = dict(TU = 32, TK = 64, TC = 64)
+#: Whether the top-k pass sums every stored class's candidates on their own (:func:`_topk_class_kernel`: the candidates
+#: sorted by class, a class's run a sum) rather than as a one-hot product over a tile of classes (:func:`_topk_kernel`),
+#: and its tiles: rows of the parameter table, candidates a step, classes a fill. MEASURED (Codpula-4096 x JSON hard_0
+#: B8, LLaDA vocabulary: 75 stored classes, a column's 1024 candidates in ~16 of them, 744 in the largest): the one-hot
+#: product multiplies every candidate's probabilities by the whole tile of 64 classes -- 18 G instructions, 203
+#: registers, 46.8 ms under ncu --, where a class's sum takes one multiply-add a candidate and row.
+TOPK_BY_CLASS = True
+TOPK_CLASS_TILES = dict(TU = 32, TK = 64, TF = 32)
 
 
 def check_inputs(layer, inputs: dict):
@@ -193,12 +201,90 @@ def _dense_masses(layer, classes, ev, shift, st, out, logz):
         logz.copy_(torch.log(part.sum(dim = 0)) - 44.3614195558365 + m)
 
 
+def _topk_class_masses(layer, classes, inputs, ev, ids, shift, st, out, logz):
+    """:func:`_topk_masses` by :func:`_topk_class_kernel`: the candidates sorted by (stored class, token), the
+    enumerated classes' first; ``bounds`` [Be * Vl, C + 2] every column's runs."""
+    Be, Vl, K = ev.shape
+    C, num_cats = classes.num_stored, layer.dist.num_cats
+    dev = ev.device
+    cols, tiles = _columns(st, Be, dev)
+    sc = classes.stored_class[ids.long()].long() + 1                        # 0: an enumerated class
+    order = torch.argsort(sc * num_cats + ids, dim = 2)
+    ids, ev, sc = (torch.gather(a, 2, order).contiguous() for a in (ids, ev, sc))
+    at = torch.arange(C + 2, device = dev).expand(Be * Vl, C + 2).contiguous()
+    bounds = torch.searchsorted(sc.view(Be * Vl, K), at).to(torch.int32).contiguous()
+    table = layer.params.view(-1, num_cats)
+    table_t = _transposed_table(layer, inputs)
+    cfg = TOPK_CLASS_TILES
+    for first in range(0, tiles.size(0), 65535):                            # (a grid's second axis: at most 65535)
+        _topk_class_kernel[(MASS_TILES["TN"], min(65535, tiles.size(0) - first))](
+            table, table if table_t is None else table_t, table.size(0), ev, ids, shift, bounds, st["rows"], cols, tiles,
+            st["pair_index"], out, logz, num_cats, K, Vl, st["num_pairs"], C, first, TRANSPOSED = table_t is not None,
+            TU = cfg["TU"], TK = cfg["TK"], TF = cfg["TF"], num_warps = 4)
+
+
+@triton_jit
+def _topk_class_kernel(table, table_t, num_rows, ev, ids, shift, bounds, rows, cols, tiles, pair_index, out, logz,
+                       num_cats, K, Vl, R_s, C, tile0, TRANSPOSED: tl.constexpr, TU: tl.constexpr, TK: tl.constexpr,
+                       TF: tl.constexpr):
+    """:func:`_topk_kernel`'s masses by class: one program per (column of a tile, tile), the column the fast axis (a
+    tile's rows' probabilities read by its columns' programs together, while in the L2): the row block's every class
+    -inf, then every stored class present among the column's candidates (``bounds``: its run in the class-sorted
+    candidates) the sum ``sum_k p(v_k) w_k`` over its run alone -- one multiply-add a candidate and row --, scaled by
+    2^64, its log (the shift added back); every row's ``log Z`` the sum over every candidate (the enumerated classes'
+    first, ``bounds[col, 0] .. bounds[col, 1]``)."""
+    j = tl.program_id(0)
+    tile = tile0 + tl.program_id(1)
+    r0, nr = tl.load(tiles + tile * 4), tl.load(tiles + tile * 4 + 1)
+    c0, nc = tl.load(tiles + tile * 4 + 2), tl.load(tiles + tile * 4 + 3)
+    if j < nc:
+        lv = tl.load(cols + (c0 + j) * 2).to(tl.int64)
+        b = tl.load(cols + (c0 + j) * 2 + 1).to(tl.int64)
+        col = b * Vl + lv
+        m = tl.load(shift + col)
+        ru = tl.arange(0, TU)
+        rm = ru < nr
+        r = tl.load(rows + r0 + ru, mask = rm, other = 0).to(tl.int64)
+        s = tl.load(pair_index + r * Vl + lv, mask = rm, other = -1)
+        keep = rm & (s >= 0)
+        dst = out + (b * R_s + s) * C
+        for f0 in range(0, C, TF):                                          # every class: none
+            f = f0 + tl.arange(0, TF)
+            tl.store(dst[:, None] + f[None, :], float("-inf"), mask = keep[:, None] & (f < C)[None, :])
+        tl.debug_barrier()                                                  # (the present ones written over)
+        bb = bounds + col * (C + 2)
+        total = tl.zeros([TU], dtype = tl.float32)
+        for c in range(-1, C):                                              # the enumerated classes (log Z), then
+            k0 = tl.load(bb + c + 1)                                        # every stored class's run
+            k1 = tl.load(bb + c + 2)
+            if k1 > k0:
+                acc = tl.zeros([TU], dtype = tl.float32)
+                for k in range(k0, k1, TK):
+                    kk = k + tl.arange(0, TK)
+                    km = kk < k1
+                    v = tl.load(ids + col * K + kk, mask = km, other = 0).to(tl.int64)
+                    w = tl.exp(tl.load(ev + col * K + kk, mask = km, other = float("-inf")) - m)
+                    if TRANSPOSED:
+                        p = tl.load(table_t + v[:, None] * num_rows + r[None, :], mask = km[:, None] & rm[None, :],
+                                    other = 0.0)
+                    else:
+                        p = tl.load(table + r[None, :] * num_cats + v[:, None], mask = km[:, None] & rm[None, :],
+                                    other = 0.0)
+                    acc += tl.sum(w[:, None] * (p * 18446744073709551616.0), axis = 0)          # x 2^64
+                total += acc
+                if c >= 0:
+                    tl.store(dst + c, tl.log(acc) - 44.3614195558365 + m, mask = keep)
+        tl.store(logz + b * R_s + s, tl.log(total) - 44.3614195558365 + m, mask = keep)
+
+
 def _topk_masses(layer, classes, inputs, ev, ids, shift, st, out, logz):
     """:func:`sample_inputs`' masses under top-k evidence (``ids`` the candidates, ``ev`` their log-weights), before
     ``log Z``: every row's probabilities of every variable's candidates, a program per (tile of rows, variable and
     sample) -- the classes ``TC`` at a time, the candidates sorted by tile of classes where there are more (those of
     enumerated classes first: they count in ``log Z`` alone). The stored classes' masses into ``out``, every row's
-    ``log Z`` into ``logz`` [Be, R_s]."""
+    ``log Z`` into ``logz`` [Be, R_s]. (:data:`TOPK_BY_CLASS`: :func:`_topk_class_masses`.)"""
+    if TOPK_BY_CLASS:
+        return _topk_class_masses(layer, classes, inputs, ev, ids, shift, st, out, logz)
     Be, Vl, K = ev.shape
     C, num_cats = classes.num_stored, layer.dist.num_cats
     dev = ev.device
