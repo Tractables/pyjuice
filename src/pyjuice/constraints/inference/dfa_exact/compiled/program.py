@@ -18,9 +18,9 @@ from ..kernels.common import IDENTITY, SUM, TEMP
 from ..kernels.prod import Launch, skip_masks
 from ..kernels.sum import dense_groups
 from ..kernels.live import live_successors
-from ..kernels.transitions import (SampleMasses, enumerated_tokens, sample_classes, sample_masses,
-                                   sample_transition_masses, transition_job, transition_masses, transition_stats,
-                                   transition_tables)
+from ..kernels.sample_transitions import sample_transition_masses
+from ..kernels.transitions import (SampleMasses, enumerated_tokens, sample_classes, sample_masses, transition_job,
+                                   transition_masses, transition_stats, transition_tables)
 from ..external_params import block_scale
 from .layout import interval_tables
 

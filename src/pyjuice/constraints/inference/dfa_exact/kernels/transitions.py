@@ -25,7 +25,7 @@ from pyjuice.utils.kernel_launcher import triton_jit
 from pyjuice.utils.util import host_cdiv, host_next_power_of_2
 
 from ....distributions.categorical import _exact_dot
-from .common import _lse_step, _next_col_of, grid_chunks
+from .common import _next_col_of, grid_chunks
 
 
 
@@ -442,10 +442,13 @@ class SampleMasses:
     ``rank[b, g]`` (-1: none, see :attr:`~.live.SampleSuccessors.rank`).
 
     :ivar base: int64 [Be, n]; :ivar count: int32 [Be, n]; :ivar rank, ptr: the lists'
-    :ivar cls_ptr, cls: every entry of the sample's lists (its number there, see ``ptr``) and the classes the sample
-        allows that lead along it: ``cls[cls_ptr[b, e] .. cls_ptr[b, e + 1]]`` (``cls_ptr`` int32 [Be, E + 1] into the
-        flat int32 ``cls``, one sample's after another's) -- what an entry's mass is the log-sum over (a session's
-        inputs allow few of the hundreds of classes leading along a JSON automaton's entry)
+    :ivar cls_ptr, xcode, wsel: every entry of the sample's lists (its number there, see ``ptr``) and the classes the
+        sample allows that lead along it, ``cls_ptr[b, e] .. cls_ptr[b, e + 1]`` of the flat int32 ``xcode`` /
+        ``wsel`` (``cls_ptr`` int32 [Be, E + 1], one sample's after another's) -- what an entry's mass is the log-sum
+        over (a session's inputs allow few of the hundreds of classes leading along a JSON automaton's entry): every
+        class's code at the entry's boundary, resolved -- the stored column (>= 0), or for an enumerated class ``-1 -
+        j``, ``j`` its token's column of ``enum_probs`` -- and its token's place among the enumerated tokens live at
+        any boundary (its ``enum_logw`` column; -1 for a stored class)
     :ivar size: the floats of them all; :ivar Be: the samples with lists of their own (1: one set for every sample)
     :ivar version: the class masses' they were laid out for
     """
@@ -458,7 +461,8 @@ class SampleMasses:
     Be: int
     version: int
     cls_ptr: Optional[torch.Tensor] = None                     # (built by sample_classes when the query takes the
-    cls: Optional[torch.Tensor] = None                         # layout: a session over the budget never pays for them)
+    xcode: Optional[torch.Tensor] = None                       # layout: a session over the budget never pays for them)
+    wsel: Optional[torch.Tensor] = None
 
 
 def sample_masses(masses, succ, prog) -> SampleMasses:
@@ -475,113 +479,61 @@ def sample_masses(masses, succ, prog) -> SampleMasses:
                         Be = Be, version = masses.version)
 
 
+def _pair_tables(prog):
+    """Of every (entry, class) pair of :func:`~.live.entry_classes`, built once per program: its class's code at its
+    boundary resolved (``SampleMasses.xcode``) and its enumerated token's place (``SampleMasses.wsel``), int32 [P]."""
+    kept = getattr(prog, "entry_class_tables", None)
+    if kept is None:
+        from .live import entry_classes
+        n, C, dev, en = prog.n, prog.C, prog.dev, prog.enum
+        key, first = entry_classes(prog)
+        E = first.numel() - 1
+        g = torch.repeat_interleave(torch.arange(E, device = dev), first[1:] - first[:-1])    # every pair's entry
+        tb = torch.searchsorted(prog.succ.boundary_base[1:n + 1], g, right = True)        # ... its boundary
+        c = key - tb * C                                                                  # ... its class
+        x = en.code.view(-1)[key].long() if en.num > 0 else c                             # ... its code there
+        e = (-1 - x).clamp(min = 0)
+        at = en.ptr.long()[tb] + e if en.num > 0 else e
+        enum = x < 0
+        xcode = torch.where(enum, -1 - en.index.long()[at.clamp(max = en.index.numel() - 1)], x) if en.num > 0 else x
+        wsel = torch.where(enum, at, -1)
+        kept = prog.entry_class_tables = (xcode.to(torch.int32), wsel.to(torch.int32))
+    return kept
+
+
 def sample_classes(layout: SampleMasses, succ, prog) -> None:
-    """Give ``layout`` every entry's allowed classes (``cls_ptr`` / ``cls``): the program's (entry, class) pairs
-    (:func:`~.live.entry_classes`) whose class the sample allows (``succ.allowed``), by the entry's number in the
-    sample's lists."""
-    from .live import entry_classes
-    Be, n, W, C, dev = layout.Be, prog.n, prog.W, prog.C, prog.dev
-    ptr = succ.ptr.view(Be, n, W + 1)
+    """Give ``layout`` every entry's allowed classes (``cls_ptr``, and their codes ``xcode`` / ``wsel``): the
+    program's (entry, class) pairs (:func:`~.live.entry_classes`) whose class the sample allows
+    (``succ.allowed``), by the entry's number in the sample's lists -- the samples :data:`~.live.SUPPORT_CHUNK` pairs
+    at a time: the pairs by program entry, the sample's entries in program order
+    (:attr:`~.live.SampleSuccessors.entry`), so an entry's classes end where the allowed pairs up to its program
+    entry's last do. A wait for the device per chunk (its pairs' number)."""
+    from .live import SUPPORT_CHUNK, entry_classes
+    Be, n, C, dev = layout.Be, prog.n, prog.C, prog.dev
     key, first = entry_classes(prog)                                                  # (entry, class) pairs by entry
-    E = succ.rank.size(1)
-    g = torch.repeat_interleave(torch.arange(E, device = dev), first[1:] - first[:-1])    # every pair's entry
-    tb = torch.searchsorted(prog.succ.boundary_base[1:n + 1], g, right = True)        # ... its boundary
+    xcode, wsel = _pair_tables(prog)
+    E, P = succ.rank.size(1), key.numel()
+    allowed = succ.allowed.view(Be, n * C)
     cls_ptr = torch.empty(Be, E + 1, dtype = torch.int32, device = dev)
-    classes, total = [], 0
-    for b in range(Be):
-        keep = succ.allowed.view(Be, n * C)[b, key] != 0                             # the sample allows the class
-        e = ptr[b, :, 0].long()[tb[keep]] + succ.rank[b].long()[g[keep]]              # the entry's number in its lists
-        cls_ptr[b, 0] = total
-        cls_ptr[b, 1:] = total + torch.cumsum(torch.bincount(e, minlength = E), dim = 0)
-        classes.append((key[keep] - tb[keep] * C).to(torch.int32))                   # (in entry order: by entry)
-        total += int(classes[-1].numel())
+    j = torch.arange(E, device = dev)
+    base = torch.zeros(1, dtype = torch.int64, device = dev)                          # the samples' before
+    picked, total = [], 0
+    step = max(1, SUPPORT_CHUNK // max(P, 1))
+    for b0 in range(0, Be, step):
+        bs = min(step, Be - b0)
+        keep = allowed[b0:b0 + bs, key] != 0                                          # the sample allows the class
+        hits = torch.zeros(bs * P + 1, dtype = torch.int64, device = dev)             # the chunk's allowed pairs before
+        hits[1:] = torch.cumsum(keep.view(-1), dim = 0)                               # each (one scan over the chunk:
+        hits = hits.as_strided((bs, P + 1), (P, 1))                                   # a scan along rows runs a row a
+        num = (succ.rank[b0:b0 + bs] >= 0).sum(dim = 1)                               # block); the sample's entries
+        ends = hits.gather(1, first[succ.entry[b0:b0 + bs, :E].long() + 1])           # ... each one's last pair's
+        ends = torch.where(j[None, :] < num[:, None], ends, hits[:, P:])
+        cls_ptr[b0:b0 + bs, 0] = base + hits[:, 0]                                    # (samples one after another)
+        cls_ptr[b0:b0 + bs, 1:] = base + ends
+        base = base + hits[-1, P]
+        picked.append(torch.nonzero(keep.view(-1)).squeeze(1) % P)                   # (in entry order: by entry)
+        total += picked[-1].numel()
     assert total < 1 << 31, total                                                     # (int32 pointers, as the tables')
+    pair = torch.cat(picked) if total else torch.zeros(1, dtype = torch.int64, device = dev)
     layout.cls_ptr = cls_ptr
-    layout.cls = torch.cat(classes) if total else torch.zeros(1, dtype = torch.int32, device = dev)
-
-
-#: :func:`sample_transition_masses`' tiles: entries of a sample per program (the rows are the job's tiles), warps
-SAMPLE_TRANSITION_TILES = dict(TQ = 32, warps = 4)
-
-
-@triton_jit
-def _sample_transition_kernel(class_mars, mass_row, mass_stride, trans, rows, tiles, sptr, sbase, scount, cls_ptr, cls,
-                              code, tok_ptr, eidx, eprobs, prow, lognorm, enum_logw, width, W, C, n, Cs, num_enum,
-                              logw_stride, input_start, E, pid0, TS: tl.constexpr, TQ: tl.constexpr,
-                              SAMPLE: tl.constexpr, ENUM: tl.constexpr, LOGW: tl.constexpr):
-    """
-    One program per (tile of ``TS`` rows at one position ``t``, sample ``b``): the sample's entries at boundary ``t``
-    (``sptr`` [Be, n, W + 1], its lists' pointers), ``TQ`` at a time -- each the log-sum over the classes the sample
-    allows that lead along it (``cls_ptr`` / ``cls``, see :class:`SampleMasses`) of the row's mass of the class: a
-    stored class's from the row of the class masses (``SAMPLE``: the sample's row), an enumerated class's (``ENUM``,
-    code < 0) its token's probability under the row's parameter row, times its weight (``LOGW``, as
-    :func:`_transition_kernel`) --, stored at ``trans[sbase[b, t] + rank * scount[b, t] + e]`` for the entry's place
-    ``e`` in the sample's list at ``t``.
-    """
-    tile = pid0 + tl.program_id(0)
-    b = tl.program_id(1).to(tl.int64)
-    start, count, t = tl.load(tiles + tile * 3), tl.load(tiles + tile * 3 + 1), tl.load(tiles + tile * 3 + 2)
-    r = tl.arange(0, TS)
-    rmask = r < count
-    u = tl.load(rows + (start + r) * 3, mask = rmask, other = 0).to(tl.int64)
-    rk = tl.load(rows + (start + r) * 3 + 2, mask = rmask, other = 0).to(tl.int64)   # the step's rank at t
-    row = tl.load(mass_row + (u - input_start), mask = rmask, other = 0).to(tl.int64)
-    if SAMPLE:
-        row = row + b * tl.load(mass_stride + (u - input_start), mask = rmask, other = 0).to(tl.int64)
-    masses = class_mars + row * Cs
-    if ENUM:
-        pr = tl.load(prow + row, mask = rmask, other = 0).to(tl.int64)
-        tk = tl.load(tok_ptr + t).to(tl.int64)
-        if LOGW:
-            lz = tl.load(lognorm + row, mask = rmask, other = 0.0)
-    bt = b * n + t
-    e0 = tl.load(sptr + bt * (W + 1))                                        # the sample's entries at t
-    e1 = tl.load(sptr + bt * (W + 1) + tl.load(width + t))
-    out = trans + tl.load(sbase + bt) + rk[:, None] * tl.load(scount + bt).to(tl.int64)
-    jj = tl.arange(0, TQ)
-    for q0 in range(e0, e1, TQ):
-        em = q0 + jj < e1
-        f0 = tl.load(cls_ptr + b * (E + 1) + q0 + jj, mask = em, other = 0)   # the entries' allowed classes
-        f1 = tl.load(cls_ptr + b * (E + 1) + q0 + jj + 1, mask = em, other = 0)
-        mx = tl.full([TS, TQ], float("-inf"), dtype = tl.float32)
-        acc = tl.zeros([TS, TQ], dtype = tl.float32)
-        for k in range(0, tl.max(f1 - f0, axis = 0)):
-            km = em & (f0 + k < f1)
-            c = tl.load(cls + f0 + k, mask = km, other = 0)
-            if ENUM:                                                         # (as :func:`~.prod_top_down._entry_mass`)
-                x = tl.load(code + t * C + c, mask = km, other = -1)
-                enum = (x < 0)[None, :]
-                miss = rmask[:, None] & km[None, :]
-                stored = tl.load(masses[:, None] + tl.maximum(x, 0)[None, :], mask = miss & ~enum, other = float("-inf"))
-                e = tl.maximum(-1 - x, 0).to(tl.int64)                       # the e-th enumerated token at t (a stored
-                gc = tl.load(eidx + tk + e).to(tl.int64)                     # class's: the boundary's first, unread)
-                val = tl.log(tl.load(eprobs + pr[:, None] * num_enum + gc[None, :], mask = miss & enum, other = 0.0))
-                if LOGW:
-                    val = val + tl.load(enum_logw + b * logw_stride + tk + e, mask = km & (x < 0), other = 0.0)[None, :] - \
-                        lz[:, None]
-                mass = tl.where(enum, val, stored)
-            else:
-                mass = tl.load(masses[:, None] + c[None, :], mask = rmask[:, None] & km[None, :], other = float("-inf"))
-            mx, acc = _lse_step(mx, acc, mass)
-        val = tl.log(acc) + mx
-        tl.store(out + (q0 + jj - e0)[None, :], val, mask = rmask[:, None] & em[None, :])
-
-
-def sample_transition_masses(trans, job, masses, prog, layout: SampleMasses):
-    """Write every sample's transition masses over its successor entries (``layout``, a :class:`SampleMasses`), for
-    the steps of ``job`` (from :func:`transition_job`), from the class masses ``masses``: see
-    :func:`_sample_transition_kernel`."""
-    rows, tiles, TS = job
-    cfg = SAMPLE_TRANSITION_TILES
-    en = prog.enum
-    enum = en.num > 0
-    logw = enum and masses.enum_logw is not None
-    eprobs = masses.enum_probs if enum else masses.table
-    for first_tile, size in grid_chunks(tiles.size(0), 0):
-        _sample_transition_kernel[(size, layout.Be)](
-            masses.table, masses.row, masses.stride if masses.batch > 1 else masses.row, trans, rows, tiles,
-            layout.ptr, layout.base, layout.count, layout.cls_ptr, layout.cls, en.code, en.ptr, en.index,
-            eprobs, masses.prow, masses.lognorm if logw else masses.table,
-            masses.enum_logw if logw else masses.table, prog.width_t, prog.W, prog.C, prog.n, masses.table.size(1),
-            eprobs.size(1), enum_logw_stride(masses), prog.input_start, layout.rank.size(1), first_tile,
-            TS = TS, TQ = cfg["TQ"], SAMPLE = masses.batch > 1, ENUM = enum, LOGW = logw, num_warps = cfg["warps"])
+    layout.xcode, layout.wsel = xcode[pair], wsel[pair]

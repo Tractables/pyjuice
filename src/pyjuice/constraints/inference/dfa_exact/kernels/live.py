@@ -586,55 +586,95 @@ class SampleSuccessors:
         return self.ptr[0].numel(), self.succ.size(1)
 
 
-def class_support(prog, masses) -> Optional[torch.Tensor]:
-    """
-    The classes a missing token can have under a decoder session's per-sample inputs (``masses``, a
-    :class:`~..state.ClassMasses`): bool [Be, n, C] on the device, class ``c`` at position ``t`` of sample ``b`` when
-    some input node a product step reads there gives it a mass (> -inf) -- or None when nothing in the masses is per
-    sample (no session's inputs), or they rule no class out. One wait for the device.
-    """
-    if not masses.sample:
-        return None
-    nodes = getattr(prog, "position_nodes", None)
-    if nodes is None:                         # every position's input nodes the products read, one a row, -1 padded
-        from .score import score_tables
+@triton_jit
+def _stored_support_kernel(table, row, stride, nodes, class_of_stored, allowed, n, K, Cs, C, SAMPLE: tl.constexpr,
+                           TK: tl.constexpr, TC: tl.constexpr):
+    """``allowed[b, t, class_of_stored[s]]`` (int8) for every stored class ``s``: whether some input node at position
+    ``t`` (``nodes``, [n, K], -1 padded) gives it a mass at sample ``b`` (a finite entry of its row of ``table``)."""
+    t = tl.program_id(0)
+    b = tl.program_id(1).to(tl.int64)
+    cs = tl.arange(0, TC)
+    cm = cs < Cs
+    kk = tl.arange(0, TK)
+    hit = tl.zeros([TC], dtype = tl.int32)
+    for k0 in range(0, K, TK):
+        u = tl.load(nodes + t * K + k0 + kk, mask = k0 + kk < K, other = -1)
+        real = u >= 0
+        u = tl.maximum(u, 0)
+        r = tl.load(row + u, mask = real, other = 0).to(tl.int64)
+        if SAMPLE:
+            r = r + b * tl.load(stride + u, mask = real, other = 0).to(tl.int64)
+        v = tl.load(table + r[:, None] * Cs + cs[None, :], mask = real[:, None] & cm[None, :], other = float("-inf"))
+        hit = tl.maximum(hit, tl.max((v > float("-inf")).to(tl.int32), axis = 0))
+    c = tl.load(class_of_stored + cs, mask = cm, other = 0).to(tl.int64)
+    tl.store(allowed + (b * n + t) * C + c, hit.to(tl.int8), mask = cm)
+
+
+#: the input nodes and the stored classes a program of :func:`_stored_support_kernel` reads at a time
+SUPPORT_TILE_NODES = 32
+SUPPORT_WARPS = 4
+
+
+def _support_tables(prog):
+    """What :func:`class_support` reads of the program alone, built once: every position's input nodes the products
+    read (int64 [n, K] on the device, -1 padded), and of the enumerated classes every one's position, class and column
+    of ``enum_probs`` (int64 [num_enum] each)."""
+    kept = getattr(prog, "support_tables", None)
+    if kept is None:
+        from .score import score_tables         # every position's input nodes the products read, one a row
         score = score_tables(prog)
         per = [score.nodes[g][t] if g >= 0 else np.zeros(0, dtype = np.int64) for t, g in enumerate(score.group_of)]
         per = [at[at >= 0] for at in per]
         table = np.full((prog.n, max(1, max(len(at) for at in per))), -1, dtype = np.int64)
         for t, at in enumerate(per):
             table[t, :len(at)] = at
-        nodes = prog.position_nodes = torch.from_numpy(table).to(prog.dev)
-    real = nodes >= 0                                                        # [n, K]
-    u = nodes.clamp(min = 0)
-    row = masses.row[u].long()
-    stride = masses.stride[u].long() if masses.stride is not None else torch.zeros_like(row)
-    finite = masses.table > -float("inf")                                    # [rows, stored classes]
-    (n, K), Be, Cs, C = nodes.shape, masses.batch, finite.size(1), prog.C
+        nodes = torch.from_numpy(table).to(prog.dev)
+        en = prog.enum
+        enum = None
+        if en.num > 0:
+            counts = en.ptr_host[1:] - en.ptr_host[:-1]
+            tok = en.tok[:en.num].long()
+            enum = (torch.from_numpy(np.repeat(np.arange(prog.n), counts)).to(prog.dev),    # (the tokens' positions,
+                    prog.token_classes.token_class[tok].long(),                              # classes and columns of
+                    en.index[:en.num].long())                                               # enum_probs)
+        kept = prog.support_tables = (nodes, nodes >= 0, enum)
+    return kept
+
+
+def class_support(prog, masses) -> Optional[torch.Tensor]:
+    """
+    The classes a missing token can have under a decoder session's per-sample inputs (``masses``, a
+    :class:`~..state.ClassMasses`): bool [Be, n, C] on the device, class ``c`` at position ``t`` of sample ``b`` when
+    some input node a product step reads there gives it a mass (> -inf) -- or None when nothing in the masses is per
+    sample (no session's inputs), or they rule no class out. One wait for the device.
+
+    The stored classes by :func:`_stored_support_kernel` (the masses' rows read once); the enumerated ones -- a token
+    some node gives probability, with a weight -- by which parameter rows every position reads (a 0/1 [n, rows]
+    matrix) times which of the rows give every token probability (0/1 [rows, tokens]): a positive count where some
+    row read there gives the token probability.
+    """
+    if not masses.sample:
+        return None
+    nodes, real, enum = _support_tables(prog)
+    (n, K), Be, Cs, C = nodes.shape, masses.batch, masses.table.size(1), prog.C
     classes = prog.token_classes
     allowed = torch.zeros(Be, n, C, dtype = torch.bool, device = prog.dev)
-    samples = torch.arange(Be, device = prog.dev)
-    step = max(1, SUPPORT_CHUNK // (n * K * max(Cs, 1)))
-    for b0 in range(0, Be, step):                                           # the stored classes: a finite mass
-        at = row[None] + samples[b0:b0 + step, None, None] * stride[None]   # [samples, n, K]
-        allowed[b0:b0 + step, :, classes.class_of_stored] = (finite[at] & real[None, :, :, None]).any(dim = 2)
-    en = prog.enum
-    if en.num > 0:                                                          # the enumerated classes: a token some
-        counts = en.ptr_host[1:] - en.ptr_host[:-1]                         # node gives probability, with a weight
-        pos = torch.from_numpy(np.repeat(np.arange(n), counts)).to(prog.dev)
-        tok = en.tok[:en.num].long()
-        cls = classes.token_class[tok].long()
-        col = en.index[:en.num].long()                                      # (the tokens' columns of enum_probs)
-        pr = masses.prow[row].long()                                        # [n, K]: the nodes' parameter rows
-        NE = masses.enum_probs.size(1)
-        given = torch.empty(n, NE, dtype = torch.bool, device = prog.dev)    # every position's tokens some row of
-        step = max(1, SUPPORT_CHUNK // (K * NE))                            # its gives probability (whole rows of
-        for t0 in range(0, n, step):                                        # the table read)
-            p = masses.enum_probs[pr[t0:t0 + step]] > 0
-            given[t0:t0 + step] = (p & real[t0:t0 + step, :, None]).any(dim = 1)
-        has_p = given[pos, col]
-        w = masses.enum_logw if masses.enum_logw is not None else torch.zeros(1, en.num, device = prog.dev)   # (every
-        allowed[:, pos, cls] = (w[:, :en.num] > -float("inf")) & has_p[None, :]                             # sample's)
+    if Cs > 0:                                                              # the stored classes: a finite mass
+        sample = masses.stride is not None and Be > 1
+        _stored_support_kernel[(n, Be)](
+            masses.table, masses.row, masses.stride if sample else masses.row, nodes, classes.class_of_stored,
+            allowed.view(torch.int8), n, K, Cs, C, SAMPLE = sample, TK = SUPPORT_TILE_NODES,
+            TC = host_next_power_of_2(Cs), num_warps = SUPPORT_WARPS)
+    if enum is not None:                                                    # the enumerated classes
+        pos, cls, col = enum
+        R = masses.enum_probs.size(0)
+        pr = torch.where(real, masses.prow[masses.row[nodes.clamp(min = 0)].long()].long(), R)   # [n, K]
+        reads = torch.zeros(n, R + 1, dtype = torch.bfloat16, device = prog.dev)
+        reads.scatter_(1, pr, 1.0)                                          # the parameter rows read at t (R: none)
+        gives = (masses.enum_probs > 0).to(torch.bfloat16)                  # [rows, tokens]
+        given = (reads[:, :R] @ gives) > 0                                  # [n, tokens]: counts, exact
+        w = masses.enum_logw if masses.enum_logw is not None else torch.zeros(1, prog.enum.num, device = prog.dev)
+        allowed[:, pos, cls] = (w[:, :prog.enum.num] > -float("inf")) & given[pos, col][None, :]   # (every sample's)
     allowed[:, ~real.any(dim = 1)] = True                                   # (a position no product step reads)
     return None if bool(allowed.all()) else allowed
 
@@ -671,6 +711,24 @@ def entry_classes(prog):
     return kept
 
 
+def _successor_maps(prog):
+    """What :func:`sample_successors` reads of the program alone, built once: the pointer rows counted per boundary
+    (int64 [n * (W + 1)]), every entry's boundary (int64 [E]) and successor (int32 [E], of the grouped lists), and
+    every boundary's first entry (int64 [n])."""
+    kept = getattr(prog, "successor_maps", None)
+    if kept is None:
+        tt, n, W = prog.succ, prog.n, prog.W
+        E, dev = tt.num_entries, prog.dev
+        eptr = tt.entry_ptr.long().view(n, W + 1)
+        bases = tt.boundary_base[:n]
+        rows = (eptr - eptr[:, :1] + bases[:, None]).view(-1)
+        e = torch.arange(E, device = dev)
+        tb = torch.searchsorted(tt.boundary_base[1:n + 1], e, right = True)
+        succ = tt.entry_succ[eptr[tb, 0] + e - bases[tb]].contiguous()      # (boundaries alike share their entries)
+        kept = prog.successor_maps = (rows, tb, succ, bases)
+    return kept
+
+
 def sample_successors(prog, allowed: torch.Tensor) -> SampleSuccessors:
     """The :class:`SampleSuccessors` of the classes ``allowed`` (bool [Be, n, C] on the device): an entry (column,
     successor) of the grouped lists stays for sample ``b`` when some class allowed at its boundary leads along it --
@@ -678,14 +736,12 @@ def sample_successors(prog, allowed: torch.Tensor) -> SampleSuccessors:
     tt, (n, W, C) = prog.succ, (prog.n, prog.W, prog.C)
     Be, E, dev = allowed.size(0), tt.num_entries, prog.dev                # (the entries counted per boundary)
     key, first = entry_classes(prog)
+    rows, tb, esucc, bases = _successor_maps(prog)
     ptr = torch.empty(Be, n, W + 1, dtype = torch.int32, device = dev)
     succ = torch.empty(Be, E + 1, dtype = torch.int32, device = dev)
     entry = torch.zeros(Be, E + 1, dtype = torch.int32, device = dev)
     rank = torch.empty(Be, E, dtype = torch.int32, device = dev)
-    eptr = tt.entry_ptr.long().view(n, W + 1)
-    rows = (eptr - eptr[:, :1] + tt.boundary_base[:n, None]).view(-1)       # the pointer rows, counted per boundary
-    ranges = list(zip(tt.boundary_base.tolist(), eptr[:, 0].tolist(), (eptr[:, W] - eptr[:, 0]).tolist()))
-    tb = torch.searchsorted(tt.boundary_base[1:n + 1], torch.arange(E, device = dev), right = True)   # entries' boundaries
+    numbers = torch.arange(E, dtype = torch.int32, device = dev)
     P = key.numel()
     step = max(1, SUPPORT_CHUNK // max(P, E, 1))
     for b0 in range(0, Be, step):                                           # (the scans over the chunk's samples
@@ -700,14 +756,10 @@ def sample_successors(prog, allowed: torch.Tensor) -> SampleSuccessors:
         count = count.as_strided((bs, E + 1), (E, 1))
         count = count - count[:, :1]                                        # count[:, e]: the kept entries before e
         ptr[b0:b0 + bs] = count[:, rows].view(bs, n, W + 1)
-        starts = count[:, tt.boundary_base[:n]]                             # ... before each boundary's first
-        rank[b0:b0 + bs] = torch.where(kept, count[:, :E] - starts[:, tb], -1)
-        entry[b0:b0 + bs].scatter_(1, torch.where(kept, count[:, :E].long(), E),
-                                   torch.arange(E, dtype = torch.int32, device = dev)[None].expand(bs, -1))
-        for base, shared, size in ranges:                                   # a boundary's successors: its segment's
-            if size:
-                at = torch.where(kept[:, base:base + size], count[:, base:base + size].long(), E)
-                succ[b0:b0 + bs].scatter_(1, at, tt.entry_succ[shared:shared + size][None].expand(bs, -1))
+        rank[b0:b0 + bs] = torch.where(kept, count[:, :E] - count[:, bases][:, tb], -1)
+        at = torch.where(kept, count[:, :E].long(), E)                      # a kept entry's place in the sample's
+        entry[b0:b0 + bs].scatter_(1, at, numbers[None].expand(bs, -1))      # lists (E: none)
+        succ[b0:b0 + bs].scatter_(1, at, esucc[None].expand(bs, -1))
     return SampleSuccessors(ptr = ptr, succ = succ, allowed = allowed.to(torch.int8), rank = rank, entry = entry)
 
 

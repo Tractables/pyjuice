@@ -8,7 +8,9 @@ token, both sides of the boundary between the passes, and every token its own cl
 enough to be subnormal, which tensor cores would flush to zero.
 """
 import math
+from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 
@@ -121,6 +123,53 @@ def test_subnormal_probabilities_are_kept(name):
     want = brute_force(layer, classes.token_class, C)
     assert want[0, 1] < math.log(1.17e-38)                             # class 1 of node 0: a subnormal mass
     check(categorical.class_masses(layer, classes)[categorical.class_mass_rows(layer)], want)
+
+
+def picked_rows(R, pick):
+    """Host rows of a [R, V] table: every one, a consecutive run, or a sorted third of them."""
+    if pick == "all":
+        return np.arange(R)
+    if pick == "consecutive":
+        return np.arange(1, R - 1)
+    return np.sort(np.random.default_rng(0).choice(R, max(1, R // 3), replace = False))
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("pick", ["all", "consecutive", "gathered"])
+@pytest.mark.parametrize("kind", ["tied", "untied", "wide"])
+def test_token_probs_are_the_rows_token_major(kind, pick, dtype):
+    """``token_probs`` into the columns of a wider table (and into a table whose columns are apart): torch's own
+    transposed copy, cast, bit for bit, and nothing written around it. ``wide``: rows and tokens over several of the
+    copy kernel's tiles, neither a multiple of them."""
+    if kind == "wide":
+        g = torch.Generator(device = DEV).manual_seed(0)
+        layer = SimpleNamespace(params = torch.rand(300 * 1000, device = DEV, generator = g),
+                                dist = SimpleNamespace(num_cats = 1000))
+    else:
+        layer = build(kind).input_layer_group[0]
+    num_cats = layer.dist.num_cats
+    table = layer.params.view(-1, num_cats)
+    rows = picked_rows(table.size(0), pick)
+    want = table[torch.as_tensor(rows, device = DEV)].t().to(dtype)
+    out = torch.full((num_cats, len(rows) + 5), float("nan"), dtype = dtype, device = DEV)
+    categorical.token_probs(layer, rows, out[:, 2:2 + len(rows)])
+    assert torch.equal(out[:, 2:2 + len(rows)], want)
+    assert out[:, :2].isnan().all() and out[:, 2 + len(rows):].isnan().all()
+    apart = torch.full((len(rows), num_cats), float("nan"), dtype = dtype, device = DEV).t()   # (stride(1) != 1)
+    categorical.token_probs(layer, rows, apart)
+    assert torch.equal(apart, want)
+
+
+@pytest.mark.parametrize("pick", ["all", "gathered"])
+@pytest.mark.parametrize("kind", ["tied", "untied"])
+def test_token_columns_are_the_tokens_probabilities(kind, pick):
+    layer = build(kind).input_layer_group[0]
+    table = layer.params.view(-1, V)
+    rows = picked_rows(table.size(0), pick)
+    tokens = torch.tensor([5, 0, V - 1, 17, 5], device = DEV)                  # any order, repeated
+    out = torch.full((len(rows), tokens.numel()), float("nan"), device = DEV)
+    categorical.token_columns(layer, rows, tokens, out)
+    assert torch.equal(out, table[torch.as_tensor(rows, device = DEV)][:, tokens])
 
 
 def test_the_class_order_is_built_once():

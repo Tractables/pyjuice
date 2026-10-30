@@ -25,6 +25,7 @@ import triton
 import triton.language as tl
 
 from pyjuice.utils.kernel_launcher import triton_jit
+from pyjuice.utils.transpose import transposed_rows
 from pyjuice.utils.util import host_cdiv, host_next_power_of_2
 
 #: up to this many classes, the natural-order pass; above, the class-order pass
@@ -47,21 +48,28 @@ def class_mass_rows(layer) -> torch.Tensor:
     return (layer.s_pids // layer.dist.num_cats).long()
 
 
-#: rows of the parameter table :func:`token_probs` gathers at a time when they are not consecutive (bounds the copy)
-TOKEN_ROWS_PER_COPY = 256
-
-
 def token_probs(layer, rows: np.ndarray, out: torch.Tensor) -> torch.Tensor:
     """``out[v, k] = p(v)`` of row ``rows[k]`` of the layer's parameter table (see :func:`class_mass_rows`; ``rows``
     sorted, host int64): the rows transposed token-major, as the conditionals score them. ``out``: [num_cats,
-    len(rows)], fp32 or bf16, possibly the columns of a wider table."""
+    len(rows)], fp32 or bf16, possibly the columns of a wider table (:func:`pyjuice.utils.transpose.transposed_rows`:
+    the same values as torch's copy, at a plain copy's rate)."""
     table = layer.params.view(-1, layer.dist.num_cats)
-    if len(rows) and rows[-1] - rows[0] + 1 == len(rows):                    # consecutive: no gather
-        out.copy_(table[int(rows[0]):int(rows[-1]) + 1].t())
-    else:
-        idx = torch.as_tensor(rows, dtype = torch.long, device = table.device)
-        for k0 in range(0, len(rows), TOKEN_ROWS_PER_COPY):
-            out[:, k0:k0 + TOKEN_ROWS_PER_COPY].copy_(table[idx[k0:k0 + TOKEN_ROWS_PER_COPY]].t())
+    if not len(rows):
+        return out
+    if rows[-1] - rows[0] + 1 == len(rows):                                 # consecutive: no gather
+        return transposed_rows(table, out, first = int(rows[0]))
+    return transposed_rows(table, out, rows = torch.as_tensor(rows, dtype = torch.long, device = table.device))
+
+
+def token_columns(layer, rows: np.ndarray, tokens: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+    """``out[k, j] = p(tokens[j])`` of row ``rows[k]`` of the layer's parameter table (``rows`` sorted, host int64;
+    ``tokens`` int64 on the device): a few tokens' probabilities by row, read without the whole table token-major.
+    ``out``: fp32 [len(rows), len(tokens)], contiguous rows."""
+    table = layer.params.view(-1, layer.dist.num_cats)
+    if len(rows) and rows[-1] - rows[0] + 1 == len(rows):
+        out.copy_(table[int(rows[0]):int(rows[-1]) + 1].index_select(1, tokens))
+    elif len(rows):
+        out.copy_(table[torch.as_tensor(rows, dtype = torch.long, device = table.device)].index_select(1, tokens))
     return out
 
 

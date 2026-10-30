@@ -19,6 +19,9 @@ module provides
 * ``token_probs(layer, rows, out) -> torch.Tensor``: the probability of every value under the table's rows ``rows``
   (sorted, host int64), token-major: ``out[v, k] = p(v)`` of row ``rows[k]``, ``out`` [values, len(rows)] in fp32 or
   bf16 -- what the conditionals score (:mod:`~pyjuice.constraints.inference.dfa_exact.queries.conditional`).
+* optionally ``token_columns(layer, rows, tokens, out) -> torch.Tensor``: a few values' probabilities under the
+  rows, row-major: ``out[k, j] = p(tokens[j])`` of row ``rows[k]``, ``out`` fp32 [len(rows), len(tokens)] -- what an
+  enumerated class's mass is read from (else they are taken from ``token_probs``' whole table).
 
 A distribution that also reads per-sample inputs at query time -- keyword arguments of ``pc(x, ...)``, such as soft
 evidence; a decoder takes them for its whole session (see :meth:`~pyjuice.constraints.ConstrainedCircuit.decoder`) --
