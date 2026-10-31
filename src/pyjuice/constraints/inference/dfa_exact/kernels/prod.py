@@ -1164,6 +1164,11 @@ def _flat_tile(lanes: int) -> int:
 #: diffusion (~77 lanes a step) 2129 -> 2002 ms grouped; B1 / B8 / B32 the same either way
 GROUP_MIN_LANES = 64
 
+#: (step, lane) pairs a program of :func:`_input_block_group_kernel` takes: G steps of GROUP_TILE // G lanes (or a step's
+#: lanes, fewer), a pair a thread. Codpula-4096 x JSON hard_0 B64 diffusion (G 16 chosen: 64 lanes a program at 1024,
+#: 168 registers a thread, 0.91 waves) 2036 -> 1949 ms at 128; 512 / 256 / 64 / 32: 1992 / 1982 / 2010 / 1994
+GROUP_TILE = 128
+
 #: The log-sum-exp steps the autotuner times for :func:`_input_block_group_kernel` (with every group size the
 #: Program built): two exps (the default), and :func:`_lse_step_one_exp` -- bit-identical; x1.115 on the kernel with
 #: most lanes live (one observed token), x0.91-0.97 under evidence pruning.
@@ -1265,7 +1270,7 @@ def run_products(stages, bufs, prog, regions, element_mars, node_mars, masses, o
                             firsts = groups[G]
                             gsel, gcnt = cut.groups[G]
                             G = host_next_power_of_2(G)            # lanes per group (a group may be shorter)
-                            tile = min(_flat_tile(lanes), 1024 // G)
+                            tile = min(_flat_tile(lanes), GROUP_TILE // G)
                             for first, size in grid_chunks(host_cdiv(lanes, tile), 1):
                                 _input_block_group_kernel[(gcnt, size)](
                                     element_mars, node_mars, temp, obs_class, prog.next_col_arg, prog.delta, prog.state_id,
