@@ -10,9 +10,15 @@ from __future__ import annotations
 import os
 
 import torch
+import triton
 
 from pyjuice.utils.launch_plans import LaunchPlans
 from .common import _buffer_kwarg
+
+# The per-block element fork's ranges of parent blocks (`kernels/blockscale_backward_blocks.py`), a third grid axis:
+# timed with the other forks
+_BLOCK_SPLITS = (1, 2, 4, 8, 16)
+
 
 def _set_attrs(layer, **attrs) -> None:
     """Plain attributes of a layer -- functions, tensors, None: never a parameter, buffer or module -- written past
@@ -605,7 +611,9 @@ class _BackwardMixin:
             Four may apply and which wins is not deducible: the CuTe fork is strongest at very large
             batch, but the ungated layer's own autotuner prefers Triton to its CuTe kernel at many
             shapes, below batch 16 the plain-CUDA fork beats both, and the pre-pass fork
-            takes the shapes it serves from Triton by 2-4x where measured. So they are MEASURED.
+            takes the shapes it serves from Triton by 2-4x where measured; where parent blocks are narrower than the
+            k-tile (32-wide gated layers) the only forks are Triton's and its per-block form, split into ranges of
+            parent blocks. So they are MEASURED.
 
             The whole decision -- eligibility, gate tables, winner -- is cached per
             (signature, batch, partition) and only the winning launch is built per call. An earlier
@@ -739,6 +747,18 @@ class _BackwardMixin:
             if plan["gate_tile"] is not None:
                 kinds.append("triton")
                 plan["grad_store_ok"] = self._grad_store_ok(plan["gate_tile"], ctx, gate_cbs)
+                # Parent blocks narrower than the k-tile (`ptr_inc_step > 1`): the Triton fork a parent block a step, the
+                # blocks split into ranges over the grid (`kernels/blockscale_backward_blocks.py`), on absolute per-block
+                # tables -- each step's first parent (`full_ebase`), first parameter and gate row (the gate table's)
+                if pinc > 1 and n_ngates_ == 1 and tk == pinc * blk:
+                    _cpb = torch.cumsum(ctx["parpids_increment"].to(torch.int64), 1)
+                    _shb = torch.zeros_like(_cpb)
+                    _shb[:, 1:] = _cpb[:, :-1]
+                    plan["blocks"] = (full_ebase.reshape(full_ebase.size(0), -1).contiguous(),
+                                      (ctx["parpids_start"][:, None, :].to(torch.int64) + _shb)
+                                      .reshape(full_ebase.size(0), -1).contiguous())
+                    steps = knt * pinc
+                    kinds += [("blocks", sp) for sp in _BLOCK_SPLITS if sp <= steps]
 
             if n_ngates_ > 1:
                 # The CuTe and small-batch element forks apply one gate per edge block to a whole node
@@ -878,6 +898,38 @@ class _BackwardMixin:
                     sbm_mod.blockscale_sb_ele_backward_mma(
                         tgt, element_mars, node_flows, node_mars, params, ext, chids, e0, p0, gsb,
                         no_grad if grad is None else grad, gp, scr, batch, blk, cbs, ne64, gate_cbs, ext_base, code)
+
+            elif isinstance(kind, tuple) and kind[0] == "blocks":
+                from ..kernels.blockscale_backward_blocks import _bs_triton_ele_blocks_kernel, _bs_blocks_merge_kernel
+                (eb_t, pb_t), gb, splits = plan["blocks"], plan["gate_tile"], kind[1]
+                bb, tm, tl_dot = ctx["BLOCK_B"], ctx["TILE_SIZE_M"], ctx["TL_DOT"]
+                steps = eb_t.size(1)
+                per = -(-steps // splits)
+                rows = chids.numel() * cbs
+                grad_atomic = 0 if plan.get("grad_store_ok") else 1
+                n_m = chids.numel() * (cbs // tm)
+                chunks = [(s0, min(s0 + 32768, n_m) - s0) for s0 in range(0, n_m, 32768)]
+                nb = triton.cdiv(batch, bb)
+
+                def run(tgt, node_flows, node_mars, element_mars, params, ext, grad):
+                    out = tgt
+                    if splits > 1:
+                        out = plan.get("blocks_scratch")
+                        if out is None or out.numel() < splits * rows * batch or out.device != tgt.device:
+                            out = plan["blocks_scratch"] = torch.empty(splits * rows * batch, device = tgt.device)
+                    for s0, cnt in chunks:
+                        _bs_triton_ele_blocks_kernel[(nb, cnt, splits)](
+                            node_flows = node_flows, out = out, node_mars = node_mars, element_mars = element_mars,
+                            mparams = params, ext = ext, gate = gb, chids = chids, ebase_t = eb_t, pbase_t = pb_t,
+                            grad_ext = ext if grad is None else grad, batch_size = batch, num_steps = steps,
+                            steps_per_split = per, BLOCK_B = bb, TILE_SIZE_M = tm, BLOCK_SIZE_M = cbs,
+                            BLOCK_SIZE_K = blk, TL_DOT = tl_dot, GATE_CBS = gate_cbs, ext_base = ext_base,
+                            SPLITS = splits, out_rows = rows, WRITE_GRAD = 0 if grad is None else 1,
+                            GRAD_ATOMIC = grad_atomic, pid_m_offset = s0, num_stages = 1)
+                    if splits > 1:
+                        _bs_blocks_merge_kernel[(triton.cdiv(rows * batch, 1024),)](
+                            scratch = out, element_flows = tgt, chids = chids, batch_size = batch, out_rows = rows,
+                            BLOCK_SIZE_M = cbs, SPLITS = splits, BLOCK = 1024)
 
             elif isinstance(kind, tuple):                     # ("sb", cfg)
                 (e0, p0), gsb, cfg = plan["sb"], plan["gate_sb"], kind[1]
