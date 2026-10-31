@@ -35,10 +35,13 @@ provides besides
 * ``sample_rows(layer, inputs) -> int`` and ``sample_inputs(layer, classes, inputs, out) -> SampleInputs``: the class
   masses the inputs give its nodes, per sample, in ``sample_rows`` rows per sample written into ``out`` ([batch,
   rows, num_classes]);
-* ``input_values(layer, x, missing, out, sample = None)``: the log-probability of every observed token, into the
-  layer's rows of ``out`` (``[input nodes, B]``, as a :class:`TensorCircuit`'s ``node_mars``; ``x`` [B, n] token ids,
-  ``missing`` [B, n] bool), under the inputs (``sample``, :func:`sample_inputs`') or none -- written by the backend
-  instead of the layer's own forward, which would need the inputs every query.
+* ``input_values(layer, x, missing, out, sample = None, positions = None)``: the log-probability of every observed
+  token, into the layer's rows of ``out`` (``[input nodes, B]``, as a :class:`TensorCircuit`'s ``node_mars``; ``x``
+  [B, n] token ids, ``missing`` [B, n] bool), under the inputs (``sample``, :func:`sample_inputs`') or none -- written
+  by the backend instead of the layer's own forward, which would need the inputs every query -- at the nodes over the
+  ``positions`` a query's launches read alone (None: every node; int32 [n] on the device, non-zero at those). A
+  distribution reading no inputs may provide it too (Categorical does: the layer's values in one launch, at those
+  positions); without it, the layer's own forward writes every node.
 
 Only the distributions in :data:`SUPPORTED` can be compiled under a constraint, matched by exact type: a subclass
 may compute different probabilities, so it is refused until it has its own module.

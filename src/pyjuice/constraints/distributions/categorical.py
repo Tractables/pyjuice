@@ -19,6 +19,8 @@ halves) carry their full precision, and the probabilities are scaled by 2^64 fir
 subnormal inputs to zero (a class whose tokens are all subnormal would read -inf).
 """
 
+from typing import Optional
+
 import numpy as np
 import torch
 import triton
@@ -46,6 +48,16 @@ def class_mass_rows(layer) -> torch.Tensor:
     refuses any other vocabulary), so its parameters are one ``[rows, num_cats]`` table, node ``i``'s at row
     ``s_pids[i] // num_cats``."""
     return (layer.s_pids // layer.dist.num_cats).long()
+
+
+def input_values(layer, x: torch.Tensor, missing: torch.Tensor, out: torch.Tensor, sample = None,
+                 positions: Optional[torch.Tensor] = None):
+    """``log p(d)`` of every observed token ``d`` at every node of the layer, into its rows of ``out`` (0 where the
+    token is missing) -- the layer's own forward's values (the log of the same parameter, ``s_pids[i] + d``), in one
+    launch (:func:`.softevi_categorical.input_values` under no evidence), at the nodes over ``positions`` alone
+    (None: every node; see there)."""
+    from .softevi_categorical import input_values as values
+    values(layer, x, missing, out, None, positions = positions)
 
 
 def token_probs(layer, rows: np.ndarray, out: torch.Tensor) -> torch.Tensor:

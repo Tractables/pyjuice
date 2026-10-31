@@ -24,7 +24,7 @@ import pyjuice as juice
 import pyjuice.constraints as jc
 import pyjuice.nodes.distributions as dists
 from pyjuice.nodes import inputs, multiply, summate
-from pyjuice.constraints.distributions import TokenClasses, softevi_categorical
+from pyjuice.constraints.distributions import TokenClasses, categorical, softevi_categorical
 
 V = 3
 KINDS = {"hmm": 6, "hmm_untied": 6, "hmm_block_sparse": 6, "left_linear": 6, "pd": 6, "pd_prod_dominated": 6,
@@ -986,23 +986,31 @@ def test_input_values_are_the_observed_tokens_against_float64(kind, evidence_kin
 
 
 @pytest.mark.parametrize("storage", ["dense", "compact"])
-@pytest.mark.parametrize("evidence_kind", ["dense", "topk"])
-@pytest.mark.parametrize("kind, n", [(k, None) for k in KINDS] + [(k, 12) for k in ("hmm", "hmm_untied", "pd", "pd_prod_dominated", "left_linear")] +
+@pytest.mark.parametrize("evidence_kind", ["dense", "topk", "categorical"])
+@pytest.mark.parametrize("kind, n", [(k, None) for k in KINDS] +
+                         [(k, 12) for k in ("hmm", "hmm_untied", "pd", "pd_prod_dominated", "left_linear")] +
                          [("hmm", 16), ("pd", 16)])
 def test_queries_compute_the_inputs_their_launches_read(kind, n, evidence_kind, storage, build_pc, monkeypatch):
     """A query computes the input values of the positions its launches read alone (``QueryPlan.input_reads``): with
     the input rows poisoned (NaN, or a finite value) before every query's layer writes them, a decoder session's
     conditionals -- prefix decoding, any order, rows moved -- and marginals are the bits of the queries that compute
-    every input; short sequences and longer ones (launches over more positions)."""
+    every input; short sequences and longer ones (launches over more positions). ``categorical``: a PC of Categorical
+    inputs, no evidence (the layers' values written by the backend's launch, at those positions too)."""
     n = KINDS[kind] if n is None else n
-    cc = jc.compile(CONSTRAINTS["contains"](), soft_pc(build_pc, kind, n))
+    module = categorical if evidence_kind == "categorical" else softevi_categorical
+    pc = build_pc(kind, n, V) if module is categorical else soft_pc(build_pc, kind, n)
+    assert all(type(layer.dist) is (dists.Categorical if module is categorical else dists.SoftEvidenceCategorical)
+               for layer in pc.input_layer_group)
+    cc = jc.compile(CONSTRAINTS["contains"](), pc)
     B = 4
     if evidence_kind == "dense":
         data, _, E = evidence(n, B)
         inputs = dict(categorical_evidence_logp = E)
-    else:
+    elif evidence_kind == "topk":
         data, _, inputs = topk_evidence(n, B)
-    real = softevi_categorical.input_values
+    else:
+        data, inputs = evidence(n, B)[0], {}
+    real = module.input_values
 
     def poisoned(value):
         def values(layer, x, missing, out, sample = None, positions = None):
@@ -1021,7 +1029,7 @@ def test_queries_compute_the_inputs_their_launches_read(kind, n, evidence_kind, 
     calls += [(data[torch.tensor([2, 0, 1, 3], device = DEV)], prefix(n - 1), [n - 1])]
 
     def session(values):
-        monkeypatch.setattr(softevi_categorical, "input_values", values)
+        monkeypatch.setattr(module, "input_values", values)
         with cc.decoder(storage = storage, **inputs) as d:
             out = [d.conditional(x, m, targets = tg) for x, m, tg in calls]
             out += [d.marginal(x, m) for x, m, _ in calls[::3]]

@@ -179,6 +179,33 @@ def test_the_class_order_is_built_once():
     assert moved.token_class.device.type == "cpu" and not moved._by_class
 
 
+@pytest.mark.parametrize("B", [1, 5, 24])
+@pytest.mark.parametrize("kind", ["tied", "untied", "tied_out_of_order"])
+def test_input_values_are_the_layers_own(kind, B):
+    """``input_values`` writes the layer's own forward's values bit for bit -- every observed token's log-probability,
+    0 where missing --, and with ``positions`` the nodes over the positions marked alone, the others' rows untouched;
+    batches of one sample, part of a tile of samples, and several tiles."""
+    pc = build(kind)
+    layer = pc.input_layer_group[0]
+    first, end = layer._output_ind_range
+    n = int(layer.vids.max()) + 1
+    g = torch.Generator().manual_seed(B)
+    x = torch.randint(0, V, (B, n), generator = g).to(DEV)
+    missing = (torch.rand(B, n, generator = g) < 0.4).to(DEV)
+    want = torch.full((end, B), float("nan"), device = DEV)
+    with torch.no_grad():
+        layer(x.permute(1, 0), want, missing_mask = missing)
+    got = torch.full((end, B), float("nan"), device = DEV)
+    categorical.input_values(layer, x, missing, got)
+    assert torch.equal(got[first:end].view(torch.int32), want[first:end].view(torch.int32))
+    marked = torch.rand(n, generator = g) < 0.5
+    some = torch.full((end, B), float("nan"), device = DEV)
+    categorical.input_values(layer, x, missing, some, positions = marked.to(torch.int32).to(DEV))
+    on = marked.to(DEV)[layer.vids.view(-1).long()]
+    assert torch.equal(some[first:end][on].view(torch.int32), want[first:end][on].view(torch.int32))
+    assert some[first:end][~on].isnan().all()
+
+
 def test_supported_distributions_are_matched_by_exact_type():
     class MyCategorical(dists.Categorical):
         pass
