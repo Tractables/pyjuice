@@ -55,6 +55,7 @@ readme = {file = "README.md"}
 [tool.setuptools.package-data]
 "pyjuice.layer.kernels.c" = ["*.cu", "*.cuh", "*.h"]
 "pyjuice.constraints.inference.dfa_exact.kernels.c" = ["*.cu"]
+"pyjuice.utils.c" = ["*.cpp"]
 
 [tool.pytest.ini_options]
 addopts = [

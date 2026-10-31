@@ -3,6 +3,8 @@ import torch
 import triton
 from typing import Callable, Tuple, Union
 
+from pyjuice.utils.c import launch_bind
+
 
 # Triton launch meta-parameters: they affect COMPILATION (so they belong in the cache signature) but
 # are NOT kernel arguments (they are not passed to `CompiledKernel.run`).
@@ -40,7 +42,10 @@ class FastJITFunction3x:
     (``cuPointerGetAttribute``) -- for memory of the current device, that address itself -- for every
     tensor argument of every launch. Any other tensor (a CPU tensor, PyTorch's pinned memory among them;
     a tensor on another GPU, which the driver refuses when that GPU's memory is not mapped here) is passed
-    as it is, and Triton's launcher handles it as before.
+    as it is, and Triton's launcher handles it as before. Where the C++ binding builds (:mod:`pyjuice.utils.c`,
+    on first use; ``PYJUICE_NATIVE_BIND=0`` switches it off), the binder hands the values it unpacked to it, which
+    builds the same values and signature in one call -- a call with a value outside its domain (a tensor subclass,
+    a sparse tensor, ... -- see ``launch_bind.cpp``) bound in Python as before.
     """
 
     def __init__(self, fn: Callable):
@@ -48,6 +53,7 @@ class FastJITFunction3x:
         self.params = self.jit_fn.params
         self.n_params = len(self.params)
         self.is_constexpr = tuple(p.is_constexpr for p in self.params)
+        self.constexpr_mask = bytes(self.is_constexpr)              # (the C++ binding's)
         self.defaults = tuple(p.default for p in self.params)   # inspect._empty when required
         self.name_to_idx = {p.name: i for i, p in enumerate(self.params)}
         self.cache = dict()
@@ -122,26 +128,40 @@ class FastJITFunction3x:
                     return None
                 defaults[f"_fj_d{i}"] = self.defaults[i]
                 lines.append(f"    {name} = _fj_d{i}")
-        sig = []
+        order = sorted(range(len(meta)), key = lambda j: meta[j])
+        meta_items = "".join(f"({meta[j]!r}, _fj_m{j}), " for j in order)
+        values = f"({', '.join(names)},)"
+        tail, sig = [], []
         for i, (name, c) in enumerate(zip(names, self.is_constexpr)):
             if c:
                 sig.append(name)
                 continue
-            lines += [f"    if _fj_isinstance({name}, _fj_Tensor):",
-                      f"        _fj_p = {name}.data_ptr()",
-                      f"        _fj_s{i} = ({name}.dtype, _fj_p & 15)",
-                      f"        if {name}.get_device() == _fj_dev:",
-                      f"            {name} = _fj_p",
-                      f"    else:",
-                      f"        _fj_s{i} = {name}"]
+            tail += [f"    if _fj_isinstance({name}, _fj_Tensor):",
+                     f"        _fj_p = {name}.data_ptr()",
+                     f"        _fj_s{i} = ({name}.dtype, _fj_p & 15)",
+                     f"        if {name}.get_device() == _fj_dev:",
+                     f"            {name} = _fj_p",
+                     f"    else:",
+                     f"        _fj_s{i} = {name}"]
             sig.append(f"_fj_s{i}")
-        order = sorted(range(len(meta)), key = lambda j: meta[j])
-        meta_items = "".join(f"({meta[j]!r}, _fj_m{j}), " for j in order)
-        lines.append(f"    return ({', '.join(names)},), (_fj_dev, {', '.join(sig)}, ({meta_items}))")
-        namespace = dict(_fj_isinstance = isinstance, _fj_Tensor = torch.Tensor, **defaults)
+        tail.append(f"    return {values}, (_fj_dev, {', '.join(sig)}, ({meta_items}))")
+        python = self._compile(lines + tail, dict(_fj_isinstance = isinstance, _fj_Tensor = torch.Tensor, **defaults))
+        native = launch_bind() if python is not None else None
+        if native is None:
+            return python
+        # The C++ binding (`pyjuice.utils.c`): the same unpacking, then one call building the same values and
+        # signature -- or None for a value outside its domain (a tensor subclass, ...), that call bound in Python
+        tail = [f"    _fj_r = _fj_bind_c(_fj_dev, {values}, _fj_constexpr, ({meta_items}))",
+                f"    return _fj_python(_fj_dev, _fj_args, _fj_kwargs) if _fj_r is None else _fj_r"]
+        return self._compile(lines + tail, dict(_fj_bind_c = native.bind, _fj_constexpr = self.constexpr_mask,
+                                                _fj_python = python, **defaults)) or python
+
+    @staticmethod
+    def _compile(lines, namespace):
+        # The generated `_fj_bind`, or None if it does not compile (e.g. no parameter at all: the generic binding)
         try:
             exec("\n".join(lines), namespace)
-        except Exception:                                       # (e.g. no parameter at all: the generic binding)
+        except Exception:
             return None
         return namespace["_fj_bind"]
 

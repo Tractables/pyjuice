@@ -167,6 +167,107 @@ def test_fast_jit3x_runs_with_addresses_and_rejects_cpu_tensors():
     assert outcome(fast) == stock
 
 
+def _same_binding(got, want):
+    """Whether two bindings `(values, signature)` are the same: equal signatures hashing alike, every value the
+    same object or the same address."""
+    (gv, gs), (wv, ws) = got, want
+    return gs == ws and hash(gs) == hash(ws) and len(gv) == len(wv) and \
+        all(g is w or (type(g) is int and type(w) is int and g == w) for g, w in zip(gv, wv))
+
+
+class _TensorSubclass(torch.Tensor):
+    pass
+
+
+def _binding_values(dev):
+    """Values for `_mixed_kernel`'s tensor and scalar parameters: every kind the C++ binding takes or declines."""
+    base = torch.randn(64, device = dev)
+    tensors = [base, base[1:], base[2:], base[3:], torch.randn(8, 8, device = dev).t(), torch.zeros((), device = dev),
+               torch.empty(0, device = dev), torch.randn(16, device = dev, requires_grad = True),
+               torch.nn.Parameter(torch.randn(16, device = dev)), torch.randn(16), torch.randn(16)[1:],
+               base.as_subclass(_TensorSubclass)]
+    tensors += [torch.ones(16, device = dev, dtype = d)[o:] for d in (torch.float16, torch.bfloat16, torch.float64,
+                torch.int8, torch.uint8, torch.int32, torch.int64, torch.bool) for o in (0, 1)]
+    scalars = [0.5, 3, -1, 2 ** 70, True, None]
+    return tensors, scalars
+
+
+@pytest.mark.skipif(not (torch.cuda.is_available() and int(triton.__version__.split(".")[0]) >= 3),
+                    reason="FastJITFunction3x targets triton >= 3 on CUDA")
+def test_fast_jit3x_cpp_binding_builds_the_python_bindings(monkeypatch):
+    """
+    The C++ binding (`pyjuice.utils.c`, `launch_bind.cpp`) builds exactly the values and signature of the
+    generated Python binding, for every kind of value: tensors of every dtype and 16-byte alignment class, views,
+    0-d and empty ones, ones requiring grad, a Parameter, CPU tensors, a tensor subclass (declined: bound in Python),
+    scalars of every kind, constexprs, meta-parameters, defaults -- with the tensors' device the current one or not.
+    """
+    import pyjuice.utils.kernel_launcher as KL
+    if KL.launch_bind() is None:
+        pytest.skip("the C++ binding does not build here")
+    fast = FastJITFunction3x(_mixed_kernel)
+    dev = torch.device("cuda:0")
+    tensors, scalars = _binding_values(dev)
+    patterns = [((), {}), (("x_ptr", "y_ptr"), {"num_warps": 4}), (("x_ptr",), {"num_stages": 1, "num_warps": 2})]
+    with monkeypatch.context() as m:
+        m.setattr(KL, "launch_bind", lambda: None)
+        python = {}
+        for pos, meta in patterns:
+            kw = [k for k in ("x_ptr", "y_ptr", "n", "scale", "z_ptr", "offset", "FLAG") if k not in pos]
+            python[pos] = fast._binder(len(pos), tuple(kw) + tuple(meta))
+    checked = 0
+    for pos, meta in patterns:
+        kw = [k for k in ("x_ptr", "y_ptr", "n", "scale", "z_ptr", "offset", "FLAG") if k not in pos]
+        native = fast._binder(len(pos), tuple(kw) + tuple(meta))
+        assert native is not None and native is not python[pos]
+        for xv in tensors:
+            for sv in scalars:
+                for flag in (False, True):
+                    vals = dict(x_ptr = xv, y_ptr = tensors[0], n = 64, scale = sv, z_ptr = tensors[-1], offset = sv,
+                                FLAG = flag)
+                    args = tuple(vals[k] for k in pos)
+                    kwargs = {**{k: vals[k] for k in kw}, **meta}
+                    for current in (0, 1):
+                        assert _same_binding(native(current, args, kwargs), python[pos](current, args, kwargs)), \
+                            (pos, meta, type(xv), xv.dtype, xv.device, sv, flag, current)
+                        checked += 1
+    assert checked > 1000
+
+
+class _Mode(torch.overrides.TorchFunctionMode):
+    def __torch_function__(self, func, types, args = (), kwargs = None):
+        return func(*args, **(kwargs or {}))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason = "requires CUDA")
+def test_cpp_binding_declines_what_it_does_not_bind_as_python_does():
+    """
+    The C++ binding's domain: exact Tensors and Parameters, strided, on the CPU or a CUDA device, with no
+    TorchFunctionMode active -- for anything else (a subclass, a sparse or meta tensor, a mode the Python binding's
+    attribute reads would go through) it returns None, and the launcher binds that call in Python.
+    """
+    from pyjuice.utils.c import launch_bind
+    native = launch_bind()
+    if native is None:
+        pytest.skip("the C++ binding does not build here")
+    x = torch.randn(16, device = "cuda:0")
+    bind = lambda v, current = 0: native.bind(current, (v, 7), b"\x00\x01", (("num_warps", 4),))
+    for v in (x, x[1:], torch.nn.Parameter(x.clone()), torch.randn(16), x.view(4, 4).t()):
+        got = bind(v)
+        assert got is not None
+        assert got[1] == (0, (v.dtype, v.data_ptr() & 15), 7, (("num_warps", 4),))
+        assert got[0][1] == 7 and (got[0][0] == v.data_ptr() if v.is_cuda else got[0][0] is v)
+        assert bind(v, 1)[0][0] is v                               # (not the current device: as it is)
+    for v in (x.as_subclass(_TensorSubclass), x.to_sparse(), torch.empty(16, device = "meta")):
+        assert bind(v) is None, type(v)
+    with _Mode():
+        assert bind(x) is None
+    assert native.bind(0, (3, None, 0.5), b"\x00\x00\x00", ()) == ((3, None, 0.5), (0, 3, None, 0.5, ()))
+    got = native.bind(0, (x,), b"\x01", ())                        # a constexpr: by value, whatever it is
+    assert got[0][0] is x and got[1][1] is x
+    with pytest.raises(ValueError):
+        native.bind(0, (x,), b"", ())
+
+
 def _two_gpus():
     """
     Two GPU ids for a real cross-device launch, or None: the conftest pins every test process to ONE GPU,
