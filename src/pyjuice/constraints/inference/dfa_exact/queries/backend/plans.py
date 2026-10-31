@@ -49,6 +49,7 @@ from typing import Optional
 
 import numpy as np
 import torch
+from numba import njit
 
 from .planners import IndexLists, _forward_steps, _mode_workspace, _top_down_modes, _top_down_steps, _top_down_tables, \
     class_weight_writes
@@ -139,10 +140,23 @@ def _prefix(mask: np.ndarray) -> np.ndarray:
     return out
 
 
+@njit(cache = True)
+def _unobserved(observed, bounds, outside):
+    """Per interval ``[a, b)`` of ``bounds``: whether ``observed`` (bool [n]) holds no position inside it -- or, with
+    ``outside``, none outside it."""
+    P = np.zeros(observed.size + 1, dtype = np.int64)
+    for i in range(observed.size):
+        P[i + 1] = P[i] + observed[i]
+    out = np.empty(bounds.shape[0], dtype = np.bool_)
+    for k in range(bounds.shape[0]):
+        a, b = bounds[k, 0], bounds[k, 1]
+        out[k] = (P[a] == 0 and P[-1] == P[b]) if outside else P[b] == P[a]
+    return out
+
+
 def free_regions(prog, observed: np.ndarray) -> np.ndarray:
     """bool [sum intervals]: the input-independent ones -- no sample observes a position of the interval."""
-    P = _prefix(observed)
-    return P[prog.iv_bounds[:, 1]] == P[prog.iv_bounds[:, 0]]
+    return _unobserved(np.ascontiguousarray(observed, dtype = bool), prog.iv_bounds, False)
 
 
 def prior_regions(prog, observed: np.ndarray, B: int, kept: bool, liveness) -> np.ndarray:
@@ -313,8 +327,7 @@ def held_intervals(prog, held: np.ndarray) -> np.ndarray:
 def top_down_free(td, observed: np.ndarray) -> np.ndarray:
     """bool [intervals] (by ``prog.intervals``' numbers): the input-independent top-down values -- no sample observes
     a position outside the interval."""
-    P = _prefix(observed)
-    return (P[td.iv_bounds[:, 0]] == 0) & (P[-1] == P[td.iv_bounds[:, 1]])
+    return _unobserved(np.ascontiguousarray(observed, dtype = bool), td.iv_bounds, True)
 
 
 def scope_intervals(td, scopes) -> np.ndarray:

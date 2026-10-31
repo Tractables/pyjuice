@@ -406,22 +406,41 @@ def regather(prog, old: "CompactLayout", src: torch.Tensor, new: "CompactLayout"
     must hold under the new evidence (none newly observed outside its scope -- top-down values -- or inside it, see
     :mod:`..queries.decoder`).
     """
-    regs = np.nonzero(regions)[0]
-    if regs.size == 0:
-        return
-    k = prog.reg_iv_all[regs]
-    ends = prog.iv_ends_np[k]
     (old_offset, old_width), (new_offset, new_width) = old.rows(rows), new.rows(rows)
-    dst_offset = (new_offset if dst_offset is None else dst_offset)[regs]
-    table = np.stack([old_offset[regs], old_width[regs], dst_offset, new_width[regs], prog.reg_rows[regs], k,
-                      ends[:, 0], ends[:, 1]], axis = 1)
-    table = torch.from_numpy(np.ascontiguousarray(table, dtype = np.int64)).to(prog.dev)
-    lanes = max(new.lanes(k), 1)
+    table, lanes, most = _regather_table(regions, old_offset, old_width,
+                                         new_offset if dst_offset is None else dst_offset, new_width, prog.reg_rows,
+                                         prog.reg_iv_all, prog.iv_ends_np, new.total)
+    if table.shape[0] == 0:
+        return
+    table = torch.from_numpy(table).to(prog.dev)
+    lanes = max(int(lanes), 1)
     tile = min(REGATHER_TILE, max(16, host_next_power_of_2(lanes)))
-    grid = (-(-lanes // tile), regs.size, -(-int(prog.reg_rows[regs].max()) // REGATHER_ROWS))
+    grid = (-(-lanes // tile), table.size(0), -(-int(most) // REGATHER_ROWS))
     _regather_kernel[grid](src, dst, table, parents, old.off, old.count, old.rank, new.off, new.count, new.start,
                            new.columns, old.B, new.B, prog.n, prog.W, new.steps, ROWS = REGATHER_ROWS,
                            STEP = max(1, REGATHER_FLOATS // tile), TILE = tile, num_warps = 4)
+
+
+@njit(cache = True)
+def _regather_table(regions, old_offset, old_width, dst_offset, new_width, reg_rows, reg_iv, iv_ends, total):
+    """:func:`regather`'s table, a row per region of ``regions`` (int64 [regions, 8]: its rows' old place and width,
+    their new place and width, its rows, its interval and the interval's ends), and the most lanes (``total``: the new
+    layout's, per interval) and rows of a region in it."""
+    R = 0
+    for r in range(regions.size):
+        if regions[r]:
+            R += 1
+    table = np.empty((R, 8), dtype = np.int64)
+    lanes = most = 0
+    i = 0
+    for r in range(regions.size):
+        if regions[r]:
+            k = reg_iv[r]
+            table[i, 0], table[i, 1], table[i, 2], table[i, 3] = old_offset[r], old_width[r], dst_offset[r], new_width[r]
+            table[i, 4], table[i, 5], table[i, 6], table[i, 7] = reg_rows[r], k, iv_ends[k, 0], iv_ends[k, 1]
+            lanes, most = max(lanes, total[k]), max(most, reg_rows[r])
+            i += 1
+    return table, lanes, most
 
 
 @triton_jit
@@ -448,16 +467,17 @@ def regather_into(state, prog, old: "CompactLayout", new: "CompactLayout", regio
     storage whose values the query neither reads nor keeps; where it holds the ``regions``' values, the scratch is
     there, whatever their share. Returns ``allocate()``'s result.
     """
-    regs = np.nonzero(regions)[0]
     new_offset, new_width = new.rows(rows)
-    sizes = prog.reg_rows[regs] * new_width[regs]
-    numel = max(int(sizes.sum()), 1)
+    held, every = _region_floats(regions, prog.reg_rows, new_width)
+    numel = max(int(held), 1)
     spare = spare if spare is not None and spare.numel() >= numel else None
-    if spare is None and 2 * int(sizes.sum()) >= int((prog.reg_rows * new_width).sum()):   # most of the new storage:
-        src = state.replace_storage(name, None)                      # in one pass, the old held while the new is made
+    if spare is None and 2 * int(held) >= int(every):               # most of the new storage: in one pass, the old
+        src = state.replace_storage(name, None)                      # held while the new is made
         out = allocate()
         regather(prog, old, src, new, out[name], regions, parents, rows = rows)
         return out
+    regs = np.nonzero(regions)[0]
+    sizes = prog.reg_rows[regs] * new_width[regs]
     starts = np.zeros(len(new_width), dtype = np.int64)
     starts[regs] = np.concatenate([[0], np.cumsum(sizes)[:-1]])
     scratch = torch.empty(numel, device = prog.dev) if spare is None else spare[:numel]
@@ -470,6 +490,18 @@ def regather_into(state, prog, old: "CompactLayout", new: "CompactLayout", regio
     _copy_segments_kernel[(-(-max(int(sizes.max()), 1) // COPY_TILE), regs.size)](scratch, out[name], table,
                                                                                 TILE = COPY_TILE, num_warps = 4)
     return out
+
+
+@njit(cache = True)
+def _region_floats(regions, reg_rows, width):
+    """The floats of the rows (``width`` per region) of the ``regions``, and of every region's."""
+    held = every = 0
+    for r in range(regions.size):
+        f = reg_rows[r] * width[r]
+        every += f
+        if regions[r]:
+            held += f
+    return held, every
 
 
 def query_layout(backend, liveness, plan, regions: np.ndarray, held: Optional[np.ndarray]) -> CompactLayout:
@@ -521,14 +553,28 @@ def _spare(state, prog, carry: dict) -> Optional[torch.Tensor]:
     if storage is None or carry.get("regions") is None:
         return None
     offset, width = carry["layout"].rows("flows")
-    regs = np.nonzero(carry["regions"])[0]
+    start, end = _largest_gap(carry["regions"], offset, width, prog.reg_rows, storage.numel())
+    return storage[start:end] if end > start else None
+
+
+@njit(cache = True)
+def _largest_gap(regions, offset, width, reg_rows, numel):
+    """``(start, end)``: the longest stretch of ``numel`` floats holding no row of the ``regions`` (``offset`` /
+    ``width``: per region, its rows' place and width), the first of them -- starting 16 bytes into the floats, past
+    every row before it."""
+    regs = np.nonzero(regions)[0]
     lo = offset[regs]
-    order = np.argsort(lo)
-    lo, hi = lo[order], (lo + prog.reg_rows[regs] * width[regs])[order]
-    starts = -(-np.concatenate([[0], hi]) // 4) * 4                  # (16 bytes into the storage)
-    ends = np.concatenate([lo, [storage.numel()]])
-    k = int(np.argmax(ends - starts))
-    return storage[int(starts[k]):int(ends[k])] if ends[k] > starts[k] else None
+    order = np.argsort(lo, kind = "mergesort")
+    start, best, best_start, best_end = 0, -1, 0, 0
+    for j in range(regs.size + 1):
+        end = lo[order[j]] if j < regs.size else numel
+        at = -(-start // 4) * 4                                      # (16 bytes into the storage)
+        if end - at > best:
+            best, best_start, best_end = end - at, at, end
+        if j < regs.size:
+            r = regs[order[j]]
+            start = max(start, offset[r] + reg_rows[r] * width[r])
+    return best_start, best_end
 
 
 #: a compact query leaves the held inside values it does not read where they are (:func:`held_moves`) only when the

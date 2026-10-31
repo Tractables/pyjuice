@@ -614,8 +614,10 @@ class ClassWeightRows:
 CLASS_ROWS_SHARED = True
 #: the bits of the classes' keys (:func:`_row_key`) the grouping compares: a key only proposes the classes that may
 #: share a row, each is then checked exactly (:func:`_class_reps_kernel`); fewer bits (tests: 0, every class of a
-#: column one candidate) cost merges, never values
-CLASS_ROW_KEY_MASK = (1 << 62) - 1
+#: column one candidate) cost merges, never values. At most 48 (:data:`_KEY_BITS`): a column's sort in registers packs
+#: a class's rank below its key (:func:`_sorted_candidates_kernel`)
+CLASS_ROW_KEY_MASK = (1 << 48) - 1
+_KEY_BITS = tl.constexpr(48)
 _KEY_NONE = tl.constexpr((1 << 63) - 1)                 # (a dead class's key: after every live one)
 
 
@@ -647,8 +649,8 @@ def _row_key(h, cnt, stored, key_mask):
 
 
 @triton_jit
-def _live_classes_kernel(live, cls_ptr, cls_col, cls_succ, col_pos, col_K, row, floats, key, elen, stored, n, W, C, B,
-                         allowed, a_stride, key_mask, TC: tl.constexpr, TP: tl.constexpr, PRUNE: tl.constexpr,
+def _live_classes_kernel(live, cls_ptr, cls_col, cls_succ, col_pos, col_K, row, floats, off, key, elen, stored, n, W,
+                         C, B, N, allowed, a_stride, key_mask, TC: tl.constexpr, TP: tl.constexpr, PRUNE: tl.constexpr,
                          ALLOWED: tl.constexpr, KEYS: tl.constexpr):
     """One program per target column ``m`` (sample ``m % B`` of position ``col_pos[m // B]``) and tile of ``TC``
     classes: which of them are live -- a class whose list (``cls_ptr`` / ``cls_col`` / ``cls_succ``) has a pair live
@@ -658,7 +660,7 @@ def _live_classes_kernel(live, cls_ptr, cls_col, cls_succ, col_pos, col_K, row, 
     rows shared, see :class:`ClassWeightRows`): every live class's key (:func:`_row_key`; a dead one's
     :data:`_KEY_NONE`) into ``key[m, c]`` and its live pairs' number into ``elen[m, c]`` -- the rows are counted once
     the classes are grouped (:func:`_class_reps_kernel`); else the live classes' rows' floats (``col_K[m]`` a row)
-    added to ``floats[m]``."""
+    added to ``floats[m]``, and the ``N`` columns' first floats into ``off`` (:func:`_offsets_when_counted`)."""
     m = tl.program_id(0).to(tl.int64)
     t = tl.load(col_pos + m // B)
     b = m % B
@@ -697,10 +699,38 @@ def _live_classes_kernel(live, cls_ptr, cls_col, cls_succ, col_pos, col_K, row, 
         tl.store(elen + m * C + c, cnt, mask = c < C)
     else:
         tl.atomic_add(floats + m, tl.sum(on.to(tl.int64), axis = 0) * tl.load(col_K + m))
+        _offsets_when_counted(floats, off, N)
+
+
+_OFFSET_STEP = tl.constexpr(1024)
+
+
+@triton.jit
+def _offsets_when_counted(floats, off, N):
+    """Once every program of the launch added its column's floats to ``floats[:N]`` -- counted at ``floats[N]`` (0
+    before the launch) --, the last of them writes their running sums, every column's first float past the first,
+    into ``off[1:]`` (``off[0]`` 0 already), 1024 columns a step, read from L2 (where the others' atomics are)."""
+    tl.debug_barrier()                                                  # (this program's floats added)
+    if tl.atomic_add(floats + N, 1) == tl.num_programs(0) * tl.num_programs(1) - 1:
+        total = tl.zeros([], dtype = tl.int64)
+        for s0 in range(0, N, _OFFSET_STEP):
+            s = s0 + tl.arange(0, _OFFSET_STEP)
+            v = tl.load(floats + s, mask = s < N, other = 0, cache_modifier = ".cg")
+            tl.store(off + 1 + s, total + tl.cumsum(v, axis = 0), mask = s < N)
+            total += tl.sum(v, axis = 0)
 
 
 #: classes a step of :func:`_class_candidates_kernel` (one program per target column, every class of its boundary)
 CLASS_CANDIDATE_TILE = 1024
+#: the most classes (padded to a power of 2) whose candidates :func:`_sorted_candidates_kernel` finds, a column's keys
+#: sorted in registers -- one launch for the three of :func:`_ordered_keys_kernel`, a sort and
+#: :func:`_class_candidates_kernel` (~27 us of host time, 5 on its own) --, at any number of target columns up to
+#: ``CLASS_CANDIDATE_ANY`` of them, past it at most ``CLASS_CANDIDATE_COLUMNS`` (None: the device's SMs, one wave).
+#: Device time, the sort's vs the registers' (brezel): 100 classes x 8192 columns 99 vs 17 us, 500 x 8192 318 vs 119;
+#: 617 x 1024 67 vs 60, x 8192 373 vs 406; 1224 x 1 42 vs 39, x 1024 120 vs 172; 3000 x 1 54 vs 88
+CLASS_CANDIDATE_REGISTERS = 2048
+CLASS_CANDIDATE_ANY = 512
+CLASS_CANDIDATE_COLUMNS = None
 
 
 @triton_jit
@@ -744,13 +774,35 @@ def _class_candidates_kernel(keys, sidx, cls_order, col_pos, rep, C, B, TC: tl.c
 
 
 @triton_jit
-def _class_reps_kernel(live, cls_ptr, cls_col, cls_succ, col_pos, col_K, row, rep, elen, stored, floats, next_col,
-                       delta, state_id, col_of_state, n, W, C, B, K, TC: tl.constexpr, TP: tl.constexpr,
+def _sorted_candidates_kernel(key, cls_order, col_pos, rep, C, B, CP: tl.constexpr, RB: tl.constexpr):
+    """:func:`_class_candidates_kernel`'s candidates from the keys themselves, one program per target column ``m``: its
+    ``C <= CP`` keys in class order with their ranks below them (``RB`` bits, ``2^RB = CP``; a live key of at most
+    :data:`_KEY_BITS` bits, a dead one's :data:`_KEY_NONE` after every live one) sorted in registers -- the order of the
+    stable sort --, every class's candidate the class at its key's first place."""
+    m = tl.program_id(0).to(tl.int64)
+    t = tl.load(col_pos + m // B)
+    order, row = cls_order + t * C, m * C
+    r = tl.arange(0, CP)
+    rm = r < C
+    k = tl.load(key + row + tl.load(order + r, mask = rm, other = 0), mask = rm, other = 0)
+    k = tl.where(k == _KEY_NONE, 1 << _KEY_BITS, k)
+    s = tl.sort(tl.where(rm, (k << RB) | r.to(tl.int64), _KEY_NONE))      # (past C: last)
+    sk, sr = s >> RB, (s & (CP - 1)).to(tl.int32)
+    start = tl.where((r == 0) | (sk != tl.gather(sk, tl.maximum(r - 1, 0), 0)), r, 0)      # (a key's first place)
+    start = tl.associative_scan(start, 0, _max_combine)
+    tl.store(rep + row + tl.load(order + sr, mask = rm, other = 0),
+             tl.load(order + tl.gather(sr, start, 0), mask = rm, other = 0), mask = rm)
+
+
+@triton_jit
+def _class_reps_kernel(live, cls_ptr, cls_col, cls_succ, col_pos, col_K, row, rep, elen, stored, floats, off, next_col,
+                       delta, state_id, col_of_state, n, W, C, B, K, N, TC: tl.constexpr, TP: tl.constexpr,
                        PRUNE: tl.constexpr, HOMOGENEOUS: tl.constexpr):
     """One program per target column ``m`` and tile of ``TC`` classes: every live class's representative -- the
     candidate ``rep[m, c]`` its key proposed (the first class of the same key in the boundary's class order), if their
     live pairs are the same, else itself -- into ``rep[m, c]`` (-1 for a dead class), and the column's
-    representatives' rows' floats (``col_K[m]`` a row) added to ``floats[m]``. The same live pairs: as many
+    representatives' rows' floats (``col_K[m]`` a row) added to ``floats[m]`` (the ``N`` columns' first floats then
+    into ``off``, :func:`_offsets_when_counted`). The same live pairs: as many
     (``elen``), and each of the class's taken the same way by the candidate -- its column live at ``t``, its
     successor live at ``t + 1`` and the candidate's successor there (``next_col`` / ``delta``, see
     :func:`~.common._next_col`; the sequence end's one column) --, and the same kind (both stored, or both
@@ -787,6 +839,7 @@ def _class_reps_kernel(live, cls_ptr, cls_col, cls_succ, col_pos, col_K, row, re
     fin = tl.where(on, tl.where(bad, c, r), -1)
     tl.store(rep + m * C + c, fin, mask = cm)
     tl.atomic_add(floats + m, tl.sum((on & (fin == c)).to(tl.int64), axis = 0) * tl.load(col_K + m))
+    _offsets_when_counted(floats, off, N)
 
 
 @triton_jit
@@ -842,7 +895,8 @@ def class_weight_rows(prog, liveness, col_pos: torch.Tensor, col_K: torch.Tensor
     With ``stored`` (int32 [C] on the device: every class's stored column, -1 for an enumerated class) and
     :data:`CLASS_ROWS_SHARED`, the live classes of a column with the same live pairs share a row: every class's key
     (:func:`_live_classes_kernel`), the classes of a key grouped per column in the boundary's class order (a sort),
-    every class checked exactly against the first of its key (:func:`_class_reps_kernel`), then the rows.
+    every class checked exactly against the first of its key (:func:`_class_reps_kernel`), then the rows -- the
+    grouping in registers where it fits (:data:`CLASS_CANDIDATE_REGISTERS`).
 
     :param col_pos: int64 [N / B] on the device, every block of ``B`` columns' position
     :param col_K, col_first: int64 [N] on the device, every column's row group's rows and first column
@@ -852,7 +906,7 @@ def class_weight_rows(prog, liveness, col_pos: torch.Tensor, col_K: torch.Tensor
     N, G, dev = col_K.numel(), group_first.numel() - 1, prog.dev
     shared = CLASS_ROWS_SHARED and stored is not None and N > 0
     M, a, b = max(N, 1), N + 1 + (N + 1) % 2, G + 2 + G % 2                 # (pieces 16 B aligned)
-    z = torch.zeros(a + b + M, dtype = torch.int64, device = dev)
+    z = torch.zeros(a + b + M + 1, dtype = torch.int64, device = dev)      # (the floats' programs counted past them)
     off, sizes, floats = z.as_strided((N + 1,), (1,)), z.as_strided((G + 2,), (1,), a), z.as_strided((M,), (1,), a + b)
     NC, MP = M * C + (-M * C) % 4, M + (-M) % 4
     e = torch.empty((4 if shared else 2) * NC + MP, dtype = torch.int32, device = dev)
@@ -862,7 +916,7 @@ def class_weight_rows(prog, liveness, col_pos: torch.Tensor, col_K: torch.Tensor
         key = torch.empty(M, C, dtype = torch.int64, device = dev)
     else:
         rep, elen, key = row, row, floats
-    if N > 0:
+    if N > 0:                                       # (the last launch adding floats writes the columns' offsets)
         prune = liveness is not None
         classes = prune and liveness.allowed is not None                    # (a session's per-sample classes)
         a_stride = n * C if classes and liveness.allowed.size(0) > 1 else 0  # (one set: every sample's)
@@ -871,23 +925,29 @@ def class_weight_rows(prog, liveness, col_pos: torch.Tensor, col_K: torch.Tensor
             TC //= 2                                                                         # device)
         TP = max(1, LIVE_CLASS_LANES // TC)
         _live_classes_kernel[(N, host_cdiv(C, TC))](liveness.live if prune else row, tt.cls_ptr, tt.cls_col,
-                                                     tt.cls_succ, col_pos, col_K, row, floats, key, elen,
-                                                     stored if shared else row, n, W, C, B,
+                                                     tt.cls_succ, col_pos, col_K, row, floats, off, key, elen,
+                                                     stored if shared else row, n, W, C, B, N,
                                                      liveness.allowed if classes else row, a_stride, CLASS_ROW_KEY_MASK,
                                                      TC = TC, TP = TP, PRUNE = prune, ALLOWED = classes, KEYS = shared,
                                                      num_warps = 4)
         if shared:                                  # every class's candidate: the first of its key in class order
-            ordered = torch.empty(N, C, dtype = torch.int64, device = dev)
-            TK = min(CLASS_CANDIDATE_TILE, host_next_power_of_2(C))
-            _ordered_keys_kernel[(N, host_cdiv(C, TK))](key, tt.cls_order, col_pos, ordered, C, B, TC = TK)
-            keys, sidx = torch.sort(ordered, dim = 1, stable = True)
-            _class_candidates_kernel[(N,)](keys, sidx, tt.cls_order, col_pos, rep, C, B, TC = TK, num_warps = 4)
+            CP = max(2, host_next_power_of_2(C))
+            most = _num_sms(dev) if CLASS_CANDIDATE_COLUMNS is None else CLASS_CANDIDATE_COLUMNS
+            if CP <= CLASS_CANDIDATE_REGISTERS and (CP <= CLASS_CANDIDATE_ANY or N <= most) and \
+                    CLASS_ROW_KEY_MASK < (1 << _KEY_BITS.value):            # (8 warps the faster at 1024 only)
+                _sorted_candidates_kernel[(N,)](key, tt.cls_order, col_pos, rep, C, B, CP = CP,
+                                                RB = CP.bit_length() - 1, num_warps = 8 if CP == 1024 else 4)
+            else:
+                ordered = torch.empty(N, C, dtype = torch.int64, device = dev)
+                TK = min(CLASS_CANDIDATE_TILE, host_next_power_of_2(C))
+                _ordered_keys_kernel[(N, host_cdiv(C, TK))](key, tt.cls_order, col_pos, ordered, C, B, TC = TK)
+                keys, sidx = torch.sort(ordered, dim = 1, stable = True)
+                _class_candidates_kernel[(N,)](keys, sidx, tt.cls_order, col_pos, rep, C, B, TC = TK, num_warps = 4)
             _class_reps_kernel[(N, host_cdiv(C, TC))](liveness.live if prune else row, tt.cls_ptr, tt.cls_col,
-                                                      tt.cls_succ, col_pos, col_K, row, rep, elen, stored, floats,
+                                                      tt.cls_succ, col_pos, col_K, row, rep, elen, stored, floats, off,
                                                       prog.next_col_arg, prog.delta, prog.state_id, prog.col_of_state,
-                                                      n, W, C, B, prog.K, TC = TC, TP = TP, PRUNE = prune,
+                                                      n, W, C, B, prog.K, N, TC = TC, TP = TP, PRUNE = prune,
                                                       HOMOGENEOUS = prog.homogeneous, num_warps = 4)
-        torch.cumsum(floats, dim = 0, out = off[1:])
     TC = min(LIVE_CLASS_TILE, host_next_power_of_2(C))
     _class_rows_kernel[(max(N, G + 1),)](off, tt.cls_order, col_pos, col_K, col_first, group_first, row, rep, count,
                                          cls, sizes, N, G, C, B, TC = TC, SHARED = shared)

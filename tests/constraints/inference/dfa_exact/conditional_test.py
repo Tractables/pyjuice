@@ -13,6 +13,8 @@ import sys
 import numpy as np
 import pytest
 import torch
+import triton
+import triton.language as tl
 
 import pyjuice as juice
 import pyjuice.constraints as jc
@@ -23,7 +25,7 @@ from pyjuice.constraints.inference.dfa_exact.queries import marginal as QM
 from pyjuice.constraints.inference.dfa_exact.queries.conditional import class_weights
 from pyjuice.constraints.inference.dfa_exact.kernels import score as S
 from pyjuice.constraints.inference.dfa_exact.kernels.live import sample_successors
-from pyjuice.constraints.inference.dfa_exact.kernels.score import score_tables
+from pyjuice.constraints.inference.dfa_exact.kernels.score import _offsets_when_counted, score_tables
 from pyjuice.constraints.inference.dfa_exact.queries.backend import plans as QP
 from pyjuice.constraints.distributions import TokenClasses
 from pyjuice.constraints.evidence import candidate_tensor
@@ -311,14 +313,15 @@ def test_live_class_rows_match_a_brute_force(constraint, kind, storage, pattern,
     column with the same live pairs and kind (stored or enumerated) share one row, their representative the first of
     them in the boundary's class order, a column's representatives on consecutive rows in that order; unshared, every
     live class a row of its own in that order. A row group's columns in order. Also reading a class's pairs one at a
-    time (``one_pair``: every list walked over several tiles; and a column's candidates found 2 classes a step, a key's
-    first place carried over the steps), and under a session's per-sample classes (``classes``, stood in for the
-    session's): a class the sample rules out has none. ``contains``: boundaries whose class order (most columns
-    first) is not the classes', with classes of different rows there."""
+    time (``one_pair``: every list walked over several tiles; and a column's candidates found by the sort, 2 classes
+    a step, a key's first place carried over the steps -- else in registers), and under a session's per-sample classes
+    (``classes``, stood in for the session's): a class the sample rules out has none. ``contains``: boundaries whose
+    class order (most columns first) is not the classes', with classes of different rows there."""
     monkeypatch.setattr(S, "CLASS_ROWS_SHARED", shared)
     if one_pair:
         monkeypatch.setattr(S, "LIVE_CLASS_LANES", 1)
         monkeypatch.setattr(S, "CLASS_CANDIDATE_TILE", 2)
+        monkeypatch.setattr(S, "CLASS_CANDIDATE_REGISTERS", 0)
     n = {"walks": 6}.get(kind, KINDS.get(kind))
     cc = jc.compile(CONSTRAINTS[constraint](), build_pc(kind, n, V))
     data, missing = evidence(pattern, n)
@@ -373,43 +376,131 @@ def test_shared_rows_are_exact_whatever_the_keys(kind, storage, pattern, build_p
     exactly -- classes sharing a row have the same live pairs, and the first class of the column is shared by every
     class with its pairs --, and every class's weights are those it gets with rows of its own (unshared) and with the
     keys in full: the same -inf, the finite ones equal to their rounding (the walks' tiles follow the rows' number).
-    The candidates found 2 classes a step where every key is the same (one key over every step)."""
+    The candidates found in registers, and by the sort 2 classes a step where every key is the same (one key over
+    every step)."""
     n = KINDS[kind]
     cc = jc.compile(CONSTRAINTS["either"](), build_pc(kind, n, V))
     data, missing = evidence(pattern, n)
     positions = missing.any(dim = 0).numpy()
     B, dev = data.size(0), cc.pc.params.device
     out = {}
-    for name, shared, mask in (("unshared", False, S.CLASS_ROW_KEY_MASK), ("keys", True, S.CLASS_ROW_KEY_MASK),
-                               ("collide", True, 0)):
+    for name, shared, mask, sort in (("unshared", False, S.CLASS_ROW_KEY_MASK, False),
+                                     ("keys", True, S.CLASS_ROW_KEY_MASK, False), ("collide", True, 0, True),
+                                     ("collide_registers", True, 0, False)):
         monkeypatch.setattr(S, "CLASS_ROWS_SHARED", shared)
         monkeypatch.setattr(S, "CLASS_ROW_KEY_MASK", mask)
-        monkeypatch.setattr(S, "CLASS_CANDIDATE_TILE", 2 if mask == 0 else 1024)
+        monkeypatch.setattr(S, "CLASS_CANDIDATE_TILE", 2 if sort else 1024)
+        monkeypatch.setattr(S, "CLASS_CANDIDATE_REGISTERS", 0 if sort else 2048)
         report = {}
         with torch.no_grad():
             groups, _ = class_weights(cc.backend, data, missing.to(dev), positions, storage = storage, report = report)
         out[name] = (groups, [w for _, _, w in dense_weights(groups)], report["liveness"])
-    for name in ("keys", "collide"):
+    for name in ("keys", "collide", "collide_registers"):
         for a, b in zip(out["unshared"][1], out[name][1]):
             assert torch.equal(torch.isneginf(a), torch.isneginf(b)), name
             fin = torch.isfinite(a)
             assert ((a[fin] - b[fin]).abs() <= 1e-5 * a[fin].abs() + n * 1e-6).all(), name
     prog = cc.backend.program()
-    groups, _, lv = out["collide"]
-    live = None if lv is None else lv.live.cpu() != 0
     stored = cc.backend.token_classes.stored_of_class.cpu()
-    for g, pos, w, row, rep in groups:
-        row, rep = row.cpu(), rep.cpu()
-        for p, t in enumerate(pos.tolist()):
-            for b in range(B):
-                keys = live_lists(prog, live, None, stored, t, b)
-                m = p * B + b
-                for c in keys:
-                    r = int(rep[m, c])
-                    assert keys[r] == keys[c] and int(row[m, c]) == int(row[m, r]), (g, t, b, c)
-                if keys:
-                    c0 = next(iter(keys))
-                    assert all(int(rep[m, c]) == c0 for c in keys if keys[c] == keys[c0]), (g, t, b)
+    for name in ("collide", "collide_registers"):
+        groups, _, lv = out[name]
+        live = None if lv is None else lv.live.cpu() != 0
+        for g, pos, w, row, rep in groups:
+            row, rep = row.cpu(), rep.cpu()
+            for p, t in enumerate(pos.tolist()):
+                for b in range(B):
+                    keys = live_lists(prog, live, None, stored, t, b)
+                    m = p * B + b
+                    for c in keys:
+                        r = int(rep[m, c])
+                        assert keys[r] == keys[c] and int(row[m, c]) == int(row[m, r]), (name, g, t, b, c)
+                    if keys:
+                        c0 = next(iter(keys))
+                        assert all(int(rep[m, c]) == c0 for c in keys if keys[c] == keys[c0]), (name, g, t, b)
+
+
+@pytest.mark.parametrize("seed", range(6))
+def test_the_sample_columns_offsets_are_numpys(seed):
+    """`_sample_offsets` (numba) is `_sample_columns`' numpy formulas: every column's first weight ``(first + b x
+    stride) x width`` (-1 at a position whose nodes no input reweights), sample by sample within a position -- or
+    status 1 (unsupported) for a position whose nodes are reweighted by different inputs, or, top-k, some positions'
+    nodes only; 2 when no position's are."""
+    from pyjuice.constraints.inference.dfa_exact.queries.conditional import _sample_offsets
+    rng = np.random.default_rng(seed)
+    n, B = int(rng.integers(1, 30)), int(rng.integers(1, 9))
+    stride, width = int(rng.integers(0, 5)), int(rng.integers(1, 1000))
+    for first, mixed in ((rng.integers(0, 50, n), np.zeros(n, bool)),
+                         (np.where(rng.random(n) < 0.5, -1, rng.integers(0, 50, n)), np.zeros(n, bool)),
+                         (np.full(n, -1), np.zeros(n, bool)), (rng.integers(0, 50, n), rng.random(n) < 0.2)):
+        first = first.astype(np.int64)
+        pos = np.sort(rng.choice(n, int(rng.integers(1, n + 1)), replace = False)).astype(np.int64)
+        for topk in (False, True):
+            f, m = first[pos], mixed[pos]
+            status, offset = _sample_offsets(first, mixed, pos, B, stride, width, topk)
+            if m.any() or (topk and (f < 0).any() and (f >= 0).any()):
+                assert status == 1
+            elif (f < 0).all():
+                assert status == 2
+            else:
+                want = np.where(f[:, None] >= 0, (f[:, None] + np.arange(B)[None, :] * stride) * width, -1)
+                assert status == 0 and offset.dtype == np.int64 and np.array_equal(offset, want.reshape(-1))
+
+
+@pytest.mark.parametrize("C", [1, 2, 3, 37, 64, 65, 617, 1224, 2048])
+def test_candidates_in_registers_are_the_sorts(C):
+    """A column's candidates found in registers (``_sorted_candidates_kernel``: its keys sorted with their ranks
+    below them) are the sort's (``_ordered_keys_kernel``, a stable sort, ``_class_candidates_kernel``): every class's
+    the first class of its key in its boundary's class order -- dead classes (``_KEY_NONE``) after every live key, live
+    keys of every width up to ``_KEY_BITS`` bits (0, the most, the dead one's neighbors), few distinct keys (long runs)
+    or many, columns of one sample or of several."""
+    dev = torch.device("cuda")
+    g = torch.Generator().manual_seed(C)
+    for B, N, distinct in ((1, 5, 2), (3, 12, max(1, C // 3)), (4, 8, C)):
+        T = 5
+        order = torch.stack([torch.randperm(C, generator = g) for _ in range(T)]).to(torch.int32)
+        col_pos = torch.randint(0, T, (N // B,), generator = g)
+        pool = torch.tensor([0, 1, (1 << 48) - 1, (1 << 48) - 2, 1 << 47], dtype = torch.int64)
+        pool = torch.cat([pool, torch.randint(0, 1 << 48, (distinct,), generator = g)])
+        key = pool[torch.randint(0, min(len(pool), distinct + 2), (N, C), generator = g)]
+        key = torch.where(torch.rand(N, C, generator = g) < 0.3, torch.full_like(key, (1 << 63) - 1), key)
+        key, order, col_pos = key.to(dev), order.to(dev).contiguous(), col_pos.to(dev)
+        want = torch.full((N, C), -7, dtype = torch.int32, device = dev)
+        got = want.clone()
+        TK = min(S.CLASS_CANDIDATE_TILE, triton.next_power_of_2(C))
+        ordered = torch.empty(N, C, dtype = torch.int64, device = dev)
+        S._ordered_keys_kernel[(N, triton.cdiv(C, TK))](key, order, col_pos, ordered, C, B, TC = TK)
+        keys, sidx = torch.sort(ordered, dim = 1, stable = True)
+        S._class_candidates_kernel[(N,)](keys, sidx, order, col_pos, want, C, B, TC = TK, num_warps = 4)
+        CP = max(2, triton.next_power_of_2(C))
+        S._sorted_candidates_kernel[(N,)](key, order, col_pos, got, C, B, CP = CP, RB = CP.bit_length() - 1,
+                                          num_warps = 8 if CP == 1024 else 4)
+        assert torch.equal(got, want), (B, N, distinct)
+        assert (got >= 0).all()
+
+
+@triton.jit
+def _counted_floats_kernel(floats, off, vals, N):
+    m = tl.program_id(0)
+    tl.atomic_add(floats + m, tl.load(vals + m * tl.num_programs(1) + tl.program_id(1)))
+    _offsets_when_counted(floats, off, N)
+
+
+@pytest.mark.parametrize("N", [1, 7, 1023, 1024, 1025, 3000])
+def test_the_last_program_adding_floats_writes_the_offsets(N):
+    """Every program of a launch adding floats to its column's (``N`` columns, tiles of 1, 3 or 8 programs a column),
+    the last of them writes every column's first float (``_offsets_when_counted``): the running sums -- over one step
+    of 1024 columns or several --, whatever order the programs ran in (twenty launches each)."""
+    dev = torch.device("cuda")
+    g = torch.Generator().manual_seed(N)
+    for Q in (1, 3, 8):
+        for _ in range(20):
+            vals = torch.randint(0, 1 << 20, (N, Q), generator = g, dtype = torch.int64)
+            z = torch.zeros(2 * N + 2, dtype = torch.int64, device = dev)
+            off, floats = z[:N + 1], z[N + 1:]
+            _counted_floats_kernel[(N, Q)](floats, off, vals.to(dev), N)
+            want = torch.cat([torch.zeros(1, dtype = torch.int64), vals.sum(1).cumsum(0)])
+            assert torch.equal(off.cpu(), want), Q
+            assert int(floats[N]) == N * Q
 
 
 @pytest.mark.parametrize("one_sample", [False, True])

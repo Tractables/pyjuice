@@ -84,6 +84,22 @@ def out_temp(launch):
     return launch.kinds[2] if launch.form == "block_block" else launch.kinds[1]
 
 
+@pytest.mark.parametrize("seed", range(6))
+def test_the_unobserved_intervals_are_numpys(seed):
+    """`_unobserved` (numba) is numpy's prefix formulas: per interval ``[a, b)``, no observed position inside it (the
+    input-independent inside values, `free_regions`) or, ``outside``, none outside it (the input-independent top-down
+    values, `top_down_free`) -- empty intervals, the whole sequence, nothing or everything observed."""
+    from pyjuice.constraints.inference.dfa_exact.queries.backend.plans import _unobserved
+    rng = np.random.default_rng(seed)
+    n = int(rng.integers(1, 40))
+    bounds = np.sort(rng.integers(0, n + 1, (int(rng.integers(1, 60)), 2)), axis = 1).astype(np.int64)
+    bounds = np.concatenate([bounds, [[0, n], [0, 0], [n, n]]]).astype(np.int64)
+    for observed in (rng.random(n) < 0.3, np.zeros(n, bool), np.ones(n, bool)):
+        P = np.concatenate([[0], np.cumsum(observed)])
+        assert np.array_equal(_unobserved(observed, bounds, False), P[bounds[:, 1]] == P[bounds[:, 0]])
+        assert np.array_equal(_unobserved(observed, bounds, True), (P[bounds[:, 0]] == 0) & (P[-1] == P[bounds[:, 1]]))
+
+
 @pytest.mark.parametrize("kind", list(KINDS))
 def test_every_step_carries_its_products_interval(kind, build_pc):
     """A step writing the layer's element row is its product: its interval is its output's. A step writing scratch

@@ -19,6 +19,7 @@ from typing import Optional
 
 import numpy as np
 import torch
+from numba import njit
 
 from .backend import forward as F
 from ..kernels.common import pack_aligned
@@ -107,18 +108,42 @@ def _sample_columns(masses, score, g: int, pos: np.ndarray, B: int, prog) -> Opt
         first = np.where(real.any(axis = 1), tr[np.arange(len(tr)), real.argmax(axis = 1)], -1)
         mixed = ~(np.where(real, tr, first[:, None]) == first[:, None]).all(axis = 1)
         kept = rows[g] = (weakref.ref(masses), first, mixed)
-    first, mixed = kept[1][pos], kept[2][pos]
-    if mixed.any() or (masses.token_ids is not None and (first < 0).any() and (first >= 0).any()):
+    pos = np.asarray(pos, dtype = np.int64)
+    status, offset = _sample_offsets(kept[1], kept[2], pos, B, masses.token_stride, masses.token_width,
+                                     masses.token_ids is not None)
+    if status == 1:
         raise NotImplementedError("Conditionals at a position whose input nodes are reweighted by different per-sample "
                                   "inputs (or some only) are not supported.")
-    if (first < 0).all():
+    if status == 2:
         return None
     nodes = prog.__dict__.setdefault("sample_nodes", {})
     if g not in nodes:
         nodes[g] = torch.from_numpy(np.maximum(score.nodes[g], 0)).to(prog.dev)
-    off = first[:, None]
-    offset = np.where(off >= 0, (off + np.arange(B)[None, :] * masses.token_stride) * masses.token_width, -1)
-    return nodes[g], np.asarray(pos, dtype = np.int64), offset.reshape(-1)
+    return nodes[g], pos, offset
+
+
+@njit(cache = True)
+def _sample_offsets(first, mixed, pos, B, stride, width, topk):
+    """``(status, offsets)`` of :func:`_sample_columns`' positions ``pos`` (``first``: per position, its nodes' weights'
+    row, -1 for none; ``mixed``: nodes of different rows): status 1 if a position's nodes are reweighted by different
+    inputs (or, ``topk``, some positions' only), 2 if no position's are, else 0 and every column's first weight
+    (``(first + b x stride) x width``, -1 for a position without), sample by sample within a position."""
+    none = 0
+    for i in range(pos.size):
+        if mixed[pos[i]]:
+            return 1, np.empty(0, dtype = np.int64)
+        if first[pos[i]] < 0:
+            none += 1
+    if topk and 0 < none < pos.size:
+        return 1, np.empty(0, dtype = np.int64)
+    if none == pos.size:
+        return 2, np.empty(0, dtype = np.int64)
+    offset = np.empty(pos.size * B, dtype = np.int64)
+    for i in range(pos.size):
+        f = first[pos[i]]
+        for b in range(B):
+            offset[i * B + b] = (f + b * stride) * width if f >= 0 else -1
+    return 0, offset
 
 
 def _as_int64(a: np.ndarray) -> np.ndarray:
