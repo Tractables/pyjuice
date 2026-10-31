@@ -178,10 +178,10 @@ def run_forward(backend, bufs: dict, plan, x: torch.Tensor, missing: torch.Tenso
     else:
         hold = None
     masses = backend.state.masses() if masses is None else masses
-    for k, layer in enumerate(pc.input_layer_group):                   # the input region: pyjuice's own layout
-        values = getattr(lookup(layer.dist), "input_values", None)
-        if values is not None:
-            values(layer, x, missing, bufs["input_mars"], masses.sample.get(k))
+    for k, layer in enumerate(pc.input_layer_group):                   # the input region: pyjuice's own layout --
+        values = getattr(lookup(layer.dist), "input_values", None)      # where it can, at the positions the plan's
+        if values is not None:                                          # launches read alone
+            values(layer, x, missing, bufs["input_mars"], masses.sample.get(k), positions = plan.input_reads)
         else:
             layer(x.permute(1, 0), bufs["input_mars"], missing_mask = missing)
     prog.transitions(masses)

@@ -25,6 +25,7 @@ missing token contributes 1 whatever the mask, a False one ``Z``).
 """
 
 import weakref
+from typing import Optional
 
 import numpy as np
 import torch
@@ -312,13 +313,16 @@ def _transposed_table(layer, inputs = None):
     return table
 
 
-def input_values(layer, x: torch.Tensor, missing: torch.Tensor, out: torch.Tensor, sample = None):
+def input_values(layer, x: torch.Tensor, missing: torch.Tensor, out: torch.Tensor, sample = None,
+                 positions: Optional[torch.Tensor] = None):
     """``log q(d)`` of every observed token ``d`` at every node of the layer, into its rows of ``out`` (0 where the
     token is missing): ``log p(d)``, and under soft evidence (``sample``, :func:`sample_inputs`') ``+ log w(d) - log
     Z`` (top-k: -inf for a token that is not a candidate; under a value mask, True wherever a token is observed, no
     ``Z``). The weight of the token a sample observes at a variable is looked up once (:func:`_token_weights_kernel`),
     for all the nodes over the variable. The probabilities from the table transposed where the session keeps one (see
-    :func:`_transposed_table`): a token's nodes' probabilities contiguous."""
+    :func:`_transposed_table`): a token's nodes' probabilities contiguous. ``positions``: None (every node), or int32
+    [n] on the device -- the nodes over the positions it marks (non-zero) alone, the others' rows left as they are (a
+    query's launches read no other, see :func:`~..inference.dfa_exact.queries.backend.plans.input_reads`)."""
     B, n = x.shape
     first, end = layer._output_ind_range
     nodes = end - first
@@ -343,9 +347,10 @@ def input_values(layer, x: torch.Tensor, missing: torch.Tensor, out: torch.Tenso
     table_t = _transposed_table(layer)
     TN, TB = INPUT_TILES["TN"], min(INPUT_TILES["TB"], host_next_power_of_2(B))
     _input_values_kernel[(host_cdiv(nodes, TN), host_cdiv(B, TB))](
-        out, table if table_t is None else table_t, x, miss, layer.vids, prow, lvid, srow, w, logz, first, nodes, B, n,
-        num_cats, table.size(0), Vl, R_s, HAS_EV = has_ev, PER_SAMPLE = Be > 1, NORMALIZE = normalize,
-        TRANSPOSED = table_t is not None, TN = TN, TB = TB, num_warps = INPUT_TILES["warps"])
+        out, table if table_t is None else table_t, x, miss, layer.vids, prow, lvid, srow, w, logz,
+        prow if positions is None else positions, first, nodes, B, n, num_cats, table.size(0), Vl, R_s, HAS_EV = has_ev,
+        PER_SAMPLE = Be > 1, NORMALIZE = normalize, TRANSPOSED = table_t is not None, SOME = positions is not None,
+        TN = TN, TB = TB, num_warps = INPUT_TILES["warps"])
 
 
 # -------------------------------------------------------------------------------------------------
@@ -593,18 +598,21 @@ INPUT_TILES = dict(TN = 64, TB = 16, warps = 4)
 
 
 @triton_jit
-def _input_values_kernel(out, table, x, missing, vids, prow, lvid, srow, w, logz, first, nodes, B, n, num_cats,
+def _input_values_kernel(out, table, x, missing, vids, prow, lvid, srow, w, logz, need, first, nodes, B, n, num_cats,
                          num_rows, Vl, R_s, HAS_EV: tl.constexpr, PER_SAMPLE: tl.constexpr, NORMALIZE: tl.constexpr,
-                         TRANSPOSED: tl.constexpr, TN: tl.constexpr, TB: tl.constexpr):
+                         TRANSPOSED: tl.constexpr, SOME: tl.constexpr, TN: tl.constexpr, TB: tl.constexpr):
     """One program per (tile of the layer's nodes, tile of samples), the nodes the fast axis: every observed token's
     ``log p(d)`` (``HAS_EV``: ``+ log w(d)``, the sample's at the node's variable from ``w``
     (:func:`_token_weights_kernel`), ``- log Z`` if ``NORMALIZE``), 0 where it is missing -- ``p(d)`` from ``table``
-    [num_rows, num_cats], or ``TRANSPOSED`` [num_cats, num_rows] (a token's rows contiguous)."""
+    [num_rows, num_cats], or ``TRANSPOSED`` [num_cats, num_rows] (a token's rows contiguous); ``SOME``: the nodes over
+    the positions ``need`` marks (int32 [n], non-zero) alone."""
     i = tl.program_id(0) * TN + tl.arange(0, TN)
     b = tl.program_id(1) * TB + tl.arange(0, TB)
     im, bm = i < nodes, b < B
-    mask = bm[:, None] & im[None, :]
     var = tl.load(vids + i, mask = im, other = 0).to(tl.int64)
+    if SOME:
+        im = im & (tl.load(need + var, mask = im, other = 0) != 0)
+    mask = bm[:, None] & im[None, :]
     at = b[:, None].to(tl.int64) * n + var[None, :]
     d = tl.load(x + at, mask = mask, other = 0)
     miss = tl.load(missing + at, mask = mask, other = 1) != 0

@@ -985,6 +985,56 @@ def test_input_values_are_the_observed_tokens_against_float64(kind, evidence_kin
         assert torch.equal(values(True).view(torch.int32), got.view(torch.int32))
 
 
+@pytest.mark.parametrize("storage", ["dense", "compact"])
+@pytest.mark.parametrize("evidence_kind", ["dense", "topk"])
+@pytest.mark.parametrize("kind, n", [(k, None) for k in KINDS] + [(k, 12) for k in ("hmm", "hmm_untied", "pd", "pd_prod_dominated", "left_linear")] +
+                         [("hmm", 16), ("pd", 16)])
+def test_queries_compute_the_inputs_their_launches_read(kind, n, evidence_kind, storage, build_pc, monkeypatch):
+    """A query computes the input values of the positions its launches read alone (``QueryPlan.input_reads``): with
+    the input rows poisoned (NaN, or a finite value) before every query's layer writes them, a decoder session's
+    conditionals -- prefix decoding, any order, rows moved -- and marginals are the bits of the queries that compute
+    every input; short sequences and longer ones (launches over more positions)."""
+    n = KINDS[kind] if n is None else n
+    cc = jc.compile(CONSTRAINTS["contains"](), soft_pc(build_pc, kind, n))
+    B = 4
+    if evidence_kind == "dense":
+        data, _, E = evidence(n, B)
+        inputs = dict(categorical_evidence_logp = E)
+    else:
+        data, _, inputs = topk_evidence(n, B)
+    real = softevi_categorical.input_values
+
+    def poisoned(value):
+        def values(layer, x, missing, out, sample = None, positions = None):
+            first, end = layer._output_ind_range
+            out[first:end].fill_(value)
+            return real(layer, x, missing, out, sample, positions = positions)
+        return values
+
+    def every(layer, x, missing, out, sample = None, positions = None):
+        return real(layer, x, missing, out, sample)
+
+    prefix = lambda t: (torch.arange(n, device = DEV)[None, :] >= t).expand(B, n)
+    g = torch.Generator().manual_seed(1)
+    ranks = torch.stack([torch.randperm(n, generator = g) for _ in range(B)]).to(DEV)
+    calls = [(data, prefix(t), [t]) for t in range(n)] + [(data, ranks >= k, None) for k in range(n)]
+    calls += [(data[torch.tensor([2, 0, 1, 3], device = DEV)], prefix(n - 1), [n - 1])]
+
+    def session(values):
+        monkeypatch.setattr(softevi_categorical, "input_values", values)
+        with cc.decoder(storage = storage, **inputs) as d:
+            out = [d.conditional(x, m, targets = tg) for x, m, tg in calls]
+            out += [d.marginal(x, m) for x, m, _ in calls[::3]]
+        return out
+
+    want = session(every)
+    for value in (float("nan"), 3.0):                        # (a NaN a maximum may pass over; a value it may not)
+        got = session(poisoned(value))
+        assert len(got) == len(want)
+        for i, (a, b) in enumerate(zip(want, got)):
+            assert torch.equal(a.view(torch.int32), b.view(torch.int32)), (value, i)
+
+
 # -------------------------------------------------------------------------------------------------
 # What a session refuses
 # -------------------------------------------------------------------------------------------------
