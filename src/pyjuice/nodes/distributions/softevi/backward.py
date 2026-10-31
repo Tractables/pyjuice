@@ -14,8 +14,9 @@ import os
 from pyjuice.utils.util import max_power_of_2_factor
 
 from .common import _grad_scratch
-from .dense_index import _build_dense_index, _dense_scratch, _dense_topk_applicable, _dense_update_pflows, \
-                         _missing_mask_kwargs
+from .dense_index import _build_dense_index, _cached_dense_choice, _dense_scratch, _dense_topk_applicable, \
+                         _dense_update_pflows, _hot_products, _missing_mask_kwargs
+from .forward import _fw_linear_evidence
 
 
 class _GradCastEpilogue:
@@ -191,6 +192,9 @@ class _DenseDenomDispatch:
         # The shards partition the lists, and every update is an accumulation (atomic wherever a category
         # can have more than one list), so the shards may run in any order.
         def launch(**kw):
+            hot = kw.pop("hot")
+            if hot is not None:
+                _hot_expected_flow(kw, *hot)
             shards = kw.pop("shards")
             for sh in shards:
                 skw = dict(kw)
@@ -217,6 +221,39 @@ class _DenseDenomDispatch:
         return launch
 
 
+def _hot_expected_flow(kw, index, pt):
+    """The hybrid backward's hot categories (`dense_index._HOT_DIV`): their expected-category flow and evidence-gradient
+    term as dense products over every slot, where the list walk (`dense_expected_flow`) takes the cold ones.
+
+        phase1[row(l), cat_u] += beta[l, cat_u] * G[u, l],   G = P^T ratio         ([hot, latents])
+        grad[e]               -= p_theta_e * D[slot_e, u_e],  D = ratio beta^T      ([slots, hot])
+
+    with P [slots, hot] the hot references' p_theta at (slot, its category's rank), zero elsewhere -- the same sums the
+    walk makes, in fp32 (`"highest"`: not TF32)."""
+    hot = index["hot"]
+    elem, rank, keys = hot["elem"], hot["rank"], hot["keys"]
+    B, V, K = pt.shape
+    ratio = kw["ratio_ptr"]                                                    # [V * B, num_latents]
+    nc = kw["tot_num_cats"]
+    P = _hot_products(index, pt)
+    prev = torch.get_float32_matmul_precision()
+    torch.set_float32_matmul_precision("highest")
+    try:
+        if kw["update_pflows"]:
+            from ..c_kernels import softevi_hot_flows
+            softevi_hot_flows(kw["params_ptr"], kw["param_flows_ptr"], P.t() @ ratio, keys, kw["p_base_ptr"],
+                              kw["pf_base_ptr"], keys.numel(), ratio.size(1), nc)
+        if kw["update_extflows"]:
+            g = keys // nc
+            beta = kw["params_ptr"][kw["p_base_ptr"][g] + (keys - g * nc)[:, None]]   # [hot, num_latents]
+            D = ratio @ beta.t()                                                   # [V * B, hot]
+            t = elem // K
+            slot = (t % V) * B + t // V
+            kw["categorical_evidence_logp_grad_ptr"].view(-1).index_add_(0, elem, -P[slot, rank] * D[slot, rank])
+    finally:
+        torch.set_float32_matmul_precision(prev)
+
+
 def _condition_bk_dense_denom(layer, kwargs):
     return _dense_topk_applicable(layer, kwargs)
 
@@ -227,7 +264,13 @@ def _prep_args_bk_dense_denom(layer, kwargs):
     batch_size = kwargs["batch_size"]
     evidence = kwargs["categorical_evidence_logp"]
     assert evidence.size(0) == batch_size, "Batch size doesn't match in `categorical_evidence_logp`."
-    index = _build_dense_index(layer, kwargs)
+    index = None
+    if _cached_dense_choice(layer, kwargs) == "hybrid":
+        # The cold categories' lists, and the hot ones for the dense products (`_hot_expected_flow`)
+        index = _build_dense_index(layer, kwargs, ladder = False, cold = True)
+    target_kwargs["hot"] = None if index is None else (index, _fw_linear_evidence(layer, kwargs))
+    if index is None:
+        index = _build_dense_index(layer, kwargs)
 
     num_latents = index["num_latents"]
 

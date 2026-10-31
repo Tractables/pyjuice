@@ -103,3 +103,23 @@ def softevi_forward_rows(params, node_mars, Z, T, log_ex_p, data, vids, s_pids, 
         params, node_mars, Z, T, log_ex_p, data, vids, s_pids, nids, var_idmapping, keys, p_base, elem_key, pt,
         int(num_keys), int(num_cats), int(num_latents), int(chunk), int(B), int(V), int(K), int(layer_num_nodes),
         int(node_offset), int(threads), int(unroll))
+
+
+def softevi_hot_flows(params, param_flows, G, keys, p_base, pf_base, num_hot, num_latents, num_cats):
+    _rows_module.softevi_hot_flows(params, param_flows, G, keys, p_base, pf_base, int(num_hot), int(num_latents),
+                                   int(num_cats))
+
+
+def softevi_rows_table(params, keys, p_base, T, num_keys, num_latents, num_cats, l0, lc):
+    _rows_module.softevi_rows_table(params, keys, p_base, T, int(num_keys), int(num_latents), int(num_cats), int(l0),
+                                    int(lc))
+
+
+def softevi_rows_z_cold(T, elem_key, pt, Zh, Z, B, V, K, num_latents, l0, lc):
+    _rows_module.softevi_rows_z_cold(T, elem_key, pt, Zh, Z, int(B), int(V), int(K), int(num_latents), int(l0), int(lc))
+
+
+def softevi_rows_epilogue(params, node_mars, Z, log_ex_p, data, vids, s_pids, nids, var_idmapping, layer_num_nodes, B,
+                          node_offset, num_latents):
+    _rows_module.softevi_rows_epilogue(params, node_mars, Z, log_ex_p, data, vids, s_pids, nids, var_idmapping,
+                                       int(layer_num_nodes), int(B), int(node_offset), int(num_latents))

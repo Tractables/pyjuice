@@ -83,6 +83,16 @@ _DENSE_TOPK_BACKWARD = os.environ.get("PYJUICE_SOFTEVI_DENSE_BACKWARD", "1") != 
 # the warps nearly even on their own, and the tuner stopped picking the length-sharded layout.
 _DENSE_LIST_SPLIT = 32
 
+# The hybrid backward's hot categories (`_build_dense_index(cold = True)`): those referenced by at least 1 / _HOT_DIV of
+# their block's slots, at least _HOT_MIN of them. A hot category's expected-category flow is a column of one dense
+# product over every slot (`backward._hot_expected_flow`) instead of a walk of its reference list: per slot one fp32
+# GEMM element (2 x latents flops at ~65 TF/s here) against, per reference, a ratio row (4 x latents bytes from L2 at
+# the ~3 TB/s the walk reads them) -- even at a reference in ~35 slots the product is cheaper. MEASURED on CoDD's PC
+# (1024 latents, real LLaDA top-k 1024 evidence), the input layer's forward and backward at 1 / 32, 1 / 16, 1 / 8:
+# 64 blocks of 32 6.10 / 5.74 / 5.61 ms (list walk alone 6.15), 256 blocks 14.61 / 14.32 / 14.83 (19.47).
+_HOT_DIV = 16
+_HOT_MIN = 64
+
 
 # The padded reference arrays are `12 * max_refs * Umax * num_blocks` bytes (three [max_refs, Umax]
 # tables: slot, p_theta, grad offset). Heavily-overlapping candidate lists at a large batch can push
@@ -329,11 +339,12 @@ def _dense_choice(layer, kwargs, default):
     """Scattered, or dense with which index layout -- by measurement where possible (see the end of
     `_dense_worth_it`). Returns whether to take the dense form; the layout is read by `_index_layout`.
 
-    Three candidates: "scattered", "single" (one category order, coalesced) and "ladder" (shards by
-    list length, see `_choose_shards`). The two dense layouts trade against each other: the ladder makes
-    the forward's inner loop balanced (3.2x on the CoDD forward at batch 32, before lists were cut into
-    pieces -- see `_DENSE_LIST_SPLIT`), but splitting the categories costs the backward coalescing, so at
-    small batch it is slower there. That crossover moves with the shape, hence timing.
+    Four candidates: "scattered", "single" (one category order, coalesced), "ladder" (shards by list length,
+    see `_choose_shards`) and "hybrid" (the single layout, and in the backward the hot categories' expected flow
+    as dense products, `_HOT_DIV`). The dense layouts trade against each other: the ladder makes the forward's
+    inner loop balanced (3.2x on the CoDD forward at batch 32, before lists were cut into pieces -- see
+    `_DENSE_LIST_SPLIT`), but splitting the categories costs the backward coalescing, so at small batch it is
+    slower there. That crossover moves with the shape, hence timing.
 
     Two choices are kept, both keyed by SHAPE and cached process-wide in the launch autotuner:
       * the JOINT one (forward + backward), measured in a backward. Once it exists both passes follow
@@ -347,10 +358,10 @@ def _dense_choice(layer, kwargs, default):
         from pyjuice.layer.kernels import autotune
         key = _dense_choice_key(layer, kwargs)
         if kwargs.get("_bk_launch_common", None) is not None:
-            if autotune.should_tune(key, 3):
+            if autotune.should_tune(key, 4):
                 _tune_dense_choice(layer, kwargs, key, default, backward = True)
         elif kwargs.get("_fw_launch_common", None) is not None and autotune.cached(key) is None:
-            if autotune.should_tune(key + ("forward_only",), 3):
+            if autotune.should_tune(key + ("forward_only",), 4):
                 _tune_dense_choice(layer, kwargs, key + ("forward_only",), default, backward = False)
 
     choice = _cached_dense_choice(layer, kwargs)
@@ -374,7 +385,7 @@ def _cached_dense_choice(layer, kwargs):
 def _index_layout(layer, kwargs):
     """The dense index layout to build: True (ladder), False (single) or None (let `_choose_shards`'
     gate decide), per `_cached_dense_choice`."""
-    return {"ladder": True, "single": False}.get(_cached_dense_choice(layer, kwargs), None)
+    return {"ladder": True, "single": False, "hybrid": False}.get(_cached_dense_choice(layer, kwargs), None)
 
 
 def _tune_dense_choice(layer, kwargs, key, default, backward):
@@ -393,6 +404,8 @@ def _tune_dense_choice(layer, kwargs, key, default, backward):
     # scattered path it falls back to, and could then win on noise and pay a failed build every step.
     cands = ["scattered"] + [name for name, ladder in (("single", False), ("ladder", True))
                              if _build_dense_index(layer, kwargs, ladder = ladder) is not None]
+    if backward and "single" in cands and _build_dense_index(layer, kwargs, ladder = False, cold = True) is not None:
+        cands.append("hybrid")
     if len(cands) == 1:
         return "scattered"
     # The reference -- kept unless beaten by the autotuner's margin -- is what would run otherwise: a
@@ -432,7 +445,7 @@ def _tune_dense_choice(layer, kwargs, key, default, backward):
         try:
             # Charge each candidate the per-step work it causes: a step sorts the candidates (when its
             # forward does) and builds the index once, shared by the forward and the backward.
-            layer._dense_index_cache = None
+            layer._dense_index_cache = layer._dense_sorted_cache = None
             layer._fw_sorted_cache = None
             fkw = dict(kwargs, _fw_launch_common = fw_common)
             fkw.pop("_bk_launch_common", None)
@@ -452,7 +465,7 @@ def _tune_dense_choice(layer, kwargs, key, default, backward):
         return autotune.pick(key, candidates, run)
     finally:
         # The live call rebuilds for the winner.
-        layer._dense_index_cache = None
+        layer._dense_index_cache = layer._dense_sorted_cache = None
         layer._fw_sorted_cache = None
 
 
@@ -570,7 +583,7 @@ def _dense_index_scatter_kernel(order_ptr, list_ptr, list_start_ptr, first_piece
     tl.store(ref_goff_ptr + dst, e.to(tl.int32), mask = mask)
 
 
-def _build_dense_index(layer, kwargs, ladder = None):
+def _build_dense_index(layer, kwargs, ladder = None, cold = False):
     """
     Invert (position, batch, candidate) -> category, once per step, per param-flow block.
 
@@ -582,6 +595,10 @@ def _build_dense_index(layer, kwargs, ladder = None):
 
     Cached on the layer and keyed by the identity of `soft_evidence_cat_ids` (and the layout), so the
     forward and the backward of a step share one build.
+
+    `cold`: the lists without the HOT categories (`_HOT_DIV`), which the backward takes as dense products instead
+    (`backward._hot_expected_flow`); the index then also carries them (`hot`). None where fewer than `_HOT_MIN`
+    categories are hot, none are cold, or the dense products would not fit the index's memory budget.
     """
     cat_ids = kwargs["soft_evidence_cat_ids"]
     evidence = kwargs["categorical_evidence_logp"]
@@ -595,9 +612,10 @@ def _build_dense_index(layer, kwargs, ladder = None):
     # silently serves the previous call's index once the allocator recycles a block.
     key = _evidence_cache_key(cat_ids, evidence)
     cached = getattr(layer, "_dense_index_cache", None)
+    ckey = ladder if not cold else ("cold", ladder)
     if cached is not None and _evidence_cache_hit(cached[0], (cat_ids, evidence)):
-        if ladder in cached[1]:
-            return cached[1][ladder]
+        if ckey in cached[1]:
+            return cached[1][ckey]
     else:
         cached = layer._dense_index_cache = (key, {})
 
@@ -622,25 +640,58 @@ def _build_dense_index(layer, kwargs, ladder = None):
     # `categorical_evidence_logp_grad` IS e, and its slot in the [V * B, num_latents] ratio scratch is
     # `v * B + b`.
     E = B * V * K
-    # 32-bit keys whenever they fit: the sort is the single most expensive step of the build.
-    kdt = torch.int32 if G * num_cats < 2 ** 31 else torch.long
-    key = cat_ids.to(kdt)
-    if G > 1:
-        key = key + (var_group.to(kdt) * num_cats).view(1, V, 1)
-    # Stable, so each list holds its references in element order and the build is reproducible.
-    key_s, order = torch.sort(key.reshape(-1), stable = True)
+    # The sorted references, shared by the step's builds -- every layout's, and the hybrid's cold lists -- so only the
+    # first sorts (keyed as the index is)
+    sorted_refs = getattr(layer, "_dense_sorted_cache", None)
+    sorted_refs = sorted_refs[1] if sorted_refs is not None and sorted_refs[0] is cached[0] else None
+    if sorted_refs is None:
+        # 32-bit keys whenever they fit: the sort is the single most expensive step of the build.
+        kdt = torch.int32 if G * num_cats < 2 ** 31 else torch.long
+        key = cat_ids.to(kdt)
+        if G > 1:
+            key = key + (var_group.to(kdt) * num_cats).view(1, V, 1)
+        # Stable, so each list holds its references in element order and the build is reproducible.
+        key_s, order = torch.sort(key.reshape(-1), stable = True)
 
-    # `return_inverse` gives the per-element list directly, which avoids two `repeat_interleave`s
-    ukey, row, counts = torch.unique_consecutive(key_s, return_inverse = True, return_counts = True)
+        # `return_inverse` gives the per-element list directly, which avoids two `repeat_interleave`s
+        ukey, row, counts = torch.unique_consecutive(key_s, return_inverse = True, return_counts = True)
+        sorted_refs = (order, ukey, row, counts)
+        layer._dense_sorted_cache = (cached[0], sorted_refs)
+    order, ukey, row, counts = sorted_refs
     list_start = counts.cumsum(0) - counts                                       # first reference of each list
 
     # The row-form forward's view of the same inversion (`_fw_launch_rows`): the keys (block * num_cats + category,
     # ascending) and each element's key in ELEMENT order -- `row` is in key order.
     rows = None
-    if _fw_rows_available():
+    if _fw_rows_available() and not cold:
         elem_key = torch.empty(E, dtype = torch.int32, device = dev)
         elem_key[order] = row.int()
         rows = dict(keys = ukey.long(), elem_key = elem_key)
+
+    hot = None
+    if cold:
+        # The hot categories: referenced by at least 1 / _HOT_DIV of their block's slots (variables x batch). Their
+        # references leave the lists; `hot` keeps them -- the keys, and each reference's element and its key's rank
+        is_hot = counts * _HOT_DIV >= (torch.bincount(var_group, minlength = G) * B)[ukey.long() // num_cats]
+        n_hot, n_keys = int(is_hot.sum()), ukey.numel()
+        if n_hot < _HOT_MIN or n_hot == n_keys or 2 * V * B * n_hot * 4 > _dense_index_budget(dev):
+            cached[1][ckey] = None
+            return None
+        hot_ref = is_hot[row]
+        hot = dict(keys = ukey[is_hot].long(), elem = order[hot_ref],
+                   rank = (torch.cumsum(is_hot, 0) - 1)[row[hot_ref]])
+        keep = ~hot_ref
+        row = (torch.cumsum(~is_hot, 0) - 1)[row[keep]]
+        order = order[keep]
+        ukey, counts = ukey[~is_hot], counts[~is_hot]
+        list_start = counts.cumsum(0) - counts
+        E = order.numel()
+        if _fw_rows_available():
+            # The hybrid forward's cold half (`forward._fw_launch_hybrid`): the cold keys, and each element's among them
+            # (-1 for a hot one's: the dense product's)
+            elem_key = torch.full((B * V * K,), -1, dtype = torch.int32, device = dev)
+            elem_key[order] = row.int()
+            rows = dict(keys = ukey.long(), elem_key = elem_key)
 
     # A category's reference list, cut into PIECES of at most `_DENSE_LIST_SPLIT` references; each piece
     # is a "list" from here on, so one category may own several consecutive ones. Both kernels give a list
@@ -801,10 +852,25 @@ def _build_dense_index(layer, kwargs, ladder = None):
         # A category may own several lists: its parameter-flow update must then be atomic.
         split = split,
         rows = rows,
+        hot = hot,
     )
 
-    cached[1][ladder] = index
+    cached[1][ckey] = index
     return index
+
+
+def _hot_products(index, pt):
+    """The hybrid's hot references (`index["hot"]`, a cold index's) as a dense [slots, hot] matrix of their p_theta, zero
+    elsewhere -- the operand of both passes' products, made once a step (kept in the index)."""
+    hot = index["hot"]
+    P = hot.get("P")
+    if P is None:
+        B, V, K = pt.shape
+        t = hot["elem"] // K
+        P = torch.zeros(V * B, hot["keys"].numel(), dtype = torch.float32, device = pt.device)
+        P[(t % V) * B + t // V, hot["rank"]] = pt.reshape(-1)[hot["elem"]]
+        hot["P"] = P
+    return P
 
 
 def _missing_mask_kwargs(kwargs):
