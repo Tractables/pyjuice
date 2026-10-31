@@ -268,6 +268,186 @@ def test_cpp_binding_declines_what_it_does_not_bind_as_python_does():
         native.bind(0, (x,), b"", ())
 
 
+class _Recorder:
+    """A compiled kernel's launcher (`CompiledKernel._run`), recording every launch's arguments; ``fail`` an
+    exception (a type) to raise once instead of launching."""
+
+    def __init__(self, run, log):
+        self.run, self.log, self.fail = run, log, None
+
+    def __call__(self, *args):
+        self.log.append(args)
+        if self.fail is not None:
+            fail, self.fail = self.fail, None
+            raise fail("injected")
+        return self.run(*args)
+
+
+def _record(fast, log):
+    for kernel in fast.cache.values():
+        if not isinstance(kernel.run, _Recorder):
+            kernel._run = _Recorder(kernel.run, log)
+
+
+def _same_run(got, want):
+    """Whether two launches' `run` arguments are the same: the same objects, or equal ints (addresses, the stream)."""
+    return len(got) == len(want) and all(g is w or (type(g) is int and type(w) is int and g == w)
+                                          for g, w in zip(got, want))
+
+
+def _native(fast):
+    from pyjuice.utils.c import launch_bind
+    return launch_bind() is not None and fast._native_state() is not None
+
+
+@pytest.mark.skipif(not (torch.cuda.is_available() and int(triton.__version__.split(".")[0]) >= 3),
+                    reason="FastJITFunction3x targets triton >= 3 on CUDA")
+def test_cpp_launcher_launches_as_the_python_path():
+    """
+    The C++ launcher (`kernel[grid]`, `launch_bind.cpp`) launches a call of a pattern the Python path bound plainly
+    exactly as the Python path (`_launch`) does: the same compiled kernel's `run` called with the same arguments --
+    the grid (one, two or three dimensions), the stream, the kernel's function and metadata, no launch metadata, the
+    hooks (an empty chain as None), every value bound (tensors as addresses or as they are, scalars, None,
+    constexprs, defaults) -- for every pattern of positional and keyword arguments, meta-parameters, values in any
+    alignment, and without the Python path; the results the stock launch's.
+    """
+    fast = FastJITFunction3x(_mixed_kernel)
+    if not _native(fast):
+        pytest.skip("the C++ launcher does not build here")
+    ref = triton.jit(_mixed_kernel)
+    dev = torch.device("cuda:0")
+    torch.manual_seed(0)
+    n = 300
+    x, z = torch.randn(n + 1, device = dev), torch.randn(n, device = dev)
+    names = [p.name for p in fast.params]
+    python_calls = []
+    real = fast._launch
+    fast._launch = lambda grid, args, kwargs: (python_calls.append(1), real(grid, args, kwargs))[1]
+    log = []
+    checked = 0
+    for npos in (0, 2, 5, 7):
+        for meta in ({}, {"num_warps": 2}, {"num_stages": 1, "num_warps": 4}):
+            for drop in ([], ["offset"], ["A", "FLAG"]):
+                for xv, flag, scale, grid in ((x[:n], False, 0.5, (5,)), (x[1:], True, 2, (5, 1)),
+                                              (x[:n], True, -1.5, (5, 1, 1))):
+                    full = dict(x_ptr = xv, y_ptr = None, n = n, scale = scale, z_ptr = z, offset = 3, A = 2,
+                                FLAG = flag, B = 64)
+                    for out_ref, out in ((torch.zeros(n, device = dev), torch.zeros(n, device = dev)),):
+                        full["y_ptr"] = out
+                        pos = names[:npos]
+                        kw = [k for k in names[npos:] if k not in drop]
+                        args = tuple(full[k] for k in pos)
+                        kwargs = {**{k: full[k] for k in kw}, **meta}
+                        ref[grid](*tuple(dict(full, y_ptr = out_ref)[k] for k in pos),
+                                  **{**{k: dict(full, y_ptr = out_ref)[k] for k in kw}, **meta})
+                        fast[grid](*args, **kwargs)                   # (a first sight: the Python path's)
+                        _record(fast, log)
+                        del log[:], python_calls[:]
+                        fast._launch(grid, args, kwargs)
+                        fast[grid](*args, **kwargs)
+                        assert len(python_calls) == 1 and len(log) == 2, (npos, meta, drop, grid, python_calls)
+                        assert _same_run(log[1], log[0]), (npos, meta, drop, grid)
+                        assert log[1][6] is None and log[1][7] is None and log[1][8] is None
+                        torch.cuda.synchronize()
+                        assert torch.equal(out, out_ref), (npos, meta, drop, grid)
+                        checked += 1
+    assert checked == 4 * 3 * 3 * 3
+
+
+@pytest.mark.skipif(not (torch.cuda.is_available() and int(triton.__version__.split(".")[0]) >= 3),
+                    reason="FastJITFunction3x targets triton >= 3 on CUDA")
+def test_cpp_launcher_hands_over_what_it_does_not_take():
+    """
+    What the C++ launcher does not launch itself it hands over, as the Python path did every call: a pattern not
+    seen yet, one the Python path does not bind plainly (a parameter given twice), a value outside the binding's domain
+    (a tensor subclass), a kernel not compiled for the signature (another dtype), a callable grid -- to the Python
+    path; a call raising an Exception on the way (the kernel's run) -- to the standard launch, once; a
+    KeyboardInterrupt propagates. A hook in the chain is passed and called, a plain hook too. Without the C++ module,
+    every launch is the Python path's.
+    """
+    import pyjuice.utils.kernel_launcher as KL
+    fast = FastJITFunction3x(_scale_kernel)
+    if not _native(fast):
+        pytest.skip("the C++ launcher does not build here")
+    dev = torch.device("cuda:0")
+    n = 256
+    x = torch.randn(n, device = dev)
+    y = torch.zeros(n, device = dev)
+    taken = []
+    real_launch, real_jit = fast._launch, fast.jit_fn
+
+    class Standard:
+        def __getitem__(self, grid):
+            taken.append("standard")
+            return real_jit[grid]
+
+    fast._launch = lambda grid, args, kwargs: (taken.append("python"), real_launch(grid, args, kwargs))[1]
+    fast.jit_fn = Standard()
+
+    def launch(*args, grid = (2,), **kwargs):
+        del taken[:]
+        y.zero_()
+        fast[grid](*args, **kwargs)
+        torch.cuda.synchronize()
+        return list(taken)
+
+    assert launch(x, y, n, 2.0, BLOCK = 128) == ["python", "standard"]       # (unseen: compiled by the standard)
+    assert launch(x, y, n, 2.0, BLOCK = 128) == [] and torch.equal(y, x * 2.0)
+    assert launch(x, y, n, 3.0, BLOCK = 128, num_warps = 4) == ["python", "standard"]   # (another pattern)
+    assert launch(x, y, n, 3.0, BLOCK = 128, num_warps = 4) == [] and torch.equal(y, x * 3.0)
+    assert launch(x, y_ptr = y, n = n, scale = 2.0, BLOCK = 128) == ["python"]     # (the first's kernel)
+    assert launch(x, y_ptr = y, n = n, scale = 2.0, BLOCK = 128) == []
+    assert launch(x.as_subclass(_TensorSubclass), y, n, 2.0, BLOCK = 128) == ["python"]
+    assert torch.equal(y, x * 2.0)
+    xh = x.half()
+    yh = torch.zeros(n, device = dev, dtype = torch.float16)
+    del taken[:]
+    fast[(2,)](xh, yh, n, 2.0, BLOCK = 128)                                  # (not compiled: the Python path's)
+    assert taken == ["python", "standard"]
+    for _ in range(2):                                                       # (x_ptr twice: bound generically)
+        assert launch(x, y, n, 2.0, x_ptr = x, BLOCK = 128) == ["python"] and torch.equal(y, x * 2.0)
+    del taken[:]
+    fast[lambda meta: (2,)](x, y, n, 4.0, BLOCK = 128)
+    assert taken == ["python", "standard"] and torch.equal(y, x * 4.0)
+    log = []
+    _record(fast, log)
+    for kernel in fast.cache.values():
+        kernel.run.fail = RuntimeError
+    assert launch(x, y, n, 2.0, BLOCK = 128) == ["standard"] and torch.equal(y, x * 2.0)    # (a compiled one)
+    for kernel in fast.cache.values():
+        kernel.run.fail = KeyboardInterrupt
+    with pytest.raises(KeyboardInterrupt):
+        launch(x, y, n, 2.0, BLOCK = 128)
+    assert taken == []
+    for kernel in fast.cache.values():
+        kernel.run.fail = None
+    hooked = []
+    hook = lambda metadata: hooked.append(metadata)
+    triton.knobs.runtime.launch_enter_hook.add(hook)
+    try:
+        del log[:]
+        assert launch(x, y, n, 2.0, BLOCK = 128) == [] and hooked == [None] and torch.equal(y, x * 2.0)
+        assert log[0][7] is triton.knobs.runtime.launch_enter_hook and log[0][8] is None
+    finally:
+        triton.knobs.runtime.launch_enter_hook.remove(hook)
+    chain = triton.knobs.runtime.launch_enter_hook                           # (a plain hook: passed as it is)
+    triton.knobs.runtime.launch_enter_hook = hook
+    try:
+        del log[:], hooked[:]
+        assert launch(x, y, n, 2.0, BLOCK = 128) == [] and hooked == [None] and log[0][7] is hook
+    finally:
+        triton.knobs.runtime.launch_enter_hook = chain
+    with pytest.MonkeyPatch.context() as m:                                  # (no C++ module: the Python path's)
+        m.setattr(KL, "launch_bind", lambda: None)
+        plain = FastJITFunction3x(_scale_kernel)
+        assert plain._native_state() is None and not type(plain[(2,)]).__name__ == "Launcher"
+        y.zero_()
+        plain[(2,)](x, y, n, 2.0, BLOCK = 128)
+        plain[(2,)](x, y, n, 2.0, BLOCK = 128)
+        torch.cuda.synchronize()
+        assert torch.equal(y, x * 2.0)
+
+
 def _two_gpus():
     """
     Two GPU ids for a real cross-device launch, or None: the conftest pins every test process to ONE GPU,

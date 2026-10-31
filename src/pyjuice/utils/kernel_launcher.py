@@ -46,6 +46,14 @@ class FastJITFunction3x:
     on first use; ``PYJUICE_NATIVE_BIND=0`` switches it off), the binder hands the values it unpacked to it, which
     builds the same values and signature in one call -- a call with a value outside its domain (a tensor subclass,
     a sparse tensor, ... -- see ``launch_bind.cpp``) bound in Python as before.
+
+    There, ``kernel[grid]`` is the C++ launcher: a call of a pattern the Python path (``_launch``) has bound
+    plainly -- its spec, every parameter's place among the call's arguments, registered then (``_native_spec``) --
+    with values in the binding's domain and a kernel compiled under their signature is bound, looked up and
+    launched in C++, ``CompiledKernel.run`` called with the arguments the Python path passes it; any other call
+    goes to the Python path, as every call did, and one raising on the way to the standard launch. A launch hook
+    chain with no hook in it goes to ``run`` as None (Triton's launcher skips None; it would call the chain to do
+    nothing), on either path.
     """
 
     def __init__(self, fn: Callable):
@@ -58,6 +66,8 @@ class FastJITFunction3x:
         self.name_to_idx = {p.name: i for i, p in enumerate(self.params)}
         self.cache = dict()
         self.binders = dict()                                    # call pattern -> its binder (None: generic)
+        self.specs = dict()                                      # (npos, knames) -> the C++ launcher's spec
+        self._state = _UNSEEN                                    # (the C++ launcher's, see `_native_state`)
         # Imported here (not at module load) so plain `import pyjuice` never depends on these triton
         # internals on triton versions where this fast path is unused.
         from triton.runtime import driver as _driver
@@ -91,31 +101,43 @@ class FastJITFunction3x:
         return (device, *[(v.dtype, v.data_ptr() & 15) if not c and isinstance(v, Tensor) else v
                           for v, c in zip(vals, self.is_constexpr)], meta_items)
 
-    def _binder(self, npos: int, knames: tuple):
-        # The binding of the calls passing the first `npos` parameters by position and `knames` by keyword,
-        # in this order, as a function `(device, args, kwargs) -> (values to run with, signature)`: the
-        # positional arguments and the keyword values unpacked into locals named as the parameters, the
-        # missing ones their defaults, then the signature `_signature` would build (constexprs and non-tensor
-        # values by value, a tensor's (dtype, data_ptr() & 15), the meta-parameters given, sorted), and the
-        # values in declared order -- a tensor on the current device as the int its signature read. None
-        # (the call bound by `_gather`, as before) when the generic binding would not be a plain one: a name
-        # it does not know (`_gather` raises, the launch falls back), one given twice (`_gather` keeps the
-        # keyword's), a required parameter not given, or a parameter name the generated code reserves
-        # (`_fj_...`).
+    def _pattern(self, npos: int, knames: tuple):
+        # The calls passing the first `npos` parameters by position and `knames` by keyword, in this order:
+        # `(places, meta)` -- every parameter's place among the call's arguments (the positional ones, then the
+        # keyword values in order; -1: its default) and the meta-parameters given, `(name, place)` sorted by
+        # name. None when the generic binding would not be a plain one: a name it does not know (`_gather`
+        # raises, the launch falls back), one given twice (`_gather` keeps the keyword's), a required parameter
+        # not given, or a parameter name the generated binding reserves (`_fj_...`).
         names = [p.name for p in self.params]
         if npos > len(names) or any(name.startswith("_fj_") for name in names):
             return None
-        given, meta = set(names[:npos]), []
-        local = []                                              # every keyword value's local
-        for k in knames:
+        places, meta = list(range(npos)) + [-1] * (len(names) - npos), []
+        for j, k in enumerate(knames):
             if k in _TRITON_META_PARAMS:
-                meta.append(k)
-                local.append(f"_fj_m{len(meta) - 1}")
-            elif k in self.name_to_idx and k not in given:
-                given.add(k)
-                local.append(k)
+                meta.append((k, npos + j))
+            elif k in self.name_to_idx and places[self.name_to_idx[k]] < 0:
+                places[self.name_to_idx[k]] = npos + j
             else:
                 return None
+        if any(at < 0 and d is inspect.Parameter.empty for at, d in zip(places, self.defaults)):
+            return None
+        return places, sorted(meta)
+
+    def _binder(self, npos: int, knames: tuple):
+        # The binding of the calls of a pattern (`_pattern`) as a function `(device, args, kwargs) -> (values to
+        # run with, signature)`: the positional arguments and the keyword values unpacked into locals named as
+        # the parameters, the missing ones their defaults, then the signature `_signature` would build
+        # (constexprs and non-tensor values by value, a tensor's (dtype, data_ptr() & 15), the meta-parameters
+        # given, sorted), and the values in declared order -- a tensor on the current device as the int its
+        # signature read. None (the call bound by `_gather`, as before) for a pattern that is not a plain one.
+        pattern = self._pattern(npos, knames)
+        if pattern is None:
+            return None
+        places, meta = pattern
+        names = [p.name for p in self.params]
+        param_at = {at: names[i] for i, at in enumerate(places) if at >= npos}
+        meta_at = {at: j for j, (_, at) in enumerate(meta)}
+        local = [param_at.get(npos + j) or f"_fj_m{meta_at[npos + j]}" for j in range(len(knames))]
         lines = ["def _fj_bind(_fj_dev, _fj_args, _fj_kwargs):"]
         if npos:
             lines.append(f"    {', '.join(names[:npos])}, = _fj_args")
@@ -123,13 +145,10 @@ class FastJITFunction3x:
             lines.append(f"    {', '.join(local)}, = _fj_kwargs.values()")
         defaults = {}
         for i, name in enumerate(names):
-            if name not in given:
-                if self.defaults[i] is inspect.Parameter.empty:
-                    return None
+            if places[i] < 0:
                 defaults[f"_fj_d{i}"] = self.defaults[i]
                 lines.append(f"    {name} = _fj_d{i}")
-        order = sorted(range(len(meta)), key = lambda j: meta[j])
-        meta_items = "".join(f"({meta[j]!r}, _fj_m{j}), " for j in order)
+        meta_items = "".join(f"({name!r}, _fj_m{j}), " for j, (name, _) in enumerate(meta))
         values = f"({', '.join(names)},)"
         tail, sig = [], []
         for i, (name, c) in enumerate(zip(names, self.is_constexpr)):
@@ -165,48 +184,104 @@ class FastJITFunction3x:
             return None
         return namespace["_fj_bind"]
 
+    def _native_spec(self, npos: int, knames: tuple):
+        # A pattern's spec for the C++ launcher (`launch_bind.cpp`): every parameter's place among the call's
+        # arguments (2 bytes, little endian: 1 + the place, 0 for its default), the defaults, the meta-parameters
+        # given ((name, place), sorted by name) -- or None for a pattern that is not a plain one
+        pattern = self._pattern(npos, knames)
+        if pattern is None:
+            return None
+        places, meta = pattern
+        return b"".join((at + 1).to_bytes(2, "little") for at in places), self.defaults, tuple(meta)
+
+    def _native_state(self):
+        # `(launcher, state)` of the C++ launcher, or None (it does not build, or is switched off): what it reads
+        # -- the patterns' specs (filled by the Python path, `_launch`), the compiled kernels, the constexprs,
+        # the Python path and the standard launch to hand calls to, the launch hooks, and the functions the
+        # Python path reads the current device and stream with (`torch._C._cuda_getDevice` once a launch went
+        # through it: `torch.cuda.current_device` past CUDA's lazy initialization)
+        if self._state is _UNSEEN:
+            native = launch_bind()
+            self._state = None
+            if native is not None and hasattr(native, "launcher"):
+                try:
+                    self._state = (native.launcher, (self.specs, self.cache, self.constexpr_mask,
+                                                     lambda grid, args, kwargs: self._launch(grid, args, kwargs),
+                                                     lambda grid, args, kwargs: self.jit_fn[grid](*args, **kwargs),
+                                                     self._knobs, _HookChain, torch._C._cuda_getDevice,
+                                                     self._driver.active.get_current_stream))
+                except Exception:                           # (no CUDA, ...: the Python path)
+                    self._state = None
+        return self._state
+
     def __getitem__(self, grid: Union[Tuple, Callable]):
+        if type(grid) is tuple:                              # the C++ launcher, where it builds
+            native = self._native_state() if self._state is _UNSEEN else self._state
+            if native is not None:
+                return native[0](native[1], grid)
+        return lambda *args, **kwargs: self._launch(grid, args, kwargs)
+
+    def _launch(self, grid, args, kwargs):
+        # A launch in Python (the C++ launcher's calls of an unseen pattern, outside its domain, or of a kernel
+        # not compiled yet; every launch where it does not build)
         jit_fn = self.jit_fn
+        try:
+            if type(grid) is not tuple:          # callable grids: not fast-pathed
+                return jit_fn[grid](*args, **kwargs)
 
-        def wrapper(*args, **kwargs):
-            try:
-                if type(grid) is not tuple:          # callable grids: not fast-pathed
-                    return jit_fn[grid](*args, **kwargs)
+            driver = self._driver.active
+            device = driver.get_current_device()
+            key = (len(args), *kwargs)
+            bind = self.binders.get(key, _UNSEEN)
+            if bind is _UNSEEN:
+                bind = self.binders[key] = self._binder(len(args), key[1:])
+                if bind is not None:             # (the C++ launcher's from then on)
+                    spec = self._native_spec(len(args), key[1:])
+                    if spec is not None:
+                        self.specs[(len(args), key[1:])] = spec
+            if bind is not None:
+                vals, sig = bind(device, args, kwargs)
+            else:
+                vals, meta_items = self._gather(args, kwargs)
+                sig = self._signature(vals, device, meta_items)
 
-                driver = self._driver.active
-                device = driver.get_current_device()
-                key = (len(args), *kwargs)
-                bind = self.binders.get(key, _UNSEEN)
-                if bind is _UNSEEN:
-                    bind = self.binders[key] = self._binder(len(args), key[1:])
-                if bind is not None:
-                    vals, sig = bind(device, args, kwargs)
-                else:
-                    vals, meta_items = self._gather(args, kwargs)
-                    sig = self._signature(vals, device, meta_items)
+            kernel = self.cache.get(sig)
+            if kernel is None:
+                kernel = jit_fn[grid](*args, **kwargs)     # standard launch: compile + run + return
+                if kernel is not None and hasattr(kernel, "result"):
+                    kernel = kernel.result()
+                self.cache[sig] = kernel
+                return
 
-                kernel = self.cache.get(sig)
-                if kernel is None:
-                    kernel = jit_fn[grid](*args, **kwargs)     # standard launch: compile + run + return
-                    if kernel is not None and hasattr(kernel, "result"):
-                        kernel = kernel.result()
-                    self.cache[sig] = kernel
-                    return
+            stream = driver.get_current_stream(device)
+            ng = len(grid)
+            g0 = grid[0]
+            g1 = grid[1] if ng > 1 else 1
+            g2 = grid[2] if ng > 2 else 1
+            # launch_metadata is only consumed by the (optional) launch hooks, never by the kernel
+            # itself, so None is correctness-safe: with no hooks (the default) it is unused, and a
+            # registered profiling hook would fail loudly rather than silently corrupt results. A hook chain
+            # without a hook goes as None, which Triton's launcher skips (it would call the chain to do nothing).
+            runtime = self._knobs.runtime
+            kernel.run(g0, g1, g2, stream, kernel.function, kernel.packed_metadata, None,
+                       _hook_argument(runtime.launch_enter_hook), _hook_argument(runtime.launch_exit_hook), *vals)
+        except Exception:
+            return jit_fn[grid](*args, **kwargs)           # safe fallback: always correct
 
-                stream = driver.get_current_stream(device)
-                ng = len(grid)
-                g0 = grid[0]
-                g1 = grid[1] if ng > 1 else 1
-                g2 = grid[2] if ng > 2 else 1
-                # launch_metadata is only consumed by the (optional) launch hooks, never by the kernel
-                # itself, so None is correctness-safe: with no hooks (the default) it is unused, and a
-                # registered profiling hook would fail loudly rather than silently corrupt results.
-                kernel.run(g0, g1, g2, stream, kernel.function, kernel.packed_metadata, None,
-                           self._knobs.runtime.launch_enter_hook, self._knobs.runtime.launch_exit_hook, *vals)
-            except Exception:
-                return jit_fn[grid](*args, **kwargs)           # safe fallback: always correct
 
-        return wrapper
+class _NoHookChain:
+    """(Where Triton has no hook chains: a type no hook is.)"""
+
+
+try:
+    from triton.knobs import HookChain as _HookChain
+except ImportError:
+    _HookChain = _NoHookChain
+
+
+def _hook_argument(hook):
+    """A launch hook as the fast launch passes it: None for a hook chain with no hook in it, else the hook."""
+    return None if type(hook) is _HookChain and not hook.calls else hook
 
 
 class FastJITFunction2x:

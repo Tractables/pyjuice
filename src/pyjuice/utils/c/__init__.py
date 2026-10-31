@@ -1,15 +1,16 @@
-"""The fast launcher's per-argument binding in C++ (``launch_bind.cpp``, for
+"""The fast launcher's per-argument binding and launch in C++ (``launch_bind.cpp``, for
 :class:`pyjuice.utils.kernel_launcher.FastJITFunction3x`).
 
 Built on first use -- plain host C++ against PyTorch's headers, no CUDA compiler -- and None where it cannot be (no
-compiler or ninja, a failed build) or is switched off (``PYJUICE_NATIVE_BIND=0``): the launcher then binds in Python, as
-before. It changes nothing a launch computes: it builds the same values and signature the Python binding does.
+compiler or ninja, a failed build) or is switched off (``PYJUICE_NATIVE_BIND=0``): the launcher then binds and launches
+in Python, as before. It changes nothing a launch computes: it builds the same values and signature the Python binding
+does, and calls the compiled kernel's ``run`` as the Python path does.
 """
 
 import os
 import warnings
 
-#: Whether the launcher binds through the C++ module (``PYJUICE_NATIVE_BIND=0``: the Python binding always)
+#: Whether the launcher binds and launches through the C++ module (``PYJUICE_NATIVE_BIND=0``: in Python always)
 ENABLED = os.environ.get("PYJUICE_NATIVE_BIND", "1") != "0"
 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -19,7 +20,7 @@ _attempted = False
 
 
 def launch_bind():
-    """The C++ binding module (its ``bind``), built and loaded once, or None (warns once if the build fails)."""
+    """The C++ module (its ``bind`` and ``launcher``), built and loaded once, or None (warns once if the build fails)."""
     global _module, _attempted
     if not _attempted:
         _attempted = True
