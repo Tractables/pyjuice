@@ -14,6 +14,7 @@ from typing import Optional
 
 import numpy as np
 import torch
+from numba import njit
 
 
 def evidence(data, missing_mask, mask_id: int, n: int):
@@ -63,14 +64,26 @@ def target_mask(targets, B: int, n: int) -> Optional[torch.Tensor]:
         raise TypeError(f"`targets` must be a bool mask or integer positions, got {pos.dtype}.")
     if pos.ndim not in (1, 2) or (pos.ndim == 2 and pos.shape[0] != B):
         raise ValueError(f"`targets` given as positions must be [k] or [{B}, k], got {list(pos.shape)}.")
-    if pos.size and (pos.min() < -1 or pos.max() >= n):
+    mask, ok = _positions_mask(np.ascontiguousarray(pos[None] if pos.ndim == 1 else pos, dtype = np.int64), B, n)
+    if not ok:
         raise ValueError(f"`targets` given as positions must be in 0..{n - 1} (-1 pads).")
-    mask = np.zeros((B, n + 1), dtype = bool)                                  # -1 pads into the extra column
-    if pos.ndim == 1:
-        mask[:, pos] = True
-    else:
-        mask[np.arange(B)[:, None], pos] = True
-    return torch.from_numpy(np.ascontiguousarray(mask[:, :n]))
+    return torch.from_numpy(mask)
+
+
+@njit(cache = True)
+def _positions_mask(pos, B, n):
+    """``(mask, ok)``: bool [B, n], True at the positions ``pos`` lists for each sample (int64 [1, k]: every sample's,
+    or [B, k]; -1 pads), and whether they are all in 0..n-1 (but -1)."""
+    mask = np.zeros((B, n), dtype = np.bool_)
+    for b in range(B):
+        r = 0 if pos.shape[0] == 1 else b
+        for j in range(pos.shape[1]):
+            p = pos[r, j]
+            if p < -1 or p >= n:
+                return mask, False
+            if p >= 0:
+                mask[b, p] = True
+    return mask, True
 
 
 def candidate_tensor(candidates, B: int, n: int) -> Optional[torch.Tensor]:

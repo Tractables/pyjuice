@@ -420,6 +420,41 @@ def test_shared_rows_are_exact_whatever_the_keys(kind, storage, pattern, build_p
 
 
 @pytest.mark.parametrize("seed", range(6))
+def test_the_querys_host_arrays_are_numpys(seed):
+    """A conditional's host arrays (numba) are numpy's formulas: every target's row (`_target_rows`: a running count,
+    sample by sample), the targets' number and positions; every column's row of a row group's positions
+    (`_column_rows`, -1 off the targets); and the host evidence packed for the upload (`_host_evidence`): the tokens (0
+    where missing), their classes (-1 where missing; a negative token's from the vocabulary's end) as int32 pairs and
+    the missing flags as bytes, zero-padded to whole int64 -- odd sizes too -- or the first token out of the vocabulary,
+    flat."""
+    from pyjuice.constraints.inference.dfa_exact.queries.conditional import _column_rows, _host_evidence, _target_rows
+    rng = np.random.default_rng(seed)
+    B, n, V = int(rng.integers(1, 7)), int(rng.integers(1, 40)), int(rng.integers(1, 300))
+    miss = rng.random((B, n)) < 0.5
+    tgt = miss & (rng.random((B, n)) < 0.5)
+    rank, M, positions = _target_rows(tgt)
+    want = np.cumsum(tgt.ravel()).reshape(B, n) - 1
+    assert np.array_equal(rank, want) and M == int(tgt.sum()) and np.array_equal(positions, tgt.any(axis = 0))
+    pos = np.nonzero(positions)[0]
+    for part in (pos, pos[::2]):
+        assert np.array_equal(_column_rows(tgt, rank, part), np.where(tgt[:, part], want[:, part], -1).T.ravel())
+    token_class = rng.integers(0, 50, V).astype(np.int64)
+    data = rng.integers(-V, V, (B, n)).astype(np.int64)
+    pad = lambda a: np.concatenate([a.view(np.uint8).ravel(), np.zeros((-a.nbytes) % 8, np.uint8)]).view(np.int64)
+    x, cls, m, bad = _host_evidence(miss, data, token_class)
+    x_h = np.where(miss, 0, data)
+    assert bad == -1 and np.array_equal(x, x_h.ravel())
+    assert np.array_equal(cls, pad(np.where(miss, -1, token_class[x_h]).astype(np.int32))) and np.array_equal(m, pad(miss))
+    if (~miss).any():
+        at = int(rng.choice(np.flatnonzero(~miss.ravel())))
+        for v in (V, -V - 1):
+            data2 = data.copy()
+            data2.flat[at] = v
+            first = np.flatnonzero((~miss.ravel()) & ((data2.ravel() >= V) | (data2.ravel() < -V)))[0]
+            assert _host_evidence(miss, data2, token_class)[3] == first
+
+
+@pytest.mark.parametrize("seed", range(6))
 def test_the_sample_columns_offsets_are_numpys(seed):
     """`_sample_offsets` (numba) is `_sample_columns`' numpy formulas: every column's first weight ``(first + b x
     stride) x width`` (-1 at a position whose nodes no input reweights), sample by sample within a position -- or
