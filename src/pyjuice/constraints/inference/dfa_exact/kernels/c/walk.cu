@@ -186,6 +186,8 @@ struct IbArgs {
     long long team_floats;   // a team's shared memory (floats, a multiple of 4)
     int B, n, W, C, Cs, mw, num_enum, logw_stride, input_start, subs, tn, lp_ld, xb;   // mw: staged masses a child
     int sample, logw, c_kind, out_temp, c_full, out_full;
+    int ms;                  // the codes a unit's staged masses take (the main kernel's: its terms' alone, by rank)
+    int* defer;              // [2 + 2 x units]: the units deferred, the deferred kernel's CTAs done, then (CTA, sample)s
 };
 
 template <int G>
@@ -201,21 +203,30 @@ __device__ __forceinline__ void load_g(const float* p, float* v) {       // G co
 
 #define WTEAMS 8           // samples a CTA of warp teams takes (256 threads)
 
-// A CTA per (TN children of a node tile, sample), or with `WARPS` per (TN children, 8 samples), a warp each (a sample's
-// lanes few: one CTA each would leave most threads idle); a thread per (lane, G of the children) item
-template <int G, bool WARPS>
-__global__ void __launch_bounds__(256) ibtd_kernel(IbArgs a) {
-    extern __shared__ float sm[];
-    __shared__ int s_c[WTILE];                 // the CTA's children (-1: none)
-    __shared__ long long s_dst[WTILE];         // where a child's row starts (`node_flows` / `temp_flows`)
-    __shared__ long long s_op[WARPS ? WTEAMS : 1][WTILE];     // where its parent's row starts (a team's parent r)
-    __shared__ long long s_mrow[WARPS ? WTEAMS : 1][WTILE];   // its parent's class masses (the team's sample's)
-    __shared__ int s_terms[WARPS ? WTEAMS : 1];                // the team's terms (whether to mark the codes read)
+// A CTA's static shared memory (`WARPS`: a team's own per sample)
+template <bool WARPS>
+struct IbShared {
+    int c[WTILE];                              // the CTA's children (-1: none)
+    long long dst[WTILE];                      // where a child's row starts (`node_flows` / `temp_flows`)
+    long long op[WARPS ? WTEAMS : 1][WTILE];   // where its parent's row starts (a team's parent r)
+    long long mrow[WARPS ? WTEAMS : 1][WTILE]; // its parent's class masses (the team's sample's)
+    int terms[WARPS ? WTEAMS : 1];             // the team's terms (whether to mark the codes read)
+};
+
+// One unit: the children of CTA `bx` (TN of a node tile) for sample `b`, by a team of `nt` threads (`tid` its own) --
+// a thread per (lane, G of the children) item. `COMPACT` (the main kernel's): the masses a missing token's terms read
+// staged alone, `a.ms` of them at most, by their rank among the codes marked -- a unit reading more, as many terms as
+// codes, or a kept-once parent's every entry is DEFERRED (`a.defer`), for `ibtd_deferred_kernel` to sum with every
+// code staged by its index (the terms' alone where they are fewer). Both sum a unit's terms in the same order with the
+// same arithmetic.
+template <int G, bool WARPS, bool COMPACT>
+__device__ __forceinline__ void ibtd_unit(const IbArgs& a, const int bx, const int b, const int team, const int tid,
+                                          const int nt, float* sm, IbShared<WARPS>& sh) {
+    int* s_c = sh.c;
+    long long* s_dst = sh.dst;
+    int* s_terms = sh.terms;
     const int n = a.n, B = a.B, W = a.W, Cs = a.Cs, MW = a.mw, TN = a.tn;
-    const int team = WARPS ? threadIdx.x >> 5 : 0;                        // a team sums one sample
-    const int tid = WARPS ? threadIdx.x & 31 : threadIdx.x, nt = WARPS ? 32 : blockDim.x;
-    const int tile = blockIdx.x / a.subs, sub = blockIdx.x - tile * a.subs;
-    const int b = WARPS ? blockIdx.y * (blockDim.x >> 5) + team : blockIdx.y;
+    const int tile = bx / a.subs, sub = bx - tile * a.subs;
     const int c0 = a.tiles[(long long)tile * WTILE];                   // the tile's first: its interval, parents, add
     const int f0 = a.ptr[c0], R = a.ptr[c0 + 1] - f0;
     const int t = a.parents[(long long)f0 * 7 + 2], t2 = a.parents[(long long)f0 * 7 + 5];
@@ -254,18 +265,29 @@ __global__ void __launch_bounds__(256) ibtd_kernel(IbArgs a) {
     const float* src = a.out_temp ? a.temp_flows : a.element_flows;
     float* O = sm + (long long)team * a.team_floats;                     // [lp_ld][TN]: the parents' lanes
     float* M = O + (long long)a.lp_ld * TN;                               // [MW][TN]: their masses, by code index
-    float* own = M + (long long)MW * TN;                                  // [TN]: an observed token's log-prob
+    float* own = M + (long long)(COMPACT ? a.ms : MW) * TN;               // [TN]: an observed token's log-prob
     const int NW = (MW + 31) / 32;
     unsigned* used = reinterpret_cast<unsigned*>(own + TN);               // [NW]: the codes the terms read
     int* wpre = reinterpret_cast<int*>(used + NW);                        // [NW + 1]: the marked codes before a word
-    long long* op_ = s_op[team];
-    long long* mrow = s_mrow[team];
+    long long* op_ = sh.op[team];
+    long long* mrow = sh.mrow[team];
     const int tk = a.tok_ptr[t], ecount = a.tok_ptr[t + 1] - tk;          // the boundary's enumerated tokens
     const int code_oc = oc >= 0 ? a.code[(long long)t * a.C + oc] : -1;
     auto sync = [&]() {
         if constexpr (WARPS) __syncwarp();
         else __syncthreads();
     };
+    auto defer = [&]() {                                                  // (COMPACT) for the deferred kernel
+        if (tid == 0) {
+            const int at = atomicAdd(a.defer, 1);
+            a.defer[2 + 2 * at] = bx;
+            a.defer[3 + 2 * at] = b;
+        }
+    };
+    if (COMPACT && oc < 0 && once) {                                      // every entry: every code it reads
+        defer();
+        return;
+    }
 
     // the codes the sample's terms read, where they are fewer than the codes (a missing token, its terms summed: the
     // blocks kept once read every entry): `stage` computes those masses alone -- the same masses, the same bits
@@ -280,6 +302,10 @@ __global__ void __launch_bounds__(256) ibtd_kernel(IbArgs a) {
         sync();
         const int total = s_terms[team];
         sparse = total < MW;
+        if (COMPACT && !sparse) {                                         // (as many terms as codes at least)
+            defer();
+            return;
+        }
         if (sparse) {
             for (int w = tid; w < NW; w += nt) used[w] = 0u;
             sync();
@@ -307,6 +333,10 @@ __global__ void __launch_bounds__(256) ibtd_kernel(IbArgs a) {
                 if (tid == 0) wpre[NW] = run;
             }
             sync();
+            if (COMPACT && wpre[NW] > a.ms) {                             // more codes than its staging takes
+                defer();
+                return;
+            }
         }
     }
 
@@ -357,9 +387,9 @@ __global__ void __launch_bounds__(256) ibtd_kernel(IbArgs a) {
                 unsigned m = used[lo];
                 for (int c = i - wpre[lo]; c > 0; --c) m &= m - 1u;
                 const int x = lo * 32 + __ffs(m) - 1;
-                M[x * TN + k] = mass_of(k, x);
+                M[(COMPACT ? i : x) * TN + k] = mass_of(k, x);
             }
-        } else if (oc < 0)
+        } else if (!COMPACT && oc < 0)
             for (int e = tid; e < TN * MW; e += nt) {                    // stored columns, then enumerated tokens
                 const int k = e / MW, x = e - k * MW;
                 M[x * TN + k] = mass_of(k, x);
@@ -396,7 +426,9 @@ __global__ void __launch_bounds__(256) ibtd_kernel(IbArgs a) {
                 const int pk = ent[s], ri = (int)((unsigned)pk >> a.xb), x = pk & xmask;
                 if (opos >= 0 && a.iv_table[opos + (long long)a.ccolumns[st_t + ri] * X + j] < 0) continue;
                 load_g<G>(ob + (long long)ri * ce * TN, ov);
-                if (oc < 0) load_g<G>(M + x * TN + k0, mv);
+                if (oc < 0)                                               // (COMPACT: by the code's rank)
+                    load_g<G>(M + (COMPACT ? wpre[x >> 5] + __popc(used[x >> 5] & ((1u << (x & 31)) - 1u)) : x) * TN
+                              + k0, mv);
 #pragma unroll
                 for (int c = 0; c < G; ++c) lse_one_exp(mx[c], acc[c], mv[c] + ov[c]);
             }
@@ -463,6 +495,39 @@ __global__ void __launch_bounds__(256) ibtd_kernel(IbArgs a) {
     }
 }
 
+// A CTA per (TN children of a node tile, sample), or with `WARPS` per (TN children, 8 samples), a warp each (a sample's
+// lanes few: one CTA each would leave most threads idle): the units with the codes of their masses staged alone
+template <int G, bool WARPS>
+__global__ void __launch_bounds__(256) ibtd_kernel(IbArgs a) {
+    extern __shared__ float sm[];
+    __shared__ IbShared<WARPS> sh;
+    const int team = WARPS ? threadIdx.x >> 5 : 0;                        // a team sums one sample
+    const int tid = WARPS ? threadIdx.x & 31 : threadIdx.x, nt = WARPS ? 32 : blockDim.x;
+    const int b = WARPS ? blockIdx.y * (blockDim.x >> 5) + team : blockIdx.y;
+    ibtd_unit<G, WARPS, true>(a, blockIdx.x, b, team, tid, nt, sm, sh);
+}
+
+// The units `ibtd_kernel` deferred, every code of their masses staged: CTAs over the list (a CTA a unit at a time);
+// the last CTA done leaves the list's count zero for the next launch
+template <int G>
+__global__ void __launch_bounds__(256) ibtd_deferred_kernel(IbArgs a) {
+    extern __shared__ float sm[];
+    __shared__ IbShared<false> sh;
+    const int count = a.defer[0];
+    for (int u = blockIdx.x; u < count; u += gridDim.x) {
+        __syncthreads();                                                  // (the previous unit's shared memory read)
+        ibtd_unit<G, false, false>(a, a.defer[2 + 2 * u], a.defer[3 + 2 * u], 0, threadIdx.x, blockDim.x, sm, sh);
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        __threadfence();
+        if (atomicAdd(a.defer + 1, 1) == (int)gridDim.x - 1) {           // every CTA has read the count
+            a.defer[0] = 0;
+            a.defer[1] = 0;
+        }
+    }
+}
+
 }  // namespace
 
 // Shared memory of a CTA of `tn` children: their parents' lanes (`lp_ld` each), masses (`mw`: the stored columns and a
@@ -472,35 +537,60 @@ static int64_t ibtd_smem(int64_t tn, int64_t lp_ld, int64_t mw) {
     return (4 * tn * (lp_ld + mw + 1) + 4 * (2 * ((mw + 31) / 32) + 1) + 15) / 16 * 16;
 }
 
-// The most dynamic shared memory a CTA of `ibtd_kernel<G, WARPS>` may take (the device's opt-in less the kernel's
-// static), the attribute set once
-template <int G, bool WARPS>
-static int64_t ibtd_allowed() {
-    static const int64_t most = [] {
-        const void* f = (const void*)ibtd_kernel<G, WARPS>;
-        int dev = 0, optin = 0;
-        cudaFuncAttributes fa;
-        C10_CUDA_CHECK(cudaGetDevice(&dev));
-        C10_CUDA_CHECK(cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev));
-        C10_CUDA_CHECK(cudaFuncGetAttributes(&fa, f));
-        const int dyn = optin - (int)fa.sharedSizeBytes;
-        C10_CUDA_CHECK(cudaFuncSetAttribute(f, cudaFuncAttributeMaxDynamicSharedMemorySize, dyn));
-        return (int64_t)dyn;
-    }();
+// ... of `ibtd_kernel`'s, the masses of `ms` codes a child (the marked bits still every code's)
+static int64_t ibtd_smem_compact(int64_t tn, int64_t lp_ld, int64_t mw, int64_t ms) {
+    return (4 * tn * (lp_ld + ms + 1) + 4 * (2 * ((mw + 31) / 32) + 1) + 15) / 16 * 16;
+}
+
+// The current device's SMs (kept per device)
+static int num_sms() {
+    static int sms[64] = {0};
+    int dev = 0;
+    C10_CUDA_CHECK(cudaGetDevice(&dev));
+    if (sms[dev % 64] == 0) C10_CUDA_CHECK(cudaDeviceGetAttribute(&sms[dev % 64], cudaDevAttrMultiProcessorCount, dev));
+    return sms[dev % 64];
+}
+
+// The most dynamic shared memory a CTA of kernel `f` may take (the device's opt-in less the kernel's static), the
+// attribute set once per instantiation
+template <typename F>
+static int64_t kernel_allowed(F f) {
+    int dev = 0, optin = 0;
+    cudaFuncAttributes fa;
+    C10_CUDA_CHECK(cudaGetDevice(&dev));
+    C10_CUDA_CHECK(cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev));
+    C10_CUDA_CHECK(cudaFuncGetAttributes(&fa, (const void*)f));
+    const int dyn = optin - (int)fa.sharedSizeBytes;
+    C10_CUDA_CHECK(cudaFuncSetAttribute((const void*)f, cudaFuncAttributeMaxDynamicSharedMemorySize, dyn));
+    return (int64_t)dyn;
+}
+
+template <int G>
+static int64_t ibtd_deferred_allowed() {
+    static const int64_t most = kernel_allowed(ibtd_deferred_kernel<G>);
     return most;
 }
 
-// The most dynamic shared memory of a CTA of one child (a sample's CTA, not warp teams): `_input_block_cuda`'s limit
-// for the CTAs of parent rows too wide for 45 KB
+// ... of `ibtd_kernel<G, WARPS>`
+template <int G, bool WARPS>
+static int64_t ibtd_allowed() {
+    static const int64_t most = kernel_allowed(ibtd_kernel<G, WARPS>);
+    return most;
+}
+
+// The most dynamic shared memory of a CTA of one child with every code staged (a deferred unit's):
+// `_input_block_cuda`'s limit for the CTAs of parent rows too wide for 45 KB
 int64_t ibtd_smem_max() {
-    return ibtd_allowed<1, false>();
+    return ibtd_deferred_allowed<1>();
 }
 
 // One launch: `tiles` (int32, 16 per node tile) with `subs` CTAs of `tn` children per tile (`threads` each), every
 // sample (`warps`: 8 a CTA, a warp each); `tlist` / `t2i` / `ecum` the launch's boundaries (see TermArgs), `terms` /
 // `cnt` / `perm` / `done` the work space (B x ecum[T], T x B x W, T x B x W, T x B int32; `done` zero), `sort`: the
 // live columns summed in `perm`'s order (or in their own); `cq_max` a sample's most live columns at t + 1 over them,
-// `lp_ld` at least a sample's lanes of a parent's row
+// `lp_ld` at least a sample's lanes of a parent's row; `ms` the codes a unit's staged masses take in `ibtd_kernel`'s
+// CTAs, `defer` the deferred units' list (int32, at least 2 + 2 x units; its first two zero, and left zero),
+// `defer_ctas` the deferred kernel's CTAs (0: as many as the device holds at once; at most one a unit)
 void ibtd_cuda(torch::Tensor element_flows, torch::Tensor temp_flows, torch::Tensor node_flows,
                torch::Tensor node_mars, torch::Tensor obs_class, torch::Tensor class_mars, torch::Tensor mass_row,
                torch::Tensor mass_stride, torch::Tensor pred_ptr, torch::Tensor pred_col, torch::Tensor pred_x,
@@ -516,7 +606,7 @@ void ibtd_cuda(torch::Tensor element_flows, torch::Tensor temp_flows, torch::Ten
                bool out_full, torch::Tensor code, torch::Tensor tok_ptr, torch::Tensor eidx, torch::Tensor eprobs,
                torch::Tensor prow, torch::Tensor lognorm, torch::Tensor enum_logw, int64_t Cs, int64_t mw,
                int64_t num_enum, int64_t logw_stride, bool logw, torch::Tensor pred_class, torch::Tensor allowed,
-               int64_t a_stride, bool classes) {
+               int64_t a_stride, bool classes, int64_t ms, torch::Tensor defer, int64_t defer_ctas) {
     TORCH_CHECK(node_flows.scalar_type() == torch::kFloat32 && element_flows.scalar_type() == torch::kFloat32 &&
                 temp_flows.scalar_type() == torch::kFloat32 && node_mars.scalar_type() == torch::kFloat32 &&
                 class_mars.scalar_type() == torch::kFloat32 && eprobs.scalar_type() == torch::kFloat32 &&
@@ -534,6 +624,9 @@ void ibtd_cuda(torch::Tensor element_flows, torch::Tensor temp_flows, torch::Ten
     const int64_t ntiles = tiles.numel() / WTILE;
     const int T = (int)tlist.numel();
     if (ntiles == 0 || B == 0 || T == 0 || cq_max == 0) return;
+    TORCH_CHECK(ms >= 1 && ms <= mw, "ibtd_cuda: 1 to mw codes a unit's staged masses");
+    TORCH_CHECK(defer.scalar_type() == torch::kInt32 && defer.is_contiguous() &&
+                defer.numel() >= 2 + 2 * ntiles * subs * B, "ibtd_cuda: int32 room for every unit deferred");
     auto stream = at::cuda::getCurrentCUDAStream();
     TermArgs ta{i32(tlist, "tlist"), widx(ecum), i32(pred_ptr, "pred_ptr"), i32(pred_col, "pred_col"),
                 i32(pred_x, "pred_x"), i32(code, "code"), widx(obs_class), i32(ccount, "ccount"), widx(cstart),
@@ -607,14 +700,30 @@ void ibtd_cuda(torch::Tensor element_flows, torch::Tensor temp_flows, torch::Ten
     a.out_temp = out_temp;
     a.c_full = c_full;
     a.out_full = out_full;
-    a.team_floats = ibtd_smem(tn, lp_ld, mw) / 4;
+    a.ms = (int)ms;
+    a.defer = defer.data_ptr<int>();
+    a.team_floats = ibtd_smem_compact(tn, lp_ld, mw, ms) / 4;
     const int64_t smem = 4 * a.team_floats * (warps ? threads / 32 : 1);
+    const int64_t smem_full = ibtd_smem(tn, lp_ld, mw);
+    const int64_t units = ntiles * subs * B;
     const dim3 grid((unsigned)(ntiles * subs), (unsigned)(warps ? (B + threads / 32 - 1) / (threads / 32) : B));
+    // the units, then the ones they deferred (CTAs as many as the device holds at once, at most one a unit)
 #define IBTD_LAUNCH(GG, WW) \
     do { \
         TORCH_CHECK(smem <= 45 * 1024 || smem <= (ibtd_allowed<GG, WW>()), "ibtd_cuda: ", smem, \
                     " bytes of dynamic shared memory, more than the device takes"); \
         ibtd_kernel<GG, WW><<<grid, (unsigned)threads, (size_t)smem, stream>>>(a); \
+    } while (0)
+#define IBTD_DEFERRED(GG) \
+    do { \
+        TORCH_CHECK(smem_full <= 45 * 1024 || smem_full <= ibtd_deferred_allowed<GG>(), "ibtd_cuda: ", smem_full, \
+                    " bytes of dynamic shared memory, more than the device takes"); \
+        int per_sm = 0; \
+        C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, ibtd_deferred_kernel<GG>, (int)threads, \
+                                                                     (size_t)smem_full)); \
+        const int64_t most = defer_ctas > 0 ? defer_ctas : std::max(per_sm, 1) * (int64_t)num_sms(); \
+        const int64_t ctas = std::min<int64_t>(units, most); \
+        ibtd_deferred_kernel<GG><<<(unsigned)ctas, (unsigned)threads, (size_t)smem_full, stream>>>(a); \
     } while (0)
     if (warps) {
         if (tn % 4 == 0) IBTD_LAUNCH(4, true);
@@ -625,6 +734,11 @@ void ibtd_cuda(torch::Tensor element_flows, torch::Tensor temp_flows, torch::Ten
         else if (tn == 2) IBTD_LAUNCH(2, false);
         else IBTD_LAUNCH(1, false);
     }
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    if (tn % 4 == 0) IBTD_DEFERRED(4);
+    else if (tn == 2) IBTD_DEFERRED(2);
+    else IBTD_DEFERRED(1);
 #undef IBTD_LAUNCH
+#undef IBTD_DEFERRED
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }

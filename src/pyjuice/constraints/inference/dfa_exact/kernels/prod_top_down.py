@@ -881,6 +881,14 @@ INPUT_BLOCK_CUDA_WARP_ITEMS = 64
 #: the most int32 of work space a launch takes (every sample's copy of its boundaries' predecessor lists): past it, the
 #: Triton kernel
 INPUT_BLOCK_CUDA_SPACE = 1 << 26
+#: the codes of a unit's class masses (a sample's, at a CTA's children) the CUDA kernel's CTAs stage -- its terms' alone,
+#: by rank --: a unit reading more (or a kept-once parent's every entry) is summed by the deferred kernel, every code
+#: staged (`c/walk.cu`). Codpula-4096 x JSON hard_0 B64 diffusion (1224 codes, a unit's terms 43 at most): every code
+#: staged took 39.5 KB a CTA, 2 CTAs an SM, the launches of a call 91-104 ms; 32 / 64 / 128 / 256 / 512 codes 26-29 /
+#: 26-29 / 33-36 / 33-37 / 45-51 ms (8 samples a CTA, a warp each, up to 128)
+INPUT_BLOCK_CUDA_CODES = 64
+#: the deferred kernel's CTAs (0: as many as the device holds at once, at most one a deferred unit)
+INPUT_BLOCK_CUDA_DEFER_CTAS = 0
 
 
 def _input_block_boundaries(la: TopDownLaunch, prog) -> dict:
@@ -918,6 +926,15 @@ def _work_space(prog, size: int, counters: int):
     if done is None or done.numel() < counters:
         done = prog.walk_done = torch.zeros(max(counters, 1 << 10), dtype = torch.int32, device = prog.dev)
     return ws, done
+
+
+def _defer_space(prog, size: int) -> torch.Tensor:
+    """The CUDA walk's list of deferred units: int32 of at least ``size`` on ``prog``'s device, zeros where it counts
+    them (each launch leaves them zero), kept for the next launch."""
+    d = getattr(prog, "walk_defer", None)
+    if d is None or d.numel() < size:
+        d = prog.walk_defer = torch.zeros(max(size, 1 << 12), dtype = torch.int32, device = prog.dev)
+    return d
 
 
 def _ibtd_smem_max(mod) -> int:
@@ -963,18 +980,21 @@ def _input_block_cuda(la: TopDownLaunch, tiles: torch.Tensor, height: int, prog,
     lp = max(int((mc[st["ta"]] * mc[st["te"]]).max()), 1)                   # ... lanes of a parent's row
     nw = (mw + 31) // 32                                                    # a sample's shared memory (bytes:
     team = lambda tn: (4 * tn * (lp + mw + 1) + 4 * (2 * nw + 1) + 15) // 16 * 16   # c/walk.cu's `ibtd_smem`)
+    ms = min(mw, INPUT_BLOCK_CUDA_CODES)                                    # ... and its CTAs' (`ibtd_smem_compact`)
+    staged = lambda tn: (4 * tn * (lp + ms + 1) + 4 * (2 * nw + 1) + 15) // 16 * 16
     tn = min(height, INPUT_BLOCK_CUDA_NODES)
     while tn > 1 and team(tn) > INPUT_BLOCK_CUDA_SMEM:
         tn //= 2
     if team(tn) > INPUT_BLOCK_CUDA_SMEM and team(tn) > _ibtd_smem_max(mod):  # (one child: the device's most)
         return None
     items = cq * int(mc[st["te"]].max()) * max(tn // 4, 1)                  # a sample's most (lane, 4 children)
-    warps = items <= INPUT_BLOCK_CUDA_WARP_ITEMS and 8 * team(tn) <= INPUT_BLOCK_CUDA_SMEM
+    warps = items <= INPUT_BLOCK_CUDA_WARP_ITEMS and 8 * staged(tn) <= INPUT_BLOCK_CUDA_SMEM
     threads = 256 if warps or items >= INPUT_BLOCK_CUDA_WIDE else 128
     T, nterms = st["ts"].size, B * int(st["ecum"][-1])
     if nterms + 2 * T * B * W > INPUT_BLOCK_CUDA_SPACE:
         return None
     ws, done = _work_space(prog, nterms + 2 * T * B * W, T * B)
+    defer = _defer_space(prog, 2 + 2 * (tiles.numel() // NODE_TILE) * (height // tn) * B)
     tt, ivs = prog.trans_top_down, prog.intervals
     c_kind, out_temp, (c_full, out_full) = la.kinds
     sample = masses.batch > 1
@@ -990,8 +1010,9 @@ def _input_block_cuda(la: TopDownLaunch, tiles: torch.Tensor, height: int, prog,
                   height // tn, tn, threads, warps, not warps, lp, cq, sample, c_kind, out_temp, c_full, out_full,
                   ea["code"], ea["tok_ptr"], ea["eidx"], ea["eprobs"], ea["prow"], ea["lognorm"], ea["enum_logw"],
                   ea["Cs"], mw, ea["num_enum"], ea["logw_stride"], ea["LOGW"],
-                  tt.pred_class if classes else tt.pred_x, allowed if classes else obs_class, a_stride, classes)
-    return dict(tn = tn, threads = threads, warps = warps, smem = team(tn) * (8 if warps else 1))
+                  tt.pred_class if classes else tt.pred_x, allowed if classes else obs_class, a_stride, classes,
+                  ms, defer, INPUT_BLOCK_CUDA_DEFER_CTAS)
+    return dict(tn = tn, threads = threads, warps = warps, smem = staged(tn) * (8 if warps else 1), codes = ms)
 
 
 def run_top_down(launches, bufs, prog, regions, element_flows, temp_flows, node_flows, node_mars, masses, obs_class,

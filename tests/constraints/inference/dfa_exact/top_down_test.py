@@ -602,6 +602,28 @@ def test_cuda_walk_gives_the_triton_values(kind, name, pattern, policy, cta, bui
 
 
 @pytest.mark.skipif(get_module() is None, reason = "the CUDA kernels are unavailable")
+@pytest.mark.parametrize("codes", [1, 2])
+@pytest.mark.parametrize("cta", ["default", "1_warps"])
+@pytest.mark.parametrize("pattern", ["none", "prefix", "mixed"])
+@pytest.mark.parametrize("name", list(CONSTRAINTS))
+@pytest.mark.parametrize("kind", list(WALK_KINDS))
+def test_cuda_walk_with_deferred_units_gives_the_triton_values(kind, name, pattern, cta, codes, build_pc, walk_launches,
+                                                               monkeypatch):
+    """A CTA staging the masses of 1 or 2 codes a unit (``INPUT_BLOCK_CUDA_CODES``): a unit whose terms read more
+    defers to the kernel staging every code, with the kept-once parents' -- with 1 code, that kernel's one CTA summing
+    every deferred unit in turn -- the Triton kernel's values bit for bit."""
+    set_walk_ctas(monkeypatch, cta)
+    monkeypatch.setattr(prod_top_down, "INPUT_BLOCK_CUDA_CODES", codes)
+    monkeypatch.setattr(prod_top_down, "INPUT_BLOCK_CUDA_DEFER_CTAS", 1 if codes == 1 else 0)
+    n = WALK_KINDS[kind]
+    cc = jc.compile(CONSTRAINTS[name](), walk_pc(kind, build_pc))
+    data, missing = evidence(pattern, n)
+    want, got = both_walks(monkeypatch, lambda: top_down_blocks(cc, data, missing, storage = "compact")[0])
+    assert_same_bits(got, want)
+    assert all(la["taken"] and la["codes"] <= codes for la in walk_launches)
+
+
+@pytest.mark.skipif(get_module() is None, reason = "the CUDA kernels are unavailable")
 @pytest.mark.parametrize("kind", ["hmm", "walks"])
 def test_cuda_walk_on_per_sample_class_masses(kind, build_pc, walk_launches, monkeypatch):
     """Soft evidence inputs (class masses of each sample's own) in a decoder session, left to right: the conditionals
