@@ -36,6 +36,7 @@
 #define WIPT 2             // items per thread at once when the sums run over several parents
 #define TW 256             // `ibtd_terms_kernel`: threads, a live column per warp
 #define SORT_BINS 256      // live columns ordered by min(terms, 255)
+#define TU 8               // `ibtd_terms_kernel`: a warp's chunks of 32 entries read at once
 
 namespace {
 
@@ -91,22 +92,28 @@ __global__ void __launch_bounds__(TW) ibtd_terms_kernel(TermArgs a) {
         const int code_oc = oc >= 0 ? a.code[(long long)t * a.C + oc] : -1;   // the observed class's code
         const int* rank = a.crank + ((long long)b * (n + 1) + t) * W;
         int kept = 0;
-        for (int base = e0; base < e1; base += 32) {
-            const int e = base + lane;
-            bool ok = false;
-            int pk = 0;
-            if (e < e1) {
-                const int x = a.pred_x[e];
-                if (oc < 0 || x == code_oc) {
-                    const int ri = rank[a.pred_col[e]];
-                    ok = ri >= 0 && (oc >= 0 || !a.classes ||
-                                     a.allowed[(long long)b * a.a_stride + (long long)t * a.C + a.pred_class[e]] != 0);
-                    pk = (int)(((unsigned)ri << a.xb) | (unsigned)code_index(x, a.Cs));
+        const signed char* allowed = a.classes ? a.allowed + (long long)b * a.a_stride + (long long)t * a.C : nullptr;
+        for (int base = e0; base < e1; base += 32 * TU) {                // TU chunks' reads in flight at once
+            bool ok[TU];
+            int pk[TU];
+#pragma unroll
+            for (int u = 0; u < TU; ++u) {
+                const int e = base + u * 32 + lane;
+                ok[u] = false;
+                pk[u] = 0;
+                if (e < e1) {
+                    const int x = a.pred_x[e], ri = rank[a.pred_col[e]];
+                    const bool cls = oc >= 0 || allowed == nullptr || allowed[a.pred_class[e]] != 0;
+                    ok[u] = (oc < 0 || x == code_oc) && ri >= 0 && cls;
+                    pk[u] = (int)(((unsigned)ri << a.xb) | (unsigned)code_index(x, a.Cs));
                 }
             }
-            const unsigned m = __ballot_sync(0xffffffffu, ok);
-            if (ok) out[kept + __popc(m & ((1u << lane) - 1u))] = pk;
-            kept += __popc(m);
+#pragma unroll
+            for (int u = 0; u < TU; ++u) {                                // in the list's order
+                const unsigned m = __ballot_sync(0xffffffffu, ok[u]);
+                if (ok[u]) out[kept + __popc(m & ((1u << lane) - 1u))] = pk[u];
+                kept += __popc(m);
+            }
         }
         if (lane == 0) a.cnt[sb * W + rq] = kept;
     }
