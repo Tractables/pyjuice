@@ -978,10 +978,9 @@ def _input_block_cuda(la: TopDownLaunch, tiles: torch.Tensor, height: int, prog,
     mc = compact.max_count
     cq = int(mc[st["ts"] + 1].max())                                         # a sample's most live columns at t + 1
     lp = max(int((mc[st["ta"]] * mc[st["te"]]).max()), 1)                   # ... lanes of a parent's row
-    nw = (mw + 31) // 32                                                    # a sample's shared memory (bytes:
-    team = lambda tn: (4 * tn * (lp + mw + 1) + 4 * (2 * nw + 1) + 15) // 16 * 16   # c/walk.cu's `ibtd_smem`)
-    ms = min(mw, INPUT_BLOCK_CUDA_CODES)                                    # ... and its CTAs' (`ibtd_smem_compact`)
-    staged = lambda tn: (4 * tn * (lp + ms + 1) + 4 * (2 * nw + 1) + 15) // 16 * 16
+    team = lambda tn: (4 * tn * (lp + mw + 1) + 15) // 16 * 16             # a sample's shared memory (bytes:
+    ms = min(mw, INPUT_BLOCK_CUDA_CODES)                                    # c/walk.cu's `ibtd_smem`), and its
+    staged = lambda tn: (4 * tn * (lp + ms + 1) + 15) // 16 * 16           # CTAs' (`ibtd_smem_compact`)
     tn = min(height, INPUT_BLOCK_CUDA_NODES)
     while tn > 1 and team(tn) > INPUT_BLOCK_CUDA_SMEM:
         tn //= 2
@@ -991,9 +990,10 @@ def _input_block_cuda(la: TopDownLaunch, tiles: torch.Tensor, height: int, prog,
     warps = items <= INPUT_BLOCK_CUDA_WARP_ITEMS and 8 * staged(tn) <= INPUT_BLOCK_CUDA_SMEM
     threads = 256 if warps or items >= INPUT_BLOCK_CUDA_WIDE else 128
     T, nterms = st["ts"].size, B * int(st["ecum"][-1])
-    if nterms + 2 * T * B * W > INPUT_BLOCK_CUDA_SPACE:
+    space = nterms + 2 * T * B * W + T * B * (mw + 1)                       # (terms, cnt, perm, codes, ncodes)
+    if space > INPUT_BLOCK_CUDA_SPACE or 4 * (2 * ((mw + 31) // 32) + 1) > 48 * 1024:
         return None
-    ws, done = _work_space(prog, nterms + 2 * T * B * W, T * B)
+    ws, done = _work_space(prog, space, T * B)
     defer = _defer_space(prog, 2 + 2 * (tiles.numel() // NODE_TILE) * (height // tn) * B)
     tt, ivs = prog.trans_top_down, prog.intervals
     c_kind, out_temp, (c_full, out_full) = la.kinds
@@ -1006,6 +1006,7 @@ def _input_block_cuda(la: TopDownLaunch, tiles: torch.Tensor, height: int, prog,
                   compact.rank, la.children, tiles, la.ptr, la.parents, common["reg_offset"], common["reg_width"],
                   common["reg_first"], st["tlist"], st["t2i"], st["ecum_t"], ws[:nterms],
                   ws[nterms:nterms + T * B * W], ws[nterms + T * B * W:nterms + 2 * T * B * W], done,
+                  ws[nterms + 2 * T * B * W:space - T * B], ws[space - T * B:space],
                   common["out_first"], common["out_width"], common["temp_width"], B, n, W, C, prog.input_start,
                   height // tn, tn, threads, warps, not warps, lp, cq, sample, c_kind, out_temp, c_full, out_full,
                   ea["code"], ea["tok_ptr"], ea["eidx"], ea["eprobs"], ea["prow"], ea["lognorm"], ea["enum_logw"],

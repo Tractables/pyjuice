@@ -660,6 +660,30 @@ def test_cuda_walk_on_wide_automata(build_pc, walk_launches, monkeypatch):
 
 
 @pytest.mark.skipif(get_module() is None, reason = "the CUDA kernels are unavailable")
+def test_cuda_walk_on_wide_automata_reading_few_codes(build_pc, walk_launches, monkeypatch):
+    """A 48-state automaton over 24 tokens, every sample's tokens at a position 5 of them (top-k soft evidence): tens
+    of live columns a sample, whose terms read a few of the classes -- the sample's listed codes, staged and read by
+    their ranks there (`ibtd_terms_kernel`'s lists), not their codes; the Triton kernel's conditionals bit for bit."""
+    rng = random.Random(1)
+    K, Vw, n, B = 48, 24, 6, 4
+    dfa = jc.DFA.from_dense(Vw, [[rng.randrange(K) for _ in range(Vw)] for _ in range(K)], 0, rng.sample(range(K), 24))
+    cc = jc.compile(dfa, build_pc("hmm_block_sparse", n, Vw, input_dist = dists.SoftEvidenceCategorical))
+    g = torch.Generator().manual_seed(0)
+    logp, ids = torch.topk(torch.randn(B, n, Vw, generator = g) * 2, 5, dim = 2)
+    data = ids[:, :, 0].cuda()                                       # (observed tokens among a position's own)
+    masks = [torch.ones(B, n, dtype = torch.bool).cuda(), (torch.rand(B, n, generator = g) < 0.5).cuda()]
+
+    def session():
+        with cc.decoder(categorical_evidence_logp = logp.cuda(), soft_evidence_cat_ids = ids.cuda(),
+                        storage = "compact") as decoder:
+            return [decoder.conditional(data, m) for m in masks]
+
+    want, got = both_walks(monkeypatch, session)
+    assert_same_bits(got, want)
+    assert any(la["taken"] and la["missing"] for la in walk_launches)
+
+
+@pytest.mark.skipif(get_module() is None, reason = "the CUDA kernels are unavailable")
 def test_cuda_walk_past_45k_of_shared_memory(build_pc, walk_launches, monkeypatch):
     """A random 16000-state automaton over 32 tokens: a sample observing nothing keeps most states live within three
     tokens, its parents' rows too wide for 45 KB of shared memory -- CTAs of one child with the device's more; the
