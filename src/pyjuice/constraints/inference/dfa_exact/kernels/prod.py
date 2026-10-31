@@ -1159,8 +1159,10 @@ def _flat_tile(lanes: int) -> int:
 
 #: An ``input @ block`` launch runs its steps in groups (see :func:`_input_block_group_kernel`) only when a step's
 #: output has more lanes than this (batch x slots): a step that fits one program shares little, and its launch would
-#: have G times fewer programs (HMM4096 with 67- and 101-state automata at batch 1: 1-3% slower grouped).
-GROUP_MIN_LANES = 128
+#: have G times fewer programs (HMM4096 with 67- and 101-state automata at batch 1: 1-3% slower grouped). A group
+#: shares its steps' lanes' samples (a search over the batch's offsets a lane): Codpula-4096 x JSON hard_0 B64
+#: diffusion (~77 lanes a step) 2129 -> 2002 ms grouped; B1 / B8 / B32 the same either way
+GROUP_MIN_LANES = 64
 
 #: The log-sum-exp steps the autotuner times for :func:`_input_block_group_kernel` (with every group size the
 #: Program built): two exps (the default), and :func:`_lse_step_one_exp` -- bit-identical; x1.115 on the kernel with
