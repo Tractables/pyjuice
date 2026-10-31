@@ -432,8 +432,9 @@ def test_dense_forward_shared_memory_limit(fits):
     even the smallest one (TL = 4) is 51 KB: past the 48 KB a kernel gets without opting in, which is
     where every forward of that size used to crash (`_fw_autotune` found no tile and returned None).
     `fits`: it runs with the opt-in raised. Otherwise -- the cap shrunk below the tile -- the forward
-    must decline to the Triton kernel while the backward keeps its dense kernels, which hold no such
-    tile. Either way the step must match the scattered one."""
+    must not launch it: it takes the row form (`softevi_rows_test.py`), which keeps no tile, or without
+    that extension the Triton kernel, while the backward keeps its dense kernels, which hold no such tile
+    either. Either way the step must match the scattered one."""
     from pyjuice.nodes.distributions import c_kernels
     if not c_kernels.dense_expected_flow_available():
         pytest.skip("the softevi CUDA extension is not available")

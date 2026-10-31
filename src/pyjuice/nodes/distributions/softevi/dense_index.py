@@ -634,6 +634,14 @@ def _build_dense_index(layer, kwargs, ladder = None):
     ukey, row, counts = torch.unique_consecutive(key_s, return_inverse = True, return_counts = True)
     list_start = counts.cumsum(0) - counts                                       # first reference of each list
 
+    # The row-form forward's view of the same inversion (`_fw_launch_rows`): the keys (block * num_cats + category,
+    # ascending) and each element's key in ELEMENT order -- `row` is in key order.
+    rows = None
+    if _fw_rows_available():
+        elem_key = torch.empty(E, dtype = torch.int32, device = dev)
+        elem_key[order] = row.int()
+        rows = dict(keys = ukey.long(), elem_key = elem_key)
+
     # A category's reference list, cut into PIECES of at most `_DENSE_LIST_SPLIT` references; each piece
     # is a "list" from here on, so one category may own several consecutive ones. Both kernels give a list
     # to one thread and walk it serially, and a token proposed at nearly every position has a list of
@@ -792,6 +800,7 @@ def _build_dense_index(layer, kwargs, ladder = None):
         num_latents = num_latents,
         # A category may own several lists: its parameter-flow update must then be atomic.
         split = split,
+        rows = rows,
     )
 
     cached[1][ladder] = index
@@ -811,10 +820,51 @@ def _missing_mask_kwargs(kwargs):
 
 
 def _fw_use_dense(layer, kwargs):
-    """Whether the forward can use the index-driven form. It needs its shared tile to fit, and the same
-    inverted index and tying / L2 criterion as the backward; otherwise the gather form still applies."""
-    return _fw_dense_fits(layer, kwargs) and _dense_worth_it(layer, kwargs) and \
-        _build_dense_index(layer, kwargs) is not None
+    """Whether the forward can use the index: in the index-driven form (its shared tile must fit) or the row form
+    (`_fw_rows_fits`), under the same inverted index and tying / L2 criterion as the backward; otherwise the
+    gather form still applies."""
+    tile = _fw_dense_fits(layer, kwargs)
+    if not (tile or _fw_rows_fits(layer, kwargs)) or not _dense_worth_it(layer, kwargs):
+        return False
+    index = _build_dense_index(layer, kwargs)
+    return index is not None and (tile or len(_fw_rows_chunks(index, layer.params.device)) > 0)
+
+
+def _fw_rows_available():
+    """Whether the row-form forward's extension is built (`c_kernels/softevi_rows.cu`)."""
+    try:
+        from ..c_kernels import softevi_rows_available
+        return softevi_rows_available()
+    except Exception:
+        return False
+
+
+def _fw_rows_chunks(index, device):
+    """The row form's latent chunks to time: the whole latent axis and its halves down to 256 latents, each within the
+    index's memory budget for its table (`num_keys * chunk` floats, `_dense_index_budget`); none without the row
+    form's part of the index (`index["rows"]`, built only where its extension is) or with latents not in fours."""
+    rows, L = index["rows"], index["num_latents"]
+    if rows is None:
+        return []
+    budget = _dense_index_budget(device)
+    n = rows["keys"].numel()
+    out, c = [], L
+    while c % 4 == 0 and (c == L or c >= 256):                                  # (none for latents not in fours)
+        if n * c * 4 <= budget:
+            out.append(c)
+        if c % 8 != 0:
+            break
+        c //= 2
+    return out[:3]
+
+
+def _fw_rows_fits(layer, kwargs):
+    """Whether the row-form forward applies: its extension built, and the latents in fours (its rows are read and
+    written as float4). It keeps no shared tile, so any number of slots fits."""
+    if not _fw_rows_available():
+        return False
+    layout = _dense_layer_layout(layer, kwargs["categorical_evidence_logp"].size(1))
+    return layout is not None and layout[0] % 4 == 0
 
 
 # Latents per thread for the normalizer. Larger amortizes the per-reference index loads over more

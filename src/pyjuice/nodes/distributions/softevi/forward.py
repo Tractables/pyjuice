@@ -14,7 +14,8 @@ import os
 from pyjuice.utils.util import max_power_of_2_factor
 
 from .common import _evidence_cache_hit, _evidence_cache_key, _row_index
-from .dense_index import _build_dense_index, _fw_smem_cap, _FW_TL_CANDIDATES, _fw_use_dense, _params_exceed_l2
+from .dense_index import _build_dense_index, _fw_rows_chunks, _fw_smem_cap, _FW_TL_CANDIDATES, _fw_use_dense, \
+                         _params_exceed_l2
 
 
 def _fw_transposed_args(layer, target_kwargs, num_cats):
@@ -171,6 +172,8 @@ def _fw_dense_target(layer, kwargs, index):
                 num_latents = num_latents,
                 # `FW_TL` and the swizzle are chosen by `_fw_autotune`, once per shape.
                 _fw_layer = layer,
+                # The row form's weights, exp(evidence) (`_fw_linear_evidence`, made when it runs)
+                _fw_evidence = kwargs["categorical_evidence_logp"],
                 FW_THREADS = 256, FW_CAT_BLOCKS = 64)
 
 
@@ -194,10 +197,34 @@ def _fw_launch_dense(kw, tl, swizzle):
             si == 0, si == len(shards) - 1, swizzle)
 
 
-def _fw_autotune(kw):
-    """Pick (latents-per-thread, XOR swizzle) for the normalizer by timing them once per shape.
+def _fw_launch_rows(kw, chunk):
+    """One forward in the row form (`c_kernels/softevi_rows.cu`): per chunk of latents, the keys' table and its Z;
+    then the epilogue."""
+    from ..c_kernels import softevi_forward_rows
+    ix = kw["index"]
+    rows = ix["rows"]
+    layer = kw["_fw_layer"]
+    evidence = kw["_fw_evidence"]
+    B, V, K = evidence.shape
+    pt = _fw_linear_evidence(layer, {"categorical_evidence_logp": evidence})
+    n = rows["keys"].numel()
+    T = torch.empty(n * chunk, dtype = torch.float32, device = pt.device)
+    softevi_forward_rows(
+        kw["params_ptr"], kw["node_mars_ptr"], kw["Z_ptr"], T, kw["log_ex_p_ptr"], kw["data_ptr"], kw["vids_ptr"],
+        kw["s_pids_ptr"], kw["nids_ptr"], kw["var_idmapping_ptr"], rows["keys"], ix["p_base"], rows["elem_key"], pt,
+        n, layer.nodes[0].dist.num_cats, kw["num_latents"], chunk, B, V, K, kw["layer_num_nodes"], kw["node_offset"])
 
-    These two interact and neither has a threshold that survived contact with more than a couple of
+
+def _fw_autotune(kw):
+    """Pick the normalizer's form by timing the candidates once per shape: the index-driven form at each
+    (latents-per-thread, XOR swizzle) whose shared tile fits, and the row form (`_fw_launch_rows`) at each of its
+    latent chunks (`_fw_rows_chunks`). The row form reads a transposed table of the referenced categories a slot's
+    candidate at a time, so common tokens' rows are reused through L1 and no tile limits the slots: MEASURED on
+    CoDD's PC with real LLaDA evidence (top-k 1024, 1024 latents), a micro-batch's forward and backward 13.65 ->
+    7.7 ms at 64 blocks of 32, 61.4 -> 20.75 at 256 (where no tile fit and the forward fell back to Triton's
+    gather, 44 ms of it); 4096 latents at 64 blocks 63.5 -> 41.5.
+
+    The index-driven form's two parameters interact and neither has a threshold that survived contact with more than a couple of
     configurations. A larger `TL` amortizes the per-reference index loads but grows the shared tile; the
     swizzle removes a shared-memory bank conflict (`s * TL + t` reaches only 32/TL banks, so 32 distinct
     slots collapse onto 8 at TL=4) that is worth 1.95x on this kernel at a 4 KB tile and is a wash by
@@ -206,8 +233,8 @@ def _fw_autotune(kw):
 
     Runs ONCE per (shape, shard layout) and is cached on the layer; every later step reads the cache.
     Timing repeats the real launch, which is idempotent -- `Z` is re-zeroed by the first shard of each
-    pass and the epilogue recomputes `node_mars` from it -- so the state left behind is the correct one
-    either way."""
+    pass (the row form writes all of it) and the epilogue recomputes `node_mars` from it -- so the state
+    left behind is the correct one either way."""
     ix = kw["index"]
     shards = ix["shards"]
     # Bucket `Umax` to a power of two: it drifts a little every step with the candidate data, and
@@ -226,25 +253,34 @@ def _fw_autotune(kw):
 
     cands = [(tl, swz) for tl in _FW_TL_CANDIDATES for swz in (0, 1)
              if kw["num_slots"] * tl * 4 <= _fw_smem_cap(layer)]
-    assert cands, "the dense forward was taken with no `Zs` tile that fits (see `_fw_dense_fits`)"
+    cands += [("rows", c) for c in _fw_rows_chunks(ix, layer.params.device)]
+    assert cands, "the dense forward was taken with no `Zs` tile that fits and no row form (see `_fw_use_dense`)"
     best, best_t = None, None
-    for tl, swz in cands:
+    for cand in cands:
         for _ in range(2):                                   # warm up this instantiation
-            _fw_launch_dense(kw, tl, swz)
+            _fw_launch_choice(kw, cand)
         torch.cuda.synchronize()
         t0 = torch.cuda.Event(enable_timing = True)
         t1 = torch.cuda.Event(enable_timing = True)
         t0.record()
         for _ in range(3):
-            _fw_launch_dense(kw, tl, swz)
+            _fw_launch_choice(kw, cand)
         t1.record()
         torch.cuda.synchronize()
         el = t0.elapsed_time(t1)
         if best_t is None or el < best_t:
-            best, best_t = (tl, swz), el
+            best, best_t = cand, el
 
     cache[key] = best
     return best
+
+
+def _fw_launch_choice(kw, choice):
+    """The forward `_fw_autotune` chose: ("rows", chunk), the row form, or (TL, swizzle), the index-driven form."""
+    if choice[0] == "rows":
+        _fw_launch_rows(kw, choice[1])
+    else:
+        _fw_launch_dense(kw, *choice)
 
 
 class _FwCudaDispatch:
@@ -256,7 +292,9 @@ class _FwCudaDispatch:
         (latent x category), so `params` is read ONCE, coalesced, at each referenced position: ~113M
         reads rather than the 268M SCATTERED ones the direct form does. Needs tied parameters to pay
         off, exactly like the backward. The normalizer kernel measures 0.86 ms against a 0.31 ms floor
-        for the parameter read alone, versus 2.90 ms for the whole Triton forward.
+        for the parameter read alone, versus 2.90 ms for the whole Triton forward. On the same index, the
+        ROW form (`c_kernels/softevi_rows.cu`): the referenced categories' parameters transposed, then a
+        slot's candidates' rows summed -- `_fw_autotune` times the two.
       * GATHER. One thread per (node, batch) walking its own candidate list; applies to any top-k
         configuration. 2.35 ms versus Triton's 2.90 ms on the tied config, and its speed hinges on two
         things found by benchmarking the gather in isolation against an equivalent Triton one: 512
@@ -268,8 +306,7 @@ class _FwCudaDispatch:
     def __getitem__(self, grid):
         def launch(**kw):
             if kw["use_dense"]:
-                tl, swz = _fw_autotune(kw)
-                _fw_launch_dense(kw, tl, swz)
+                _fw_launch_choice(kw, _fw_autotune(kw))
             else:
                 from ..c_kernels import softevi_forward
                 softevi_forward(
