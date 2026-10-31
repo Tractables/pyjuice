@@ -203,6 +203,41 @@ def ask(target, query, step):
     return target.conditional(**{"precision": "fp32", **step})
 
 
+@pytest.mark.parametrize("seed", range(8))
+def test_the_scope_masks_are_numpys(seed):
+    """`_scope_masks` (numba) gives the region masks of a call's reuse as numpy's formulas give them: per scope ``[a,
+    b)``, no row newly observing it, the kept inside values that hold, the kept top-down ones with nothing new outside
+    it, whether it misses or meets an asked position, and (compact) the rows newly observing it and the regions whose
+    values hold for some rows only; rows observing nothing new, everything, or some."""
+    rng = np.random.default_rng(seed)
+    B, n, R = int(rng.integers(1, 6)), int(rng.integers(1, 12)), int(rng.integers(1, 30))
+    a = rng.integers(0, n + 1, R).astype(np.int64)
+    b = np.minimum(n, a + rng.integers(0, n + 1, R)).astype(np.int64)
+    bounds = np.stack([a, b], axis = 1)                                 # (columns of a table, as the decoder's)
+    a, b = bounds[:, 0], bounds[:, 1]
+    for new in (rng.random((B, n)) < 0.2, np.zeros((B, n), bool), np.ones((B, n), bool)):
+        asked = rng.random(n) < 0.3
+        kept_inside, kept_top_down = rng.random(R) < 0.6, rng.random(R) < 0.6
+        for fresh_rows in (False, True):
+            got = QD._scope_masks(new, asked, a, b, kept_inside, kept_top_down, fresh_rows)
+            cum = np.zeros(n + 1, dtype = np.int64)
+            np.cumsum(new.any(axis = 0), out = cum[1:])
+            on_new = cum[b] - cum[a]
+            unseen = on_new == 0
+            np.cumsum(asked, out = cum[1:])
+            on_asked = cum[b] - cum[a]
+            want = [unseen, kept_inside & unseen, kept_top_down & (on_new == new.any(axis = 0).sum()),
+                    on_asked < asked.sum(), on_asked > 0]
+            if fresh_rows:
+                rows = np.zeros((B, n + 1), dtype = np.int64)
+                np.cumsum(new, axis = 1, out = rows[:, 1:])
+                fresh = (rows[:, b] - rows[:, a] > 0).T
+                want += [fresh, kept_inside & ~unseen & ~fresh.all(axis = 1)]
+            for g, w in zip(got, want):
+                assert np.array_equal(g, w), (g, w)
+            assert not fresh_rows or len(got[5]) == R
+
+
 @pytest.mark.parametrize("storage, park", [("dense", "default"), ("compact", "default"), ("compact", "always")])
 @pytest.mark.parametrize("query", ["conditional", "marginal"])
 @pytest.mark.parametrize("scenario", list(SCENARIOS))

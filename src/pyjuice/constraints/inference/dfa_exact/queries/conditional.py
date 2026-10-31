@@ -25,7 +25,7 @@ from ..kernels.common import pack_aligned
 from ..kernels.compact import (STORAGES, compact_buffers, held_elsewhere, held_moves, partial_carry, query_layout,
                                regather_into, resolve_storage, worth_parking)
 from ..kernels.live import live_successors, liveness
-from ..kernels.score import class_weight_rows, score_group, score_tables
+from ..kernels.score import class_weight_rows, class_weight_walk, score_group, score_tables
 from ..kernels.transitions import enumerated_args
 from .backend.plans import (PLANS_PER_POSITION, PLAN_CACHE_SIZE, per_sample_intervals, prior_regions, query_plan,
                     read_regions, scope_intervals, top_down_prior)
@@ -257,6 +257,7 @@ def class_weights(backend, data: torch.Tensor, missing: torch.Tensor, positions:
     if not early:
         rows = class_weight_rows(prog, lv, col_pos, col_K, col_first, group_first, B,
                                  backend.token_classes.stored_of_class)
+    class_weight_walk(rows, prog, lv, compact)
     gates = F.gate_context(backend, external)
     hold = None if partial is None or compact is None else dict(regions = partial, fresh = carry["fresh"])
     forward = lambda p, **kw: F.run_forward(backend, bufs, p, x, missing, obs_class, lv, precision, compact, masses,

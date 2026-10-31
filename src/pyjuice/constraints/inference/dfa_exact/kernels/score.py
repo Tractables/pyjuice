@@ -568,8 +568,8 @@ class ClassWeightRows:
     :ivar starts: every row group's first float, then the size (host; read on first use, see :attr:`most`)
     :ivar most: the most rows of any column (host): copied with :attr:`starts` as the rows are built, and waited for
         on first use -- a query asks after its forward pass's launches, so the wait is the rows' alone
-    :ivar walk: per boundary, the most live columns of any sample there (host, with :attr:`most`; every column under
-        no pruning): the class weights' longest walk at a position (:data:`CLASS_WEIGHT_CUDA_WALK`)
+    :ivar walk: per boundary, the most live columns of any sample there (host, every column under no pruning; set by
+        :func:`class_weight_walk`): the class weights' longest walk at a position (:data:`CLASS_WEIGHT_CUDA_WALK`)
     """
 
     count: torch.Tensor
@@ -581,13 +581,15 @@ class ClassWeightRows:
     _groups: int
     rep: Optional[torch.Tensor] = None
     _read: Optional[tuple] = None
+    _walk: Optional[list] = None
+    _walk_copy: Optional[tuple] = None
 
     def _sizes(self):
         if self._read is None:
             self._done.synchronize()
             v = self._host.tolist()
             g = self._groups
-            self._read = (v[:g + 1], int(v[g + 1]), v[g + 2:])
+            self._read = (v[:g + 1], int(v[g + 1]))
         return self._read
 
     @property
@@ -600,7 +602,11 @@ class ClassWeightRows:
 
     @property
     def walk(self) -> list:
-        return self._sizes()[2]
+        if self._walk is None:                          # (copied behind the launches, see `class_weight_walk`)
+            host, done = self._walk_copy
+            done.synchronize()
+            self._walk = host.tolist()
+        return self._walk
 
 
 #: whether the live classes of a target column with the same live pairs share one row of class weights (see
@@ -885,16 +891,30 @@ def class_weight_rows(prog, liveness, col_pos: torch.Tensor, col_K: torch.Tensor
     TC = min(LIVE_CLASS_TILE, host_next_power_of_2(C))
     _class_rows_kernel[(max(N, G + 1),)](off, tt.cls_order, col_pos, col_K, col_first, group_first, row, rep, count,
                                          cls, sizes, N, G, C, B, TC = TC, SHARED = shared)
-    # the longest walk at every boundary (the most live columns of any sample; every column without pruning), copied
-    # with the sizes: the class weights' kernel choice (:data:`CLASS_WEIGHT_CUDA_WALK`)
-    walk = liveness.lists()[0].view(B, n + 1).amax(0) if liveness is not None else prog.width_t[:n + 1]
-    host = torch.empty(G + 2 + n + 1, dtype = torch.int64, pin_memory = True)
-    host[:G + 2].copy_(sizes, non_blocking = True)
-    host[G + 2:].copy_(walk, non_blocking = True)
+    host = torch.empty(G + 2, dtype = torch.int64, pin_memory = True)
+    host.copy_(sizes, non_blocking = True)
     done = torch.cuda.Event()
     done.record(torch.cuda.current_stream(dev.index))
     return ClassWeightRows(count = count, cls = cls, off = off, row = row, _host = host, _done = done, _groups = G,
                            rep = rep if shared else None)
+
+
+def class_weight_walk(rows: ClassWeightRows, prog, liveness, compact = None):
+    """``rows``' longest walk at every boundary (:attr:`ClassWeightRows.walk`: the most live columns of any sample
+    there), the class weights' kernel choice (:data:`CLASS_WEIGHT_CUDA_WALK`): a compact query's layout's
+    (``compact.max_count``, on the host already), else its ``liveness``' lists' counts copied behind the launches, or
+    every column without pruning."""
+    n = prog.n
+    if compact is not None:
+        rows._walk = compact.max_count.tolist()
+    elif liveness is not None:
+        host = torch.empty(n + 1, dtype = torch.int64, pin_memory = True)
+        host.copy_(liveness.lists()[0].view(liveness.B, n + 1).amax(0), non_blocking = True)
+        done = torch.cuda.Event()
+        done.record(torch.cuda.current_stream(prog.dev.index))
+        rows._walk_copy = (host, done)
+    else:
+        rows._walk = prog.width[:n + 1]
 
 
 def run_class_weights(launches, cw: dict, prog, bufs, element_flows, temp_flows, node_mars, liveness, elem_first: int,
