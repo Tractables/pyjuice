@@ -15,9 +15,8 @@ import triton
 from pyjuice.utils.launch_plans import LaunchPlans
 from .common import _buffer_kwarg
 
-# The per-block element fork's ranges of parent blocks (`kernels/blockscale_backward_blocks.py`), a third grid axis:
-# timed with the other forks
-_BLOCK_SPLITS = (1, 2, 4, 8, 16)
+# The per-block element fork's most ranges of parent blocks (`kernels/blockscale_backward_blocks.py`, a third grid axis)
+_BLOCK_SPLITS_MAX = 16
 
 
 def _set_attrs(layer, **attrs) -> None:
@@ -747,9 +746,10 @@ class _BackwardMixin:
             if plan["gate_tile"] is not None:
                 kinds.append("triton")
                 plan["grad_store_ok"] = self._grad_store_ok(plan["gate_tile"], ctx, gate_cbs)
-                # Parent blocks narrower than the k-tile (`ptr_inc_step > 1`): the Triton fork a parent block a step, the
-                # blocks split into ranges over the grid (`kernels/blockscale_backward_blocks.py`), on absolute per-block
-                # tables -- each step's first parent (`full_ebase`), first parameter and gate row (the gate table's)
+                # Parent blocks narrower than the k-tile (`ptr_inc_step > 1`): the Triton fork a parent block a step,
+                # the blocks split into ranges over the grid (`kernels/blockscale_backward_blocks.py`), on absolute
+                # per-block tables -- each step's first parent (`full_ebase`), first parameter and gate row (the gate
+                # table's)
                 if pinc > 1 and n_ngates_ == 1 and tk == pinc * blk:
                     _cpb = torch.cumsum(ctx["parpids_increment"].to(torch.int64), 1)
                     _shb = torch.zeros_like(_cpb)
@@ -757,8 +757,18 @@ class _BackwardMixin:
                     plan["blocks"] = (full_ebase.reshape(full_ebase.size(0), -1).contiguous(),
                                       (ctx["parpids_start"][:, None, :].to(torch.int64) + _shb)
                                       .reshape(full_ebase.size(0), -1).contiguous())
+                    # One range count, by rule rather than timed among several: ranges merged in a different order
+                    # round differently, and near-tied counts timed by two circuits of one shape would leave them
+                    # different in the last bits (a moved circuit against one compiled there). Enough ranges for ~8
+                    # programs an SM, at most 16 (MEASURED, 4096 nodes of 32-blocks: 4 to 16 ranges within 1% at 64
+                    # and at 16 samples; 8 the best at both)
+                    from pyjuice.layer.kernels.c import _sms
                     steps = knt * pinc
-                    kinds += [("blocks", sp) for sp in _BLOCK_SPLITS if sp <= steps]
+                    programs = triton.cdiv(batch, ctx["BLOCK_B"]) * chids.numel() * (cbs // ctx["TILE_SIZE_M"])
+                    sp = 1
+                    while sp < _BLOCK_SPLITS_MAX and 2 * sp <= steps and programs * sp < 8 * _sms():
+                        sp *= 2
+                    kinds.append(("blocks", sp))
 
             if n_ngates_ > 1:
                 # The CuTe and small-batch element forks apply one gate per edge block to a whole node
