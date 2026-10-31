@@ -205,6 +205,15 @@ def class_weights(backend, data: torch.Tensor, missing: torch.Tensor, positions:
     # compact, a query needs its liveness even with nothing observed: every column is live, but only the regions it
     # computes per sample get rows (none, every value input-independent, inside fast_inference)
     lv = liveness(prog, obs_class, B, succ) if observed.any() or storage != "dense" or succ is not None else None
+    # the class weights' rows, issued while the liveness runs -- they read its live pairs alone, and the layout below
+    # waits for its counts (the lists with their ranks first, as the layout reads them: built once) --, unless a dense
+    # query observing nothing may give the liveness up below (its rows then every column's, as they were)
+    early = lv is not None and (observed.any() or succ is not None or storage == "compact")
+    if early:
+        if storage != "dense":
+            lv.lists(rank = True)
+        rows = class_weight_rows(prog, lv, col_pos, col_K, col_first, group_first, B,
+                                 backend.token_classes.stored_of_class)
     valid, kept = backend.state.prior_validity(masses.version)
     prior = prior_regions(prog, observed, B, kept, lv)
     pf = backend.state.prior_flows(np.zeros(len(backend.sum_regions), dtype = bool))
@@ -245,9 +254,10 @@ def class_weights(backend, data: torch.Tensor, missing: torch.Tensor, positions:
                               lambda: backend.state.flows(B, bufs, compact))
     else:
         flows = backend.state.flows(B, bufs, compact)
-    rows = class_weight_rows(prog, lv, col_pos, col_K, col_first, group_first, B,     # (their sizes copied behind
-                             backend.token_classes.stored_of_class)
-    gates = F.gate_context(backend, external)                                         # the forward pass's launches)
+    if not early:
+        rows = class_weight_rows(prog, lv, col_pos, col_K, col_first, group_first, B,
+                                 backend.token_classes.stored_of_class)
+    gates = F.gate_context(backend, external)
     hold = None if partial is None or compact is None else dict(regions = partial, fresh = carry["fresh"])
     forward = lambda p, **kw: F.run_forward(backend, bufs, p, x, missing, obs_class, lv, precision, compact, masses,
                                             gates = gates, **kw)

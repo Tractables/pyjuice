@@ -25,6 +25,7 @@ import numpy as np
 import torch
 import triton
 import triton.language as tl
+from numba import njit
 
 from pyjuice.utils.kernel_launcher import triton_jit
 from pyjuice.utils.util import host_next_power_of_2
@@ -275,73 +276,86 @@ def compact_layout(backend, liveness, regions: np.ndarray, inside: Optional[np.n
                                          TILE = min(1024, max(32, host_next_power_of_2(B))), num_warps = 4)
     host = both.cpu().numpy()
     total, max_count = host[at:at + K], host[at + K:]
-    lanes = total[prog.reg_iv_all]
-    width = np.where(regions, _aligned(lanes), 0)
-    offset = _row_offsets(prog.reg_rows, width)
-    sample_ivs = _region_ivs(prog, regions, K)
-    elem_width, element_size = _group_widths(prog, total, sample_ivs)
-    arrays = [offset, width, lanes]
-    mars = None
-    if inside is not None:
-        mars = _mars_layout(backend, prog, total, lanes, inside, B)
-        arrays += [mars["sum_offsets"], mars["sum_widths"]]
-    tables = _upload(prog, arrays)
-    if mars is not None:
-        mars.update(sum_offsets_t = tables[3], sum_widths_t = tables[4])
+    mars = inside is not None
+    regions = np.ascontiguousarray(regions, dtype = bool)
+    keep_in = np.ascontiguousarray(inside, dtype = bool) if mars else regions
+    (buf, R, lanes, width, offset, sample_ivs, elem_width, element_size, size, sum_lanes, m_width, m_offsets, m_ivs,
+     m_elem, m_elem_size, m_size, m_lanes) = _layout_host(total, regions, keep_in, mars,
+                                                          prog.reg_iv_all, prog.reg_rows, prog.elem_iv_pad,
+                                                          prog.elem_slots, prog.elem_rows, ALIGN,
+                                                          int(_aligned(backend.input_range[1] * B)))
+    dev = torch.from_numpy(buf).to(prog.dev)                                # (the host arrays below, in one copy)
+    tables = [dev[i * R:i * R + len(regions)] for i in range(5 if mars else 3)]
+    if mars:
+        mars = dict(input_offset = 0, sum_offsets = m_offsets, sum_widths = m_width, node_size = m_size,
+                    element_widths = m_elem.tolist(), element_size = m_elem_size, lanes = m_lanes, ivs = m_ivs,
+                    regions = keep_in, sum_offsets_t = tables[3], sum_widths_t = tables[4])
     return CompactLayout(B = B, off = off, total = total, steps = max(1, int(np.ceil(np.log2(B + 1)))), count = count,
                          start = start, columns = columns, rank = liveness.rank, offset = offset, width = width,
-                         offset_t = tables[0], width_t = tables[1], lanes_t = tables[2],
-                         size = int((prog.reg_rows * width).sum()), sum_lanes = int(lanes[regions].max(initial = 0)),
-                         max_count = max_count, sample_ivs = sample_ivs, elem_width = elem_width,
-                         element_size = element_size, prog = prog, mars = mars,
-                         off_host = host[:K * (B + 1)].reshape(K, B + 1))
+                         offset_t = tables[0], width_t = tables[1], lanes_t = tables[2], size = size,
+                         sum_lanes = sum_lanes, max_count = max_count, sample_ivs = sample_ivs,
+                         elem_width = elem_width.tolist(), element_size = element_size, prog = prog,
+                         mars = mars or None, off_host = host[:K * (B + 1)].reshape(K, B + 1))
 
 
-def _row_offsets(rows: np.ndarray, width: np.ndarray) -> np.ndarray:
-    """Where every sum region's rows start (int64), the regions' ``rows`` of ``width`` floats one after the other."""
-    out = np.zeros(len(width), dtype = np.int64)
-    np.cumsum((rows * width)[:-1], out = out[1:])
-    return out
+@njit(cache = True)
+def _region_layout(keep, lanes, total, reg_iv, reg_rows, elem_pad, elem_slots, elem_rows, align):
+    """For the sum regions ``keep`` (bool) a query keeps per sample, of ``lanes`` lanes a row each (``total``: every
+    interval's): their rows' widths (the lanes aligned; 0 for the others), places (the regions' rows one after the
+    other: ``offset``), the intervals they cover (bool [intervals]), every product layer group's row width (as wide as
+    its products' compact values under those intervals -- ``elem_pad`` its intervals, padded past the last --, or its
+    slots) and the widest group's floats, the regions' floats and their most lanes."""
+    R, K = len(keep), len(total)
+    width, offset = np.zeros(R, np.int64), np.zeros(R, np.int64)
+    ivs = np.zeros(K, np.bool_)
+    size, most = 0, 0
+    for r in range(R):
+        offset[r] = size
+        if keep[r]:
+            width[r] = (lanes[r] + align - 1) // align * align
+            ivs[reg_iv[r]] = True
+            most = max(most, lanes[r])
+        size += reg_rows[r] * width[r]
+    G, P = elem_pad.shape
+    groups = np.zeros(G, np.int64)
+    group_size = 0
+    for g in range(G):
+        widest = 0
+        for p in range(P):
+            k = elem_pad[g, p]
+            if k < K and ivs[k]:
+                widest = max(widest, total[k])
+        groups[g] = (max(widest, elem_slots[g]) + align - 1) // align * align
+        group_size = max(group_size, elem_rows[g] * groups[g])
+    return width, offset, ivs, groups, group_size, size, most
 
 
-def _region_ivs(prog, regions: np.ndarray, K: int) -> np.ndarray:
-    """bool [intervals]: those of the sum ``regions`` (bool [sum regions])."""
-    out = np.zeros(K, dtype = bool)
-    out[prog.reg_iv_all[regions]] = True
-    return out
-
-
-def _group_widths(prog, total: np.ndarray, ivs: np.ndarray):
-    """``(widths, size)``: per product layer group, the width of its rows (a list) -- as wide as the compact values of
-    its products whose interval ``ivs`` marks (bool [intervals]; ``total``: every interval's lanes), or one sample's
-    block kept once --, and the floats the widest group's rows take. The table's padding is one past the last
-    interval: none marked, without lanes."""
-    pad = prog.elem_iv_pad
-    lanes = np.where(np.append(ivs, False)[pad], np.append(total, 0)[pad], 0).max(axis = 1)
-    widths = _aligned(np.maximum(lanes, prog.elem_slots))
-    return widths.tolist(), int((prog.elem_rows * widths).max(initial = 0))
-
-
-def _upload(prog, arrays) -> list:
-    """The int64 host ``arrays`` on the device, in one copy (each 16 bytes aligned, see
-    :func:`~.common.pack_aligned`)."""
-    buf, starts = pack_aligned(arrays, np.int64)
-    dev = torch.from_numpy(buf).to(prog.dev)
-    return [dev[s:s + len(a)] for a, s in zip(arrays, starts.tolist())]
-
-
-def _mars_layout(backend, prog, total: np.ndarray, lanes: np.ndarray, inside: np.ndarray, B: int) -> dict:
-    """:attr:`CompactLayout.mars`, but its rows' offsets and widths not on the device: ``node_mars``'s
-    input rows as dense ones (a value per sample, where pyjuice's input layers write them), then the compact rows of
-    the sum regions ``inside`` (bool), none for the others; per product layer group, ``element_mars``'s rows as wide
-    as the compact values of its products under those regions, or one sample's block kept once."""
-    width = np.where(inside, _aligned(lanes), 0)
-    base = int(_aligned(backend.input_range[1] * B))
-    ivs = _region_ivs(prog, inside, len(total))
-    elem, size = _group_widths(prog, total, ivs)
-    return dict(input_offset = 0, sum_offsets = base + _row_offsets(prog.reg_rows, width), sum_widths = width,
-                node_size = base + int((prog.reg_rows * width).sum()), element_widths = elem, element_size = size,
-                lanes = int(lanes[inside].max(initial = 0)), ivs = ivs, regions = inside)
+@njit(cache = True)
+def _layout_host(total, regions, inside, mars, reg_iv, reg_rows, elem_pad, elem_slots, elem_rows, align, base):
+    """:func:`compact_layout`'s host arrays from every interval's lanes per row (``total``): the sum regions' rows in
+    ``node_flows`` (those of ``regions``) and, with ``mars``, in ``node_mars`` (``inside``, after the input rows'
+    ``base`` floats), and the arrays the device takes -- the rows' offsets, widths and lanes, then (``mars``) the inside
+    rows' offsets and widths -- in one buffer, each ``R`` int64 apart (16 bytes aligned, as
+    :func:`~.common.pack_aligned` places them)."""
+    lanes = total[reg_iv]
+    width, offset, ivs, groups, group_size, size, most = _region_layout(regions, lanes, total, reg_iv, reg_rows,
+                                                                        elem_pad, elem_slots, elem_rows, align)
+    if mars:
+        m_width, m_offset, m_ivs, m_groups, m_group_size, m_size, m_most = _region_layout(
+            inside, lanes, total, reg_iv, reg_rows, elem_pad, elem_slots, elem_rows, align)
+    else:
+        m_width, m_offset, m_ivs, m_groups, m_group_size, m_size, m_most = width, offset, ivs, groups, 0, 0, 0
+    n = len(regions)
+    R = n + n % 2
+    buf = np.zeros((5 if mars else 3) * R, np.int64)
+    buf[:n] = offset
+    buf[R:R + n] = width
+    buf[2 * R:2 * R + n] = lanes
+    if mars:
+        buf[3 * R:3 * R + n] = base + m_offset
+        buf[4 * R:4 * R + n] = m_width
+    return (buf, R, lanes, width, offset, ivs, groups, group_size, size, most, m_width, base + m_offset, m_ivs,
+            m_groups, m_group_size, base + m_size, m_most)
 
 
 #: a re-gather program's lanes -- a region's most, rounded up to a power of 2 of at least 16, up to REGATHER_TILE --,
