@@ -1349,13 +1349,23 @@ def _score_candidates_kernel(table, w, row, shift, token_class, code, positions,
         tl.store(out + rr * KC + js, val, mask = jm)
 
 
-#: :func:`_score_candidates_kernel`'s and :func:`_score_tokens_kernel`'s ``(BV, BH, warps)`` -- tokens per program,
-#: the dot's chunk of rows -- for at most :data:`SCORE_CANDIDATE_PAIRS` (column, token) pairs, and for more: from a
-#: sweep of the cached decode step on Ctrl-G's HMM4096 (4096 rows) at 1/16/128 columns x 50/1024 candidates, the first
-#: within 2% of the best everywhere but 128 x 1024, where the second takes the step from 3.32 to 2.87 ms (scoring every
-#: token: 2.92)
-SCORE_CANDIDATE_TILES = ((16, 256, 4), (64, 64, 2))
+#: :func:`_score_tokens_kernel`'s ``(BV, BH, warps)`` -- tokens per program, the dot's chunk of rows -- for at most
+#: :data:`SCORE_CANDIDATE_PAIRS` (column, token) pairs, and for more: from a sweep of the cached decode step on Ctrl-G's
+#: HMM4096 (4096 rows) at 1/16/128 columns x 50/1024 candidates, the first within 2% of the best everywhere but
+#: 128 x 1024, where the second takes the step from 3.32 to 2.87 ms (scoring every token: 2.92)
+SCORE_TOKEN_TILES = ((16, 256, 4), (64, 64, 2))
+#: ... and :func:`_score_candidates_kernel`'s, from its launches' captured inputs (1024 candidates a column, 4096 rows):
+#: Codpula-4096 x JSON hard_0 diffusion, B8 / B32 / B64 (1024 / 4096 / 8192 columns) 1396 -> 942 / 1906 -> 1212 /
+#: 9843 -> 7729 us from (64, 64, 2), HMM-4096 x GPT-2 JSON with candidates (B16, 2048 columns) 1146 -> 755 -- 242
+#: registers a thread at 64 tokens, 12% occupancy --; l2r B8 / B32 (8 / 32 columns) 47 -> 43 / 101 -> 94 from
+#: (16, 256, 4). The same chunks of rows: every candidate's score the same bits; log Z's sums over the enumerated
+#: candidates run in other tiles: the conditionals within fp32 rounding (3.8e-6 in log at most there)
+SCORE_CANDIDATE_TILES = ((16, 256, 8), (16, 64, 2))
 SCORE_CANDIDATE_PAIRS = 1 << 16
+#: :func:`_score_weights_kernel`'s warps (its tiles, and so its arithmetic, unchanged by them). Its two launches on
+#: their captured inputs, Codpula-4096 x JSON hard_0: l2r B8 37 -> 29 us, diffusion B8 / B32 / B64 1185 -> 484 /
+#: 3180 -> 1491 / 5848 -> 2964 us from 4 (184 registers a thread: 16% occupancy)
+SCORE_WEIGHT_WARPS = 2
 
 
 #: :func:`_score_kernel`'s tiles ``(BB, BV, BH, warps, stages)`` by table dtype and dot precision, for at most 16, 64 and
@@ -1431,7 +1441,7 @@ def score_group(out: torch.Tensor, table: torch.Tensor, w: torch.Tensor, row: to
         part = torch.empty(N * ctiles * shares * 3 * TC if shares > 1 else 1, dtype = torch.float32, device = dev)
         args = (w, row, row if rep is None else rep, class_mars, rows, columns["nodes"], positions, columns["mrow"],
                 columns["mstride"], columns["lognorm"], shift, zc, part, classes.class_of_stored32, C, K, B, KS, Cs)
-        consts = dict(TC = TC, TK = TK, SHARES = shares, SPLIT = rep is not None, num_warps = 4, **modes)
+        consts = dict(TC = TC, TK = TK, SHARES = shares, SPLIT = rep is not None, num_warps = SCORE_WEIGHT_WARPS, **modes)
         _score_weights_kernel[(N, ctiles, shares)](*args, FINISH = False, **consts)
         if shares > 1 or rep is not None:
             _score_weights_kernel[(N, ctiles, shares)](*args, FINISH = True, **consts)
@@ -1441,7 +1451,7 @@ def score_group(out: torch.Tensor, table: torch.Tensor, w: torch.Tensor, row: to
     by_tokens = E > 0 and not run                                           # with a weight: their parts come with
     KC = (candidates.size(1) if candidates is not None else weights["KW"]) if candidates is not None or ids is not None \
         else 0
-    tokens_tile = SCORE_CANDIDATE_TILES[N * E > SCORE_CANDIDATE_PAIRS]
+    tokens_tile = SCORE_TOKEN_TILES[N * E > SCORE_CANDIDATE_PAIRS]
     cand_tile = SCORE_CANDIDATE_TILES[N * KC > SCORE_CANDIDATE_PAIRS]
     UT = host_cdiv(E, tokens_tile[0]) if by_tokens else host_cdiv(KC, cand_tile[0]) if run and E > 0 else 0
     uz = torch.empty(N, max(UT, 1), dtype = torch.float32, device = dev)
