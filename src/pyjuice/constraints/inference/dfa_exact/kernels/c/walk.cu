@@ -5,7 +5,8 @@
 // a sample's terms those of its live columns i (a dead one's parent lane holds nothing).
 //
 // Two kernels per launch:
-//   `ibtd_terms_kernel`, a warp per (boundary t of the launch, sample, live column q at t + 1), 32 entries at a time:
+//   `ibtd_terms_kernel`, a CTA per (boundary t of the launch, sample, live column q at t + 1), its warps a segment of
+//   the list each (counted, then written at the warps' before it, 32 entries at a time):
 //   the entries of q's predecessor list that the sample sums -- i live at t, and the observed class if the sample
 //   observes t, else (under a session's per-sample inputs, `classes`) a class the sample allows there: a ruled-out
 //   class's mass is -inf, its term adds nothing --, in the list's order, as (i's place among the sample's live
@@ -34,7 +35,7 @@
 
 #define WTILE 16           // a node tile's rows (`common.NODE_TILE`)
 #define WIPT 2             // items per thread at once when the sums run over several parents
-#define TW 256             // `ibtd_terms_kernel`: threads, a live column per warp
+#define TW 256             // `ibtd_terms_kernel`: threads, a live column per CTA
 #define SORT_BINS 256      // live columns ordered by min(terms, 255)
 #define TU 8               // `ibtd_terms_kernel`: a warp's chunks of 32 entries read at once
 
@@ -76,12 +77,13 @@ struct TermArgs {
 __global__ void __launch_bounds__(TW) ibtd_terms_kernel(TermArgs a) {
     __shared__ int bins[SORT_BINS];
     __shared__ int last;
+    __shared__ int wkept[TW / 32];                                        // every warp's kept entries
     const int ti = blockIdx.z, b = blockIdx.y, n = a.n, W = a.W;
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
     const int t = a.tlist[ti];
     const long long row_q = (long long)b * (n + 1) + t + 1, sb = (long long)ti * a.B + b;
     const int cq = a.ccount[row_q];
-    const int rq = blockIdx.x * (TW / 32) + warp;
+    const int rq = blockIdx.x;                                            // a CTA per live column
     if (rq < cq) {
         const int q = a.ccolumns[a.cstart[row_q] + rq];
         const int* pp = a.pred_ptr + (long long)t * (W + 1);
@@ -91,31 +93,50 @@ __global__ void __launch_bounds__(TW) ibtd_terms_kernel(TermArgs a) {
         const int oc = (int)a.obs[(long long)b * n + t];
         const int code_oc = oc >= 0 ? a.code[(long long)t * a.C + oc] : -1;   // the observed class's code
         const int* rank = a.crank + ((long long)b * (n + 1) + t) * W;
-        int kept = 0;
         const signed char* allowed = a.classes ? a.allowed + (long long)b * a.a_stride + (long long)t * a.C : nullptr;
-        for (int base = e0; base < e1; base += 32 * TU) {                // TU chunks' reads in flight at once
+        // the warps' segments of the list, whole chunks of 32 entries each, in order
+        const int seg = ((e1 - e0 + 31) / 32 + TW / 32 - 1) / (TW / 32) * 32;
+        const int s0 = min(e1, e0 + warp * seg), s1 = min(e1, s0 + seg);
+        auto term = [&](int e, bool& ok, int& pk) {                       // entry e: kept, and its packed term
+            ok = false;
+            pk = 0;
+            if (e < s1) {
+                const int x = a.pred_x[e], ri = rank[a.pred_col[e]];
+                const bool cls = oc >= 0 || allowed == nullptr || allowed[a.pred_class[e]] != 0;
+                ok = (oc < 0 || x == code_oc) && ri >= 0 && cls;
+                pk = (int)(((unsigned)ri << a.xb) | (unsigned)code_index(x, a.Cs));
+            }
+        };
+        int kept = 0;                                                     // pass 1: the warp's kept entries
+        for (int base = s0; base < s1; base += 32 * TU) {                 // (TU chunks' reads in flight at once)
             bool ok[TU];
             int pk[TU];
 #pragma unroll
-            for (int u = 0; u < TU; ++u) {
-                const int e = base + u * 32 + lane;
-                ok[u] = false;
-                pk[u] = 0;
-                if (e < e1) {
-                    const int x = a.pred_x[e], ri = rank[a.pred_col[e]];
-                    const bool cls = oc >= 0 || allowed == nullptr || allowed[a.pred_class[e]] != 0;
-                    ok[u] = (oc < 0 || x == code_oc) && ri >= 0 && cls;
-                    pk[u] = (int)(((unsigned)ri << a.xb) | (unsigned)code_index(x, a.Cs));
-                }
-            }
+            for (int u = 0; u < TU; ++u) term(base + u * 32 + lane, ok[u], pk[u]);
 #pragma unroll
-            for (int u = 0; u < TU; ++u) {                                // in the list's order
+            for (int u = 0; u < TU; ++u) kept += __popc(__ballot_sync(0xffffffffu, ok[u]));
+        }
+        if (lane == 0) wkept[warp] = kept;
+        __syncthreads();
+        int at = 0, total = 0;                                            // the warps' before it, and every one's
+#pragma unroll
+        for (int w = 0; w < TW / 32; ++w) {
+            at += w < warp ? wkept[w] : 0;
+            total += wkept[w];
+        }
+        for (int base = s0; base < s1; base += 32 * TU) {                 // pass 2: written in the list's order
+            bool ok[TU];
+            int pk[TU];
+#pragma unroll
+            for (int u = 0; u < TU; ++u) term(base + u * 32 + lane, ok[u], pk[u]);
+#pragma unroll
+            for (int u = 0; u < TU; ++u) {
                 const unsigned m = __ballot_sync(0xffffffffu, ok[u]);
-                if (ok[u]) out[kept + __popc(m & ((1u << lane) - 1u))] = pk[u];
-                kept += __popc(m);
+                if (ok[u]) out[at + __popc(m & ((1u << lane) - 1u))] = pk[u];
+                at += __popc(m);
             }
         }
-        if (lane == 0) a.cnt[sb * W + rq] = kept;
+        if (tid == 0) a.cnt[sb * W + rq] = total;
     }
     // the last CTA of the (boundary, sample): its live columns by their terms, most first
     if (a.perm == nullptr) return;
@@ -642,8 +663,7 @@ void ibtd_cuda(torch::Tensor element_flows, torch::Tensor temp_flows, torch::Ten
                 xb, classes ? i32(pred_class, "pred_class") : nullptr,
                 classes ? (const signed char*)allowed.data_ptr<int8_t>() : nullptr, (long long)a_stride,
                 classes ? 1 : 0};
-    ibtd_terms_kernel<<<dim3((unsigned)((cq_max + TW / 32 - 1) / (TW / 32)), (unsigned)B, (unsigned)T), TW, 0,
-                        stream>>>(ta);
+    ibtd_terms_kernel<<<dim3((unsigned)cq_max, (unsigned)B, (unsigned)T), TW, 0, stream>>>(ta);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     IbArgs a;
     a.element_flows = element_flows.data_ptr<float>();
