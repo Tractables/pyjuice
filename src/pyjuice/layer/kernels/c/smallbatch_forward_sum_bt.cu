@@ -112,19 +112,22 @@ sb_fwd_bt_kernel(float* __restrict__ node_mars, const float* __restrict__ elemen
     #pragma unroll
     for (int j = 0; j < BT; j++) l[j] = 0.f;
 
-    float pe[U], emv[U];
-    auto fetch = [&](int e, float* p_out, float* em_out) {
+    // The parameters held as loaded (`raw_t`), widened where used: a widening right behind the load ahead would wait
+    // for it there (see param_load.cuh)
+    using PR = typename ParamLoad<TP>::raw_t;
+    PR pe[U]; float emv[U];
+    auto fetch = [&](int e, PR* p_out, float* em_out) {
         #pragma unroll
         for (int u = 0; u < U; u++) {
             const int ee = e + u * SPLIT;
             const bool ok = ee < num_edges;
-            p_out[u] = ok ? ParamLoad<TP>::at(pcol + (long)ee * block_size) : 0.f;
+            p_out[u] = ok ? ParamLoad<TP>::raw(pcol + (long)ee * block_size) : PR(0);
             em_out[u] = (ok && live) ? ecol[(long)ee * batch] : -INFINITY;
         }
     };
     fetch(ty, pe, emv);
     for (int e = ty; e < num_edges; e += SPLIT * U) {
-        float pn[U], emn[U];
+        PR pn[U]; float emn[U];
         const int en = e + SPLIT * U;
         if (en < num_edges) fetch(en, pn, emn);
         // Lane j: its column's terms of these edges, staged
@@ -136,14 +139,15 @@ sb_fwd_bt_kernel(float* __restrict__ node_mars, const float* __restrict__ elemen
         // Every lane: BT multiply-adds per edge from the staged terms (broadcast reads)
         #pragma unroll
         for (int u = 0; u < U; u++) {
+            const float pu = ParamLoad<TP>::cvt(pe[u]);
             const float4* t4 = reinterpret_cast<const float4*>(sE + u * BT);
             #pragma unroll
             for (int j4 = 0; j4 < BT / 4; j4++) {
                 const float4 t = t4[j4];
-                l[j4 * 4 + 0] = fmaf(pe[u], t.x, l[j4 * 4 + 0]);
-                l[j4 * 4 + 1] = fmaf(pe[u], t.y, l[j4 * 4 + 1]);
-                l[j4 * 4 + 2] = fmaf(pe[u], t.z, l[j4 * 4 + 2]);
-                l[j4 * 4 + 3] = fmaf(pe[u], t.w, l[j4 * 4 + 3]);
+                l[j4 * 4 + 0] = fmaf(pu, t.x, l[j4 * 4 + 0]);
+                l[j4 * 4 + 1] = fmaf(pu, t.y, l[j4 * 4 + 1]);
+                l[j4 * 4 + 2] = fmaf(pu, t.z, l[j4 * 4 + 2]);
+                l[j4 * 4 + 3] = fmaf(pu, t.w, l[j4 * 4 + 3]);
             }
         }
         __syncwarp();                                               // before the next edges overwrite the stage

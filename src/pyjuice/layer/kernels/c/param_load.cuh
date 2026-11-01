@@ -2,6 +2,12 @@
 // `float`, or `__nv_bfloat16` -- 8 consecutive values as floats from one 16-byte load (the operand tiles), 4 as floats
 // (the param-flow epilogue), and one. The fp32 forms are the loads the kernels had before they were templated
 // (two float4 / one float4 / a scalar), so the fp32 instantiations compute what they always did, to the bit.
+//
+// `raw` / `cvt` split the one-value load for a kernel that loads ahead: `raw` issues the load into a register of
+// `raw_t` and `cvt` makes the float where the value is used. With `at` the bf16 widening sat right behind the load,
+// so a load issued a chunk ahead stalled the warp there and hid nothing (MEASURED, BlockScale's batch-tiled small-batch
+// forward: 30.9 against fp32's 24.6 us a launch, ~40% of the stall samples on the widening). At fp32 both are the
+// plain load and the identity.
 #pragma once
 #include <cuda_bf16.h>
 #include <type_traits>
@@ -18,6 +24,9 @@ template <> struct ParamLoad<float> {
         r[0] = a.x; r[1] = a.y; r[2] = a.z; r[3] = a.w;
     }
     static __device__ __forceinline__ float at(const float* __restrict__ g) { return *g; }
+    using raw_t = float;
+    static __device__ __forceinline__ raw_t raw(const float* __restrict__ g) { return *g; }
+    static __device__ __forceinline__ float cvt(raw_t r) { return r; }
 };
 
 template <> struct ParamLoad<__nv_bfloat16> {
@@ -36,6 +45,12 @@ template <> struct ParamLoad<__nv_bfloat16> {
         r[0] = f0.x; r[1] = f0.y; r[2] = f1.x; r[3] = f1.y;
     }
     static __device__ __forceinline__ float at(const __nv_bfloat16* __restrict__ g) { return __bfloat162float(*g); }
+    // the 16 bits as stored; widened by the shift `__bfloat162float` makes (exact: the same float)
+    using raw_t = unsigned short;
+    static __device__ __forceinline__ raw_t raw(const __nv_bfloat16* __restrict__ g) {
+        return *reinterpret_cast<const unsigned short*>(g);
+    }
+    static __device__ __forceinline__ float cvt(raw_t r) { return __uint_as_float(((unsigned)r) << 16); }
 };
 
 // The parameters' device pointer in the dtype `TP` the kernel was instantiated for -- checked, as the `data_ptr<float>()`

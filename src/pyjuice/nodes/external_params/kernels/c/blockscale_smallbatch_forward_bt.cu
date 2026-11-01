@@ -146,19 +146,22 @@ __global__ void __launch_bounds__(32 * SPLIT) bs_sb_fwd_bt_kernel(
         if (owner) sW[lane] = (lpj == -INFINITY) ? 0.f : __expf(lpj - Mzf);
 
         float sig = 0.f;                                            // the gate's parameter mass of this node
-        float pe_[U], emv[U];
-        auto fetch = [&](int c, float* p_out, float* em_out) {
+        // The parameters held as loaded (`raw_t`), widened where used: a widening right behind the load ahead would
+        // wait for it there (see param_load.cuh)
+        using PR = typename ParamLoad<TP>::raw_t;
+        PR pe_[U]; float emv[U];
+        auto fetch = [&](int c, PR* p_out, float* em_out) {
             #pragma unroll
             for (int u = 0; u < U; u++) {
                 const int cc = c + u;
                 const bool ok = cc < gate_cbs;
-                p_out[u] = ok ? ParamLoad<TP>::at(pe + (long)cc * block_size) : 0.f;
+                p_out[u] = ok ? ParamLoad<TP>::raw(pe + (long)cc * block_size) : PR(0);
                 em_out[u] = (ok && live) ? ecol[(long)cc * batch] : -INFINITY;
             }
         };
         fetch(0, pe_, emv);
         for (int c = 0; c < gate_cbs; c += U) {
-            float pn[U], emn[U];
+            PR pn[U]; float emn[U];
             if (c + U < gate_cbs) fetch(c + U, pn, emn);
             if (owner) {
                 #pragma unroll
@@ -167,15 +170,16 @@ __global__ void __launch_bounds__(32 * SPLIT) bs_sb_fwd_bt_kernel(
             __syncwarp();
             #pragma unroll
             for (int u = 0; u < U; u++) {
-                sig += pe_[u];
+                const float pu = ParamLoad<TP>::cvt(pe_[u]);
+                sig += pu;
                 const float4* t4 = reinterpret_cast<const float4*>(sE + u * BT);
                 #pragma unroll
                 for (int j4 = 0; j4 < BT / 4; j4++) {
                     const float4 t = t4[j4];
-                    ln[j4 * 4 + 0] = fmaf(pe_[u], t.x, ln[j4 * 4 + 0]);
-                    ln[j4 * 4 + 1] = fmaf(pe_[u], t.y, ln[j4 * 4 + 1]);
-                    ln[j4 * 4 + 2] = fmaf(pe_[u], t.z, ln[j4 * 4 + 2]);
-                    ln[j4 * 4 + 3] = fmaf(pe_[u], t.w, ln[j4 * 4 + 3]);
+                    ln[j4 * 4 + 0] = fmaf(pu, t.x, ln[j4 * 4 + 0]);
+                    ln[j4 * 4 + 1] = fmaf(pu, t.y, ln[j4 * 4 + 1]);
+                    ln[j4 * 4 + 2] = fmaf(pu, t.z, ln[j4 * 4 + 2]);
+                    ln[j4 * 4 + 3] = fmaf(pu, t.w, ln[j4 * 4 + 3]);
                 }
             }
             __syncwarp();
