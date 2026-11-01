@@ -50,7 +50,12 @@ def _bs_triton_ele_blocks_kernel(node_flows, out, node_mars, element_mars, mpara
                     mask = mask_batch[None,:])                     # [TILE_SIZE_M, BLOCK_B]
     offs_gate = offs_ele // GATE_CBS
 
-    acc = tl.zeros([TILE_SIZE_M, BLOCK_B], dtype = tl.float32) - float("inf")
+    # The steps' terms summed in linear space against a running maximum (`acc_m`), one log at the end: the log-space
+    # merge a step (`log(pf + exp(acc - pfmax) + 1e-32) + pfmax` or its mirror, both branches evaluated) was 2 logs and 2
+    # exps an element a step, ~a third of the kernel's stall samples (ncu, Codpula's layer at 29 samples). The 1e-32
+    # stays, once, in the final log: a range whose terms are all exactly 0 keeps the finite value it had.
+    acc_m = tl.zeros([TILE_SIZE_M, BLOCK_B], dtype = tl.float32) - float("inf")
+    acc_l = tl.zeros([TILE_SIZE_M, BLOCK_B], dtype = tl.float32)
     GROWS: tl.constexpr = TILE_SIZE_M // GATE_CBS if TILE_SIZE_M >= GATE_CBS else 1
 
     k0 = pid_s * steps_per_split
@@ -99,14 +104,12 @@ def _bs_triton_ele_blocks_kernel(node_flows, out, node_mars, element_mars, mpara
                     tl.store(grad_ext + grow[:,None] * batch_size + offs_batch[None,:], gacc,
                              mask = mask_batch[None,:] & (gbase >= 0))
 
-            acc = tl.where(partial_flows_max == -float("inf"),
-                acc,
-                tl.where(partial_flows_max > acc,
-                    tl.log(partial_flows + tl.exp(acc - partial_flows_max) + 1e-32) + partial_flows_max,
-                    tl.log(tl.exp(partial_flows_max - acc) * partial_flows + 1.0) + acc
-                )
-            )
+            new_m = tl.maximum(acc_m, partial_flows_max)
+            acc_l = (acc_l * tl.where(acc_m == -float("inf"), 0.0, tl.exp(acc_m - new_m))
+                     + partial_flows * tl.where(partial_flows_max == -float("inf"), 0.0, tl.exp(partial_flows_max - new_m)))
+            acc_m = new_m
 
+    acc = tl.where(acc_m == -float("inf"), -float("inf"), tl.log(acc_l + 1e-32) + acc_m)
     if SPLITS == 1:
         tl.store(out + (off_eleids + offs_ele[:,None]) * batch_size + offs_batch[None,:], acc, mask = mask_batch[None,:])
     else:
