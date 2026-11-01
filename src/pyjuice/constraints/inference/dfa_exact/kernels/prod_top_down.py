@@ -310,8 +310,10 @@ def _input_block_top_down_kernel(element_flows, temp_flows, node_flows, node_mar
                                 temp_width, OUT_TEMP)[:, None] + _parent_base(b, ostride, COMPACT)[None, :]
             if GROUPED:                                                      # the parents' transition masses: each
                 mt = b.to(tl.int64) * mb_stride + t                          # step's rank's block of the boundary's
-                masses = trans + tl.load(mbase + mt)[None, :] + \
-                    tl.load(parents + p * 7 + 6).to(tl.int64)[:, None] * tl.load(mcount + mt).to(tl.int64)[None, :]
+                # (masked: a lane past the tile's outputs has no sample, its `b` anywhere -- see _input_block_kernel)
+                masses = trans + tl.load(mbase + mt, mask = m, other = 0)[None, :] + \
+                    tl.load(parents + p * 7 + 6).to(tl.int64)[:, None] * \
+                    tl.load(mcount + mt, mask = m, other = 0).to(tl.int64)[None, :]
                 bbt = tl.load(bbase + t)                                     # pairs, or of the lane's sample's entries
             else:
                 mrow = tl.load(mass_row + (u - input_start)).to(tl.int64)[:, None]
@@ -443,9 +445,10 @@ def _block_input_top_down_kernel(element_flows, temp_flows, node_flows, node_mar
             mx, acc = _lse_step_one_exp(mx, acc, tl.where(obs[None, :], own + ov, float("-inf")))
             if any_miss:
                 if GROUPED:                                                  # the parents' transition masses (as in
-                    mt = b.to(tl.int64) * mb_stride + t                      # _input_block_top_down_kernel)
-                    masses = trans + tl.load(mbase + mt)[None, :] + \
-                        tl.load(parents + p * 7 + 6).to(tl.int64)[:, None] * tl.load(mcount + mt).to(tl.int64)[None, :]
+                    mt = b.to(tl.int64) * mb_stride + t                      # _input_block_top_down_kernel; masked)
+                    masses = trans + tl.load(mbase + mt, mask = m, other = 0)[None, :] + \
+                        tl.load(parents + p * 7 + 6).to(tl.int64)[:, None] * \
+                        tl.load(mcount + mt, mask = m, other = 0).to(tl.int64)[None, :]
                     bbt = tl.load(bbase + t)
                 else:
                     mrow = tl.load(mass_row + (u - input_start)).to(tl.int64)[:, None]

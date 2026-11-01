@@ -396,8 +396,10 @@ def _input_block_kernel(element_mars, node_mars, temp, obs_class, next_col, delt
             acc = tl.zeros([TILE], dtype = tl.float32)
             if GROUPED:                                                      # the step's transition masses: its rank's
                 mt = b.to(tl.int64) * mb_stride + t                          # block of the boundary's pairs, or of the
-                masses = trans + tl.load(mbase + mt) + \
-                    tl.load(steps + s * 7 + 6).to(tl.int64) * tl.load(mcount + mt).to(tl.int64)   # lane's sample's
+                # (masked: a lane past the tile's outputs has no sample, its `b` anywhere -- unmasked, these 8-byte
+                # loads read past the tables and, on an unmapped page, faulted the context)
+                masses = trans + tl.load(mbase + mt, mask = miss, other = 0) + \
+                    tl.load(steps + s * 7 + 6).to(tl.int64) * tl.load(mcount + mt, mask = miss, other = 0).to(tl.int64)
                 bbt = tl.load(bbase + t)                                     # entries there (see Program.mass_args)
                 tk, pr, lz = 0, 0, 0.0                                       # (no class masses read)
             else:                                                            # the input's row of the class masses
@@ -630,9 +632,9 @@ def _block_input_kernel(element_mars, node_mars, temp, obs_class, next_col, delt
             lp = lp + tl.where(l_own, b * LS, 0)
             lbase = 0
         if GROUPED:                                                          # the step's transition masses (as in
-            mt = b.to(tl.int64) * mb_stride + t                              # _input_block_kernel)
-            masses = trans + tl.load(mbase + mt) + \
-                tl.load(steps + s * 7 + 6).to(tl.int64) * tl.load(mcount + mt).to(tl.int64)
+            mt = b.to(tl.int64) * mb_stride + t                              # _input_block_kernel; masked as there)
+            masses = trans + tl.load(mbase + mt, mask = m, other = 0) + \
+                tl.load(steps + s * 7 + 6).to(tl.int64) * tl.load(mcount + mt, mask = m, other = 0).to(tl.int64)
             bbt = tl.load(bbase + t)
         else:                                                                # the input's row of the class masses
             mrow = tl.load(mass_row + (u - input_start)).to(tl.int64) + b * 0
