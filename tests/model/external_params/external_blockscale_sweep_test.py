@@ -155,8 +155,13 @@ SMALL = [(K, K, g, b)
 @needs_cute
 @pytest.mark.parametrize("num_latents,block_size,gate_cbs,batch", LARGE)
 def test_sweep_large_batch(num_latents, block_size, gate_cbs, batch):
-    """The CuTe/TMA forks, over tile sizes, gate widths and parent-block counts."""
-    _check(num_latents, block_size, gate_cbs, batch, tol_val = 2e-3, tol_ef = 3e-3, tol_pf = 5e-3)
+    """The CuTe/TMA forks, over tile sizes, gate widths and parent-block counts.
+
+    Their operands are bf16 -- the parameters, the exponentials and the normalizer's gate exponentials, each within
+    2^-9 -- and a node value is the ratio of two such sums: off by 2.18e-3 at (256, 128, 32), every CuTe and pre-pass
+    config alike (a float64 emulation of those roundings gives the same number). Where an fp32 fork (small-batch) is
+    faster the tuner takes it and the error is ~1e-6; the bar is the bf16 forks'."""
+    _check(num_latents, block_size, gate_cbs, batch, tol_val = 3e-3, tol_ef = 3e-3, tol_pf = 5e-3)
 
 
 @cuda_only
@@ -205,7 +210,7 @@ def test_sweep_small_batch_tensor_cores(num_latents, block_size, gate_cbs, batch
     """The tensor-core small-batch forward and element backward (blockscale_smallbatch_forward_mma.cu,
     blockscale_smallbatch_ele_mma.cu) forced: bf16 operands, so the large batch's bar."""
     taken = _force_twins(monkeypatch, hp = False)
-    _check(num_latents, block_size, gate_cbs, batch, tol_val = 2e-3, tol_ef = 3e-3, tol_pf = 5e-3)
+    _check(num_latents, block_size, gate_cbs, batch, tol_val = 3e-3, tol_ef = 3e-3, tol_pf = 5e-3)
     assert taken == {"sbmma", "sbm"}, taken
 
 
