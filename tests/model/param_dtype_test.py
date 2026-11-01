@@ -500,3 +500,98 @@ def test_blockscale_gate_gradients_at_bf16(B):
     for g16 in (grads(pc16), grads(pc_conv)):
         assert torch.allclose(g16, g32, atol = 5e-4 * g32.abs().max().item(), rtol = 0.0), \
             float((g16 - g32).abs().max() / g32.abs().max())
+
+
+def _codpula_pair(gated):
+    """CoDD's PC in small: a homogeneous GeneralizedHMM over soft evidence (`SoftEvidenceCategorical`, its dual-flow
+    backward), gated (every latent-wide sum a BlockScale node: its z-correction, the sum parameters' dual-flow EM) or
+    not; at fp32 and at bf16 sum parameters, the same (rounded) values. (fp32 pc, bf16 pc, the gated nodes)."""
+    from pyjuice.nodes import BlockScaleSumParams
+    from pyjuice.nodes.external_sum_nodes import ExternalParamsSumNodes
+    torch.manual_seed(0)
+    # (blocks of 32, as Codpula's: below batch 16 BlockScale's parameter-flow backward needs them)
+    ns = juice.structures.GeneralizedHMM(seq_length = 6, num_latents = 64, homogeneous = True, block_size = 32,
+                                         input_dist = dists.SoftEvidenceCategorical(num_cats = 300, _dual_flow_backward = True))
+    gated_ns = []
+    if gated:
+        for s in ns:
+            if s.is_sum() and s.num_nodes == 64:
+                s.__class__ = ExternalParamsSumNodes
+                s.external_params = BlockScaleSumParams(ch_block_size = 32)
+                gated_ns.append(s)
+    ns.init_parameters(perturbation = 2.0)
+    pc32 = juice.compile(ns, verbose = False).to(DEV)
+    pc16 = juice.compile(ns, verbose = False, param_dtype = BF16).to(DEV)
+    pc32.set_param_dtype(BF16).set_param_dtype(torch.float32)           # the same (rounded) values
+    assert pc16._requests_denom_param_flows == gated
+    return pc32, pc16, gated_ns
+
+
+def _topk_evidence(B, V, C, K, seed):
+    """Top-k evidence as CoDD hands it over: K distinct candidates a position, the token among them, bf16 log-probs."""
+    g = torch.Generator(device = DEV).manual_seed(seed)
+    ids = torch.rand(B, V, C, device = DEV, generator = g).topk(K, dim = -1).indices
+    x = ids.gather(-1, torch.randint(0, K, (B, V, 1), device = DEV, generator = g)).squeeze(-1)
+    lp = torch.log_softmax(torch.randn(B, V, K, device = DEV, generator = g) * 2, dim = -1)
+    return x, lp.to(BF16).contiguous(), ids.contiguous()
+
+
+@cuda_only
+@pytest.mark.parametrize("gated", [False, True], ids = ["ungated", "gated"])
+@pytest.mark.parametrize("B", [8, 40])
+def test_codpula_dual_flows_at_bf16(gated, B):
+    """CoDD's training step on bf16 sum parameters with both dual flows -- SoftEvi's (the input parameters) and, gated,
+    BlockScale's z-correction (the sum parameters) -- against fp32 on the same values: log-likelihoods, the sum flows and
+    their denominators, the SoftEvi layer's dual flows, the evidence gradient (an fp32 buffer: a bf16 one rounds it to
+    its own 2^-8) and the gate gradient, then two micro-batches' EM step as CoDD's loop runs it (step-size rescaled; the
+    sum parameters through the master copy, `params` its rounding). MEASURED on CoDD's PC (32 x 1024, blocks of 32, real
+    LLaDA evidence): bf16 vs fp32 flows 2e-6..2.5e-5, the gate gradient 2.6-4.7e-4, the parameters after EM 1e-4 of
+    their largest; two fp32 runs 1e-7."""
+    from pyjuice.layer.external_sum_layer import EXTERNAL_PARAMS_GRAD_KWARG
+    pc32, pc16, gated_ns = _codpula_pair(gated)
+    V, C, K = 6, 300, 24
+
+    def rel(a, b):
+        return float((a.double() - b.double()).abs().max() / b.double().abs().max())
+
+    def gates(i):
+        g = torch.Generator(device = DEV).manual_seed(100 + i)
+        return {s: torch.randn(s.external_params.tensor_shapes(s, B)[0], device = DEV, generator = g)
+                for s in gated_ns}
+
+    outs = {}
+    for name, pc in (("fp32", pc32), ("bf16", pc16)):
+        pc.init_param_flows(flows_memory = 0.0)
+        res = []
+        for i in range(2):
+            x, lp, ids = _topk_evidence(B, V, C, K, seed = i)
+            phi = gates(i)
+            fkw = {"sum_external_params": phi} if gated else {}
+            gkw = {EXTERNAL_PARAMS_GRAD_KWARG: {s: torch.zeros_like(p) for s, p in phi.items()}} if gated else {}
+            lls = pc(x, categorical_evidence_logp = lp, soft_evidence_cat_ids = ids, **fkw)
+            eg = torch.zeros(lp.shape, dtype = torch.float32, device = DEV)
+            pc.backward(x, allow_modify_flows = False, logspace_flows = True, categorical_evidence_logp = lp,
+                        soft_evidence_cat_ids = ids, categorical_evidence_logp_grad = eg, **fkw, **gkw)
+            gg = torch.cat([t.flatten() for t in gkw[EXTERNAL_PARAMS_GRAD_KWARG].values()]) if gated else None
+            res.append((lls.clone(), eg, gg))
+        outs[name] = res
+    for (l32, e32, g32), (l16, e16, g16) in zip(outs["fp32"], outs["bf16"]):
+        # (the tuned forks may take bf16 operands where the parameters are bf16: MEASURED 1.8e-3 nats at |LL| ~ 25
+        # where one did -- 1e-8 where none did; as `test_bf16_parameters_agree_with_fp32_to_their_rounding` allows)
+        assert torch.allclose(l16, l32, atol = 1e-2, rtol = 0.0), float((l16 - l32).abs().max())
+        assert rel(e16, e32) < 2e-3, rel(e16, e32)
+        if gated:
+            assert rel(g16, g32) < 2e-3, rel(g16, g32)
+    assert rel(pc16.param_flows, pc32.param_flows) < 1e-3, rel(pc16.param_flows, pc32.param_flows)
+    if gated:
+        assert rel(pc16.denom_param_flows, pc32.denom_param_flows) < 1e-3
+    for a, b in zip(pc32.input_layer_group, pc16.input_layer_group):
+        assert rel(b.param_flows, a.param_flows) < 1e-3, rel(b.param_flows, a.param_flows)
+
+    for pc in (pc32, pc16):
+        pc._cum_flow = 2.0 * B
+        pc.mini_batch_em(step_size = 0.6, pseudocount = 1e-6, step_size_rescaling = True)
+    assert rel(pc16.params_master, pc32.params) < 1e-3, rel(pc16.params_master, pc32.params)
+    assert torch.equal(pc16.params, pc16.params_master.to(BF16))
+    for a, b in zip(pc32.input_layer_group, pc16.input_layer_group):
+        assert rel(b.params, a.params) < 1e-3, rel(b.params, a.params)
