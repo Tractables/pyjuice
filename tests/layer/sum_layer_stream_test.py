@@ -166,6 +166,44 @@ def test_the_stream_forward_on_dead_columns(name, monkeypatch):
     assert checked > 0, "no layer of the circuit takes the stream forward"
 
 
+@pytest.mark.parametrize("name", ["hmm896", "hclt256_b64"])
+def test_the_stream_forward_reads_the_exponentials_of_its_own_call(name, monkeypatch):
+    """Every arm right after a call on OTHER children's values: the GEMM's blocks launch beside the pre-pass (the chain's
+    programmatic dependent launch) into a scratch the allocator hands back from the call before -- that call's
+    exponentials in it -- so a GEMM reading them before its own pre-pass is done gives the call before's rows. Against
+    float64 of this call's values."""
+    if not _available():
+        pytest.skip("the CUDA kernels are not available here")
+    monkeypatch.setattr(SL, "FORWARD_SUM_CUDA", False)
+    pc, V, C = CIRCUITS[name]()
+    B = 128
+    x = torch.randint(0, C, (B, V), device = DEV)
+    pc(x)
+    gen = torch.Generator(device = DEV).manual_seed(1)
+    checked = 0
+    for layer, nids, ebase, pbase in _cuda_layers(pc, B):
+        saved = pc.element_mars.clone()
+        other = saved + 4 * torch.randn(saved.shape, generator = gen, device = DEV)    # (-inf stays -inf)
+        ref = _float64(pc, layer, nids, B)
+        fin = torch.isfinite(ref)
+        a, b = layer.nid_range
+        groups = ck.row_groups(ebase)
+        for code in ck.stream_arms(layer.block_size, B, ebase.size(1), nids.numel(), groups[2]):
+            pc.element_mars.copy_(other)
+            ck.tlmm_forward_sum_stream(pc.node_mars, pc.element_mars, pc.params, nids, ebase, pbase, groups, B,
+                                       layer.block_size, ebase.size(1), code)
+            pc.element_mars.copy_(saved)
+            pc.node_mars[a:b] = NAN
+            ck.tlmm_forward_sum_stream(pc.node_mars, pc.element_mars, pc.params, nids, ebase, pbase, groups, B,
+                                       layer.block_size, ebase.size(1), code)
+            got = pc.node_mars[a:b]
+            assert torch.equal(fin, torch.isfinite(got)) and (got[~fin] == NINF).all(), (name, code, "the -inf pattern")
+            assert float((got.double()[fin] - ref[fin]).abs().max()) < 1e-2, (name, code, "against float64")
+        pc.element_mars.copy_(saved)
+        checked += 1
+    assert checked > 0, "no layer of the circuit takes the stream forward"
+
+
 def _check_runs(got, want, rows, label):
     """A launch over runs: the rows outside untouched (NaN), those inside the arm's -- or, a run too short for the
     partition's grouped tiles, the pre-pass kernel's: the same -inf pattern, within 5e-3."""
@@ -363,6 +401,38 @@ def test_the_stream_element_backward_against_float64_and_the_prepass_kernel(name
         if name.startswith("hmm"):                                      # every child block the same parents
             assert groups[1].numel() == 1, (name, "one group")
         _check_ele_arms(pc, layer, chids, cs, ebase, pbase, rows, groups, B, ref, pre, (name, B, sig))
+        checked += 1
+    assert checked > 0, "no partition of the circuit takes the stream element backward"
+
+
+@pytest.mark.parametrize("name", ["hmm896", "hclt256_b64"])
+def test_the_stream_element_backward_reads_the_exponentials_of_its_own_call(name, monkeypatch):
+    """Every arm right after a call on OTHER parents' flows -- the forward stream's test of the chain's programmatic
+    dependent launch (`test_the_stream_forward_reads_the_exponentials_of_its_own_call`) for the element backward."""
+    if not _ele_available():
+        pytest.skip("the CUDA kernels are not available here")
+    B = 128
+    pc = _ele_state(name, B, monkeypatch)
+    gen = torch.Generator(device = DEV).manual_seed(1)
+    checked = 0
+    for layer, sig, chids, cs, ebase, pbase, rows, groups in _ele_partitions(pc, B):
+        saved = pc.node_flows.clone()
+        other = saved + 4 * torch.randn(saved.shape, generator = gen, device = DEV)
+        ref = _ele_float64(pc, layer, sig, chids, cs)
+        fin = torch.isfinite(ref)
+        for code in ck.ele_stream_arms(cs, B, layer.block_size, ebase.size(1), chids.numel(), groups[2]):
+            ef = torch.full_like(pc.element_flows, NAN)
+            pc.node_flows.copy_(other)
+            ck.ele_backward_sum_stream(ef, pc.element_mars, pc.node_flows, pc.node_mars, pc.params, chids, ebase, pbase,
+                                       groups, B, layer.block_size, cs, ebase.size(1), code)
+            pc.node_flows.copy_(saved)
+            ef.fill_(NAN)
+            ck.ele_backward_sum_stream(ef, pc.element_mars, pc.node_flows, pc.node_mars, pc.params, chids, ebase, pbase,
+                                       groups, B, layer.block_size, cs, ebase.size(1), code)
+            got = ef[rows]
+            assert torch.equal(fin, torch.isfinite(got)) and (got[~fin] == NINF).all(), (name, code, "the -inf pattern")
+            assert float((got.double()[fin] - ref[fin]).abs().max()) < 1e-2, (name, code, "against float64")
+        pc.node_flows.copy_(saved)
         checked += 1
     assert checked > 0, "no partition of the circuit takes the stream element backward"
 

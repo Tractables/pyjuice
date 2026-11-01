@@ -26,6 +26,12 @@
 // launches; the plan keeps the faster). Against float64 the node values' max error 2 - 5e-4 (the pre-pass copy's
 // 5 - 15e-4), log Z's 3e-6 (8e-4).
 //
+// The three launches are chained by programmatic dependent launch, as the regular stream's are
+// (layer/kernels/c/tlmm_forward_sum_stream.cu): the GEMM's blocks launch while the pre-pass runs, set up and load the
+// first stages' parameter tiles, then wait for it; the merge launches while the GEMM runs. Every kernel waits before it
+// touches what an earlier launch of the chain wrote. MEASURED gated HMM-4096 B128 bf16 training (both chains): the
+// forward 764 -> 707 us, the step 3353 -> 3130-3230 us; the same bits.
+//
 // Scope (`fitting_configs`, and the Python plan for the rest): bf16 parameters with 8-aligned runs, one gate per node
 // block, node_cbs >= 64 (an edge tile is one run of children), a power-of-two gate width >= 4 dividing node_cbs,
 // batch % 64 == 0, block_size % 64 == 0 and a multiple of the tile's rows, split 1 .. 8. Scratch: one allocation per
@@ -86,6 +92,8 @@ __global__ void __launch_bounds__(NT) bs_stream_prepass_kernel(
         long ext_base, int gc) {
     constexpr int PARTS = NT / PB, NG = CH / 4;          // a gate spans >= 4 children
     __shared__ float smx[PARTS][PB];
+    cudaGridDependencySynchronize();                     // (`element_mars` is the launch before's)
+    cudaTriggerProgrammaticLaunchCompletion();           // the GEMM may launch onto the SMs this grid leaves free
     const int tid = threadIdx.x, nbc = batch / PB;
     const int r = blockIdx.x / (split * nbc), sp = (blockIdx.x / nbc) % split, b0 = (blockIdx.x % nbc) * PB;
     const int b = tid % PB, part = tid / PB;
@@ -338,7 +346,8 @@ __global__ void __launch_bounds__((WM * WN + PW) * 32) bs_stream_gemm_kernel(
     constexpr int ABYTES = KT * BM * 2, BBYTES = KT * BN * 2;
     constexpr int STAGE = (ABYTES + BBYTES + 1023) / 1024 * 1024;
     constexpr int SUB = BK / KT;                         // k-steps an edge tile is
-    if ((int)blockIdx.x >= n_gemm) {
+    cudaTriggerProgrammaticLaunchCompletion();           // the merge may launch
+    if ((int)blockIdx.x >= n_gemm) {                     // (the gates' and sigma's: nothing of the chain writes them)
         z_tile<NC + NP, ZMT, ZBT>(smem_raw, blockIdx.x - n_gemm, sigma, ext, gate, log_z_out, batch, block_size,
                                   n_gates, n_child_gates, gate_stride, ext_base);
         return;
@@ -384,6 +393,14 @@ __global__ void __launch_bounds__((WM * WN + PW) * 32) bs_stream_gemm_kernel(
         }
         const uint32_t sbase = (uint32_t)__cvta_generic_to_shared(smem_raw);
         const long* pr = pids + (long)r * knt;
+        // the first stages' parameter tiles while the pre-pass may still run (no launch of the chain writes them)
+        const int t_pre = min(k1, k0 + ST);
+        for (int t = k0; t < t_pre; t++) {
+            const bfloat16_t* pa = params + pr[t / SUB] + (long)(t % SUB) * KT * block_size + (long)tile_id * BM;
+            CUTE_UNROLL
+            for (int q = 0; q < CA; q++) if (oA[q] != ~0u) cpa16(sbase + (t - k0) * STAGE + oA[q], pa + gA[q]);
+        }
+        cudaGridDependencySynchronize();                 // u (the pre-pass's) from here on
         for (int t = k0; t < k1; t++) {
             const int j = t - k0, s = j % ST;
             if (j >= ST) mbar_wait(&empty[s], ((j / ST) - 1) & 1);
@@ -391,11 +408,13 @@ __global__ void __launch_bounds__((WM * WN + PW) * 32) bs_stream_gemm_kernel(
             const int t64 = t / SUB, sub = t % SUB;
             const bfloat16_t* pa = params + pr[t64] + (long)sub * KT * block_size + (long)tile_id * BM;
             const bfloat16_t* pb = u + ((long)r * num_edges + (long)t * KT) * batch + (long)pid_b * BN;
-            CUTE_UNROLL
-            for (int q = 0; q < CA; q++) if (oA[q] != ~0u) cpa16(ss + oA[q], pa + gA[q]);
+            if (t >= t_pre) {
+                CUTE_UNROLL
+                for (int q = 0; q < CA; q++) if (oA[q] != ~0u) cpa16(ss + oA[q], pa + gA[q]);
+            }
             CUTE_UNROLL
             for (int q = 0; q < CB; q++) if (oB[q] != ~0u) cpa16(ss + oB[q], pb + gB[q]);
-            cpa_mbar_arrive(&full[s]);
+            cpa_mbar_arrive(&full[s]);                   // (tracks every copy this thread issued: the stage's A too)
         }
         asm volatile("cp.async.wait_all;\n" ::: "memory");
         return;
@@ -438,6 +457,7 @@ __global__ void __launch_bounds__((WM * WN + PW) * 32) bs_stream_gemm_kernel(
             cute::gemm(mma, tCrA(_, _, kb), tCrB(_, _, kb), tCrL);
         }
     }
+    cudaGridDependencySynchronize();                     // (the producers waited; the epilogue's own guarantee)
     float* o = part + ((long)sp * rows_total + (long)r * block_size + (long)tile_id * BM) * batch + pid_b * BN;
     CUTE_UNROLL
     for (int i = 0; i < size(tCrL); i += 2) {            // (i, i + 1): columns b, b + 1 of one row
@@ -450,6 +470,7 @@ template <int S>
 __global__ void __launch_bounds__(256) bs_stream_merge_kernel(
         float* __restrict__ node_mars, const float* __restrict__ log_z, const float* __restrict__ part,
         const float* __restrict__ mp, const long* __restrict__ nids, int batch, int block_size, long rows_total) {
+    cudaGridDependencySynchronize();                     // (the GEMM's partials and log Z)
     const long idx = (long)blockIdx.x * 256 + threadIdx.x;
     const int bq = batch / 4;
     if (idx >= rows_total * bq) return;
@@ -483,6 +504,18 @@ __global__ void __launch_bounds__(256) bs_stream_merge_kernel(
 }
 
 // ---------------- host ----------------
+// `kernel<<<grid, block, smem, st>>>(args...)` as a programmatic dependent of the launch before it (see the top)
+template <typename... P, typename... A>
+static void launch_pdl(void (*kernel)(P...), dim3 grid, dim3 block, int smem, cudaStream_t st, A... args) {
+    cudaLaunchConfig_t lc = {};
+    lc.gridDim = grid; lc.blockDim = block; lc.dynamicSmemBytes = smem; lc.stream = st;
+    cudaLaunchAttribute at[1];
+    at[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    at[0].val.programmaticStreamSerializationAllowed = 1;
+    lc.attrs = at; lc.numAttrs = 1;
+    C10_CUDA_CHECK(cudaLaunchKernelEx(&lc, kernel, static_cast<P>(args)...));
+}
+
 template <int BM, int BN, int WM, int WN, int PW, int ST, int KT, int ZMT, int ZBT>
 static void launch_gemm(const bfloat16_t* params, const long* pids, const bfloat16_t* u, float* part, int knt, int rows,
                         int block_size, int batch, int num_edges, int split, const float* sigma, const float* ext,
@@ -507,9 +540,9 @@ static void launch_gemm(const bfloat16_t* params, const long* pids, const bfloat
     const long n_gemm = (long)(batch / BN) * rows * mtiles * split;
     const long n_z = (long)rows * (block_size / ZMT) * (batch / ZBT);
     TORCH_CHECK(n_gemm + n_z < (1L << 31), "blockscale forward stream: a grid past 2^31 blocks");
-    kernel<<<(unsigned)(n_gemm + n_z), NTH, SMEM, st>>>(params, pids, u, part, knt, mtiles, block_size, batch,
-                                                        num_edges, split, (long)rows * block_size, (int)n_gemm, sigma,
-                                                        ext, gate, log_z, n_gates, ncg, gate_stride, ext_base);
+    launch_pdl(kernel, dim3((unsigned)(n_gemm + n_z)), dim3(NTH), SMEM, st, params, pids, u, part, knt, mtiles,
+               block_size, batch, num_edges, split, (long)rows * block_size, (int)n_gemm, sigma, ext, gate, log_z,
+               n_gates, ncg, gate_stride, ext_base);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
@@ -610,10 +643,10 @@ void blockscale_forward_stream(torch::Tensor node_mars, torch::Tensor element_ma
     {
         constexpr int NT = 512, PB = 16;
         const int gc = (int)(gate_cbs < CH ? gate_cbs : CH);
-        bs_stream_prepass_kernel<NT, PB><<<rows * split * (batch / PB), NT, 0, st>>>(
-            element_mars.data_ptr<float>(), cids.data_ptr<long>(), ext.data_ptr<float>(), gate.data_ptr<long>(), u, mp,
-            batch, (int)num_edges, knt, ksteps, kt_sh, split, (int)gate.size(1), node_sh, gate_sh, (int)node_cbs,
-            (long)ext_base, gc);
+        launch_pdl(bs_stream_prepass_kernel<NT, PB>, dim3(rows * split * (batch / PB)), dim3(NT), 0, st,
+                   element_mars.data_ptr<float>(), cids.data_ptr<long>(), ext.data_ptr<float>(), gate.data_ptr<long>(),
+                   u, mp, batch, (int)num_edges, knt, ksteps, kt_sh, split, (int)gate.size(1), node_sh, gate_sh,
+                   (int)node_cbs, (long)ext_base, gc);
         C10_CUDA_KERNEL_LAUNCH_CHECK();
     }
     switch (cfg_id) {
@@ -632,8 +665,8 @@ void blockscale_forward_stream(torch::Tensor node_mars, torch::Tensor element_ma
         const float* lz = log_z.data_ptr<float>();
         const long* np = nids.data_ptr<long>();
         switch (split) {
-#define M_(S) case S: bs_stream_merge_kernel<S><<<grid, 256, 0, st>>>(nm, lz, part, mp, np, batch, (int)block_size, \
-                                                                      rt); break;
+#define M_(S) case S: launch_pdl(bs_stream_merge_kernel<S>, dim3(grid), dim3(256), 0, st, nm, lz, part, mp, np, batch, \
+                                 (int)block_size, rt); break;
             M_(1) M_(2) M_(3) M_(4) M_(5) M_(6) M_(7) M_(8)
 #undef M_
         }

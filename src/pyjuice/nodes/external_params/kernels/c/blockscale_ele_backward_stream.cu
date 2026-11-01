@@ -27,6 +27,12 @@
 // gradient's 2-3e-6 (1.5e-5), and no flow lost where the pre-pass kernel's fp16 parameters flush (children whose
 // parameters are all < 6e-8). Three launches: ~2 us more host time a call than the pre-pass kernel's two (7.1 / 5.1).
 //
+// The three launches are chained by programmatic dependent launch, as the regular stream's are
+// (layer/kernels/c/tlmm_forward_sum_stream.cu): the GEMM's blocks launch while the pre-pass runs, set up and load the
+// first stages' parameter tiles, then wait for it; the merge launches while the GEMM runs. Every kernel waits before it
+// touches what an earlier launch of the chain wrote. MEASURED gated HMM-4096 B128 bf16 training (both chains): the
+// forward 764 -> 707 us, the step 3353 -> 3130-3230 us; the same bits.
+//
 // Scope (`fitting_configs`, and the Python plan for the rest): bf16 parameters with 8-aligned rows, k-tiles of 64
 // parents within one parent block (contiguous node ids), a power-of-two gate width from 4 to the element block,
 // batch % 64 == 0, the element block a multiple of 64 and of the tile's rows, at most PMAX pieces an element block.
@@ -84,6 +90,8 @@ __global__ void __launch_bounds__(NT) bs_eles_prepass_kernel(
         int kt_sh, int npc) {
     constexpr int PARTS = NT / PB;
     __shared__ float smx[PARTS][PB];
+    cudaGridDependencySynchronize();                     // (the flows are the launches before's)
+    cudaTriggerProgrammaticLaunchCompletion();           // the GEMM may launch onto the SMs this grid leaves free
     const int tid = threadIdx.x, nbc = batch / PB;
     const int grp = blockIdx.x / (npc * nbc), p = (blockIdx.x / nbc) % npc, b0 = (blockIdx.x % nbc) * PB;
     const int eb = grep[grp];
@@ -177,6 +185,7 @@ __global__ void __launch_bounds__((WM * WN + PW) * 32) bs_eles_gemm_kernel(
     if (tid == 0)
         for (int s = 0; s < ST; s++) { mbar_init(&full[s], NP); mbar_init(&empty[s], NC); }
     __syncthreads();
+    cudaTriggerProgrammaticLaunchCompletion();           // the merge may launch
     const int* k0p = pc_k0 + eb * PMAX;
     const int* k1p = pc_k1 + eb * PMAX;
     if (tid >= NC) {
@@ -206,6 +215,15 @@ __global__ void __launch_bounds__((WM * WN + PW) * 32) bs_eles_gemm_kernel(
         const uint32_t sbase = (uint32_t)__cvta_generic_to_shared(smem_raw);
         const long* pr = pbase + (long)eb * knt;
         const long ub = (long)ugrp[eb] * knt * BK * batch + (long)pid_b * BN;
+        // the first stages' parameter tiles while the pre-pass may still run (no launch of the chain writes them)
+        int jpre = 0;
+        for (int pc = plo; pc < phi && jpre < ST; pc++)
+            for (int t = k0p[pc]; t < k1p[pc] && jpre < ST; t++, jpre++) {
+                const bfloat16_t* pa = params + pr[t / SUB] + (long)tile_id * BM * BSK + (t % SUB) * KT;
+                CUTE_UNROLL
+                for (int qq = 0; qq < CA; qq++) if (oA[qq] != ~0u) cpa16(sbase + jpre * STAGE + oA[qq], pa + gA[qq]);
+            }
+        cudaGridDependencySynchronize();                 // uh, ul (the pre-pass's) from here on
         int j = 0;
         for (int pc = plo; pc < phi; pc++) {
             for (int t = k0p[pc]; t < k1p[pc]; t++, j++) {
@@ -214,8 +232,10 @@ __global__ void __launch_bounds__((WM * WN + PW) * 32) bs_eles_gemm_kernel(
                 const uint32_t ss = sbase + s * STAGE;
                 const int t64 = t / SUB, sub = t % SUB;
                 const bfloat16_t* pa = params + pr[t64] + (long)tile_id * BM * BSK + sub * KT;
-                CUTE_UNROLL
-                for (int qq = 0; qq < CA; qq++) if (oA[qq] != ~0u) cpa16(ss + oA[qq], pa + gA[qq]);
+                if (j >= jpre) {
+                    CUTE_UNROLL
+                    for (int qq = 0; qq < CA; qq++) if (oA[qq] != ~0u) cpa16(ss + oA[qq], pa + gA[qq]);
+                }
                 const long ob = ub + (long)t * KT * batch;
                 CUTE_UNROLL
                 for (int h = 0; h < 2; h++) {
@@ -231,6 +251,7 @@ __global__ void __launch_bounds__((WM * WN + PW) * 32) bs_eles_gemm_kernel(
         return;
     }
     // ---------------- consumers: a piece's k-steps into one accumulator, stored at its end ----------------
+    cudaGridDependencySynchronize();                     // (the producers wait; the stores' own guarantee)
     TiledMMA mma = make_tiled_mma(SM80_16x8x16_F32BF16BF16F32_TN{}, Layout<Shape<Int<WM>, Int<WN>, _1>>{});
     ThrMMA thr = mma.get_thread_slice(tid);
     Tensor sAt0 = make_tensor(make_smem_ptr(stA(0)), sAl);
@@ -308,6 +329,7 @@ __global__ void __launch_bounds__(256, 4) bs_eles_merge_kernel(
         const long* __restrict__ chids, const int* __restrict__ ugrp, float* __restrict__ grad, int batch, int BSM,
         int gc, int R, long ext_base, int npc, long rows_total, int wgrad) {
     __shared__ float sg[16][PMAX][16];                   // [group of children][piece][column]: summed over chunks
+    cudaGridDependencySynchronize();                     // (the GEMM's partials)
     const int tid = threadIdx.x, mi = tid / 4, cq = tid % 4, lane = tid % 32;
     const int nrb = BSM / R, nbc = batch / 16;
     const int eb = blockIdx.x / (nrb * nbc), mb = ((blockIdx.x / nbc) % nrb) * R, b0 = (blockIdx.x % nbc) * 16;
@@ -402,6 +424,18 @@ __global__ void __launch_bounds__(256, 4) bs_eles_merge_kernel(
 }
 
 // ---------------- host ----------------
+// `kernel<<<grid, block, smem, st>>>(args...)` as a programmatic dependent of the launch before it (see the top)
+template <typename... P, typename... A>
+static void launch_pdl(void (*kernel)(P...), dim3 grid, dim3 block, int smem, cudaStream_t st, A... args) {
+    cudaLaunchConfig_t lc = {};
+    lc.gridDim = grid; lc.blockDim = block; lc.dynamicSmemBytes = smem; lc.stream = st;
+    cudaLaunchAttribute at[1];
+    at[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    at[0].val.programmaticStreamSerializationAllowed = 1;
+    lc.attrs = at; lc.numAttrs = 1;
+    C10_CUDA_CHECK(cudaLaunchKernelEx(&lc, kernel, static_cast<P>(args)...));
+}
+
 template <int BM, int BN, int WM, int WN, int PW, int ST, int KT>
 static void launch_gemm(const bfloat16_t* params, const long* pbase, const bfloat16_t* uh, const bfloat16_t* ul,
                         const int* pc_k0, const int* pc_k1, const int* sp_lo, const int* sp_hi, const int* ugrp,
@@ -420,8 +454,8 @@ static void launch_gemm(const bfloat16_t* params, const long* pbase, const bfloa
     const int mtiles = BSM / BM;
     TORCH_CHECK((long)neb * mtiles < 65536, "blockscale element stream: past 65535 child tiles");
     dim3 grid(batch / BN, neb * mtiles, split);
-    kernel<<<grid, (WM * WN + PW) * 32, SMEM, st>>>(params, pbase, uh, ul, pc_k0, pc_k1, sp_lo, sp_hi, ugrp, part, knt,
-                                                    mtiles, BSK, batch, split, (long)neb * BSM);
+    launch_pdl(kernel, grid, dim3((WM * WN + PW) * 32), SMEM, st, params, pbase, uh, ul, pc_k0, pc_k1, sp_lo, sp_hi, ugrp,
+               part, knt, mtiles, BSK, batch, split, (long)neb * BSM);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
@@ -509,7 +543,7 @@ void blockscale_ele_backward_stream(torch::Tensor element_flows, torch::Tensor e
     auto* part = reinterpret_cast<float*>(base + o_part);
     cudaStream_t st = c10::cuda::getCurrentCUDAStream();
     {
-#define P_(NT, PB) bs_eles_prepass_kernel<NT, PB><<<ngrp * (int)npc * ((int)batch / PB), NT, 0, st>>>( \
+#define P_(NT, PB) launch_pdl(bs_eles_prepass_kernel<NT, PB>, dim3(ngrp * (int)npc * ((int)batch / PB)), dim3(NT), 0, st, \
             node_flows.data_ptr<float>(), node_mars.data_ptr<float>(), ebase.data_ptr<long>(), pc_k0, pc_k1, grep, uh, \
             ul, mp, (int)batch, (int)knt, kt_sh, (int)npc)
         if (batch >= 256) P_(512, 16); else P_(256, 8);
@@ -528,7 +562,7 @@ void blockscale_ele_backward_stream(torch::Tensor element_flows, torch::Tensor e
         const int R = gate_cbs > 64 ? (int)gate_cbs : 64;
         const long nblk = (long)neb * (cs_block_size / R) * (batch / 16);
         TORCH_CHECK(nblk < (1L << 31), "blockscale element stream: a merge grid past 2^31 blocks");
-        bs_eles_merge_kernel<<<(unsigned)nblk, 256, 0, st>>>(
+        launch_pdl(bs_eles_merge_kernel, dim3((unsigned)nblk), dim3(256), 0, st,
             element_flows.data_ptr<float>(), element_mars.data_ptr<float>(), part, mp, ext.data_ptr<float>(), pc_gate,
             chids.data_ptr<long>(), ugrp, write_grad ? grad_ext.data_ptr<float>() : nullptr, (int)batch,
             (int)cs_block_size, (int)gate_cbs, R, (long)ext_base, (int)npc, rows_total, (int)write_grad);
