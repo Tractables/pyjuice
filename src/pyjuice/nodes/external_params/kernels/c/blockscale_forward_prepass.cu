@@ -26,6 +26,11 @@
 // tiles) B 64 194 -> 33, B 128 199 -> 50, B 512 338 -> 144 (fp32 365 -> 192). The small grids are bound by the L2's
 // rate per SM (~31 B / clock at most); the large ones by the bytes a stage ring keeps in flight.
 //
+// The launches are chained by programmatic dependent launch, as the stream kernels' are
+// (layer/kernels/c/tlmm_forward_sum_stream.cu): each lets the next one launch at once and waits
+// (cudaGridDependencySynchronize) before it touches what an earlier launch wrote; the streaming kernel's producers
+// load what no launch of the chain writes (the tables, the first tiles' parameters) before their wait.
+//
 // Scope (the Python dispatcher checks it): one gate per node block (n_node_gates 1), node_cbs >= 64 (an edge tile is
 // one run of children), a gate width >= 4 (clamped to 64), batch % 64 == 0, block_size % BM == 0. Scratch: one
 // allocation per call (inside a CUDA graph capture, from its pool).
@@ -93,6 +98,8 @@ __global__ void __launch_bounds__(NT) bs_prepass_kernel(
         long ext_base) {
     constexpr int PARTS = NT / PB, EP = BK / PARTS, QP = EP / 4;
     static_assert(NT % PB == 0 && BK % PARTS == 0 && EP % 4 == 0, "threads over the batch columns");
+    cudaGridDependencySynchronize();                 // (`element_mars` is the launch before's)
+    cudaTriggerProgrammaticLaunchCompletion();       // the factors may launch
     __shared__ float smx[PARTS][PB];
     long tile = blockIdx.x;
     int nblock = (int)(tile / knt), kt = (int)(tile % knt);
@@ -158,6 +165,8 @@ __global__ void __launch_bounds__(NT) bs_factors_kernel(const float* __restrict_
                                                         __nv_bfloat16* __restrict__ zg, int batch, int knt, int ng) {
     constexpr int W = 32, PARTS = NT / W;
     __shared__ float sM[CH + 1][W], sZ[CH + 1][W], sX[CH][W], sC[2][PARTS][W];
+    cudaGridDependencySynchronize();                 // (the pre-pass's maxima)
+    cudaTriggerProgrammaticLaunchCompletion();       // the streaming kernel may launch
     int nblock = blockIdx.x, b0 = blockIdx.y * W, c0 = blockIdx.z * CH;
     int b = threadIdx.x % W, part = threadIdx.x / W;
     const long tile0 = (long)nblock * knt;
@@ -280,6 +289,7 @@ __global__ void __launch_bounds__((G * WM * WN + PW) * 32) bs_stream_kernel(
     if constexpr (G > 1)
         for (int i = tid; i < BM * LS; i += NC + NP) { sL[i] = 0.f; sZs[i] = 0.f; }
     __syncthreads();
+    cudaTriggerProgrammaticLaunchCompletion();       // the next chunk may launch
 
     if (tid >= NC) {
         // ---------------- producers: tile t into stage t % ST once its consumer group released it ----------------
@@ -334,6 +344,7 @@ __global__ void __launch_bounds__((G * WM * WN + PW) * 32) bs_stream_kernel(
             CUTE_UNROLL
             for (int q = 0; q < CA4; q++) if (oA4[q] != ~0u) ra[q] = *(const float4*)(ga + gA4[q]);
         }
+        cudaGridDependencySynchronize();             // the pre-pass's exponentials and the factors from here on
         for (int t = 0; t < knt; t++) {
             int s = t % ST;
             if (t >= ST) mbar_wait(&empty[s], ((t / ST) - 1) & 1);
@@ -377,6 +388,7 @@ __global__ void __launch_bounds__((G * WM * WN + PW) * 32) bs_stream_kernel(
     }
 
     // ---------------- consumers: group g, tiles g, g + G, ... ----------------
+    cudaGridDependencySynchronize();                 // (the producers wait; the stores' own guarantee)
     const int g = tid / NCG, gtid = tid % NCG;
     TiledMMA mma = make_tiled_mma(SM80_16x8x16_F32BF16BF16F32_TN{}, Layout<Shape<Int<WM>, Int<WN>, _1>>{});
     ThrMMA thr = mma.get_thread_slice(gtid);
@@ -478,6 +490,18 @@ __global__ void __launch_bounds__((G * WM * WN + PW) * 32) bs_stream_kernel(
     }
 }
 
+// `kernel<<<grid, block, smem, st>>>(args...)` as a programmatic dependent of the launch before it (see the top)
+template <typename... P, typename... A>
+static void launch_pdl(void (*kernel)(P...), dim3 grid, dim3 block, int smem, cudaStream_t st, A... args) {
+    cudaLaunchConfig_t lc = {};
+    lc.gridDim = grid; lc.blockDim = block; lc.dynamicSmemBytes = smem; lc.stream = st;
+    cudaLaunchAttribute at[1];
+    at[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    at[0].val.programmaticStreamSerializationAllowed = 1;
+    lc.attrs = at; lc.numAttrs = 1;
+    C10_CUDA_CHECK(cudaLaunchKernelEx(&lc, kernel, static_cast<P>(args)...));
+}
+
 template <int BM, int BN, int WM, int WN, int G, int PW, int ST, typename TP>
 static void launch_cfg(float* node_mars, const TP* params, const long* nids, int n_nblocks, const long* pids,
                        const __nv_bfloat16* bx, const float* f, const __nv_bfloat16* zg, float* log_z, int batch,
@@ -500,8 +524,8 @@ static void launch_cfg(float* node_mars, const TP* params, const long* nids, int
     for (int off = 0; off < total_m; off += MAX_Y) {
         int chunk = (total_m - off < MAX_Y) ? (total_m - off) : MAX_Y;
         dim3 grid(batch / BN, chunk);
-        kernel<<<grid, NTH, smem, stream>>>(node_mars, params, nids, pids, bx, f, zg, log_z, batch, block_size, knt,
-                                            off, gsh);
+        launch_pdl(kernel, grid, dim3(NTH), smem, stream, node_mars, params, nids, pids, bx, f, zg, log_z, batch,
+                   block_size, knt, off, gsh);
         C10_CUDA_KERNEL_LAUNCH_CHECK();
     }
 }
@@ -584,12 +608,13 @@ void blockscale_forward_prepass(torch::Tensor node_mars, torch::Tensor element_m
     auto* lp = reinterpret_cast<float*>(base + o_lp);
     auto* f = reinterpret_cast<float*>(base + o_f);
     cudaStream_t st = c10::cuda::getCurrentCUDAStream();
-    bs_prepass_kernel<256><<<dim3(tiles, batch / PB), 256, 0, st>>>(
+    launch_pdl(bs_prepass_kernel<256>, dim3(tiles, batch / PB), dim3(256), 0, st,
         element_mars.data_ptr<float>(), cids.data_ptr<long>(), ext.data_ptr<float>(), gate.data_ptr<long>(), bx, mx,
         gm, lp, batch, knt, (int)gate.size(1), (int)node_cbs, gc, node_sh, gate_sh, (long)ext_base);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     const int nb = (int)nids.size(0);
-    bs_factors_kernel<256, 8><<<dim3(nb, batch / 32, (knt + 7) / 8), 256, 0, st>>>(mx, gm, lp, f, zg, batch, knt, ng);
+    launch_pdl(bs_factors_kernel<256, 8>, dim3(nb, batch / 32, (knt + 7) / 8), dim3(256), 0, st, mx, gm, lp, f, zg, batch,
+               knt, ng);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     float* lz = log_z.numel() ? log_z.data_ptr<float>() : nullptr;
     const int bs = (int)block_size;

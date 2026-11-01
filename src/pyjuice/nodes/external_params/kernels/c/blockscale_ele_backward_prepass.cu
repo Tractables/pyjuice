@@ -28,6 +28,11 @@
 // HMM-256 B 128 gate width 16 14.5 -> 8.1. Against float64, the element flows' max error 3e-5 .. 1.2e-4 (Triton's
 // TF32 dots: 3e-4 .. 8e-4), the gradient's max relative error <= 4e-5 (Triton's 3e-4 .. 7e-4).
 //
+// The launches are chained by programmatic dependent launch, as the stream kernels' are
+// (layer/kernels/c/tlmm_forward_sum_stream.cu): each lets the next one launch at once and waits
+// (cudaGridDependencySynchronize) before it touches what an earlier launch wrote; the streaming kernel's producers
+// load what no launch of the chain writes (the tables, the first tiles' parameters) before their wait.
+//
 // Scope (`fitting_configs`, and the Python plan for the rest): k-tiles of 64 parents within one parent block, the
 // parameters' 8-value loads aligned (`_cuda_param_loads_aligned`), a power-of-two gate width >= 4, batch % 64 == 0,
 // the element block a multiple of the tile's rows, the element block's gates (knt ints) in shared memory, `ext`
@@ -89,6 +94,8 @@ __global__ void __launch_bounds__(256) bs_ele_prepass_kernel(const float* __rest
     __shared__ float sLf[BK][PB + 1];
     __shared__ float sMx4[4][PB];
     __shared__ float sMx[PB];
+    cudaGridDependencySynchronize();                 // (the flows are the launches before's)
+    cudaTriggerProgrammaticLaunchCompletion();       // the streaming kernel may launch
     long tile = blockIdx.x;
     int b0 = blockIdx.y * PB, tid = threadIdx.x;
     long e0 = ebase[tile];
@@ -180,6 +187,7 @@ __global__ void __launch_bounds__((G * WM * WN + PW) * 32) bs_ele_stream_kernel(
     if (tid == 0)
         for (int s = 0; s < ST; s++) { mbar_init(&full[s], 2 * NP); mbar_init(&empty[s], NCG); }
     __syncthreads();
+    cudaTriggerProgrammaticLaunchCompletion();       // the next chunk may launch
 
     if (tid >= NC) {
         // ---------------- producers ----------------
@@ -250,6 +258,7 @@ __global__ void __launch_bounds__((G * WM * WN + PW) * 32) bs_ele_stream_kernel(
         CUTE_UNROLL
         for (int d = 0; d < PE; d++) loadP(d, ra[d]);
         for (int i = ptid; i < knt; i += NP) sGt[i] = (int)gate[tile0 + i];
+        cudaGridDependencySynchronize();             // the pre-pass's exponentials and maxima from here on
         bar_sync(3, NC + NP);
         CUTE_UNROLL
         for (int d = 0; d < PE; d++) loadV(d, rm[d % RV], rl[d % RV]);
@@ -322,6 +331,7 @@ __global__ void __launch_bounds__((G * WM * WN + PW) * 32) bs_ele_stream_kernel(
     }
 
     // ---------------- consumers ----------------
+    cudaGridDependencySynchronize();                 // (the pre-pass's maxima, read below)
     const int g = tid / NCG, gtid = tid % NCG;
     TiledMMA mma = make_tiled_mma(SM80_16x8x16_F32F16F16F32_TN{}, Layout<Shape<Int<WM>, Int<WN>, _1>>{});
     ThrMMA thr = mma.get_thread_slice(gtid);
@@ -487,6 +497,18 @@ __global__ void __launch_bounds__((G * WM * WN + PW) * 32) bs_ele_stream_kernel(
 
 static int gates_smem(int64_t knt) { return (int)(((knt * 4 + 15) / 16) * 16); }
 
+// `kernel<<<grid, block, smem, st>>>(args...)` as a programmatic dependent of the launch before it (see the top)
+template <typename... P, typename... A>
+static void launch_pdl(void (*kernel)(P...), dim3 grid, dim3 block, int smem, cudaStream_t st, A... args) {
+    cudaLaunchConfig_t lc = {};
+    lc.gridDim = grid; lc.blockDim = block; lc.dynamicSmemBytes = smem; lc.stream = st;
+    cudaLaunchAttribute at[1];
+    at[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    at[0].val.programmaticStreamSerializationAllowed = 1;
+    lc.attrs = at; lc.numAttrs = 1;
+    C10_CUDA_CHECK(cudaLaunchKernelEx(&lc, kernel, static_cast<P>(args)...));
+}
+
 template <int BM, int BN, int WM, int WN, int G, int PW, int ST, int PD, bool CWM, typename TP>
 static void launch_cfg(bool wgrad, float* ef, const float* em, const TP* p, const long* chids, int neb, const long* pb,
                        const long* gate, const half_t* bx, const float* mx, const float* ext, float* grad, int batch,
@@ -512,10 +534,8 @@ static void launch_cfg(bool wgrad, float* ef, const float* em, const TP* p, cons
     for (int off = 0; off < total_m; off += 65535) {
         int chunk = (total_m - off < 65535) ? (total_m - off) : 65535;
         dim3 grid(batch / BN, chunk);
-        if (wgrad) k1<<<grid, NTH, smem, st>>>(ef, em, p, chids, pb, gate, bx, mx, ext, grad, batch, BSK, BSM, knt, gc,
-                                               ext_base, off);
-        else k0<<<grid, NTH, smem, st>>>(ef, em, p, chids, pb, gate, bx, mx, ext, grad, batch, BSK, BSM, knt, gc,
-                                         ext_base, off);
+        launch_pdl(wgrad ? k1 : k0, grid, dim3(NTH), smem, st, ef, em, p, chids, pb, gate, bx, mx, ext, grad, batch, BSK,
+                   BSM, knt, gc, ext_base, off);
         C10_CUDA_KERNEL_LAUNCH_CHECK();
     }
 }
@@ -593,9 +613,8 @@ void blockscale_ele_backward_prepass(torch::Tensor element_flows, torch::Tensor 
     auto* bx = reinterpret_cast<half_t*>(base);
     auto* mx = reinterpret_cast<float*>(base + o_mx);
     cudaStream_t st = c10::cuda::getCurrentCUDAStream();
-    bs_ele_prepass_kernel<<<dim3(tiles, batch / PB), 256, 0, st>>>(node_flows.data_ptr<float>(),
-                                                                   node_mars.data_ptr<float>(), ebase.data_ptr<long>(),
-                                                                   bx, mx, (int)batch);
+    launch_pdl(bs_ele_prepass_kernel, dim3(tiles, batch / PB), dim3(256), 0, st, node_flows.data_ptr<float>(),
+               node_mars.data_ptr<float>(), ebase.data_ptr<long>(), bx, mx, (int)batch);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     float* grad = write_grad ? grad_ext.data_ptr<float>() : nullptr;
     if (params.scalar_type() == torch::kBFloat16)
