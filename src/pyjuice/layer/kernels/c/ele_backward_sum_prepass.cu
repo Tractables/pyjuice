@@ -28,6 +28,11 @@
 // Scratch: the exponentials (fp16) and maxima, one allocation per call from the caching allocator (inside a CUDA graph
 // capture, from the graph's pool), freed when it returns.
 //
+// The launches -- pre-pass, streaming kernel (in chunks of 65535 tile rows), merge -- are chained by programmatic
+// dependent launch, as the stream kernels' are (tlmm_forward_sum_stream.cu): each lets the next launch at once and
+// waits (cudaGridDependencySynchronize) before it touches what an earlier launch wrote; the streaming kernel's producers
+// load what no launch of the chain writes (the tables, the first tile's parameters into registers) before their wait.
+//
 // SPECIALIZED fast path under the plain kernel's conditions (LL, logspace flows, allow_modify_flows / allow_neg_flows /
 // accumulate_ch_flows off, no tempering, the fp16 dot regime, TILE_SIZE_K == 64, block_size % 128 == 0,
 // batch % 64 == 0, contiguous edge/param layout); the Python dispatcher measures it against the other kernels per shape.
@@ -71,6 +76,8 @@ __global__ void __launch_bounds__(256) ele_prepass_kernel(const float* __restric
     __shared__ float sLf[BK][PB + 1];
     __shared__ float sMx4[4][PB];
     __shared__ float sMx[PB];
+    cudaGridDependencySynchronize();                 // (the flows are the launches before's)
+    cudaTriggerProgrammaticLaunchCompletion();       // the streaming kernel may launch
     long tile = blockIdx.x;
     int b0 = blockIdx.y * PB;
     int tid = threadIdx.x;
@@ -155,6 +162,7 @@ __global__ void __launch_bounds__((WM * WN + PW) * 32) ele_stream_kernel(
     auto stB = [&](int s) { return (half_t*)(smem_raw + s * STAGE + BM * BK * 2); };
     auto stF = [&](int s) { return (float*)(smem_raw + s * STAGE + BM * BK * 2 + BN * BK * 2); };
 
+    cudaTriggerProgrammaticLaunchCompletion();       // the next chunk / the merge may launch
     if (tid >= NC) {
         int ptid = tid - NC;
         const long tile0 = (long)eb * knt_all + k0;
@@ -164,10 +172,6 @@ __global__ void __launch_bounds__((WM * WN + PW) * 32) ele_stream_kernel(
         // the pre-pass tiles of tiles t (tx1) and t + 1 (tx2), loaded a tile ahead (a load that waited on them a tile
         // would sit on the producers' path)
         int tx1 = TIX ? tix[tile0] : (int)tile0, tx2 = TIX ? (knt > 1 ? tix[tile0 + 1] : 0) : (int)tile0 + 1;
-        if (ptid < 32) {
-            CUTE_UNROLL
-            for (int j = 0; j < BN / 32; j++) mnext[j] = mx[(long)tx1 * batch + b0 + ptid + 32 * j];
-        }
         // the parameter blocks of tiles t (pn1a, and pn1b: the second block of a two-block tile) and t + 1 (pn2a / b),
         // the next tile's fp32/bf16 loads one issue ahead -- scalars, not an array the lambda takes by address (MEASURED
         // that at fp32: local memory, +18% on the kernel)
@@ -186,6 +190,11 @@ __global__ void __launch_bounds__((WM * WN + PW) * 32) ele_stream_kernel(
             }
         };
         loadA(pn1a, pn1b);
+        cudaGridDependencySynchronize();             // the pre-pass's exponentials and maxima from here on
+        if (ptid < 32) {
+            CUTE_UNROLL
+            for (int j = 0; j < BN / 32; j++) mnext[j] = mx[(long)tx1 * batch + b0 + ptid + 32 * j];
+        }
         auto issue = [&](int t) {
             int s = t % ST;
             Tensor sAt = make_tensor(make_smem_ptr(stA(s)), sAl);
@@ -283,6 +292,7 @@ __global__ void __launch_bounds__((WM * WN + PW) * 32) ele_stream_kernel(
         }
         if (kt + ST < knt) bar_arrive(1 + ST + s, NTH);
     }
+    cudaGridDependencySynchronize();                 // (the producers waited; the epilogue's own guarantee)
     const float* fM = stF((knt - 1) % ST) + 2 * BN;  // the last tile's stage: the running maxima, never refilled
     CUTE_UNROLL
     for (int i = 0; i < size(tCrL); i++) {
@@ -306,6 +316,7 @@ __global__ void __launch_bounds__((WM * WN + PW) * 32) ele_stream_kernel(
 // the sum in range order. `part`: L [split, rows, batch] then M [split, rows, batch]; row = element block x BSM + m.
 __global__ void merge_kernel(float* __restrict__ eflows, const float* __restrict__ emars, const float* __restrict__ part,
                              const long* __restrict__ chids, int split, long rows_total, int BSM, int batch) {
+    cudaGridDependencySynchronize();                 // (the streaming kernel's partials)
     const long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= rows_total * batch) return;
     const long row = i / batch, stride = rows_total * (long)batch;
@@ -325,6 +336,18 @@ __global__ void merge_kernel(float* __restrict__ eflows, const float* __restrict
         r = logf(L) + M + emars[off];
     }
     eflows[off] = r;
+}
+
+// `kernel<<<grid, block, smem, st>>>(args...)` as a programmatic dependent of the launch before it (see the top)
+template <typename... P, typename... A>
+static void launch_pdl(void (*kernel)(P...), dim3 grid, dim3 block, int smem, cudaStream_t st, A... args) {
+    cudaLaunchConfig_t lc = {};
+    lc.gridDim = grid; lc.blockDim = block; lc.dynamicSmemBytes = smem; lc.stream = st;
+    cudaLaunchAttribute at[1];
+    at[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    at[0].val.programmaticStreamSerializationAllowed = 1;
+    lc.attrs = at; lc.numAttrs = 1;
+    C10_CUDA_CHECK(cudaLaunchKernelEx(&lc, kernel, static_cast<P>(args)...));
 }
 
 template <int BM, int BN, int WM, int WN, int PW, int ST, int PBT, bool TIX, typename TP>
@@ -349,13 +372,14 @@ static void launch_cfg(float* ef, const float* em, const TP* p, const long* chid
     for (int off = 0; off < total_m; off += MAX_Y) {
         int chunk = (total_m - off < MAX_Y) ? (total_m - off) : MAX_Y;
         dim3 grid(batch / BN, chunk, split);
-        kernel<<<grid, NTH, smem, st>>>(ef, em, p, chids, pb, bx, mx, tix, part, batch, BSK, BSM, knt, split, rows_total,
-                                        off);
+        launch_pdl(kernel, grid, dim3(NTH), smem, st, ef, em, p, chids, pb, bx, mx, tix, part, batch, BSK, BSM, knt,
+                   split, rows_total, off);
         C10_CUDA_KERNEL_LAUNCH_CHECK();
     }
     if (split > 1) {
         const long n = rows_total * batch;
-        merge_kernel<<<(unsigned)((n + 255) / 256), 256, 0, st>>>(ef, em, part, chids, split, rows_total, BSM, batch);
+        launch_pdl(merge_kernel, dim3((unsigned)((n + 255) / 256)), dim3(256), 0, st, ef, em, part, chids, split,
+                   rows_total, BSM, batch);
         C10_CUDA_KERNEL_LAUNCH_CHECK();
     }
 }
@@ -424,8 +448,8 @@ void ele_backward_sum_prepass(torch::Tensor element_flows, torch::Tensor element
     auto* part = reinterpret_cast<float*>(reinterpret_cast<char*>(scratch.data_ptr()) + bx_bytes + mx_bytes);
     cudaStream_t st = c10::cuda::getCurrentCUDAStream();
     dim3 grid(tiles, batch / PB);
-    ele_prepass_kernel<<<grid, 256, 0, st>>>(node_flows.data_ptr<float>(), node_mars.data_ptr<float>(),
-                                             ebase.data_ptr<long>(), bx, mx, (int)batch);
+    launch_pdl(ele_prepass_kernel, grid, dim3(256), 0, st, node_flows.data_ptr<float>(), node_mars.data_ptr<float>(),
+               ebase.data_ptr<long>(), bx, mx, (int)batch);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     int neb = (int)chids.size(0);
     if (params.scalar_type() == torch::kBFloat16)
