@@ -212,6 +212,34 @@ def test_training_at_bf16_follows_fp32_training(name):
 
 
 @cuda_only
+def test_an_element_flow_choice_is_kept_per_parameter_dtype(monkeypatch):
+    """SGD on bf16 parameters runs its renormalization's backward on the fp32 MASTER copy (`eval_partition_grad(...,
+    params = )`): the element-flow choice the bf16 backward cached -- among its arms the stream kernel, which takes bf16
+    parameters alone -- must not be taken for it (it was, wherever the tuner happened to pick that arm: a `TypeError`
+    from the stream kernel's absent row groups). Forced here: the stream arm wherever it is offered."""
+    import pyjuice.layer.kernels.autotune as at
+    real, offered = at.best_of, []
+
+    def best_of(cands, *args, **kwargs):
+        stream = [k for k, _ in cands if isinstance(k, tuple) and k[0] == "cuda_stream"]
+        if stream:
+            offered.append(stream[0])
+            return stream[0]
+        return real(cands, *args, **kwargs)
+
+    monkeypatch.setattr(at, "best_of", best_of)
+    ns, data = _training_setup()
+    pc = juice.compile(ns, verbose = False, param_dtype = BF16).to(DEV)
+    opt = juice.optim.SGD(pc, lr = 0.1)
+    for s in range(2):
+        pc(data[s * 256:(s + 1) * 256]).mean().backward()
+        opt.step()
+    if not offered:
+        pytest.skip("the stream element-flow kernel is not offered here")
+    assert torch.isfinite(pc._params_in_fp32()).all() and torch.equal(pc.params, pc.params_master.to(BF16))
+
+
+@cuda_only
 @pytest.mark.parametrize("name", ["em_0.01", "sgd"])
 def test_a_write_to_bf16_params_between_steps_is_kept(name):
     """`pc.params.data[...] = x` between two steps: the next update starts from x, not from the master copy's older

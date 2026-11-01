@@ -2527,7 +2527,10 @@ class SumLayer(Layer, nn.Module):
                         tgt, t["element_mars"], t["node_flows"], t["node_mars"], t["params"], chids[a:b], ele_ebase[a:b],
                         pre_pbase[a:b], groups, batch_size, self.block_size, cs_block_size, K_NUM_TILES, c)
 
-                choice_key = (signature, batch_size)
+                # (keyed on the parameters' dtype too, as the small-batch choice is: the arms depend on it -- the stream
+                # copy takes bf16 parameters alone -- and one circuit runs both, SGD's renormalization on the fp32
+                # master copy of bf16 parameters, where a cached stream arm met no row groups)
+                choice_key = (signature, batch_size, params.dtype)
                 choice = self._cached_bk_ele_choice.get(choice_key)
                 if choice is None:
                     # autotune into a SCRATCH clone (corruption-safe); the live element_flows is
