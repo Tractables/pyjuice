@@ -66,6 +66,11 @@ def test_small_node_tiles_are_offered_and_compute_the_same_circuit(batch_size, m
         return real_pick(key, candidates, bench, *args, **kwargs)
 
     monkeypatch.setattr(autotune, "pick", pick)
+    # (and never cached: the layer asks `pick` only on a cache miss, and an earlier test of this worker on the same
+    # product shape left its choice there -- every pass then took it, nothing was offered)
+    real_cached = autotune.cached
+    monkeypatch.setattr(autotune, "cached", lambda key: None if isinstance(key, tuple) and key
+                        and key[0] is prod_kernels._forward_backward_kernel_2d else real_cached(key))
     torch.manual_seed(0)
     ns = juice.structures.HMM(seq_length = 8, num_latents = 256, num_emits = 16, homogeneous = True, block_size = 64)
     pc = juice.compile(ns, verbose = False).to(device)
