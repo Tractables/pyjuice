@@ -937,9 +937,12 @@ class _BackwardMixin:
                             SPLITS = splits, out_rows = rows, WRITE_GRAD = 0 if grad is None else 1,
                             GRAD_ATOMIC = grad_atomic, pid_m_offset = s0, num_stages = 1)
                     if splits > 1:
-                        _bs_blocks_merge_kernel[(triton.cdiv(rows * batch, 1024),)](
+                        # 256 entries a program: at 1024 a Codpula layer (1024 rows x 29 samples, 16 ranges) was 29
+                        # programs and 3.7 us; 1.7 at 256 (MEASURED, device time). Each entry's sum is its own: the
+                        # same bits at any block
+                        _bs_blocks_merge_kernel[(triton.cdiv(rows * batch, 256),)](
                             scratch = out, element_flows = tgt, chids = chids, batch_size = batch, out_rows = rows,
-                            BLOCK_SIZE_M = cbs, SPLITS = splits, BLOCK = 1024)
+                            BLOCK_SIZE_M = cbs, SPLITS = splits, BLOCK = 256)
 
             elif isinstance(kind, tuple):                     # ("sb", cfg)
                 (e0, p0), gsb, cfg = plan["sb"], plan["gate_sb"], kind[1]
