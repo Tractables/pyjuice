@@ -217,6 +217,9 @@ __global__ void __launch_bounds__(32 * SPLIT) bs_sb_fwd_bt_kernel(
         __syncthreads();
         #pragma unroll
         for (int j = 0; j < BT; j++) {
+            // (edge-warp ty stores columns ty, ty + SPLIT, ... alone: it combines those alone -- every warp combining
+            // every column was ~a third of the kernel's stall samples, ncu, Codpula's layer at 29 samples)
+            if (j % SPLIT != ty) continue;
             float gm = -INFINITY;
             #pragma unroll
             for (int k = 0; k < SPLIT; k++) gm = fmaxf(gm, sM[k * BT + j]);
@@ -233,7 +236,7 @@ __global__ void __launch_bounds__(32 * SPLIT) bs_sb_fwd_bt_kernel(
         }
     }
 
-    // Every lane holds every column's result; edge-warp ty stores columns ty, ty + SPLIT, ...
+    // Edge-warp ty holds (and stores) the results of columns ty, ty + SPLIT, ...
     const long node = nids[nb] + m_local;
     #pragma unroll
     for (int j = 0; j < BT; j++) {
