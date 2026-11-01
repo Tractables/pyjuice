@@ -666,3 +666,85 @@ if __name__ == "__main__":
     test_unmasked_variables_are_untouched_by_a_mask_elsewhere()
     for bs in (6, 8):
         test_no_nan_with_a_partially_padded_batch_tile(bs)
+
+
+@pytest.mark.parametrize("tied", [False, True])
+def test_dense_path_on_a_layer_of_some_variables(tied, monkeypatch):
+    """A soft-evidence layer over SOME of the circuit's variables (Categorical inputs on the others): the evidence's
+    variable axis is the layer's own, `var_idmapping` maps the circuit's variables onto it -- the dense forward's and the
+    dense backward's observed tokens are found through it. Dense against scattered, a whole step."""
+    from pyjuice.nodes import inputs, multiply, summate
+    device = torch.device("cuda:0")
+    C, K, B, L = 64, 16, 6, 8
+    monkeypatch.setattr(_dense._l2_bytes, "_cached", 512, raising = False)
+    torch.manual_seed(7)
+    with juice.set_block_size(L):
+        cat = [inputs(v, num_node_blocks = 1, dist = dists.Categorical(num_cats = C)) for v in range(2)]
+        leaf = dists.SoftEvidenceCategorical(num_cats = C, _dual_flow_backward = True)
+        sev = [inputs(2, num_node_blocks = 1, dist = leaf)]
+        for v in range(3, 6):
+            sev.append(sev[0].duplicate(v, tie_params = True) if tied else inputs(v, num_node_blocks = 1, dist = leaf))
+        root = summate(multiply(*cat, *sev), num_node_blocks = 1, block_size = 1)
+    root.init_parameters(perturbation = 2.0)
+    pc = juice.compile(root, verbose = False).to(device)
+    layer = [l for l in pc.input_layer_group if isinstance(l.nodes[0].dist, dists.SoftEvidenceCategorical)][0]
+    assert not torch.equal(layer.var_idmapping[layer.vids.view(-1)], layer.vids.view(-1)), "the mapping is the identity"
+
+    data = torch.randint(0, C, (B, 6), device = device)
+    kw = dict(categorical_evidence_logp = _evidence(B, 4, K, device), soft_evidence_cat_ids = _topk_ids(B, 4, K, C, data[:, 2:], device))
+    out = {}
+    for choice in ("scattered", "single"):
+        layer._dense_choice_override = choice
+        pc.init_param_flows(flows_memory = 0.0)
+        lls = pc(data, **kw).clone()
+        grad = torch.zeros_like(kw["categorical_evidence_logp"])
+        pc.backward(data, allow_modify_flows = False, logspace_flows = True, categorical_evidence_logp_grad = grad, **kw)
+        out[choice] = (lls, layer.param_flows.clone(), grad)
+        if choice != "scattered":
+            assert layer._dense_index_cache is not None, "the dense path did not run"
+    layer._dense_choice_override = None
+    for name, a, b in zip(("LL", "param flows", "evidence gradient"), out["single"], out["scattered"]):
+        assert torch.allclose(a, b, rtol = 1e-4, atol = 1e-6), f"{name}: dense vs scattered {float((a - b).abs().max()):.3e}"
+
+
+@pytest.mark.parametrize("B, K", [(1, 16), (5, 24), (13, 16), (37, 40)])
+def test_observed_slots_are_the_first_matching_candidate(B, K):
+    """`prologue._observed_slots` -- each slot's observed candidate for the dense backward, one Triton launch -- against
+    its definition: the FIRST k with cat_ids[b, lvid, k] == the token, -1 where the token is not a candidate. On a layer
+    of some of the circuit's variables (`var_idmapping` not the identity), batches that are not a multiple of its tile,
+    K not a power of two, with absent tokens and repeated tokens planted (outside the kernels' precondition, but the
+    search's contract all the same)."""
+    from pyjuice.nodes import inputs, multiply, summate
+    from pyjuice.nodes.distributions.softevi.prologue import _observed_slots
+    device = torch.device("cuda:0")
+    C, V = 64, 4
+    with juice.set_block_size(8):
+        cat = [inputs(v, num_node_blocks = 1, dist = dists.Categorical(num_cats = C)) for v in range(2)]
+        sev = [inputs(v, num_node_blocks = 1, dist = dists.SoftEvidenceCategorical(num_cats = C)) for v in range(2, 2 + V)]
+        root = summate(multiply(*cat, *sev), num_node_blocks = 1, block_size = 1)
+    root.init_parameters()
+    pc = juice.compile(root, verbose = False).to(device)
+    layer = [l for l in pc.input_layer_group if isinstance(l.nodes[0].dist, dists.SoftEvidenceCategorical)][0]
+    gv = layer.layer_var_list
+    lv = layer.var_idmapping[gv]
+    assert not torch.equal(lv, gv), "the mapping is the identity"
+
+    torch.manual_seed(B * 100 + K)
+    data = torch.randint(0, C, (2 + V, B), device = device)            # [pc variables, batch], as the kernels read it
+    ids = torch.randint(0, C, (B, V, K), device = device)
+    tok = torch.empty(B, V, dtype = data.dtype, device = device)
+    tok[:, lv] = data[gv].t()
+    plant = (torch.arange(B, device = device)[:, None] + torch.arange(V, device = device)[None, :]) % 3
+    ids = torch.where((plant == 0)[:, :, None] & (ids == tok[:, :, None]), (tok[:, :, None] + 1) % C, ids)   # absent
+    twice = plant == 1
+    ids[:, :, 2] = torch.where(twice, tok, ids[:, :, 2])                                                    # twice
+    ids[:, :, K - 3] = torch.where(twice, tok, ids[:, :, K - 3])
+    ids = ids.contiguous()
+
+    kstar = _observed_slots(layer, ids, data)
+
+    match = ids == tok[:, :, None]
+    ref = torch.where(match.any(dim = 2), match.to(torch.uint8).argmax(dim = 2), -1)
+    assert bool((ref[:, lv][(plant == 0)[:, lv]] == -1).all()) and bool((ref[:, lv][twice[:, lv]] <= 2).all())
+    assert torch.equal(kstar[:, lv].long(), ref[:, lv].long()), \
+        f"{int((kstar[:, lv].long() != ref[:, lv].long()).sum())} of {kstar[:, lv].numel()} slots differ"

@@ -126,21 +126,10 @@ def _prep_args_bk_dense_prologue(layer, kwargs):
 
     target_kwargs["ratio_ptr"] = _dense_scratch(layer, ext_num_vars, batch_size, index["num_latents"])
     target_kwargs.update(_missing_mask_kwargs(kwargs))
+    # (the dispatch's kernel takes its own tiles: `prologue._DensePrologueDispatch`)
+    target_kwargs["_layer"] = layer
 
-    n_block_size = max_power_of_2_factor(layer.n_block_size)
-    TILE_SIZE_K = min(16, triton.next_power_of_2(num_cats))
-    BLOCK_SIZE_B = min(128, 1024 // TILE_SIZE_K, triton.next_power_of_2(batch_size))
-    BLOCK_SIZE_N = min(n_block_size, max(8192 // BLOCK_SIZE_B // TILE_SIZE_K, 1))
-
-    target_kwargs["TILE_SIZE_K"] = TILE_SIZE_K
-    target_kwargs["K_NUM_TILES"] = triton.cdiv(num_cats, TILE_SIZE_K)
-    target_kwargs["BLOCK_SIZE_B"] = BLOCK_SIZE_B
-    target_kwargs["BLOCK_SIZE_N"] = BLOCK_SIZE_N
-
-    layer_num_nodes = layer._output_ind_range[1] - layer._output_ind_range[0]
-    grid = (triton.cdiv(batch_size, BLOCK_SIZE_B), triton.cdiv(layer_num_nodes, BLOCK_SIZE_N))
-
-    return target_kwargs, grid
+    return target_kwargs, (1,)
 
 
 class _DenseDenomDispatch:
