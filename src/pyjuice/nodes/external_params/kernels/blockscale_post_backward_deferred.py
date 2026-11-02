@@ -10,7 +10,11 @@ layer). Over all the layers at once there are programs enough for the loops the 
 
   * the gradient: a program per (layer, node block, gate tile, batch slice) walks the block's node tiles itself and
     adds the shares in tile order -- what the last ticket of the per-layer kernel adds, so the same bits, with no
-    shares stored and no tickets;
+    shares stored and no tickets. Where two of the launch's node blocks write one gate row -- copies of a node whose
+    gates are tied (`tie_external`): in several layers, or in one -- they add atomically (`GRAD_ATOMIC`), in no
+    fixed order, as a layer's own kernel does where its node blocks share rows: a load and a store there kept one
+    program's terms (MEASURED, a tied chain of three: the tied gradient off the sum of the copies' by 2.9-7.7 times its
+    largest entry);
   * `W`: a program per (node tile, gate tile) walks the layers in the pass's order and their batch slices in order,
     adding each slice's sum as the per-layer kernel did -- one writer, so deterministic: the per-layer kernel's bits
     where a layer is one batch slice, and where it is several (its slices then add atomically, in no fixed order)
@@ -41,7 +45,7 @@ def _bs_post_deferred_grad_kernel(node_flows, node_mars, lz_ptrs, sg_ptrs, ext, 
                                   N_CHILD_GATES: tl.constexpr, BLOCK_SIZE_M: tl.constexpr, gate_stride: tl.constexpr,
                                   ROWS: tl.constexpr, TILE_M: tl.constexpr, TILE_G: tl.constexpr, TILE_B: tl.constexpr,
                                   B_TILES_PER_PROG: tl.constexpr, WANT_GRAD: tl.constexpr, USE_DOT: tl.constexpr,
-                                  NIDS_I64: tl.constexpr, GATE_I64: tl.constexpr):
+                                  NIDS_I64: tl.constexpr, GATE_I64: tl.constexpr, GRAD_ATOMIC: tl.constexpr):
     pid_y = tl.program_id(0)                       # (layer, node block)
     pid_g = tl.program_id(1)                       # gate tile
     pid_s = tl.program_id(2)                       # batch slice
@@ -107,7 +111,10 @@ def _bs_post_deferred_grad_kernel(node_flows, node_mars, lz_ptrs, sg_ptrs, ext, 
         if WANT_GRAD:
             gptr = grad_ext + grow[:,None] * batch_size + offs_b[None,:]
             gmask = ghas[:,None] & mask_b[None,:]
-            tl.store(gptr, tl.load(gptr, mask = gmask, other = 0.0) + tot, mask = gmask)
+            if GRAD_ATOMIC:                        # (another program of the launch adds into these rows too)
+                tl.atomic_add(gptr, tot, mask = gmask)
+            else:
+                tl.store(gptr, tl.load(gptr, mask = gmask, other = 0.0) + tot, mask = gmask)
         offs_b += TILE_B
 
 

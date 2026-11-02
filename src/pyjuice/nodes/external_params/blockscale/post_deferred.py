@@ -10,7 +10,9 @@ layer, 15 layers a step). At the end of the pass the layers' work is one launch 
 one of `_bs_post_deferred_w_kernel` per `W` (each program walks the layers; one writer, no atomics) --
 `kernels/blockscale_post_backward_deferred.py`, whose tiles compute what the per-layer kernel's compute: the
 gradient and the shifted node values are the same bits; `W` the bits of one order of the adds the per-layer kernel
-makes atomically where a layer spans several batch slices (its own bits where it spans one).
+makes atomically where a layer spans several batch slices (its own bits where it spans one). Where two of the layers'
+node blocks write one gate row -- copies of a node whose gates are tied (`tie_external`), which read the same rows --
+the gradient's adds are atomic, in no fixed order (the per-layer launches add them one layer after another).
 
 One more option of the tuners: at a group's first end of pass, `autotune.pick` (keyed by shape; margin 1.0: the same
 results either way) times the layers' own launches -- now after the last layer -- against the deferred ones, into
@@ -160,7 +162,8 @@ def _launch_deferred(members, tabs, node_mars, grad_ext, ws) -> None:
     t = tabs["all"]
     _bs_post_deferred_grad_kernel[(len(members) * rows, grid[1] if want_grad else 1, grid[2])](
         m0["node_flows"], node_mars, t["lz"], t["sg"] if want_grad else t["lz"], m0["ext"], t["gate"], t["nids"],
-        t["ext_base"], log_z0 if grad_ext is None else grad_ext, ROWS = rows, WANT_GRAD = int(want_grad), **common)
+        t["ext_base"], log_z0 if grad_ext is None else grad_ext, ROWS = rows, WANT_GRAD = int(want_grad),
+        GRAD_ATOMIC = tabs["grad_atomic"], **common)
     if consts["WANT_W"]:
         tw, w_ptrs = tabs["w"], tabs["w_ptrs"]
         if any(int(p) != _ptr(ws[int(p)]) for p in tabs["w_keys"]):        # (scratch `W`s: a table of their own)
@@ -173,7 +176,8 @@ def _launch_deferred(members, tabs, node_mars, grad_ext, ws) -> None:
 def _tables(members):
     """The members' pointer and base tables on their device -- ``all`` of them; and ``w``: the members grouped by their
     `W` (``w_keys`` the `W`s' addresses, in order of first use; ``off`` each group's first row; ``w_first`` a member of
-    each), each group in the pass's order --, or None inside a capture where they are not made yet."""
+    each), each group in the pass's order; ``grad_atomic``: whether two of their node blocks write one gate row
+    (`post_rows_overlap`) --, or None inside a capture where they are not made yet."""
     m0 = members[0]
     dev = m0["log_z"].device
     rows_of = lambda m: (m["log_z"].data_ptr(), _ptr(m["sigma"]) if m["grad_ext"] is not None else 0,
@@ -198,9 +202,16 @@ def _tables(members):
     w = table(order)
     w["off"] = torch.tensor([0] + list(itertools.accumulate(len(ix) for ix in w_groups.values())), dtype = torch.int64,
                             device = dev)
+    c = m0["plan"][1]
+    if m0["grad_ext"] is None:
+        grad_atomic = 0
+    else:
+        from .backward import post_rows_overlap
+        grad_atomic = int(post_rows_overlap([(m["gb"], int(m["plan"][1]["ext_base"])) for m in members], c["n_gates"],
+                                            c["N_CHILD_GATES"]))
     hit = dict(all = table(range(len(members))), w = w, w_keys = list(w_groups), w_first = [ix[0] for ix in w_groups.values()],
                w_sizes = tuple(len(ix) for ix in w_groups.values()),
-               w_ptrs = torch.tensor(list(w_groups), dtype = torch.int64, device = dev))
+               w_ptrs = torch.tensor(list(w_groups), dtype = torch.int64, device = dev), grad_atomic = grad_atomic)
     if len(_TABLES) >= _MAX_TABLES:
         _TABLES.clear()
     _TABLES[key] = hit
