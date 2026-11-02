@@ -21,8 +21,10 @@
 // block's 32 rows x TN / 2 columns -- and share of the chunks (grid z): a first pass gives every (row block, column)
 // its shift
 //     T = max over the share's chunks of t + s,
-// then, per chunk, the chunk's weights (4 x 32 x 32), e (32 x TN), t and s are copied into shared memory a chunk
-// ahead (cp.async, two stages: the products of one under the copies of the next), every warp's products are summed
+// then, per chunk, the chunk's weights (4 x 32 x 32), e (32 x TN), t and s are copied into shared memory ahead of its
+// products (cp.async, a ring of stages: two -- the products of one under the copies of the next --, or at bf16 four,
+// three chunks' copies in flight under a chunk's products: a chunk's few products hid no copy, and bf16 stages, half
+// the floats', take four at the occupancy two took), every warp's products are summed
 // from zero over the chunk on the tensor cores (TF32, or 3 x TF32 for fp32-level products, from zero every 8: the
 // tensor cores' sums truncate) and added times the chunk's factors f = exp(t + s - T) <= 1 (every column's computed once
 // a warp, by one lane, and shuffled to its sums' lanes; at TF32 a chunk's sums are added under the next chunk's
@@ -92,6 +94,8 @@ __device__ __forceinline__ void cp_async4(void* smem, const void* gmem, bool val
 }
 __device__ __forceinline__ void cp_commit() { asm volatile("cp.async.commit_group;\n" ::); }
 __device__ __forceinline__ void cp_wait_all() { asm volatile("cp.async.wait_group 0;\n" ::); }
+template <int N>                                        // every group but the N last committed in
+__device__ __forceinline__ void cp_wait_group() { asm volatile("cp.async.wait_group %0;\n" :: "n"(N)); }
 
 __device__ __forceinline__ unsigned to_tf32(float x) {
     unsigned r;
@@ -117,13 +121,16 @@ __device__ __forceinline__ void mma_bf16(float* c, const unsigned* a, unsigned b
 // A tile of TN columns: a stage of shared memory holds a chunk's weights, e, t and (external parameters) s. The
 // weights' rows are their memory's (32 floats: forward one child's nodes, top-down one child's parent nodes), padded:
 // A_LD 40 (forward: the products read a column of them), 36 (top-down: a row) -- or (FA) a block's 1024 in fragment
-// order. e: the tile's TN / 8 groups of 8 columns, 256 floats each, in fragment order.
-template <int TN, bool TD>
+// order. e: the tile's TN / 8 groups of 8 columns, 256 floats each, in fragment order. At bf16 (BF) both halve: a
+// block's 1024 weights in fragment order (2 KB, 16 floats a row) and e's 256 bf16 a group, so a stage of 16 columns is
+// 9.6 KB, not 23 -- an SM's 100 KB of shared memory holds more of them.
+template <int TN, bool TD, bool BF = false>
 struct Tile {
-    static constexpr int A_LD = TD ? 36 : 40;
+    static constexpr int STAGES = BF ? 4 : 2;          // the ring of chunks in flight (`fused_sum_kernel`)
+    static constexpr int A_LD = BF ? 16 : TD ? 36 : 40;
     static constexpr int J = TN / 16;                  // a warp's tiles of 8 columns
     static constexpr int SL = TN + 4;                  // a block's scales: its samples from a multiple of 4, or columns
-    static constexpr int A_ST = NBT * BS * A_LD, B_ST = BS * TN;
+    static constexpr int A_ST = NBT * BS * A_LD, B_ST = BF ? BS * TN / 2 : BS * TN;
     static constexpr int ST = A_ST + B_ST + TN + NBT * SL;
     static constexpr int SHARE = NBT * BS * TN + NBT * TN;          // a share's sums and shifts in the split buffer
     static constexpr int HEAD = 4 * TN;                             // a tile's columns (int64) and samples first
@@ -313,9 +320,10 @@ __global__ void __launch_bounds__(THREADS) prepass_kernel(Args a) {
 
 template <bool EXT, bool X3, bool FA, bool BF, int TN, bool TD>
 __global__ void __launch_bounds__(THREADS) fused_sum_kernel(Args a) {
-    using TT = Tile<TN, TD>;
+    using TT = Tile<TN, TD, BF>;
+    constexpr int S = TT::STAGES;
     extern __shared__ float smem[];
-    float* Ts = smem + 2 * TT::ST;                                  // [NBT][TN] the shifts
+    float* Ts = smem + S * TT::ST;                                  // [NBT][TN] the shifts (past the S stages)
     long long* Cs = reinterpret_cast<long long*>(Ts + NBT * TN);   // [TN] the columns
     int* Ss = reinterpret_cast<int*>(Cs + TN);                      // [TN] their samples
     int* Cl = Ss + TN;                                              // EXT: [NBT][share] the chunks' cells
@@ -457,7 +465,7 @@ __global__ void __launch_bounds__(THREADS) fused_sum_kernel(Args a) {
 
     auto load = [&](int ch, int st) {                   // chunk ch into stage st: the thread's copies at its offsets
         if (!DESC) settle();                            // (at the register cap: settled every chunk)
-        float* As = smem + (st ? TT::ST : 0);
+        float* As = smem + st * TT::ST;
         float* Bs = As + TT::A_ST;
         float* tS = Bs + TT::B_ST;
         float* sS = tS + TN;
@@ -514,6 +522,11 @@ __global__ void __launch_bounds__(THREADS) fused_sum_kernel(Args a) {
     };
     load(ch0, 0);                                       // (under pass 1)
     cp_commit();
+    #pragma unroll
+    for (int k = 1; k < S - 1; ++k) {                   // (a deeper ring: its first S - 1 chunks in flight together)
+        if (ch0 + k < ch1) load(ch0 + k, k);
+        cp_commit();
+    }
 
     {   // pass 1: T = max over the share's chunks of t + s -- a thread's one or two (block, column)s together, which of
         // them are live tested once, outside the loops (a loop without a test: its loads in flight together)
@@ -583,10 +596,11 @@ __global__ void __launch_bounds__(THREADS) fused_sum_kernel(Args a) {
     // A chunk: its copies waited for, the next chunk's issued under its products, its sums into P and the lane's two
     // factors into G (shuffled to the fold)
     auto chunk = [&](int ch, float (&P)[2][TT::J][4], float (&G)[2]) {
-        const int st = (ch - ch0) & 1;
-        cp_wait_all();                                  // this chunk's copies in
-        __syncthreads();                                // (and visible; the other stage's products done)
-        if (ch + 1 < ch1) load(ch + 1, st ^ 1);         // the next chunk's under this one's products
+        const int st = (ch - ch0) % S;
+        cp_wait_group<S - 2>();                         // this chunk's copies in (the next S - 2 chunks' may fly on)
+        __syncthreads();                                // (and visible; the stage refilled below read by no warp now:
+                                                        // the chunk before's, its products done)
+        if (ch + S - 1 < ch1) load(ch + S - 1, (st + S - 1) % S);   // S - 1 chunks ahead, under this one's products
         cp_commit();
         const float* A = smem + st * TT::ST + wb * BS * TT::A_LD;
         const float* Bt = smem + st * TT::ST + TT::A_ST;
@@ -788,9 +802,9 @@ __global__ void __launch_bounds__(THREADS) fused_sum_merge_kernel(Args a) {
 }
 
 
-static size_t smem_bytes(int tn, bool td, bool ext, int share, bool affine) {
-    const int st = NBT * BS * (td ? 36 : 40) + BS * tn + tn + NBT * (tn + 4);
-    return (2 * st + NBT * tn) * sizeof(float) + tn * (sizeof(long long) + sizeof(int)) +
+static size_t smem_bytes(int tn, bool td, bool ext, int share, bool affine, bool bf) {
+    const int st = NBT * BS * (bf ? 16 : td ? 36 : 40) + BS * tn / (bf ? 2 : 1) + tn + NBT * (tn + 4);   // (`Tile`'s)
+    return ((bf ? 4 : 2) * st + NBT * tn) * sizeof(float) + tn * (sizeof(long long) + sizeof(int)) +
            (ext ? NBT * share * sizeof(int) + (OFF_SAMPLES + 1) * sizeof(long long) : 0) +
            (affine ? 0 : NBT * share * sizeof(long long));
 }
@@ -846,7 +860,7 @@ template <bool EXT, bool X3, bool FA, bool BF, int TN, bool TD>
 static void launch(const Args& a, dim3 grid, unsigned pre_tiles, cudaStream_t stream) {
     if (a.prepass) launch_prepass<TD, EXT>(a, pre_tiles, stream);
     allowed<EXT, X3, FA, BF, TN, TD>();
-    const size_t bytes = smem_bytes(TN, TD, EXT, a.share, a.affine);
+    const size_t bytes = smem_bytes(TN, TD, EXT, a.share, a.affine, BF);
     launch_dependent(fused_sum_kernel<EXT, X3, FA, BF, TN, TD>, grid, bytes, stream, a);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     if (a.split > 1) {
@@ -1035,9 +1049,11 @@ void fragment_weights(torch::Tensor weights, torch::Tensor frag, torch::Tensor w
 }
 
 
-// How many CTAs of a direction's kernel an SM holds at once (for the split's waves)
+// How many CTAs of a direction's kernel an SM holds at once (for the split's waves) -- at bf16 as many as the float
+// stages' ring of two allowed (`Tile`), which its four half-size stages may exceed: a launch splits by it, and the
+// split orders the merge's adds, so a launch's bits do not hang on the bf16 stages
 int64_t ctas_per_sm(bool td, bool ext, bool x3, bool fa, bool bf, int64_t tn, int64_t share, bool affine) {
-    const size_t bytes = smem_bytes((int)tn, td, ext, (int)share, affine);
+    const size_t bytes = smem_bytes((int)tn, td, ext, (int)share, affine, false);
     const void* k = nullptr;
 #define K_OF(T, E, X, F, B, N) \
     if (td == T && ext == E && x3 == X && fa == F && bf == B && tn == N) k = allowed<E, X, F, B, N, T>();
