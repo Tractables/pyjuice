@@ -57,7 +57,11 @@ _STREAM_FUSION_FW_OPTS = frozenset(("precision", "pflow_temperature", "sum_exter
 # The backward options of the plain regime a fused product backward serves (`_stream_fusion_bk_groups`)
 _STREAM_FUSION_BK_OPTS = frozenset(("param_flows", "denom_param_flows", "allow_modify_flows", "logspace_flows",
                                     "negate_pflows", "precision", "pflow_temperature", "temper_eflow",
-                                    "defer_param_flows", "pf_store_first"))
+                                    "defer_param_flows", "pf_store_first", "sum_external_params",
+                                    "sum_external_params_buffer", "sum_external_params_grad",
+                                    "sum_external_params_grad_buffer"))
+# (a fused product backward's trials compute no gate gradients: the gradient buffers left out of them)
+_STREAM_FUSION_BK_GRADS = ("sum_external_params_grad", "sum_external_params_grad_buffer")
 
 
 class TensorCircuit(_BuildMixin, _CudaGraphsMixin, _ExternalParamsMixin, _LearningMixin, _InspectionMixin,
@@ -548,7 +552,7 @@ class TensorCircuit(_BuildMixin, _CudaGraphsMixin, _ExternalParamsMixin, _Learni
             return frozenset()
         pf = sum_opts.get("param_flows") is not None
         state = self.__dict__.setdefault("_stream_fusion_bk_", {})
-        key = (batch_size, self.precision, self.params.dtype, op_groups, pf)
+        key = (batch_size, self.precision, self.params.dtype, op_groups, pf, "sum_external_params_buffer" in sum_opts)
         seen = state.get(key)
         if isinstance(seen, frozenset):
             return seen
@@ -573,7 +577,9 @@ class TensorCircuit(_BuildMixin, _CudaGraphsMixin, _ExternalParamsMixin, _Learni
         nf, ef = None, None
         for k in range(len(groups) - 1):
             prod, sumg = groups[k], groups[k + 1]
-            if not (prod.is_prod() and sumg.is_sum() and all(type(layer) is SumLayer for layer in sumg)):
+            if not (prod.is_prod() and sumg.is_sum() and all(
+                    type(layer) is SumLayer or getattr(getattr(layer, "external_params", None), "fuses_stream_children",
+                                                       False) for layer in sumg)):
                 continue
             table = tables[k]
             given = op is not None and id(sumg) in op_groups
@@ -583,21 +589,23 @@ class TensorCircuit(_BuildMixin, _CudaGraphsMixin, _ExternalParamsMixin, _Learni
                 continue
             if not bool((parents[table[0].reshape(-1).long()] == 1).all()):
                 continue
-            if nf is None:                                   # (scratch flows: the trials write children's rows)
-                nf, ef = self.node_flows.clone(), self.element_flows.clone()
-            opts = dict(sum_opts, param_flows = None, denom_param_flows = None, defer_param_flows = False,
-                        pf_store_first = False, **(dict(op_params = op) if given else {}))
+            if nf is None:                                   # (scratch flows: the trials write children's rows; and
+                # node values: a gated layer's backward shifts its own rows by log Z and back, not to the bit)
+                nf, ef, nm = self.node_flows.clone(), self.element_flows.clone(), self.node_mars.clone()
+            opts = {k: v for k, v in sum_opts.items() if k not in _STREAM_FUSION_BK_GRADS}
+            opts.update(param_flows = None, denom_param_flows = None, defer_param_flows = False, pf_store_first = False,
+                        **(dict(op_params = op) if given else {}))
             shape = ("prod_stream_fusion_bk", batch_size, str(self.params.dtype), self.precision, given,
                      tuple((layer.num_nodes, layer.num_edges, layer.block_size, layer.num_bk_partitions) for layer in sumg),
                      tuple((layer.num_nodes, layer.block_size) for layer in prod))
 
             def bench(choice, prod = prod, sumg = sumg, opts = opts, table = table):
                 if choice == "fused":
-                    sumg.backward(nf, ef, self.node_mars, self.element_mars, self.params, propagation_alg = "LL",
+                    sumg.backward(nf, ef, nm, self.element_mars, self.params, propagation_alg = "LL",
                                   stream_children = table, **opts)
                 else:
-                    prod.forward(self.node_mars, self.element_mars)
-                    sumg.backward(nf, ef, self.node_mars, self.element_mars, self.params, propagation_alg = "LL", **opts)
+                    prod.forward(nm, self.element_mars)
+                    sumg.backward(nf, ef, nm, self.element_mars, self.params, propagation_alg = "LL", **opts)
                     prod.backward(nf, ef, logspace_flows = True)
             if autotune.pick(shape, ["unfused", "fused"], bench, margin = 1.0) == "fused":
                 fused.append(k)

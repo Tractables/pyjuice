@@ -41,6 +41,23 @@ _GRAD_KWARGS = None
 _MODS = {}
 
 
+def _form_elements():
+    """`pyjuice.layer.fused_children.form_elements` (imported at the call: `pyjuice.layer` imports `pyjuice.nodes`)."""
+    from pyjuice.layer.fused_children import form_elements
+    return form_elements
+
+
+def _scatter_flows():
+    """`pyjuice.layer.fused_children.scatter_flows` (as `_form_elements`)."""
+    from pyjuice.layer.fused_children import scatter_flows
+    return scatter_flows
+
+
+def _rows(chids: torch.Tensor, cbs: int) -> torch.Tensor:
+    """A partition's element rows (its child blocks' every row, int64)."""
+    return (chids.long()[:, None] + torch.arange(cbs, device = chids.device)[None, :]).reshape(-1)
+
+
 def _mod(name: str):
     """The module `..kernels.<name>`, imported on first use and then looked up (an import statement a call costs
     ~0.5 us; read attributes off the module, so a test replacing one still takes effect)."""
@@ -643,6 +660,16 @@ class _BackwardMixin:
             if plan is None:
                 plan = _build_ele_plan(ctx)
                 cache[key] = plan
+            # (whether a gated call's element flows here take the split kernel, which the product layer below fuses
+            # into: `ExternalParamsSumLayer._stream_fusion_bk`)
+            kind = plan["kind"]
+            ready = (isinstance(kind, tuple) and kind[0] == "eles"
+                     and _mod("c").get_ele_stream_fused_module() is not None)
+            parts = layer.__dict__.setdefault("_bk_stream_parts_g", {}).setdefault(
+                (ctx["batch_size"], ctx["params"].dtype, ctx.get("op") is not None), {})
+            if parts.get(ctx["partition_id"]) != ready:
+                parts[ctx["partition_id"]] = ready
+                layer.__dict__.pop("_bk_fusion_ready_g", None)
             run = _ele_fn(ctx, plan, plan["kind"])
             if planning:
                 def _ele(node_flows, element_flows, node_mars, element_mars, params, param_flows, denom_param_flows,
@@ -896,9 +923,21 @@ class _BackwardMixin:
                 tb, code, tri = plan["eles"], kind[1], _ele_fn(ctx, plan, "triton")
 
                 def run(tgt, node_flows, node_mars, element_mars, params, ext, grad):
+                    # (the product layer group below handed to this call, its passes not run: `_bk_stream_children`)
+                    sc = layer.__dict__.get("_bk_stream_children")
                     if ext.data_ptr() % 16:                    # (its log-gate rows are 16-byte loads)
-                        return tri(tgt, node_flows, node_mars, element_mars, params, ext, grad)
+                        if sc is None:
+                            return tri(tgt, node_flows, node_mars, element_mars, params, ext, grad)
+                        _form_elements()(element_mars, node_mars, sc)
+                        tri(tgt, node_flows, node_mars, element_mars, params, ext, grad)
+                        return _scatter_flows()(node_flows, tgt, sc, _rows(chids, cbs))
                     op = layer._bk_copy()                      # (the call's bf16 copy of fp32 parameters, if any)
+                    if sc is not None:                         # (the product fused: its children's node flows)
+                        _mod("c").get_ele_stream_fused_module().blockscale_ele_backward_stream_fused(
+                            node_flows, node_mars, sc[0], int(sc[1]), params if op is None else op, ext, chids, ebase,
+                            pbase, no_grad if grad is None else grad, batch, blk, cbs, knt, gate_cbs, ext_base,
+                            0 if grad is None else 1, code, tb["tables"], tb["ngrp"], tb["npc"])
+                        return
                     eles_mod.blockscale_ele_backward_stream(
                         tgt, element_mars, node_flows, node_mars, params if op is None else op, ext, chids, ebase, pbase,
                         no_grad if grad is None else grad, batch, blk, cbs, knt, gate_cbs, ext_base,
@@ -1159,9 +1198,18 @@ class _BackwardMixin:
                       if k not in ("node_flows", "element_flows", "node_mars", "element_mars", "params", "param_flows")}
 
             def defer(param_flows, node_flows, node_mars, element_mars, params, ext):
+                sc = layer.__dict__.get("_bk_stream_children")
                 c = dict(static, param_flows = param_flows, node_flows = node_flows, node_mars = node_mars,
-                         element_mars = element_mars, params = params)
-                return _deferred_par().try_defer(pd_mod, layer, c, gb, ext, node_cbs, gate_cbs, ext_base, n_ngates_)
+                         element_mars = element_mars, params = params, children = sc)
+                done = _deferred_par().try_defer(pd_mod, layer, c, gb, ext, node_cbs, gate_cbs, ext_base, n_ngates_)
+                if done:
+                    deferred = layer.__dict__.setdefault("_bk_par_deferred_g", {})
+                    if not deferred.get((static["batch_size"], static["partition_id"])):
+                        deferred[(static["batch_size"], static["partition_id"])] = True
+                        layer.__dict__.pop("_bk_fusion_ready_g", None)
+                elif sc is not None:                   # (declined after all: the per-step kernels read the values)
+                    _form_elements()(element_mars, node_mars, sc)
+                return done
 
             return defer
 

@@ -73,10 +73,18 @@ def stream_steered(monkeypatch):
 
 @pytest.fixture
 def fused_preferred(stream_steered, monkeypatch):
-    """`stream_steered`, and the fusion decisions -- forward and backward -- steered to the fused copies."""
+    """`stream_steered`, and the fusion decisions -- forward and backward -- steered to the fused copies, after every
+    candidate's trial has run as the tuner runs it (on what the decision hands it: what a trial leaves behind is what
+    the pass then reads)."""
     real_pick = autotune.pick
-    monkeypatch.setattr(autotune, "pick", lambda key, cands, bench, *a, **k: "fused"
-                        if key[0] in ("prod_stream_fusion", "prod_stream_fusion_bk") else real_pick(key, cands, bench, *a, **k))
+
+    def pick(key, cands, bench, *a, **k):
+        if key[0] not in ("prod_stream_fusion", "prod_stream_fusion_bk"):
+            return real_pick(key, cands, bench, *a, **k)
+        for c in cands:
+            bench(c)
+        return "fused"
+    monkeypatch.setattr(autotune, "pick", pick)
 
 
 def _needs_stream():
@@ -249,11 +257,13 @@ def _gated_hmm(T = 5, L = 4096, C = 16):
 
 @pytest.fixture
 def split_forward_steered(monkeypatch):
-    """BlockScale's forward fork steered to its split forward where it is offered (its tuner times the forks)."""
+    """BlockScale's forward fork and element backward steered to its split kernels where they are offered (its tuner
+    times the forks, and each circuit's layers time their own)."""
     import pyjuice.layer.kernels.c as ck
     real = ck.autotune
     monkeypatch.setattr(ck, "autotune", lambda cands, *a, **k: next(
-        (key for key, _ in cands if isinstance(key, tuple) and key[:1] == ("stream",)), None) or real(cands, *a, **k))
+        (key for key, _ in cands if isinstance(key, tuple) and key[:1] in (("stream",), ("eles",))), None)
+        or real(cands, *a, **k))
 
 
 @cuda_only
@@ -280,6 +290,108 @@ def test_gated_layers_fused_compute_the_unfused_bits(fused_preferred, split_forw
         for _ in range(3):
             outs = [c(x).clone() for c in (pc, pc2)]
             assert torch.equal(outs[0], outs[1]) and torch.equal(pc.node_mars, pc2.node_mars)
+
+
+@cuda_only
+def test_gated_training_steps_fused_compute_the_unfused_bits(fused_preferred, split_forward_steered):
+    """Training steps of a tied chain of gated layers fusing the products forward and backward
+    (`blockscale_ele_backward_stream_fused.cu`, the gated parameter flows' capture from the children) and one never
+    fusing, every parameter given to the fusing one before each step: node values, node flows and parameter flows to
+    the bit, the gate gradients and the denominator flows to their summation order (atomics)."""
+    _needs_stream()
+    B, T, C = 128, 5, 16
+    (pc, nodes), (pc2, nodes2) = _gated_hmm(), _gated_hmm()
+    _unfused(pc2)
+    g = torch.Generator().manual_seed(2)
+    gates = [torch.randn(n.external_params.tensor_shapes(n, B)[0], generator = g).to(DEV) * 0.5 - 0.5 for n in nodes]
+    x = torch.randint(0, C, (B, T), device = DEV)
+    for step in range(4):
+        with torch.no_grad():
+            for p0, p1 in zip(pc.parameters(), pc2.parameters()):
+                if p0.is_floating_point():
+                    p0.data.copy_(p1.data)
+        out = []
+        for c, ns in ((pc, nodes), (pc2, nodes2)):
+            grads = {n: torch.zeros_like(v) for n, v in zip(ns, gates)}
+            c.init_param_flows(flows_memory = 0.0)
+            c(x, sum_external_params = {n: v for n, v in zip(ns, gates)})
+            c.backward(x, flows_memory = 1.0, sum_external_params_grad = grads)
+            out.append((c.node_mars.clone(), c.node_flows.clone(), c.param_flows.clone(), [grads[n] for n in ns],
+                        c.denom_param_flows.clone()))
+        (nm0, nf0, pf0, g0, w0), (nm1, nf1, pf1, g1, w1) = out
+        assert torch.equal(nm0, nm1) and torch.equal(nf0, nf1) and torch.equal(pf0, pf1), step
+        for a, b in zip(g0, g1):
+            assert torch.allclose(a, b, rtol = 1e-5, atol = 1e-5 * float(b.abs().max())), step
+        assert torch.allclose(w0, w1, rtol = 1e-5, atol = 1e-6 * float(w1.abs().max())), step
+        for c in (pc, pc2):
+            c.mini_batch_em(step_size = 0.5, pseudocount = 0.1)
+    fused = [v for k, v in pc.__dict__["_stream_fusion_bk_"].items() if k[0] == B and isinstance(v, frozenset)]
+    assert fused and len(fused[0]) >= T - 2
+
+
+def _gated_steps(pc, nodes, gates, x, steps, B):
+    for _ in range(steps):
+        grads = {n: torch.zeros_like(v) for n, v in zip(nodes, gates)}
+        pc.init_param_flows(flows_memory = 0.0)
+        pc(x, sum_external_params = {n: v for n, v in zip(nodes, gates)})
+        pc.backward(x, flows_memory = 1.0, sum_external_params_grad = grads)
+
+
+@cuda_only
+def test_gated_backward_off_the_split_kernel_fuses_nothing(fused_preferred, monkeypatch):
+    """Gated element flows steered to another fork than the split kernel: no product backward fused
+    (`ExternalParamsSumLayer._stream_fusion_bk`), the node flows of a circuit never fusing."""
+    _needs_stream()
+    import pyjuice.layer.kernels.c as ck
+    real = ck.autotune
+
+    def pick(cands, *a, **k):
+        keys = [key for key, _ in cands]
+        if any(isinstance(key, tuple) and key[:1] == ("eles",) for key in keys):
+            return next(key for key in keys if not (isinstance(key, tuple) and key[:1] == ("eles",)))
+        return next((key for key in keys if isinstance(key, tuple) and key[:1] == ("stream",)), None) or real(cands, *a, **k)
+    monkeypatch.setattr(ck, "autotune", pick)
+    B, T, C = 128, 5, 16
+    (pc, nodes), (pc2, nodes2) = _gated_hmm(), _gated_hmm()
+    _unfused(pc2)
+    g = torch.Generator().manual_seed(2)
+    gates = [torch.randn(n.external_params.tensor_shapes(n, B)[0], generator = g).to(DEV) * 0.5 - 0.5 for n in nodes]
+    x = torch.randint(0, C, (B, T), device = DEV)
+    _gated_steps(pc, nodes, gates, x, 3, B)
+    _gated_steps(pc2, nodes2, gates, x, 3, B)
+    assert not any(v for k, v in pc.__dict__["_stream_fusion_bk_"].items() if isinstance(v, frozenset))
+    assert torch.equal(pc.node_flows, pc2.node_flows)
+
+
+@cuda_only
+def test_gated_fused_backward_whose_deferral_declines_computes_the_unfused_bits(fused_preferred, split_forward_steered,
+                                                                                monkeypatch):
+    """Gated parameter flows deferred when the backward fusion was decided, then not: the fused gated layers form the
+    element values for the per-step kernels -- node flows of a circuit never fusing to the bit, its parameter flows to
+    the per-step kernels' forks."""
+    _needs_stream()
+    import pyjuice.layer.deferred_par as deferred_par
+    B, T, C = 128, 5, 16
+    (pc, nodes), (pc2, nodes2) = _gated_hmm(), _gated_hmm()
+    _unfused(pc2)
+    g = torch.Generator().manual_seed(2)
+    gates = [torch.randn(n.external_params.tensor_shapes(n, B)[0], generator = g).to(DEV) * 0.5 - 0.5 for n in nodes]
+    x = torch.randint(0, C, (B, T), device = DEV)
+    _gated_steps(pc, nodes, gates, x, 2, B)
+    _gated_steps(pc2, nodes2, gates, x, 2, B)
+    assert any(v for k, v in pc.__dict__["_stream_fusion_bk_"].items() if isinstance(v, frozenset))
+    monkeypatch.setattr(deferred_par, "MIN_FLOWS", 1 << 62)
+    monkeypatch.setattr(deferred_par, "MIN_FLOW_SAMPLES", 1 << 62)
+    with torch.no_grad():
+        for p0, p1 in zip(pc.parameters(), pc2.parameters()):
+            if p0.is_floating_point():
+                p0.data.copy_(p1.data)
+    _gated_steps(pc, nodes, gates, x, 1, B)
+    _gated_steps(pc2, nodes2, gates, x, 1, B)
+    assert torch.equal(pc.node_flows, pc2.node_flows)
+    # (the per-step kernels each circuit times for itself, whose forks differ at TF32's level; stale element values
+    # would be off by O(1))
+    assert torch.allclose(pc.param_flows, pc2.param_flows, rtol = 1e-3, atol = 1e-4 * float(pc2.param_flows.abs().max()))
 
 
 @cuda_only
@@ -400,7 +512,8 @@ def _decided(pc, x, steps = 2):
 @cuda_only
 def test_a_fused_backward_launches_no_product_kernels(fused_preferred, monkeypatch):
     """Where the backward fuses a product group, neither its forward (the recompute) nor its backward is launched in the
-    backward; every other product group's are."""
+    backward, every other product group's are, and the fused element kernel runs for each fused group's layers (not the
+    layers' fallback, which computes the same bits)."""
     _needs_stream()
     pc, T, E = _hmm(4096)
     B = 128
@@ -412,6 +525,8 @@ def test_a_fused_backward_launches_no_product_kernels(fused_preferred, monkeypat
         real = getattr(ProdLayer, name)
         monkeypatch.setattr(ProdLayer, name, lambda self, *a, real = real, name = name, **k: ran[name].append(self)
                             or real(self, *a, **k))
+    calls, real_fused = [], cuda_kernels.ele_backward_sum_stream_fused
+    monkeypatch.setattr(cuda_kernels, "ele_backward_sum_stream_fused", lambda *a, **k: calls.append(1) or real_fused(*a, **k))
     pc.backward(x, flows_memory = 1.0)
     fused = _fused_groups(pc, B, "_stream_fusion_bk_")
     groups = pc.inner_layer_groups
@@ -419,6 +534,7 @@ def test_a_fused_backward_launches_no_product_kernels(fused_preferred, monkeypat
     assert fused and fused <= prods
     for name in ran:
         assert {k for k in prods if any(layer in ran[name] for layer in groups[k])} == prods - fused, name
+    assert len(calls) >= sum(len(list(groups[k + 1])) for k in fused)
 
 
 @cuda_only
@@ -524,7 +640,8 @@ def test_no_backward_fusion_of_parameter_flows_that_are_not_deferred(fused_prefe
     for _ in range(3):
         pc(x)
         pc.backward(x, compute_param_flows = False)
-    assert pc.__dict__["_stream_fusion_bk_"][(B, pc.precision, pc.params.dtype, pc._param_operand_groups(B), False)]
+    assert pc.__dict__["_stream_fusion_bk_"][(B, pc.precision, pc.params.dtype, pc._param_operand_groups(B), False,
+                                              False)]
 
 
 @cuda_only
@@ -572,9 +689,11 @@ def test_no_backward_fusion_on_kept_flow_buffers(fused_preferred):
 
 
 @cuda_only
-def test_stream_children_backward_takes_a_settled_plain_call(stream_steered):
-    """`backward(stream_children = ...)` in linear-space flows, or where the layer's element flows take no stream kernel
-    (a batch of 48, not a multiple of its 64 columns): an error."""
+def test_stream_children_backward_falls_back_where_no_fused_kernel_serves(stream_steered):
+    """`backward(stream_children = ...)` where the layer's element flows take no stream kernel (a batch of 48, not a
+    multiple of its 64 columns): the product layer's values formed, the backward as without the tables, its element
+    flows written as the children's node flows -- the node flows of the product layer's forward, the backward and the
+    product layer's backward one after the other; in linear-space flows (no fused regime): an error."""
     _needs_stream()
     from pyjuice.layer.fused_children import element_children
     pc, T, E = _hmm(4096)
@@ -582,15 +701,28 @@ def test_stream_children_backward_takes_a_settled_plain_call(stream_steered):
     x = torch.randint(0, E, (B, T), device = DEV)
     _decided(pc, x, 1)
     k = [i for i, g in enumerate(pc.inner_layer_groups) if g.is_sum()][2]
-    layer = list(pc.inner_layer_groups[k])[0]
+    layer, prod = list(pc.inner_layer_groups[k])[0], pc.inner_layer_groups[k - 1]
     table = element_children(pc)[k - 1]
-    nf, ef = pc.node_flows.clone(), pc.element_flows.clone()
     assert layer._stream_fusion_bk(B, pc.params.dtype, False, False)
     with pytest.raises(ValueError):
-        layer.backward(nf, ef, pc.node_mars, pc.element_mars, pc.params, logspace_flows = False, stream_children = table)
-    with pytest.raises(ValueError):
-        layer.backward(nf[:, :48].contiguous(), ef[:, :48].contiguous(), pc.node_mars[:, :48].contiguous(),
-                       pc.element_mars[:, :48].contiguous(), pc.params, logspace_flows = True, stream_children = table)
+        layer.backward(pc.node_flows.clone(), pc.element_flows.clone(), pc.node_mars, pc.element_mars, pc.params,
+                       logspace_flows = False, stream_children = table)
+    nm, em = pc.node_mars[:, :48].contiguous(), pc.element_mars[:, :48].contiguous()
+    outs = []
+    for fused in (True, False):
+        nf, ef = pc.node_flows[:, :48].contiguous(), pc.element_flows[:, :48].contiguous()
+        rows = layer._element_rows()
+        ch = table[0][rows - table[1]].long().reshape(-1)
+        nf[ch] = -torch.inf                                     # (the children's flows -inf before, as in a pass)
+        if fused:
+            layer.backward(nf, ef, nm, em.clone(), pc.params, logspace_flows = True, stream_children = table)
+        else:
+            em2 = em.clone()
+            prod.forward(nm, em2)
+            layer.backward(nf, ef, nm, em2, pc.params, logspace_flows = True)
+            prod.backward(nf, ef, logspace_flows = True)
+        outs.append(nf[ch].clone())
+    assert torch.equal(outs[0], outs[1])
 
 
 @cuda_only

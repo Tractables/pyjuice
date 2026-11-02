@@ -98,7 +98,7 @@ FORWARD_SUM_TUNED = True
 FORWARD_SUM_CUDA = True
 from .kernels import c as cuda_kernels
 from . import deferred_par
-from .fused_children import form_elements
+from .fused_children import form_elements, scatter_flows
 
 # Node-tile sizes for the small-batch (batch < 16) block-sparse path. At tiny batch the GPU is
 # filled by splitting the *node* dimension into many tiles (the batch dimension is too short to
@@ -524,11 +524,13 @@ class SumLayer(Layer, nn.Module):
                       self._cached_bk_par_trim, self._cached_param_align8, self._fw_fast,
                       self.__dict__.setdefault("_cached_tile_index", {}),
                       self.__dict__.setdefault("_stream_fusion_plans", {}),
-                      self.__dict__.setdefault("_bk_stream_parts", {}), self.__dict__.setdefault("_bk_par_deferred", {})):
+                      self.__dict__.setdefault("_bk_stream_parts", {}), self.__dict__.setdefault("_bk_par_deferred", {}),
+                      self.__dict__.setdefault("_bk_fusion_ready_", {})):
             cache.clear()
         LaunchPlans.of(self).clear()
         self._bk_ele_scratch = None
         self._bk_par_scratch = None
+        self.__dict__.pop("_element_rows_", None)
 
     def _cuda_param_loads_aligned(self, params: torch.Tensor, key, pbase: torch.Tensor, row_stride: int) -> bool:
         """Whether the CUDA kernels' 8-parameter loads (`c/param_load.cuh`) are aligned for parameters stored as
@@ -997,6 +999,14 @@ class SumLayer(Layer, nn.Module):
         # `_defer_param_flows` below, since a plan's element launchers read it too
         op = op_params if op_params is not None and self.__dict__.get("_reads_param_operands", False) else None
         self.__dict__["_bk_op_params"] = op
+        fallback = None
+        if stream_children is not None and not self._bk_fusion_ready(node_flows.size(1), params.dtype, op is not None,
+                                                                      param_flows is not None):
+            # (this call's partitions not all settled on the fused kernels -- another shape than the decision's: the
+            # product layer's values formed for the kernels that read them, the backward as without the tables, and its
+            # element flows written as the children's node flows after: the bits of the product layer's passes)
+            form_elements(element_mars, node_mars, stream_children)
+            fallback, stream_children = stream_children, None
         self.__dict__["_bk_stream_children"] = stream_children
 
         # A launch plan (`pyjuice.utils.launch_plans`): what an earlier call with this signature launched, its decisions
@@ -1027,6 +1037,8 @@ class SumLayer(Layer, nn.Module):
             if plan is not None:
                 for launch in plan:
                     launch(node_flows, element_flows, node_mars, element_mars, params, param_flows)
+                if fallback is not None:
+                    scatter_flows(node_flows, element_flows, fallback, self._element_rows())
                 return None
         elif LaunchPlans.nested():
             LaunchPlans.fail()
@@ -1128,7 +1140,29 @@ class SumLayer(Layer, nn.Module):
         if pkey is not None:
             LaunchPlans.of(self).store(pkey, rec, self.num_bk_partitions + (self.num_fw_partitions
                                                                             if param_flows is not None else 0))
+        if fallback is not None:
+            scatter_flows(node_flows, element_flows, fallback, self._element_rows())
         return None
+
+    def _element_rows(self) -> torch.Tensor:
+        """Every element row this layer's backward computes the flows of (its backward partitions' child blocks, int64),
+        made once: what `scatter_flows` writes to the children where a call handed the product group below did not
+        take the fused kernels."""
+        rows = self.__dict__.get("_element_rows_")
+        if rows is None:
+            rows = self.__dict__["_element_rows_"] = torch.cat([
+                (chids.long()[:, None] + torch.arange(cbs, device = chids.device)[None, :]).reshape(-1)
+                for chids, cbs in zip(self.partitioned_chids, self.cs_block_sizes)])
+        return rows
+
+    def _bk_fusion_ready(self, batch_size: int, dtype: torch.dtype, op: bool, param_flows: bool) -> bool:
+        """`_stream_fusion_bk` for a call, kept until the records it reads change (one lookup a call)."""
+        memo = self.__dict__.setdefault("_bk_fusion_ready_", {})
+        key = (batch_size, dtype, op, param_flows)
+        hit = memo.get(key)
+        if hit is None:
+            hit = memo[key] = self._stream_fusion_bk(batch_size, dtype, op, param_flows)
+        return hit
 
     def is_sum(self):
         return True
@@ -2716,8 +2750,10 @@ class SumLayer(Layer, nn.Module):
                 # backward with the product layer below fused takes: `_stream_fusion_bk`)
                 stream_parts = self.__dict__.setdefault("_bk_stream_parts", {}).setdefault(
                     (batch_size, params.dtype, op is not None), {})
-                stream_parts[partition_id] = (choice[0] == "cuda_stream" and runs is None
-                                              and cuda_kernels.ele_stream_fused_is_available())
+                ready = (choice[0] == "cuda_stream" and runs is None and cuda_kernels.ele_stream_fused_is_available())
+                if stream_parts.get(partition_id) != ready:
+                    stream_parts[partition_id] = ready
+                    self.__dict__.pop("_bk_fusion_ready_", None)
                 if self.__dict__.get("_bk_stream_children") is not None and not stream_parts[partition_id]:
                     raise ValueError("`stream_children`: this partition's element flows did not settle on the stream "
                                      "kernel (see `_stream_fusion_bk`).")
@@ -3413,7 +3449,10 @@ class SumLayer(Layer, nn.Module):
                 par_planned = True
                 if _defer(param_flows, cur):
                     # (deferred at this batch: what a backward with the product layer below fused needs)
-                    self.__dict__.setdefault("_bk_par_deferred", {})[(batch_size, partition_id)] = True
+                    deferred = self.__dict__.setdefault("_bk_par_deferred", {})
+                    if not deferred.get((batch_size, partition_id)):
+                        deferred[(batch_size, partition_id)] = True
+                        self.__dict__.pop("_bk_fusion_ready_", None)
                     return None
                 if _choice(param_flows, cur) == "cuda":
                     _cuda_par(param_flows, cur)
