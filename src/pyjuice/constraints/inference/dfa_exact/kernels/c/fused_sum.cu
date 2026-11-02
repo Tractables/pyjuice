@@ -45,9 +45,11 @@
 #include <math_constants.h>
 #include <cuda_bf16.h>
 
-// Programmatic dependent launch (sm_90 on; elsewhere the launches are plain and these do nothing): the fused sum and
-// its merge launch while the launch before them runs, then wait for it before they read anything (`pdl_wait` first
-// thing), so only their launch overlaps it; the pre-pass and the fused sum let their dependents launch at once.
+// Programmatic dependent launch (sm_90 on; elsewhere the launches are plain and these do nothing): the pre-pass, the
+// fused sum and its merge each launch while the launch before them runs. The pre-pass waits for it (`pdl_wait`) first
+// thing and only then lets the sums launch (`pdl_trigger`), so when they start every launch before the pre-pass is done:
+// the sums read the program's and the query's tables under the pre-pass and wait for it only before its buffer, the
+// merge reads its tables under the sums and waits for them before their shares (`fused_sum_kernel`).
 __device__ __forceinline__ void pdl_wait() {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
     cudaGridDependencySynchronize();
@@ -231,7 +233,8 @@ __device__ __forceinline__ void put(const Where& w, int b, long long r, long lon
 
 template <bool TD, bool EXT, int FRAG>
 __global__ void __launch_bounds__(THREADS) prepass_kernel(Args a) {
-    pdl_trigger();                                                   // (the fused sum may launch: it waits for this)
+    pdl_wait();                                                      // (every launch before, done: the sums read
+    pdl_trigger();                                                   // tables under this kernel; they may launch)
     __shared__ float X[BS][PRE_COLS + 1];
     __shared__ float Tc[PRE_COLS];
     __shared__ long long cols[PRE_COLS];
@@ -338,8 +341,9 @@ __global__ void __launch_bounds__(THREADS) fused_sum_kernel(Args a) {
     __shared__ int s_lo, s_hi;                                      // EXT: the tile's columns' samples, a range
 
     // The tables up to the first chunk's copies -- the blocks' rows, the chunks' cells and weights, the columns and their
-    // samples -- read under the launch before, where that is this call's pre-pass: they were written before it began
-    // (a launch of its own, not a dependent), and only its buffer, the chunks' e and t, is not. Else the wait first
+    // samples -- read under the launch before, where that is this call's pre-pass: it lets this kernel launch only once
+    // every launch before it is done (its wait, then its trigger), and only its buffer, the chunks' e and t, is its own
+    // writing. Else the wait first
     if (!a.prepass) pdl_wait();                                     // (every earlier launch's)
     pdl_trigger();                                                  // (the merge may launch: it waits for this)
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
@@ -836,14 +840,6 @@ static const void* allowed() {
     return k;
 }
 
-template <bool TD, bool EXT>
-static void launch_prepass(const Args& a, unsigned col_tiles, cudaStream_t stream) {
-    dim3 pgrid((unsigned)a.nch, col_tiles);
-    if (a.frag == 2) prepass_kernel<TD, EXT, 2><<<pgrid, THREADS, 0, stream>>>(a);
-    else prepass_kernel<TD, EXT, 1><<<pgrid, THREADS, 0, stream>>>(a);
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
-}
-
 // `kernel<<<grid, THREADS, smem, stream>>>(a)` as a programmatic dependent of the launch before it where the GPU has it
 // (compute capability 9 on)
 static bool pdl_supported() {
@@ -864,6 +860,13 @@ static void launch_dependent(void (*kernel)(Args), dim3 grid, size_t smem, cudaS
     at[0].val.programmaticStreamSerializationAllowed = 1;
     lc.attrs = at; lc.numAttrs = pdl_supported() ? 1 : 0;
     C10_CUDA_CHECK(cudaLaunchKernelEx(&lc, kernel, a));
+}
+
+template <bool TD, bool EXT>
+static void launch_prepass(const Args& a, unsigned col_tiles, cudaStream_t stream) {
+    dim3 pgrid((unsigned)a.nch, col_tiles);
+    launch_dependent(a.frag == 2 ? prepass_kernel<TD, EXT, 2> : prepass_kernel<TD, EXT, 1>, pgrid, 0, stream, a);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
 template <bool EXT, bool X3, bool FA, bool BF, int TN, bool TD>
