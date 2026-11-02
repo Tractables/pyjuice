@@ -187,15 +187,18 @@ struct Where {
     long long reg, ncols, num_live;
 };
 
+// A CTA's `Where`, by threads 0 to NBT at once -- thread b < NBT block b's rows, thread NBT the region of columns the
+// blocks read (block 0's: a tile's block 0 is always one of the launch's) --, each a chain of a few dependent loads
+// (one thread ran the NBT + 1 of them one after another); thread `t` past NBT does nothing
 template <bool TD>
-__device__ __forceinline__ void where_of(const Args& a, Where& w) {
-    for (int b = 0; b < NBT; ++b) {
-        int i = blockIdx.x * NBT + b;
+__device__ __forceinline__ void where_of(const Args& a, Where& w, int t) {
+    if (t < NBT) {
+        const int b = t, i = blockIdx.x * NBT + b;
         const long long nb = i < a.num_blocks ? (a.indexed ? a.sel[i] : (long long)i) : -1;
         w.nbs[b] = nb;
         w.out[b] = nullptr;
         w.ow[b] = w.lzrow[b] = 0;
-        if (nb < 0) continue;
+        if (nb < 0) return;
         const long long row = a.rows[nb], r = a.rreg[nb];
         if (TD && r < 0) {                              // element rows
             w.out[b] = a.out0 + (row - a.elem_first) * a.elem_width;
@@ -205,10 +208,12 @@ __device__ __forceinline__ void where_of(const Args& a, Where& w) {
             w.out[b] = (TD ? a.out1 : a.out0) + a.reg_offset[r] + (row - a.reg_first[r]) * w.ow[b];
         }
         w.lzrow[b] = row;
+    } else if (t == NBT) {                              // (the blocks share their chunks: one region of columns)
+        const int i = blockIdx.x * NBT;
+        w.reg = a.colreg[a.indexed ? a.sel[i] : (long long)i];
+        w.ncols = (long long)a.B * a.reg_slots[w.reg];
+        w.num_live = a.prune ? (long long)a.reg_live[w.reg] : w.ncols;
     }
-    w.reg = a.colreg[w.nbs[0]];                         // (the blocks share their chunks: one region of columns)
-    w.ncols = (long long)a.B * a.reg_slots[w.reg];
-    w.num_live = a.prune ? (long long)a.reg_live[w.reg] : w.ncols;
 }
 
 __device__ __forceinline__ void put(const Where& w, int b, long long r, long long col, float o) {
@@ -332,11 +337,14 @@ __global__ void __launch_bounds__(THREADS) fused_sum_kernel(Args a) {
     __shared__ Where w;
     __shared__ int s_lo, s_hi;                                      // EXT: the tile's columns' samples, a range
 
-    pdl_wait();                                                     // (the pre-pass's, and every earlier launch's)
+    // The tables up to the first chunk's copies -- the blocks' rows, the chunks' cells and weights, the columns and their
+    // samples -- read under the launch before, where that is this call's pre-pass: they were written before it began
+    // (a launch of its own, not a dependent), and only its buffer, the chunks' e and t, is not. Else the wait first
+    if (!a.prepass) pdl_wait();                                     // (every earlier launch's)
     pdl_trigger();                                                  // (the merge may launch: it waits for this)
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    where_of<TD>(a, w, tid);
     if (tid == 0) {
-        where_of<TD>(a, w);
         s_lo = 0x7fffffff;
         s_hi = -1;
     }
@@ -347,6 +355,7 @@ __global__ void __launch_bounds__(THREADS) fused_sum_kernel(Args a) {
 
     if (a.prune && col0 >= w.num_live) {                // a tile of dead columns: -inf, nothing read (its first
         if (blockIdx.z != 0) return;                    // share; not merged)
+        if (a.prepass) pdl_wait();                      // (no write under the launch before)
         for (int i = tid; i < NBT * BS * TN; i += THREADS) {
             int b = i / (BS * TN), m = (i / TN) % BS, c = i % TN;
             long long k = col0 + c;
@@ -520,6 +529,7 @@ __global__ void __launch_bounds__(THREADS) fused_sum_kernel(Args a) {
             }
         }
     };
+    if (a.prepass) pdl_wait();                          // (the pre-pass's e and t, from here on)
     load(ch0, 0);                                       // (under pass 1)
     cp_commit();
     #pragma unroll
@@ -774,9 +784,9 @@ template <bool EXT, int TN, bool TD>
 __global__ void __launch_bounds__(THREADS) fused_sum_merge_kernel(Args a) {
     using TT = Tile<TN, TD>;
     __shared__ Where w;
-    pdl_wait();                                                     // (the shares' sums)
-    if (threadIdx.x == 0) where_of<TD>(a, w);
+    where_of<TD>(a, w, threadIdx.x);                                // (the tables, under the sums: written before them)
     __syncthreads();
+    pdl_wait();                                                     // (the shares' sums)
     const int i = blockIdx.z * THREADS + threadIdx.x, r = i / TN, c = i % TN, b = r / BS, m = r % BS;
     const long long col0 = (long long)blockIdx.y * TN;
     if (r >= NBT * BS || w.nbs[b] < 0 || col0 + c >= w.ncols || (a.prune && col0 >= w.num_live)) return;
