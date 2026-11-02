@@ -102,6 +102,20 @@ class BlockScaleSumParams(_ForwardMixin, _BackwardMixin, _SampleMixin, _Denomina
     #: computes the node values itself instead of correcting them afterwards.
     replaces_shared_forward = True
 
+    #: Its CUDA forwards round the parameters to bf16 for their products (the CuTe fork, `blockscale_forward_prepass.cu`,
+    #: the tensor-core small-batch fork from batch 16), and its split forward and split element backward read bf16
+    #: parameters only: on a bf16 copy of tied fp32 parameters (`ExternalSumParams.reads_param_operands`) those read it
+    #: -- the split kernels joining the others, the split forward's `sigma` summed from it --, the fp32 and fp16 forks
+    #: the fp32 parameters.
+    reads_param_operands = True
+
+    #: Its split kernels, which the copy brings in, launch more and look up more per layer than the forks they replace
+    #: (MEASURED, a tied gated HMM-2048 B 128: ~8 us of host a layer in the forward, ~10 in the backward): with the copy
+    #: a step of gated layers of 2^22 parameters (HMM-2048) is slower at every batch measured (+2.1..3.4%, B 32-128),
+    #: of 2^20 (HMM-1024) too (+3.2/3.3% at B 128/256, -0.3% at 512), of 2^24 (HMM-4096) faster at every one (-5.4%
+    #: at B 16 .. -25.7% at 128): so from 2^23 on.
+    param_operands_min_edges = 1 << 23
+
     #: `d LL / d log phi` IS computed, in two halves (see `post_backward_layer`): the `Ntilde` term is
     #: fused into the element-flow backward -- all three forks carry it, Triton, CuTe and small-batch,
     #: since they must agree and the launcher picks between them by speed alone -- where the

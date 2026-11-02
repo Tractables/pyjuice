@@ -29,13 +29,21 @@ from .common import _buffer_kwarg
 #: candidate forks, and they would silently share a plan built for the wrong one.
 _FW_PLAN_CACHE = 32
 
+#: The forks whose products round the parameters to bf16 -- the CuTe fork, its pre-pass copy, the tensor-core
+#: small-batch fork from batch 16 (below it its high-precision form; no copy is made there) -- and the split forward,
+#: which reads bf16 parameters only: these read the circuit's bf16 copy of tied fp32 parameters where a call has one
+#: (`forward_layer`'s `op_params`; the same bits, half the bytes), the fp32 forks and the Triton fallback `params`.
+_BF16_FORKS = frozenset(("blockscale_forward", "blockscale_forward_prepass", "blockscale_forward_stream",
+                         "blockscale_sb_forward_mma"))
+
 
 class _ForwardMixin:
     """The forward of :class:`~pyjuice.nodes.external_params.block_scale.BlockScaleSumParams`, one of its bases."""
 
-    def _build_plan(self, layer, ns_tensors, node_mars, element_mars, params, external_params):
+    def _build_plan(self, layer, ns_tensors, node_mars, element_mars, params, external_params, op = None):
         """
-        Resolve every per-layer launch argument once, and check each kernel's assumptions.
+        Resolve every per-layer launch argument once, and check each kernel's assumptions. `op`: the circuit's bf16
+        copy of the fp32 `params` (`forward_layer`'s `op_params`) or None, what the forks of `_BF16_FORKS` read.
 
         FIVE kernels serve this type, and which apply is a property of the shape:
 
@@ -101,8 +109,10 @@ class _ForwardMixin:
         # (`node_cbs >= 64`), with a gate width >= 4, and like the fork one gate per node block.
         pre_valid = ([int(i) for i in pre_mod.fitting_configs(block_size, batch_size, node_cbs, gate_cbs)]
                      if (pre_mod is not None and block_size == gate_bs) else [])
+        # What the bf16-product forks read (`_BF16_FORKS`): the copy where the call has one
+        p_bf = params if op is None else op
         # The split forward's tiles: the same tuples and scope (bf16 parameters, node blocks of 64s).
-        stream_mod = get_stream_module() if params.dtype == torch.bfloat16 else None
+        stream_mod = get_stream_module() if p_bf.dtype == torch.bfloat16 else None
         stream_valid = ([int(i) for i in stream_mod.fitting_configs(block_size, batch_size, node_cbs, gate_cbs)]
                         if (stream_mod is not None and block_size == gate_bs) else [])
 
@@ -211,7 +221,7 @@ class _ForwardMixin:
                 if (bool(((c3 == c3[:, :, :1] + ar.view(1, 1, -1)) | run_pad).all())
                         and bool(((p3 == p3[:, :, :1]
                                    + ar.view(1, 1, -1) * block_size) | run_pad).all())
-                        and (params.dtype == torch.float32
+                        and (p_bf.dtype == torch.float32
                              or (block_size % 8 == 0 and bool((p3[:, :, 0] % 8 == 0).all())))):
                     # The COMPILED TABLES go to the kernel unchanged -- no derived `ebase` / `pbase`
                     # slices to build here or to drift from what the layer compiled.
@@ -341,13 +351,13 @@ class _ForwardMixin:
         # is only safe because every launch here is idempotent (see the note above).
         REPEATS = 10
 
-        def _runner(fn, argslist, i):
+        def _runner(fn, argslist, i, p):
             tuned = _with_cfg(argslist, i)
 
             def run():
                 for _ in range(REPEATS):
                     for args in tuned:
-                        fn(node_mars, element_mars, params, external_params, *args)
+                        fn(node_mars, element_mars, p, external_params, *args)
 
             return run
 
@@ -378,46 +388,46 @@ class _ForwardMixin:
                 for _ in range(REPEATS):
                     for pid, args in enumerate(tuned):
                         stream_mod.blockscale_forward_stream(
-                            node_mars, element_mars, params, external_params, *args,
-                            self._sigma(layer, params, pid, block_size, gate_cbs)[0])
+                            node_mars, element_mars, p_bf, external_params, *args,
+                            self._sigma(layer, p_bf, pid, block_size, gate_cbs)[0])
             return run
 
         cands = []
         if calls:
             for i in valid:
-                cands.append((("cute", i), _runner(mod.blockscale_forward, calls, i)))
+                cands.append((("cute", i), _runner(mod.blockscale_forward, calls, i, p_bf)))
             # The pre-pass copy takes the same launch tuples, and writes `node_mars` and `log Z` by assignment too.
             for i in pre_valid:
-                cands.append((("pre", i), _runner(pre_mod.blockscale_forward_prepass, calls, i)))
+                cands.append((("pre", i), _runner(pre_mod.blockscale_forward_prepass, calls, i, p_bf)))
             # The split forward: the same tuples and each partition's `sigma`, by assignment too; one candidate, its
             # (tile, split) measured first.
             if stream_valid:
-                code = self._stream_code(layer, calls, stream_mod, stream_valid, node_mars, element_mars, params,
+                code = self._stream_code(layer, calls, stream_mod, stream_valid, node_mars, element_mars, p_bf,
                                          external_params)
                 cands.append((("stream", code), _stream_runner(code)))
         if sb_calls:
             for i in range(len(sb_mod.blockscale_sb_configs())):
-                cands.append((("sb", i), _runner(sb_mod.blockscale_sb_forward, sb_calls, i)))
+                cands.append((("sb", i), _runner(sb_mod.blockscale_sb_forward, sb_calls, i, params)))
             # The batch-tiled copy of that kernel (the parameters loaded once per BT columns): the same launch tuples.
             # It wins from a few samples on (gated HMM-4096: batch 4 54 us a layer -> ~25, batch 16 Triton's 174 -> ~50).
             sbbt_mod = get_sb_bt_module()
             if sbbt_mod is not None:
                 for i in range(len(sbbt_mod.blockscale_sb_bt_configs())):
-                    cands.append((("sbbt", i), _runner(sbbt_mod.blockscale_sb_forward_bt, sb_calls, i)))
+                    cands.append((("sbbt", i), _runner(sbbt_mod.blockscale_sb_forward_bt, sb_calls, i, params)))
             # The tensor-core copy (blockscale_smallbatch_forward_mma.cu: N and Z both products of the parameter tile,
             # split-K ranges merged by a dependent launch), its (config, split) codes common to every partition, the
             # same launch tuples; below fp32 its 16-byte parameter loads need the edge blocks' first parameters at
             # multiples of 8 (as the CuTe fork's). Below batch 16 its high-precision form (~2^-16 a term).
             sbmma_mod = get_sb_mma_module()
-            if sbmma_mod is not None and (params.dtype == torch.float32
+            if sbmma_mod is not None and (p_bf.dtype == torch.float32
                                           or (block_size % 8 == 0 and all(bool((c[2] % 8 == 0).all()) for c in sb_calls))):
                 codes = None
                 for c in sb_calls:
                     arms = ck_ext.blockscale_sb_mma_arms(block_size, batch_size, c[6], c[0].numel(), node_cbs, bool(c[10]),
-                                                         params.dtype == torch.float32)
+                                                         p_bf.dtype == torch.float32)
                     codes = list(arms) if codes is None else [a for a in codes if a in arms]
                 for code in codes or []:
-                    cands.append((("sbmma", code), _runner(sbmma_mod.blockscale_sb_forward_mma, sb_calls, code)))
+                    cands.append((("sbmma", code), _runner(sbmma_mod.blockscale_sb_forward_mma, sb_calls, code, p_bf)))
 
         # The portable fork is a CANDIDATE only where the CuTe fork is ineligible -- which is where
         # the small-batch one otherwise takes shapes it was never meant for. Its grid is one block per
@@ -463,6 +473,8 @@ class _ForwardMixin:
             "gate_cbs": gate_cbs,
             "node_cbs": node_cbs,
             "shift_args": shift_args,
+            # `log Z` summed from the copy's `sigma` (the split forward on it): the gate gradient's `sigma` from it too
+            "z_from_copy": kind == "stream" and op is not None,
         }
 
         return out_mod, fname, calls
@@ -509,7 +521,14 @@ class _ForwardMixin:
 
         Unlike a corrective parameterization this owns the whole computation: it reweights the
         per-edge-block partial sums, and those do not survive the standard kernel.
+
+        `op_params` (keyword): the circuit's bf16 copy of tied fp32 parameters (`reads_param_operands`), which the forks
+        whose products are bf16 read in place of `params` (`_BF16_FORKS`: they round the parameters to bf16 anyway --
+        the same bits) and with which the split forward (bf16 parameters only) joins them, its `sigma` summed from the
+        copy: `log Z` from the rounded parameters' sums keeps the cancellation of their rounding between `N` and `Z`.
+        A plan of its own (the candidates differ); the fp32 forks and the portable Triton fallback keep `params`.
         """
+        op_params = kwargs.pop("op_params", None)
         if len(ns_tensors) == 0:
             return None
 
@@ -528,21 +547,22 @@ class _ForwardMixin:
         # is an offset RELATIVE to the staging buffer, so it survives the whole thing moving. It is
         # re-derived and compared anyway -- a pointer subtraction against a rebuild that autotunes.
         batch = node_mars.size(1)
+        pkey = batch if op_params is None else (batch, "operands")
         plans = layer.__dict__.setdefault("_bs_fw_plans", OrderedDict())
-        entry = plans.get(batch)
+        entry = plans.get(pkey)
         if entry is not None:
-            plans.move_to_end(batch)          # LRU: a hit has to protect the entry, or it cannot help
+            plans.move_to_end(pkey)           # LRU: a hit has to protect the entry, or it cannot help
         if entry is not None and entry[1]["ext_base"] != self._ext_base(ns_tensors, external_params,
                                                                        batch):
             entry = None
         if entry is None:
             built = self._build_plan(layer, ns_tensors, node_mars, element_mars, params,
-                                     external_params)
+                                     external_params, op_params)
             # `_build_plan` also allocates a `log Z` buffer per partition, sized by batch, so an
             # unbounded cache would hold one set per batch size ever seen. Oldest out first.
             while len(plans) >= _FW_PLAN_CACHE:
                 plans.popitem(last = False)
-            entry = plans[batch] = (built, layer._bs_bw_state)
+            entry = plans[pkey] = (built, layer._bs_bw_state)
 
         mod, fname, calls = entry[0]
         # The backward reads this, and on a cache HIT `_build_plan` did not run to set it.
@@ -570,14 +590,15 @@ class _ForwardMixin:
             return None
 
         fn = getattr(mod, fname)
+        p = op_params if op_params is not None and fname in _BF16_FORKS else params
         if fname == "blockscale_forward_stream":
             # and each partition's `sigma` (cached until the parameters change)
             st = layer._bs_bw_state
             for pid, args in enumerate(calls):
-                fn(node_mars, element_mars, params, external_params, *args,
-                   self._sigma(layer, params, pid, st["block_size"], st["gate_cbs"])[0])
+                fn(node_mars, element_mars, p, external_params, *args,
+                   self._sigma(layer, p, pid, st["block_size"], st["gate_cbs"])[0])
             return None
         for args in calls:
-            fn(node_mars, element_mars, params, external_params, *args)
+            fn(node_mars, element_mars, p, external_params, *args)
 
         return None

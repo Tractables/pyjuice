@@ -585,11 +585,13 @@ class ExternalParamsSumLayer(SumLayer):
                 "External sum parameters are not supported with `negate_pflows = True`."
 
     def forward(self, node_mars: torch.Tensor, element_mars: torch.Tensor, params: torch.Tensor,
-                propagation_alg: str = "LL", **kwargs) -> None:
+                propagation_alg: str = "LL", op_params: Optional[torch.Tensor] = None, **kwargs) -> None:
         """
         Forward pass. The shared-parameter term is the standard sum-layer forward, run unchanged; the
         descriptor then turns the values it wrote into the effective ones. Whole partitions only (no
-        `partition_runs`): the descriptors' passes cover every node of the layer.
+        `partition_runs`): the descriptors' passes cover every node of the layer. `op_params`: the circuit's bf16
+        copy of shared fp32 parameters (`SumLayer.forward`), for the standard forward and for a descriptor that takes
+        it (`ExternalSumParams.reads_param_operands`).
         """
 
         if kwargs.get("partition_runs") is not None:
@@ -601,7 +603,7 @@ class ExternalParamsSumLayer(SumLayer):
         # supplied for this layer, since then the layer IS a plain sum layer.
         if len(ns_tensors) == 0 or not self.external_params.replaces_shared_forward:
             super(ExternalParamsSumLayer, self).forward(
-                node_mars, element_mars, params, propagation_alg = propagation_alg, **kwargs
+                node_mars, element_mars, params, propagation_alg = propagation_alg, op_params = op_params, **kwargs
             )
 
         if len(ns_tensors) == 0:
@@ -609,6 +611,8 @@ class ExternalParamsSumLayer(SumLayer):
 
         self._assert_supported(propagation_alg, is_backward = False, **kwargs)
 
+        if op_params is not None and self.external_params.reads_param_operands:
+            kwargs = dict(kwargs, op_params = op_params)
         self.external_params.forward_layer(
             self, ns_tensors, node_mars, element_mars, params,
             propagation_alg = propagation_alg, **kwargs
@@ -620,12 +624,14 @@ class ExternalParamsSumLayer(SumLayer):
                  node_mars: torch.Tensor, element_mars: torch.Tensor,
                  params: torch.Tensor, param_flows: Optional[torch.Tensor] = None,
                  denom_param_flows: Optional[torch.Tensor] = None,
-                 propagation_alg: str = "LL", **kwargs) -> None:
+                 propagation_alg: str = "LL", op_params: Optional[torch.Tensor] = None, **kwargs) -> None:
         """
         Backward pass. The descriptor is given a chance to prepare the buffers so that the *standard*
         sum-layer backward computes the shared component's element and parameter flows, and then to
         add the external contribution to the child flows and write the per-sample gradients. Whole
-        partitions only, as the forward.
+        partitions only, as the forward. `op_params`: as `SumLayer.backward`'s -- the element kernels whose products
+        are bf16 read it, the descriptor's among them (`SumLayer._bk_copy`), for a descriptor that takes it
+        (`ExternalSumParams.reads_param_operands`).
         """
 
         if kwargs.get("partition_runs") is not None:
@@ -636,8 +642,15 @@ class ExternalParamsSumLayer(SumLayer):
             # Nothing supplied for this layer -> it is a plain sum layer
             return super(ExternalParamsSumLayer, self).backward(
                 node_flows, element_flows, node_mars, element_mars, params,
-                param_flows = param_flows, propagation_alg = propagation_alg, **kwargs
+                param_flows = param_flows, propagation_alg = propagation_alg, op_params = op_params, **kwargs
             )
+
+        # The copy this call's element flows may read, set before this layer's plan is looked up: its element
+        # launchers read it (`SumLayer._bk_copy`), replayed with `params`
+        if not self.external_params.reads_param_operands:
+            op_params = None
+        op = op_params if op_params is not None and self.__dict__.get("_reads_param_operands", False) else None
+        self.__dict__["_bk_op_params"] = op
 
         self._assert_supported(propagation_alg, is_backward = True, **kwargs)
 
@@ -656,6 +669,8 @@ class ExternalParamsSumLayer(SumLayer):
         # converted ones -- which records itself as usual, inside, and fails this recording if it comes out short.
         pkey, expected = self._backward_plan_key(ns_tensors, ns_grad_tensors, node_flows, node_mars, params,
                                                  param_flows, denom_param_flows, propagation_alg, kwargs)
+        if pkey is not None:
+            pkey = pkey + (op is not None,)
         if pkey is not None:
             plan = LaunchPlans.of(self).lookup(pkey)
             if plan is not None:
@@ -680,7 +695,7 @@ class ExternalParamsSumLayer(SumLayer):
                 if not self.external_params.replaces_shared_backward:
                     super(ExternalParamsSumLayer, self).backward(
                         node_flows, element_flows, node_mars, element_mars, params,
-                        param_flows = param_flows, propagation_alg = propagation_alg, **kwargs
+                        param_flows = param_flows, propagation_alg = propagation_alg, op_params = op, **kwargs
                     )
 
                 self.external_params.post_backward_layer(

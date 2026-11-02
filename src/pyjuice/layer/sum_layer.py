@@ -136,10 +136,14 @@ _BLOCK_SPARSE_EDGE_TRIM = os.environ.get("PYJUICE_EDGE_TRIM", "1") != "0"
 
 # Precision of a circuit's sum layers (`TensorCircuit.precision`). Forward: "auto" is the fastest per layer --
 # bf16 products in the block-sparse kernels from batch 16 (~4e-3 in the log-likelihood of a 4096-latent HMM
-# layer), TF32 on dense layers that take cuBLAS (below); "tf32" never uses bf16 (round-to-nearest TF32 in the
+# layer), TF32 on dense layers that take cuBLAS (below) -- but not on those whose fp32 parameters several layers
+# share: those read a bf16 copy, `TensorCircuit._param_operands`, in the block-sparse kernels' bf16 products;
+# "tf32" never uses bf16 (round-to-nearest TF32 in the
 # Triton kernels, TF32 cuBLAS; ~5e-4); "fp32" gives fp32-level products (`tf32x3` in the Triton tlmm kernel,
 # exact fp32 cuBLAS; ~1e-6). Batches below 16 run fp32 kernels in every mode. Backward: "auto" and "tf32" keep
-# the round-to-nearest TF32 products; "fp32" takes `tf32x3` products (fp32-level, on tensor cores).
+# the round-to-nearest TF32 products -- under "auto" the element flows of the layers reading the bf16 copy have
+# the stream kernel among their arms, on the copy (bf16 products, as on bf16-stored parameters; `SumLayer.backward`'s
+# `op_params`); "fp32" takes `tf32x3` products (fp32-level, on tensor cores).
 PRECISIONS = ("auto", "tf32", "fp32")
 
 
@@ -556,7 +560,7 @@ class SumLayer(Layer, nn.Module):
     def forward(self, node_mars: torch.Tensor, element_mars: torch.Tensor, params: torch.Tensor,
                 propagation_alg: str = "LL", pflow_temperature: float = 1.0, precision: str = "auto",
                 partition_runs: Optional[Sequence] = None, compute_children: Optional[Tuple[torch.Tensor, int]] = None,
-                **kwargs) -> None:
+                op_params: Optional[torch.Tensor] = None, **kwargs) -> None:
         """
         Computes the forward pass of a sum layer.
 
@@ -575,7 +579,16 @@ class SumLayer(Layer, nn.Module):
                           values may be stale, and every partition forms them itself from `node_mars` (the fused
                           kernel of the `tlmm` regime; nothing is written to `element_mars`). Only for a layer whose
                           every partition `fuses_children` at this batch; another raises.
+        `op_params`:      None, or the circuit's bf16 copy of fp32 parameters shared by several layers
+                          (`TensorCircuit._param_operands`), every parameter this layer reads among them: taken by the
+                          layer the circuit marked so (`_reads_param_operands`) for its CUDA kernels whose products are
+                          bf16 -- the `tlmm` kernels and the small-batch tensor-core one, which round the parameters to
+                          bf16 anyway (the same bits, half the bytes), and the stream kernel, which reads bf16
+                          parameters only and joins them --; the dense cuBLAS path is then left out, and the fp32
+                          kernels read `params`.
         """
+        op = op_params if op_params is not None and self.__dict__.get("_reads_param_operands", False) else None
+
         # A plain call -- LL, no tempering, whole partitions, nothing else passed -- whose every partition the full
         # dispatch below sent to a tuned CUDA tlmm kernel launches those kernels straight away (`_fw_fast_launch`, which
         # checks first that the CUDA kernels are still on and each choice is still the tuner's). MEASURED, host time of
@@ -583,9 +596,9 @@ class SumLayer(Layer, nn.Module):
         fast_key = None
         if (propagation_alg == "LL" and pflow_temperature == 1.0 and partition_runs is None and compute_children is None
                 and not kwargs and node_mars.is_cuda):
-            fast_key = (node_mars.size(1), params.dtype, precision)
+            fast_key = (node_mars.size(1), params.dtype, precision, op is not None)
             fast = self._fw_fast.get(fast_key)
-            if fast is not None and self._fw_fast_launch(fast, node_mars, element_mars, params):
+            if fast is not None and self._fw_fast_launch(fast, node_mars, element_mars, params if op is None else op):
                 return None
 
         assert not (propagation_alg != "LL" and abs(pflow_temperature - 1.0) > 1e-6), \
@@ -609,10 +622,10 @@ class SumLayer(Layer, nn.Module):
                 pids = self.partitioned_pids[partition_id]
 
                 self._forward(
-                    node_mars, element_mars, params, nids, cids, pids, 
-                    partition_id = partition_id, propagation_alg = propagation_alg, 
+                    node_mars, element_mars, params, nids, cids, pids,
+                    partition_id = partition_id, propagation_alg = propagation_alg,
                     pflow_temperature = pflow_temperature, precision = precision, runs = runs,
-                    children = compute_children, **kwargs
+                    children = compute_children, **({} if op is None else dict(op_params = op)), **kwargs
                 )
             recorded = self.__dict__["_fw_recording"]
             if recorded is not None and len(recorded) == self.num_fw_partitions:
@@ -830,15 +843,23 @@ class SumLayer(Layer, nn.Module):
             ok.append(not (plan is not None and plan[1] * batch_size >= _DENSE_MIN_WORK and plan[3] > 1))
         return ok
 
-    def backward(self, node_flows: torch.Tensor, element_flows: torch.Tensor, 
-                 node_mars: torch.Tensor, element_mars: torch.Tensor, 
+    def _bk_copy(self) -> Optional[torch.Tensor]:
+        """The circuit's bf16 copy of shared fp32 parameters where this backward call gave it to the layer (`backward`'s
+        `op_params`, set on the layer per call), else None: what the element kernels whose products are bf16 read (the
+        stream kernels), every other kernel reading `params`. The full path and a launch plan's launchers both read it
+        here: a launcher is replayed with `params`."""
+        return self.__dict__.get("_bk_op_params")
+
+    def backward(self, node_flows: torch.Tensor, element_flows: torch.Tensor,
+                 node_mars: torch.Tensor, element_mars: torch.Tensor,
                  params: torch.Tensor, param_flows: Optional[torch.Tensor] = None,
                  allow_modify_flows: bool = False, propagation_alg: str = "LL", 
                  logspace_flows: bool = False, negate_pflows: bool = False, 
                  accumulate_ch_flows: bool = False, allow_neg_flows: bool = False,
                  precision: str = "auto", pflow_temperature: float = 1.0, 
                  temper_eflow: bool = False, partition_runs: Optional[Sequence] = None,
-                 compute_children: Optional[Tuple[torch.Tensor, int]] = None, **kwargs) -> None:
+                 compute_children: Optional[Tuple[torch.Tensor, int]] = None,
+                 op_params: Optional[torch.Tensor] = None, **kwargs) -> None:
         """
         Computes the forward pass of a sum layer:
         ```
@@ -865,7 +886,18 @@ class SumLayer(Layer, nn.Module):
                           values may be stale, and the element-flow kernel forms them itself from `node_mars` (the
                           fused kernel of the `tlmm` regime). Element flows only, for a layer whose every partition
                           `fuses_children_backward` at this batch; another raises.
+        `op_params`:      None, or the circuit's bf16 copy of fp32 parameters shared by several layers
+                          (`TensorCircuit._param_operands`), as in `forward`: for a layer marked to take it, the
+                          element kernels whose products are bf16 read it -- the stream kernel, bf16 parameters only,
+                          offered with it --, every other kernel `params`, as without it (the fp16 and fp32 element
+                          kernels, the parameter flows). Set on the layer per call (`_bk_copy`), where a plan's
+                          launcher reads it as the full path does.
         """
+        # The copy this call's element flows may read (`_bk_copy`): set before the plan lookup, as
+        # `_defer_param_flows` below, since a plan's element launchers read it too
+        op = op_params if op_params is not None and self.__dict__.get("_reads_param_operands", False) else None
+        self.__dict__["_bk_op_params"] = op
+
         # A launch plan (`pyjuice.utils.launch_plans`): what an earlier call with this signature launched, its decisions
         # made once. The standard regime only -- LL, no tempering, whole partitions, flows not modified in place --,
         # where the decisions below read nothing but what the key holds (`kwargs` by name: their values are read by
@@ -888,7 +920,8 @@ class SumLayer(Layer, nn.Module):
                     self._ext_bw_par_triton_hook is not None, tuple(sorted(kwargs)),
                     # the pass's first-writer stores (`_plan_param_flow_stores`): a launcher bakes its partition's
                     # decision, so the key holds every partition's
-                    self.__dict__.get("_pf_store_key") if kwargs.get("pf_store_first", False) else None)
+                    self.__dict__.get("_pf_store_key") if kwargs.get("pf_store_first", False) else None,
+                    op is not None)
             plan = LaunchPlans.of(self).lookup(pkey)
             if plan is not None:
                 for launch in plan:
@@ -945,8 +978,8 @@ class SumLayer(Layer, nn.Module):
                 cs_block_size = self.cs_block_sizes[partition_id]
 
                 self._backward(
-                    node_flows, element_flows, params, node_mars, 
-                    element_mars, param_flows, 
+                    node_flows, element_flows, params, node_mars,
+                    element_mars, param_flows,
                     chids = chids, parids = parids, parpids = parpids,
                     cs_block_size = cs_block_size,
                     partition_id = partition_id,
@@ -1005,10 +1038,11 @@ class SumLayer(Layer, nn.Module):
                  pids: torch.Tensor,
                  partition_id: int = -1, mode: Optional[str] = None,
                  propagation_alg: str = "LL", pflow_temperature: float = 1.0, precision: str = "auto",
-                 runs: Optional[Sequence] = None, children: Optional[torch.Tensor] = None, **kwargs) -> None:
+                 runs: Optional[Sequence] = None, children: Optional[torch.Tensor] = None,
+                 op_params: Optional[torch.Tensor] = None, **kwargs) -> None:
         """
         Forward pass of sum layers.
-        
+
         Parameters:
         `node_mars`:    [N, B]
         `element_mars`: [M, B]
@@ -1017,6 +1051,7 @@ class SumLayer(Layer, nn.Module):
         `cids`:         [ng, c]
         `pids`:         [ng, c]
         `runs`:         the rows of the tables to compute (`(start, end)`), or None for all (see `forward`)
+        `op_params`:    the block-sparse mode's CUDA kernels' bf16 parameters, or None (see `forward`)
         """
 
         num_edges = cids.size(1)
@@ -1051,9 +1086,9 @@ class SumLayer(Layer, nn.Module):
         if mode == self.BLOCK_SPARSE:
             self._forward_block_sparse(
                 node_mars, element_mars, params, nids, cids, pids,
-                partition_id = partition_id, propagation_alg = propagation_alg, 
+                partition_id = partition_id, propagation_alg = propagation_alg,
                 pflow_temperature = pflow_temperature, precision = precision, runs = runs, children = children,
-                **kwargs
+                **({} if op_params is None else dict(op_params = op_params)), **kwargs
             )
 
         elif mode == self.SPARSE:
@@ -1083,10 +1118,10 @@ class SumLayer(Layer, nn.Module):
                               partition_id: int = -1, propagation_alg: str = "LL", 
                               pflow_temperature: float = 1.0, precision: str = "auto",
                               runs: Optional[Sequence] = None, children: Optional[torch.Tensor] = None,
-                              **kwargs) -> None:
+                              op_params: Optional[torch.Tensor] = None, **kwargs) -> None:
         """
         Forward pass of sum layers with the block-sparse processing kernel.
-        
+
         Parameters:
         `node_mars`:    [N, B]
         `element_mars`: [M, B]
@@ -1099,9 +1134,14 @@ class SumLayer(Layer, nn.Module):
                         rows only: the Triton kernels by their tile offset (`pid_m_offset`) into the whole tables,
                         the CUDA ones on views of them. A launch of some rows never tunes (it would time the whole
                         partition in place): a choice not made yet -- by a whole launch -- takes the default.
+        `op_params`:    None, or a bf16 copy of the fp32 `params` (see `forward`), read by the CUDA kernels whose
+                        products are bf16: the `tlmm` kernels (the stream kernel, bf16 parameters only, offered with
+                        it) and the small-batch tensor-core one -- never the dense cuBLAS path; the Triton kernels and
+                        the small-batch fp32 ones read `params`.
         """
 
         assert params.dim() == 1, "Expecting a 1D `params`."
+        p_cuda = params if op_params is None else op_params             # what the bf16-product CUDA kernels read
 
         num_nblocks = nids.size(0)
         layer_n_nodes = num_nblocks * self.block_size
@@ -1127,8 +1167,10 @@ class SumLayer(Layer, nn.Module):
 
         # Dense node blocks through cuBLAS where that is faster (see `_DENSE_MIN_BLOCK_SIZE`) -- fp32 parameters only:
         # `torch.mm` on bf16 operands returns bf16, too coarse for log-space node values, so bf16-stored parameters take
-        # the block-sparse kernels, which read them as they are and accumulate in fp32
-        if (propagation_alg_id == 0 and not pflow_tempered_enabled and node_mars.is_cuda
+        # the block-sparse kernels, which read them as they are and accumulate in fp32; so do fp32 ones with a bf16 copy
+        # (`op_params`), whose stream kernel is the faster (MEASURED, HMM-4096 B 128: 69 us a layer on cuBLAS's TF32
+        # GEMMs against the stream kernel's ~28)
+        if (propagation_alg_id == 0 and not pflow_tempered_enabled and node_mars.is_cuda and op_params is None
                 and params.dtype == torch.float32 and self.block_size >= _DENSE_MIN_BLOCK_SIZE and batch_size >= 16):
             dense = self._dense_blocks(partition_id, nids, cids, pids)
             if dense is not None and dense[1] * batch_size >= _DENSE_MIN_WORK:
@@ -1329,7 +1371,7 @@ class SumLayer(Layer, nn.Module):
                 and TILE_SIZE_K == 64 and num_edges % TILE_SIZE_K == 0
                 and node_mars.is_cuda and cuda_kernels.is_available()):
             ebase, pbase, cuda_ok = self._cached_fw_cuda[signature]
-            cuda_ok = cuda_ok and self._cuda_param_loads_aligned(params, ("fw", signature), pbase, self.block_size)
+            cuda_ok = cuda_ok and self._cuda_param_loads_aligned(p_cuda, ("fw", signature), pbase, self.block_size)
             valid_cfgs = cuda_kernels.valid_configs(self.block_size, batch_size) if cuda_ok else []
             # (the pre-pass copy has tile shapes of its own -- 32-node blocks among them, which no other kernel takes)
             prepass_cfgs = (cuda_kernels.prepass_valid_configs(self.block_size, batch_size)
@@ -1338,7 +1380,7 @@ class SumLayer(Layer, nn.Module):
             # pre-pass kernel beside it takes the runs its grouped tiles cannot)
             stream_arms = (cuda_kernels.stream_arms(self.block_size, batch_size, K_NUM_TILES, nids.numel(),
                                                     self._row_groups(signature, ebase)[2])
-                           if prepass_cfgs and params.dtype == torch.bfloat16 and cuda_kernels.stream_is_available()
+                           if prepass_cfgs and p_cuda.dtype == torch.bfloat16 and cuda_kernels.stream_is_available()
                            else [])
             if valid_cfgs or prepass_cfgs or stream_arms:
                 # The best config depends on the shape (which tile shapes are valid, and their speed).
@@ -1346,7 +1388,8 @@ class SumLayer(Layer, nn.Module):
                 # arms agree only to ~1e-6, so structurally identical layers that measured on their own
                 # could each take a different one, and identical models disagree in the last bits (a
                 # CUDA-graph replay against an eager twin caught it, tests/model/precision_option_test.py).
-                tlmm_key = ("sum_fw_tlmm_cuda", num_edges) + fw_key
+                # (With a bf16 copy, a choice of its own: the stream kernel is among the arms.)
+                tlmm_key = ("sum_fw_tlmm_cuda", num_edges) + fw_key + (() if op_params is None else ("operands",))
                 choice = autotune.cached(tlmm_key)
                 if choice is None and runs is not None:
                     choice = ("triton", -1)              # not measured yet: the reference (see `runs`)
@@ -1356,7 +1399,7 @@ class SumLayer(Layer, nn.Module):
                     cands = [(("triton", -1), (lambda: _launch_fw(default_fw_cfg)))]
                     cands += [(("cuda", c),
                                (lambda c=c: cuda_kernels.tlmm_forward_sum(
-                                   node_mars, element_mars, params, nids, ebase, pbase,
+                                   node_mars, element_mars, p_cuda, nids, ebase, pbase,
                                    batch_size, self.block_size, K_NUM_TILES, c)))
                               for c in valid_cfgs]
                     # The warp-specialized copy of the kernel (c/tlmm_forward_sum_pipelined.cu, bit-identical:
@@ -1365,7 +1408,7 @@ class SumLayer(Layer, nn.Module):
                     if cuda_kernels.pipe_is_available():
                         cands += [(("cuda_pipe", c),
                                    (lambda c=c: cuda_kernels.tlmm_forward_sum_pipelined(
-                                       node_mars, element_mars, params, nids, ebase, pbase,
+                                       node_mars, element_mars, p_cuda, nids, ebase, pbase,
                                        batch_size, self.block_size, K_NUM_TILES, c)))
                                   for c in cuda_kernels.pipe_valid_configs(self.block_size, batch_size)]
                     # The pre-pass copy (c/tlmm_forward_sum_prepass.cu, bit-identical: the distinct element tiles'
@@ -1377,7 +1420,7 @@ class SumLayer(Layer, nn.Module):
                         tiles = self._tile_index("fw", signature, ebase)
                         cands += [(("cuda_prepass", c),
                                    autotune.charged(lambda c=c: cuda_kernels.tlmm_forward_sum_prepass(
-                                       node_mars, element_mars, params, nids, tiles[0], tiles[1], pbase,
+                                       node_mars, element_mars, p_cuda, nids, tiles[0], tiles[1], pbase,
                                        batch_size, self.block_size, K_NUM_TILES, c, tiles[2]),
                                                     autotune.LAUNCH_S if c >> 8 else 0.0))   # (a split: its merge launch)
                                   for c in cuda_kernels.prepass_arms(self.block_size, batch_size, K_NUM_TILES,
@@ -1390,7 +1433,7 @@ class SumLayer(Layer, nn.Module):
                         groups = self._row_groups(signature, ebase)
                         cands += [(("cuda_stream", c),
                                    autotune.charged(lambda c=c: cuda_kernels.tlmm_forward_sum_stream(
-                                       node_mars, element_mars, params, nids, ebase, pbase, groups,
+                                       node_mars, element_mars, p_cuda, nids, ebase, pbase, groups,
                                        batch_size, self.block_size, K_NUM_TILES, c), 2 * autotune.LAUNCH_S))
                                   for c in stream_arms]
                     choice = autotune.choose(tlmm_key, cands)
@@ -1429,14 +1472,14 @@ class SumLayer(Layer, nn.Module):
                         kernel = (cuda_kernels.tlmm_forward_sum if choice[0] == "cuda" else
                                   cuda_kernels.tlmm_forward_sum_pipelined)
                     if runs is None:
-                        kernel(node_mars, element_mars, params, nids, ebase, pbase,
+                        kernel(node_mars, element_mars, p_cuda, nids, ebase, pbase,
                                batch_size, self.block_size, K_NUM_TILES, choice[1])
                         recording = self.__dict__.get("_fw_recording")
                         if recording is not None and autotune.cached(tlmm_key) == choice:
                             recording.append((tlmm_key, choice, nids, ebase, pbase, K_NUM_TILES, tiles))
                     else:
                         for a, b in runs:                    # (views of the tables: the grid comes from them)
-                            kernel(node_mars, element_mars, params, nids[a:b], ebase[a:b], pbase[a:b],
+                            kernel(node_mars, element_mars, p_cuda, nids[a:b], ebase[a:b], pbase[a:b],
                                    batch_size, self.block_size, K_NUM_TILES, choice[1],
                                    **({} if tiles is None else dict(a = a, b = b)))
                     return None
@@ -1496,8 +1539,8 @@ class SumLayer(Layer, nn.Module):
                         # (a run that splits a grouped tile's blocks: the batch-tiled FMA kernel takes it)
                         cuda_kernels.smallbatch_forward_sum_bt(node_mars, element_mars, params, nids_, ebase_, pbase_,
                                                                batch_size, self.block_size, num_edges, 0)
-                    elif cfg[0] == "cuda_mma":
-                        cuda_kernels.smallbatch_forward_sum_mma(node_mars, element_mars, params, nids_, ebase_, pbase_,
+                    elif cfg[0] == "cuda_mma":                # (bf16 products: the copy where the call has one)
+                        cuda_kernels.smallbatch_forward_sum_mma(node_mars, element_mars, p_cuda, nids_, ebase_, pbase_,
                                                                 batch_size, self.block_size, num_edges, cfg[1],
                                                                 _mma_scratch(cfg[1]))
                     else:
@@ -1520,10 +1563,12 @@ class SumLayer(Layer, nn.Module):
                 # this path reached batch 32.
                 # The tensor-core arms round the operands to bf16: only under the circuit's default precision ("auto",
                 # as the other tensor-core forwards), and with the parameter bases aligned for its 16-byte loads. Part
-                # of the key: "tf32" and "auto" share the rest of it at these batches.
+                # of the key: "tf32" and "auto" share the rest of it at these batches. (On the bf16 copy, a choice of
+                # its own: that arm reads half the bytes.)
                 mma_ok = (precision == "auto"
-                          and self._cuda_param_loads_aligned(params, ("fw_sb_mma", signature), sb_pbase, self.block_size))
-                sb_key = ("sum_fw_smallbatch_cuda", num_edges, mma_ok) + fw_key
+                          and self._cuda_param_loads_aligned(p_cuda, ("fw_sb_mma", signature), sb_pbase, self.block_size))
+                sb_key = (("sum_fw_smallbatch_cuda", num_edges, mma_ok) + fw_key
+                          + (() if op_params is None else ("operands",)))
                 choice = autotune.cached(sb_key)
                 if choice is None:
                     mma_arms = (cuda_kernels.smallbatch_fw_mma_arms(self.block_size, batch_size, num_edges, nids.numel(),
@@ -2297,7 +2342,9 @@ class SumLayer(Layer, nn.Module):
         # The launches below take the call's tensors (`t`: node_flows, node_mars, element_mars, params) as an argument
         # -- `cur` for this call; a launch plan's launcher (`LaunchPlans`) passes those of the call it replays for, and
         # holds none of this call's (held, a plan would keep the buffers of its first call alive)
-        cur = dict(node_flows = node_flows, node_mars = node_mars, element_mars = element_mars, params = params)
+        # (`op`: the circuit's bf16 copy of the parameters where the call has one, `_bk_copy` -- the stream kernel's)
+        op = self._bk_copy()
+        cur = dict(node_flows = node_flows, node_mars = node_mars, element_mars = element_mars, params = params, op = op)
 
         def _launch_ele(cfg, out, t, first = 0, count = None):
             """The child-node tiles (of `cfg`'s `TILE_SIZE_M`) ``[first, first + count)`` of the whole tables -- all of
@@ -2445,9 +2492,11 @@ class SumLayer(Layer, nn.Module):
             )
 
             def _hook(node_flows, element_flows, node_mars, element_mars, params, param_flows, static = static):
-                # (the hook installed for THIS call: the parameterization's `pre_backward_layer` sets it each backward)
+                # (the hook installed for THIS call: the parameterization's `pre_backward_layer` sets it each backward;
+                # `op` the call's bf16 copy of the parameters, or None -- `_bk_copy`)
                 self._ext_bw_ele_hook(dict(static, element_flows = element_flows, element_mars = element_mars,
-                                           node_flows = node_flows, node_mars = node_mars, params = params))
+                                           node_flows = node_flows, node_mars = node_mars, params = params,
+                                           op = self._bk_copy()))
 
             LaunchPlans.add(_hook)
             _hook(node_flows, element_flows, node_mars, element_mars, params, None)
@@ -2477,9 +2526,11 @@ class SumLayer(Layer, nn.Module):
             pre_pbase, pre_ok = self._cached_bk_ele_pre[signature]
             ele_plain_ok = ele_plain_ok and ele_cuda_ok
             ele_pre_cfgs = ele_pre_cfgs if pre_ok else []
-            # (the stream copy, c/ele_backward_sum_stream.cu: bf16 parameters, the pre-pass kernel's tables)
+            # (the stream copy, c/ele_backward_sum_stream.cu: bf16 parameters -- or the call's bf16 copy of fp32 ones,
+            # `op` --, the pre-pass kernel's tables)
             ele_groups = (self._row_groups(signature, ele_ebase, "eleg")
-                          if pre_ok and params.dtype == torch.bfloat16 and cuda_kernels.ele_stream_is_available() else None)
+                          if pre_ok and (params.dtype == torch.bfloat16 or op is not None)
+                          and cuda_kernels.ele_stream_is_available() else None)
             # (the pre-pass kernel beside it takes the runs its grouped tiles cannot)
             ele_stream_arms = (cuda_kernels.ele_stream_arms(cs_block_size, batch_size, self.block_size, K_NUM_TILES,
                                                             chids.numel(), ele_groups[2])
@@ -2524,13 +2575,15 @@ class SumLayer(Layer, nn.Module):
                     elif groups is None:
                         groups = cuda_kernels.row_groups(ele_ebase[a:b])
                     cuda_kernels.ele_backward_sum_stream(
-                        tgt, t["element_mars"], t["node_flows"], t["node_mars"], t["params"], chids[a:b], ele_ebase[a:b],
-                        pre_pbase[a:b], groups, batch_size, self.block_size, cs_block_size, K_NUM_TILES, c)
+                        tgt, t["element_mars"], t["node_flows"], t["node_mars"], t["params"] if t["op"] is None else t["op"],
+                        chids[a:b], ele_ebase[a:b], pre_pbase[a:b], groups, batch_size, self.block_size, cs_block_size,
+                        K_NUM_TILES, c)
 
                 # (keyed on the parameters' dtype too, as the small-batch choice is: the arms depend on it -- the stream
                 # copy takes bf16 parameters alone -- and one circuit runs both, SGD's renormalization on the fp32
-                # master copy of bf16 parameters, where a cached stream arm met no row groups)
-                choice_key = (signature, batch_size, params.dtype)
+                # master copy of bf16 parameters, where a cached stream arm met no row groups; and on whether the call
+                # has the bf16 copy of fp32 ones, on which the stream copy is offered)
+                choice_key = (signature, batch_size, params.dtype, op is not None)
                 choice = self._cached_bk_ele_choice.get(choice_key)
                 if choice is None:
                     # autotune into a SCRATCH clone (corruption-safe); the live element_flows is
@@ -2561,7 +2614,7 @@ class SumLayer(Layer, nn.Module):
 
                         def _ele(node_flows, element_flows, node_mars, element_mars, params, param_flows):
                             t = dict(node_flows = node_flows, node_mars = node_mars, element_mars = element_mars,
-                                     params = params)
+                                     params = params, op = self._bk_copy())
                             if kind == "cuda_pipe":
                                 _cuda_ele_pipe(element_flows, t)
                             elif kind == "cuda_prepass":

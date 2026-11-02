@@ -376,12 +376,13 @@ class _BackwardMixin:
         if len(cands) == 1:
             return cands[0], table(cands[0])
         none = external_params.new_empty(0)
+        params = ctx["params"] if ctx.get("op") is None else ctx["op"]          # (the call's bf16 copy, if any)
 
         def bench(code):
             tb = table(code)
             for _ in range(3):
                 eles_mod.blockscale_ele_backward_stream(
-                    scr, ctx["element_mars"], ctx["node_flows"], ctx["node_mars"], ctx["params"], external_params,
+                    scr, ctx["element_mars"], ctx["node_flows"], ctx["node_mars"], params, external_params,
                     ctx["chids"], ctx["ele_ebase"], ctx["ele_pbase"], none, batch, blk, cbs, knt, gate_cbs, ext_base,
                     0, code, tb["tables"], tb["ngrp"], tb["npc"])
 
@@ -558,7 +559,9 @@ class _BackwardMixin:
         ele_mod, par_mod = _mod("c").get_ele_bw_module(), _mod("c").get_par_bw_module()
         sb_mod = _mod("c").get_sb_bw_module()
         elep_mod = _mod("c").get_ele_prepass_module()
-        eles_mod = _mod("c").get_ele_stream_module() if params.dtype == torch.bfloat16 else None
+        # (bf16 parameters, or the circuit's bf16 copy of tied fp32 ones where the call gave it -- `_bk_copy`)
+        eles_mod = (_mod("c").get_ele_stream_module()
+                    if params.dtype == torch.bfloat16 or layer._bk_copy() is not None else None)
         # A tied group's parameter flows may be left to the end of the pass (`deferred_par`), if the backward allows it
         import pyjuice.layer.kernels.c as _ck
         pd_mod = _ck.get_par_deferred_module()
@@ -619,7 +622,8 @@ class _BackwardMixin:
             version rebuilt the candidate list every time; its two `torch.equal` eligibility checks
             forced a device sync per backward and cost more at small batch than the gate itself.
             """
-            key = ("eleplan", ctx["signature"], ctx["batch_size"], ctx["partition_id"], ctx["params"].dtype)
+            key = ("eleplan", ctx["signature"], ctx["batch_size"], ctx["partition_id"], ctx["params"].dtype,
+                   ctx.get("op") is not None)
             plan = cache.get(key)
             if plan is None:
                 plan = _build_ele_plan(ctx)
@@ -681,12 +685,14 @@ class _BackwardMixin:
                     and pinc == 1 and plan["gate_tile"] is not None):
                 kinds += [("elep", int(c)) for c in elep_mod.fitting_configs(cbs, batch, gate_cbs, knt)]
 
-            # The split element backward (kernels/c/blockscale_ele_backward_stream.cu), bf16 parameters, on the
+            # The split element backward (kernels/c/blockscale_ele_backward_stream.cu), bf16 parameters -- or the
+            # call's bf16 copy of fp32 ones (`op`, which it reads; every other fork the fp32 parameters) --, on the
             # pre-pass fork's tables and contract: an element block's gated k-steps cut into ranges and pieces, each
             # piece under one stabilizer and one gate, so each is a plain bf16 GEMM (the exponentials as hi + lo
             # halves), merged after -- not the fork's bits (more accurate). One candidate, its (tile, split) and
             # tables measured first (`_eles_code`); its own scope is `fitting_configs`' and the piece limit.
-            if (eles_mod is not None and ctx["params"].dtype == torch.bfloat16 and ctx["ele_cuda_ok"]
+            if (eles_mod is not None and (ctx["params"].dtype == torch.bfloat16 or ctx.get("op") is not None)
+                    and ctx["ele_cuda_ok"]
                     and ctx.get("ele_loads_aligned", True) and tk == 64 and pinc == 1 and n_ngates_ == 1
                     and plan["gate_tile"] is not None and external_params.data_ptr() % 16 == 0):
                 fit = [int(c) for c in eles_mod.fitting_configs(cbs, batch, gate_cbs)]
@@ -877,8 +883,9 @@ class _BackwardMixin:
                 def run(tgt, node_flows, node_mars, element_mars, params, ext, grad):
                     if ext.data_ptr() % 16:                    # (its log-gate rows are 16-byte loads)
                         return tri(tgt, node_flows, node_mars, element_mars, params, ext, grad)
+                    op = layer._bk_copy()                      # (the call's bf16 copy of fp32 parameters, if any)
                     eles_mod.blockscale_ele_backward_stream(
-                        tgt, element_mars, node_flows, node_mars, params, ext, chids, ebase, pbase,
+                        tgt, element_mars, node_flows, node_mars, params if op is None else op, ext, chids, ebase, pbase,
                         no_grad if grad is None else grad, batch, blk, cbs, knt, gate_cbs, ext_base,
                         0 if grad is None else 1, code, tb["tables"], tb["ngrp"], tb["npc"])
 
@@ -1321,7 +1328,10 @@ class _BackwardMixin:
         plans = layer.__dict__.setdefault("_bs_post_plans", {})
         for pid, (nids, log_z, rows) in enumerate(state["shift_args"]):
             if want_grad:
-                sigma, n_gates = self._sigma(layer, params, pid, bs_, gate_cbs)
+                # (from the parameters the forward's `log Z` was summed from: the call's bf16 copy of tied fp32
+                # parameters where the forward took the split forward on it -- `z_from_copy` --, else `params`)
+                op = layer._bk_copy() if state.get("z_from_copy", False) else None
+                sigma, n_gates = self._sigma(layer, params if op is None else op, pid, bs_, gate_cbs)
             else:
                 sigma, n_gates = log_z, self.denom_gate_geometry(layer)[pid][2]     # (`sigma` unread)
             W = self._denom_slice(layer, denom_param_flows, pid) if want_w else log_z      # (unread without)

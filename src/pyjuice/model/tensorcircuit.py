@@ -42,6 +42,14 @@ def _calls_its_forward(module: nn.Module) -> bool:
                 or torch._C._get_tracing_state())
 
 
+# The work per layer from which the layers reading only shared fp32 parameters take their bf16 copy
+# (`TensorCircuit._param_operand_groups`): the parameters such a layer reads a sample, times the batch. MEASURED
+# (training steps of tied HMMs, the copy forced off and on): slower with it to 2^27 (HMM-1024 B 32 / 128 +2.4 / +2.2%,
+# HMM-2048 B 16 / 32 +1.5 / +1.1%), faster from 2^28 (HMM-1024 B 256 -2.2%, HMM-2048 B 64 -3.0%, HMM-4096 B 16 -3.5%;
+# 2^29: HMM-2048 B 128 -9.9%, HMM-4096 B 32 -7.1%; 2^31: HMM-4096 B 128 -38%).
+_COPY_MIN_WORK = 1 << 28
+
+
 class TensorCircuit(_BuildMixin, _CudaGraphsMixin, _ExternalParamsMixin, _LearningMixin, _InspectionMixin,
                     nn.Module):
     """
@@ -252,7 +260,14 @@ class TensorCircuit(_BuildMixin, _CudaGraphsMixin, _ExternalParamsMixin, _Learni
         Precision of the sum layers' products, in the forward and the backward pass:
 
         * ``"auto"`` (the default): the fastest per layer -- bf16 products in the block-sparse kernels from batch 16
-          (about 4e-3 in a log-likelihood), TF32 on large dense layers, which run through cuBLAS;
+          (about 4e-3 in a log-likelihood), TF32 on large dense layers, which run through cuBLAS -- unless several layers
+          share their fp32 parameters (a tied HMM's transitions): those may read a bf16 copy made in every forward (its
+          backward reads the same) in their kernels whose products are bf16 -- the CUDA kernels that round the
+          parameters to bf16 anyway (the same bits, half the bytes), and the stream kernels, bf16 parameters only,
+          offered on the copy in the forward and the element flows --, every other kernel reading the fp32 parameters;
+          they do where the parameters such a layer reads a sample, times the batch, reach `_COPY_MIN_WORK` (below it a
+          step is host-bound, and the copy's host time costs more than the GPU time it saves), and are at least what
+          their parameterization takes it from (BlockScale's: 2^23);
         * ``"tf32"``: never bf16 -- round-to-nearest TF32 products (about 5e-4);
         * ``"fp32"``: fp32-level products in the forward and the backward (about 1e-6; ``tf32x3`` on tensor cores).
 
@@ -316,6 +331,127 @@ class TensorCircuit(_BuildMixin, _CudaGraphsMixin, _ExternalParamsMixin, _Learni
         super()._load_from_state_dict(*args, **kwargs)
         self.drop_params_master()
 
+    # ---------------------------------------------------------------------------------------------
+    # The bf16 copy of shared fp32 parameters, for the sum layers' CUDA kernels
+    # ---------------------------------------------------------------------------------------------
+
+    def _param_operand_plan(self) -> tuple:
+        """``(groups, ranges)``: the inner sum layer groups whose every layer reads only parameters that several sum
+        nodes share (a tied node's source and its copies) and is a plain sum layer or an external-parameter one whose
+        parameterization takes the copy (`ExternalSumParams.reads_param_operands`), at offsets the bf16 kernels' 16-byte
+        loads can take, each such layer marked (`SumLayer._reads_param_operands`), and those parameters' ranges -- what
+        `_param_operands` copies. Shared ranges only: there one copy serves every layer that reads them, while an unshared
+        parameter would be copied (6 bytes) for one read (4). Built once, from the structure, with each group's size for
+        `_param_operand_groups` (`_param_operand_sizes_`)."""
+        plan = self.__dict__.get("_param_operand_plan_")
+        if plan is not None:
+            return plan
+        from pyjuice.layer.sum_layer import SumLayer
+        from pyjuice.layer.external_sum_layer import ExternalParamsSumLayer
+
+        def source(ns):
+            return ns.get_source_ns() if ns.is_tied() else ns
+
+        def aligned(layer):
+            # (a bf16 kernel loads 8 parameters as one 16-byte load: every parameter base -- a node block's first
+            # parameter of a child, the forward's and the backward's -- and the block a multiple of 8, as for bf16-stored
+            # parameters, `SumLayer._cuda_param_loads_aligned`; one sync a table, here once)
+            return layer.block_size % 8 == 0 and all(bool((t % 8 == 0).all()) for t in (*layer.partitioned_pids,
+                                                                                         *layer.partitioned_parpids))
+
+        readers = {}
+        for ns in self.root_ns:
+            if ns.is_sum():
+                readers[source(ns)] = readers.get(source(ns), 0) + 1
+        groups, ranges, sizes = [], set(), {}
+        for group in self.inner_layer_groups:
+            if not group.is_sum():
+                continue
+            marked = []
+            for layer in group:
+                takes = type(layer) is SumLayer or (isinstance(layer, ExternalParamsSumLayer)
+                                                   and layer.external_params.reads_param_operands)
+                srcs = [source(ns) for ns in layer.nodes] if takes else None
+                ok = srcs is not None and all(readers.get(s, 0) >= 2 for s in srcs) and aligned(layer)
+                layer.__dict__["_reads_param_operands"] = ok
+                marked.append(ok)
+                if ok:
+                    ranges.update(s._param_range for s in srcs)
+            if all(marked):
+                groups.append(group)
+                # (the parameters its layers read a sample -- their mean -- and the least its parameterizations
+                # take the copy from: `_param_operand_groups`)
+                sizes[id(group)] = (sum(layer.num_edges for layer in group) / len(group),
+                                    max(getattr(getattr(layer, "external_params", None), "param_operands_min_edges", 0)
+                                        for layer in group))
+        self.__dict__["_param_operand_sizes_"] = sizes
+        plan = self.__dict__["_param_operand_plan_"] = (frozenset(id(g) for g in groups), tuple(sorted(ranges)))
+        return plan
+
+    #: Overrides `_param_operand_groups`' rule: True gives the copy to every group it applies to, False to none; None:
+    #: the rule.
+    _param_operands_force: Optional[bool] = None
+
+    def _param_operand_groups(self, batch_size: int) -> frozenset:
+        """The groups (`_param_operand_plan`'s, by id) a pass at this batch size gives the bf16 copy (`_param_operands`,
+        where it applies; none: no copy made): those whose layers read enough parameters for the batch to make them
+        GPU-bound -- the parameters such a layer reads a sample (their mean over the group) times the batch at least
+        `_COPY_MIN_WORK` -- and at least what their parameterizations take it from
+        (`ExternalSumParams.param_operands_min_edges`). The kernels reading the copy are faster, but it costs host time
+        (made by every forward, handed through the layers), which a host-bound step pays in full while the GPU's
+        savings hide behind the host; a layer's GPU time grows with that work, its host time does not. A rule, not a
+        measurement of the caller's steps: every pass at a batch size computes with the same kernels -- the stream
+        kernels' bf16 products among them --, the first as the rest, as the kernels' own tuning keeps them (a
+        measurement would switch them while it measures). `_param_operands_force` overrides it."""
+        groups = self._param_operand_plan()[0]
+        force = self._param_operands_force
+        if force is not None:
+            return groups if force else frozenset()
+        cache = self.__dict__.setdefault("_param_operand_groups_", {})
+        taken = cache.get(batch_size)
+        if taken is None:
+            taken = cache[batch_size] = frozenset(
+                g for g, (edges, least) in self.__dict__["_param_operand_sizes_"].items()
+                if edges >= least and edges * batch_size >= _COPY_MIN_WORK)
+        return taken
+
+    def _param_operands(self, batch_size: int, refresh: Optional[bool] = True) -> Optional[torch.Tensor]:
+        """The bf16 copy of the fp32 parameters several sum layers share (`_param_operand_plan`), for those layers'
+        kernels whose products are bf16 under "auto" (`SumLayer.forward`'s and `backward`'s `op_params`): brought in
+        line with `params` by every forward that takes it (`_param_operand_groups`), inside its pass -- a graph recorded
+        from it copies them too; never keyed on a version counter, which a write through `params.data` does not move --,
+        and read by the backward that follows: the parameters its forward computed the node values with
+        (`_param_operands_made`); a backward whose forward made none (another precision, a batch below 16) makes it
+        before its pass. None where it does not apply: another
+        precision, below batch 16 (fp32 kernels in every mode), parameters stored below fp32 (the kernels read them as
+        they are), no such layer. ``refresh = False``: the buffer made, nothing copied (before a pass: a capture
+        allocates nothing); ``None``: copied unless the last forward made the copy in this buffer (the backward, before
+        its pass)."""
+        p = self.params
+        if self.precision != "auto" or batch_size < 16 or p.dtype != torch.float32 or not p.is_cuda:
+            return None
+        groups, ranges = self._param_operand_plan()
+        if not groups:
+            return None
+        op = self.__dict__.get("_param_operands_")
+        if op is None or op.device != p.device or op.numel() != p.numel():
+            op = self.__dict__["_param_operands_"] = torch.zeros(p.numel(), dtype = torch.bfloat16, device = p.device)
+            self.__dict__["_param_operands_made"] = False
+        if refresh is None:
+            refresh = not self.__dict__.get("_param_operands_made", False)
+        if refresh:
+            # The ranges' views, kept with the storage they slice rather than sliced again every call (one `copy_` a
+            # range): made anew once `params` is another tensor or its `.data` another storage -- the kept views hold
+            # the old storage, so no new one can start at its address
+            views = self.__dict__.get("_param_operands_views")
+            if views is None or views[0] is not p or views[1] != p.data_ptr() or views[2] is not op:
+                src = p.detach()
+                views = self.__dict__["_param_operands_views"] = (p, p.data_ptr(), op,
+                                                                  [(op[a:b], src[a:b]) for a, b in ranges])
+            for dst, src in views[3]:
+                dst.copy_(src)                               # (round to nearest even, as the kernels round)
+        return op
+
     def forward(self, inputs: torch.Tensor, input_layer_fn: Optional[Union[str,Callable]] = None,
                 cache: Optional[dict] = None, return_cache: bool = False, record_cudagraph: Optional[bool] = None, 
                 apply_cudagraph: bool = True, 
@@ -350,6 +486,9 @@ class TensorCircuit(_BuildMixin, _CudaGraphsMixin, _ExternalParamsMixin, _Learni
         with device_grad_controller(device = self.device, no_grad = True):
         
             B = inputs.size(0)
+            # (the groups this forward and its backward give the bf16 copy of shared parameters, if any:
+            # `_param_operand_groups`)
+            op_groups = self._param_operand_groups(B)
 
             origin_inputs = inputs
             if input_layer_fn is None:
@@ -417,6 +556,9 @@ class TensorCircuit(_BuildMixin, _CudaGraphsMixin, _ExternalParamsMixin, _Learni
                 # `nn.Module.__call__` does for it, less that call's 0.6 us (MEASURED, a step of an HMM: two groups)
                 node_mars, element_mars, params = self.node_mars, self.element_mars, self.params
                 per_layer_alg = not isinstance(propagation_alg, str)
+                # (the bf16 copy of shared fp32 parameters, made here, inside the pass: `_param_operands`)
+                op = self._param_operands(node_mars.size(1)) if op_groups else None
+                given = op_groups if op is not None else ()
                 for layer_id, layer_group in enumerate(self.inner_layer_groups):
                     run = layer_group.forward if _calls_its_forward(layer_group) else layer_group
                     if layer_group.is_prod():
@@ -425,9 +567,11 @@ class TensorCircuit(_BuildMixin, _CudaGraphsMixin, _ExternalParamsMixin, _Learni
 
                     elif layer_group.is_sum():
                         # Sum layer
-                        run(node_mars, element_mars, params,
-                            propagation_alg = propagation_alg[layer_id] if per_layer_alg else propagation_alg,
-                            **sum_opts)
+                        alg = propagation_alg[layer_id] if per_layer_alg else propagation_alg
+                        if id(layer_group) in given:
+                            run(node_mars, element_mars, params, propagation_alg = alg, op_params = op, **sum_opts)
+                        else:
+                            run(node_mars, element_mars, params, propagation_alg = alg, **sum_opts)
 
                     else:
                         raise ValueError(f"Unknown layer type {type(layer)}.")
@@ -443,9 +587,14 @@ class TensorCircuit(_BuildMixin, _CudaGraphsMixin, _ExternalParamsMixin, _Learni
                 record, on_repeat = self.cuda_graphs, True          # the circuit's default: OFF unless compiled with it
             else:
                 record, on_repeat = False, False
+            # (the copy's buffer made outside a capture; whether this pass makes the copy -- eagerly or replayed from a
+            # graph, which runs none of `_run_inner_layers` -- kept for the backward that follows)
+            made = bool(op_groups) and self._param_operands(B, refresh = False) is not None
             self._run_inner_pass(_run_inner_layers, 0, (self.node_mars, self.element_mars, self.params),
-                                 self._graph_key_options(sum_opts, propagation_alg = propagation_alg),
+                                 self._graph_key_options(sum_opts, propagation_alg = propagation_alg,
+                                                         param_operands = op_groups),
                                  record = record, apply = apply_cudagraph, record_on_repeat = on_repeat)
+            self.__dict__["_param_operands_made"] = made
             if record:
                 register_cudagraph_owner(self)
 
@@ -674,6 +823,11 @@ class TensorCircuit(_BuildMixin, _CudaGraphsMixin, _ExternalParamsMixin, _Learni
 
             def _inner_layers():
 
+                # The bf16 copy of shared fp32 parameters, for the element kernels of the layers that read it
+                # (`_param_operands`, `SumLayer.backward`'s `op_params`): the forward's, or made before this pass
+                op = self._param_operands(B, refresh = False) if op_groups else None
+                given = op_groups if op is not None else ()
+
                 # Backward pass for inner layers
                 for layer_id in range(len(self.inner_layer_groups) - 1, -1, -1):
                     layer_group = self.inner_layer_groups[layer_id]
@@ -700,9 +854,13 @@ class TensorCircuit(_BuildMixin, _CudaGraphsMixin, _ExternalParamsMixin, _Learni
                         )
 
                         # Backward sum layer
-                        layer_group.backward(self.node_flows, self.element_flows, self.node_mars, self.element_mars, self.params,
-                                             propagation_alg = propagation_alg if isinstance(propagation_alg, str) else propagation_alg[layer_id],
-                                             **sum_opts)
+                        alg = propagation_alg if isinstance(propagation_alg, str) else propagation_alg[layer_id]
+                        if id(layer_group) in given:
+                            layer_group.backward(self.node_flows, self.element_flows, self.node_mars, self.element_mars,
+                                                 self.params, propagation_alg = alg, op_params = op, **sum_opts)
+                        else:
+                            layer_group.backward(self.node_flows, self.element_flows, self.node_mars, self.element_mars,
+                                                 self.params, propagation_alg = alg, **sum_opts)
 
                         # Execute post-backward callback
                         layer_group.callback(
@@ -727,9 +885,16 @@ class TensorCircuit(_BuildMixin, _CudaGraphsMixin, _ExternalParamsMixin, _Learni
             # Callbacks run inside the captured region and could do anything, so they make the pass eager.
             use_graphs = sum_layer_pre_backward_callback is None and sum_layer_post_backward_callback is None
             record, on_repeat = (self.cuda_graphs, True) if record_cudagraph is None else (record_cudagraph, False)
+            # The copy the forward made -- the parameters it computed the node values with -- else made here, before the
+            # pass (outside a capture, so a replayed pass is preceded by it as an eager one is); for the groups that take
+            # it at this batch size (`_param_operand_groups`), as its forward's did
+            op_groups = self._param_operand_groups(B)
+            if op_groups:
+                self._param_operands(B, refresh = None)
             self._run_inner_pass(_run_inner_layers, 1,
                                  (self.node_flows, self.element_flows, self.node_mars, self.element_mars, self.params),
-                                 self._graph_key_options(sum_opts, propagation_alg = propagation_alg),
+                                 self._graph_key_options(sum_opts, propagation_alg = propagation_alg,
+                                                         param_operands = op_groups),
                                  record = use_graphs and record, apply = use_graphs and apply_cudagraph,
                                  record_on_repeat = on_repeat, reads_layer_states = True)
 

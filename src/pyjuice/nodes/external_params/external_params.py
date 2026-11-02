@@ -74,6 +74,17 @@ class ExternalSumParams():
     #: this and takes over the whole computation.
     replaces_shared_forward: bool = False
 
+    #: Whether the parameterization's kernels take the circuit's bf16 copy of fp32 parameters that several sum layers
+    #: share (`TensorCircuit._param_operands`), for those whose products are bf16: `forward_layer`'s `op_params`, and
+    #: in the backward the layer's per-call copy (`SumLayer._bk_copy`, the element-flow hook's `op`). `False` -- the
+    #: default -- leaves such a layer on `params`.
+    reads_param_operands: bool = False
+
+    #: The least parameters a layer of this parameterization reads a sample (`SumLayer.num_edges`) for it to take that
+    #: copy (`TensorCircuit._param_operand_groups`), beside the circuit's rule on the work, those times the batch: for
+    #: kernels on the copy whose host cost only a large layer's GPU savings repay. 0 -- the default -- adds none.
+    param_operands_min_edges: int = 0
+
     #: The backward counterpart. `False` -- the default -- means the standard element-flow and
     #: param-flow kernels run and the descriptor corrects what they wrote. A parameterization whose
     #: effective parameters vary PER EDGE BLOCK cannot be served that way: the standard kernels sum
