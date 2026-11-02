@@ -43,6 +43,20 @@
 #include <math_constants.h>
 #include <cuda_bf16.h>
 
+// Programmatic dependent launch (sm_90 on; elsewhere the launches are plain and these do nothing): the fused sum and
+// its merge launch while the launch before them runs, then wait for it before they read anything (`pdl_wait` first
+// thing), so only their launch overlaps it; the pre-pass and the fused sum let their dependents launch at once.
+__device__ __forceinline__ void pdl_wait() {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    cudaGridDependencySynchronize();
+#endif
+}
+__device__ __forceinline__ void pdl_trigger() {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    cudaTriggerProgrammaticLaunchCompletion();
+#endif
+}
+
 #define NBT 4              // row blocks per CTA
 #define BS 32              // rows per block, reduction rows per chunk
 #define THREADS 256
@@ -205,6 +219,7 @@ __device__ __forceinline__ void put(const Where& w, int b, long long r, long lon
 
 template <bool TD, bool EXT, int FRAG>
 __global__ void __launch_bounds__(THREADS) prepass_kernel(Args a) {
+    pdl_trigger();                                                   // (the fused sum may launch: it waits for this)
     __shared__ float X[BS][PRE_COLS + 1];
     __shared__ float Tc[PRE_COLS];
     __shared__ long long cols[PRE_COLS];
@@ -309,6 +324,8 @@ __global__ void __launch_bounds__(THREADS) fused_sum_kernel(Args a) {
     __shared__ Where w;
     __shared__ int s_lo, s_hi;                                      // EXT: the tile's columns' samples, a range
 
+    pdl_wait();                                                     // (the pre-pass's, and every earlier launch's)
+    pdl_trigger();                                                  // (the merge may launch: it waits for this)
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     if (tid == 0) {
         where_of<TD>(a, w);
@@ -743,6 +760,7 @@ template <bool EXT, int TN, bool TD>
 __global__ void __launch_bounds__(THREADS) fused_sum_merge_kernel(Args a) {
     using TT = Tile<TN, TD>;
     __shared__ Where w;
+    pdl_wait();                                                     // (the shares' sums)
     if (threadIdx.x == 0) where_of<TD>(a, w);
     __syncthreads();
     const int i = blockIdx.z * THREADS + threadIdx.x, r = i / TN, c = i % TN, b = r / BS, m = r % BS;
@@ -802,16 +820,38 @@ static void launch_prepass(const Args& a, unsigned col_tiles, cudaStream_t strea
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
+// `kernel<<<grid, THREADS, smem, stream>>>(a)` as a programmatic dependent of the launch before it where the GPU has it
+// (compute capability 9 on)
+static bool pdl_supported() {
+    static int ok = -1;
+    if (ok < 0) {
+        int dev = 0, major = 0;
+        C10_CUDA_CHECK(cudaGetDevice(&dev));
+        C10_CUDA_CHECK(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev));
+        ok = major >= 9;
+    }
+    return ok == 1;
+}
+static void launch_dependent(void (*kernel)(Args), dim3 grid, size_t smem, cudaStream_t stream, const Args& a) {
+    cudaLaunchConfig_t lc = {};
+    lc.gridDim = grid; lc.blockDim = dim3(THREADS); lc.dynamicSmemBytes = smem; lc.stream = stream;
+    cudaLaunchAttribute at[1];
+    at[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    at[0].val.programmaticStreamSerializationAllowed = 1;
+    lc.attrs = at; lc.numAttrs = pdl_supported() ? 1 : 0;
+    C10_CUDA_CHECK(cudaLaunchKernelEx(&lc, kernel, a));
+}
+
 template <bool EXT, bool X3, bool FA, bool BF, int TN, bool TD>
 static void launch(const Args& a, dim3 grid, unsigned pre_tiles, cudaStream_t stream) {
     if (a.prepass) launch_prepass<TD, EXT>(a, pre_tiles, stream);
     allowed<EXT, X3, FA, BF, TN, TD>();
     const size_t bytes = smem_bytes(TN, TD, EXT, a.share, a.affine);
-    fused_sum_kernel<EXT, X3, FA, BF, TN, TD><<<grid, THREADS, bytes, stream>>>(a);
+    launch_dependent(fused_sum_kernel<EXT, X3, FA, BF, TN, TD>, grid, bytes, stream, a);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     if (a.split > 1) {
         dim3 mgrid(grid.x, grid.y, (NBT * BS * TN + THREADS - 1) / THREADS);
-        fused_sum_merge_kernel<EXT, TN, TD><<<mgrid, THREADS, 0, stream>>>(a);
+        launch_dependent(fused_sum_merge_kernel<EXT, TN, TD>, mgrid, 0, stream, a);
         C10_CUDA_KERNEL_LAUNCH_CHECK();
     }
 }
