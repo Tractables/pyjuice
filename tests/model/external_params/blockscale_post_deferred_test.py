@@ -200,7 +200,10 @@ def test_the_choice_is_the_tuners(monkeypatch):
 @cuda_only
 def test_nothing_deferred_with_a_layer_callback(monkeypatch):
     """A backward with a layer callback (which sees the node values between layers) launches each layer's own: the
-    callback after a gated layer sees its node values shifted back."""
+    callback after a gated layer sees its node values shifted back (the deferred kernels the choice, so a deferral
+    would show)."""
+    monkeypatch.setattr(autotune, "_CACHE", {})
+    _forced(monkeypatch, "deferred")
     pc, gated, phi, x = _circuit(64)
     _step(pc, phi, x)
     seen = []
