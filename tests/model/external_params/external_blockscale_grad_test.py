@@ -207,34 +207,51 @@ def test_every_fork_computes_the_same_gradient():
 
 @cuda_only
 @needs_cute
-def test_tied_gates_accumulate_across_every_layer_that_shares_them():
+@pytest.mark.parametrize("two_per_layer", [False, True])
+def test_tied_gates_accumulate_across_every_layer_that_shares_them(two_per_layer, monkeypatch):
     """`tie_external` points every copy of a tied node at the SOURCE's gate tensor, so one gradient row
     is written by one layer per copy. The buffer is zeroed once per backward precisely so those add up,
     and the tied gradient must therefore equal the SUM of what the copies contribute separately.
 
     This is the invariant behind the emission being an atomic rather than a store, and it is checked
     against an UNTIED build of the same circuit fed the same gates -- an oracle that needs no reference
-    implementation and no assumption about what the right answer is."""
+    implementation and no assumption about what the right answer is.
+
+    The copies one a layer (a chain), or two in each of two layers: two node blocks of one partition writing the same
+    rows, where a store of the post-backward's (the log-Z term's) lost one block's terms. Its launches per layer (the
+    deferral to the end of the pass, `blockscale.post_deferred`, off)."""
+    import pyjuice.nodes.external_params.blockscale.post_deferred as pdm
     dev = torch.device("cuda:0")
-    K, gate_cbs, batch, steps = 128, 8, 64, 4
+    K, gate_cbs, batch, steps = 128, 8, 64, (6 if two_per_layer else 4)
+    monkeypatch.setattr(pdm, "try_defer", lambda *a, **kw: False)
 
     def build(tie):
         torch.manual_seed(0)
+        cat = lambda v: inputs(v, num_node_blocks = 1, dist = dists.Categorical(num_cats = NUM_CATS))
         with juice.set_block_size(K):
-            ns = inputs(0, num_node_blocks = 1, dist = dists.Categorical(num_cats = NUM_CATS))
-            src, copies = None, []
-            for t in range(1, steps):
-                emit = inputs(t, num_node_blocks = 1, dist = dists.Categorical(num_cats = NUM_CATS))
-                prod = multiply(ns, emit)
-                if src is None:
-                    ns = summate(prod, num_node_blocks = 1,
-                                 external_params = BlockScaleSumParams(ch_block_size = gate_cbs,
-                                                                       tie_external = tie))
-                    src = ns
-                else:
-                    ns = src.duplicate(prod, tie_params = True)
-                copies.append(ns)
-            root = summate(multiply(ns), num_node_blocks = 1, block_size = 1)
+            if two_per_layer:
+                # A over (x0, x1) and B over (x2, x3) in one layer, C over (A, x4) and D over (B, x5) in the next
+                a = summate(multiply(cat(0), cat(1)), num_node_blocks = 1,
+                            external_params = BlockScaleSumParams(ch_block_size = gate_cbs, tie_external = tie))
+                b = a.duplicate(multiply(cat(2), cat(3)), tie_params = True)
+                c = a.duplicate(multiply(a, cat(4)), tie_params = True)
+                d = a.duplicate(multiply(b, cat(5)), tie_params = True)
+                copies, top = [a, b, c, d], multiply(c, d)
+            else:
+                ns = cat(0)
+                src, copies = None, []
+                for t in range(1, steps):
+                    prod = multiply(ns, cat(t))
+                    if src is None:
+                        ns = summate(prod, num_node_blocks = 1,
+                                     external_params = BlockScaleSumParams(ch_block_size = gate_cbs,
+                                                                           tie_external = tie))
+                        src = ns
+                    else:
+                        ns = src.duplicate(prod, tie_params = True)
+                    copies.append(ns)
+                top = multiply(ns)
+            root = summate(top, num_node_blocks = 1, block_size = 1)
         torch.manual_seed(0)
         root.init_parameters(perturbation = 2.0)
         return juice.compile(root, verbose = False).to(dev), copies

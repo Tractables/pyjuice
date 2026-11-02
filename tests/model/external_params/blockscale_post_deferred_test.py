@@ -125,6 +125,7 @@ def test_the_deferred_kernels_compute_the_layers_bits(L, nb, gcb, B, tied, z, gr
     owner, members = _members(pc, phi, x, monkeypatch, grad)
     assert len(members) == len(gated)
     assert (members[0]["grad_ext"] is not None) == grad and (members[0]["W"] is not None) == z
+    assert all(m["plan"][1]["GRAD_ATOMIC"] == 0 for m in members)   # (every layer's own gates: one writer a row)
     nm0 = members[0]["node_mars"].clone() + 0.25
     a, b = _run(owner, members, "layers", nm0), _run(owner, members, "deferred", nm0)
     assert torch.equal(a[0], b[0]) and not torch.equal(a[0], nm0)

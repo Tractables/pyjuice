@@ -30,7 +30,11 @@ order that varies from run to run -- two equal backwards differed in the last bi
 (`GRAD_PARTIAL`), each STORES its share (`partial`, `[node blocks, tiles, gates, batch]`) and takes a ticket from its
 group's counter (the programs of one node block, gate tile and batch slice); the program holding the last ticket adds
 the shares in tile order -- the one writer of each entry -- and sets the counter back to 0 for the next launch. The
-tickets are an acq_rel atomic after a CTA barrier, the shares read past L1 (`.cg`). A second launch for the sum
+tickets are an acq_rel atomic after a CTA barrier, the shares read past L1 (`.cg`). Where two node blocks of the
+partition write one gate row -- copies of a node whose gates are tied (`tie_external`) in one partition, which read the
+same rows -- their last tickets add atomically (`GRAD_ATOMIC`), in no fixed order: a load and a store there kept one
+block's terms (MEASURED, two such pairs: the tied gradient off the sum of the copies' by 3.9-9.2 times its largest
+entry). A second launch for the sum
 instead: MEASURED ~12 us a layer more (its grid is the gradient's, a few programs, each walking every tile); the node
 tiles looping inside one program per block instead: 3-10x slower (a block's walk is latency-bound at any tile).
 `W` keeps an atomic add across batch slices, as the denominator kernel did across its.
@@ -52,7 +56,8 @@ def _bs_post_backward_kernel(node_flows, node_mars, log_z, sigma, ext, gate, nid
                              BLOCK_SIZE_M: tl.constexpr, gate_stride: tl.constexpr, ext_base,
                              TILE_M: tl.constexpr, TILE_G: tl.constexpr, TILE_B: tl.constexpr,
                              B_TILES_PER_PROG: tl.constexpr, WANT_GRAD: tl.constexpr, WANT_W: tl.constexpr,
-                             W_ATOMIC: tl.constexpr, USE_DOT: tl.constexpr, GRAD_PARTIAL: tl.constexpr):
+                             W_ATOMIC: tl.constexpr, USE_DOT: tl.constexpr, GRAD_PARTIAL: tl.constexpr,
+                             GRAD_ATOMIC: tl.constexpr):
     pid_y = tl.program_id(0)                       # (node block, node tile): grid-x, past the 65535 of grid-y
     pid_g = tl.program_id(1)                       # gate tile
     pid_s = tl.program_id(2)                       # batch slice
@@ -142,7 +147,10 @@ def _bs_post_backward_kernel(node_flows, node_mars, log_z, sigma, ext, gate, nid
                                        cache_modifier = ".cg")
                 gptr = grad_ext + grow[:,None] * batch_size + offs_b[None,:]
                 gmask = ghas[:,None] & mask_b[None,:]
-                tl.store(gptr, tl.load(gptr, mask = gmask, other = 0.0) + tot, mask = gmask)
+                if GRAD_ATOMIC:                    # (another node block's last ticket adds into these rows too)
+                    tl.atomic_add(gptr, tot, mask = gmask)
+                else:
+                    tl.store(gptr, tl.load(gptr, mask = gmask, other = 0.0) + tot, mask = gmask)
                 offs_b += TILE_B
             tl.atomic_xchg(counter + group, 0)
 

@@ -79,6 +79,21 @@ def _no_grad(ext):
     return t
 
 
+def post_rows_overlap(tables, n_gates: int, ncg: int) -> bool:
+    """
+    Whether the post-backward kernels' gradient writes for these partitions -- each a `(gate table, ext base)` -- reach
+    one `ext` row twice (a host sync). A table's entry, one node block's edge block, is the first of a run of `ncg` gate
+    rows, in the columns the kernels read (below `n_gates / ncg`, and the table's width). Copies of a node whose gates
+    are tied (`tie_external`) read the same runs: in one partition, or in several layers' deferred together.
+    """
+    starts = []
+    for gb, base in tables:
+        s = gb[:, :min(gb.size(1), -(-n_gates // ncg))].reshape(-1).long()
+        starts.append(s[s >= 0] + base)
+    s = torch.cat(starts).sort().values
+    return s.numel() > 1 and bool((s[1:] - s[:-1] < ncg).any())
+
+
 def _host_extra(runs):
     """
     Each of a plan's candidates' host time a call beyond the cheapest's, in seconds: the best of a few bursts of calls
@@ -1420,6 +1435,11 @@ class _BackwardMixin:
             tm, tg, tb, bpp, _ = c
             return (rows * (bs_ // tm), triton.cdiv(n_gates, tg), triton.cdiv(triton.cdiv(batch, tb), bpp))
 
+        # (where two node blocks of the partition write one gate row -- copies of a node with tied gates in it -- the
+        # last tickets add atomically: their stores kept one block's terms; assumed inside a capture, which cannot look)
+        shared = want_grad and (torch.cuda.is_current_stream_capturing()
+                                or post_rows_overlap([(gb, 0)], n_gates, state["node_cbs"] // gate_cbs))
+
         def consts(c):
             tm, tg, tb, bpp, warps = c
             return dict(batch_size = batch, n_gates = n_gates, N_CHILD_GATES = state["node_cbs"] // gate_cbs,
@@ -1427,7 +1447,8 @@ class _BackwardMixin:
                         TILE_G = tg, TILE_B = tb, B_TILES_PER_PROG = bpp, WANT_GRAD = int(want_grad),
                         WANT_W = int(want_w), W_ATOMIC = 1 if grid(c)[2] > 1 else 0,
                         USE_DOT = 1 if min(tm, tg, tb) >= 16 else 0,
-                        GRAD_PARTIAL = 1 if (want_grad and bs_ // tm > 1) else 0, num_warps = warps, num_stages = 1)
+                        GRAD_PARTIAL = 1 if (want_grad and bs_ // tm > 1) else 0, GRAD_ATOMIC = int(shared),
+                        num_warps = warps, num_stages = 1)
 
         def shares(c):
             if not (want_grad and bs_ // c[0] > 1):
