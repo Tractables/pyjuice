@@ -52,6 +52,8 @@ _eleprepass_module = None  # element-flow backward, exponentials pre-pass + stre
 _eleprepass_attempted = False
 _stream_module = None   # forward (tlmm, bf16 params): pre-pass per split range, a split GEMM, a merge
 _stream_attempted = False
+_stream_fused_module = None   # the same forward, the product layer below fused into its pre-pass
+_stream_fused_attempted = False
 _elestream_module = None  # element-flow backward (bf16 params): the same three launches
 _elestream_attempted = False
 _pardef_module = None   # a tied group's deferred parameter flows (fp16 operands): capture + flush
@@ -794,6 +796,27 @@ def tlmm_forward_sum_stream(node_mars: torch.Tensor, element_mars: torch.Tensor,
     plain kernel's dispatch conditions but the tile shape (the gate in ``sum_layer._forward_block_sparse``)."""
     _stream_module.tlmm_forward_sum_stream(node_mars, element_mars, params, nids, ebase, pbase, groups[0], groups[1],
                                            int(batch_size), int(block_size), int(k_num_tiles), int(cfg))
+
+
+def stream_fused_is_available() -> bool:
+    """Whether the stream forward with the product layer below fused into its pre-pass (tlmm_forward_sum_stream_fused.cu)
+    is usable (lazily JIT-compiles once)."""
+    global _stream_fused_module, _stream_fused_attempted
+    if not _stream_fused_attempted:
+        _stream_fused_attempted = True
+        _stream_fused_module = _jit("pyjuice_sum_forward_stream_fused_cuda", "tlmm_forward_sum_stream_fused.cu")
+    return _stream_fused_module is not None
+
+
+def tlmm_forward_sum_stream_fused(node_mars: torch.Tensor, cbase: torch.Tensor, params: torch.Tensor,
+                                  nids: torch.Tensor, pbase: torch.Tensor, groups, batch_size: int, block_size: int,
+                                  k_num_tiles: int, cfg: int) -> None:
+    """`tlmm_forward_sum_stream` with each child's value formed in its pre-pass as the sum of its product's two child node
+    values -- ``cbase`` int32 [rows, knt, 2, 2], an edge tile's half's two runs of child node rows (-1: the dummy element
+    rows), `SumLayer._stream_fusion` -- instead of read from ``element_mars``: the same bits as the product layer's
+    forward and `tlmm_forward_sum_stream` at ``cfg`` one after the other, without the product layer's launch."""
+    _stream_fused_module.tlmm_forward_sum_stream_fused(node_mars, cbase, params, nids, pbase, groups[0], groups[1],
+                                                       int(batch_size), int(block_size), int(k_num_tiles), int(cfg))
 
 
 def stream_configs():

@@ -1,0 +1,501 @@
+// The CUDA block-sparse sum-layer stream forward (tlmm_forward_sum_stream.cu: a pre-pass, a split GEMM, a merge) with
+// the PRODUCT LAYER BELOW FUSED into its pre-pass: the pre-pass forms each child's value as the sum of that product's two
+// child node values -- what the product layer's forward writes into `element_mars` (`ProdLayer.forward`, pyjuice's
+// `_forward_backward_kernel_2d`: `tl.sum` over its two children, one fp32 add) -- instead of reading `element_mars`:
+//
+//     node_mars[n, b] = log sum_c params[n, c] exp(node_mars[child0(c), b] + node_mars[child1(c), b])
+//
+// so the product layer's launch is not needed before it, and its rows of `element_mars` are neither written nor read.
+// The same element values, so the same bits as the product forward and the stream kernel run one after the other; the
+// GEMM and the merge are that module's, copied unchanged (a new module: the kernels training runs stay as they are).
+//
+// A pre-pass chunk is 32 consecutive element rows (half an edge tile); its children are two runs of 32 consecutive node
+// rows, whose first rows `cbase` gives per (node block, edge tile, half) -- int32 [rows, knt, 2, 2], -1 for a chunk of
+// the dummy element rows (-inf: the padding of a ragged block). The caller verifies that every chunk is one of the two
+// (`SumLayer`'s plan of the fusion). Products of two children only.
+//
+// What the stream module's header says of the rest holds here: the three launches chained by programmatic dependent
+// launch (the pre-pass now waits for the node values of the launches before it, as it waited for `element_mars`), every
+// sum in a fixed order.
+
+#include <torch/extension.h>
+#include "param_load.cuh"
+#include <cuda_bf16.h>
+#include <c10/cuda/CUDAStream.h>
+#include <c10/cuda/CUDAException.h>
+#include <c10/cuda/CUDAGuard.h>
+#include <vector>
+#include <cmath>
+#include <cute/tensor.hpp>
+#include <cute/atom/mma_atom.hpp>
+#include <cute/atom/copy_atom.hpp>
+
+using namespace cute;
+
+#define BK 64           // edge tile: one run of children (ebase / pbase one entry each)
+#define CH 32           // the pre-pass's chunk: half an edge tile
+#define MAX_SPLIT 12
+
+__device__ __forceinline__ void cpa16(uint32_t smem, const void* gmem) {
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(smem), "l"(gmem) : "memory");
+}
+__device__ __forceinline__ void mbar_init(uint64_t* bar, int cnt) {
+    unsigned a = (unsigned)__cvta_generic_to_shared(bar);
+    asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;" ::"r"(a), "r"(cnt) : "memory");
+}
+__device__ __forceinline__ void mbar_arrive(uint64_t* bar) {
+    unsigned a = (unsigned)__cvta_generic_to_shared(bar);
+    asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];" ::"r"(a) : "memory");
+}
+// arrives on `bar` once every cp.async this thread issued before has landed (the barrier's count includes it)
+__device__ __forceinline__ void cpa_mbar_arrive(uint64_t* bar) {
+    unsigned a = (unsigned)__cvta_generic_to_shared(bar);
+    asm volatile("cp.async.mbarrier.arrive.noinc.shared::cta.b64 [%0];" ::"r"(a) : "memory");
+}
+__device__ __forceinline__ void mbar_wait(uint64_t* bar, int phase) {
+    unsigned a = (unsigned)__cvta_generic_to_shared(bar);
+    asm volatile("{\n .reg .pred p;\n W_%=:\n"
+                 "mbarrier.try_wait.parity.shared::cta.b64 p, [%0], %1;\n"
+                 "@!p bra W_%=;\n}\n" ::"r"(a), "r"(phase) : "memory");
+}
+
+// ---------------- pre-pass: a thread block per (group, split, PB columns) ----------------
+// Thread (part, b) takes the range's 32-child chunks part, part + PARTS, ...: a chunk is 32 consecutive element rows,
+// formed as the sums of two runs of node rows (`cbase` of the group's first node block `grep`); the range's max over
+// every chunk (shared memory); u = bf16 exp(em - M). A range past PARTS chunks forms its later chunks twice (the max,
+// then the exponentials).
+template <int NT, int PB>
+__global__ void __launch_bounds__(NT) stream_fused_prepass_kernel(
+        const float* __restrict__ nm, const int* __restrict__ cbase, const int* __restrict__ grep,
+        __nv_bfloat16* __restrict__ u, float* __restrict__ mp, int batch, int num_edges, int knt, int ksteps, int kt_sh,
+        int split) {
+    constexpr int PARTS = NT / PB;
+    __shared__ float smx[PARTS][PB];
+    cudaGridDependencySynchronize();                     // (the children's node values are the launches before's)
+    cudaTriggerProgrammaticLaunchCompletion();           // the GEMM may launch onto the SMs this grid leaves free
+    const int tid = threadIdx.x, nbc = batch / PB;
+    const int g = blockIdx.x / (split * nbc), sp = (blockIdx.x / nbc) % split, b0 = (blockIdx.x % nbc) * PB;
+    const int b = tid % PB, part = tid / PB;
+    const int q0 = (int)((((long)sp * ksteps / split) << kt_sh) / CH);
+    const int q1 = (int)((((long)(sp + 1) * ksteps / split) << kt_sh) / CH);
+    const int* ct = cbase + (long)grep[g] * knt * 4;     // [knt, 2 halves, 2 children]
+    auto load_chunk = [&](int q, float* v) {
+        const int pos0 = q * CH;
+        const int* cq = ct + (pos0 / BK) * 4 + ((pos0 % BK) / CH) * 2;
+        const int c0 = cq[0], c1 = cq[1];
+        if (c0 < 0) {                                    // (the dummy element rows: -inf)
+            CUTE_UNROLL
+            for (int i = 0; i < CH; i++) v[i] = -INFINITY;
+            return;
+        }
+        const float* x0 = nm + (long)c0 * batch + b0 + b;
+        const float* x1 = nm + (long)c1 * batch + b0 + b;
+        CUTE_UNROLL
+        for (int i = 0; i < CH; i++) v[i] = x0[(long)i * batch] + x1[(long)i * batch];
+    };
+    float v[CH];
+    float m = -INFINITY;
+    const int q = q0 + part;
+    if (q < q1) {
+        load_chunk(q, v);
+        CUTE_UNROLL
+        for (int i = 0; i < CH; i++) m = fmaxf(m, v[i]);
+    }
+    for (int qq = q + PARTS; qq < q1; qq += PARTS) {
+        float w[CH];
+        load_chunk(qq, w);
+        CUTE_UNROLL
+        for (int i = 0; i < CH; i++) m = fmaxf(m, w[i]);
+    }
+    smx[part][b] = m;
+    __syncthreads();
+    m = smx[0][b];
+    CUTE_UNROLL
+    for (int k = 1; k < PARTS; k++) m = fmaxf(m, smx[k][b]);
+    __nv_bfloat16* ur = u + ((long)g * num_edges) * batch + b0 + b;
+    if (q < q1) {
+        CUTE_UNROLL
+        for (int i = 0; i < CH; i++)
+            ur[(long)(q * CH + i) * batch] = __float2bfloat16_rn(m == -INFINITY ? 0.f : __expf(v[i] - m));
+    }
+    for (int qq = q + PARTS; qq < q1; qq += PARTS) {
+        float w[CH];
+        load_chunk(qq, w);
+        CUTE_UNROLL
+        for (int i = 0; i < CH; i++)
+            ur[(long)(qq * CH + i) * batch] = __float2bfloat16_rn(m == -INFINITY ? 0.f : __expf(w[i] - m));
+    }
+    if (part == 0) mp[((long)g * split + sp) * batch + b0 + b] = m;
+}
+
+extern __shared__ __align__(1024) char smem_raw[];
+
+// The MN-major smem atom of an operand with 64 rows (m or b) a k: 128-byte lines, swizzled over the 16-byte chunks so
+// the transposed ldmatrix's 8 k-rows of one chunk fall in distinct banks.
+using Atom64 = decltype(composition(Swizzle<3, 3, 3>{}, Layout<Shape<_64, _8>, Stride<_1, _64>>{}));
+
+// ---------------- the GEMM: (batch tile, node tile, split) blocks ----------------
+template <int BM, int BN, int WM, int WN, int PW, int ST, int KT>
+__global__ void __launch_bounds__((WM * WN + PW) * 32) stream_fused_gemm_kernel(
+        const bfloat16_t* __restrict__ params, const long* __restrict__ pbase, const bfloat16_t* __restrict__ u,
+        const int* __restrict__ ugrp, float* __restrict__ part, int knt, int mtiles, int block_size, int batch,
+        int num_edges, int split, long rows_total, float* __restrict__ node_mars, const float* __restrict__ mp,
+        const long* __restrict__ nids) {
+    constexpr int NC = WM * WN * 32, NP = PW * 32;
+    constexpr int ABYTES = KT * BM * 2, BBYTES = KT * BN * 2;
+    constexpr int STAGE = (ABYTES + BBYTES + 1023) / 1024 * 1024;
+    constexpr int SUB = BK / KT;                         // k-steps an edge tile is
+    // 16 consumer warps (the 256-row tile, 640 threads) run under a 96-register cap: the tile's columns in NH halves of
+    // BNH, each half's fragments loaded as they are multiplied; the 8-warp tiles (NH 1) keep their fragments a k-block
+    // ahead, their code as it was
+    constexpr int NH = (WM * WN >= 16) ? 2 : 1, BNH = BN / NH, HBYTES = BBYTES / NH;
+    const int nbt = batch / BN, nmt = (int)(rows_total / BM);
+    const int pid_b = blockIdx.x % nbt, pid_m = (blockIdx.x / nbt) % nmt, sp = blockIdx.x / (nbt * nmt);
+    // the node tile: one of `mtiles` of a node block, or -- a block smaller than the tile (an HCLT's 32-node blocks)
+    // -- `bpt` consecutive blocks of one group, their parameters a slab each
+    const int bpt = BM > block_size ? BM / block_size : 1;
+    const int r = bpt > 1 ? pid_m * bpt : pid_m / mtiles, tile_id = bpt > 1 ? 0 : pid_m % mtiles;
+    const int ksteps = knt * SUB;
+    const int k0 = (int)((long)sp * ksteps / split), k1 = (int)((long)(sp + 1) * ksteps / split);
+    uint64_t* full = (uint64_t*)(smem_raw + ST * STAGE);
+    uint64_t* empty = full + ST;
+    const int tid = threadIdx.x;
+    auto sAl = tile_to_shape(Atom64{}, make_shape(Int<BM>{}, Int<KT>{}));
+    auto sBl = tile_to_shape(Atom64{}, make_shape(Int<BNH>{}, Int<KT>{}));      // (a half's u tile)
+    auto stA = [&](int s) { return (bfloat16_t*)(smem_raw + s * STAGE); };
+    auto stB = [&](int s, int h) { return (bfloat16_t*)(smem_raw + s * STAGE + ABYTES + h * HBYTES); };
+    if (tid == 0)
+        for (int s = 0; s < ST; s++) { mbar_init(&full[s], NP); mbar_init(&empty[s], NC); }
+    __syncthreads();
+    cudaTriggerProgrammaticLaunchCompletion();           // the merge may launch
+    if (tid >= NC) {
+        // ---------------- producers: k-step t into stage (t - k0) % ST once the consumers released it ----------------
+        const int ptid = tid - NC;
+        // a thread's 16-byte chunks are the same every k-step: their shared offsets (bytes, from a stage) and global
+        // offsets (elements, from the k-step's bases), computed once; ~0u marks a chunk past the end
+        constexpr int TA = ABYTES / 16, TB = BBYTES / 16, CA = (TA + NP - 1) / NP, CB = (TB + NP - 1) / NP;
+        uint32_t oA[CA], oB[CB];
+        int gA[CA], gB[CB];
+        const long* prA[CA];                             // a chunk's node block's parameter table (its slab of the tile)
+        {
+            Tensor sAt = make_tensor(make_smem_ptr(stA(0)), sAl);
+            Tensor sBt = make_tensor(make_smem_ptr(stB(0, 0)), sBl);
+            CUTE_UNROLL
+            for (int q = 0; q < CA; q++) {
+                int i = ptid + q * NP, e = i / (BM / 8), mm = (i % (BM / 8)) * 8;
+                oA[q] = i < TA ? (uint32_t)((char*)&sAt(mm, e) - smem_raw) : ~0u;
+                const int bq = bpt > 1 ? mm / block_size : 0;
+                gA[q] = e * block_size + (bpt > 1 ? mm - bq * block_size : mm) + tile_id * BM;
+                prA[q] = pbase + (long)(r + bq) * knt;
+            }
+            CUTE_UNROLL
+            for (int q = 0; q < CB; q++) {
+                int i = ptid + q * NP, e = i / (BN / 8), bb = (i % (BN / 8)) * 8, h = bb / BNH;
+                oB[q] = i < TB ? (uint32_t)((char*)&sBt(bb % BNH, e) - smem_raw) + h * HBYTES : ~0u;
+                gB[q] = e * batch + bb;
+            }
+        }
+        const uint32_t sbase = (uint32_t)__cvta_generic_to_shared(smem_raw);
+        const bfloat16_t* ug = u + ((long)ugrp[r] * num_edges) * batch + (long)pid_b * BN;
+        // the first stages' parameter tiles while the pre-pass may still run (no launch of the chain writes them)
+        const int t_pre = min(k1, k0 + ST);
+        for (int t = k0; t < t_pre; t++) {
+            const long psub = (long)(t % SUB) * KT * block_size;
+            CUTE_UNROLL
+            for (int q = 0; q < CA; q++)
+                if (oA[q] != ~0u) cpa16(sbase + (t - k0) * STAGE + oA[q], params + prA[q][t / SUB] + psub + gA[q]);
+        }
+        cudaGridDependencySynchronize();                 // u (the pre-pass's) from here on
+        for (int t = k0; t < k1; t++) {
+            const int j = t - k0, s = j % ST;
+            if (j >= ST) mbar_wait(&empty[s], ((j / ST) - 1) & 1);
+            const uint32_t ss = sbase + s * STAGE;
+            const int t64 = t / SUB, sub = t % SUB;
+            const long psub = (long)sub * KT * block_size;
+            const bfloat16_t* pb = ug + (long)t * KT * batch;
+            if (t >= t_pre) {
+                CUTE_UNROLL
+                for (int q = 0; q < CA; q++) if (oA[q] != ~0u) cpa16(ss + oA[q], params + prA[q][t64] + psub + gA[q]);
+            }
+            CUTE_UNROLL
+            for (int q = 0; q < CB; q++) if (oB[q] != ~0u) cpa16(ss + oB[q], pb + gB[q]);
+            cpa_mbar_arrive(&full[s]);                   // (tracks every copy this thread issued: the stage's A too)
+        }
+        asm volatile("cp.async.wait_all;\n" ::: "memory");
+        return;
+    }
+    // ---------------- consumers: the range's k-steps in order into one fp32 accumulator ----------------
+    TiledMMA mma = make_tiled_mma(SM80_16x8x16_F32BF16BF16F32_TN{}, Layout<Shape<Int<WM>, Int<WN>, _1>>{});
+    ThrMMA thr = mma.get_thread_slice(tid);
+    Tensor sAt0 = make_tensor(make_smem_ptr(stA(0)), sAl);
+    Tensor sBt0 = make_tensor(make_smem_ptr(stB(0, 0)), sBl);
+    Tensor tCrA = thr.partition_fragment_A(sAt0);
+    Tensor tCrB = thr.partition_fragment_B(sBt0);
+    auto s2rA = make_tiled_copy_A(Copy_Atom<SM75_U16x8_LDSM_T, bfloat16_t>{}, mma);
+    auto s2rB = make_tiled_copy_B(Copy_Atom<SM75_U16x4_LDSM_T, bfloat16_t>{}, mma);
+    auto tA = s2rA.get_thread_slice(tid);
+    auto tB = s2rB.get_thread_slice(tid);
+    Tensor tXrA = tA.retile_D(tCrA);
+    Tensor tXrB = tB.retile_D(tCrB);
+    Tensor cC = make_identity_tensor(Shape<Int<BM>, Int<BNH>>{});
+    Tensor tCcC = thr.partition_C(cC);
+    Tensor tCrL = thr.partition_fragment_C(cC);
+    Tensor tCrL1 = thr.partition_fragment_C(cC);         // (the second half's accumulator; unused where NH is 1)
+    clear(tCrL);
+    clear(tCrL1);
+    constexpr int KB = size<2>(tCrA);
+    for (int t = k0; t < k1; t++) {
+        const int j = t - k0, s = j % ST;
+        mbar_wait(&full[s], (j / ST) & 1);
+        Tensor sAt = make_tensor(make_smem_ptr(stA(s)), sAl);
+        Tensor sBt = make_tensor(make_smem_ptr(stB(s, 0)), sBl);
+        auto tXsA = tA.partition_S(sAt);
+        auto tXsB = tB.partition_S(sBt);
+        if constexpr (NH == 1) {
+            copy(s2rA, tXsA(_, _, 0), tXrA(_, _, 0));
+            copy(s2rB, tXsB(_, _, 0), tXrB(_, _, 0));
+            CUTE_UNROLL
+            for (int kb = 0; kb < KB; kb++) {            // block kb + 1's fragments load while block kb multiplies
+                if (kb + 1 < KB) {
+                    copy(s2rA, tXsA(_, _, kb + 1), tXrA(_, _, kb + 1));
+                    copy(s2rB, tXsB(_, _, kb + 1), tXrB(_, _, kb + 1));
+                } else {
+                    mbar_arrive(&empty[s]);              // the stage is read
+                }
+                cute::gemm(mma, tCrA(_, _, kb), tCrB(_, _, kb), tCrL);
+            }
+        } else {
+            auto tXsB1 = tB.partition_S(make_tensor(make_smem_ptr(stB(s, 1)), sBl));
+            CUTE_UNROLL
+            for (int kb = 0; kb < KB; kb++) {            // a k-block: A once, each half's u as it is multiplied
+                copy(s2rA, tXsA(_, _, kb), tXrA(_, _, kb));
+                copy(s2rB, tXsB(_, _, kb), tXrB(_, _, kb));
+                cute::gemm(mma, tCrA(_, _, kb), tCrB(_, _, kb), tCrL);
+                copy(s2rB, tXsB1(_, _, kb), tXrB(_, _, kb));
+                if (kb + 1 == KB) mbar_arrive(&empty[s]);   // the stage is read
+                cute::gemm(mma, tCrA(_, _, kb), tCrB(_, _, kb), tCrL1);
+            }
+        }
+    }
+    cudaGridDependencySynchronize();                     // (the producers waited; the epilogue's own guarantee)
+    if (split > 1) {                                     // the range's partial, merged by the merge kernel
+        CUTE_UNROLL
+        for (int h = 0; h < NH; h++) {
+            float* o = part + ((long)sp * rows_total + (long)r * block_size + (long)tile_id * BM) * batch + pid_b * BN
+                       + h * BNH;
+            auto& L = h == 0 ? tCrL : tCrL1;
+            CUTE_UNROLL
+            for (int i = 0; i < size(L); i += 2) {       // (i, i + 1): columns b, b + 1 of one row
+                *(float2*)&o[(long)get<0>(tCcC(i)) * batch + get<1>(tCcC(i))] = make_float2(L(i), L(i + 1));
+            }
+        }
+    } else {                                             // one range: the merge in the epilogue (its S = 1 arithmetic)
+        const float* mpg = mp + (long)ugrp[r] * batch + (long)pid_b * BN;
+        CUTE_UNROLL
+        for (int h = 0; h < NH; h++) {
+            auto& L = h == 0 ? tCrL : tCrL1;
+            CUTE_UNROLL
+            for (int i = 0; i < size(L); i += 2) {
+                const int m = get<0>(tCcC(i)), c = get<1>(tCcC(i)) + h * BNH;
+                const int bq = bpt > 1 ? m / block_size : 0;
+                const long nid = nids[r + bq] + (bpt > 1 ? m - bq * block_size : tile_id * BM + m);
+                const float2 M = *(const float2*)&mpg[c];
+                const float o0 = M.x == -INFINITY ? -INFINITY : (logf(L(i)) + M.x);
+                const float o1 = M.y == -INFINITY ? -INFINITY : (logf(L(i + 1)) + M.y);
+                *(float2*)&node_mars[nid * batch + pid_b * BN + c] = make_float2(o0, o1);
+            }
+        }
+    }
+}
+
+// ---------------- merge: a thread per 4 columns of a node ----------------
+template <int S>
+__global__ void __launch_bounds__(256) stream_fused_merge_kernel(
+        float* __restrict__ node_mars, const float* __restrict__ part, const float* __restrict__ mp,
+        const long* __restrict__ nids, const int* __restrict__ ugrp, int batch, int block_size, long rows_total) {
+    cudaGridDependencySynchronize();                     // (the GEMM's partials)
+    const long idx = (long)blockIdx.x * 256 + threadIdx.x;
+    const int bq = batch / 4;
+    if (idx >= rows_total * bq) return;
+    const long n = idx / bq;
+    const int b = (int)(idx % bq) * 4;
+    const int r = (int)(n / block_size), g = ugrp[r];
+    float4 lp[S], xm[S];
+    CUTE_UNROLL
+    for (int p = 0; p < S; p++) {                        // (every load issued before the arithmetic)
+        lp[p] = *(const float4*)&part[((long)p * rows_total + n) * batch + b];
+        xm[p] = *(const float4*)&mp[((long)g * S + p) * batch + b];
+    }
+    const long nid = nids[r] + n % block_size;
+    float out[4];
+    CUTE_UNROLL
+    for (int c = 0; c < 4; c++) {
+        float M = -INFINITY;
+        CUTE_UNROLL
+        for (int p = 0; p < S; p++) M = fmaxf(M, (&xm[p].x)[c]);
+        float L = 0.f;
+        CUTE_UNROLL
+        for (int p = 0; p < S; p++) {
+            const float x = (&xm[p].x)[c];
+            L = fmaf((&lp[p].x)[c], x == -INFINITY ? 0.f : __expf(x - M), L);
+        }
+        out[c] = (M == -INFINITY) ? -INFINITY : (logf(L) + M);
+    }
+    *(float4*)&node_mars[nid * batch + b] = make_float4(out[0], out[1], out[2], out[3]);
+}
+
+// ---------------- host ----------------
+// `kernel<<<grid, block, smem, st>>>(args...)` as a programmatic dependent of the launch before it (see the top)
+template <typename... P, typename... A>
+static void launch_pdl(void (*kernel)(P...), dim3 grid, dim3 block, int smem, cudaStream_t st, A... args) {
+    cudaLaunchConfig_t lc = {};
+    lc.gridDim = grid; lc.blockDim = block; lc.dynamicSmemBytes = smem; lc.stream = st;
+    cudaLaunchAttribute at[1];
+    at[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    at[0].val.programmaticStreamSerializationAllowed = 1;
+    lc.attrs = at; lc.numAttrs = 1;
+    C10_CUDA_CHECK(cudaLaunchKernelEx(&lc, kernel, static_cast<P>(args)...));
+}
+
+template <int BM, int BN, int WM, int WN, int PW, int ST, int KT>
+static void launch_gemm(const bfloat16_t* params, const long* pbase, const bfloat16_t* u, const int* ugrp, float* part,
+                        int knt, int rows, int block_size, int batch, int num_edges, int split, float* node_mars,
+                        const float* mp, const long* nids, cudaStream_t st) {
+    constexpr int STAGE = (KT * BM * 2 + KT * BN * 2 + 1023) / 1024 * 1024;
+    constexpr int SMEM = ST * STAGE + 2 * ST * 8;
+    constexpr int NTH = (WM * WN + PW) * 32;
+    static_assert(SMEM <= 101376, "a config past sm_120's 99 KB of shared memory a block");
+    auto kernel = stream_fused_gemm_kernel<BM, BN, WM, WN, PW, ST, KT>;
+    // the shared-memory attribute once per device and instantiation (the call costs host time on every launch)
+    static bool attr_set[64] = {};
+    int dev = 0;
+    C10_CUDA_CHECK(cudaGetDevice(&dev));
+    if (dev >= 64 || !attr_set[dev]) {
+        C10_CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM));
+        if (dev < 64) attr_set[dev] = true;
+    }
+    const int mtiles = BM >= block_size ? 1 : block_size / BM;     // (a tile of several blocks: one a tile)
+    const long n_gemm = (long)(batch / BN) * ((long)rows * block_size / BM) * split;
+    TORCH_CHECK(n_gemm < (1L << 31), "sum forward stream: a grid past 2^31 blocks");
+    launch_pdl(kernel, dim3((unsigned)n_gemm), dim3(NTH), SMEM, st, params, pbase, u, ugrp, part, knt, mtiles, block_size,
+               batch, num_edges, split, (long)rows * block_size, node_mars, mp, nids);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+// id -> {BM, BN, WM, WN, PW, ST, KT}: the BlockScale forward stream's table (MEASURED there: the 128 x 128 tiles take
+// B >= 128 at most shapes -- 64-row k-steps in 3 stages, or 32-row ones in 6 --, 128 x 64 B 64 and the 512-node blocks,
+// 64 x 128 the 256-node blocks at B 512, 64 x 64 the 64-node blocks at a batch that is no multiple of 128); 256 x 128
+// (16 consumer warps in two column halves under the 96-register cap, the u tile read once per 256 rows) for blocks of
+// 256 and more -- MEASURED HMM-4096: B512 96.6 -> 90.5 us a layer (split 2), B128 loses (26 vs 19 us GEMM: a CTA's
+// MMA/ingest overlap, not its bytes, paces it); the tuner picks
+#define CFG_TABLE(X)                     \
+    X(0, 128, 128, 4, 2, 4, 3, 64)       \
+    X(1, 128, 128, 2, 4, 4, 6, 32)       \
+    X(2, 128, 64, 4, 2, 4, 4, 64)        \
+    X(3, 64, 128, 2, 4, 4, 4, 64)        \
+    X(4, 128, 64, 4, 2, 4, 8, 32)        \
+    X(5, 64, 64, 2, 2, 4, 6, 64)         \
+    X(6, 256, 128, 8, 2, 4, 4, 32)       \
+    X(7, 256, 128, 8, 2, 4, 2, 64)
+
+std::vector<std::vector<int64_t>> configs() {
+    std::vector<std::vector<int64_t>> out;
+#define X(id, bm, bn, wm, wn, pw, st, kt) out.push_back({bm, bn, kt});
+    CFG_TABLE(X)
+#undef X
+    return out;
+}
+
+// The config ids that serve a layer: its tile divides the node block -- or, `grouped` (the caller verified that every
+// tile's consecutive blocks share a group), the node block divides the tile -- and it divides the batch.
+std::vector<int64_t> fitting_configs(int64_t block_size, int64_t batch, bool grouped) {
+    std::vector<int64_t> out;
+    if (batch % 64 != 0 || block_size % 32 != 0) return out;
+    const auto cfgs = configs();
+    for (int i = 0; i < (int)cfgs.size(); i++) {
+        const int64_t bm = cfgs[i][0];
+        const bool tile_ok = block_size % bm == 0 || (grouped && bm % block_size == 0);
+        if (tile_ok && batch % cfgs[i][1] == 0) out.push_back(i);
+    }
+    return out;
+}
+
+// The stream module's tables but `ebase`: `nids` [rows], `pbase` [rows, knt] (an edge tile's node 0's parameter), `ugrp`
+// int32 [rows] (each node block's group: blocks of equal children share the pre-pass), `grep` int32 [groups] (a group's
+// first node block); `cbase` int32 [rows, knt, 2, 2] (an edge tile's half's two runs of child node rows, -1 for dummy
+// element rows), `cfg` = config id * 16 + split.
+void tlmm_forward_sum_stream_fused(torch::Tensor node_mars, torch::Tensor cbase, torch::Tensor params,
+                                   torch::Tensor nids, torch::Tensor pbase, torch::Tensor ugrp, torch::Tensor grep,
+                                   int64_t batch_, int64_t block_size, int64_t knt_, int64_t cfg) {
+    const int batch = (int)batch_, knt = (int)knt_, rows = (int)nids.size(0), ngrp = (int)grep.size(0);
+    const int num_edges = knt * BK;
+    const int cfg_id = (int)(cfg / 16), split = (int)(cfg % 16);
+    const auto cfgs = configs();
+    TORCH_CHECK(cfg_id >= 0 && cfg_id < (int)cfgs.size(), "sum forward stream: no config ", cfg_id);
+    const int BMc = (int)cfgs[cfg_id][0], BNc = (int)cfgs[cfg_id][1], kt = (int)cfgs[cfg_id][2];
+    const int ksteps = (int)(num_edges / kt), kt_sh = kt == 64 ? 6 : 5;
+    TORCH_CHECK(params.scalar_type() == torch::kBFloat16, "sum forward stream: bf16 parameters");
+    TORCH_CHECK(batch % 64 == 0 && block_size % 32 == 0 && batch % BNc == 0 &&
+                (block_size % BMc == 0 || (BMc % block_size == 0 && ((long)rows * block_size) % BMc == 0)),
+                "sum forward stream: batch % 64, block_size % 32, the config's tile dividing the node block (or the "
+                "block the tile, whole tiles of blocks) and the batch");
+    TORCH_CHECK(split >= 1 && split <= MAX_SPLIT && split <= ksteps, "sum forward stream: split 1 .. ", MAX_SPLIT,
+                " and at most the k-steps (", ksteps, "); got ", split);
+    TORCH_CHECK(cbase.is_contiguous() && node_mars.is_contiguous() && nids.is_contiguous() &&
+                pbase.is_contiguous() && ugrp.is_contiguous() && grep.is_contiguous(),
+                "sum forward stream fused: contiguous tensors");
+    TORCH_CHECK(pbase.numel() == (long)rows * knt && cbase.numel() == (long)rows * knt * 4 &&
+                cbase.scalar_type() == torch::kInt32 && ugrp.numel() == rows && ugrp.scalar_type() == torch::kInt32 &&
+                grep.scalar_type() == torch::kInt32 && ngrp >= 1,
+                "sum forward stream fused: pbase one entry per (node block, edge tile), cbase int32 [rows, knt, 2, 2]; "
+                "ugrp int32 [rows], grep int32");
+    const at::cuda::OptionalCUDAGuard guard(node_mars.device());
+    const auto* pp = reinterpret_cast<const bfloat16_t*>(param_ptr<__nv_bfloat16>(params));
+    // scratch, ONE allocation: u bf16 [groups, num_edges, B], Mp [groups, split, B], the partials [split, rows * bs, B]
+    // (every region 16-byte aligned: B % 64 == 0)
+    const long o_mp = (long)ngrp * num_edges * batch * 2;
+    const long o_part = o_mp + (long)ngrp * split * batch * 4;
+    const long total = o_part + (split > 1 ? (long)split * rows * block_size * batch * 4 : 0);   // (split 1: no partials)
+    torch::Tensor scratch = torch::empty({total}, node_mars.options().dtype(torch::kUInt8));
+    char* base = reinterpret_cast<char*>(scratch.data_ptr());
+    auto* u = reinterpret_cast<__nv_bfloat16*>(base);
+    auto* mp = reinterpret_cast<float*>(base + o_mp);
+    auto* part = reinterpret_cast<float*>(base + o_part);
+    cudaStream_t st = c10::cuda::getCurrentCUDAStream();
+    {
+        constexpr int NT = 512, PB = 16;
+        launch_pdl(stream_fused_prepass_kernel<NT, PB>, dim3(ngrp * split * (batch / PB)), dim3(NT), 0, st,
+                   node_mars.data_ptr<float>(), cbase.data_ptr<int>(), grep.data_ptr<int>(), u, mp, batch, num_edges,
+                   knt, ksteps, kt_sh, split);
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+    }
+    switch (cfg_id) {
+#define X(id, bm, bn, wm, wn, pw, stg, ktt) \
+        case id: launch_gemm<bm, bn, wm, wn, pw, stg, ktt>(pp, pbase.data_ptr<long>(), (const bfloat16_t*)u, \
+                     ugrp.data_ptr<int>(), part, knt, rows, (int)block_size, batch, num_edges, split, \
+                     node_mars.data_ptr<float>(), mp, nids.data_ptr<long>(), st); break;
+        CFG_TABLE(X)
+#undef X
+    }
+    if (split > 1) {                                     // (split 1: the GEMM's epilogue merged, nothing to launch)
+        const long rt = (long)rows * block_size, n = rt * (batch / 4);
+        const unsigned grid = (unsigned)((n + 255) / 256);
+        float* nm = node_mars.data_ptr<float>();
+        const long* np = nids.data_ptr<long>();
+        const int* ug = ugrp.data_ptr<int>();
+        switch (split) {
+#define M_(S) case S: launch_pdl(stream_fused_merge_kernel<S>, dim3(grid), dim3(256), 0, st, nm, part, mp, np, ug, batch, \
+                                 (int)block_size, rt); break;
+            M_(2) M_(3) M_(4) M_(5) M_(6) M_(7) M_(8) M_(9) M_(10) M_(11) M_(12)
+#undef M_
+        }
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+    }
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("tlmm_forward_sum_stream_fused", &tlmm_forward_sum_stream_fused,
+          "block-sparse sum-layer forward (bf16 params) with the product layer below fused into its pre-pass");
+    m.def("configs", &configs, "(BM, BN, KT) per config id");
+    m.def("fitting_configs", &fitting_configs, "the config ids that serve a layer (block_size, batch, grouped tiles)");
+}

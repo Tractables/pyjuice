@@ -29,6 +29,7 @@ disk by Triton across processes), i.e. it lands in the first iteration's warmup.
 
 import os
 import torch
+from typing import Optional
 
 
 # Master switch, settable in code with `pyjuice.set_autotune(...)` or via PYJUICE_AUTOTUNE=0. When
@@ -105,7 +106,7 @@ def _median_time(run, warmup: int, reps: int):
     return ts[len(ts) // 2]
 
 
-def best_of(candidates: list, warmup: int = 3, reps: int = 7):
+def best_of(candidates: list, warmup: int = 3, reps: int = 7, margin: Optional[float] = None):
     """Benchmark each ``(key, run)`` candidate and return the winning key (None if none can run).
 
     ``candidates[0]`` is the REFERENCE -- the heuristic tile config, or the plain Triton kernel a
@@ -120,6 +121,9 @@ def best_of(candidates: list, warmup: int = 3, reps: int = 7):
     fastest cannot clear the margin against it, so it is dropped. The others get the remaining
     `warmup - 2` warm-up runs and `reps` timed ones: the same number of runs as a single stage, so a
     close race is measured exactly as before.
+
+    ``margin`` replaces `MARGIN` for this choice: 1.0 where the candidates compute the same bits -- nothing to keep
+    reproducible -- and the faster is to be taken.
     """
     first = [_median_time(run, 1, 1) for _, run in candidates]
     if all(t is None for t in first):
@@ -137,7 +141,8 @@ def best_of(candidates: list, warmup: int = 3, reps: int = 7):
 
     if ref_t is None:                                    # the reference cannot run on this GPU
         return best_key
-    return best_key if (best_t is not None and best_t * MARGIN < ref_t) else ref_key
+    margin = MARGIN if margin is None else margin
+    return best_key if (best_t is not None and best_t * margin < ref_t) else ref_key
 
 
 # Process-wide cache of tuned configs, keyed by SHAPE -- see `pick`.
@@ -188,7 +193,7 @@ def should_tune(key, num_candidates: int = 2) -> bool:
     return ENABLED and num_candidates >= 2 and not _capturing()
 
 
-def pick(key, candidates: list, bench, warmup: int = 3, reps: int = 7):
+def pick(key, candidates: list, bench, warmup: int = 3, reps: int = 7, margin: Optional[float] = None):
     """Return the best of `candidates` (config values), benchmarking them at most ONCE per `key`.
 
     `candidates[0]` is the heuristic default, kept unless `best_of`'s margin is cleared. Never
@@ -216,7 +221,7 @@ def pick(key, candidates: list, bench, warmup: int = 3, reps: int = 7):
         # Not cached on purpose: capture is transient, so a later ordinary call still tunes.
         return candidates[0]
 
-    best = best_of([(c, (lambda c = c: bench(c))) for c in candidates], warmup, reps)
+    best = best_of([(c, (lambda c = c: bench(c))) for c in candidates], warmup, reps, margin)
     cfg = candidates[0] if best is None else best
     _CACHE[key] = cfg
     return cfg

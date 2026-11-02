@@ -521,7 +521,8 @@ class SumLayer(Layer, nn.Module):
                       self._cached_bk_parids,
                       self._cached_bk_ele_cuda, self._cached_bk_ele_pre, self._cached_bk_ele_sb, self._cached_bk_par_cuda,
                       self._cached_bk_par_trim, self._cached_param_align8, self._fw_fast,
-                      self.__dict__.setdefault("_cached_tile_index", {})):
+                      self.__dict__.setdefault("_cached_tile_index", {}),
+                      self.__dict__.setdefault("_stream_fusion_plans", {})):
             cache.clear()
         LaunchPlans.of(self).clear()
         self._bk_ele_scratch = None
@@ -560,7 +561,8 @@ class SumLayer(Layer, nn.Module):
     def forward(self, node_mars: torch.Tensor, element_mars: torch.Tensor, params: torch.Tensor,
                 propagation_alg: str = "LL", pflow_temperature: float = 1.0, precision: str = "auto",
                 partition_runs: Optional[Sequence] = None, compute_children: Optional[Tuple[torch.Tensor, int]] = None,
-                op_params: Optional[torch.Tensor] = None, **kwargs) -> None:
+                op_params: Optional[torch.Tensor] = None, stream_children: Optional[Tuple[torch.Tensor, int]] = None,
+                **kwargs) -> None:
         """
         Computes the forward pass of a sum layer.
 
@@ -586,6 +588,12 @@ class SumLayer(Layer, nn.Module):
                           bf16 anyway (the same bits, half the bytes), and the stream kernel, which reads bf16
                           parameters only and joins them --; the dense cuBLAS path is then left out, and the fp32
                           kernels read `params`.
+        `stream_children`: None, or the product layer group below's `(table, first_row)` (as `compute_children`): every
+                          partition runs the stream forward its settled launch holds with the product layer fused into
+                          its pre-pass (`tlmm_forward_sum_stream_fused.cu`: the children's values formed from their two
+                          child node values, the same bits as the product layer's forward and the stream kernel), so
+                          the caller launches no product layer forward for this layer -- only where `_stream_fusion`
+                          gives a plan (the circuit's passes, `TensorCircuit._stream_fusion_groups`).
         """
         op = op_params if op_params is not None and self.__dict__.get("_reads_param_operands", False) else None
 
@@ -594,9 +602,21 @@ class SumLayer(Layer, nn.Module):
         # checks first that the CUDA kernels are still on and each choice is still the tuner's). MEASURED, host time of
         # an HMM-1024 layer at B 64: the dispatch's checks, tables and keys 5.7 of its 10.6 us.
         fast_key = None
-        if (propagation_alg == "LL" and pflow_temperature == 1.0 and partition_runs is None and compute_children is None
-                and not kwargs and node_mars.is_cuda):
+        plain = (propagation_alg == "LL" and pflow_temperature == 1.0 and partition_runs is None
+                 and compute_children is None and not kwargs and node_mars.is_cuda)
+        if stream_children is not None and not plain:
+            raise ValueError("`stream_children` takes a plain call: LL, no tempering, whole partitions, nothing else.")
+        if plain:
             fast_key = (node_mars.size(1), params.dtype, precision, op is not None)
+            if stream_children is not None:
+                fused = self._stream_fusion(fast_key, stream_children)
+                if fused is None:
+                    raise ValueError("`stream_children`: no fused stream forward here (see `_stream_fusion`).")
+                p, batch_size = (params if op is None else op), node_mars.size(1)
+                for cbase, (_, (_, c), nids, _, pbase, knt, groups) in fused:
+                    cuda_kernels.tlmm_forward_sum_stream_fused(node_mars, cbase, p, nids, pbase, groups, batch_size,
+                                                               self.block_size, knt, c)
+                return None
             fast = self._fw_fast.get(fast_key)
             if fast is not None and self._fw_fast_launch(fast, node_mars, element_mars, params if op is None else op):
                 return None
@@ -662,6 +682,54 @@ class SumLayer(Layer, nn.Module):
                 kernel(node_mars, element_mars, params, nids, ebase, pbase, batch_size, self.block_size, k_num_tiles,
                        choice[1])
         return True
+
+    def _stream_fusion(self, fast_key: tuple, children: Tuple[torch.Tensor, int]) -> Optional[tuple]:
+        """The fused stream forward of this layer for a plain call of ``fast_key`` (`forward`'s) over the product layer
+        group below (``children``: its `(table, first_row)`, `pyjuice.layer.fused_children`), per partition
+        ``(cbase, record)`` -- or None where it does not apply (yet). It applies where the call's settled launch
+        (`_fw_fast`) runs the stream forward in every partition; the products have two children each; and every pre-pass
+        chunk of 32 element rows is either dummy rows (before the group's first row: -inf) or rows whose two children
+        are runs of 32 consecutive node rows -- ``cbase`` int32 [rows, knt, 2, 2] their first rows, -1 a dummy chunk.
+        Made once (one sync a partition) and kept with the table it was made from (another table -- a moved circuit's --
+        makes it anew), at the configs the settled launch held then: a pass that left the product layer's forward to it
+        has nothing to fall back to (a later retune of the plain forward's choice changes nothing here)."""
+        table, first_row = children
+        plans = self.__dict__.setdefault("_stream_fusion_plans", {})
+        hit = plans.get(fast_key)
+        if hit is not None and hit[0] is table:
+            return hit[1]
+        fast = self._fw_fast.get(fast_key)
+        if (fast is None or not FORWARD_SUM_CUDA or table.size(1) != 2 or
+                any(choice[0] != "cuda_stream" for _, choice, *_ in fast) or
+                not cuda_kernels.stream_fused_is_available()):
+            return None
+        out = []
+        for record in fast:
+            cbase = self._stream_fusion_cbase(record[3], table, first_row)
+            if cbase is None:
+                plans[fast_key] = (table, None)               # (the structure's: no fused forward for this table)
+                return None
+            out.append((cbase, record))
+        plans[fast_key] = (table, tuple(out))
+        return plans[fast_key][1]
+
+    @staticmethod
+    def _stream_fusion_cbase(ebase: torch.Tensor, table: torch.Tensor, first_row: int) -> Optional[torch.Tensor]:
+        """`_stream_fusion`'s ``cbase`` for a partition's edge tiles (``ebase`` [rows, knt], a tile's first element row),
+        or None where a chunk of 32 element rows is neither all dummy rows nor rows of two runs of consecutive children."""
+        e0 = ebase.to(torch.int64)[:, :, None] + torch.tensor([0, 32], device = ebase.device)       # [rows, knt, 2]
+        rel = e0 - first_row
+        dummy = e0 + 31 < first_row
+        inside = (rel >= 0) & (rel + 31 < table.size(0))
+        if not bool((dummy | inside).all()):
+            return None
+        rows = rel.clamp(min = 0)[..., None] + torch.arange(32, device = ebase.device)               # [rows, knt, 2, 32]
+        rows = torch.where(dummy[..., None], 0, rows)
+        ch = table.to(torch.int64)[rows]                                                              # [.., 32, 2]
+        runs = ch == ch[..., :1, :] + torch.arange(32, device = ebase.device)[:, None]
+        if not bool((runs.all(-1).all(-1) | dummy).all()):
+            return None
+        return torch.where(dummy[..., None], -1, ch[..., 0, :]).to(torch.int32).contiguous()        # [rows, knt, 2, 2]
 
     def _tile_index(self, kind: str, signature, ebase: torch.Tensor):
         """A pre-pass kernel's ``(tiles, tix, shared)`` of ``ebase`` (`cuda_kernels.tile_index`), built once per
