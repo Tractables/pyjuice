@@ -57,6 +57,10 @@ _stream_fused_attempted = False
 _elestream_module = None  # element-flow backward (bf16 params): the same three launches
 _elestream_attempted = False
 _pardef_module = None   # a tied group's deferred parameter flows (fp16 operands): capture + flush
+_pardeff_module = None  # its capture, the product layer below fused into it
+_pardeff_attempted = False
+_elestreamf_module = None  # the element-flow stream backward, the product layer below fused into its merge
+_elestreamf_attempted = False
 _pardef_attempted = False
 _flags_cache = "unset"  # cached (cuda_cflags, ldflags) or None; computed once
 _plain_flags_cache = "unset"  # cached plain (no-CUTLASS) cuda_cflags or None
@@ -850,6 +854,41 @@ def stream_arms(block_size: int, batch_size: int, k_num_tiles: int, n_blocks: in
 #: Split-K ranges the stream forward may cut a row's k-steps into (its kernel's MAX_SPLIT; the 256-row tile needs more
 #: ranges than the 128-row one to fill a wave)
 STREAM_MAX_SPLIT = 12
+
+
+def get_par_deferred_fused_module():
+    """The deferred parameter-flow capture with the product layer below fused into it (`par_deferred_fp16_fused.cu`:
+    an edge's element value formed from its product's two children), or None (warns once)."""
+    global _pardeff_module, _pardeff_attempted
+    if not _pardeff_attempted:
+        _pardeff_attempted = True
+        _pardeff_module = _jit("pyjuice_sum_par_deferred_fused_cuda", "par_deferred_fp16_fused.cu")
+    return _pardeff_module
+
+
+def ele_stream_fused_is_available() -> bool:
+    """Whether the stream element-flow backward with the product layer below fused into its merge
+    (ele_backward_sum_stream_fused.cu) is usable (lazily JIT-compiles once)."""
+    global _elestreamf_module, _elestreamf_attempted
+    if not _elestreamf_attempted:
+        _elestreamf_attempted = True
+        _elestreamf_module = _jit("pyjuice_sum_backward_ele_stream_fused_cuda", "ele_backward_sum_stream_fused.cu")
+    return _elestreamf_module is not None
+
+
+def ele_backward_sum_stream_fused(node_flows: torch.Tensor, node_mars: torch.Tensor, children, params: torch.Tensor,
+                                  chids: torch.Tensor, ebase: torch.Tensor, pbase: torch.Tensor, groups,
+                                  batch_size: int, block_size: int, cs_block_size: int, k_num_tiles: int,
+                                  cfg: int) -> None:
+    """`ele_backward_sum_stream` with each element's value formed in its merge as the sum of its product's two child
+    node values (``children``: the product layer group's `(table, first_row)`, `pyjuice.layer.fused_children`) instead
+    of read from `element_mars`, and its flow written as both children's node flows instead of into `element_flows`:
+    the same bits as the product layer's forward, `ele_backward_sum_stream` at ``cfg`` and the product layer's backward
+    one after the other, for children of one parent element whose flows start at -inf (log space)."""
+    table, first_row = children
+    _elestreamf_module.ele_backward_sum_stream_fused(node_flows, node_mars, table, int(first_row), params, chids, ebase,
+                                                     pbase, groups[0], groups[1], int(batch_size), int(block_size),
+                                                     int(cs_block_size), int(k_num_tiles), int(cfg))
 
 
 def ele_stream_is_available() -> bool:

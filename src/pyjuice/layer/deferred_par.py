@@ -180,8 +180,20 @@ def try_defer(mod, layer, ctx, gate_table, ext, node_cbs, gate_cbs, ext_base, n_
     if group.slots + group.cps > group.S:                      # full: add what the slots hold, then go on
         group.flush(mod, pf, params)
     gated = gtab is not None                                   # (a regular layer's gate table and log-gates: unread)
-    mod.capture(group.A, group.Bop, group.fA, group.fB, group.M, ctx["node_flows"], ctx["node_mars"],
-                ctx["element_mars"], ext if gated else ctx["node_mars"], nids, cids, gtab if gated else nids, batch,
-                group.slots, node_cbs, gate_cbs, ext_base, gated)
+    children = ctx.get("children")
+    if children is not None:
+        # (the product layer below fused: each edge's element value formed from its product's two children,
+        # `par_deferred_fp16_fused.cu` -- the same operands, the product layer's forward not run for them)
+        import pyjuice.layer.kernels.c as cuda_kernels
+        fmod = cuda_kernels.get_par_deferred_fused_module()
+        if fmod is None:
+            return False
+        fmod.capture_fused(group.A, group.Bop, group.fA, group.fB, group.M, ctx["node_flows"], ctx["node_mars"],
+                           children[0], int(children[1]), ext if gated else ctx["node_mars"], nids, cids,
+                           gtab if gated else nids, batch, group.slots, node_cbs, gate_cbs, ext_base, gated)
+    else:
+        mod.capture(group.A, group.Bop, group.fA, group.fB, group.M, ctx["node_flows"], ctx["node_mars"],
+                    ctx["element_mars"], ext if gated else ctx["node_mars"], nids, cids, gtab if gated else nids, batch,
+                    group.slots, node_cbs, gate_cbs, ext_base, gated)
     group.slots += group.cps
     return True

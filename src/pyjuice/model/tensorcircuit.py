@@ -49,6 +49,11 @@ def _calls_its_forward(module: nn.Module) -> bool:
 # 2^29: HMM-2048 B 128 -9.9%, HMM-4096 B 32 -7.1%; 2^31: HMM-4096 B 128 -38%).
 _COPY_MIN_WORK = 1 << 28
 
+# The backward options of the plain regime a fused product backward serves (`_stream_fusion_bk_groups`)
+_STREAM_FUSION_BK_OPTS = frozenset(("param_flows", "denom_param_flows", "allow_modify_flows", "logspace_flows",
+                                    "negate_pflows", "precision", "pflow_temperature", "temper_eflow",
+                                    "defer_param_flows", "pf_store_first"))
+
 
 class TensorCircuit(_BuildMixin, _CudaGraphsMixin, _ExternalParamsMixin, _LearningMixin, _InspectionMixin,
                     nn.Module):
@@ -223,8 +228,8 @@ class TensorCircuit(_BuildMixin, _CudaGraphsMixin, _ExternalParamsMixin, _Learni
         # The product groups' tables the fused stream forward was handed (`_stream_fusion_groups`), and its decisions,
         # made anew on this device
         if moved:
-            self.__dict__.pop("_fused_child_tables", None)
-            self.__dict__.pop("_stream_fusion_", None)
+            for name in ("_fused_child_tables", "_stream_fusion_", "_fused_child_parents", "_stream_fusion_bk_"):
+                self.__dict__.pop(name, None)
 
         # For parameter flow accumulation
         self.parflow_fusing_kwargs = cum_par_flows_to_device(self.parflow_fusing_kwargs, device)
@@ -510,6 +515,83 @@ class TensorCircuit(_BuildMixin, _CudaGraphsMixin, _ExternalParamsMixin, _Learni
                 else:
                     prod.forward(self.node_mars, self.element_mars)
                     sumg.forward(self.node_mars, self.element_mars, self.params, propagation_alg = "LL", **opts)
+            if autotune.pick(shape, ["unfused", "fused"], bench, margin = 1.0) == "fused":
+                fused.append(k)
+        state[key] = frozenset(fused)
+        return state[key]
+
+    def _stream_fusion_bk_groups(self, batch_size: int, sum_opts: dict, propagation_alg, op_groups) -> frozenset:
+        """The product layer groups (by index) whose backward this backward leaves to the sum group above: that group's
+        element flows by the stream kernel with the product fused into its merge, which writes the product's children's
+        node flows, and its parameter flows captured from the children (`SumLayer.backward`'s `stream_children`) -- so
+        the product layer's forward (the recompute) and backward are not launched. Where every layer of the sum group is
+        a plain `SumLayer` whose backward can take it (`SumLayer._stream_fusion_bk`: settled on the stream kernel,
+        parameter flows deferred), the products have two children each, and each of those children has no other parent
+        element in the circuit (its flow is the one element's: logaddexp(-inf, f) = f, what the product backward
+        writes); and where that MEASURES the faster -- the product layer's forward, the sum group's backward and the
+        product layer's backward against the sum group's fused backward, element flows only, into scratch flow buffers
+        (`autotune.pick`, keyed by the pair's shape; margin 1.0: the same bits). One more option of the tuners: decided
+        once per batch size at its second plain backward (the first settles the layers' kernels), and kept; none
+        before, nor for a backward of another regime (not LL in log space, tempered, negated or modified flows, keyword
+        arguments, layer callbacks)."""
+        if not (propagation_alg == "LL" and sum_opts.get("logspace_flows", False)
+                and not sum_opts.get("allow_modify_flows", False) and not sum_opts.get("negate_pflows", False)
+                and sum_opts.get("pflow_temperature", 1.0) == 1.0 and not sum_opts.get("temper_eflow", False)
+                and not (sum_opts.keys() - _STREAM_FUSION_BK_OPTS) and self.node_mars.is_cuda):
+            return frozenset()
+        pf = sum_opts.get("param_flows") is not None
+        state = self.__dict__.setdefault("_stream_fusion_bk_", {})
+        key = (batch_size, self.precision, self.params.dtype, op_groups, pf)
+        seen = state.get(key)
+        if isinstance(seen, frozenset):
+            return seen
+        if seen is None:                                     # (the first: the layers' kernels settle in it)
+            state[key] = 1
+            return frozenset()
+        from pyjuice.layer.sum_layer import SumLayer
+        from pyjuice.layer.fused_children import element_children
+        import pyjuice.layer.kernels.autotune as autotune
+        tables = self.__dict__.get("_fused_child_tables")
+        if tables is None or len(tables) != len(self.inner_layer_groups):
+            tables = self.__dict__["_fused_child_tables"] = element_children(self)
+        parents = self.__dict__.get("_fused_child_parents")
+        if parents is None:                                  # (per node: its parent elements, over every product group)
+            parents = torch.zeros(self.num_nodes, dtype = torch.int32, device = self.node_mars.device)
+            for t in tables:
+                if t is not None:
+                    parents.index_add_(0, t[0].reshape(-1).long(), torch.ones_like(t[0].reshape(-1)))
+            parents = self.__dict__["_fused_child_parents"] = parents
+        groups, fused = self.inner_layer_groups, []
+        op = self._param_operands(batch_size, refresh = False) if op_groups else None
+        nf, ef = None, None
+        for k in range(len(groups) - 1):
+            prod, sumg = groups[k], groups[k + 1]
+            if not (prod.is_prod() and sumg.is_sum() and all(type(layer) is SumLayer for layer in sumg)):
+                continue
+            table = tables[k]
+            given = op is not None and id(sumg) in op_groups
+            if not (table[0].size(1) == 2 and all(layer._stream_fusion_bk(
+                    batch_size, self.params.dtype, given and layer.__dict__.get("_reads_param_operands", False), pf)
+                    for layer in sumg)):
+                continue
+            if not bool((parents[table[0].reshape(-1).long()] == 1).all()):
+                continue
+            if nf is None:                                   # (scratch flows: the trials write children's rows)
+                nf, ef = self.node_flows.clone(), self.element_flows.clone()
+            opts = dict(sum_opts, param_flows = None, denom_param_flows = None, defer_param_flows = False,
+                        pf_store_first = False, **(dict(op_params = op) if given else {}))
+            shape = ("prod_stream_fusion_bk", batch_size, str(self.params.dtype), self.precision, given,
+                     tuple((layer.num_nodes, layer.num_edges, layer.block_size, layer.num_bk_partitions) for layer in sumg),
+                     tuple((layer.num_nodes, layer.block_size) for layer in prod))
+
+            def bench(choice, prod = prod, sumg = sumg, opts = opts, table = table):
+                if choice == "fused":
+                    sumg.backward(nf, ef, self.node_mars, self.element_mars, self.params, propagation_alg = "LL",
+                                  stream_children = table, **opts)
+                else:
+                    prod.forward(self.node_mars, self.element_mars)
+                    sumg.backward(nf, ef, self.node_mars, self.element_mars, self.params, propagation_alg = "LL", **opts)
+                    prod.backward(nf, ef, logspace_flows = True)
             if autotune.pick(shape, ["unfused", "fused"], bench, margin = 1.0) == "fused":
                 fused.append(k)
         state[key] = frozenset(fused)
@@ -902,14 +984,16 @@ class TensorCircuit(_BuildMixin, _CudaGraphsMixin, _ExternalParamsMixin, _Learni
                     layer_group = self.inner_layer_groups[layer_id]
 
                     if layer_group.is_prod():
-                        # Prod layer
-                        layer_group.backward(self.node_flows, self.element_flows, logspace_flows = logspace_flows)
+                        # Prod layer (none where the sum group above wrote its children's flows: `_stream_fusion_bk_groups`)
+                        if layer_id not in fused_bk:
+                            layer_group.backward(self.node_flows, self.element_flows, logspace_flows = logspace_flows)
 
                     elif layer_group.is_sum():
                         # Sum layer
 
-                        # First recompute the previous product layer
-                        self.inner_layer_groups[layer_id-1].forward(self.node_mars, self.element_mars)
+                        # First recompute the previous product layer (none where this group forms its values itself)
+                        if layer_id - 1 not in fused_bk:
+                            self.inner_layer_groups[layer_id-1].forward(self.node_mars, self.element_mars)
 
                         # Execute pre-backward callback
                         layer_group.callback(
@@ -924,12 +1008,14 @@ class TensorCircuit(_BuildMixin, _CudaGraphsMixin, _ExternalParamsMixin, _Learni
 
                         # Backward sum layer
                         alg = propagation_alg if isinstance(propagation_alg, str) else propagation_alg[layer_id]
+                        extra = sum_opts if layer_id - 1 not in fused_bk else \
+                            dict(sum_opts, stream_children = self.__dict__["_fused_child_tables"][layer_id - 1])
                         if id(layer_group) in given:
                             layer_group.backward(self.node_flows, self.element_flows, self.node_mars, self.element_mars,
-                                                 self.params, propagation_alg = alg, op_params = op, **sum_opts)
+                                                 self.params, propagation_alg = alg, op_params = op, **extra)
                         else:
                             layer_group.backward(self.node_flows, self.element_flows, self.node_mars, self.element_mars,
-                                                 self.params, propagation_alg = alg, **sum_opts)
+                                                 self.params, propagation_alg = alg, **extra)
 
                         # Execute post-backward callback
                         layer_group.callback(
@@ -960,10 +1046,14 @@ class TensorCircuit(_BuildMixin, _CudaGraphsMixin, _ExternalParamsMixin, _Learni
             op_groups = self._param_operand_groups(B)
             if op_groups:
                 self._param_operands(B, refresh = None)
+            # (the product layer groups whose forward and backward the sum group above takes over: decided before the
+            # pass, outside a capture; not where the flows did not start at -inf -- buffers kept or loaded from a cache)
+            fused_bk = (self._stream_fusion_bk_groups(B, sum_opts, propagation_alg, op_groups)
+                        if use_graphs and not _disable_buffer_init and cache is None else frozenset())
             self._run_inner_pass(_run_inner_layers, 1,
                                  (self.node_flows, self.element_flows, self.node_mars, self.element_mars, self.params),
                                  self._graph_key_options(sum_opts, propagation_alg = propagation_alg,
-                                                         param_operands = op_groups),
+                                                         param_operands = op_groups, stream_fusion_bk = fused_bk),
                                  record = use_graphs and record, apply = use_graphs and apply_cudagraph,
                                  record_on_repeat = on_repeat, reads_layer_states = True)
 

@@ -522,7 +522,8 @@ class SumLayer(Layer, nn.Module):
                       self._cached_bk_ele_cuda, self._cached_bk_ele_pre, self._cached_bk_ele_sb, self._cached_bk_par_cuda,
                       self._cached_bk_par_trim, self._cached_param_align8, self._fw_fast,
                       self.__dict__.setdefault("_cached_tile_index", {}),
-                      self.__dict__.setdefault("_stream_fusion_plans", {})):
+                      self.__dict__.setdefault("_stream_fusion_plans", {}),
+                      self.__dict__.setdefault("_bk_stream_parts", {}), self.__dict__.setdefault("_bk_par_deferred", {})):
             cache.clear()
         LaunchPlans.of(self).clear()
         self._bk_ele_scratch = None
@@ -712,6 +713,22 @@ class SumLayer(Layer, nn.Module):
             out.append((cbase, record))
         plans[fast_key] = (table, tuple(out))
         return plans[fast_key][1]
+
+    def _stream_fusion_bk(self, batch_size: int, dtype: torch.dtype, op: bool, param_flows: bool) -> bool:
+        """Whether a backward of this layer at ``batch_size`` (its parameters' ``dtype``, given the bf16 copy or not:
+        ``op``; with parameter flows or not) can take `stream_children`: every backward partition's element flows
+        settled on the whole-partition stream kernel (recorded by the full dispatch: `_bk_stream_parts`), and with
+        parameter flows every forward partition's deferred (`_bk_par_deferred`), the fused modules available."""
+        parts = self.__dict__.get("_bk_stream_parts", {}).get((batch_size, dtype, op))
+        if not parts or not all(parts.get(pid) for pid in range(self.num_bk_partitions)):
+            return False
+        if param_flows:
+            deferred = self.__dict__.get("_bk_par_deferred", {})
+            if not all(deferred.get((batch_size, pid)) for pid in range(self.num_fw_partitions)):
+                return False
+            if cuda_kernels.get_par_deferred_fused_module() is None:
+                return False
+        return True
 
     @staticmethod
     def _stream_fusion_cbase(ebase: torch.Tensor, table: torch.Tensor, first_row: int) -> Optional[torch.Tensor]:
@@ -927,7 +944,8 @@ class SumLayer(Layer, nn.Module):
                  precision: str = "auto", pflow_temperature: float = 1.0, 
                  temper_eflow: bool = False, partition_runs: Optional[Sequence] = None,
                  compute_children: Optional[Tuple[torch.Tensor, int]] = None,
-                 op_params: Optional[torch.Tensor] = None, **kwargs) -> None:
+                 op_params: Optional[torch.Tensor] = None, stream_children: Optional[Tuple[torch.Tensor, int]] = None,
+                 **kwargs) -> None:
         """
         Computes the forward pass of a sum layer:
         ```
@@ -960,11 +978,22 @@ class SumLayer(Layer, nn.Module):
                           offered with it --, every other kernel `params`, as without it (the fp16 and fp32 element
                           kernels, the parameter flows). Set on the layer per call (`_bk_copy`), where a plan's
                           launcher reads it as the full path does.
+        `stream_children`: None, or the product layer group below's `(table, first_row)` (as `compute_children`): every
+                          partition's element flows by the stream kernel with the product layer fused into its merge
+                          (`ele_backward_sum_stream_fused.cu`: each element's value formed from its two children, its
+                          flow written as both children's node flows) and its parameter flows deferred with the
+                          product fused into the capture (`par_deferred_fp16_fused.cu`) -- the same bits as the product
+                          layer's forward before this backward and its backward after it, which the caller leaves out:
+                          only for children of one parent each, log-space flows -inf before (the circuit's backward,
+                          `TensorCircuit._stream_fusion_bk_groups`), where `_stream_fusion_bk` holds (a call whose
+                          parameter-flow deferral declines forms the element values itself for the per-step kernels).
+                          Set on the layer per call (`_bk_stream_children`), read by the launchers as `_bk_copy` is.
         """
         # The copy this call's element flows may read (`_bk_copy`): set before the plan lookup, as
         # `_defer_param_flows` below, since a plan's element launchers read it too
         op = op_params if op_params is not None and self.__dict__.get("_reads_param_operands", False) else None
         self.__dict__["_bk_op_params"] = op
+        self.__dict__["_bk_stream_children"] = stream_children
 
         # A launch plan (`pyjuice.utils.launch_plans`): what an earlier call with this signature launched, its decisions
         # made once. The standard regime only -- LL, no tempering, whole partitions, flows not modified in place --,
@@ -989,7 +1018,7 @@ class SumLayer(Layer, nn.Module):
                     # the pass's first-writer stores (`_plan_param_flow_stores`): a launcher bakes its partition's
                     # decision, so the key holds every partition's
                     self.__dict__.get("_pf_store_key") if kwargs.get("pf_store_first", False) else None,
-                    op is not None)
+                    op is not None, stream_children is not None)
             plan = LaunchPlans.of(self).lookup(pkey)
             if plan is not None:
                 for launch in plan:
@@ -1000,6 +1029,9 @@ class SumLayer(Layer, nn.Module):
 
         if compute_children is not None and (param_flows is not None or allow_modify_flows):
             raise ValueError("`compute_children` serves a backward of element flows only.")
+        if stream_children is not None and (pkey is None or not logspace_flows or accumulate_ch_flows or allow_neg_flows):
+            raise ValueError("`stream_children` takes a plain call with log-space flows (LL, no tempering, whole "
+                             "partitions, flows neither modified, accumulated nor negative).")
 
         if partition_runs is not None and (param_flows is not None or allow_modify_flows):
             raise ValueError("`partition_runs` restricts a backward's element flows: it takes neither "
@@ -2676,6 +2708,15 @@ class SumLayer(Layer, nn.Module):
                               for c in ele_stream_arms]
                     choice = autotune.best_of(cands) or ("triton", -1)
                     self._cached_bk_ele_choice[choice_key] = choice
+                # (whether this partition's element flows settled on the whole-partition stream kernel, which a
+                # backward with the product layer below fused takes: `_stream_fusion_bk`)
+                stream_parts = self.__dict__.setdefault("_bk_stream_parts", {}).setdefault(
+                    (batch_size, params.dtype, op is not None), {})
+                stream_parts[partition_id] = (choice[0] == "cuda_stream" and runs is None
+                                              and cuda_kernels.ele_stream_fused_is_available())
+                if self.__dict__.get("_bk_stream_children") is not None and not stream_parts[partition_id]:
+                    raise ValueError("`stream_children`: this partition's element flows did not settle on the stream "
+                                     "kernel (see `_stream_fusion_bk`).")
                 if choice[0] in ("cuda", "cuda_pipe", "cuda_prepass", "cuda_stream"):
                     if runs is None:
                         kind, c = choice
@@ -2688,7 +2729,14 @@ class SumLayer(Layer, nn.Module):
                             elif kind == "cuda_prepass":
                                 _cuda_ele_prepass(element_flows, c, t)
                             elif kind == "cuda_stream":
-                                _cuda_ele_stream(element_flows, c, t)
+                                sc = self.__dict__.get("_bk_stream_children")
+                                if sc is None:
+                                    _cuda_ele_stream(element_flows, c, t)
+                                else:                    # (the product layer below fused: its children's node flows)
+                                    cuda_kernels.ele_backward_sum_stream_fused(
+                                        node_flows, node_mars, sc, params if t["op"] is None else t["op"], chids,
+                                        ele_ebase, pre_pbase, ele_groups, batch_size, self.block_size, cs_block_size,
+                                        K_NUM_TILES, c)
                             else:
                                 _cuda_ele(element_flows, t)
 
@@ -2715,6 +2763,9 @@ class SumLayer(Layer, nn.Module):
                                 K_NUM_TILES)
                     return None
                 # choice == ("triton", -1): fall through to the Triton launch below
+        if self.__dict__.get("_bk_stream_children") is not None:
+            raise ValueError("`stream_children`: this partition's element flows take no stream kernel (see "
+                             "`_stream_fusion_bk`).")
 
         # Small-batch (batch < 64) CUDA element-flow backwards, autotuned against the Triton launch that would run on
         # fall-through, INTO A SCRATCH buffer (corruption-safe: the live element_flows is touched only by the single
@@ -3331,8 +3382,18 @@ class SumLayer(Layer, nn.Module):
                 def _defer(param_flows, t):
                     if defers and pf_planned:
                         self._pf_reset(partition_id, param_flows)   # (the deferred flush accumulates at the pass's end)
-                    return defers and deferred_par.try_defer(pd_mod, self, dict(ctx, param_flows = param_flows, **t),
+                    sc = self.__dict__.get("_bk_stream_children")
+                    done = defers and deferred_par.try_defer(pd_mod, self, dict(ctx, param_flows = param_flows,
+                                                                                children = sc, **t),
                                                              None, None, blk, blk, 0, 1)
+                    if sc is not None and not done:
+                        # (the product layer below fused, these flows not deferred after all -- a call whose deferral
+                        # declines: the per-step kernels read the element values, formed here as its forward forms
+                        # them, one fp32 add of the two children: the same bits)
+                        table, first = sc
+                        em, nm = t["element_mars"], t["node_mars"]
+                        em[first:first + table.size(0)] = nm[table[:, 0].long()] + nm[table[:, 1].long()]
+                    return done
 
                 # The partition's flows as ONE launcher of a plan (`LaunchPlans`): deferred, or the measured kernel --
                 # the Triton one at its tuned config, as the dispatch below launches it
@@ -3349,6 +3410,8 @@ class SumLayer(Layer, nn.Module):
                 LaunchPlans.add(_par)
                 par_planned = True
                 if _defer(param_flows, cur):
+                    # (deferred at this batch: what a backward with the product layer below fused needs)
+                    self.__dict__.setdefault("_bk_par_deferred", {})[(batch_size, partition_id)] = True
                     return None
                 if _choice(param_flows, cur) == "cuda":
                     _cuda_par(param_flows, cur)

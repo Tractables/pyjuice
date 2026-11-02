@@ -5,6 +5,12 @@ product layer's forward followed by the sum layer's stream forward and the sum l
 fused copy forms each child's value as the sum of its product's two child node values -- the product layer's own
 arithmetic --, so the two compute the same bits; where the fused copy is taken, the circuit launches no forward for the
 product layer below it.
+
+And into the backward (`ele_backward_sum_stream_fused.cu`, `par_deferred_fp16_fused.cu`, `SumLayer.backward`'s
+`stream_children`, `TensorCircuit._stream_fusion_bk_groups`): the sum layer's element flows and its deferred parameter
+flows' capture form each element's value from its two children, and the merge writes the element's flow as its two
+children's node flows -- what the product layer's recompute before and backward after the sum layer's give where each
+child has one parent --, so neither product launch is made: the same bits.
 """
 
 import subprocess
@@ -33,11 +39,12 @@ def _hmm(L, T = 8, E = 64, dtype = torch.bfloat16, block_size = None):
 
 def _unfused(pc):
     pc._stream_fusion_groups = lambda *a, **k: frozenset()
+    pc._stream_fusion_bk_groups = lambda *a, **k: frozenset()
     return pc
 
 
-def _fused_groups(pc, B):
-    for key, v in pc.__dict__.get("_stream_fusion_", {}).items():
+def _fused_groups(pc, B, state = "_stream_fusion_"):
+    for key, v in pc.__dict__.get(state, {}).items():
         if key[0] == B and isinstance(v, frozenset):
             return v
     return None
@@ -45,9 +52,11 @@ def _fused_groups(pc, B):
 
 @pytest.fixture
 def stream_steered(monkeypatch):
-    """The plain forward's CUDA choice steered to the stream kernel where it is offered (the tuners' timing decides it
-    otherwise; the tests check what the choices compute), nothing kept from an earlier test."""
-    real_choose = autotune.choose
+    """The plain forward's CUDA choice and the element backward's steered to the stream kernel where it is offered (the
+    tuners' timing decides them otherwise -- each layer times its own element kernels, `_cached_bk_ele_choice`, so two
+    circuits may take arms whose bits differ; the tests check what the choices compute), nothing kept from an earlier
+    test."""
+    real_choose, real_best_of = autotune.choose, autotune.best_of
 
     def choose(key, cands):
         if key[0] == "sum_fw_tlmm_cuda":
@@ -57,14 +66,17 @@ def stream_steered(monkeypatch):
         return real_choose(key, cands)
     monkeypatch.setattr(autotune, "_CACHE", {})
     monkeypatch.setattr(autotune, "choose", choose)
+    monkeypatch.setattr(autotune, "best_of", lambda cands, *a, **k: next(
+        (key for key, _ in cands if isinstance(key, tuple) and key[:1] == ("cuda_stream",)), None)
+        or real_best_of(cands, *a, **k))
 
 
 @pytest.fixture
 def fused_preferred(stream_steered, monkeypatch):
-    """`stream_steered`, and the fusion decision steered to the fused copy."""
+    """`stream_steered`, and the fusion decisions -- forward and backward -- steered to the fused copies."""
     real_pick = autotune.pick
-    monkeypatch.setattr(autotune, "pick", lambda key, cands, bench, *a, **k: "fused" if key[0] == "prod_stream_fusion"
-                        else real_pick(key, cands, bench, *a, **k))
+    monkeypatch.setattr(autotune, "pick", lambda key, cands, bench, *a, **k: "fused"
+                        if key[0] in ("prod_stream_fusion", "prod_stream_fusion_bk") else real_pick(key, cands, bench, *a, **k))
 
 
 def _needs_stream():
@@ -94,19 +106,15 @@ def test_the_fused_forward_computes_the_unfused_bits(L, B, dtype, fused_preferre
 
 
 @cuda_only
-def test_fused_training_steps_compute_the_unfused_bits(fused_preferred, monkeypatch):
-    """Training steps (forward, backward, EM) of a circuit fusing and one never fusing, every parameter given to the
-    fusing one in place before each step: each step's node values and node flows to the bit (the backward recomputes the
-    products as before), the element backward steered to its stream kernel in both (each layer times its own element
-    kernels, `_cached_bk_ele_choice`: two circuits may take arms whose bits differ); the parameter flows to their
-    summation order. (Not over several steps unsynced: the input layers' flows are summed with atomics, and two unfused
-    circuits' EM updates already drift apart by ulps.)"""
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_fused_training_steps_compute_the_unfused_bits(dtype, fused_preferred):
+    """Training steps (forward, backward, EM) of a circuit fusing -- forward and backward -- and one never fusing,
+    every parameter given to the fusing one in place before each step: each step's node values, node flows and
+    parameter flows to the bit (bf16 parameters, and fp32 ones through their bf16 copy). (Not over several steps
+    unsynced: the input layers' flows are summed with atomics, and two unfused circuits' EM updates already drift
+    apart by ulps.)"""
     _needs_stream()
-    real_best_of = autotune.best_of
-    monkeypatch.setattr(autotune, "best_of", lambda cands, *a, **k: next(
-        (key for key, _ in cands if isinstance(key, tuple) and key[:1] == ("cuda_stream",)), None)
-        or real_best_of(cands, *a, **k))
-    pcs = [_hmm(4096)[0], _unfused(_hmm(4096)[0])]
+    pcs = [_hmm(4096, dtype = dtype)[0], _unfused(_hmm(4096, dtype = dtype)[0])]
     B, T, E = 128, 8, 64
     x = torch.randint(0, E, (B, T), device = DEV, generator = torch.Generator(device = DEV).manual_seed(2))
     for step in range(4):
@@ -119,11 +127,10 @@ def test_fused_training_steps_compute_the_unfused_bits(fused_preferred, monkeypa
             pc(x)
             pc.backward(x, flows_memory = 1.0)
         assert torch.equal(pcs[0].node_mars, pcs[1].node_mars) and torch.equal(pcs[0].node_flows, pcs[1].node_flows), step
-        pf = [pc.param_flows for pc in pcs]
-        assert torch.allclose(pf[0], pf[1], rtol = 1e-5, atol = 1e-6 * float(pf[1].abs().max())), step
+        assert torch.equal(pcs[0].param_flows, pcs[1].param_flows), step
         for pc in pcs:
             pc.mini_batch_em(step_size = 0.5, pseudocount = 0.1)
-    assert _fused_groups(pcs[0], B)
+    assert _fused_groups(pcs[0], B) and _fused_groups(pcs[0], B, "_stream_fusion_bk_")
 
 
 @cuda_only
@@ -361,6 +368,234 @@ def test_a_fused_forward_replayed_from_a_graph_computes_the_eager_bits(fused_pre
     assert torch.equal(replayed, eager)
 
 
+def _decided(pc, x, steps = 2):
+    for _ in range(steps):
+        pc.init_param_flows(flows_memory = 0.0)
+        pc(x)
+        pc.backward(x, flows_memory = 1.0)
+
+
+@cuda_only
+def test_a_fused_backward_launches_no_product_kernels(fused_preferred, monkeypatch):
+    """Where the backward fuses a product group, neither its forward (the recompute) nor its backward is launched in the
+    backward; every other product group's are."""
+    _needs_stream()
+    pc, T, E = _hmm(4096)
+    B = 128
+    x = torch.randint(0, E, (B, T), device = DEV)
+    _decided(pc, x)
+    pc(x)
+    ran = {"forward": [], "backward": []}
+    for name in ran:
+        real = getattr(ProdLayer, name)
+        monkeypatch.setattr(ProdLayer, name, lambda self, *a, real = real, name = name, **k: ran[name].append(self)
+                            or real(self, *a, **k))
+    pc.backward(x, flows_memory = 1.0)
+    fused = _fused_groups(pc, B, "_stream_fusion_bk_")
+    groups = pc.inner_layer_groups
+    prods = {k for k, g in enumerate(groups) if g.is_prod()}
+    assert fused and fused <= prods
+    for name in ran:
+        assert {k for k in prods if any(layer in ran[name] for layer in groups[k])} == prods - fused, name
+
+
+@cuda_only
+def test_the_fused_backward_is_one_more_option_of_the_tuners(stream_steered, monkeypatch):
+    """The backward's decision is the tuners' (`autotune.pick`: the unfused first, margin 1.0, keyed by the pair's shape
+    and the batch size), taken as chosen: the unfused pair chosen, no product left out."""
+    _needs_stream()
+    offered, real = [], autotune.pick
+
+    def pick(key, cands, bench, *a, **k):
+        if key[0] == "prod_stream_fusion_bk":
+            offered.append((key, list(cands), k.get("margin")))
+            return "unfused"
+        return real(key, cands, bench, *a, **k)
+    monkeypatch.setattr(autotune, "pick", pick)
+    pc, T, E = _hmm(4096)
+    B = 128
+    x = torch.randint(0, E, (B, T), device = DEV)
+    _decided(pc, x, 3)
+    assert offered and all(c == ["unfused", "fused"] and m == 1.0 for _, c, m in offered)
+    assert {key[1] for key, _, _ in offered} == {B}
+    assert _fused_groups(pc, B, "_stream_fusion_bk_") == frozenset()
+
+
+@cuda_only
+def test_no_backward_fusion_for_another_regime(fused_preferred, monkeypatch):
+    """A circuit whose plain backwards fuse: asked for linear-space, modified, negated or tempered flows, another
+    algorithm or keyword arguments, nothing fused; a backward with a layer callback launches every product layer."""
+    _needs_stream()
+    pc, T, E = _hmm(4096)
+    B = 128
+    x = torch.randint(0, E, (B, T), device = DEV)
+    _decided(pc, x)
+    og = pc._param_operand_groups(B)
+    plain = dict(param_flows = pc.param_flows, denom_param_flows = None, allow_modify_flows = False,
+                 logspace_flows = True, negate_pflows = False, precision = pc.precision, pflow_temperature = 1.0,
+                 temper_eflow = False, defer_param_flows = True, pf_store_first = False)
+    fused = pc._stream_fusion_bk_groups(B, plain, "LL", og)
+    assert fused
+    for opts, alg in ((dict(plain, logspace_flows = False), "LL"), (plain, "MPE"), (dict(plain, negate_pflows = True), "LL"),
+                      (dict(plain, pflow_temperature = 0.5), "LL"), (dict(plain, temper_eflow = True), "LL"),
+                      (dict(plain, allow_modify_flows = True), "LL"), (dict(plain, foo = 1), "LL")):
+        assert pc._stream_fusion_bk_groups(B, opts, alg, og) == frozenset(), (opts, alg)
+    ran, real = [], ProdLayer.backward
+    monkeypatch.setattr(ProdLayer, "backward", lambda self, *a, **k: ran.append(self) or real(self, *a, **k))
+    pc(x)
+    pc.backward(x, flows_memory = 1.0, sum_layer_post_backward_callback = lambda layer, **kwargs: None)
+    prods = [k for k, g in enumerate(pc.inner_layer_groups) if g.is_prod()]
+    assert all(any(layer in ran for layer in pc.inner_layer_groups[k]) for k in prods)
+
+
+@cuda_only
+def test_no_backward_fusion_where_a_child_has_another_parent(fused_preferred):
+    """A product group one of whose children has another parent element is left unfused (the merge writes a child's
+    flow; the product backward adds the parents' flows)."""
+    _needs_stream()
+    from pyjuice.layer.fused_children import element_children
+    pcs = [_hmm(4096)[0], _hmm(4096)[0]]
+    B, T, E = 128, 8, 64
+    x = torch.randint(0, E, (B, T), device = DEV)
+    _decided(pcs[0], x)
+    every = _fused_groups(pcs[0], B, "_stream_fusion_bk_")
+    pc = pcs[1]
+    tables = element_children(pc)
+    parents = torch.zeros(pc.num_nodes, dtype = torch.int32, device = DEV)
+    for t in tables:
+        if t is not None:
+            parents.index_add_(0, t[0].reshape(-1).long(), torch.ones_like(t[0].reshape(-1)))
+    k = min(every)
+    parents[tables[k][0][5, 1].long()] = 2                     # (one child of group k given a second parent)
+    pc.__dict__["_fused_child_parents"] = parents
+    _decided(pc, x)
+    assert _fused_groups(pc, B, "_stream_fusion_bk_") == every - {k}
+
+
+@cuda_only
+def test_no_backward_fusion_where_the_stream_element_kernel_does_not_run(fused_preferred, monkeypatch):
+    """Element flows steered to the pre-pass kernel: nothing fused in the backward (`_stream_fusion_bk`)."""
+    _needs_stream()
+    real = autotune.best_of
+    monkeypatch.setattr(autotune, "best_of", lambda cands, *a, **k: next(
+        (key for key, _ in cands if isinstance(key, tuple) and key[:1] == ("cuda_prepass",)), None)
+        or real(cands, *a, **k))
+    pc, T, E = _hmm(4096)
+    B = 128
+    x = torch.randint(0, E, (B, T), device = DEV)
+    _decided(pc, x, 3)
+    assert _fused_groups(pc, B, "_stream_fusion_bk_") == frozenset()
+
+
+@cuda_only
+def test_no_backward_fusion_of_parameter_flows_that_are_not_deferred(fused_preferred, monkeypatch):
+    """Parameter flows not deferred (their kernels read the element values): no backward fusion with parameter flows
+    -- one without them (`compute_param_flows = False`) fuses."""
+    _needs_stream()
+    import pyjuice.layer.deferred_par as deferred_par
+    monkeypatch.setattr(deferred_par, "may_defer", lambda *a, **k: False)
+    pc, T, E = _hmm(4096)
+    B = 128
+    x = torch.randint(0, E, (B, T), device = DEV)
+    _decided(pc, x, 3)
+    assert _fused_groups(pc, B, "_stream_fusion_bk_") == frozenset()
+    for _ in range(3):
+        pc(x)
+        pc.backward(x, compute_param_flows = False)
+    assert pc.__dict__["_stream_fusion_bk_"][(B, pc.precision, pc.params.dtype, pc._param_operand_groups(B), False)]
+
+
+@cuda_only
+def test_a_fused_backward_whose_deferral_declines_computes_the_unfused_bits(fused_preferred, monkeypatch):
+    """Parameter flows deferred when the backward fusion was decided, then not (the deferral's thresholds out of reach):
+    the fused layers form the element values for the per-step kernels themselves -- the bits of a circuit never fusing,
+    node flows and parameter flows."""
+    _needs_stream()
+    import pyjuice.layer.deferred_par as deferred_par
+    pcs = [_hmm(4096)[0], _unfused(_hmm(4096)[0])]
+    B, T, E = 128, 8, 64
+    x = torch.randint(0, E, (B, T), device = DEV)
+    for pc in pcs:
+        _decided(pc, x)
+    assert _fused_groups(pcs[0], B, "_stream_fusion_bk_")
+    monkeypatch.setattr(deferred_par, "MIN_FLOWS", 1 << 62)
+    monkeypatch.setattr(deferred_par, "MIN_FLOW_SAMPLES", 1 << 62)
+    with torch.no_grad():
+        for p0, p1 in zip(pcs[0].parameters(), pcs[1].parameters()):
+            if p0.is_floating_point():
+                p0.data.copy_(p1.data)
+    for pc in pcs:
+        pc.init_param_flows(flows_memory = 0.0)
+        pc(x)
+        pc.backward(x, flows_memory = 1.0)
+    assert torch.equal(pcs[0].node_flows, pcs[1].node_flows) and torch.equal(pcs[0].param_flows, pcs[1].param_flows)
+
+
+@cuda_only
+def test_no_backward_fusion_on_kept_flow_buffers(fused_preferred):
+    """A backward keeping the flow buffers it is given (`_disable_buffer_init`: a child's flows need not start at -inf,
+    the product backward adds to them) is not fused: the bits of a circuit never fusing."""
+    _needs_stream()
+    pcs = [_hmm(4096)[0], _unfused(_hmm(4096)[0])]
+    B, T, E = 128, 8, 64
+    x = torch.randint(0, E, (B, T), device = DEV)
+    for pc in pcs:
+        _decided(pc, x)
+    assert _fused_groups(pcs[0], B, "_stream_fusion_bk_")
+    for pc in pcs:
+        pc(x)
+        pc.backward(x, flows_memory = 1.0)
+        pc.backward(x, flows_memory = 1.0, _disable_buffer_init = True)
+    assert torch.equal(pcs[0].node_flows, pcs[1].node_flows)
+
+
+@cuda_only
+def test_stream_children_backward_takes_a_settled_plain_call(stream_steered):
+    """`backward(stream_children = ...)` in linear-space flows, or where the layer's element flows take no stream kernel
+    (a batch of 48, not a multiple of its 64 columns): an error."""
+    _needs_stream()
+    from pyjuice.layer.fused_children import element_children
+    pc, T, E = _hmm(4096)
+    B = 128
+    x = torch.randint(0, E, (B, T), device = DEV)
+    _decided(pc, x, 1)
+    k = [i for i, g in enumerate(pc.inner_layer_groups) if g.is_sum()][2]
+    layer = list(pc.inner_layer_groups[k])[0]
+    table = element_children(pc)[k - 1]
+    nf, ef = pc.node_flows.clone(), pc.element_flows.clone()
+    assert layer._stream_fusion_bk(B, pc.params.dtype, False, False)
+    with pytest.raises(ValueError):
+        layer.backward(nf, ef, pc.node_mars, pc.element_mars, pc.params, logspace_flows = False, stream_children = table)
+    with pytest.raises(ValueError):
+        layer.backward(nf[:, :48].contiguous(), ef[:, :48].contiguous(), pc.node_mars[:, :48].contiguous(),
+                       pc.element_mars[:, :48].contiguous(), pc.params, logspace_flows = True, stream_children = table)
+
+
+@cuda_only
+def test_a_fused_backward_replayed_from_a_graph_computes_the_eager_bits(fused_preferred):
+    """A backward recorded into a CUDA graph with its products fused replays its eager node flows and parameter flows;
+    the fusion is in the backward graphs' key (the unfused first backward's graph is not replayed for the fused)."""
+    _needs_stream()
+    pc, T, E = _hmm(4096)
+    B = 128
+    x = torch.randint(0, E, (B, T), device = DEV)
+    pc(x)
+    pc.init_param_flows(flows_memory = 0.0)
+    pc.backward(x, flows_memory = 1.0, record_cudagraph = True)
+    n = len(pc._recorded_cuda_graphs)
+    pc(x)
+    pc.init_param_flows(flows_memory = 0.0)
+    pc.backward(x, flows_memory = 1.0, record_cudagraph = True)
+    assert _fused_groups(pc, B, "_stream_fusion_bk_") and len(pc._recorded_cuda_graphs) == n + 1
+    outs = []
+    for apply in (True, False):
+        pc(x, apply_cudagraph = False)
+        pc.init_param_flows(flows_memory = 0.0)
+        pc.backward(x, flows_memory = 1.0, apply_cudagraph = apply)
+        outs.append((pc.node_flows.clone(), pc.param_flows.clone()))
+    assert torch.equal(outs[0][0], outs[1][0]) and torch.equal(outs[0][1], outs[1][1])
+
+
 def _two_gpus():
     """Two GPU ids for a child process, or None (the conftest pins each test process to one GPU; the pool it published
     lists them all, ids past the worker count preferred -- as `tests/model/device_move_test.py` reads it)."""
@@ -394,7 +629,10 @@ def choose(key, cands):
             return real_choose(key, stream[:1])
     return real_choose(key, cands)
 autotune.choose = choose
-autotune.pick = lambda key, cands, bench, *a, **k: ("fused" if key[0] == "prod_stream_fusion"
+real_best_of = autotune.best_of
+autotune.best_of = lambda cands, *a, **k: next((key for key, _ in cands if isinstance(key, tuple)
+                                                and key[:1] == ("cuda_stream",)), None) or real_best_of(cands, *a, **k)
+autotune.pick = lambda key, cands, bench, *a, **k: ("fused" if key[0] in ("prod_stream_fusion", "prod_stream_fusion_bk")
                                                     else real_pick(key, cands, bench, *a, **k))
 d0, d1 = torch.device("cuda:0"), torch.device("cuda:1")
 B, T, E = 128, 8, 64
@@ -429,6 +667,12 @@ with torch.no_grad():
         torch.cuda.synchronize()
         assert torch.equal(got, want), it
 assert fused(pc) and fused(pc)[0] and fused(twin)[0], "fused after the move"
+for it in range(3):                                      # (backwards: the fusion decided anew there too)
+    for c in (twin, pc):
+        c(x.to(d1))
+        c.backward(x.to(d1))
+    torch.cuda.synchronize()
+    assert torch.equal(pc.node_flows, twin.node_flows), ("flows", it)
 print("CHILD_OK")
 """
 
