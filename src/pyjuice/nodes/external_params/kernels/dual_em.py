@@ -44,6 +44,7 @@ the torch path's `eblk_per_nb[nb] * ch_block_size`. It sets the pseudocount spli
 import triton
 import triton.language as tl
 
+from pyjuice.model.backend.params_master import flows_to_master
 from pyjuice.utils.kernel_launcher import triton_jit
 
 
@@ -56,7 +57,7 @@ def _dual_em_cum_kernel(mparams, param_flows, denom, cum, cids, pids, pfids, nid
                         num_edges: tl.constexpr, n_groups: tl.constexpr,
                         TILE_SIZE_K: tl.constexpr, TILE_SIZE_M: tl.constexpr,
                         BLOCK_SIZE_M: tl.constexpr, GROUP_CBS: tl.constexpr,
-                        consts, cum_base, denom_base, DENOM_MODE: tl.constexpr):
+                        consts, cum_base, denom_base, DENOM_MODE: tl.constexpr, ROUNDED: tl.constexpr = 0):
     """
     Pass 1: `cum[n] += sum_c theta[n,c] * ratio[n,c]`, the per-node normalizer of the dual M-step, with
 
@@ -65,6 +66,10 @@ def _dual_em_cum_kernel(mparams, param_flows, denom, cum, cids, pids, pfids, nid
     ATOMIC into `cum`, because a node's children may be split across edge tiles AND across forward
     partitions -- the normalizer has to sum over all of them before pass 2 divides by it. Indexed by
     GLOBAL node id minus `cum_base` for the same reason: the buffer has to be shared across partitions.
+
+    `ROUNDED`: `mparams` is the fp32 master copy of parameters stored in bf16, in line with them, and the backward
+    made `F+` with the stored values -- taken to the copy's first (`params_master.flows_to_master`). (A `F-` kept in
+    DENSE form would carry the stored value as well; no parameterization keeps one.)
     """
     pid_k = tl.program_id(0)
     pid_y = tl.program_id(1)
@@ -83,6 +88,8 @@ def _dual_em_cum_kernel(mparams, param_flows, denom, cum, cids, pids, pfids, nid
     pf = tl.load(pfids + nblock_id * num_edges + offs_edge, mask = emask, other = 0)
     theta = tl.load(mparams + par[None,:] + offs_node[:,None], mask = real[None,:], other = 0.0).to(tl.float32)
     fp = tl.load(param_flows + pf[None,:] + offs_node[:,None], mask = real[None,:], other = 0.0)
+    if ROUNDED:
+        fp = flows_to_master(fp, theta.to(tl.bfloat16), theta)
 
     k = tl.load(kcount + nblock_id).to(tl.float32)
     pseudocount = tl.load(consts + 0)
@@ -113,9 +120,9 @@ def _dual_em_update_kernel(mparams, param_flows, denom, cum, out, cids, pids, pf
                            BLOCK_SIZE_M: tl.constexpr, GROUP_CBS: tl.constexpr,
                            consts, cum_base, denom_base, out_base, out_size,
                            DENOM_MODE: tl.constexpr, KEEP_ZERO: tl.constexpr,
-                           OUT_BY_PAR: tl.constexpr = 0):
+                           OUT_BY_PAR: tl.constexpr = 0, ROUNDED: tl.constexpr = 0):
     """
-    Pass 2: `out[.] = clamp(theta * ((1-s) + s*ratio) / ((1-s) + s*cum[n]), min = 1e-30)`.
+    Pass 2: `out[.] = clamp(theta * ((1-s) + s*ratio) / ((1-s) + s*cum[n]), min = 1e-30)` (`ROUNDED`: as pass 1's).
 
     `ratio` is RECOMPUTED rather than stored. It is three flops over values this kernel has to read
     anyway, against a parameter-sized round trip to keep it -- and keeping it is what the eager path did.
@@ -143,6 +150,8 @@ def _dual_em_update_kernel(mparams, param_flows, denom, cum, out, cids, pids, pf
     pf = tl.load(pfids + nblock_id * num_edges + offs_edge, mask = emask, other = 0)
     theta = tl.load(mparams + par[None,:] + offs_node[:,None], mask = real[None,:], other = 0.0).to(tl.float32)
     fp = tl.load(param_flows + pf[None,:] + offs_node[:,None], mask = real[None,:], other = 0.0)
+    if ROUNDED:
+        fp = flows_to_master(fp, theta.to(tl.bfloat16), theta)
 
     k = tl.load(kcount + nblock_id).to(tl.float32)
     pseudocount = tl.load(consts + 0)

@@ -16,13 +16,16 @@ the copy in the L2 for the first pass and the copy reads it back from there (MEA
 HMM-6144 (144 MB) 874 -> 776, HMM-8192 (256 MB) 1491 -> 1318). The caller decides (`ExternalSumParams._fold_master`).
 
 The same arithmetic as `dual_em`'s kernels on the same `theta`, to the layout Triton gives the first pass's tile (its
-reduction order: ~1e-7 apart). The stored parameters' range is indexed as the update's output, `stored[par -
-out_base]` (the caller hands both `[ps:pe]`).
+reduction order: ~1e-7 apart), on `F+` taken to the master copy's values (`params_master.flows_to_master`: the backward
+made it with the stored ones) -- in the second pass from the copy alone, in line with the stored values after the first
+(the same factor, to the bit: the stored value is the copy's rounding there). The stored parameters' range is indexed as
+the update's output, `stored[par - out_base]` (the caller hands both `[ps:pe]`).
 """
 
 import triton
 import triton.language as tl
 
+from pyjuice.model.backend.params_master import flows_to_master
 from pyjuice.utils.kernel_launcher import triton_jit
 
 
@@ -55,7 +58,8 @@ def _dual_em_cum_sync_kernel(mparams, stored, param_flows, denom, cum, cids, pid
     stale = s != m.to(stored.dtype.element_ty)                 # written since the copy was last stored
     theta = tl.where(stale, s.to(tl.float32), m)
     tl.store(m_ptr, theta, mask = real[None,:] & stale)        # (as `sync_master`: the update reads the copy)
-    fp = tl.load(param_flows + pf[None,:] + offs_node[:,None], mask = real[None,:], other = 0.0)
+    fp = flows_to_master(tl.load(param_flows + pf[None,:] + offs_node[:,None], mask = real[None,:], other = 0.0),
+                         s, theta)
 
     k = tl.load(kcount + nblock_id).to(tl.float32)
     pseudocount = tl.load(consts + 0)
@@ -103,7 +107,8 @@ def _dual_em_update_store_kernel(mparams, stored, param_flows, denom, cum, out, 
     par = tl.load(pids + nblock_id * num_edges + offs_edge, mask = emask, other = 0)
     pf = tl.load(pfids + nblock_id * num_edges + offs_edge, mask = emask, other = 0)
     theta = tl.load(mparams + par[None,:] + offs_node[:,None], mask = real[None,:], other = 0.0).to(tl.float32)
-    fp = tl.load(param_flows + pf[None,:] + offs_node[:,None], mask = real[None,:], other = 0.0)
+    fp = flows_to_master(tl.load(param_flows + pf[None,:] + offs_node[:,None], mask = real[None,:], other = 0.0),
+                         theta.to(stored.dtype.element_ty), theta)
 
     k = tl.load(kcount + nblock_id).to(tl.float32)
     pseudocount = tl.load(consts + 0)

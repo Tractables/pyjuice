@@ -667,7 +667,8 @@ class ExternalSumParams():
         return out
 
     def _fused_em_correction(self, ns, params, param_flows, denom_param_flows, step_size,
-                             pseudocount, keep_zero_params, denom_sources, out = None, stored = None):
+                             pseudocount, keep_zero_params, denom_sources, out = None, stored = None,
+                             rounded = False):
         """
         The conditional M-step as two shared Triton kernels, or `None` when this shape is not served
         (:func:`compute_em_correction` then runs the generic torch path, which is also what this is
@@ -679,7 +680,8 @@ class ExternalSumParams():
         implementing that one method.
 
         With `stored` (see :func:`compute_em_correction`), the two kernels of `kernels/dual_em_master.py`: the master
-        copy's check against the stored values in the first pass, the store back in the second.
+        copy's check against the stored values in the first pass, the store back in the second. `rounded`: the
+        shared kernels' `ROUNDED` (`compute_em_correction`'s `_rounded`).
         """
         import triton
         if stored is None:
@@ -766,9 +768,9 @@ class ExternalSumParams():
                           DENOM_MODE = mode, num_stages = 1)
             # (the first pass with `stored`: the copy's check in it, and the copy's taking of a write from outside --
             # idempotent, so the tile trials below may run it on the live copy)
-            cum_master = {} if stored is None else dict(stored = stored, out_base = out_base)
+            cum_master = dict(ROUNDED = int(rounded)) if stored is None else dict(stored = stored, out_base = out_base)
             cands = self._em_tile_candidates(block_size, num_edges, n_rows, dev)
-            akey = (num_edges, n_groups, block_size, group_cbs, n_rows, mode, stored is not None)
+            akey = (num_edges, n_groups, block_size, group_cbs, n_rows, mode, stored is not None, bool(rounded))
 
             def _cum(cfg, target_cum):
                 tm, tk = cfg
@@ -799,7 +801,8 @@ class ExternalSumParams():
 
             def _upd(cfg, target_out, target_stored = None):
                 tm, tk = cfg
-                extra = dict(OUT_BY_PAR = 1 if by_par else 0) if stored is None else dict(stored = target_stored)
+                extra = (dict(OUT_BY_PAR = 1 if by_par else 0, ROUNDED = int(rounded)) if stored is None
+                         else dict(stored = target_stored))
                 _dual_em_update_kernel[(triton.cdiv(num_edges, tk),
                                         n_rows * (block_size // tm))](
                     cum = cum, out = target_out, out_base = out_base,
@@ -822,7 +825,8 @@ class ExternalSumParams():
         return out
 
     def compute_em_correction(self, ns, params, param_flows, denom_param_flows, step_size,
-                              pseudocount, keep_zero_params, denom_sources = (), out = None, stored = None):
+                              pseudocount, keep_zero_params, denom_sources = (), out = None, stored = None,
+                              _rounded = False):
         """
         The conditional dual-flow EM update for `ns`: `theta <- normalize(theta * F+ / F-)`, in the
         multiplicative MAP form. Returns the new parameters for `ns._param_range` as a flat tensor --
@@ -852,7 +856,10 @@ class ExternalSumParams():
             stored parameters' `[ps:pe]`. The update then is the one `sync_master(params[ps:pe], stored)` before and
             `stored.copy_(out)` after would make -- `theta` the stored value where that is no longer the master's
             rounding, the result stored, rounded -- and the fused kernels do both in their own passes where the
-            range's master copy is larger than the L2 (:func:`_fold_master`).
+            range's master copy is larger than the L2 (:func:`_fold_master`). `F+`, which the backward made with the
+            stored values, is taken to the master copy's first (`params_master.flows_to_master`).
+        :param _rounded: internal -- `params` is a master copy in line with bf16-stored parameters, `F+` made with
+            those (the update of the branch above that keeps the copy's passes apart).
         """
         if not self.requests_denom_param_flows:
             return None
@@ -863,7 +870,8 @@ class ExternalSumParams():
                 "`stored` comes with `out`, both `[ps:pe]`"
         if stored is None or self._fold_master(params, pe - ps):
             fused = self._fused_em_correction(ns, params, param_flows, denom_param_flows, step_size, pseudocount,
-                                              keep_zero_params, denom_sources, out = out, stored = stored)
+                                              keep_zero_params, denom_sources, out = out, stored = stored,
+                                              rounded = _rounded)
             if fused is not None:
                 return fused
         if stored is not None:                                  # the master copy's passes of their own around it
@@ -871,7 +879,8 @@ class ExternalSumParams():
 
             sync_master(params[ps:pe], stored)
             self.compute_em_correction(ns, params, param_flows, denom_param_flows, step_size, pseudocount,
-                                       keep_zero_params, denom_sources = denom_sources, out = out)
+                                       keep_zero_params, denom_sources = denom_sources, out = out,
+                                       _rounded = True)
             stored.copy_(out)
             return out
 
@@ -885,6 +894,9 @@ class ExternalSumParams():
         # node-in-block) -- the same one `params` uses.
         theta = params[ps:pe].reshape(E, cbs, bs)
         Fp = param_flows[pfs:pfe].reshape(E, cbs, bs)
+        if _rounded:                                            # (`params_master.flows_to_master`)
+            s = theta.to(torch.bfloat16).float()
+            Fp = Fp * torch.where((s == 0) | (s == theta), torch.ones_like(theta), theta / s)
         Fm = self.materialize_denom_flows(ns, params, denom_param_flows,
                                           denom_sources).reshape(E, cbs, bs)
 

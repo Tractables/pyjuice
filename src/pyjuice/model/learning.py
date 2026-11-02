@@ -106,13 +106,13 @@ class _LearningMixin:
             if step_size_rescaling:
                 self.init_param_flows(flows_memory = step_size / self._cum_flow)
 
-                # Below fp32, the `(1 - step_size) * P_td * theta` term from the fp32 master copy: built from the stored
-                # rounding, the step-size-1 update below would reset the copy to it every step, and an update smaller
-                # than half a bf16 ulp would never land (MEASURED: near convergence every parameter fp32 moved by > 2
-                # ulps in 40 steps stayed where it was)
-                td_params = self.params if self.params.dtype == torch.float32 else self._params_master(sync = True)
-                eval_top_down_probs(self, update_pflow = True, scale = (1.0 - step_size), use_cudagraph = use_cudagraph,
-                                    params = td_params)
+                # The `(1 - step_size) * P_td * theta` term from the parameters as stored, as the data's flows are: below
+                # fp32 the update takes every flow to the master copy's value (`params_master.flows_to_master`), this
+                # term's last factor too, so the step-size-1 update below starts from the copy's own `theta` -- built from
+                # the stored rounding and taken as it was, the term reset the copy to that rounding every step, and an
+                # update smaller than half a bf16 ulp never landed (MEASURED: near convergence every parameter fp32 moved
+                # by > 2 ulps in 40 steps stayed where it was)
+                eval_top_down_probs(self, update_pflow = True, scale = (1.0 - step_size), use_cudagraph = use_cudagraph)
 
                 self._cum_flow = 0.0 # Zero out the cumulative flow value
                 step_size = 1.0 # We have applied the step size within the parameter flows

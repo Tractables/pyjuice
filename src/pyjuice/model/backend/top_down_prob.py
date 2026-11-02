@@ -288,15 +288,12 @@ def sum_layer_td_pflow(layer, node_flows, node_mars, element_mars, params, param
         )
 
 
-def eval_top_down_probs(pc, update_pflow: bool = True, scale: float = 1.0, pc_is_normalized: bool = True, use_cudagraph: bool = True,
-                        params = None):
+def eval_top_down_probs(pc, update_pflow: bool = True, scale: float = 1.0, pc_is_normalized: bool = True, use_cudagraph: bool = True):
     """
     Computes the top-down probabilities of every node.
     We use the first # nodes entries in `pc.node_flows` and the first # element entries in `pc.element_flows`.
-    `params`: the sum layers' parameters to use, `pc.params` by default (mini-batch EM below fp32: the fp32 master copy,
-    whose `(1 - step_size) * P_td * theta` term must not be built from the stored rounding).
     """
-    params = pc.params if params is None else params
+    params = pc.params
     assert hasattr(pc, "node_flows") and hasattr(pc, "element_flows")
     assert pc.node_flows.numel() >= pc.num_nodes
     assert pc.element_flows.numel() >= pc.num_elements

@@ -38,7 +38,9 @@ busy GPUs). A node's total is summed in one order (the atomics added in none): t
 kernels' to the last bits of fp32, and with themselves run to run and rank to rank to the bit.
 
 The same kernels serve the fp32 master copy of parameters stored below fp32 (`params_master`): the old value read
-through `params_master._em_par_update_master_kernel`'s external-write check, both copies written.
+through `params_master._em_par_update_master_kernel`'s external-write check, both copies written, and every flow taken
+from the stored value to the master copy's (`params_master.flows_to_master`) -- in the totals as in the update, so the
+forms that walk the flows twice read both copies in the first walk too.
 
 Node blocks of fewer than `MIN_BLOCK_SIZE` nodes (a node's children a few floats apart, the per-block kernels' reads and
 writes then sharing sectors) keep `par_update.em_par_update` / `params_master.em_par_update_master`.
@@ -52,6 +54,8 @@ import numpy as np
 import torch
 import triton
 import triton.language as tl
+
+from .params_master import flows_to_master
 
 
 #: Node blocks of at least this many nodes take the node-block kernel; smaller ones the per-block kernels
@@ -107,6 +111,7 @@ def _em_node_block_one_pass_kernel(stored_ptr, master, param_flows, cum_pflows, 
         stored = tl.load(stored_ptr + par0 + rel, mask = mask, other = 0)
         mval = tl.load(master + par0 + rel, mask = mask, other = 0)
         old = tl.where(stored != mval.to(stored.dtype), stored.to(tl.float32), mval)
+        pflows = flows_to_master(pflows, stored, old)
     else:
         old = tl.load(stored_ptr + par0 + rel, mask = mask, other = 0).to(tl.float32)
     if KEEP_ZERO:
@@ -146,20 +151,21 @@ def _em_block_kernel(stored_ptr, master, param_flows, cum_pflows, t_par, t_pflow
     offs_c0 = tl.arange(0, BLOCK_C)
 
     # The nodes' totals: `cum_pflow_kernel`'s sum (with `keep_zero_params`, over the children not at zero, each flow
-    # plus its share of the pseudocount)
+    # plus its share of the pseudocount); with a master copy, of the flows taken to its values (`flows_to_master`)
     tot = tl.zeros([BLOCK_N], dtype = tl.float32)
     for c0 in range(0, nch32, BLOCK_C):
         offs_c = c0 + offs_c0
         mask = (offs_c < nch32)[:, None] & mask_n[None, :]
         rel = offs_c.to(tl.int64)[:, None] * stride + offs_n[None, :]
         pflows = tl.load(param_flows + pf0 + rel, mask = mask, other = 0)
+        if HAS_MASTER:
+            stored = tl.load(stored_ptr + par0 + rel, mask = mask, other = 0)
+            mval = tl.load(master + par0 + rel, mask = mask, other = 0)
+            old = tl.where(stored != mval.to(stored.dtype), stored.to(tl.float32), mval)
+            pflows = flows_to_master(pflows, stored, old)
+        elif KEEP_ZERO:
+            old = tl.load(stored_ptr + par0 + rel, mask = mask, other = 0).to(tl.float32)
         if KEEP_ZERO:
-            if HAS_MASTER:
-                stored = tl.load(stored_ptr + par0 + rel, mask = mask, other = 0)
-                mval = tl.load(master + par0 + rel, mask = mask, other = 0)
-                old = tl.where(stored != mval.to(stored.dtype), stored.to(tl.float32), mval)
-            else:
-                old = tl.load(stored_ptr + par0 + rel, mask = mask, other = 0).to(tl.float32)
             pflows += pseudocount / nch
             tot += tl.sum(tl.where(mask & ~(old < 1e-12), pflows, 0.0), axis = 0)      # (the original's test)
         else:
@@ -172,16 +178,17 @@ def _em_block_kernel(stored_ptr, master, param_flows, cum_pflows, t_par, t_pflow
         mask = (offs_c < nch32)[:, None] & mask_n[None, :]
         rel = offs_c.to(tl.int64)[:, None] * stride + offs_n[None, :]
         pflows = tl.load(param_flows + pf0 + rel, mask = mask, other = 0)
-        if KEEP_ZERO:
-            new_param = (pflows + pseudocount / nch) / tot[None, :]
-        else:
-            new_param = (pflows + pseudocount / nch) / (tot[None, :] + pseudocount)
         if HAS_MASTER:
             stored = tl.load(stored_ptr + par0 + rel, mask = mask, other = 0)
             mval = tl.load(master + par0 + rel, mask = mask, other = 0)
             old = tl.where(stored != mval.to(stored.dtype), stored.to(tl.float32), mval)
+            pflows = flows_to_master(pflows, stored, old)
         else:
             old = tl.load(stored_ptr + par0 + rel, mask = mask, other = 0).to(tl.float32)
+        if KEEP_ZERO:
+            new_param = (pflows + pseudocount / nch) / tot[None, :]
+        else:
+            new_param = (pflows + pseudocount / nch) / (tot[None, :] + pseudocount)
         if KEEP_ZERO:
             upd = tl.where(old < 1e-12, 0.0, (1.0 - step_size) * old + step_size * new_param)
         else:
@@ -218,13 +225,14 @@ def _em_split_partials_kernel(stored_ptr, master, param_flows, partials, t_par, 
             mask = (offs_c < nch32)[:, None] & mask_n[None, :]
             rel = offs_c.to(tl.int64)[:, None] * stride + offs_n[None, :]
             pflows = tl.load(param_flows + pf0 + rel, mask = mask, other = 0)
+            if HAS_MASTER:
+                stored = tl.load(stored_ptr + par0 + rel, mask = mask, other = 0)
+                mval = tl.load(master + par0 + rel, mask = mask, other = 0)
+                old = tl.where(stored != mval.to(stored.dtype), stored.to(tl.float32), mval)
+                pflows = flows_to_master(pflows, stored, old)
+            elif KEEP_ZERO:
+                old = tl.load(stored_ptr + par0 + rel, mask = mask, other = 0).to(tl.float32)
             if KEEP_ZERO:
-                if HAS_MASTER:
-                    stored = tl.load(stored_ptr + par0 + rel, mask = mask, other = 0)
-                    mval = tl.load(master + par0 + rel, mask = mask, other = 0)
-                    old = tl.where(stored != mval.to(stored.dtype), stored.to(tl.float32), mval)
-                else:
-                    old = tl.load(stored_ptr + par0 + rel, mask = mask, other = 0).to(tl.float32)
                 pflows += pseudocount / nch
                 tot += tl.sum(tl.where(mask & ~(old < 1e-12), pflows, 0.0), axis = 0)
             else:
@@ -274,16 +282,17 @@ def _em_split_update_kernel(stored_ptr, master, param_flows, cum_pflows, t_par, 
             mask = (offs_c < nch32)[:, None] & mask_n[None, :]
             rel = offs_c.to(tl.int64)[:, None] * stride + offs_n[None, :]
             pflows = tl.load(param_flows + pf0 + rel, mask = mask, other = 0)
-            if KEEP_ZERO:
-                new_param = (pflows + pseudocount / nch) / tot[None, :]
-            else:
-                new_param = (pflows + pseudocount / nch) / (tot[None, :] + pseudocount)
             if HAS_MASTER:
                 stored = tl.load(stored_ptr + par0 + rel, mask = mask, other = 0)
                 mval = tl.load(master + par0 + rel, mask = mask, other = 0)
                 old = tl.where(stored != mval.to(stored.dtype), stored.to(tl.float32), mval)
+                pflows = flows_to_master(pflows, stored, old)
             else:
                 old = tl.load(stored_ptr + par0 + rel, mask = mask, other = 0).to(tl.float32)
+            if KEEP_ZERO:
+                new_param = (pflows + pseudocount / nch) / tot[None, :]
+            else:
+                new_param = (pflows + pseudocount / nch) / (tot[None, :] + pseudocount)
             if KEEP_ZERO:
                 upd = tl.where(old < 1e-12, 0.0, (1.0 - step_size) * old + step_size * new_param)
             else:

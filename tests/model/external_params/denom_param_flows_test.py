@@ -2076,8 +2076,9 @@ class _DenseModeDescriptor(ExternalSumParams):
 def test_the_master_copys_correction_is_its_sync_update_and_copy(mode, kz, fold, monkeypatch):
     """Parameters stored below fp32 (`stored`: the stored range beside the fp32 master copy, which is `params`): the
     correction takes the stored value where it was written since the copy was last stored, and stores its result,
-    rounded -- what `sync_master`, the update and a `copy_` made before, to the update kernels' reduction order (the
-    fused first pass lays its tile out apart: ~1e-7). Outside writes on a tenth of the range, 1.7x off (a missed one is
+    rounded -- what `sync_master`, the update on `F+` taken to the copy's values (`_rounded`, see
+    `params_master.flows_to_master`) and a `copy_` make, to the update kernels' reduction order (the fused first pass
+    lays its tile out apart: ~1e-7). Outside writes on a tenth of the range, 1.7x off (a missed one is
     70% off); the stored values exactly the copy's rounding, nothing outside the range written. The check and store in
     the update's passes (`_fold_master`: a range past the L2, forced here) and as passes of their own; both fused `F-`
     modes, and the generic path (the fused one declined)."""
@@ -2121,7 +2122,7 @@ def test_the_master_copys_correction_is_its_sync_update_and_copy(mode, kz, fold,
 
         ref_m, ref_s = master0.clone(), stored0.clone()
         sync_master(ref_m[ps:pe], ref_s[ps:pe])
-        desc.compute_em_correction(tgt, ref_m, *rest, denom_sources = srcs[tgt], out = ref_m[ps:pe])
+        desc.compute_em_correction(tgt, ref_m, *rest, denom_sources = srcs[tgt], out = ref_m[ps:pe], _rounded = True)
         ref_s[ps:pe].copy_(ref_m[ps:pe])
 
         got_m, got_s = master0.clone(), stored0.clone()
