@@ -98,6 +98,7 @@ FORWARD_SUM_TUNED = True
 FORWARD_SUM_CUDA = True
 from .kernels import c as cuda_kernels
 from . import deferred_par
+from .fused_children import form_elements
 
 # Node-tile sizes for the small-batch (batch < 16) block-sparse path. At tiny batch the GPU is
 # filled by splitting the *node* dimension into many tiles (the batch dimension is too short to
@@ -589,12 +590,14 @@ class SumLayer(Layer, nn.Module):
                           bf16 anyway (the same bits, half the bytes), and the stream kernel, which reads bf16
                           parameters only and joins them --; the dense cuBLAS path is then left out, and the fp32
                           kernels read `params`.
-        `stream_children`: None, or the product layer group below's `(table, first_row)` (as `compute_children`): every
-                          partition runs the stream forward its settled launch holds with the product layer fused into
-                          its pre-pass (`tlmm_forward_sum_stream_fused.cu`: the children's values formed from their two
-                          child node values, the same bits as the product layer's forward and the stream kernel), so
-                          the caller launches no product layer forward for this layer -- only where `_stream_fusion`
-                          gives a plan (the circuit's passes, `TensorCircuit._stream_fusion_groups`).
+        `stream_children`: None, or the product layer group below's `(table, first_row)` (as `compute_children`), whose
+                          forward the caller did not run: where `_stream_fusion` gives a plan for the call (a plain one
+                          whose settled launch is the stream forward), every partition runs it with the product layer
+                          fused into its pre-pass (`tlmm_forward_sum_stream_fused.cu`: the children's values formed
+                          from their two child node values, the same bits as the product layer's forward and the
+                          stream kernel); else the product layer's values are formed into `element_mars`
+                          (`fused_children.form_elements`, the same bits) and the forward runs as without it. (The
+                          circuit's passes: `TensorCircuit._stream_fusion_groups`.)
         """
         op = op_params if op_params is not None and self.__dict__.get("_reads_param_operands", False) else None
 
@@ -605,19 +608,20 @@ class SumLayer(Layer, nn.Module):
         fast_key = None
         plain = (propagation_alg == "LL" and pflow_temperature == 1.0 and partition_runs is None
                  and compute_children is None and not kwargs and node_mars.is_cuda)
-        if stream_children is not None and not plain:
-            raise ValueError("`stream_children` takes a plain call: LL, no tempering, whole partitions, nothing else.")
         if plain:
             fast_key = (node_mars.size(1), params.dtype, precision, op is not None)
-            if stream_children is not None:
-                fused = self._stream_fusion(fast_key, stream_children)
-                if fused is None:
-                    raise ValueError("`stream_children`: no fused stream forward here (see `_stream_fusion`).")
+        if stream_children is not None:
+            fused = SumLayer._stream_fusion(self, fast_key, stream_children) if plain else None
+            if fused is not None:
                 p, batch_size = (params if op is None else op), node_mars.size(1)
                 for cbase, (_, (_, c), nids, _, pbase, knt, groups) in fused:
                     cuda_kernels.tlmm_forward_sum_stream_fused(node_mars, cbase, p, nids, pbase, groups, batch_size,
                                                                self.block_size, knt, c)
                 return None
+            # (no fused forward for this call -- not a plain one, or none planned for its shape: the product layer's
+            # values formed here as its forward forms them, and the forward as without it)
+            form_elements(element_mars, node_mars, stream_children)
+        if plain:
             fast = self._fw_fast.get(fast_key)
             if fast is not None and self._fw_fast_launch(fast, node_mars, element_mars, params if op is None else op):
                 return None
@@ -3389,10 +3393,8 @@ class SumLayer(Layer, nn.Module):
                     if sc is not None and not done:
                         # (the product layer below fused, these flows not deferred after all -- a call whose deferral
                         # declines: the per-step kernels read the element values, formed here as its forward forms
-                        # them, one fp32 add of the two children: the same bits)
-                        table, first = sc
-                        em, nm = t["element_mars"], t["node_mars"]
-                        em[first:first + table.size(0)] = nm[table[:, 0].long()] + nm[table[:, 1].long()]
+                        # them: the same bits)
+                        form_elements(t["element_mars"], t["node_mars"], sc)
                     return done
 
                 # The partition's flows as ONE launcher of a plan (`LaunchPlans`): deferred, or the measured kernel --

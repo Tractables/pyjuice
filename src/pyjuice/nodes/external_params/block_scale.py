@@ -101,6 +101,8 @@ class BlockScaleSumParams(_ForwardMixin, _BackwardMixin, _SampleMixin, _Denomina
     #: standard kernel has summed them -- `sum_e phi_e M_e` cannot be recovered from `sum_e M_e`. So it
     #: computes the node values itself instead of correcting them afterwards.
     replaces_shared_forward = True
+    #: its split forward takes the product layer below fused into its pre-pass (`stream_fusion_plan`)
+    fuses_stream_children = True
 
     #: Its CUDA forwards round the parameters to bf16 for their products (the CuTe fork, `blockscale_forward_prepass.cu`,
     #: the tensor-core small-batch fork from batch 16), and its split forward and split element backward read bf16

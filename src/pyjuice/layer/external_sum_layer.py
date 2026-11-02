@@ -11,6 +11,7 @@ from pyjuice.utils import launch_plans
 from pyjuice.utils.launch_plans import LaunchPlans
 from pyjuice.utils.parameter_list import FastParamList
 from .sum_layer import SumLayer
+from .fused_children import form_elements
 
 
 # Forward kwarg carrying the per-sample external tensors, keyed by `ns` instance:
@@ -598,27 +599,49 @@ class ExternalParamsSumLayer(SumLayer):
             raise ValueError("An external-parameter sum layer computes whole partitions: no `partition_runs`.")
         ns_tensors = self._resolve_external_tensors(kwargs, node_mars.size(1), node_mars.device)
 
+        # The product layer group below whose forward the caller did not run (`SumLayer.forward`'s `stream_children`):
+        # to the plain forward where nothing was supplied for this layer, to a parameterization that forms the node
+        # values itself and takes them (`fuses_stream_children`), else its values formed here for what reads them
+        sc = kwargs.pop("stream_children", None)
+        gated = len(ns_tensors) > 0
+        takes = gated and self.external_params.replaces_shared_forward and \
+            getattr(self.external_params, "fuses_stream_children", False)
+        if sc is not None and gated and not takes:
+            form_elements(element_mars, node_mars, sc)
+
         # Some parameterizations compute the node values themselves, in which case the standard forward
         # would be redundant work whose result is thrown away. It still has to run when nothing was
         # supplied for this layer, since then the layer IS a plain sum layer.
-        if len(ns_tensors) == 0 or not self.external_params.replaces_shared_forward:
+        if not gated or not self.external_params.replaces_shared_forward:
             super(ExternalParamsSumLayer, self).forward(
-                node_mars, element_mars, params, propagation_alg = propagation_alg, op_params = op_params, **kwargs
+                node_mars, element_mars, params, propagation_alg = propagation_alg, op_params = op_params,
+                **(dict(kwargs, stream_children = sc) if sc is not None and not gated else kwargs)
             )
 
-        if len(ns_tensors) == 0:
+        if not gated:
             return None
 
         self._assert_supported(propagation_alg, is_backward = False, **kwargs)
 
         if op_params is not None and self.external_params.reads_param_operands:
             kwargs = dict(kwargs, op_params = op_params)
+        if takes and sc is not None:
+            kwargs = dict(kwargs, stream_children = sc)
         self.external_params.forward_layer(
             self, ns_tensors, node_mars, element_mars, params,
             propagation_alg = propagation_alg, **kwargs
         )
 
         return None
+
+    def _stream_fusion(self, fast_key: tuple, children: Tuple[torch.Tensor, int]) -> Optional[tuple]:
+        """The fused stream forward a call of ``fast_key``'s shape can take over the product group below (``children``):
+        the parameterization's, where it forms the node values with the product fused (`stream_fusion_plan`, a gated
+        call), else the plain layer's (a call supplying nothing for this layer) -- None where neither applies. What the
+        circuit's decision asks (`TensorCircuit._stream_fusion_groups`); a call without one forms the values itself."""
+        fn = getattr(self.external_params, "stream_fusion_plan", None)
+        plan = None if fn is None else fn(self, fast_key, children)
+        return plan if plan is not None else SumLayer._stream_fusion(self, fast_key, children)
 
     def backward(self, node_flows: torch.Tensor, element_flows: torch.Tensor,
                  node_mars: torch.Tensor, element_mars: torch.Tensor,

@@ -225,42 +225,61 @@ def test_no_fusion_for_a_pass_of_another_regime(fused_preferred):
             assert torch.equal(outs[0], outs[1]) and torch.equal(pcs[0].node_mars, pcs[1].node_mars), kw
 
 
-@cuda_only
-def test_external_parameter_layers_are_not_fused(fused_preferred):
-    """A tied chain of BlockScale-gated layers (subclasses of `SumLayer`, their forward their parameterization's): nothing
-    fused, the node values a circuit never fusing computes."""
-    _needs_stream()
+def _gated_hmm(T = 5, L = 4096, C = 16):
+    """A tied chain of BlockScale-gated sum layers (an HMM's transitions, node blocks of 1024, gates of 32) and its gated
+    nodes, bf16 parameters."""
     from pyjuice.nodes import inputs, multiply, summate, BlockScaleSumParams
-    B, T, L, C = 128, 5, 4096, 16
+    torch.manual_seed(0)
+    nodes = []
+    with juice.set_block_size(1024):
+        chain = inputs(0, num_node_blocks = L // 1024, dist = dists.Categorical(num_cats = C))
+        first = None
+        for t in range(1, T):
+            emit = inputs(t, num_node_blocks = L // 1024, dist = dists.Categorical(num_cats = C))
+            if first is None:
+                chain = first = summate(multiply(chain, emit), num_node_blocks = L // 1024,
+                                        external_params = BlockScaleSumParams(ch_block_size = 32))
+            else:
+                chain = first.duplicate(multiply(chain, emit), tie_params = True)
+            nodes.append(chain)
+        root = summate(multiply(chain), num_node_blocks = 1, block_size = 1)
+    root.init_parameters(perturbation = 2.0)
+    return juice.compile(root, verbose = False, param_dtype = torch.bfloat16).to(DEV), nodes
 
-    def gated():
-        torch.manual_seed(0)
-        nodes = []
-        with juice.set_block_size(1024):
-            chain = inputs(0, num_node_blocks = L // 1024, dist = dists.Categorical(num_cats = C))
-            first = None
-            for t in range(1, T):
-                emit = inputs(t, num_node_blocks = L // 1024, dist = dists.Categorical(num_cats = C))
-                if first is None:
-                    chain = first = summate(multiply(chain, emit), num_node_blocks = L // 1024,
-                                            external_params = BlockScaleSumParams(ch_block_size = 32))
-                else:
-                    chain = first.duplicate(multiply(chain, emit), tie_params = True)
-                nodes.append(chain)
-            root = summate(multiply(chain), num_node_blocks = 1, block_size = 1)
-        root.init_parameters(perturbation = 2.0)
-        return juice.compile(root, verbose = False, param_dtype = torch.bfloat16).to(DEV), nodes
-    (pc, nodes), (pc2, nodes2) = gated(), gated()
+
+@pytest.fixture
+def split_forward_steered(monkeypatch):
+    """BlockScale's forward fork steered to its split forward where it is offered (its tuner times the forks)."""
+    import pyjuice.layer.kernels.c as ck
+    real = ck.autotune
+    monkeypatch.setattr(ck, "autotune", lambda cands, *a, **k: next(
+        (key for key, _ in cands if isinstance(key, tuple) and key[:1] == ("stream",)), None) or real(cands, *a, **k))
+
+
+@cuda_only
+def test_gated_layers_fused_compute_the_unfused_bits(fused_preferred, split_forward_steered):
+    """A tied chain of BlockScale-gated layers (their parameterization takes the fused forward: `fuses_stream_children`,
+    its split forward with the product fused into the pre-pass, `blockscale_forward_stream_fused.cu`): the products below
+    the gated layers fused, the node values a circuit never fusing computes; a call giving no gates fuses no gated
+    layer's split forward and computes the plain bits."""
+    _needs_stream()
+    B, T, C = 128, 5, 16
+    (pc, nodes), (pc2, nodes2) = _gated_hmm(), _gated_hmm()
     _unfused(pc2)
-    g = torch.Generator(device = DEV).manual_seed(2)
-    gates = [torch.randn(n.external_params.tensor_shapes(n, B)[0], device = DEV, generator = g) * 0.5 - 0.5 for n in nodes]
+    g = torch.Generator().manual_seed(2)
+    gates = [torch.randn(n.external_params.tensor_shapes(n, B)[0], generator = g).to(DEV) * 0.5 - 0.5 for n in nodes]
     x = torch.randint(0, C, (B, T), device = DEV)
     with torch.no_grad():
         for _ in range(3):
-            outs = [c(x, external_params = {n: v for n, v in zip(ns, gates)}).clone()
+            outs = [c(x, sum_external_params = {n: v for n, v in zip(ns, gates)}).clone()
                     for c, ns in ((pc, nodes), (pc2, nodes2))]
-            assert torch.equal(outs[0], outs[1])
-    assert not _fused_groups(pc, B)
+            assert torch.equal(outs[0], outs[1]) and torch.equal(pc.node_mars, pc2.node_mars)
+    fused = [v for k, v in pc.__dict__["_stream_fusion_"].items() if k[0] == B and k[-1] and isinstance(v, frozenset)]
+    assert fused and len(fused[0]) >= T - 2
+    with torch.no_grad():
+        for _ in range(3):
+            outs = [c(x).clone() for c in (pc, pc2)]
+            assert torch.equal(outs[0], outs[1]) and torch.equal(pc.node_mars, pc2.node_mars)
 
 
 @cuda_only
@@ -321,29 +340,32 @@ def test_the_plan_takes_dummy_chunks_and_runs_of_children_only():
 
 
 @cuda_only
-def test_stream_children_takes_a_plain_call_with_a_plan(stream_steered):
-    """`forward(stream_children = ...)` on a call that is not plain, before the layer's forward settled, or over products
-    of other than two children: an error."""
+def test_stream_children_without_a_plan_forms_the_values(stream_steered):
+    """`forward(stream_children = ...)` on a call no fused forward serves -- not plain (MPE), or a batch whose forward
+    did not settle (64): the product layer's values formed into `element_mars` (`form_elements`), the node values of
+    the product layer's forward run first; over products of three children: an error."""
     _needs_stream()
     pc, T, E = _hmm(4096)
     B = 128
-    layer = [l for g in pc.inner_layer_groups if g.is_sum() for l in g][1]
+    k = [i for i, g in enumerate(pc.inner_layer_groups) if g.is_sum()][1]
+    layer = list(pc.inner_layer_groups[k])[0]
     from pyjuice.layer.fused_children import element_children
-    tables = element_children(pc)
-    k = [i for i, g in enumerate(pc.inner_layer_groups) if layer in list(g)][0]
+    table, first = element_children(pc)[k - 1]
+    a, b = layer._layer_nid_range
     x = torch.randint(0, E, (B, T), device = DEV)
-    table, first = tables[k - 1]
     with torch.no_grad():
         pc(x)
-        layer.forward(pc.node_mars, pc.element_mars, pc.params, stream_children = (table, first))   # (settled: a plan)
-        with pytest.raises(ValueError):
-            layer.forward(pc.node_mars, pc.element_mars, pc.params, propagation_alg = "MPE", stream_children = tables[k - 1])
+        for kw, cols in ((dict(propagation_alg = "MPE"), B), (dict(), 64)):
+            nm, em = pc.node_mars[:, :cols].contiguous(), pc.element_mars[:, :cols].contiguous()
+            em.fill_(-torch.inf)
+            layer.forward(nm, em, pc.params, stream_children = (table, first), **kw)
+            got = nm[a:b].clone()
+            pc.inner_layer_groups[k - 1].forward(nm, em)
+            layer.forward(nm, em, pc.params, **kw)
+            assert torch.equal(got, nm[a:b]), kw
         with pytest.raises(ValueError):                                    # (products of three children)
-            layer.forward(pc.node_mars, pc.element_mars, pc.params,
+            layer.forward(pc.node_mars, pc.element_mars, pc.params, propagation_alg = "MPE",
                           stream_children = (torch.cat([table, table[:, :1]], 1), first))
-        with pytest.raises(ValueError):
-            layer.forward(pc.node_mars[:, :64].contiguous(), pc.element_mars[:, :64].contiguous(), pc.params,
-                          stream_children = tables[k - 1])            # (batch 64: never settled)
 
 
 @cuda_only

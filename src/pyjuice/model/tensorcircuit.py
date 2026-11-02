@@ -49,6 +49,11 @@ def _calls_its_forward(module: nn.Module) -> bool:
 # 2^29: HMM-2048 B 128 -9.9%, HMM-4096 B 32 -7.1%; 2^31: HMM-4096 B 128 -38%).
 _COPY_MIN_WORK = 1 << 28
 
+# The forward options a fused product forward serves (`_stream_fusion_groups`): the plain regime's, and the external
+# parameters' (a gated layer whose parameterization takes the fused forward, `fuses_stream_children`)
+_STREAM_FUSION_FW_OPTS = frozenset(("precision", "pflow_temperature", "sum_external_params",
+                                    "sum_external_params_buffer"))
+
 # The backward options of the plain regime a fused product backward serves (`_stream_fusion_bk_groups`)
 _STREAM_FUSION_BK_OPTS = frozenset(("param_flows", "denom_param_flows", "allow_modify_flows", "logspace_flows",
                                     "negate_pflows", "precision", "pflow_temperature", "temper_eflow",
@@ -474,11 +479,11 @@ class TensorCircuit(_BuildMixin, _CudaGraphsMixin, _ExternalParamsMixin, _Learni
         regime (not LL, tempered, keyword arguments). Asked outside the pass: the trials run on the live buffers, whose
         rows the pass then computes again."""
         pt = sum_opts.get("pflow_temperature", 1.0)
-        if (propagation_alg != "LL" or pt != 1.0 or sum_opts.keys() - {"precision", "pflow_temperature"}
+        if (propagation_alg != "LL" or pt != 1.0 or sum_opts.keys() - _STREAM_FUSION_FW_OPTS
                 or not self.node_mars.is_cuda):
             return frozenset()
         state = self.__dict__.setdefault("_stream_fusion_", {})
-        key = (batch_size, self.precision, self.params.dtype, op_groups)
+        key = (batch_size, self.precision, self.params.dtype, op_groups, "sum_external_params" in sum_opts)
         seen = state.get(key)
         if isinstance(seen, frozenset):
             return seen
@@ -495,7 +500,9 @@ class TensorCircuit(_BuildMixin, _CudaGraphsMixin, _ExternalParamsMixin, _Learni
         op = self._param_operands(batch_size, refresh = False) if op_groups else None
         for k in range(len(groups) - 1):
             prod, sumg = groups[k], groups[k + 1]
-            if not (prod.is_prod() and sumg.is_sum() and all(type(layer) is SumLayer for layer in sumg)):
+            if not (prod.is_prod() and sumg.is_sum() and all(
+                    type(layer) is SumLayer or getattr(getattr(layer, "external_params", None), "fuses_stream_children",
+                                                       False) for layer in sumg)):
                 continue
             opts = dict(sum_opts, op_params = op) if (op is not None and id(sumg) in op_groups) else sum_opts
             plans = [layer._stream_fusion((batch_size, self.params.dtype, self.precision,

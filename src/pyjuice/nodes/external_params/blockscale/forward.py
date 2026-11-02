@@ -9,10 +9,22 @@ corrected).
 from __future__ import annotations
 
 from collections import OrderedDict
+from typing import Optional
 
 import torch
 
 from .common import _buffer_kwarg
+
+
+def _stream_fused_module():
+    from ..kernels.c import get_stream_fused_module
+    return get_stream_fused_module()
+
+
+def form_elements(element_mars, node_mars, children):
+    """`pyjuice.layer.fused_children.form_elements` (imported at the call: `pyjuice.layer` imports `pyjuice.nodes`)."""
+    from pyjuice.layer.fused_children import form_elements as form
+    form(element_mars, node_mars, children)
 
 #: How many forward plans to keep per layer, keyed by batch size. Each holds a `log Z` buffer per
 #: partition sized by that batch, so this bounds memory; rebuilding an evicted one costs an AUTOTUNE,
@@ -515,6 +527,42 @@ class _ForwardMixin:
                tuple(cands))
         return autotune.pick(key, cands, bench)
 
+    def stream_fusion_plan(self, layer, fast_key: tuple, children) -> Optional[tuple]:
+        """The split forward's `cbase` per partition (`blockscale_forward_stream_fused.cu`) for a gated forward of
+        ``fast_key``'s shape (`SumLayer.forward`'s: the batch, the parameters' dtype, the precision, the bf16 copy
+        given) over the product group below (``children``), or None where its settled fork is not the split forward
+        (or none settled yet): what `ExternalParamsSumLayer._stream_fusion` asks for the circuit's decision."""
+        batch, _, _, op = fast_key
+        entry = layer.__dict__.get("_bs_fw_plans", {}).get(batch if not op else (batch, "operands"))
+        if entry is None:
+            return None
+        _, fname, calls = entry[0]
+        return self._fused_cbases(layer, batch if not op else (batch, "operands"), fname, calls, children)
+
+    def _fused_cbases(self, layer, pkey, fname, calls, children) -> Optional[tuple]:
+        """Per partition, its edge tiles' chunks as runs of the product's children (`SumLayer._stream_fusion_cbase` of
+        the split forward's tile starts, `cids`), for the fused split forward -- or None where the fork is another or
+        a chunk is neither dummy rows nor runs. Kept with the plan's calls and the table they were made from."""
+        if fname != "blockscale_forward_stream" or _stream_fused_module() is None:
+            return None
+        table, first_row = children
+        if table.size(1) != 2:
+            return None
+        plans = layer.__dict__.setdefault("_stream_fusion_plans", {})
+        hit = plans.get(("blockscale", pkey))
+        if hit is not None and hit[0] is table and hit[1] is calls:
+            return hit[2]
+        from pyjuice.layer.sum_layer import SumLayer
+        cbases = []
+        for args in calls:
+            cb = SumLayer._stream_fusion_cbase(args[1], table, first_row)      # (args[1]: `cids`, the tile starts)
+            if cb is None:
+                cbases = None
+                break
+            cbases.append(cb)
+        plans[("blockscale", pkey)] = (table, calls, None if cbases is None else tuple(cbases))
+        return plans[("blockscale", pkey)][2]
+
     def forward_layer(self, layer, ns_tensors, node_mars, element_mars, params, **kwargs) -> None:
         """
         Compute this layer's node values under the gate, REPLACING the standard sum forward.
@@ -529,11 +577,16 @@ class _ForwardMixin:
         A plan of its own (the candidates differ); the fp32 forks and the portable Triton fallback keep `params`.
         """
         op_params = kwargs.pop("op_params", None)
+        # (the product layer group below, its forward not run: `SumLayer.forward`'s `stream_children` -- fused into
+        # the split forward's pre-pass where that is the settled fork, else its values formed for the fork)
+        stream_children = kwargs.pop("stream_children", None)
         if len(ns_tensors) == 0:
             return None
 
         external_params = kwargs.get(_buffer_kwarg(), None)
         if external_params is None:
+            if stream_children is not None:
+                form_elements(element_mars, node_mars, stream_children)
             return None
 
         # Keyed by SHAPE, and a dict. This was one entry keyed partly on data POINTERS, which was wrong
@@ -556,6 +609,9 @@ class _ForwardMixin:
                                                                        batch):
             entry = None
         if entry is None:
+            if stream_children is not None:              # (the plan's trials read the element values)
+                form_elements(element_mars, node_mars, stream_children)
+                stream_children = None
             built = self._build_plan(layer, ns_tensors, node_mars, element_mars, params,
                                      external_params, op_params)
             # `_build_plan` also allocates a `log Z` buffer per partition, sized by batch, so an
@@ -567,6 +623,11 @@ class _ForwardMixin:
         mod, fname, calls = entry[0]
         # The backward reads this, and on a cache HIT `_build_plan` did not run to set it.
         layer._bs_bw_state = entry[1]
+        cbases = None
+        if stream_children is not None:
+            cbases = self._fused_cbases(layer, pkey, fname, calls, stream_children)
+            if cbases is None:
+                form_elements(element_mars, node_mars, stream_children)
 
         if mod == "triton":
             # The portable fallback: `calls` are kwarg dicts rather than positional tuples, since
@@ -592,11 +653,16 @@ class _ForwardMixin:
         fn = getattr(mod, fname)
         p = op_params if op_params is not None and fname in _BF16_FORKS else params
         if fname == "blockscale_forward_stream":
-            # and each partition's `sigma` (cached until the parameters change)
+            # and each partition's `sigma` (cached until the parameters change); the product layer below fused into
+            # the pre-pass where the call was handed it (`cbases`)
             st = layer._bs_bw_state
+            ffn = None if cbases is None else _stream_fused_module().blockscale_forward_stream_fused
             for pid, args in enumerate(calls):
-                fn(node_mars, element_mars, p, external_params, *args,
-                   self._sigma(layer, p, pid, st["block_size"], st["gate_cbs"])[0])
+                sigma = self._sigma(layer, p, pid, st["block_size"], st["gate_cbs"])[0]
+                if ffn is None:
+                    fn(node_mars, element_mars, p, external_params, *args, sigma)
+                else:
+                    ffn(node_mars, cbases[pid], p, external_params, *args, sigma)
             return None
         for args in calls:
             fn(node_mars, element_mars, p, external_params, *args)

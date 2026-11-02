@@ -35,6 +35,17 @@ def element_children(pc) -> List[Optional[Tuple[torch.Tensor, int]]]:
     return out
 
 
+def form_elements(element_mars: torch.Tensor, node_mars: torch.Tensor, children: Tuple[torch.Tensor, int]) -> None:
+    """Write a product layer group's element values into ``element_mars`` from ``children`` (its `(table, first_row)`,
+    `element_children`): each element the sum of its two child node values, one fp32 add -- what the product layer's
+    forward writes for products of two children, the same bits. What a layer handed the product group below (its
+    `stream_children`) does where it cannot form them in its own kernels: the product layer's forward was not run."""
+    table, first = children
+    if table.size(1) != 2:
+        raise ValueError("`stream_children`: products of two children only.")
+    element_mars[first:first + table.size(0)] = node_mars[table[:, 0].long()] + node_mars[table[:, 1].long()]
+
+
 def attach_element_children(group, first_row: int) -> None:
     """Build a product layer group's table (rows ``[first_row, ...)`` of its layers) and keep it as a buffer of the
     group, ``group.element_children``, with ``group.element_children_first_row``. A block-sparse product layer's node
