@@ -1321,6 +1321,7 @@ class _BackwardMixin:
         The log-Z term shares no operand with that kernel, so it runs here. Do not re-split without re-measuring.
         """
         from ..kernels.blockscale_post_backward import _bs_post_backward_kernel
+        from .post_deferred import try_defer as try_defer_post
 
         bs_, gate_cbs, batch = state["block_size"], state["gate_cbs"], state["batch_size"]
         want_grad, want_w = grad_ext is not None, denom_param_flows is not None
@@ -1341,6 +1342,12 @@ class _BackwardMixin:
             if plan is None:
                 plan = plans[pkey] = self._post_plan(state, rows, n_gates, gb, nids, log_z, sigma, external_params,
                                                      grad_ext, W, want_grad, want_w)
+            # (left with the other layers' to the end of the pass, where the backward allows it: `post_deferred`)
+            if try_defer_post(self, layer, dict(plan = plan, rows = rows, node_flows = node_flows, node_mars = node_mars,
+                                                log_z = log_z, sigma = sigma, ext = external_params, gb = gb, nids = nids,
+                                                grad_ext = grad_ext if want_grad else None,
+                                                W = W if want_w else None)):
+                continue
             grid, consts, shares = plan
             if shares is not None:                 # the node tiles' gradient shares and their groups' tickets
                 partial, counter = self._post_scratch(log_z.device, *shares)

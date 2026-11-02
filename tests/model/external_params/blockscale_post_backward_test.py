@@ -43,6 +43,14 @@ SHAPES = {
 }
 
 
+@pytest.fixture(autouse = True)
+def _launched_per_layer(monkeypatch):
+    """Each partition's own launch, at its `_post_fused` call: a circuit's backward would leave it to the end of the
+    pass (`post_deferred`, whose kernels `blockscale_post_deferred_test.py` checks against this one)."""
+    import pyjuice.nodes.external_params.blockscale.post_deferred as post_deferred
+    monkeypatch.setattr(post_deferred, "try_defer", lambda *args, **kwargs: False)
+
+
 def _compile(name, apply_z_correction):
     nb, bs, nc, cbs, gate_cbs, edge_ids = SHAPES[name]
     torch.manual_seed(0)
