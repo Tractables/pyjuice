@@ -648,9 +648,26 @@ def test_no_backward_fusion_of_parameter_flows_that_are_not_deferred(fused_prefe
 def test_a_fused_backward_whose_deferral_declines_computes_the_unfused_bits(fused_preferred, monkeypatch):
     """Parameter flows deferred when the backward fusion was decided, then not (the deferral's thresholds out of reach):
     the fused layers form the element values for the per-step kernels themselves -- the bits of a circuit never fusing,
-    node flows and parameter flows."""
+    node flows and parameter flows. Every other tuner's choice the first candidate that runs, in both circuits: timed,
+    each circuit's could take an arm of other bits (the parameter flows came out a last digit apart beside a suite's
+    workers)."""
     _needs_stream()
     import pyjuice.layer.deferred_par as deferred_par
+    import pyjuice.layer.kernels.c as ck
+
+    def first_that_runs(cands, *a, **k):
+        for key, run in cands:
+            try:
+                run()
+                torch.cuda.synchronize()
+                return key
+            except Exception:
+                pass
+        return None
+    monkeypatch.setattr(autotune, "best_of", lambda cands, *a, **k: next(
+        (key for key, _ in cands if isinstance(key, tuple) and key[:1] == ("cuda_stream",)), None)
+        or first_that_runs(cands))
+    monkeypatch.setattr(ck, "autotune", lambda cands, *a, **k: first_that_runs(cands))
     pcs = [_hmm(4096)[0], _unfused(_hmm(4096)[0])]
     B, T, E = 128, 8, 64
     x = torch.randint(0, E, (B, T), device = DEV)

@@ -39,10 +39,32 @@ def _layers(pc, cls):
     return [layer for group in pc.inner_layer_groups for layer in group if isinstance(layer, cls)]
 
 
+def _cuda_first(monkeypatch):
+    """A tuner of its own (the shape-keyed cache is process-wide: another test's choice for these shapes -- the Triton
+    kernel, say -- would be this one's) that takes a sum layer's first CUDA candidate that runs, whatever a loaded GPU's
+    timing says: the launches a settled forward records."""
+    monkeypatch.setattr(autotune, "_CACHE", {})
+    real = autotune.best_of
+
+    def best_of(cands, *a, **k):
+        if any(c == ("triton", -1) for c, _ in cands):
+            for c, run in cands:
+                if c != ("triton", -1):
+                    try:
+                        run()
+                        torch.cuda.synchronize()
+                        return c
+                    except Exception:
+                        pass
+        return real(cands, *a, **k)
+    monkeypatch.setattr(autotune, "best_of", best_of)
+
+
 @pytest.mark.parametrize("dts", ["fp32", "bf16"])
 def test_a_settled_forward_skips_the_dispatch_to_the_bit(dts, monkeypatch):
     if not (ck.is_available() and ck.prepass_is_available()):
         pytest.skip("the CUDA kernels are not available here")
+    _cuda_first(monkeypatch)
     pc = _hmm({"fp32": torch.float32, "bf16": torch.bfloat16}[dts])
     x = torch.randint(0, 16, (64, 8), device = DEV)
     want = pc(x).detach().clone()                                   # (the full dispatch: tunes, records)
@@ -71,9 +93,12 @@ def test_the_settled_forward_follows_the_tuner_and_the_switches(monkeypatch):
     sums, prods = _layers(pc, SumLayer), _layers(pc, ProdLayer)
     unsettled = len([l for l in sums if not l._fw_fast])
     s_calls, p_calls = _counted(monkeypatch, SumLayer, "_forward"), _counted(monkeypatch, ProdLayer, "_forward_backward")
-    # the tuner's cache cleared, and it decides differently this time (the Triton reference): every settled sum layer
-    # back through its dispatch, to the Triton kernel; then settled again on the new choice (the sum layers on Triton
-    # record nothing: their dispatch every call)
+    # the tuner's cache cleared, and it decides differently this time (the Triton reference; for a product layer a tile
+    # other than the one it recorded -- the same tile again, and a layer after the first of its shape would rightly
+    # replay its launch): every settled layer back through its dispatch, the sums to the Triton kernel; then settled
+    # again on the new choice (the sum layers on Triton record nothing: their dispatch every call)
+    recorded = {cfg for l in prods for fast in l._fw_fast.values() for _, cfg, *_ in fast}
+    assert recorded, "no product layer settled"
     twin = _hmm(torch.bfloat16)
     with monkeypatch.context() as mp:
         mp.setattr(SL, "FORWARD_SUM_CUDA", False)
@@ -81,7 +106,8 @@ def test_the_settled_forward_follows_the_tuner_and_the_switches(monkeypatch):
     was = autotune.set_autotune(True, clear_cache = True)
     try:
         with monkeypatch.context() as mp:
-            mp.setattr(autotune, "best_of", lambda cands, *a, **k: next((c for c, _ in cands if c == ("triton", -1)), cands[0][0]))
+            mp.setattr(autotune, "best_of", lambda cands, *a, **k: ("triton", -1) if any(c == ("triton", -1) for c, _ in cands)
+                       else next((c for c, _ in cands if c not in recorded), cands[0][0]))
             s_calls.clear(); p_calls.clear()
             assert torch.equal(pc(x).detach(), triton_out)
             assert len(s_calls) == sum(l.num_fw_partitions for l in sums)

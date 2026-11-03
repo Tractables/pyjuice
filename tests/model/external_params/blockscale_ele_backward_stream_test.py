@@ -269,11 +269,59 @@ def test_a_backward_taking_it_matches_triton(name, builder, B, neg_gates, neg_ch
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs a GPU")
-def test_the_plans_trials_charge_a_candidates_extra_host_time():
-    """Two candidates with the same GPU work (~150 us) and host work hidden behind it, one 80 us slower on the host: one
-    call's event time cannot tell them apart; charged the host time it costs beyond the other's, the slower loses."""
+def test_the_host_charge_is_a_candidates_extra_host_time():
+    """`_host_extra`: each candidate's host time a call beyond the cheapest's (host work only here, so it holds on a
+    loaded machine too); `_charged`: the candidate run once, behind a host wait of that much."""
     import time
     from pyjuice.nodes.external_params.blockscale.backward import _host_extra, _charged
+
+    calls = []
+
+    def make(spin):
+        def run():
+            calls.append(spin)
+            end = time.perf_counter() + spin
+            while time.perf_counter() < end:
+                pass
+        return run
+
+    runs = {"slow_host": make(200e-6), "fast_host": make(0.0)}
+    extra = _host_extra(runs)
+    assert extra["fast_host"] == 0.0 and 150e-6 < extra["slow_host"] < 2e-3, extra
+    calls.clear()
+    t0 = time.perf_counter()
+    _charged(runs["fast_host"], extra["slow_host"])()
+    assert time.perf_counter() - t0 >= extra["slow_host"] and calls == [0.0]
+    assert _charged(runs["fast_host"], 0.0) is runs["fast_host"]
+
+
+def _gpu_shared():
+    """Whether another process holds this test's GPU (nvidia-smi's compute apps on its UUID besides this one)."""
+    import subprocess
+    try:
+        uuid = str(torch.cuda.get_device_properties(torch.cuda.current_device()).uuid)
+        out = subprocess.run(["nvidia-smi", "--query-compute-apps=gpu_uuid,pid", "--format=csv,noheader"],
+                             capture_output = True, text = True, timeout = 20).stdout
+    except Exception:
+        return False
+    pids = {int(l.split(",")[1]) for l in out.splitlines() if l.count(",") == 1 and uuid in l.split(",")[0]}
+    return bool(pids - {os.getpid()})
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs a GPU")
+def test_a_trial_counts_the_host_charge():
+    """Two candidates with the same GPU work (~150 us) and host work hidden behind it, one 80 us slower on the host: a
+    trial's event time (one call between two CUDA events, as the tuner times one) cannot tell them apart; charged the
+    host time it costs beyond the other's, the slower's trials are longer by about that -- past the tuner's margin.
+    The tuner's premise is a GPU its process has to itself (it syncs before each trial), so this needs one: another
+    process's time slices lengthen trials and can also run a trial's first event late, after the host's charge, hiding
+    it (MEASURED beside 4 suite workers: charged 172 us, uncharged 172 -- the tuner's median of 7 had kept the slower);
+    each trial starts once its first event has run, the best of 20."""
+    import time
+    from pyjuice.layer.kernels import autotune
+    from pyjuice.nodes.external_params.blockscale.backward import _host_extra, _charged
+    if _gpu_shared():
+        pytest.skip("another process shares this GPU: event times there fold in its time slices")
 
     def make(spin):
         def run():
@@ -283,10 +331,26 @@ def test_the_plans_trials_charge_a_candidates_extra_host_time():
                 pass
         return run
 
+    def trial(run):
+        e0, e1 = torch.cuda.Event(enable_timing = True), torch.cuda.Event(enable_timing = True)
+        run()
+        torch.cuda.synchronize()
+        best = float("inf")
+        for _ in range(20):
+            e0.record()
+            while not e0.query():
+                pass
+            run(); e1.record(); torch.cuda.synchronize()
+            best = min(best, e0.elapsed_time(e1) * 1e-3)
+        return best
+
     runs = {"slow_host": make(80e-6), "fast_host": make(0.0)}
     extra = _host_extra(runs)
     assert extra["fast_host"] == 0.0 and extra["slow_host"] > 50e-6, extra
-    assert ck.autotune([(k, _charged(runs[k], extra[k])) for k in runs]) == "fast_host"
+    fast, slow = trial(runs["fast_host"]), trial(runs["slow_host"])
+    assert abs(slow - fast) < 30e-6, (fast, slow)                  # (the host spin hidden behind the GPU's work)
+    charged = trial(_charged(runs["slow_host"], extra["slow_host"]))
+    assert charged - fast > 50e-6 and charged > autotune.MARGIN * fast, (fast, charged)
 
 
 @needs_kernels

@@ -524,9 +524,13 @@ def test_blockscale_gate_gradients_at_bf16(B):
     g32 = grads(pc32)
     grads(pc_conv)                                                      # (its fp32 plans and sums built)
     pc_conv.set_param_dtype(BF16)
-    # (two fp32 circuits, their forks timed apart, differ by up to 9e-5 of the largest gradient -- MEASURED)
+    # (two fp32 circuits, their forks timed apart, differ by up to 9e-5 of the largest gradient; the bf16 circuit against
+    # the fp32 one with every tuner's choice drawn at random -- MEASURED, 60 draws at B 64 -- by 3.6e-4 .. 5.6e-4 of it
+    # (median 4.8e-4: the bf16 forks' own arithmetic, no one fork's), 3.1e-6 in 40 at B 8; the tuners' timed picks
+    # had passed a bar of 5e-4 until a suite's load timed others in. Summed in bf16 the log-Z term was 4-5e-3 off.)
+    bar = {8: 5e-5, 64: 1e-3}[B]
     for g16 in (grads(pc16), grads(pc_conv)):
-        assert torch.allclose(g16, g32, atol = 5e-4 * g32.abs().max().item(), rtol = 0.0), \
+        assert torch.allclose(g16, g32, atol = bar * g32.abs().max().item(), rtol = 0.0), \
             float((g16 - g32).abs().max() / g32.abs().max())
 
 
