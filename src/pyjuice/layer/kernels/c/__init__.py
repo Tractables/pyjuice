@@ -61,6 +61,8 @@ _pardeff_module = None  # its capture, the product layer below fused into it
 _pardeff_attempted = False
 _pardefc_module = None  # its capture in two chained launches
 _pardefc_attempted = False
+_pardefw_module = None  # its flush, the operand tiles loaded by a producer warp
+_pardefw_attempted = False
 _elestreamf_module = None  # the element-flow stream backward, the product layer below fused into its merge
 _elestreamf_attempted = False
 _pardef_attempted = False
@@ -866,6 +868,16 @@ def get_par_deferred_fused_module():
         _pardeff_attempted = True
         _pardeff_module = _jit("pyjuice_sum_par_deferred_fused_cuda", "par_deferred_fp16_fused.cu")
     return _pardeff_module
+
+
+def get_par_deferred_flush_ws_module():
+    """The deferred parameter flows' flush with its operand tiles loaded by a producer warp (`par_deferred_fp16_flush_ws.cu`:
+    `par_deferred_fp16.cu`'s flush to the bit, more configs for its tuner), or None (warns once)."""
+    global _pardefw_module, _pardefw_attempted
+    if not _pardefw_attempted:
+        _pardefw_attempted = True
+        _pardefw_module = _jit("pyjuice_sum_par_deferred_flush_ws_cuda", "par_deferred_fp16_flush_ws.cu")
+    return _pardefw_module
 
 
 def get_par_deferred_capture_module():

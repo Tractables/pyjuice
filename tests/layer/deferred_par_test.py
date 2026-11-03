@@ -36,6 +36,12 @@ needs_kernels = pytest.mark.skipif(_module() is None,
                                    reason = "needs the deferred parameter-flow kernels (nvcc + CUTLASS)")
 
 
+def _flush_modules():
+    """The modules a group's flush may take (`_Group._pick_cfg`): par_deferred_fp16.cu's and its producer-warp copy's."""
+    from pyjuice.layer.kernels.c import get_par_deferred_flush_ws_module
+    return [m for m in (_module(), get_par_deferred_flush_ws_module()) if m is not None]
+
+
 @pytest.fixture(autouse = True)
 def _defer_from_1m_flows(monkeypatch):
     """The mechanism from 1M flows a group, the shapes here (the default threshold is a speed choice, not a limit)."""
@@ -219,19 +225,22 @@ def test_a_backward_that_raised_leaves_nothing(monkeypatch):
     pc(x)
     pc.backward(x, flows_memory = 0.0)
     clean = pc.param_flows.clone()
-    mod = _module()
-    real_flush, calls = mod.flush, []
+    calls = []
 
     def failing_flush(*a):
         calls.append(1)
         raise RuntimeError("injected")
 
-    monkeypatch.setattr(mod, "flush", failing_flush)
+    mods = _flush_modules()
+    real_flushes = [m.flush for m in mods]
+    for m in mods:
+        monkeypatch.setattr(m, "flush", failing_flush)
     pc(x)
     with pytest.raises(RuntimeError, match = "injected"):
         pc.backward(x, flows_memory = 0.0)
     assert calls
-    monkeypatch.setattr(mod, "flush", real_flush)
+    for m, real in zip(mods, real_flushes):
+        monkeypatch.setattr(m, "flush", real)
     pc(x)
     pc.backward(x, flows_memory = 0.0)
     fin = torch.isfinite(clean)

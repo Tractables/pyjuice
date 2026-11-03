@@ -1,6 +1,7 @@
 """
 A tied group's parameter flows, deferred to one contraction (kernels/c/par_deferred_fp16.cu: fp16 operands with a
-power-of-two scale per (row, slot)) -- a regular sum layer's, or a `BlockScaleSumParams` layer's with its gates. A
+power-of-two scale per (row, slot); or its copy par_deferred_fp16_flush_ws.cu, the operand tiles loaded by a producer
+warp: the same bits, the flush's tuner picks) -- a regular sum layer's, or a `BlockScaleSumParams` layer's with its gates. A
 step's capture takes kernels/c/par_deferred_fp16_capture.cu where its slots' layout allows (the same operands in two
 chained launches), else that module's or par_deferred_fp16_fused.cu's -- and, where the group's GPU measured it faster,
 a SIDE stream: what a capture with the product layer fused reads (its layer's flows and node values, its products'
@@ -144,8 +145,8 @@ class _Group:
             self.cfg = self._pick_cfg(mod, pf, params)
         if self.slots == 0:                                   # (nothing captured since: the trials above are no adds)
             return
-        mod.flush(pf, self.A, self.Bop, self.fA, self.fB, self.pfids, self.pids, params, self.slots, self.cfg,
-                  self.bulk)
+        fmod, cfg = self.cfg
+        fmod.flush(pf, self.A, self.Bop, self.fA, self.fB, self.pfids, self.pids, params, self.slots, cfg, self.bulk)
         self.slots = 0
 
     def on_side(self, eligible: bool) -> bool:
@@ -177,17 +178,19 @@ class _Group:
         return self.mode
 
     def _pick_cfg(self, mod, pf, params):
-        """The flush config, measured once into a scratch copy of the flows (the flush read-adds-writes them)."""
+        """The flush's (module, config): `mod`'s configs and its producer-warp copy's (the same bits), measured once
+        into a scratch copy of the flows (the flush read-adds-writes them)."""
         import pyjuice.layer.kernels.c as ck
 
         blk, ne = self.A.size(1), self.Bop.size(1)
-        cands = [i for i, (bm, bn, bk) in enumerate(mod.flush_configs())
+        mods = [m for m in (mod, ck.get_par_deferred_flush_ws_module()) if m is not None]
+        cands = [(m, i) for m in mods for i, (bm, bn, bk) in enumerate(m.flush_configs())
                  if blk % bm == 0 and ne % bn == 0 and self.W % bk == 0]
         if len(cands) == 1 or torch.cuda.is_current_stream_capturing():
             return cands[0]
         scr = pf.clone()
-        trials = [(c, (lambda c = c: mod.flush(scr, self.A, self.Bop, self.fA, self.fB, self.pfids, self.pids, params,
-                                                self.slots, c, self.bulk))) for c in cands]
+        trials = [(c, (lambda c = c: c[0].flush(scr, self.A, self.Bop, self.fA, self.fB, self.pfids, self.pids, params,
+                                                 self.slots, c[1], self.bulk))) for c in cands]
         return ck.autotune(trials) or cands[0]
 
 
