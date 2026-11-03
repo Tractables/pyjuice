@@ -48,3 +48,5 @@ def deferred_scope():
         yield scope
     finally:
         _SCOPES.pop()
+        # (what it held dropped: a layer keeps its last scope, which must not keep the pass's buffers alive)
+        scope.pending = []

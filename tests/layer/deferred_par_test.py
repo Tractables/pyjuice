@@ -5,7 +5,8 @@ leaves against float64 recomputed from every deferred step's inputs -- homogeneo
 bf16 parameters, 39 steps (two flow blocks: two groups), a batch past 512 (two slots a step), and more steps than the
 slots hold (flushes during the pass); the deferral an accumulation (two backwards with `flows_memory = 1` give twice
 one); what keeps the per-step kernels (a layer callback, an untied HMM, a small group, fp32-level dots); the deferred
-flows against the per-step kernels'; a CUDA graph replaying it to the bit; and a backward that raised leaving nothing.
+flows against the per-step kernels'; a CUDA graph replaying it to the bit; and a backward that raised leaving nothing --
+to the next backward, nor alive after its circuit.
 The gated layers' copy of these: tests/model/external_params/blockscale_par_deferred_test.py. Skipped where the CUDA
 kernels cannot build.
 """
@@ -236,3 +237,32 @@ def test_a_backward_that_raised_leaves_nothing(monkeypatch):
     fin = torch.isfinite(clean)
     d = float((pc.param_flows[fin] - clean[fin]).abs().max() / clean[fin].abs().max())
     assert torch.equal(fin, torch.isfinite(pc.param_flows)) and d < 1e-5, f"the next backward's flows off by {d:.2e}"
+
+
+@needs_kernels
+def test_a_backward_that_raised_keeps_nothing_alive(monkeypatch):
+    """A backward that raised after a step was captured, before the flush: its scope drops the flush it held -- a
+    group keeps its last scope, through which the circuit's parameter flows would outlive the circuit."""
+    import gc
+    import weakref
+    pc, x = _instance(1024, 1, 6, "bf16", 64)
+    pc(x)
+    pc.backward(x, flows_memory = 0.0)
+    real, calls = dpar.try_defer, []
+
+    def try_defer(*a, **k):
+        calls.append(1)
+        if len(calls) == 2:                                   # (the first step captured, its group's flush pending)
+            raise RuntimeError("injected")
+        return real(*a, **k)
+
+    monkeypatch.setattr(dpar, "try_defer", try_defer)
+    pc(x)
+    with pytest.raises(RuntimeError, match = "injected"):
+        pc.backward(x, flows_memory = 0.0)
+    monkeypatch.setattr(dpar, "try_defer", real)
+    assert len(calls) == 2
+    flows = weakref.ref(pc.param_flows)
+    del pc, x
+    gc.collect()
+    assert flows() is None, "the raised backward's scope keeps the circuit's parameter flows alive"
