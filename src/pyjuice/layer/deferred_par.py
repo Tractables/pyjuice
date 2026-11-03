@@ -1,6 +1,8 @@
 """
 A tied group's parameter flows, deferred to one contraction (kernels/c/par_deferred_fp16.cu: fp16 operands with a
-power-of-two scale per (row, slot)) -- a regular sum layer's, or a `BlockScaleSumParams` layer's with its gates.
+power-of-two scale per (row, slot)) -- a regular sum layer's, or a `BlockScaleSumParams` layer's with its gates. A
+step's capture takes kernels/c/par_deferred_fp16_capture.cu where its slots' layout allows (the same operands in two
+chained launches), else that module's or par_deferred_fp16_fused.cu's.
 
 Tied copies of a sum node -- a homogeneous HMM's steps -- write their parameter flows into ONE flow block
 (compilation gives up to `max_tied_ns_per_parflow_block` copies the same `_param_flow_range`). Step by step, each
@@ -91,6 +93,9 @@ class _Group:
             self.fA = torch.ones(nb, self.S, blk, device = dev)
             self.fB = torch.ones(nb, self.S, ne, device = dev)
             self.M = torch.empty(nb, self.cps * self.W, device = dev, dtype = torch.int32)
+            # (`par_deferred_fp16_capture.cu`: a step's column maxima its own, zeroed as the slots fill from the first)
+            self.Ms = torch.empty(self.S // self.cps, nb, self.cps * self.W, device = dev, dtype = torch.int32)
+        self.steps_ok = None                                  # (whether that capture takes the group's slots)
 
     def flush(self, mod, pf, params):
         if self.slots == 0:
@@ -165,11 +170,14 @@ def try_defer(mod, layer, ctx, gate_table, ext, node_cbs, gate_cbs, ext_base, n_
             group = groups[gkey] = _Group(pfids, pids, nb, blk, ne, batch, pf)
         ok = (group is not None and group.S >= 2 * group.cps and torch.equal(group.pfids, pfids)
               and torch.equal(group.pids, pids))
-        member = cache[mkey] = ((gkey, _long(ctx["nids"]).contiguous(), _long(ctx["cids"]).contiguous(),
-                                 _long(gate_table).contiguous() if gate_table is not None else None) if ok else False)
+        cids = _long(ctx["cids"]).contiguous().view(nb, -1)
+        # (`shared`: every node block's edges the same children -- an HMM's blocks --, which the capture's warps use)
+        member = cache[mkey] = ((gkey, _long(ctx["nids"]).contiguous(), cids,
+                                 _long(gate_table).contiguous() if gate_table is not None else None,
+                                 bool((cids == cids[:1]).all())) if ok else False)
     if member is False:
         return False
-    gkey, nids, cids, gtab = member
+    gkey, nids, cids, gtab, shared = member
     group = _groups_of(pf, create = False).get(gkey)
     if group is None:
         return False
@@ -181,10 +189,23 @@ def try_defer(mod, layer, ctx, gate_table, ext, node_cbs, gate_cbs, ext_base, n_
         group.flush(mod, pf, params)
     gated = gtab is not None                                   # (a regular layer's gate table and log-gates: unread)
     children = ctx.get("children")
-    if children is not None:
+    import pyjuice.layer.kernels.c as cuda_kernels
+    cmod = cuda_kernels.get_par_deferred_capture_module()
+    if group.steps_ok is None:
+        group.steps_ok = cmod is not None and bool(cmod.fits(group.W, batch))
+    if group.steps_ok:
+        # (the same operands in two chained launches, a step's column maxima its own: `par_deferred_fp16_capture.cu`)
+        if group.slots == 0:
+            group.Ms.zero_()
+        fused = children is not None
+        cmod.capture_steps(
+            group.A, group.Bop, group.fA, group.fB, group.Ms, ctx["node_flows"], ctx["node_mars"],
+            ctx["node_mars"] if fused else ctx["element_mars"], children[0] if fused else group.Ms,
+            int(children[1]) if fused else 0, ext if gated else ctx["node_mars"], nids, cids, gtab if gated else nids,
+            batch, group.slots, node_cbs, gate_cbs, ext_base, gated, fused, shared)
+    elif children is not None:
         # (the product layer below fused: each edge's element value formed from its product's two children,
         # `par_deferred_fp16_fused.cu` -- the same operands, the product layer's forward not run for them)
-        import pyjuice.layer.kernels.c as cuda_kernels
         fmod = cuda_kernels.get_par_deferred_fused_module()
         if fmod is None:
             return False

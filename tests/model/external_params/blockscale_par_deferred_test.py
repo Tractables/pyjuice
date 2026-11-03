@@ -79,7 +79,7 @@ def _instance(L, nb, gcb, T, dt, B, neg_gates = False, tied = True, seed = 0, ga
 
 
 def _record(monkeypatch):
-    """Every `capture` (its inputs, cloned) and `flush` the backward runs, the real ones still run."""
+    """Every `capture` / `capture_steps` (its inputs, cloned) and `flush` the backward runs, the real ones still run."""
     mod = _module()
     caps, flushes = [], []
     real_cap, real_flush = mod.capture, mod.flush
@@ -99,6 +99,28 @@ def _record(monkeypatch):
 
     monkeypatch.setattr(mod, "capture", capture)
     monkeypatch.setattr(mod, "flush", flush)
+
+    # the same captures where the two-launch kernels take them (par_deferred_fp16_capture.cu): the same inputs recorded
+    from pyjuice.layer.kernels.c import get_par_deferred_capture_module
+    cmod = get_par_deferred_capture_module()
+    if cmod is not None:
+        real_steps = cmod.capture_steps
+
+        def capture_steps(A, Bop, fA, fB, Ms, nf, nm, esrc, ctab, first_row, ext, nids, cids, gate, batch, slot,
+                          node_cbs, gate_cbs, ext_base, gated, fused, shared):
+            assert gated, "a gated layer's capture reads its gates"
+            if fused:                                        # (each element's value from its product's two children)
+                em = torch.full((first_row + ctab.size(0), batch), NEG, device = DEV)
+                em[first_row:] = nm[ctab[:, 0].long()] + nm[ctab[:, 1].long()]
+            else:
+                em = esrc.clone()
+            caps.append(dict(A = A, nf = nf.clone(), nm = nm.clone(), em = em, ext = ext.clone(), nids = nids,
+                             cids = cids, gate = gate, batch = batch, node_cbs = node_cbs, gate_cbs = gate_cbs,
+                             ext_base = ext_base, blk = A.size(1), ne = Bop.size(1), slot = slot))
+            return real_steps(A, Bop, fA, fB, Ms, nf, nm, esrc, ctab, first_row, ext, nids, cids, gate, batch, slot,
+                              node_cbs, gate_cbs, ext_base, gated, fused, shared)
+
+        monkeypatch.setattr(cmod, "capture_steps", capture_steps)
     return caps, flushes
 
 

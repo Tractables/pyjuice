@@ -59,6 +59,8 @@ _elestream_attempted = False
 _pardef_module = None   # a tied group's deferred parameter flows (fp16 operands): capture + flush
 _pardeff_module = None  # its capture, the product layer below fused into it
 _pardeff_attempted = False
+_pardefc_module = None  # its capture in two chained launches
+_pardefc_attempted = False
 _elestreamf_module = None  # the element-flow stream backward, the product layer below fused into its merge
 _elestreamf_attempted = False
 _pardef_attempted = False
@@ -864,6 +866,17 @@ def get_par_deferred_fused_module():
         _pardeff_attempted = True
         _pardeff_module = _jit("pyjuice_sum_par_deferred_fused_cuda", "par_deferred_fp16_fused.cu")
     return _pardeff_module
+
+
+def get_par_deferred_capture_module():
+    """The deferred parameter-flow capture in two chained launches (`par_deferred_fp16_capture.cu`: a step's column
+    maxima, a lane's consecutive columns, an edge's rows of every node block at once where they share children), or
+    None (warns once)."""
+    global _pardefc_module, _pardefc_attempted
+    if not _pardefc_attempted:
+        _pardefc_attempted = True
+        _pardefc_module = _jit("pyjuice_sum_par_deferred_capture_cuda", "par_deferred_fp16_capture.cu")
+    return _pardefc_module
 
 
 def ele_stream_fused_is_available() -> bool:
