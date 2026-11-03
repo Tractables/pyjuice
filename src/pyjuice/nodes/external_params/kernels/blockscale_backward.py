@@ -322,7 +322,9 @@ def _bs_triton_par_kernel(node_flows, node_mars, element_mars, mparams, param_fl
         scaled_emars = tl.exp(emars + log_n_fdm_max[:,None])
 
         if TL_DOT == 1:
-            acc += tl.dot(n_fdm_sub, scaled_emars)
+            # (both operands rounded to TF32 first, as the element kernel's: truncated by the dot, the gated layers'
+            # parameter flows came out 6.1e-4 low on average -- MEASURED, a CoDD-sized gated layer -- rounded, 2e-6)
+            acc += tl.dot(_tf32_rna(n_fdm_sub), _tf32_rna(scaled_emars))
         else:
             # axis-0 form on purpose -- see `_BROADCAST_SUM_NOTE` in pyjuice/layer/kernels/__init__.py
             acc += tl.sum(tl.trans(n_fdm_sub)[:,:,None] * scaled_emars[:,None,:], axis = 0)

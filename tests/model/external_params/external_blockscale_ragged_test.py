@@ -473,6 +473,38 @@ def test_backward_matches_reference_over_repeats(name):
 
 
 @cuda_only
+@pytest.mark.parametrize("batch", [64, 256])
+@pytest.mark.parametrize("name", list(TOPOLOGIES))
+def test_the_triton_param_flows_are_unbiased(name, batch, monkeypatch):
+    """`_bs_triton_par_kernel`'s parameter flows against the float64 reference, by their SIGNED mean relative error --
+    a bias every bar on the largest error above lets through. Its TF32 dot truncated both operands (the tensor cores
+    drop an fp32's low 13 bits): MEASURED -6.4e-4 .. -6.9e-4 on every topology here at either batch; rounded to TF32
+    first (`_tf32_rna`, as the element kernel's), -5e-6 .. +3.5e-5."""
+    import pyjuice.nodes.external_params.kernels.blockscale_backward as kb
+    launches, real = [], kb._bs_triton_par_kernel
+
+    class Spy:
+        def __getitem__(self, grid):
+            def run(*args, **kwargs):
+                launches.append(kwargs.get("TL_DOT"))
+                return real[grid](*args, **kwargs)
+            return run
+    monkeypatch.setattr(kb, "_bs_triton_par_kernel", Spy())
+    gate_cbs = 8
+    pc, root, ns, layer, data, phi = _run(name, batch = batch, gate_cbs = gate_cbs)
+    pc(data, sum_external_params = {ns: phi})
+    pc.backward(data, flows_memory = 0.0)
+    if 1 not in launches:
+        pytest.skip(f"{name}: the parameter flows were not the Triton kernel's dot form here")
+    _, ref_pf = _flow_reference(pc, ns, phi, gate_cbs, batch)
+    ns.update_param_flows(pc.param_flows)
+    got = ns.get_param_flows().double().to(ref_pf.device)
+    live = ref_pf > 1e-30
+    rel = (got[live] - ref_pf[live]) / ref_pf[live]
+    assert abs(float(rel.mean())) < 1.5e-4, f"{name}: the parameter flows are biased by {float(rel.mean()):+.2e}"
+
+
+@cuda_only
 @needs_cute
 @pytest.mark.parametrize("name", NONDENSE)
 def test_param_flows_are_bit_stable_across_repeats(name):
