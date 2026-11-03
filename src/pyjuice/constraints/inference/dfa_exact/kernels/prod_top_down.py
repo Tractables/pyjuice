@@ -28,13 +28,14 @@ import numpy as np
 import torch
 import triton
 import triton.language as tl
+from triton.language.extra.cuda import gdc_wait
 
 from pyjuice.layer.kernels import autotune
 from pyjuice.utils.kernel_launcher import triton_jit
 from pyjuice.utils.util import host_cdiv, host_next_power_of_2
 
 from .common import (NODE_TILE, SUM, _block_ptr, _child, _exit_width, _next_col, _interval, _logaddexp_tile, _lse_step, _pair,
-                     _slot, _tf32_operand, _tile_rows, grid_chunks, tensor)
+                     _slot, _tf32_operand, _tile_rows, grid_chunks, tensor, pdl_launch)
 from .compact import _lane, _lane_ends
 from .transitions import enumerated_args
 from .prod import (BLOCK_BLOCK_PROGRAMS_PER_SM, BLOCK_BLOCK_TILES, EXACT_BELOW, PRODUCT_PRECISION, SKIP_EMPTY_TILES,
@@ -240,7 +241,7 @@ def _input_block_top_down_kernel(element_flows, temp_flows, node_flows, node_mar
                                 PRUNE: tl.constexpr, ORDERED: tl.constexpr, COMPACT: tl.constexpr,
                                 C_FULL: tl.constexpr, OUT_FULL: tl.constexpr, SAMPLE: tl.constexpr, ENUM: tl.constexpr,
                                 LOGW: tl.constexpr, SAMPLE_MASSES: tl.constexpr, TN: tl.constexpr, SUBS: tl.constexpr,
-                                TILE: tl.constexpr):
+                                TILE: tl.constexpr, PDL: tl.constexpr = False):
     """The right operand ``R`` over ``[t + 1, t2)`` of ``input @ block`` steps: ``O_R[q, j] = log sum over the
     parents, and over the entries ``(i, class)`` leading to ``q`` at boundary ``t``, of mass + O_out[i, j]``. One
     program per ``TN`` children of a node tile (:func:`~.common.node_tiles`: children of one interval with as many
@@ -253,6 +254,8 @@ def _input_block_top_down_kernel(element_flows, temp_flows, node_flows, node_mar
     :meth:`~..compiled.program.Program.mass_args` lays them out, ``SAMPLE_MASSES`` each sample's own over its
     entries). Ungrouped, an entry's mass is read by its class's code (``ENUM``: an enumerated
     class's from its token, see :func:`_entry_mass`; ``Cs`` the stored classes, the table's width)."""
+    if PDL:                                             # (the launch before it, done)
+        gdc_wait()
     c, real, c0 = _tile_rows(tiles, tl.program_id(0), TN, SUBS)
     tile = pid0 + tl.program_id(1)
     row = tl.load(children + c * 4 + 0)
@@ -372,11 +375,13 @@ def _block_input_top_down_kernel(element_flows, temp_flows, node_flows, node_mar
                                 PRUNE: tl.constexpr, ORDERED: tl.constexpr, COMPACT: tl.constexpr,
                                 C_FULL: tl.constexpr, OUT_FULL: tl.constexpr, SAMPLE: tl.constexpr, ENUM: tl.constexpr,
                                 LOGW: tl.constexpr, SAMPLE_MASSES: tl.constexpr, TN: tl.constexpr, SUBS: tl.constexpr,
-                                TILE: tl.constexpr):
+                                TILE: tl.constexpr, PDL: tl.constexpr = False):
     """The left operand ``L`` over ``[t0, t)`` of ``block @ input`` steps (output over ``[t0, t + 1)``): ``O_L[i, q] =
     log sum over the parents and over the entries ``(successor, class)`` of ``q`` at boundary ``t`` of mass +
     O_out[i, successor]``. Node tiles, ``ORDERED``, ``COMPACT``, ``SAMPLE``, codes (``ENUM``): as
     :func:`_input_block_top_down_kernel`."""
+    if PDL:                                             # (the launch before it, done)
+        gdc_wait()
     c, real, c0 = _tile_rows(tiles, tl.program_id(0), TN, SUBS)
     tile = pid0 + tl.program_id(1)
     row = tl.load(children + c * 4 + 0)
@@ -1093,6 +1098,7 @@ def run_top_down(launches, bufs, prog, regions, element_flows, temp_flows, node_
             tn = min(height, TOP_DOWN_NODES)
             tile = max(16, min(_flat_tile(max(lanes_max, 1)), TOP_DOWN_TILE_LANES // tn))
             kernel = _input_block_top_down_kernel if la.form == "input_block" else _block_input_top_down_kernel
+            pdl = pdl_launch(element_flows.device)
             tables = (tt.pred_ptr, tt.pred_col, prog.mass_x("pred_x")) if la.form == "input_block" else \
                 (tt.entry_ptr, tt.entry_succ, prog.mass_x("entry_x"))
             for first, size in grid_chunks(host_cdiv(lanes_max, tile), 1):
@@ -1107,7 +1113,7 @@ def run_top_down(launches, bufs, prog, regions, element_flows, temp_flows, node_
                     OUT_TEMP = out_temp, HOMOGENEOUS = prog.homogeneous,
                     GROUPED = grouped, PRUNE = prune, ORDERED = ordered, COMPACT = compact is not None,
                     C_FULL = c_full, OUT_FULL = out_full, SAMPLE = sample, SAMPLE_MASSES = margs["SAMPLE_MASSES"],
-                    TN = tn, SUBS = height // tn, TILE = tile,
+                    TN = tn, SUBS = height // tn, TILE = tile, PDL = pdl, launch_pdl = pdl,
                     num_warps = TOP_DOWN_WARPS, **common, **lists, **enumerated_args(prog, masses))
         elif compact is not None:                    # block @ block on compact values, a sample's rectangle at a time
             c_kind, o_kind, out_temp = la.kinds

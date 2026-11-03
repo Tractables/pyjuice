@@ -33,13 +33,14 @@ import numpy as np
 import torch
 import triton
 import triton.language as tl
+from triton.language.extra.cuda import gdc_wait
 
 from pyjuice.constraints.distributions import find_token
 from pyjuice.utils.kernel_launcher import triton_jit
 from pyjuice.utils.util import host_cdiv, host_next_power_of_2
 
 from .common import (IDENTITY, NODE_TILE, _block_ptr, _exit_width, _interval, _next_col, _logaddexp_tile, _lse_step, _slot,
-                     _tf32_operand, _tile_rows, grid_chunks, node_groups, node_tiles, tensor)
+                     _tf32_operand, _tile_rows, grid_chunks, node_groups, node_tiles, tensor, pdl_launch)
 from .prod import _lse_step_one_exp
 from .prod_top_down import _once, _out_flows_ptr, _parent_base, _parent_lane
 from .sum import _num_sms
@@ -285,7 +286,8 @@ def _class_weight_kernel(dfa_class_flow, cw_col, cw_K, cw_count, cw_cls, cw_off,
                          C, K, pid0, HOMOGENEOUS: tl.constexpr, BLOCK_INPUT: tl.constexpr, S_KIND: tl.constexpr, OUT_TEMP: tl.constexpr,
                          PRUNE: tl.constexpr, OUT_FULL: tl.constexpr, S_FULL: tl.constexpr, UNIFORM: tl.constexpr,
                          COMPACT: tl.constexpr, MARS: tl.constexpr, STORE: tl.constexpr, WALK: tl.constexpr,
-                         TN: tl.constexpr, SUBS: tl.constexpr, TB: tl.constexpr, TC: tl.constexpr, TJ: tl.constexpr):
+                         TN: tl.constexpr, SUBS: tl.constexpr, TB: tl.constexpr, TC: tl.constexpr, TJ: tl.constexpr,
+                         PDL: tl.constexpr = False):
     """One program per (``TN`` destinations of a node tile, ``TB`` samples, ``TC`` classes), a lane per (sample,
     class): the log class weights of its steps' inputs (see the module docstring) -- a walk over the columns ``i`` of
     the input's boundary where the lane's class leads somewhere, then over the other boundary's columns ``TJ`` at a
@@ -310,6 +312,8 @@ def _class_weight_kernel(dfa_class_flow, cw_col, cw_K, cw_count, cw_cls, cw_off,
     (nor row). Dead (column, class) pairs are -inf terms either way, so both walks give the same bits. ``COMPACT``: the
     outputs' top-down values compact (:mod:`.compact`; ``tflow_width`` the scratch rows' width there, ``temp_width``
     their inside values'); ``MARS``: the other operands' inside values too (by the same layout)."""
+    if PDL:                                             # (the launch before it, done)
+        gdc_wait()
     d, real, d0 = _tile_rows(tiles, tl.program_id(0), TN, SUBS)
     lane = tl.arange(0, TB * TC)
     b = ((pid0 + tl.program_id(1)) * TB + lane // TC).to(tl.int64)
@@ -1026,6 +1030,7 @@ def run_class_weights(launches, cw: dict, prog, bufs, element_flows, temp_flows,
         TB = max(1, min(host_next_power_of_2(B), 128 // TC, CLASS_WEIGHT_LANES // (TC * TJ * TN)))
         lanes = TN * TB * TC * TJ
         warps = 1 if lanes <= 128 else 2 if lanes <= 512 else 4
+        pdl = pdl_launch(element_flows.device)
         for first, size in grid_chunks(host_cdiv(B, TB), 1):
             _class_weight_kernel[(tiles.numel() // NODE_TILE * (height // TN), size, host_cdiv(max(rows.most, 1), TC))](
                 cw["buf"], cw["col"], cw["K"], rows.count, rows.cls, rows.off, element_flows, temp_flows, node_mars,
@@ -1040,7 +1045,7 @@ def run_class_weights(launches, cw: dict, prog, bufs, element_flows, temp_flows,
                 PRUNE = prune, OUT_FULL = out_full, S_FULL = all(s_full), UNIFORM = not prune or TB == 1,
                 COMPACT = compact is not None, MARS = inside, STORE = store, WALK = CLASS_WEIGHT_WALK, TN = TN,
                 HOMOGENEOUS = prog.homogeneous,
-                SUBS = height // TN, TB = TB, TC = TC, TJ = TJ, num_warps = warps)
+                SUBS = height // TN, TB = TB, TC = TC, TJ = TJ, PDL = pdl, launch_pdl = pdl, num_warps = warps)
 
 
 # -------------------------------------------------------------------------------------------------
