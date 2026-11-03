@@ -15,9 +15,11 @@ node blocks write one gate row -- copies of a node whose gates are tied (`tie_ex
 the gradient's adds are atomic, in no fixed order (the per-layer launches add them one layer after another).
 
 One more option of the tuners: at a group's first end of pass, `autotune.pick` (keyed by shape; margin 1.0: the same
-results either way) times the layers' own launches -- now after the last layer -- against the deferred ones, into
-scratch outputs; the faster is kept. Inside a CUDA graph capture an untimed group takes the layers' own launches, as
-does one whose pointer tables (made with a host copy) are not made yet.
+results either way) times the layers' own launches -- now after the last layer -- against the deferred ones, in their
+own form and in `_forms`'s, into scratch outputs; the fastest is kept. Where it is a deferred one, the backwards that
+follow run each form in turn, timed by their periods (`FORM_TRIALS`), and keep the fastest. Inside a CUDA graph capture
+an untimed group takes the layers' own launches, as does one whose pointer tables (made with a host copy) are not made
+yet.
 
 A layer defers only inside a scope -- a circuit's backward -- that allows it (`_defer_param_flows`: no layer callback,
 which would see the node values and gradients between layers). What waits is safe to: nothing of the pass reads a
@@ -27,6 +29,7 @@ theirs and the inputs'), its gradient rows or `W` -- all read after the pass, wh
 
 from __future__ import annotations
 
+import contextlib
 import itertools
 
 import torch
@@ -43,6 +46,23 @@ _MAX_TABLES = 256
 # kept by its layer), so a backward builds no key; the plan held, so its id is not reused while the entry lives
 _SHAPES = dict()
 
+# device index -> the stream a form of `_forms` launches the `W` kernel on, beside the gradient's
+_SIDE = dict()
+
+#: Backwards a shape's deferred kernels run in each of their forms -- their own and `_forms`'s: the same bits -- in turn,
+#: once the tuner chose one of them, each timed by its backward's period (CUDA events: its launch to the next backward's,
+#: the whole step), before the fastest form is kept (the best of each form's) where it is at least `FORM_MARGIN` faster
+#: than their own; after `FORM_WARM` backwards in the tuner's form -- those deferred_par's side-stream placement times
+#: its own in (its `SIDE_WARM` and twice `SIDE_TRIALS`: they change a period by several percent). The tuner times the
+#: forms back to back into scratch outputs, their inputs in L2; at the end of a pass they come mostly from DRAM, and the
+#: order can change: MEASURED (tied gated HMMs, bf16; each form forced in one process) HMM-4096 in 4 blocks B 128 at the
+#: plan's node tiles of 64, `_forms`'s -0.9% / -0.4% / +1.0% a training step, the tuner taking the second (in another
+#: process +1.1% a step). Nor is the launch's own time enough where a step waits for its host: a form's side stream
+#: costs ~25 us of host -- HMM-2048 in 4 blocks B 64, the launch 49 -> 35 us in the pass but +1.3% a step.
+FORM_TRIALS, FORM_WARM, FORM_MARGIN = 3, 9, 0.005
+
+# the tuner's key -> its shape's `_FormTrials`
+_FORM_TRIALS = dict()
 
 
 def _shape(member):
@@ -113,26 +133,69 @@ class _PostGroup:
                 nm = torch.empty_like(m0["node_mars"])
                 grad = None if m0["grad_ext"] is None else torch.zeros_like(m0["grad_ext"])
                 ws = {p: torch.zeros_like(members[i]["W"]) for p, i in zip(tabs["w_keys"], tabs["w_first"])}
+                forms, ran = _forms(m0), set()
 
                 def bench(c):
                     if c == "layers":
                         for m in members:
                             _launch_layer(self.owner, m, nm, grad, ws.get(_ptr(m["W"])))
                     else:
-                        _launch_deferred(members, tabs, nm, grad, ws)
+                        _launch_deferred(members, tabs, nm, grad, ws, None if c == "deferred" else c)
+                        ran.add(c)
 
-                choice = autotune.pick(key, ["layers", "deferred"], bench, margin = 1.0)
+                choice = autotune.pick(key, ["layers", "deferred"] + forms, bench, margin = 1.0)
                 del nm, grad, ws
+                # (then, a deferred form chosen, the forms that launched timed in the backwards that follow)
+                forms = [f for f in forms if f in ran]
+                if choice != "layers" and forms and FORM_TRIALS > 0 and key not in _FORM_TRIALS:
+                    _FORM_TRIALS[key] = _FormTrials([None] + forms)
             else:
                 choice = autotune.cached(key) or "layers"
             if autotune.cached(key) is not None:
                 self.owner.__dict__.setdefault("_bs_post_choice", {})[self.shape] = choice
-        if choice == "deferred":
-            _launch_deferred(members, tabs, members[0]["node_mars"], members[0]["grad_ext"],
-                             {p: members[i]["W"] for p, i in zip(tabs["w_keys"], tabs["w_first"])})
-        else:
+        if choice == "layers":
             for m in members:
                 _launch_layer(self.owner, m, m["node_mars"], m["grad_ext"], m["W"])
+            return
+        form = None if choice == "deferred" else choice
+        trials = _FORM_TRIALS.get(key)
+        if trials is not None:
+            form = trials.next(form)
+        _launch_deferred(members, tabs, members[0]["node_mars"], members[0]["grad_ext"],
+                         {p: members[i]["W"] for p, i in zip(tabs["w_keys"], tabs["w_first"])}, form)
+
+
+class _FormTrials:
+    """A shape's deferred kernels run in each of their forms (None: their own) in turn in its backwards, each timed by
+    its backward's period, `FORM_TRIALS` times each."""
+
+    def __init__(self, forms):
+        self.forms, self.warm, self.chosen, self.marks = forms, FORM_WARM, None, []
+
+    def next(self, pick):
+        """The form of this backward's launch: `pick` (the tuner's) while warming up or in a capture, else the next one
+        timed, or the one kept once each was."""
+        if self.chosen is not None:
+            return self.chosen[0]
+        if torch.cuda.is_current_stream_capturing():
+            return pick
+        if self.warm > 0:
+            self.warm -= 1
+            return pick
+        mark = torch.cuda.Event(enable_timing = True)
+        mark.record()
+        self.marks.append(mark)
+        done = [[] for _ in self.forms]                         # (each period: a timed launch to the next one)
+        for k, (a, b) in enumerate(zip(self.marks, self.marks[1:])):
+            if b.query():
+                done[k % len(self.forms)].append(a.elapsed_time(b))
+        if min(len(d) for d in done) >= FORM_TRIALS:
+            best = min(range(len(self.forms)), key = lambda i: min(done[i]))
+            if min(done[best]) > (1 - FORM_MARGIN) * min(done[0]):
+                best = 0
+            self.chosen, self.marks = (self.forms[best],), None
+            return self.chosen[0]
+        return self.forms[(len(self.marks) - 1) % len(self.forms)]
 
 
 def _launch_layer(owner, m, node_mars, grad_ext, W) -> None:
@@ -150,8 +213,33 @@ def _launch_layer(owner, m, node_mars, grad_ext, W) -> None:
         W = log_z if W is None else W, partial = partial, counter = counter, **consts)
 
 
-def _launch_deferred(members, tabs, node_mars, grad_ext, ws) -> None:
-    """The deferred kernels over every member (their outputs given: ``ws`` by each `W`'s address)."""
+def _forms(m0) -> list:
+    """The deferred launch's other forms -- ``(gate tiles a gradient program, the gradient's batch tile, W's node
+    tile)`` --, the bits of its own: `W` at a node tile of 64 -- the M dimension of its dots, free -- launched on a side
+    stream beside the gradient's launch (forked before it, joined after both); and that with the gradient over up to 4
+    gate tiles a program (`kernels/blockscale_post_backward_deferred_wide.py`) at a batch tile of 16 or of 32 -- the N
+    dimension of its dots, free. MEASURED (tied gated HMMs, 15 layers, bf16; the gradient's launch then `W`'s, the
+    plan's node tiles 32 / 64 -> the fastest form): HMM-4096 in 4 blocks, 128 gates a block, B 128 230 / 192 -> 167 /
+    168 us, B 512 830 / 801 -> 656 / 770; 256 gates a block, B 128 427 -> 319; 64, 127 / 125 -> 97 / 102; HMM-2048 in
+    2 blocks B 256 125 / 135 -> 97 / 102, in 4 blocks B 64 53 / 45 -> 43; HMM-1024 B 128 33 -> 31 -- `W` at node tiles
+    of 64 the fastest at each but HMM-1024's (within 1 us), the wide gradient's batch tile 16 at B 128 and 32 at B 512
+    / 256; over 8 gate tiles slower everywhere (and over shared memory at node tiles of 64). The dot form only
+    (`USE_DOT`)."""
+    consts = m0["plan"][1]
+    if not consts["USE_DOT"]:
+        return []
+    w_tm = min(64, consts["BLOCK_SIZE_M"]) if consts["WANT_W"] else 0
+    forms = [(0, consts["TILE_B"], w_tm)] if w_tm else []
+    g_tiles = triton.cdiv(consts["n_gates"], consts["TILE_G"])
+    if consts["WANT_GRAD"] and g_tiles > 1:
+        ngt = min(4, triton.next_power_of_2(g_tiles))
+        forms += [(ngt, 16, w_tm), (ngt, 32, w_tm)]
+    return forms
+
+
+def _launch_deferred(members, tabs, node_mars, grad_ext, ws, form = None) -> None:
+    """The deferred kernels over every member (their outputs given: ``ws`` by each `W`'s address), in their own form
+    (``form`` None) or one of `_forms`."""
     from ..kernels.blockscale_post_backward_deferred import _bs_post_deferred_grad_kernel, _bs_post_deferred_w_kernel
     m0 = members[0]
     grid, consts, _ = m0["plan"]
@@ -160,17 +248,38 @@ def _launch_deferred(members, tabs, node_mars, grad_ext, ws) -> None:
     common = _shape(m0)[2]
     log_z0 = m0["log_z"]
     t = tabs["all"]
-    _bs_post_deferred_grad_kernel[(len(members) * rows, grid[1] if want_grad else 1, grid[2])](
-        m0["node_flows"], node_mars, t["lz"], t["sg"] if want_grad else t["lz"], m0["ext"], t["gate"], t["nids"],
-        t["ext_base"], log_z0 if grad_ext is None else grad_ext, ROWS = rows, WANT_GRAD = int(want_grad),
-        GRAD_ATOMIC = tabs["grad_atomic"], **common)
+    ngt, tb, w_tm = form or (0, consts["TILE_B"], consts["TILE_M"])
     if consts["WANT_W"]:
         tw, w_ptrs = tabs["w"], tabs["w_ptrs"]
         if any(int(p) != _ptr(ws[int(p)]) for p in tabs["w_keys"]):        # (scratch `W`s: a table of their own)
             w_ptrs = torch.tensor([_ptr(ws[int(p)]) for p in tabs["w_keys"]], dtype = torch.int64, device = log_z0.device)
-        _bs_post_deferred_w_kernel[(rows * (bs_ // consts["TILE_M"]), grid[1], len(tabs["w_keys"]))](
-            m0["node_flows"], tw["lz"], m0["ext"], tw["gate"], tw["nids"], tw["ext_base"], w_ptrs, tw["off"],
-            N_SLICES = grid[2], **common)
+    main = side = None
+    if form is not None and w_tm:
+        main = torch.cuda.current_stream(log_z0.device)
+        side = _SIDE.get(log_z0.device.index)
+        if side is None:
+            side = _SIDE[log_z0.device.index] = torch.cuda.Stream(device = log_z0.device)
+        side.wait_stream(main)
+    gargs = (m0["node_flows"], node_mars, t["lz"], t["sg"] if want_grad else t["lz"], m0["ext"], t["gate"], t["nids"],
+             t["ext_base"], log_z0 if grad_ext is None else grad_ext)
+    if ngt:
+        from ..kernels.blockscale_post_backward_deferred_wide import _bs_post_deferred_grad_wide_kernel
+        wide = {k: v for k, v in common.items() if k != "USE_DOT"}
+        wide.update(TILE_B = tb, num_warps = 4)
+        _bs_post_deferred_grad_wide_kernel[(len(members) * rows,
+                                            triton.cdiv(triton.cdiv(consts["batch_size"], tb), consts["B_TILES_PER_PROG"]),
+                                            triton.cdiv(grid[1], ngt))](
+            *gargs, ROWS = rows, NGT = ngt, GRAD_ATOMIC = tabs["grad_atomic"], **wide)
+    else:
+        _bs_post_deferred_grad_kernel[(len(members) * rows, grid[1] if want_grad else 1, grid[2])](
+            *gargs, ROWS = rows, WANT_GRAD = int(want_grad), GRAD_ATOMIC = tabs["grad_atomic"], **common)
+    if consts["WANT_W"]:
+        with contextlib.nullcontext() if side is None else torch.cuda.stream(side):
+            _bs_post_deferred_w_kernel[(rows * (bs_ // w_tm), grid[1], len(tabs["w_keys"]))](
+                m0["node_flows"], tw["lz"], m0["ext"], tw["gate"], tw["nids"], tw["ext_base"], w_ptrs, tw["off"],
+                N_SLICES = grid[2], **(common if side is None else dict(common, TILE_M = w_tm, num_warps = 4)))
+    if side is not None:
+        main.wait_stream(side)
 
 
 def _tables(members):

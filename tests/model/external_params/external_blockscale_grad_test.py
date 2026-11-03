@@ -207,7 +207,7 @@ def test_every_fork_computes_the_same_gradient():
 
 @cuda_only
 @needs_cute
-@pytest.mark.parametrize("post", ["per layer", "deferred"])
+@pytest.mark.parametrize("post", ["per layer", "deferred", "deferred wide"])
 @pytest.mark.parametrize("two_per_layer", [False, True])
 def test_tied_gates_accumulate_across_every_layer_that_shares_them(post, two_per_layer, monkeypatch):
     """`tie_external` points every copy of a tied node at the SOURCE's gate tensor, so one gradient row
@@ -220,17 +220,19 @@ def test_tied_gates_accumulate_across_every_layer_that_shares_them(post, two_per
 
     The copies one a layer (a chain), or two in each of two layers (two node blocks of one partition writing the same
     rows); the post-backward -- the log-Z term -- launched by each layer, or deferred to the end of the pass and run for
-    every layer at once (`blockscale.post_deferred`, the tuners' choice there forced). A store into rows another writer
-    of the launch adds to lost terms in either: the per-layer kernel's in one partition, the deferred kernel's across
-    layers."""
+    every layer at once (`blockscale.post_deferred`, the tuners' choice there forced: the deferred kernels, or their form
+    with the gradient over several gate tiles a program). A store into rows another writer of the launch adds to lost
+    terms in any: the per-layer kernel's in one partition, the deferred kernels' across layers."""
     import pyjuice.layer.kernels.autotune as autotune
     import pyjuice.nodes.external_params.blockscale.post_deferred as pdm
     dev = torch.device("cuda:0")
-    K, gate_cbs, batch, steps = 128, 8, 64, (6 if two_per_layer else 4)
+    # (the wide gradient's arm: gates of 2 children, 64 a node -- 2 gate tiles, which it is offered at)
+    K, gate_cbs, batch, steps = 128, (2 if post == "deferred wide" else 8), 64, (6 if two_per_layer else 4)
     monkeypatch.setattr(autotune, "_CACHE", {})              # (a choice another test made is not the one forced)
-    if post == "deferred":
+    if post != "per layer":
         real_pick = autotune.pick
-        monkeypatch.setattr(autotune, "pick", lambda key, cands, bench, *a, **kw: "deferred"
+        forced = lambda cands: "deferred" if post == "deferred" else next(c for c in cands if isinstance(c, tuple) and c[0])
+        monkeypatch.setattr(autotune, "pick", lambda key, cands, bench, *a, **kw: forced(cands)
                             if key[0] == "bs_post_deferred" else real_pick(key, cands, bench, *a, **kw))
         real_defer, deferred = pdm.try_defer, []
         monkeypatch.setattr(pdm, "try_defer", lambda *a, **kw: real_defer(*a, **kw) and (deferred.append(1) or True))
@@ -338,7 +340,7 @@ def test_tied_gates_accumulate_across_every_layer_that_shares_them(post, two_per
     total = torch.stack(untied).sum(dim = 0)
     d = float((tied[0] - total).abs().max() / total.abs().max())
     assert d < 1e-4, f"the tied gradient is not the sum over its copies (off by {d} relative)"
-    assert post != "deferred" or deferred, "nothing was deferred"
+    assert post == "per layer" or deferred, "nothing was deferred"
 
 
 @cuda_only
