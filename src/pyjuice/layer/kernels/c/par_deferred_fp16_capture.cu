@@ -16,6 +16,8 @@
 // non-coherent ones (ld.global.nc: data read-only for the kernel's lifetime), and ptxas issued them ABOVE the wait
 // (MEASURED at 16 columns a lane and 2 rows a warp: a slot's operands from maxima half made). Not L2-only loads either
 // (ld.global.cg: MEASURED the operands' kernel 7.5 -> 15.3 us -- every warp reads the same few lines, all at once).
+// A capture may run on a side stream (`side`, `pyjuice.layer.deferred_par`'s choice): the fork is an event recorded on the
+// calling stream and waited for on the side one -- here, in C++, a few microseconds of host instead of Python's ~12.
 // Scope (the caller checks it): a slot's columns W = 32 VPL with VPL 1, 2, 4, 8 or 16, batch % 4 == 0, blk % 64 == 0,
 // num_edges % 64 == 0. What par_deferred_fp16.cu's header says of the operands holds here.
 //
@@ -284,14 +286,24 @@ bool fits(int64_t W, int64_t batch) {
     return W % 32 == 0 && (v == 1 || v == 2 || v == 4 || v == 8 || v == 16) && batch % 4 == 0;
 }
 
+// The event a capture on a side stream waits for, recorded on the stream it was called on (one a device, reused: a wait
+// takes the event's state when it is queued)
+static cudaEvent_t fork_event(int dev) {
+    static cudaEvent_t evs[64] = {};
+    TORCH_CHECK(dev >= 0 && dev < 64, "capture steps: device ", dev);
+    if (evs[dev] == nullptr) C10_CUDA_CHECK(cudaEventCreateWithFlags(&evs[dev], cudaEventDisableTiming));
+    return evs[dev];
+}
+
 // `capture` / `capture_fused`'s arguments but `Ms` int32 [steps, nbk, Mp] (zeroed before the slots fill from the first;
 // this step's at slot0 / cps) for their `M`, `esrc` (element_mars, or node_mars where `fused`) and `ctab` (read where
-// `fused`), `shared` (the caller verified that every node block's edges have the same children)
+// `fused`), `shared` (the caller verified that every node block's edges have the same children); `side` a stream
+// (`cudaStream_t` as an integer) to launch on after what the current stream has queued, or 0 for the current stream
 void capture_steps(torch::Tensor A, torch::Tensor Bop, torch::Tensor fA, torch::Tensor fB, torch::Tensor Ms,
                    torch::Tensor node_flows, torch::Tensor node_mars, torch::Tensor esrc, torch::Tensor ctab,
                    int64_t first_row, torch::Tensor ext, torch::Tensor nids, torch::Tensor cids, torch::Tensor gate,
                    int64_t batch, int64_t slot0, int64_t node_cbs, int64_t gate_cbs, int64_t ext_base, bool gated,
-                   bool fused, bool shared) {
+                   bool fused, bool shared, int64_t side) {
     const int nbk = (int)A.size(0), blk = (int)A.size(1), ne = (int)Bop.size(1), S = (int)fA.size(1);
     const long Ks = A.size(2);
     const int W = (int)(Ks / S), Mp = (int)Ms.size(2), cps = Mp / W;
@@ -303,6 +315,12 @@ void capture_steps(torch::Tensor A, torch::Tensor Bop, torch::Tensor fA, torch::
                            ctab.size(1) == 2), "capture steps: ctab int32 [rows, 2]");
     const at::cuda::OptionalCUDAGuard guard(A.device());
     cudaStream_t st = c10::cuda::getCurrentCUDAStream();
+    if (side != 0) {                                     // (the fork: an event recorded here, waited for there)
+        const cudaEvent_t ev = fork_event(A.device().index());
+        C10_CUDA_CHECK(cudaEventRecord(ev, st));
+        st = reinterpret_cast<cudaStream_t>(side);
+        C10_CUDA_CHECK(cudaStreamWaitEvent(st, ev, 0));
+    }
     auto* Mord = reinterpret_cast<unsigned*>(Ms.data_ptr()) + (long)(slot0 / cps) * nbk * Mp;
     launch_pdl(caps_m_kernel, dim3(nbk, Mp / 32, blk / 64), dim3(256), st, node_flows.data_ptr<float>(),
                node_mars.data_ptr<float>(), nids.data_ptr<long>(), Mord, blk, (int)batch, Mp);

@@ -7,23 +7,30 @@ tied layer captures its step's operands, and one contraction after the pass adds
 
 Outside a scope (a layer's backward called directly) nothing can be deferred: :func:`current_scope` is None and the
 caller runs its work at once. A scope that ends in an exception drops what it held -- state a layer keeps for a scope
-must therefore be checked against the scope it belongs to (the identity of :func:`current_scope`) before reuse.
+must therefore be checked against the scope it belongs to (the identity of :func:`current_scope`) before reuse -- but
+runs what must follow its work either way (:meth:`DeferredScope.at_close`: a side stream's join).
 """
 
 from __future__ import annotations
 
 from contextlib import contextmanager
-from typing import Callable, List, Optional
+from typing import Callable, Dict, Hashable, List, Optional
 
 
 class DeferredScope:
-    """What the inner layers of one backward deferred, run in order by :meth:`run`."""
+    """What the inner layers of one backward deferred, run in order by :meth:`run`; and what runs as the scope closes,
+    after :meth:`run` or an exception (:meth:`at_close`)."""
 
     def __init__(self):
         self.pending: List[Callable[[], None]] = []
+        self.closing: Dict[Hashable, Callable[[], None]] = {}
 
     def defer(self, fn: Callable[[], None]) -> None:
         self.pending.append(fn)
+
+    def at_close(self, key: Hashable, fn: Callable[[], None]) -> None:
+        """`fn` runs as the scope closes, raised or not -- once a `key`, however often it is added."""
+        self.closing.setdefault(key, fn)
 
     def run(self) -> None:
         pending, self.pending = self.pending, []
@@ -49,4 +56,6 @@ def deferred_scope():
     finally:
         _SCOPES.pop()
         # (what it held dropped: a layer keeps its last scope, which must not keep the pass's buffers alive)
-        scope.pending = []
+        closing, scope.pending, scope.closing = scope.closing, [], {}
+        for fn in closing.values():
+            fn()

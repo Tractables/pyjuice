@@ -107,7 +107,7 @@ def _record(monkeypatch):
         real_steps = cmod.capture_steps
 
         def capture_steps(A, Bop, fA, fB, Ms, nf, nm, esrc, ctab, first_row, ext, nids, cids, gate, batch, slot,
-                          node_cbs, gate_cbs, ext_base, gated, fused, shared):
+                          node_cbs, gate_cbs, ext_base, gated, fused, shared, side):
             assert gated, "a gated layer's capture reads its gates"
             if fused:                                        # (each element's value from its product's two children)
                 em = torch.full((first_row + ctab.size(0), batch), NEG, device = DEV)
@@ -118,7 +118,7 @@ def _record(monkeypatch):
                              cids = cids, gate = gate, batch = batch, node_cbs = node_cbs, gate_cbs = gate_cbs,
                              ext_base = ext_base, blk = A.size(1), ne = Bop.size(1), slot = slot))
             return real_steps(A, Bop, fA, fB, Ms, nf, nm, esrc, ctab, first_row, ext, nids, cids, gate, batch, slot,
-                              node_cbs, gate_cbs, ext_base, gated, fused, shared)
+                              node_cbs, gate_cbs, ext_base, gated, fused, shared, side)
 
         monkeypatch.setattr(cmod, "capture_steps", capture_steps)
     return caps, flushes
@@ -414,3 +414,35 @@ def test_a_backward_that_raised_leaves_nothing(monkeypatch):
     fin = torch.isfinite(clean)
     d = float((pc.param_flows[fin] - clean[fin]).abs().max() / clean[fin].abs().max())
     assert torch.equal(fin, torch.isfinite(pc.param_flows)) and d < 1e-5, f"the next backward's flows off by {d:.2e}"
+
+
+@needs_kernels
+def test_gated_captures_stay_on_the_main_stream(monkeypatch):
+    """A gated layer's capture reads node values its backward shifts by log Z: it never goes to `deferred_par`'s side
+    stream, whatever its group chose -- the flows the main stream's to the bit."""
+    pc, phi, x = _instance(1024, 1, 64, 8, "bf16", 128)
+    taken = []
+    real = dpar._side_stream
+    monkeypatch.setattr(dpar, "_side_stream", lambda dev: (taken.append(dev), real(dev))[1])
+
+    def backward():
+        pc.init_param_flows(flows_memory = 0.0)
+        pc(x, sum_external_params = phi)
+        pc.backward(x, flows_memory = 1.0)
+        torch.cuda.synchronize()
+
+    backward()
+    groups = [g for _, (_, gs) in list(dpar._GROUPS.items()) for g in gs.values()]
+    assert groups, "nothing deferred"
+    for g in groups:
+        g.side, g.mode, g.trials, g.warm = False, None, [], 0
+    # (the groups' flows only: elsewhere a backward's atomics may round in another order)
+    ranges = [(int(g.pfids.min()), int(g.pfids.max()) + g.A.size(1)) for g in groups]
+    backward()
+    ref = [pc.param_flows[a:b].clone() for a, b in ranges]
+    for g in groups:
+        g.side, g.mode, g.trials, g.warm = True, None, [], 0
+    backward()
+    assert not taken, "a gated capture went to the side stream"
+    for (a, b), r in zip(ranges, ref):
+        assert torch.equal(pc.param_flows[a:b].view(torch.int32), r.view(torch.int32))

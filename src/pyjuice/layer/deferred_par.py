@@ -2,7 +2,12 @@
 A tied group's parameter flows, deferred to one contraction (kernels/c/par_deferred_fp16.cu: fp16 operands with a
 power-of-two scale per (row, slot)) -- a regular sum layer's, or a `BlockScaleSumParams` layer's with its gates. A
 step's capture takes kernels/c/par_deferred_fp16_capture.cu where its slots' layout allows (the same operands in two
-chained launches), else that module's or par_deferred_fp16_fused.cu's.
+chained launches), else that module's or par_deferred_fp16_fused.cu's -- and, where the group's GPU measured it faster,
+a SIDE stream: what a capture with the product layer fused reads (its layer's flows and node values, its products'
+children's node values) no later launch of the pass writes -- later layers write lower nodes' flows; a gated layer's
+parameterization may change its own node values in place (BlockScale and LowRank shift them by log Z), and its backward
+joins the side stream first (`join_side`, `ExternalParamsSumLayer.backward`) -- so it runs beside the next layers'
+chains, on the SMs their kernels leave idle, joined before the slots are flushed and as the backward's scope closes.
 
 Tied copies of a sum node -- a homogeneous HMM's steps -- write their parameter flows into ONE flow block
 (compilation gives up to `max_tied_ns_per_parflow_block` copies the same `_param_flow_range`). Step by step, each
@@ -29,6 +34,7 @@ A slot is at most 512 of a step's columns (its rows' scales its own): a batch pa
 
 from __future__ import annotations
 
+import functools
 import weakref
 
 import torch
@@ -59,6 +65,36 @@ MIN_FLOWS = 1 << 23
 #: B 64 (2^28) 1.93 -> 2.04 and HMM-1024 B 128 (2^27) 3.42 -> 3.45: there a capture's 8 us of host (a memset, two
 #: launches) is more than the per-step kernel it replaces.
 MIN_FLOW_SAMPLES = 1 << 29
+
+#: Backwards a group times in each place of its captures (the main stream, a side stream: the same bits) before it keeps
+#: the side stream if it was at least `SIDE_MARGIN` faster -- a backward's time from its first capture to the NEXT
+#: backward's (CUDA events: the whole step, the next forward's wait for a host still busy with this backward included --
+#: timed only to its flush, the side stream was kept where it is 3% slower), the best of each place's, after `SIDE_WARM`
+#: backwards untimed (the other tuners' first calls). MEASURED (the training step, bf16, the side stream against the main
+#: one, both forced in one process): HMM-4096 in 4 blocks B128 -4.8%, B512 +1.7%; HMM-2048 in 2 blocks B128 -5.5% (+6.3%
+#: with the fork in Python, ~12 us of host a capture) -- either way, so each group's GPU decides. Main stream without
+#: autotuning (`autotune.ENABLED`) or in a capture.
+SIDE_TRIALS, SIDE_WARM, SIDE_MARGIN = 3, 3, 0.01
+
+# device index -> [the side stream, whether a capture was left on it since the last join]
+_SIDE = dict()
+
+
+def join_side(device) -> None:
+    """The current stream waits for every capture left on `device`'s side stream -- before anything writes what a
+    capture reads (a gated layer's backward), before a group's slots are flushed, and as a backward's scope closes
+    (raised or not: no later launch, nor a buffer freed, may overlap a capture of it)."""
+    entry = _SIDE.get(torch.device(device).index)
+    if entry is not None and entry[1]:
+        torch.cuda.current_stream(device).wait_stream(entry[0])
+        entry[1] = False
+
+
+def _side_stream(device):
+    entry = _SIDE.get(device.index)
+    if entry is None:
+        entry = _SIDE[device.index] = [torch.cuda.Stream(device = device), False]
+    return entry
 
 # id(param_flows buffer) -> (a weak reference to it, {group key: _Group}); by identity, not equality (a tensor's `==`
 # is elementwise), the entry gone with the buffer
@@ -96,8 +132,12 @@ class _Group:
             # (`par_deferred_fp16_capture.cu`: a step's column maxima its own, zeroed as the slots fill from the first)
             self.Ms = torch.empty(self.S // self.cps, nb, self.cps * self.W, device = dev, dtype = torch.int32)
         self.steps_ok = None                                  # (whether that capture takes the group's slots)
+        # where its captures run: `side` the chosen place (None until measured), `mode` this backward's, `trials` the
+        # backwards timed [place, an event at its first capture], `warm` backwards left untimed
+        self.side, self.mode, self.trials, self.warm = None, None, [], SIDE_WARM
 
     def flush(self, mod, pf, params):
+        join_side(pf.device)
         if self.slots == 0:
             return
         if self.cfg is None:
@@ -107,6 +147,34 @@ class _Group:
         mod.flush(pf, self.A, self.Bop, self.fA, self.fB, self.pfids, self.pids, params, self.slots, self.cfg,
                   self.bulk)
         self.slots = 0
+
+    def on_side(self, eligible: bool) -> bool:
+        """Whether this backward's captures run on the side stream: the place chosen, else the next one timed."""
+        if self.mode is not None:
+            return self.mode
+        self.mode = False
+        if not eligible:
+            return False
+        from pyjuice.layer.kernels import autotune
+        if self.side is not None:
+            self.mode = self.side
+        elif autotune.ENABLED and not torch.cuda.is_current_stream_capturing():
+            if self.warm > 0:
+                self.warm -= 1
+                return False
+            t0 = torch.cuda.Event(enable_timing = True)
+            t0.record()
+            self.trials.append([None, t0])
+            done = {False: [], True: []}                     # (a backward's place: its first capture to the next's)
+            for (place, a), (_, b) in zip(self.trials, self.trials[1:]):
+                if b.query():
+                    done[place].append(a.elapsed_time(b))
+            if min(len(done[False]), len(done[True])) >= SIDE_TRIALS:
+                self.side = self.mode = min(done[True]) < (1 - SIDE_MARGIN) * min(done[False])
+                self.trials = []
+            else:
+                self.mode = self.trials[-1][0] = len(self.trials) % 2 == 0     # (main, side, main, side, ...)
+        return self.mode
 
     def _pick_cfg(self, mod, pf, params):
         """The flush config, measured once into a scratch copy of the flows (the flush read-adds-writes them)."""
@@ -184,7 +252,9 @@ def try_defer(mod, layer, ctx, gate_table, ext, node_cbs, gate_cbs, ext_base, n_
 
     if group.scope is not scope:                               # a new backward: whatever a past one left is dropped
         group.slots, group.scope = 0, scope
+        group.mode = None
         scope.defer(lambda: group.flush(mod, pf, params))
+        scope.at_close(("join_side", pf.device), functools.partial(join_side, pf.device))
     if group.slots + group.cps > group.S:                      # full: add what the slots hold, then go on
         group.flush(mod, pf, params)
     gated = gtab is not None                                   # (a regular layer's gate table and log-gates: unread)
@@ -198,11 +268,18 @@ def try_defer(mod, layer, ctx, gate_table, ext, node_cbs, gate_cbs, ext_base, n_
         if group.slots == 0:
             group.Ms.zero_()
         fused = children is not None
-        cmod.capture_steps(
-            group.A, group.Bop, group.fA, group.fB, group.Ms, ctx["node_flows"], ctx["node_mars"],
-            ctx["node_mars"] if fused else ctx["element_mars"], children[0] if fused else group.Ms,
-            int(children[1]) if fused else 0, ext if gated else ctx["node_mars"], nids, cids, gtab if gated else nids,
-            batch, group.slots, node_cbs, gate_cbs, ext_base, gated, fused, shared)
+        args = (group.A, group.Bop, group.fA, group.fB, group.Ms, ctx["node_flows"], ctx["node_mars"],
+                ctx["node_mars"] if fused else ctx["element_mars"], children[0] if fused else group.Ms,
+                int(children[1]) if fused else 0, ext if gated else ctx["node_mars"], nids, cids,
+                gtab if gated else nids, batch, group.slots, node_cbs, gate_cbs, ext_base, gated, fused, shared)
+        # (a side stream only for the children's values: `element_mars` rows are rewritten by the next layers'
+        # products, and a gated capture reads values its backward shifts)
+        if group.on_side(fused and not gated):
+            side = _side_stream(pf.device)
+            cmod.capture_steps(*args, side[0].cuda_stream)    # (forked there after the current stream's queue)
+            side[1] = True
+        else:
+            cmod.capture_steps(*args, 0)
     elif children is not None:
         # (the product layer below fused: each edge's element value formed from its product's two children,
         # `par_deferred_fp16_fused.cu` -- the same operands, the product layer's forward not run for them)

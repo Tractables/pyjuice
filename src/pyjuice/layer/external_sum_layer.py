@@ -10,6 +10,7 @@ from pyjuice.nodes import ExternalParamsSumNodes
 from pyjuice.utils import launch_plans
 from pyjuice.utils.launch_plans import LaunchPlans
 from pyjuice.utils.parameter_list import FastParamList
+from . import deferred_par
 from .sum_layer import SumLayer
 from .fused_children import form_elements, scatter_flows
 
@@ -702,6 +703,11 @@ class ExternalParamsSumLayer(SumLayer):
             self._resolve_external_grad_tensors(kwargs, ns_info, node_mars.size(1), node_mars.device)
             for ns_info, _ in ns_tensors
         ]
+
+        # `pre_backward_layer` may change this layer's node values in place (BlockScale and LowRank shift them by log Z,
+        # undone in `post_backward_layer`), which a capture the deferral left on its side stream may still read -- a
+        # tied layer's above, its products' children's values: it finishes first (`deferred_par.join_side`)
+        deferred_par.join_side(node_mars.device)
 
         # A launch plan of the rest (`pyjuice.utils.launch_plans`) where the parameterization keeps one
         # (`ExternalSumParams.backward_plan`): the two hooks and the standard backward between them are host work
