@@ -86,6 +86,11 @@ __device__ __forceinline__ void mbar_wait(uint64_t* bar, int phase) {
                  ::"r"(a), "r"(phase) : "memory");
 }
 
+// The launches of a chain overlap (programmatic dependent launch), so what an earlier launch writes -- the partials,
+// the pre-pass's maxima and exponentials -- is read after the wait through pointers that are NOT __restrict__: a
+// `const __restrict__` pointer's loads are non-coherent ones (ld.global.nc: data read-only for the kernel's lifetime),
+// which the compiler may issue before the wait -- ptxas did, in par_deferred_fp16_capture.cu's first version.
+
 // ---------------- pre-pass: a block per (element block x k-tile, PB columns) ----------------
 __global__ void __launch_bounds__(256) bs_ele_prepass_kernel(const float* __restrict__ nflows,
                                                              const float* __restrict__ nmars,
@@ -153,7 +158,7 @@ template <int BM, int BN, int WM, int WN, int G, int PW, int ST, int PD, bool CW
 __global__ void __launch_bounds__((G * WM * WN + PW) * 32) bs_ele_stream_kernel(
         float* __restrict__ eflows, const float* __restrict__ emars, const TP* __restrict__ mp,
         const long* __restrict__ chids, const long* __restrict__ pbase, const long* __restrict__ gate,
-        const half_t* __restrict__ bx, const float* __restrict__ mx, const float* __restrict__ ext,
+        const half_t* bx, const float* mx, const float* __restrict__ ext,
         float* __restrict__ grad_ext, int batch, int BSK, int BSM, int knt, int gc, long ext_base,
         int pid_m_offset) {
     constexpr int NCG = WM * WN * 32, NC = G * NCG, NP = PW * 32;

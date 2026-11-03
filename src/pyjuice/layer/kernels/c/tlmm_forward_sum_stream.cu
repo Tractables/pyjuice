@@ -72,6 +72,11 @@ __device__ __forceinline__ void mbar_wait(uint64_t* bar, int phase) {
                  "@!p bra W_%=;\n}\n" ::"r"(a), "r"(phase) : "memory");
 }
 
+// The launches of a chain overlap (programmatic dependent launch), so what an earlier launch writes -- the partials,
+// the pre-pass's maxima and exponentials -- is read after the wait through pointers that are NOT __restrict__: a
+// `const __restrict__` pointer's loads are non-coherent ones (ld.global.nc: data read-only for the kernel's lifetime),
+// which the compiler may issue before the wait -- ptxas did, in par_deferred_fp16_capture.cu's first version.
+
 // ---------------- pre-pass: a thread block per (group, split, PB columns) ----------------
 // Thread (part, b) takes the range's 32-child chunks part, part + PARTS, ...: a chunk is one run of `element_mars` rows
 // (half an edge tile, the tile's first row from `ebase` of the group's first node block `grep`); the range's max over
@@ -144,7 +149,7 @@ template <int BM, int BN, int WM, int WN, int PW, int ST, int KT>
 __global__ void __launch_bounds__((WM * WN + PW) * 32) stream_gemm_kernel(
         const bfloat16_t* __restrict__ params, const long* __restrict__ pbase, const bfloat16_t* __restrict__ u,
         const int* __restrict__ ugrp, float* __restrict__ part, int knt, int mtiles, int block_size, int batch,
-        int num_edges, int split, long rows_total, float* __restrict__ node_mars, const float* __restrict__ mp,
+        int num_edges, int split, long rows_total, float* __restrict__ node_mars, const float* mp,
         const long* __restrict__ nids) {
     constexpr int NC = WM * WN * 32, NP = PW * 32;
     constexpr int ABYTES = KT * BM * 2, BBYTES = KT * BN * 2;
@@ -316,7 +321,7 @@ __global__ void __launch_bounds__((WM * WN + PW) * 32) stream_gemm_kernel(
 // ---------------- merge: a thread per 4 columns of a node ----------------
 template <int S>
 __global__ void __launch_bounds__(256) stream_merge_kernel(
-        float* __restrict__ node_mars, const float* __restrict__ part, const float* __restrict__ mp,
+        float* __restrict__ node_mars, const float* part, const float* mp,
         const long* __restrict__ nids, const int* __restrict__ ugrp, int batch, int block_size, long rows_total) {
     cudaGridDependencySynchronize();                     // (the GEMM's partials)
     const long idx = (long)blockIdx.x * 256 + threadIdx.x;

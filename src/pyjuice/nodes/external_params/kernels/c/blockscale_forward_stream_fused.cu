@@ -91,6 +91,11 @@ __device__ __forceinline__ void mbar_wait(uint64_t* bar, int phase) {
                  "@!p bra W_%=;\n}\n" ::"r"(a), "r"(phase) : "memory");
 }
 
+// The launches of a chain overlap (programmatic dependent launch), so what an earlier launch writes -- the partials,
+// the pre-pass's maxima and exponentials -- is read after the wait through pointers that are NOT __restrict__: a
+// `const __restrict__` pointer's loads are non-coherent ones (ld.global.nc: data read-only for the kernel's lifetime),
+// which the compiler may issue before the wait -- ptxas did, in par_deferred_fp16_capture.cu's first version.
+
 // ---------------- pre-pass: a thread block per (row, split, PB columns) ----------------
 // Thread (part, b) takes the split's 32-child chunks part, part + PARTS, ...: a chunk is one run of `element_mars` rows
 // (half an edge tile) under CH / gc gates (gc = min(gate width, CH)), its s = em + log phi in registers; the split's
@@ -488,8 +493,8 @@ __global__ void __launch_bounds__((WM * WN + PW) * 32) bs_streamf_gemm_kernel(
 // ---------------- merge: a thread per 4 columns of a node ----------------
 template <int S>
 __global__ void __launch_bounds__(256) bs_streamf_merge_kernel(
-        float* __restrict__ node_mars, const float* __restrict__ log_z, const float* __restrict__ part,
-        const float* __restrict__ mp, const long* __restrict__ nids, int batch, int block_size, long rows_total) {
+        float* __restrict__ node_mars, const float* log_z, const float* part,
+        const float* mp, const long* __restrict__ nids, int batch, int block_size, long rows_total) {
     cudaGridDependencySynchronize();                     // (the GEMM's partials and log Z)
     const long idx = (long)blockIdx.x * 256 + threadIdx.x;
     const int bq = batch / 4;

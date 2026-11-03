@@ -83,6 +83,11 @@ template <int N> __device__ __forceinline__ void cpa_wait() {
     asm volatile("cp.async.wait_group %0;\n" ::"n"(N) : "memory");
 }
 
+// The launches of a chain overlap (programmatic dependent launch), so what an earlier launch writes -- the partials,
+// the pre-pass's maxima and exponentials -- is read after the wait through pointers that are NOT __restrict__: a
+// `const __restrict__` pointer's loads are non-coherent ones (ld.global.nc: data read-only for the kernel's lifetime),
+// which the compiler may issue before the wait -- ptxas did, in par_deferred_fp16_capture.cu's first version.
+
 // ---------------- pre-pass: a thread block per (node block x edge tile, PB batch columns) ----------------
 // bx[(tile * BK + e) * batch + b] = bf16 exp(element[e0 + e, b] - mx), mx[tile * batch + b] the max over the tile's
 // edges (exp's argument and the -inf guard as in the other kernels); tile = node block * knt + edge tile.
@@ -125,7 +130,7 @@ extern __shared__ char smem_raw[];
 template <int BM, int BN, int WM, int WN, int PW, int ST, bool TIX, typename TP>
 __global__ void __launch_bounds__((WM * WN + PW) * 32) tlmm_prepass_kernel(
         float* __restrict__ node_mars, const TP* __restrict__ mp, const long* __restrict__ nids,
-        const long* __restrict__ pbase, const __nv_bfloat16* __restrict__ bx, const float* __restrict__ mx,
+        const long* __restrict__ pbase, const __nv_bfloat16* bx, const float* mx,
         const int* __restrict__ tix, float* __restrict__ part, int batch, int block_size, int knt, int split,
         long rows_total, int pid_m_offset) {
     constexpr int NC = WM * WN * 32;                 // consumer threads
@@ -331,7 +336,7 @@ __global__ void __launch_bounds__((WM * WN + PW) * 32) tlmm_prepass_kernel(
 // ---------------- the ranges' merge (split > 1): a thread per (node, column) ----------------
 // node_mars = log sum_z L_z exp(M_z - M) + M over the ranges, M their maximum (-inf where every M_z is), the sum in
 // range order. `part`: L [split, rows, batch] then M [split, rows, batch]; row = node block x block_size + node.
-__global__ void merge_kernel(float* __restrict__ node_mars, const float* __restrict__ part, const long* __restrict__ nids,
+__global__ void merge_kernel(float* __restrict__ node_mars, const float* part, const long* __restrict__ nids,
                              int split, long rows_total, int block_size, int batch) {
     cudaGridDependencySynchronize();                 // (the streaming kernel's partials)
     const long i = (long)blockIdx.x * blockDim.x + threadIdx.x;

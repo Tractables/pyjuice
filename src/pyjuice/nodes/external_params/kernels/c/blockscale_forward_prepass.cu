@@ -86,6 +86,11 @@ __device__ __forceinline__ void mbar_wait(uint64_t* bar, int phase) {
                  "@!p bra W_%=;\n}\n" ::"r"(a), "r"(phase) : "memory");
 }
 
+// The launches of a chain overlap (programmatic dependent launch), so what an earlier launch writes -- the partials,
+// the pre-pass's maxima and exponentials -- is read after the wait through pointers that are NOT __restrict__: a
+// `const __restrict__` pointer's loads are non-coherent ones (ld.global.nc: data read-only for the kernel's lifetime),
+// which the compiler may issue before the wait -- ptxas did, in par_deferred_fp16_capture.cu's first version.
+
 // ---------------- pre-pass: a thread block per (node block x edge tile, PB batch columns) ----------------
 // bx[(tile * BK + e) * batch + b] = bf16 exp(s - mx), s = element + log phi; mx[tile * batch + b] = max_e s;
 // lp[(tile * QG + g) * batch + b] = log phi of the tile's gate g (rows 0 .. 64 / gc - 1); gm[tile * batch + b] = their
@@ -160,8 +165,8 @@ __global__ void __launch_bounds__(NT) bs_prepass_kernel(
 // = bf16 exp(log phi - mz) of gate g. The maxima before the block's tiles are over every earlier tile's (read in
 // parallel), its tiles' running maxima the fork's chain itself (warp 0, in shared memory), then the exponentials.
 template <int NT, int CH>
-__global__ void __launch_bounds__(NT) bs_factors_kernel(const float* __restrict__ mx, const float* __restrict__ gm,
-                                                        const float* __restrict__ lp, float* __restrict__ f,
+__global__ void __launch_bounds__(NT) bs_factors_kernel(const float* mx, const float* gm,
+                                                        const float* lp, float* __restrict__ f,
                                                         __nv_bfloat16* __restrict__ zg, int batch, int knt, int ng) {
     constexpr int W = 32, PARTS = NT / W;
     __shared__ float sM[CH + 1][W], sZ[CH + 1][W], sX[CH][W], sC[2][PARTS][W];
@@ -251,8 +256,8 @@ constexpr int smem_bytes() { return ST * stage_bytes<BM, BN>() + (G > 1 ? 2 * BM
 template <int BM, int BN, int WM, int WN, int G, int PW, int ST, typename TP>
 __global__ void __launch_bounds__((G * WM * WN + PW) * 32) bs_stream_kernel(
         float* __restrict__ node_mars, const TP* __restrict__ mp, const long* __restrict__ nids,
-        const long* __restrict__ pids, const __nv_bfloat16* __restrict__ bx, const float* __restrict__ f,
-        const __nv_bfloat16* __restrict__ zg, float* __restrict__ log_z_out, int batch, int block_size, int knt,
+        const long* __restrict__ pids, const __nv_bfloat16* bx, const float* f,
+        const __nv_bfloat16* zg, float* __restrict__ log_z_out, int batch, int block_size, int knt,
         int pid_m_offset, int gsh) {
     constexpr int NCG = WM * WN * 32;                // a consumer group's threads
     constexpr int NC = G * NCG;

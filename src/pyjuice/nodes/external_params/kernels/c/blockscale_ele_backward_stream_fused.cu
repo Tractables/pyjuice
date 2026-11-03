@@ -90,6 +90,11 @@ __device__ __forceinline__ void mbar_wait(uint64_t* bar, int phase) {
                  " @!p bra W_%=;\n}\n" ::"r"(a), "r"(phase) : "memory");
 }
 
+// The launches of a chain overlap (programmatic dependent launch), so what an earlier launch writes -- the partials,
+// the pre-pass's maxima and exponentials -- is read after the wait through pointers that are NOT __restrict__: a
+// `const __restrict__` pointer's loads are non-coherent ones (ld.global.nc: data read-only for the kernel's lifetime),
+// which the compiler may issue before the wait -- ptxas did, in par_deferred_fp16_capture.cu's first version.
+
 // ---------------- pre-pass: a block per (group, piece, PB columns) ----------------
 // Thread (part, b) takes the piece's 32-parent chunks part, part + PARTS, ...: lf in registers, the piece's max in
 // shared memory, the exponentials split into hi + lo. A piece past PARTS chunks loads its later chunks twice.
@@ -336,8 +341,8 @@ __device__ __forceinline__ void rs_round(float* v, int lane, int ofs) {
 // 24.2 -> 15.7 us at B 512, 8.2 -> 5.9 at B 128 -- the registers for 4 blocks an SM, 3x fewer shuffles.
 __global__ void __launch_bounds__(256, 4) bs_elesf_merge_kernel(
         float* __restrict__ nflows, const float* __restrict__ nmars, const int* __restrict__ ctab, long first_row,
-        const float* __restrict__ part,
-        const float* __restrict__ mp, const float* __restrict__ ext, const int* __restrict__ pc_gate,
+        const float* part,
+        const float* mp, const float* __restrict__ ext, const int* __restrict__ pc_gate,
         const long* __restrict__ chids, const int* __restrict__ ugrp, float* __restrict__ grad, int batch, int BSM,
         int gc, int R, long ext_base, int npc, long rows_total, int wgrad) {
     __shared__ float sg[16][PMAX][16];                   // [group of children][piece][column]: summed over chunks

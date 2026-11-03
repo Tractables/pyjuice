@@ -69,6 +69,11 @@ template <int N> __device__ __forceinline__ void cpa_wait() {
     asm volatile("cp.async.wait_group %0;\n" ::"n"(N) : "memory");
 }
 
+// The launches of a chain overlap (programmatic dependent launch), so what an earlier launch writes -- the partials,
+// the pre-pass's maxima and exponentials -- is read after the wait through pointers that are NOT __restrict__: a
+// `const __restrict__` pointer's loads are non-coherent ones (ld.global.nc: data read-only for the kernel's lifetime),
+// which the compiler may issue before the wait -- ptxas did, in par_deferred_fp16_capture.cu's first version.
+
 // ---------------- pre-pass: a thread block per (element block x parent tile, PB batch columns), 256 threads ----------
 __global__ void __launch_bounds__(256) ele_prepass_kernel(const float* __restrict__ nflows, const float* __restrict__ nmars,
                                                          const long* __restrict__ ebase, half_t* __restrict__ bx,
@@ -128,8 +133,8 @@ extern __shared__ char smem_raw[];
 template <int BM, int BN, int WM, int WN, int PW, int ST, int PBT, bool TIX, typename TP>
 __global__ void __launch_bounds__((WM * WN + PW) * 32) ele_stream_kernel(
         float* __restrict__ eflows, const float* __restrict__ emars, const TP* __restrict__ mp,
-        const long* __restrict__ chids, const long* __restrict__ pbase, const half_t* __restrict__ bx,
-        const float* __restrict__ mx, const int* __restrict__ tix, float* __restrict__ part, int batch, int BSK,
+        const long* __restrict__ chids, const long* __restrict__ pbase, const half_t* bx,
+        const float* mx, const int* __restrict__ tix, float* __restrict__ part, int batch, int BSK,
         int BSM, int knt, int split, long rows_total, int pid_m_offset) {
     constexpr int NC = WM * WN * 32;
     constexpr int NP = PW * 32;
@@ -314,7 +319,7 @@ __global__ void __launch_bounds__((WM * WN + PW) * 32) ele_stream_kernel(
 // ---------------- the ranges' merge (split > 1): a thread per (element, column) ----------------
 // element_flows = emars + log sum_z L_z exp(M_z - M) + M over the ranges, M their maximum (-inf where every M_z is),
 // the sum in range order. `part`: L [split, rows, batch] then M [split, rows, batch]; row = element block x BSM + m.
-__global__ void merge_kernel(float* __restrict__ eflows, const float* __restrict__ emars, const float* __restrict__ part,
+__global__ void merge_kernel(float* __restrict__ eflows, const float* __restrict__ emars, const float* part,
                              const long* __restrict__ chids, int split, long rows_total, int BSM, int batch) {
     cudaGridDependencySynchronize();                 // (the streaming kernel's partials)
     const long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
