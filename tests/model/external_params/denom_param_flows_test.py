@@ -894,9 +894,12 @@ def test_fused_em_correction_matches_the_torch_reference(block_size, n_blocks, c
         bsmod._EM_FUSED = True
         fused = desc.compute_em_correction(*args, denom_sources = sources).clone()
         bsmod._EM_FUSED = False
+        desc.__dict__.pop("_em_specs_cache", None)          # (the gate is read where the specs are made: cached)
+        assert desc._fused_em_correction(*args, sources) is None, "the reference would be the fused path again"
         ref = desc.compute_em_correction(*args, denom_sources = sources).clone()
     finally:
         bsmod._EM_FUSED = prev
+        desc.__dict__.pop("_em_specs_cache", None)
 
     assert torch.isfinite(fused).all()
     rel = ((fused - ref).abs() / ref.abs().clamp_min(1e-20)).max().item()
@@ -971,7 +974,10 @@ def test_fused_em_correction_matches_reference_for_shared_layer_and_ties():
                 f"the fused path declined {tgt}; this case would compare the reference with itself"
             fused = desc.compute_em_correction(*args, denom_sources = sources).clone()
             bsmod._EM_FUSED = False
+            desc.__dict__.pop("_em_specs_cache", None)      # (the gate is read where the specs are made: cached)
+            assert desc._fused_em_correction(*args, sources) is None, "the reference would be the fused path again"
             ref = desc.compute_em_correction(*args, denom_sources = sources).clone()
+            desc.__dict__.pop("_em_specs_cache", None)
             rel = ((fused - ref).abs() / ref.abs().clamp_min(1e-20)).max().item()
             assert rel < 1e-5, f"{tgt}: fused differs from the reference (relmax={rel})"
     finally:
