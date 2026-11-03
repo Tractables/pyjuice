@@ -89,7 +89,7 @@ __device__ __forceinline__ void mbar_wait(uint64_t* bar, int phase) {
 // shared memory, the exponentials split into hi + lo. A piece past PARTS chunks loads its later chunks twice.
 template <int NT, int PB>
 __global__ void __launch_bounds__(NT) bs_eles_prepass_kernel(
-        const float* __restrict__ nf, const float* __restrict__ nm, const long* __restrict__ ebase,
+        const float* nf, const float* nm, const long* __restrict__ ebase,
         const int* __restrict__ pc_k0, const int* __restrict__ pc_k1, const int* __restrict__ grep,
         __nv_bfloat16* __restrict__ uh, __nv_bfloat16* __restrict__ ul, float* __restrict__ mp, int batch, int knt,
         int kt_sh, int npc) {

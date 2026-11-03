@@ -89,7 +89,7 @@ __device__ __forceinline__ void mbar_wait(uint64_t* bar, int phase) {
 // ---------------- pre-pass: a thread block per (group, split, PB columns) ----------------
 template <int NT, int PB>
 __global__ void __launch_bounds__(NT) elesf_prepass_kernel(
-        const float* __restrict__ nf, const float* __restrict__ nm, const long* __restrict__ ebase,
+        const float* nf, const float* nm, const long* __restrict__ ebase,
         const int* __restrict__ grep, __nv_bfloat16* __restrict__ u, float* __restrict__ mp, int batch, int knt,
         int ksteps, int kt_sh, int split) {
     constexpr int PARTS = NT / PB;

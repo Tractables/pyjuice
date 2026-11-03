@@ -103,7 +103,7 @@ __device__ __forceinline__ void mbar_wait(uint64_t* bar, int phase) {
 // twice (the max, then the exponentials).
 template <int NT, int PB>
 __global__ void __launch_bounds__(NT) bs_streamf_prepass_kernel(
-        const float* __restrict__ nm, const int* __restrict__ cbase, const float* __restrict__ ext,
+        const float* nm, const int* __restrict__ cbase, const float* __restrict__ ext,
         const long* __restrict__ gate, __nv_bfloat16* __restrict__ u, float* __restrict__ mp, int batch, int num_edges,
         int knt, int ksteps, int kt_sh, int split, int gate_stride, int node_sh, int gate_sh, int node_cbs,
         long ext_base, int gc) {

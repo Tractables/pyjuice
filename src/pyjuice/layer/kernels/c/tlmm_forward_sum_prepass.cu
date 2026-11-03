@@ -92,7 +92,7 @@ template <int N> __device__ __forceinline__ void cpa_wait() {
 // bx[(tile * BK + e) * batch + b] = bf16 exp(element[e0 + e, b] - mx), mx[tile * batch + b] the max over the tile's
 // edges (exp's argument and the -inf guard as in the other kernels); tile = node block * knt + edge tile.
 template <int NT>
-__global__ void __launch_bounds__(NT) prepass_kernel(const float* __restrict__ element_mars, const long* __restrict__ ebase,
+__global__ void __launch_bounds__(NT) prepass_kernel(const float* element_mars, const long* __restrict__ ebase,
                                                     __nv_bfloat16* __restrict__ bx, float* __restrict__ mx, int batch) {
     constexpr int PARTS = NT / PB, EP = BK / PARTS;
     static_assert(NT % PB == 0 && BK % PARTS == 0, "threads over the batch columns");

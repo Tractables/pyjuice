@@ -64,73 +64,113 @@ __device__ __forceinline__ void mbar_wait(uint64_t* bar, int phase) {
 // `const __restrict__` pointer's loads are non-coherent ones (ld.global.nc: data read-only for the kernel's lifetime),
 // which the compiler may issue before the wait -- ptxas did, in par_deferred_fp16_capture.cu's first version.
 
-// ---------------- pre-pass: a thread block per (group, split, PB columns) ----------------
-// Thread (part, b) takes the range's 32-child chunks part, part + PARTS, ...: a chunk is 32 consecutive element rows,
-// formed as the sums of two runs of node rows (`cbase` of the group's first node block `grep`); the range's max over
-// every chunk (shared memory); u = bf16 exp(em - M). A range past PARTS chunks forms its later chunks twice (the max,
-// then the exponentials).
-template <int NT, int PB>
+// ---------------- pre-pass: a thread block per (group, split, 4 NQ columns) ----------------
+// Thread (part, quad) takes 4 consecutive columns (b0 + 4 quad ..) of the range's 8-row sub-chunks part, part + PARTS,
+// ...: a sub-chunk's rows are the sums of two runs of node rows (`cbase` of the group's first node block
+// `grep`: a 32-row chunk's two runs, -1 for the dummy element rows: -inf); the range's max over every sub-chunk (warp shuffles, then shared memory); u = bf16 exp(em - M), 4
+// columns a store. The tables (`grep`, the first sub-chunk's `cbase` entries: no launch of the chain writes them) load before the wait for the launch before
+// -- the merge before lets this one launch as soon as it may (`stream*_merge_kernel`) --; the values after it, through
+// a pointer that is not __restrict__ (see the top). A range past PARTS sub-chunks forms its later ones twice (the max,
+// then the exponentials). Every value as before, the max over the same set.
+template <int NT, int NQ>
 __global__ void __launch_bounds__(NT) stream_fused_prepass_kernel(
-        const float* __restrict__ nm, const int* __restrict__ cbase, const int* __restrict__ grep,
+        const float* nm, const int* __restrict__ cbase, const int* __restrict__ grep,
         __nv_bfloat16* __restrict__ u, float* __restrict__ mp, int batch, int num_edges, int knt, int ksteps, int kt_sh,
         int split) {
-    constexpr int PARTS = NT / PB;
-    __shared__ float smx[PARTS][PB];
-    cudaGridDependencySynchronize();                     // (the children's node values are the launches before's)
-    cudaTriggerProgrammaticLaunchCompletion();           // the GEMM may launch onto the SMs this grid leaves free
+    constexpr int SC = 8, PARTS = NT / NQ, PB = 4 * NQ, NW = NT / 32;
+    __shared__ float4 smx[NW][NQ];
     const int tid = threadIdx.x, nbc = batch / PB;
     const int g = blockIdx.x / (split * nbc), sp = (blockIdx.x / nbc) % split, b0 = (blockIdx.x % nbc) * PB;
-    const int b = tid % PB, part = tid / PB;
-    const int q0 = (int)((((long)sp * ksteps / split) << kt_sh) / CH);
-    const int q1 = (int)((((long)(sp + 1) * ksteps / split) << kt_sh) / CH);
+    const int quad = tid % NQ, part = tid / NQ, b = b0 + 4 * quad;
+    const int s0 = (int)((((long)sp * ksteps / split) << kt_sh) / SC);
+    const int s1 = (int)((((long)(sp + 1) * ksteps / split) << kt_sh) / SC);
     const int* ct = cbase + (long)grep[g] * knt * 4;     // [knt, 2 halves, 2 children]
-    auto load_chunk = [&](int q, float* v) {
-        const int pos0 = q * CH;
-        const int* cq = ct + (pos0 / BK) * 4 + ((pos0 % BK) / CH) * 2;
-        const int c0 = cq[0], c1 = cq[1];
+    auto runs = [&](int sc, int& c0, int& c1) {
+        const int pos = sc * SC;
+        const int* cq = ct + (pos / BK) * 4 + ((pos % BK) / CH) * 2;
+        c0 = cq[0]; c1 = cq[1];
+    };
+    const int s = s0 + part;
+    int f0 = -1, f1 = -1;                                // (the first sub-chunk's runs)
+    if (s < s1) runs(s, f0, f1);
+    cudaGridDependencySynchronize();                     // (the children's node values are the launches before's)
+    cudaTriggerProgrammaticLaunchCompletion();           // the GEMM may launch onto the SMs this grid leaves free
+    auto load_sub = [&](int sc, int c0, int c1, float (&v)[SC][4]) {
         if (c0 < 0) {                                    // (the dummy element rows: -inf)
             CUTE_UNROLL
-            for (int i = 0; i < CH; i++) v[i] = -INFINITY;
+            for (int i = 0; i < SC; i++)
+                CUTE_UNROLL
+                for (int k = 0; k < 4; k++) v[i][k] = -INFINITY;
             return;
         }
-        const float* x0 = nm + (long)c0 * batch + b0 + b;
-        const float* x1 = nm + (long)c1 * batch + b0 + b;
+        const int off = (sc * SC) % CH;
+        const float* x0 = nm + (long)(c0 + off) * batch + b;
+        const float* x1 = nm + (long)(c1 + off) * batch + b;
+        float4 p[SC], q[SC];
         CUTE_UNROLL
-        for (int i = 0; i < CH; i++) v[i] = x0[(long)i * batch] + x1[(long)i * batch];
+        for (int i = 0; i < SC; i++) {
+            p[i] = *reinterpret_cast<const float4*>(x0 + (long)i * batch);
+            q[i] = *reinterpret_cast<const float4*>(x1 + (long)i * batch);
+        }
+        CUTE_UNROLL
+        for (int i = 0; i < SC; i++) {
+            v[i][0] = p[i].x + q[i].x; v[i][1] = p[i].y + q[i].y; v[i][2] = p[i].z + q[i].z; v[i][3] = p[i].w + q[i].w;
+        }
     };
-    float v[CH];
-    float m = -INFINITY;
-    const int q = q0 + part;
-    if (q < q1) {
-        load_chunk(q, v);
+    float v[SC][4];
+    float m[4] = {-INFINITY, -INFINITY, -INFINITY, -INFINITY};
+    if (s < s1) {
+        load_sub(s, f0, f1, v);
         CUTE_UNROLL
-        for (int i = 0; i < CH; i++) m = fmaxf(m, v[i]);
+        for (int i = 0; i < SC; i++)
+            CUTE_UNROLL
+            for (int k = 0; k < 4; k++) m[k] = fmaxf(m[k], v[i][k]);
     }
-    for (int qq = q + PARTS; qq < q1; qq += PARTS) {
-        float w[CH];
-        load_chunk(qq, w);
+    for (int ss = s + PARTS; ss < s1; ss += PARTS) {
+        float w[SC][4];
+        int c0, c1;
+        runs(ss, c0, c1);
+        load_sub(ss, c0, c1, w);
         CUTE_UNROLL
-        for (int i = 0; i < CH; i++) m = fmaxf(m, w[i]);
+        for (int i = 0; i < SC; i++)
+            CUTE_UNROLL
+            for (int k = 0; k < 4; k++) m[k] = fmaxf(m[k], w[i][k]);
     }
-    smx[part][b] = m;
-    __syncthreads();
-    m = smx[0][b];
+    // the max over a warp's parts (the lanes of one quad), then over the warps
     CUTE_UNROLL
-    for (int k = 1; k < PARTS; k++) m = fmaxf(m, smx[k][b]);
-    __nv_bfloat16* ur = u + ((long)g * num_edges) * batch + b0 + b;
-    if (q < q1) {
+    for (int o = 16; o >= NQ; o >>= 1)
         CUTE_UNROLL
-        for (int i = 0; i < CH; i++)
-            ur[(long)(q * CH + i) * batch] = __float2bfloat16_rn(m == -INFINITY ? 0.f : __expf(v[i] - m));
-    }
-    for (int qq = q + PARTS; qq < q1; qq += PARTS) {
-        float w[CH];
-        load_chunk(qq, w);
+        for (int k = 0; k < 4; k++) m[k] = fmaxf(m[k], __shfl_xor_sync(0xffffffffu, m[k], o));
+    if (tid % 32 < NQ) smx[tid / 32][quad] = make_float4(m[0], m[1], m[2], m[3]);
+    __syncthreads();
+    {
+        float4 x = smx[0][quad];
+        m[0] = x.x; m[1] = x.y; m[2] = x.z; m[3] = x.w;
         CUTE_UNROLL
-        for (int i = 0; i < CH; i++)
-            ur[(long)(qq * CH + i) * batch] = __float2bfloat16_rn(m == -INFINITY ? 0.f : __expf(w[i] - m));
+        for (int w = 1; w < NW; w++) {
+            x = smx[w][quad];
+            m[0] = fmaxf(m[0], x.x); m[1] = fmaxf(m[1], x.y); m[2] = fmaxf(m[2], x.z); m[3] = fmaxf(m[3], x.w);
+        }
     }
-    if (part == 0) mp[((long)g * split + sp) * batch + b0 + b] = m;
+    auto store = [&](int sc, const float (&w)[SC][4]) {
+        __nv_bfloat16* o = u + ((long)g * num_edges + sc * SC) * batch + b;
+        CUTE_UNROLL
+        for (int i = 0; i < SC; i++) {
+            __nv_bfloat16 h[4];
+            CUTE_UNROLL
+            for (int k = 0; k < 4; k++) h[k] = __float2bfloat16_rn(m[k] == -INFINITY ? 0.f : __expf(w[i][k] - m[k]));
+            *reinterpret_cast<uint2*>(o + (long)i * batch) = *reinterpret_cast<const uint2*>(h);
+        }
+    };
+    if (s < s1) store(s, v);
+    for (int ss = s + PARTS; ss < s1; ss += PARTS) {
+        float w[SC][4];
+        int c0, c1;
+        runs(ss, c0, c1);
+        load_sub(ss, c0, c1, w);
+        store(ss, w);
+    }
+    if (part == 0) *reinterpret_cast<float4*>(mp + ((long)g * split + sp) * batch + b) = make_float4(m[0], m[1], m[2], m[3]);
 }
 
 extern __shared__ __align__(1024) char smem_raw[];
@@ -319,6 +359,8 @@ __global__ void __launch_bounds__(256) stream_fused_merge_kernel(
         float* __restrict__ node_mars, const float* part, const float* mp,
         const long* __restrict__ nids, const int* __restrict__ ugrp, int batch, int block_size, long rows_total) {
     cudaGridDependencySynchronize();                     // (the GEMM's partials)
+    cudaTriggerProgrammaticLaunchCompletion();           // the launch after may launch: it waits for this one, and reads
+                                                         // what this one writes by coherent loads (see the top)
     const long idx = (long)blockIdx.x * 256 + threadIdx.x;
     const int bq = batch / 4;
     if (idx >= rows_total * bq) return;
@@ -468,8 +510,8 @@ void tlmm_forward_sum_stream_fused(torch::Tensor node_mars, torch::Tensor cbase,
     auto* part = reinterpret_cast<float*>(base + o_part);
     cudaStream_t st = c10::cuda::getCurrentCUDAStream();
     {
-        constexpr int NT = 512, PB = 16;
-        launch_pdl(stream_fused_prepass_kernel<NT, PB>, dim3(ngrp * split * (batch / PB)), dim3(NT), 0, st,
+        constexpr int NT = 256, NQ = 2;
+        launch_pdl(stream_fused_prepass_kernel<NT, NQ>, dim3(ngrp * split * (batch / (4 * NQ))), dim3(NT), 0, st,
                    node_mars.data_ptr<float>(), cbase.data_ptr<int>(), grep.data_ptr<int>(), u, mp, batch, num_edges,
                    knt, ksteps, kt_sh, split);
         C10_CUDA_KERNEL_LAUNCH_CHECK();

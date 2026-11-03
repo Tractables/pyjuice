@@ -97,7 +97,7 @@ __device__ __forceinline__ void mbar_wait(uint64_t* bar, int phase) {
 // max. The gates are staged as the fork stages them (sPh), the add, max, exponential and -inf guard are its own.
 template <int NT>
 __global__ void __launch_bounds__(NT) bs_prepass_kernel(
-        const float* __restrict__ element_mars, const long* __restrict__ cids, const float* __restrict__ ext,
+        const float* element_mars, const long* __restrict__ cids, const float* __restrict__ ext,
         const long* __restrict__ gate, __nv_bfloat16* __restrict__ bx, float* __restrict__ mx, float* __restrict__ gm,
         float* __restrict__ lp, int batch, int knt, int gate_stride, int node_cbs, int gc, int node_sh, int gate_sh,
         long ext_base) {

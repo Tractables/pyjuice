@@ -92,8 +92,8 @@ __device__ __forceinline__ void mbar_wait(uint64_t* bar, int phase) {
 // which the compiler may issue before the wait -- ptxas did, in par_deferred_fp16_capture.cu's first version.
 
 // ---------------- pre-pass: a block per (element block x k-tile, PB columns) ----------------
-__global__ void __launch_bounds__(256) bs_ele_prepass_kernel(const float* __restrict__ nflows,
-                                                             const float* __restrict__ nmars,
+__global__ void __launch_bounds__(256) bs_ele_prepass_kernel(const float* nflows,
+                                                             const float* nmars,
                                                              const long* __restrict__ ebase, half_t* __restrict__ bx,
                                                              float* __restrict__ mx, int batch) {
     __shared__ float sLf[BK][PB + 1];
