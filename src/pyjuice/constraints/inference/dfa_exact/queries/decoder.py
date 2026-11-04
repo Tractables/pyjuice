@@ -180,9 +180,12 @@ class DFAExactDecoder(Decoder):
         be = self.cc.backend
         held, keep, compact, carry = self._reuse(data, missing, None, precision, storage, marginal = True,
                                                  external = external)
+
+        def call(held, carry, report):
+            return marginal(be, data, missing, precision, held = None if held is None else held[0], report = report,
+                            storage = storage, carry = carry, external = external)
         report = {}
-        out = marginal(be, data, missing, precision, held = None if held is None else held[0], report = report,
-                       storage = storage, carry = carry, external = external)
+        out, keep, compact = self._with_room(call, held, keep, compact, carry, report)
         self._after(data.size(0), precision, storage, keep, report, compact)
         return out
 
@@ -192,13 +195,29 @@ class DFAExactDecoder(Decoder):
         be = self.cc.backend
         held, keep, compact, carry = self._reuse(data, missing, targets, precision, storage, marginal = False,
                                                  external = external)
+
+        def call(held, carry, report):
+            return conditional(be, data, missing, targets, precision, return_log_marginal = return_log_marginal,
+                               held = None if held is None else dict(inside = held[0], top_down = held[1]),
+                               candidates = candidates, report = report, storage = storage, carry = carry,
+                               external = external)
         report = {}
-        out = conditional(be, data, missing, targets, precision, return_log_marginal = return_log_marginal,
-                          held = None if held is None else dict(inside = held[0], top_down = held[1]),
-                          candidates = candidates, report = report, storage = storage, carry = carry,
-                          external = external)
+        out, keep, compact = self._with_room(call, held, keep, compact, carry, report)
         self._after(data.size(0), precision, storage, keep, report, compact)
         return out
+
+    @staticmethod
+    def _with_room(call, held, keep, compact, carry, report):
+        """``(call(held, carry, report), keep, compact)``, or with nothing reused when that runs out of device memory:
+        re-gathering values holds the old rows beside the new (:func:`~..kernels.compact.regather_into`), twice the
+        memory the same call takes from scratch. An out-of-memory error from a call that reuses nothing is the query's."""
+        try:
+            return call(held, carry, report), keep, compact
+        except torch.cuda.OutOfMemoryError:
+            if held is None and carry is None:
+                raise
+        report.clear()                                  # (out of the handler: the old rows are gone with the traceback)
+        return call(None, None, report), None, None
 
     # ---------------------------------------------------------------------------------------------
 

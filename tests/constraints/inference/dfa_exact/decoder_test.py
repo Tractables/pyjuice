@@ -10,6 +10,7 @@ HMM's decoding gives the circuit's rows bit for bit, and the reference's; (slow)
 fast_inference scope (its options reach it, it nests), one per circuit at a time, usable only inside its ``with``,
 with query defaults a call overrides.
 """
+import importlib
 import random
 import time
 
@@ -559,6 +560,47 @@ def test_anything_else_using_the_buffers_or_another_precision_starts_afresh(buil
         assert spy.held[-1] is None
         assert_close(decoder.conditional(**steps[5]), want[5], n)
         assert spy.held[-1] is None
+
+
+def test_a_call_without_room_to_move_its_held_values_starts_afresh(build_pc, monkeypatch):
+    """Moving held values holds the old rows beside the new: twice the memory of the same call from scratch. Out of
+    device memory there, the call computes them again and gives what a fresh session gives, and the session goes on."""
+    QC = importlib.import_module("pyjuice.constraints.inference.dfa_exact.queries.conditional")
+    n = KINDS["hmm"]
+    cc = jc.compile(jc.DFA.contains([[1, 2]], V), build_pc("hmm", n, V))
+    B = 4
+    data = torch.randint(0, V, (B, n), generator = torch.Generator().manual_seed(0)).cuda()
+    masks = [(torch.arange(n, device = data.device) >= t)[None, :].expand(B, n) for t in (0, 2, 3)]
+    real, raised = QC.regather_into, []
+
+    def no_room(*args, **kwargs):
+        if not raised:
+            raised.append(True)
+            raise torch.cuda.OutOfMemoryError("no room")
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(QC, "regather_into", no_room)
+    options = dict(storage = "compact", precision = "fp32")
+    with cc.decoder(**options) as d:
+        got = [d.conditional(data, m) for m in masks]
+    assert raised, "the session moved nothing: this test tests nothing"
+    for m, g in zip(masks, got):
+        with cc.decoder(**options) as d:
+            assert torch.equal(d.conditional(data, m), g)
+
+
+def test_a_call_that_runs_out_of_memory_on_its_own_says_so(build_pc, monkeypatch):
+    """Nothing to give up: the error is the query's."""
+    QC = importlib.import_module("pyjuice.constraints.inference.dfa_exact.queries.decoder")
+    cc = jc.compile(jc.DFA.contains([[1, 2]], V), build_pc("hmm", KINDS["hmm"], V))
+
+    def no_room(*args, **kwargs):
+        raise torch.cuda.OutOfMemoryError("no room")
+
+    monkeypatch.setattr(QC, "conditional", no_room)
+    data = torch.zeros(2, KINDS["hmm"], dtype = torch.long).cuda()
+    with cc.decoder() as d, pytest.raises(torch.cuda.OutOfMemoryError):
+        d.conditional(data, torch.ones_like(data, dtype = torch.bool))
 
 
 @pytest.mark.parametrize("storage", ["dense", "compact"])
