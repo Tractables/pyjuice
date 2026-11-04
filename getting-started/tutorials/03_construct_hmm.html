@@ -9,7 +9,7 @@
   <title>Construct an HMM &mdash; PyJuice 2.7.0 documentation</title>
       <link rel="stylesheet" type="text/css" href="../../_static/pygments.css?v=b86133f3" />
       <link rel="stylesheet" type="text/css" href="../../_static/css/theme.css?v=9edc463e" />
-      <link rel="stylesheet" type="text/css" href="../../_static/sg_gallery.css?v=d2d258e8" />
+      <link rel="stylesheet" type="text/css" href="../../_static/sg_gallery.css?v=c83e6b79" />
       <link rel="stylesheet" type="text/css" href="../../_static/sg_gallery-binder.css?v=f4aeca0c" />
       <link rel="stylesheet" type="text/css" href="../../_static/sg_gallery-dataframe.css?v=2082cf3c" />
       <link rel="stylesheet" type="text/css" href="../../_static/sg_gallery-rendered-html.css?v=1277b6f3" />
@@ -18,8 +18,9 @@
       <script src="../../_static/jquery.js?v=5d32c60e"></script>
       <script src="../../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
       <script src="../../_static/documentation_options.js?v=dfec817d"></script>
-      <script src="../../_static/doctools.js?v=9a2dae69"></script>
+      <script src="../../_static/doctools.js?v=9bcbadda"></script>
       <script src="../../_static/sphinx_highlight.js?v=dc90522c"></script>
+      <script src="../../_static/sg-tags.js?v=d80f6fa4"></script>
     <script src="../../_static/js/theme.js"></script>
     <link rel="index" title="Index" href="../../genindex.html" />
     <link rel="search" title="Search" href="../../search.html" />
@@ -101,58 +102,52 @@ to download the full example code.</p>
 <section class="sphx-glr-example-title" id="construct-an-hmm">
 <span id="sphx-glr-getting-started-tutorials-03-construct-hmm-py"></span><h1>Construct an HMM<a class="headerlink" href="#construct-an-hmm" title="Link to this heading"></a></h1>
 <p>This tutorial demonstrates how to construct an HMM with <code class="code docutils literal notranslate"><span class="pre">pyjuice.inputs</span></code>, <code class="code docutils literal notranslate"><span class="pre">pyjuice.multiply</span></code>, and <code class="code docutils literal notranslate"><span class="pre">pyjuice.summate</span></code>.</p>
-<div class="highlight-Python notranslate"><div class="highlight"><pre><span></span><span class="c1"># sphinx_gallery_thumbnail_path = 'imgs/juice.png'</span>
-</pre></div>
-</div>
+<div class="highlight-Python notranslate"><div class="highlight"><pre><span class="c1"># sphinx_gallery_thumbnail_path = 'imgs/juice.png'</span><span class="w">
+</span></pre></div></div>
 <p>Let’s start by importing the necessary packages.</p>
-<div class="highlight-Python notranslate"><div class="highlight"><pre><span></span><span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
-<span class="kn">import</span><span class="w"> </span><span class="nn">pyjuice</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">juice</span>
-<span class="kn">import</span><span class="w"> </span><span class="nn">pyjuice.nodes.distributions</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">dists</span>
-</pre></div>
-</div>
+<div class="highlight-Python notranslate"><div class="highlight"><pre><span class="kn">import</span><span class="w"> </span><span class="nn">torch</span><span class="w">
+</span><span class="kn">import</span><span class="w"> </span><span class="nn">pyjuice</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">juice</span><span class="w">
+</span><span class="kn">import</span><span class="w"> </span><span class="nn">pyjuice</span><span class="nn">.</span><span class="nn">nodes</span><span class="nn">.</span><span class="nn">distributions</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">dists</span><span class="w">
+</span></pre></div></div>
 <p>We start with specifying the structural parameters of the HMM</p>
-<div class="highlight-Python notranslate"><div class="highlight"><pre><span></span><span class="n">seq_length</span> <span class="o">=</span> <span class="mi">32</span>
-<span class="n">num_latents</span> <span class="o">=</span> <span class="mi">2048</span>
-<span class="n">num_emits</span> <span class="o">=</span> <span class="mi">4023</span>
-</pre></div>
-</div>
+<div class="highlight-Python notranslate"><div class="highlight"><pre><span class="n">seq_length</span> <span class="o">=</span> <span class="mi">32</span><span class="w">
+</span><span class="n">num_latents</span> <span class="o">=</span> <span class="mi">2048</span><span class="w">
+</span><span class="n">num_emits</span> <span class="o">=</span> <span class="mi">4023</span><span class="w">
+</span></pre></div></div>
 <p>An important parameter to be determined is the block size, which is crucial for PyJuice to compile efficient models.
 Specifically, we want the block size to be large enough so that PyJuice can leverage block-based parallelization.</p>
-<div class="highlight-Python notranslate"><div class="highlight"><pre><span></span><span class="n">block_size</span> <span class="o">=</span> <span class="nb">min</span><span class="p">(</span><span class="n">juice</span><span class="o">.</span><span class="n">utils</span><span class="o">.</span><span class="n">util</span><span class="o">.</span><span class="n">max_cdf_power_of_2</span><span class="p">(</span><span class="n">num_latents</span><span class="p">),</span> <span class="mi">1024</span><span class="p">)</span>
-</pre></div>
-</div>
+<div class="highlight-Python notranslate"><div class="highlight"><pre><span class="n">block_size</span> <span class="o">=</span> <span class="nb">min</span><span class="p">(</span><span class="n">juice</span><span class="o">.</span><span class="n">utils</span><span class="o">.</span><span class="n">util</span><span class="o">.</span><span class="n">max_cdf_power_of_2</span><span class="p">(</span><span class="n">num_latents</span><span class="p">)</span><span class="p">,</span> <span class="mi">1024</span><span class="p">)</span><span class="w">
+</span></pre></div></div>
 <p>The number of node blocks is derived accordingly</p>
-<div class="highlight-Python notranslate"><div class="highlight"><pre><span></span><span class="n">num_node_blocks</span> <span class="o">=</span> <span class="n">num_latents</span> <span class="o">//</span> <span class="n">block_size</span>
-</pre></div>
-</div>
+<div class="highlight-Python notranslate"><div class="highlight"><pre><span class="n">num_node_blocks</span> <span class="o">=</span> <span class="n">num_latents</span> <span class="o">/</span><span class="o">/</span> <span class="n">block_size</span><span class="w">
+</span></pre></div></div>
 <p>We use the context manager <cite>set_block_size</cite> to set the block size of all PC nodes.
 In the following we assume <cite>T = seq_length</cite> and <cite>K = num_latents</cite></p>
-<div class="highlight-Python notranslate"><div class="highlight"><pre><span></span><span class="k">with</span> <span class="n">juice</span><span class="o">.</span><span class="n">set_block_size</span><span class="p">(</span><span class="n">block_size</span><span class="p">):</span>
-    <span class="c1"># We begin by defining p(X_{T-1}|Z_{T-1}) for all k = 0...K-1</span>
-    <span class="n">ns_input</span> <span class="o">=</span> <span class="n">juice</span><span class="o">.</span><span class="n">inputs</span><span class="p">(</span><span class="n">seq_length</span> <span class="o">-</span> <span class="mi">1</span><span class="p">,</span> <span class="n">num_node_blocks</span> <span class="o">=</span> <span class="n">num_node_blocks</span><span class="p">,</span>
-                            <span class="n">dist</span> <span class="o">=</span> <span class="n">dists</span><span class="o">.</span><span class="n">Categorical</span><span class="p">(</span><span class="n">num_cats</span> <span class="o">=</span> <span class="n">num_emits</span><span class="p">))</span>
-
-    <span class="n">ns_sum</span> <span class="o">=</span> <span class="kc">None</span>
-    <span class="n">curr_zs</span> <span class="o">=</span> <span class="n">ns_input</span>
-    <span class="k">for</span> <span class="n">var</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">seq_length</span> <span class="o">-</span> <span class="mi">2</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">):</span>
-        <span class="c1"># The emission probabilities p(X_{var}|Z_{var}=k) for all k = 0...K-1</span>
-        <span class="n">curr_xs</span> <span class="o">=</span> <span class="n">ns_input</span><span class="o">.</span><span class="n">duplicate</span><span class="p">(</span><span class="n">var</span><span class="p">,</span> <span class="n">tie_params</span> <span class="o">=</span> <span class="kc">True</span><span class="p">)</span>
-
-        <span class="c1"># The transition probabilities p(Z_{var+1}|Z_{var})</span>
-        <span class="k">if</span> <span class="n">ns_sum</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="c1"># Create both the structure and the transition probabilities</span>
-            <span class="n">ns</span> <span class="o">=</span> <span class="n">juice</span><span class="o">.</span><span class="n">summate</span><span class="p">(</span><span class="n">curr_zs</span><span class="p">,</span> <span class="n">num_node_blocks</span> <span class="o">=</span> <span class="n">num_node_blocks</span><span class="p">)</span>
-            <span class="n">ns_sum</span> <span class="o">=</span> <span class="n">ns</span>
-        <span class="k">else</span><span class="p">:</span>
-            <span class="c1"># Create only the structure and reuse the transition probabilities from `ns_sum`</span>
-            <span class="n">ns</span> <span class="o">=</span> <span class="n">ns_sum</span><span class="o">.</span><span class="n">duplicate</span><span class="p">(</span><span class="n">curr_zs</span><span class="p">,</span> <span class="n">tie_params</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
-
-        <span class="n">curr_zs</span> <span class="o">=</span> <span class="n">juice</span><span class="o">.</span><span class="n">multiply</span><span class="p">(</span><span class="n">curr_xs</span><span class="p">,</span> <span class="n">ns</span><span class="p">)</span>
-
-    <span class="c1"># The Initial probabilities p(Z_{0})</span>
-    <span class="n">ns</span> <span class="o">=</span> <span class="n">juice</span><span class="o">.</span><span class="n">summate</span><span class="p">(</span><span class="n">curr_zs</span><span class="p">,</span> <span class="n">num_node_blocks</span> <span class="o">=</span> <span class="mi">1</span><span class="p">,</span> <span class="n">block_size</span> <span class="o">=</span> <span class="mi">1</span><span class="p">)</span>
-</pre></div>
-</div>
+<div class="highlight-Python notranslate"><div class="highlight"><pre><span class="k">with</span> <a class="sphx-glr-backref-module-pyjuice sphx-glr-backref-type-py-class sphx-glr-backref-instance reference internal" href="../../python-api/generated/pyjuice.set_block_size.html#pyjuice.set_block_size" title="pyjuice.set_block_size"><span class="n">juice</span><span class="o">.</span><span class="n">set_block_size</span></a><span class="p">(</span><span class="n">block_size</span><span class="p">)</span><span class="p">:</span><span class="w">
+</span>    <span class="c1"># We begin by defining p(X_{T-1}|Z_{T-1}) for all k = 0...K-1</span><span class="w">
+</span>    <span class="n">ns_input</span> <span class="o">=</span> <a class="sphx-glr-backref-module-pyjuice sphx-glr-backref-type-py-function reference internal" href="../../python-api/generated/pyjuice.inputs.html#pyjuice.inputs" title="pyjuice.inputs"><span class="n">juice</span><span class="o">.</span><span class="n">inputs</span></a><span class="p">(</span><span class="n">seq_length</span> <span class="o">-</span> <span class="mi">1</span><span class="p">,</span> <span class="n">num_node_blocks</span> <span class="o">=</span> <span class="n">num_node_blocks</span><span class="p">,</span><span class="w">
+</span>                            <span class="n">dist</span> <span class="o">=</span> <a class="sphx-glr-backref-module-pyjuice-nodes-distributions sphx-glr-backref-type-py-class sphx-glr-backref-instance reference internal" href="../../python-api/generated/pyjuice.nodes.distributions.Categorical.html#pyjuice.nodes.distributions.Categorical" title="pyjuice.nodes.distributions.Categorical"><span class="n">dists</span><span class="o">.</span><span class="n">Categorical</span></a><span class="p">(</span><span class="n">num_cats</span> <span class="o">=</span> <span class="n">num_emits</span><span class="p">)</span><span class="p">)</span><span class="w">
+</span><span class="w">
+</span>    <span class="n">ns_sum</span> <span class="o">=</span> <span class="kc">None</span><span class="w">
+</span>    <span class="n">curr_zs</span> <span class="o">=</span> <span class="n">ns_input</span><span class="w">
+</span>    <span class="k">for</span> <span class="n">var</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">seq_length</span> <span class="o">-</span> <span class="mi">2</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">)</span><span class="p">:</span><span class="w">
+</span>        <span class="c1"># The emission probabilities p(X_{var}|Z_{var}=k) for all k = 0...K-1</span><span class="w">
+</span>        <span class="n">curr_xs</span> <span class="o">=</span> <span class="n">ns_input</span><span class="o">.</span><span class="n">duplicate</span><span class="p">(</span><span class="n">var</span><span class="p">,</span> <span class="n">tie_params</span> <span class="o">=</span> <span class="kc">True</span><span class="p">)</span><span class="w">
+</span><span class="w">
+</span>        <span class="c1"># The transition probabilities p(Z_{var+1}|Z_{var})</span><span class="w">
+</span>        <span class="k">if</span> <span class="n">ns_sum</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span><span class="w">
+</span>            <span class="c1"># Create both the structure and the transition probabilities</span><span class="w">
+</span>            <span class="n">ns</span> <span class="o">=</span> <a class="sphx-glr-backref-module-pyjuice sphx-glr-backref-type-py-function reference internal" href="../../python-api/generated/pyjuice.summate.html#pyjuice.summate" title="pyjuice.summate"><span class="n">juice</span><span class="o">.</span><span class="n">summate</span></a><span class="p">(</span><span class="n">curr_zs</span><span class="p">,</span> <span class="n">num_node_blocks</span> <span class="o">=</span> <span class="n">num_node_blocks</span><span class="p">)</span><span class="w">
+</span>            <span class="n">ns_sum</span> <span class="o">=</span> <span class="n">ns</span><span class="w">
+</span>        <span class="k">else</span><span class="p">:</span><span class="w">
+</span>            <span class="c1"># Create only the structure and reuse the transition probabilities from `ns_sum`</span><span class="w">
+</span>            <span class="n">ns</span> <span class="o">=</span> <span class="n">ns_sum</span><span class="o">.</span><span class="n">duplicate</span><span class="p">(</span><span class="n">curr_zs</span><span class="p">,</span> <span class="n">tie_params</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span><span class="w">
+</span><span class="w">
+</span>        <span class="n">curr_zs</span> <span class="o">=</span> <a class="sphx-glr-backref-module-pyjuice sphx-glr-backref-type-py-function reference internal" href="../../python-api/generated/pyjuice.multiply.html#pyjuice.multiply" title="pyjuice.multiply"><span class="n">juice</span><span class="o">.</span><span class="n">multiply</span></a><span class="p">(</span><span class="n">curr_xs</span><span class="p">,</span> <span class="n">ns</span><span class="p">)</span><span class="w">
+</span><span class="w">
+</span>    <span class="c1"># The Initial probabilities p(Z_{0})</span><span class="w">
+</span>    <span class="n">ns</span> <span class="o">=</span> <a class="sphx-glr-backref-module-pyjuice sphx-glr-backref-type-py-function reference internal" href="../../python-api/generated/pyjuice.summate.html#pyjuice.summate" title="pyjuice.summate"><span class="n">juice</span><span class="o">.</span><span class="n">summate</span></a><span class="p">(</span><span class="n">curr_zs</span><span class="p">,</span> <span class="n">num_node_blocks</span> <span class="o">=</span> <span class="mi">1</span><span class="p">,</span> <span class="n">block_size</span> <span class="o">=</span> <span class="mi">1</span><span class="p">)</span><span class="w">
+</span></pre></div></div>
 <p>Note that <code class="code docutils literal notranslate"><span class="pre">ns.duplication</span></code> is a handy function to create duplications of existing node vectors.
 For input nodes (e.g., <code class="code docutils literal notranslate"><span class="pre">ns_input.duplicate(var,</span> <span class="pre">tie_params</span> <span class="pre">=</span> <span class="pre">True)</span></code>) we can specify it to define on a new variable.
 The argument <code class="code docutils literal notranslate"><span class="pre">tie_params</span> <span class="pre">=</span> <span class="pre">True</span></code> means we want to use the same set of parameters in the original and the duplicated node vector.

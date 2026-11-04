@@ -9,7 +9,7 @@
   <title>Train a PC &mdash; PyJuice 2.7.0 documentation</title>
       <link rel="stylesheet" type="text/css" href="../../_static/pygments.css?v=b86133f3" />
       <link rel="stylesheet" type="text/css" href="../../_static/css/theme.css?v=9edc463e" />
-      <link rel="stylesheet" type="text/css" href="../../_static/sg_gallery.css?v=d2d258e8" />
+      <link rel="stylesheet" type="text/css" href="../../_static/sg_gallery.css?v=c83e6b79" />
       <link rel="stylesheet" type="text/css" href="../../_static/sg_gallery-binder.css?v=f4aeca0c" />
       <link rel="stylesheet" type="text/css" href="../../_static/sg_gallery-dataframe.css?v=2082cf3c" />
       <link rel="stylesheet" type="text/css" href="../../_static/sg_gallery-rendered-html.css?v=1277b6f3" />
@@ -18,8 +18,9 @@
       <script src="../../_static/jquery.js?v=5d32c60e"></script>
       <script src="../../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
       <script src="../../_static/documentation_options.js?v=dfec817d"></script>
-      <script src="../../_static/doctools.js?v=9a2dae69"></script>
+      <script src="../../_static/doctools.js?v=9bcbadda"></script>
       <script src="../../_static/sphinx_highlight.js?v=dc90522c"></script>
+      <script src="../../_static/sg-tags.js?v=d80f6fa4"></script>
       <script async="async" src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
     <script src="../../_static/js/theme.js"></script>
     <link rel="index" title="Index" href="../../genindex.html" />
@@ -109,148 +110,139 @@ to download the full example code.</p>
 <p>This tutorial demonstrates how to create a Hidden Chow-Liu Tree (<a class="reference external" href="https://arxiv.org/pdf/2106.02264.pdf">https://arxiv.org/pdf/2106.02264.pdf</a>) using <code class="code docutils literal notranslate"><span class="pre">pyjuice.structures</span></code> and train the model with mini-batch EM and full-batch EM.
 For simplicity, we use the MNIST dataset as an example.</p>
 <p>Note that the goal of this tutorial is just to quickly demonstrate the basic training pipeline using PyJuice without covering additional details such as ways to construct a PC, which will be covered in the following tutorials.</p>
-<div class="highlight-Python notranslate"><div class="highlight"><pre><span></span><span class="c1"># sphinx_gallery_thumbnail_path = 'imgs/juice.png'</span>
-</pre></div>
-</div>
+<div class="highlight-Python notranslate"><div class="highlight"><pre><span class="c1"># sphinx_gallery_thumbnail_path = 'imgs/juice.png'</span><span class="w">
+</span></pre></div></div>
 <section id="load-the-mnist-dataset">
 <h2>Load the MNIST Dataset<a class="headerlink" href="#load-the-mnist-dataset" title="Link to this heading"></a></h2>
-<div class="highlight-Python notranslate"><div class="highlight"><pre><span></span><span class="kn">import</span><span class="w"> </span><span class="nn">pyjuice</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">juice</span>
-<span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
-<span class="kn">import</span><span class="w"> </span><span class="nn">torchvision</span>
-<span class="kn">import</span><span class="w"> </span><span class="nn">time</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">torch.utils.data</span><span class="w"> </span><span class="kn">import</span> <span class="n">TensorDataset</span><span class="p">,</span> <span class="n">DataLoader</span>
-<span class="kn">import</span><span class="w"> </span><span class="nn">pyjuice.nodes.distributions</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">dists</span>
-
-<span class="n">train_dataset</span> <span class="o">=</span> <span class="n">torchvision</span><span class="o">.</span><span class="n">datasets</span><span class="o">.</span><span class="n">MNIST</span><span class="p">(</span><span class="n">root</span> <span class="o">=</span> <span class="s2">"../data"</span><span class="p">,</span> <span class="n">train</span> <span class="o">=</span> <span class="kc">True</span><span class="p">,</span> <span class="n">download</span> <span class="o">=</span> <span class="kc">True</span><span class="p">)</span>
-<span class="n">valid_dataset</span> <span class="o">=</span> <span class="n">torchvision</span><span class="o">.</span><span class="n">datasets</span><span class="o">.</span><span class="n">MNIST</span><span class="p">(</span><span class="n">root</span> <span class="o">=</span> <span class="s2">"../data"</span><span class="p">,</span> <span class="n">train</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span> <span class="n">download</span> <span class="o">=</span> <span class="kc">True</span><span class="p">)</span>
-
-<span class="n">train_data</span> <span class="o">=</span> <span class="n">train_dataset</span><span class="o">.</span><span class="n">data</span><span class="o">.</span><span class="n">reshape</span><span class="p">(</span><span class="mi">60000</span><span class="p">,</span> <span class="mi">28</span><span class="o">*</span><span class="mi">28</span><span class="p">)</span>
-<span class="n">valid_data</span> <span class="o">=</span> <span class="n">valid_dataset</span><span class="o">.</span><span class="n">data</span><span class="o">.</span><span class="n">reshape</span><span class="p">(</span><span class="mi">10000</span><span class="p">,</span> <span class="mi">28</span><span class="o">*</span><span class="mi">28</span><span class="p">)</span>
-
-<span class="n">train_loader</span> <span class="o">=</span> <span class="n">DataLoader</span><span class="p">(</span>
-    <span class="n">dataset</span> <span class="o">=</span> <span class="n">TensorDataset</span><span class="p">(</span><span class="n">train_data</span><span class="p">),</span>
-    <span class="n">batch_size</span> <span class="o">=</span> <span class="mi">512</span><span class="p">,</span>
-    <span class="n">shuffle</span> <span class="o">=</span> <span class="kc">True</span><span class="p">,</span>
-    <span class="n">drop_last</span> <span class="o">=</span> <span class="kc">True</span>
-<span class="p">)</span>
-<span class="n">valid_loader</span> <span class="o">=</span> <span class="n">DataLoader</span><span class="p">(</span>
-    <span class="n">dataset</span> <span class="o">=</span> <span class="n">TensorDataset</span><span class="p">(</span><span class="n">valid_data</span><span class="p">),</span>
-    <span class="n">batch_size</span> <span class="o">=</span> <span class="mi">512</span><span class="p">,</span>
-    <span class="n">shuffle</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
-    <span class="n">drop_last</span> <span class="o">=</span> <span class="kc">True</span>
-<span class="p">)</span>
-</pre></div>
-</div>
+<div class="highlight-Python notranslate"><div class="highlight"><pre><span class="kn">import</span><span class="w"> </span><span class="nn">pyjuice</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">juice</span><span class="w">
+</span><span class="kn">import</span><span class="w"> </span><span class="nn">torch</span><span class="w">
+</span><span class="kn">import</span><span class="w"> </span><span class="nn">torchvision</span><span class="w">
+</span><span class="kn">import</span><span class="w"> </span><span class="nn">time</span><span class="w">
+</span><span class="kn">from</span><span class="w"> </span><span class="nn">torch</span><span class="nn">.</span><span class="nn">utils</span><span class="nn">.</span><span class="nn">data</span><span class="w"> </span><span class="kn">import</span> <span class="n">TensorDataset</span><span class="p">,</span> <span class="n">DataLoader</span><span class="w">
+</span><span class="kn">import</span><span class="w"> </span><span class="nn">pyjuice</span><span class="nn">.</span><span class="nn">nodes</span><span class="nn">.</span><span class="nn">distributions</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">dists</span><span class="w">
+</span><span class="w">
+</span><span class="n">train_dataset</span> <span class="o">=</span> <span class="n">torchvision</span><span class="o">.</span><span class="n">datasets</span><span class="o">.</span><span class="n">MNIST</span><span class="p">(</span><span class="n">root</span> <span class="o">=</span> <span class="s2">&quot;</span><span class="s2">../data</span><span class="s2">&quot;</span><span class="p">,</span> <span class="n">train</span> <span class="o">=</span> <span class="kc">True</span><span class="p">,</span> <span class="n">download</span> <span class="o">=</span> <span class="kc">True</span><span class="p">)</span><span class="w">
+</span><span class="n">valid_dataset</span> <span class="o">=</span> <span class="n">torchvision</span><span class="o">.</span><span class="n">datasets</span><span class="o">.</span><span class="n">MNIST</span><span class="p">(</span><span class="n">root</span> <span class="o">=</span> <span class="s2">&quot;</span><span class="s2">../data</span><span class="s2">&quot;</span><span class="p">,</span> <span class="n">train</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span> <span class="n">download</span> <span class="o">=</span> <span class="kc">True</span><span class="p">)</span><span class="w">
+</span><span class="w">
+</span><span class="n">train_data</span> <span class="o">=</span> <span class="n">train_dataset</span><span class="o">.</span><span class="n">data</span><span class="o">.</span><span class="n">reshape</span><span class="p">(</span><span class="mi">60000</span><span class="p">,</span> <span class="mi">28</span><span class="o">*</span><span class="mi">28</span><span class="p">)</span><span class="w">
+</span><span class="n">valid_data</span> <span class="o">=</span> <span class="n">valid_dataset</span><span class="o">.</span><span class="n">data</span><span class="o">.</span><span class="n">reshape</span><span class="p">(</span><span class="mi">10000</span><span class="p">,</span> <span class="mi">28</span><span class="o">*</span><span class="mi">28</span><span class="p">)</span><span class="w">
+</span><span class="w">
+</span><span class="n">train_loader</span> <span class="o">=</span> <span class="n">DataLoader</span><span class="p">(</span><span class="w">
+</span>    <span class="n">dataset</span> <span class="o">=</span> <span class="n">TensorDataset</span><span class="p">(</span><span class="n">train_data</span><span class="p">)</span><span class="p">,</span><span class="w">
+</span>    <span class="n">batch_size</span> <span class="o">=</span> <span class="mi">512</span><span class="p">,</span><span class="w">
+</span>    <span class="n">shuffle</span> <span class="o">=</span> <span class="kc">True</span><span class="p">,</span><span class="w">
+</span>    <span class="n">drop_last</span> <span class="o">=</span> <span class="kc">True</span><span class="w">
+</span><span class="p">)</span><span class="w">
+</span><span class="n">valid_loader</span> <span class="o">=</span> <span class="n">DataLoader</span><span class="p">(</span><span class="w">
+</span>    <span class="n">dataset</span> <span class="o">=</span> <span class="n">TensorDataset</span><span class="p">(</span><span class="n">valid_data</span><span class="p">)</span><span class="p">,</span><span class="w">
+</span>    <span class="n">batch_size</span> <span class="o">=</span> <span class="mi">512</span><span class="p">,</span><span class="w">
+</span>    <span class="n">shuffle</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span><span class="w">
+</span>    <span class="n">drop_last</span> <span class="o">=</span> <span class="kc">True</span><span class="w">
+</span><span class="p">)</span><span class="w">
+</span></pre></div></div>
 </section>
 <section id="create-the-pc">
 <h2>Create the PC<a class="headerlink" href="#create-the-pc" title="Link to this heading"></a></h2>
 <p>Let’s create a HCLT PC with latent size 128.</p>
-<div class="highlight-Python notranslate"><div class="highlight"><pre><span></span><span class="n">device</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">device</span><span class="p">(</span><span class="s2">"cuda:0"</span><span class="p">)</span>
-
-<span class="c1"># The data is required to construct the backbone Chow-Liu Tree structure for the HCLT</span>
-<span class="n">ns</span> <span class="o">=</span> <span class="n">juice</span><span class="o">.</span><span class="n">structures</span><span class="o">.</span><span class="n">HCLT</span><span class="p">(</span>
-    <span class="n">train_data</span><span class="o">.</span><span class="n">float</span><span class="p">()</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">device</span><span class="p">),</span>
-    <span class="n">num_latents</span> <span class="o">=</span> <span class="mi">128</span>
-<span class="p">)</span>
-</pre></div>
-</div>
+<div class="highlight-Python notranslate"><div class="highlight"><pre><span class="n">device</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">device</span><span class="p">(</span><span class="s2">&quot;</span><span class="s2">cuda:0</span><span class="s2">&quot;</span><span class="p">)</span><span class="w">
+</span><span class="w">
+</span><span class="c1"># The data is required to construct the backbone Chow-Liu Tree structure for the HCLT</span><span class="w">
+</span><span class="n">ns</span> <span class="o">=</span> <a class="sphx-glr-backref-module-pyjuice-structures sphx-glr-backref-type-py-function reference internal" href="../../python-api/generated/pyjuice.structures.HCLT.html#pyjuice.structures.HCLT" title="pyjuice.structures.HCLT"><span class="n">juice</span><span class="o">.</span><span class="n">structures</span><span class="o">.</span><span class="n">HCLT</span></a><span class="p">(</span><span class="w">
+</span>    <span class="n">train_data</span><span class="o">.</span><span class="n">float</span><span class="p">(</span><span class="p">)</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">device</span><span class="p">)</span><span class="p">,</span><span class="w">
+</span>    <span class="n">num_latents</span> <span class="o">=</span> <span class="mi">128</span><span class="w">
+</span><span class="p">)</span><span class="w">
+</span></pre></div></div>
 <p><code class="code docutils literal notranslate"><span class="pre">ns</span></code> is a Directed Acyclic Graph (DAG) representation of the PC.
 Specifically, we use <code class="code docutils literal notranslate"><span class="pre">pyjuice.nodes.InputNodes</span></code>, <code class="code docutils literal notranslate"><span class="pre">pyjuice.nodes.ProdNodes</span></code>, and <code class="code docutils literal notranslate"><span class="pre">pyjuice.nodes.SumNodes</span></code> to define vectors of input nodes, product nodes, and sum nodes, respectively.
 By also storing the topological structure of the node vectors (with pointers to the child node vectors), we create the PC as a DAG-based structure. <code class="code docutils literal notranslate"><span class="pre">ns</span></code> is also just a node vector defining the root node of the PC.</p>
 <p>While being user-friendly, the DAG-based representation is not amenable to efficient computation.
 Therefore, before doing any computation, we need to compile the PC with <code class="code docutils literal notranslate"><span class="pre">pyjuice.compile</span></code>, which creates a compact and equivalent representation of the PC.</p>
-<div class="highlight-Python notranslate"><div class="highlight"><pre><span></span><span class="n">pc</span> <span class="o">=</span> <span class="n">juice</span><span class="o">.</span><span class="n">compile</span><span class="p">(</span><span class="n">ns</span><span class="p">)</span>
-</pre></div>
-</div>
+<div class="highlight-Python notranslate"><div class="highlight"><pre><span class="n">pc</span> <span class="o">=</span> <a class="sphx-glr-backref-module-pyjuice sphx-glr-backref-type-py-function reference internal" href="../../python-api/generated/pyjuice.compile.html#pyjuice.compile" title="pyjuice.compile"><span class="n">juice</span><span class="o">.</span><span class="n">compile</span></a><span class="p">(</span><span class="n">ns</span><span class="p">)</span><span class="w">
+</span></pre></div></div>
 <p>The <code class="code docutils literal notranslate"><span class="pre">pc</span></code> is an instance of <code class="code docutils literal notranslate"><span class="pre">torch.nn.Module</span></code>. So we can safely assume it is just a neural network with the variable assignments <span class="math notranslate nohighlight">\(\mathbf{x}\)</span> as input and its log-likelihood <span class="math notranslate nohighlight">\(\log p(\mathbf{x})\)</span> as output.
 We proceed to move it to the GPU specified by <code class="code docutils literal notranslate"><span class="pre">device</span></code>.</p>
-<div class="highlight-Python notranslate"><div class="highlight"><pre><span></span><span class="n">pc</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">device</span><span class="p">)</span>
-</pre></div>
-</div>
+<div class="highlight-Python notranslate"><div class="highlight"><pre><span class="n">pc</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">device</span><span class="p">)</span><span class="w">
+</span></pre></div></div>
 </section>
 <section id="train-the-pc">
 <h2>Train the PC<a class="headerlink" href="#train-the-pc" title="Link to this heading"></a></h2>
 <p>We start by defining the optimizer. PyJuice provides a few EM-based optimizers in <cite>juice.optim</cite>
 (<cite>FullBatchEM</cite>, <cite>MiniBatchEM</cite>, and <cite>Anemone</cite>); here we use mini-batch EM.</p>
-<div class="highlight-Python notranslate"><div class="highlight"><pre><span></span><span class="n">optimizer</span> <span class="o">=</span> <span class="n">juice</span><span class="o">.</span><span class="n">optim</span><span class="o">.</span><span class="n">MiniBatchEM</span><span class="p">(</span><span class="n">pc</span><span class="p">,</span> <span class="n">step_size</span> <span class="o">=</span> <span class="mf">0.1</span><span class="p">,</span> <span class="n">pseudocount</span> <span class="o">=</span> <span class="mf">0.1</span><span class="p">)</span>
-</pre></div>
-</div>
+<div class="highlight-Python notranslate"><div class="highlight"><pre><span class="n">optimizer</span> <span class="o">=</span> <a class="sphx-glr-backref-module-pyjuice-optim sphx-glr-backref-type-py-class sphx-glr-backref-instance reference internal" href="../../python-api/optim.html#pyjuice.optim.MiniBatchEM" title="pyjuice.optim.MiniBatchEM"><span class="n">juice</span><span class="o">.</span><span class="n">optim</span><span class="o">.</span><span class="n">MiniBatchEM</span></a><span class="p">(</span><span class="n">pc</span><span class="p">,</span> <span class="n">step_size</span> <span class="o">=</span> <span class="mf">0.1</span><span class="p">,</span> <span class="n">pseudocount</span> <span class="o">=</span> <span class="mf">0.1</span><span class="p">)</span><span class="w">
+</span></pre></div></div>
 <p>Optionally, we can leverage CUDA Graphs to hide the kernel launching overhead by doing a dry run.</p>
-<div class="highlight-Python notranslate"><div class="highlight"><pre><span></span><span class="k">for</span> <span class="n">batch</span> <span class="ow">in</span> <span class="n">train_loader</span><span class="p">:</span>
-    <span class="n">x</span> <span class="o">=</span> <span class="n">batch</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">device</span><span class="p">)</span>
-
-    <span class="n">lls</span> <span class="o">=</span> <span class="n">pc</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">record_cudagraph</span> <span class="o">=</span> <span class="kc">True</span><span class="p">)</span>
-    <span class="n">lls</span><span class="o">.</span><span class="n">mean</span><span class="p">()</span><span class="o">.</span><span class="n">backward</span><span class="p">()</span>
-    <span class="k">break</span>
-</pre></div>
-</div>
+<div class="highlight-Python notranslate"><div class="highlight"><pre><span class="k">for</span> <span class="n">batch</span> <span class="ow">in</span> <span class="n">train_loader</span><span class="p">:</span><span class="w">
+</span>    <span class="n">x</span> <span class="o">=</span> <span class="n">batch</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">device</span><span class="p">)</span><span class="w">
+</span><span class="w">
+</span>    <span class="n">lls</span> <span class="o">=</span> <span class="n">pc</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">record_cudagraph</span> <span class="o">=</span> <span class="kc">True</span><span class="p">)</span><span class="w">
+</span>    <span class="n">lls</span><span class="o">.</span><span class="n">mean</span><span class="p">(</span><span class="p">)</span><span class="o">.</span><span class="n">backward</span><span class="p">(</span><span class="p">)</span><span class="w">
+</span>    <span class="k">break</span><span class="w">
+</span></pre></div></div>
 <p>We are now ready for the training. Below is an example training loop for mini-batch EM.</p>
-<div class="highlight-Python notranslate"><div class="highlight"><pre><span></span><span class="k">for</span> <span class="n">epoch</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="mi">350</span><span class="o">+</span><span class="mi">1</span><span class="p">):</span>
-    <span class="n">t0</span> <span class="o">=</span> <a href="https://docs.python.org/3/library/time.html#time.time" title="time.time" class="sphx-glr-backref-module-time sphx-glr-backref-type-py-function"><span class="n">time</span><span class="o">.</span><span class="n">time</span></a><span class="p">()</span>
-    <span class="n">train_ll</span> <span class="o">=</span> <span class="mf">0.0</span>
-    <span class="k">for</span> <span class="n">batch</span> <span class="ow">in</span> <span class="n">train_loader</span><span class="p">:</span>
-        <span class="n">x</span> <span class="o">=</span> <span class="n">batch</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">device</span><span class="p">)</span>
-
-        <span class="c1"># Forward pass</span>
-        <span class="n">lls</span> <span class="o">=</span> <span class="n">pc</span><span class="p">(</span><span class="n">x</span><span class="p">)</span>
-
-        <span class="c1"># Backward pass accumulates the parameter flows</span>
-        <span class="n">lls</span><span class="o">.</span><span class="n">mean</span><span class="p">()</span><span class="o">.</span><span class="n">backward</span><span class="p">()</span>
-
-        <span class="n">train_ll</span> <span class="o">+=</span> <span class="n">lls</span><span class="o">.</span><span class="n">mean</span><span class="p">()</span><span class="o">.</span><span class="n">detach</span><span class="p">()</span><span class="o">.</span><span class="n">cpu</span><span class="p">()</span><span class="o">.</span><span class="n">numpy</span><span class="p">()</span><span class="o">.</span><span class="n">item</span><span class="p">()</span>
-
-        <span class="c1"># Perform a mini-batch EM step (consumes the flows, then resets the accumulator)</span>
-        <span class="n">optimizer</span><span class="o">.</span><span class="n">step</span><span class="p">()</span>
-
-    <span class="n">train_ll</span> <span class="o">/=</span> <span class="nb">len</span><span class="p">(</span><span class="n">train_loader</span><span class="p">)</span>
-
-    <span class="n">t1</span> <span class="o">=</span> <a href="https://docs.python.org/3/library/time.html#time.time" title="time.time" class="sphx-glr-backref-module-time sphx-glr-backref-type-py-function"><span class="n">time</span><span class="o">.</span><span class="n">time</span></a><span class="p">()</span>
-    <span class="n">test_ll</span> <span class="o">=</span> <span class="mf">0.0</span>
-    <span class="k">for</span> <span class="n">batch</span> <span class="ow">in</span> <span class="n">valid_loader</span><span class="p">:</span>
-        <span class="n">x</span> <span class="o">=</span> <span class="n">batch</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">pc</span><span class="o">.</span><span class="n">device</span><span class="p">)</span>
-        <span class="n">lls</span> <span class="o">=</span> <span class="n">pc</span><span class="p">(</span><span class="n">x</span><span class="p">)</span>
-        <span class="n">test_ll</span> <span class="o">+=</span> <span class="n">lls</span><span class="o">.</span><span class="n">mean</span><span class="p">()</span><span class="o">.</span><span class="n">detach</span><span class="p">()</span><span class="o">.</span><span class="n">cpu</span><span class="p">()</span><span class="o">.</span><span class="n">numpy</span><span class="p">()</span><span class="o">.</span><span class="n">item</span><span class="p">()</span>
-
-    <span class="n">test_ll</span> <span class="o">/=</span> <span class="nb">len</span><span class="p">(</span><span class="n">valid_loader</span><span class="p">)</span>
-    <span class="n">t2</span> <span class="o">=</span> <a href="https://docs.python.org/3/library/time.html#time.time" title="time.time" class="sphx-glr-backref-module-time sphx-glr-backref-type-py-function"><span class="n">time</span><span class="o">.</span><span class="n">time</span></a><span class="p">()</span>
-
-    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"[Epoch </span><span class="si">{</span><span class="n">epoch</span><span class="si">}</span><span class="s2">/</span><span class="si">{</span><span class="mi">350</span><span class="si">}</span><span class="s2">][train LL: </span><span class="si">{</span><span class="n">train_ll</span><span class="si">:</span><span class="s2">.2f</span><span class="si">}</span><span class="s2">; val LL: </span><span class="si">{</span><span class="n">test_ll</span><span class="si">:</span><span class="s2">.2f</span><span class="si">}</span><span class="s2">].....[train forward+backward+step </span><span class="si">{</span><span class="n">t1</span><span class="o">-</span><span class="n">t0</span><span class="si">:</span><span class="s2">.2f</span><span class="si">}</span><span class="s2">; val forward </span><span class="si">{</span><span class="n">t2</span><span class="o">-</span><span class="n">t1</span><span class="si">:</span><span class="s2">.2f</span><span class="si">}</span><span class="s2">] "</span><span class="p">)</span>
-</pre></div>
-</div>
+<div class="highlight-Python notranslate"><div class="highlight"><pre><span class="k">for</span> <span class="n">epoch</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="mi">350</span><span class="o">+</span><span class="mi">1</span><span class="p">)</span><span class="p">:</span><span class="w">
+</span>    <span class="n">t0</span> <span class="o">=</span> <a class="sphx-glr-backref-module-time sphx-glr-backref-type-py-function reference external" href="https://docs.python.org/3/library/time.html#time.time" title="time.time"><span class="n">time</span><span class="o">.</span><span class="n">time</span></a><span class="p">(</span><span class="p">)</span><span class="w">
+</span>    <span class="n">train_ll</span> <span class="o">=</span> <span class="mf">0.0</span><span class="w">
+</span>    <span class="k">for</span> <span class="n">batch</span> <span class="ow">in</span> <span class="n">train_loader</span><span class="p">:</span><span class="w">
+</span>        <span class="n">x</span> <span class="o">=</span> <span class="n">batch</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">device</span><span class="p">)</span><span class="w">
+</span><span class="w">
+</span>        <span class="c1"># Forward pass</span><span class="w">
+</span>        <span class="n">lls</span> <span class="o">=</span> <span class="n">pc</span><span class="p">(</span><span class="n">x</span><span class="p">)</span><span class="w">
+</span><span class="w">
+</span>        <span class="c1"># Backward pass accumulates the parameter flows</span><span class="w">
+</span>        <span class="n">lls</span><span class="o">.</span><span class="n">mean</span><span class="p">(</span><span class="p">)</span><span class="o">.</span><span class="n">backward</span><span class="p">(</span><span class="p">)</span><span class="w">
+</span><span class="w">
+</span>        <span class="n">train_ll</span> <span class="o">+</span><span class="o">=</span> <span class="n">lls</span><span class="o">.</span><span class="n">mean</span><span class="p">(</span><span class="p">)</span><span class="o">.</span><span class="n">detach</span><span class="p">(</span><span class="p">)</span><span class="o">.</span><span class="n">cpu</span><span class="p">(</span><span class="p">)</span><span class="o">.</span><span class="n">numpy</span><span class="p">(</span><span class="p">)</span><span class="o">.</span><span class="n">item</span><span class="p">(</span><span class="p">)</span><span class="w">
+</span><span class="w">
+</span>        <span class="c1"># Perform a mini-batch EM step (consumes the flows, then resets the accumulator)</span><span class="w">
+</span>        <span class="n">optimizer</span><span class="o">.</span><span class="n">step</span><span class="p">(</span><span class="p">)</span><span class="w">
+</span><span class="w">
+</span>    <span class="n">train_ll</span> <span class="o">/</span><span class="o">=</span> <span class="nb">len</span><span class="p">(</span><span class="n">train_loader</span><span class="p">)</span><span class="w">
+</span><span class="w">
+</span>    <span class="n">t1</span> <span class="o">=</span> <a class="sphx-glr-backref-module-time sphx-glr-backref-type-py-function reference external" href="https://docs.python.org/3/library/time.html#time.time" title="time.time"><span class="n">time</span><span class="o">.</span><span class="n">time</span></a><span class="p">(</span><span class="p">)</span><span class="w">
+</span>    <span class="n">test_ll</span> <span class="o">=</span> <span class="mf">0.0</span><span class="w">
+</span>    <span class="k">for</span> <span class="n">batch</span> <span class="ow">in</span> <span class="n">valid_loader</span><span class="p">:</span><span class="w">
+</span>        <span class="n">x</span> <span class="o">=</span> <span class="n">batch</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">pc</span><span class="o">.</span><span class="n">device</span><span class="p">)</span><span class="w">
+</span>        <span class="n">lls</span> <span class="o">=</span> <span class="n">pc</span><span class="p">(</span><span class="n">x</span><span class="p">)</span><span class="w">
+</span>        <span class="n">test_ll</span> <span class="o">+</span><span class="o">=</span> <span class="n">lls</span><span class="o">.</span><span class="n">mean</span><span class="p">(</span><span class="p">)</span><span class="o">.</span><span class="n">detach</span><span class="p">(</span><span class="p">)</span><span class="o">.</span><span class="n">cpu</span><span class="p">(</span><span class="p">)</span><span class="o">.</span><span class="n">numpy</span><span class="p">(</span><span class="p">)</span><span class="o">.</span><span class="n">item</span><span class="p">(</span><span class="p">)</span><span class="w">
+</span><span class="w">
+</span>    <span class="n">test_ll</span> <span class="o">/</span><span class="o">=</span> <span class="nb">len</span><span class="p">(</span><span class="n">valid_loader</span><span class="p">)</span><span class="w">
+</span>    <span class="n">t2</span> <span class="o">=</span> <a class="sphx-glr-backref-module-time sphx-glr-backref-type-py-function reference external" href="https://docs.python.org/3/library/time.html#time.time" title="time.time"><span class="n">time</span><span class="o">.</span><span class="n">time</span></a><span class="p">(</span><span class="p">)</span><span class="w">
+</span><span class="w">
+</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="s2">[Epoch </span><span class="si">{</span><span class="n">epoch</span><span class="si">}</span><span class="s2">/</span><span class="si">{</span><span class="mi">350</span><span class="si">}</span><span class="s2">][train LL: </span><span class="si">{</span><span class="n">train_ll</span><span class="si">:</span><span class="s2">.2f</span><span class="si">}</span><span class="s2">; val LL: </span><span class="si">{</span><span class="n">test_ll</span><span class="si">:</span><span class="s2">.2f</span><span class="si">}</span><span class="s2">].....[train forward+backward+step </span><span class="si">{</span><span class="n">t1</span><span class="o">-</span><span class="n">t0</span><span class="si">:</span><span class="s2">.2f</span><span class="si">}</span><span class="s2">; val forward </span><span class="si">{</span><span class="n">t2</span><span class="o">-</span><span class="n">t1</span><span class="si">:</span><span class="s2">.2f</span><span class="si">}</span><span class="s2">] </span><span class="s2">&quot;</span><span class="p">)</span><span class="w">
+</span></pre></div></div>
 <p>Similarly, an example training loop for full-batch EM is given as follows.</p>
-<div class="highlight-Python notranslate"><div class="highlight"><pre><span></span><span class="k">for</span> <span class="n">epoch</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="mi">1</span><span class="o">+</span><span class="mi">1</span><span class="p">):</span>
-    <span class="n">t0</span> <span class="o">=</span> <a href="https://docs.python.org/3/library/time.html#time.time" title="time.time" class="sphx-glr-backref-module-time sphx-glr-backref-type-py-function"><span class="n">time</span><span class="o">.</span><span class="n">time</span></a><span class="p">()</span>
-
-    <span class="c1"># Manually zeroling out the flows</span>
-    <span class="n">pc</span><span class="o">.</span><span class="n">init_param_flows</span><span class="p">(</span><span class="n">flows_memory</span> <span class="o">=</span> <span class="mf">0.0</span><span class="p">)</span>
-
-    <span class="n">train_ll</span> <span class="o">=</span> <span class="mf">0.0</span>
-    <span class="k">for</span> <span class="n">batch</span> <span class="ow">in</span> <span class="n">train_loader</span><span class="p">:</span>
-        <span class="n">x</span> <span class="o">=</span> <span class="n">batch</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">device</span><span class="p">)</span>
-
-        <span class="c1"># We only run the forward and the backward pass, and accumulate the flows throughout the epoch</span>
-        <span class="n">lls</span> <span class="o">=</span> <span class="n">pc</span><span class="p">(</span><span class="n">x</span><span class="p">)</span>
-        <span class="n">lls</span><span class="o">.</span><span class="n">mean</span><span class="p">()</span><span class="o">.</span><span class="n">backward</span><span class="p">()</span>
-
-        <span class="n">train_ll</span> <span class="o">+=</span> <span class="n">lls</span><span class="o">.</span><span class="n">mean</span><span class="p">()</span><span class="o">.</span><span class="n">detach</span><span class="p">()</span><span class="o">.</span><span class="n">cpu</span><span class="p">()</span><span class="o">.</span><span class="n">numpy</span><span class="p">()</span><span class="o">.</span><span class="n">item</span><span class="p">()</span>
-
-    <span class="c1"># Set step size to 1.0 for full-batch EM</span>
-    <span class="n">pc</span><span class="o">.</span><span class="n">mini_batch_em</span><span class="p">(</span><span class="n">step_size</span> <span class="o">=</span> <span class="mf">1.0</span><span class="p">,</span> <span class="n">pseudocount</span> <span class="o">=</span> <span class="mf">0.01</span><span class="p">)</span>
-
-    <span class="n">train_ll</span> <span class="o">/=</span> <span class="nb">len</span><span class="p">(</span><span class="n">train_loader</span><span class="p">)</span>
-
-    <span class="n">t1</span> <span class="o">=</span> <a href="https://docs.python.org/3/library/time.html#time.time" title="time.time" class="sphx-glr-backref-module-time sphx-glr-backref-type-py-function"><span class="n">time</span><span class="o">.</span><span class="n">time</span></a><span class="p">()</span>
-    <span class="n">test_ll</span> <span class="o">=</span> <span class="mf">0.0</span>
-    <span class="k">for</span> <span class="n">batch</span> <span class="ow">in</span> <span class="n">valid_loader</span><span class="p">:</span>
-        <span class="n">x</span> <span class="o">=</span> <span class="n">batch</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">pc</span><span class="o">.</span><span class="n">device</span><span class="p">)</span>
-        <span class="n">lls</span> <span class="o">=</span> <span class="n">pc</span><span class="p">(</span><span class="n">x</span><span class="p">)</span>
-        <span class="n">test_ll</span> <span class="o">+=</span> <span class="n">lls</span><span class="o">.</span><span class="n">mean</span><span class="p">()</span><span class="o">.</span><span class="n">detach</span><span class="p">()</span><span class="o">.</span><span class="n">cpu</span><span class="p">()</span><span class="o">.</span><span class="n">numpy</span><span class="p">()</span><span class="o">.</span><span class="n">item</span><span class="p">()</span>
-
-    <span class="n">test_ll</span> <span class="o">/=</span> <span class="nb">len</span><span class="p">(</span><span class="n">valid_loader</span><span class="p">)</span>
-    <span class="n">t2</span> <span class="o">=</span> <a href="https://docs.python.org/3/library/time.html#time.time" title="time.time" class="sphx-glr-backref-module-time sphx-glr-backref-type-py-function"><span class="n">time</span><span class="o">.</span><span class="n">time</span></a><span class="p">()</span>
-    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"[Epoch </span><span class="si">{</span><span class="n">epoch</span><span class="si">}</span><span class="s2">/</span><span class="si">{</span><span class="mi">1</span><span class="si">}</span><span class="s2">][train LL: </span><span class="si">{</span><span class="n">train_ll</span><span class="si">:</span><span class="s2">.2f</span><span class="si">}</span><span class="s2">; val LL: </span><span class="si">{</span><span class="n">test_ll</span><span class="si">:</span><span class="s2">.2f</span><span class="si">}</span><span class="s2">].....[train forward+backward+step </span><span class="si">{</span><span class="n">t1</span><span class="o">-</span><span class="n">t0</span><span class="si">:</span><span class="s2">.2f</span><span class="si">}</span><span class="s2">; val forward </span><span class="si">{</span><span class="n">t2</span><span class="o">-</span><span class="n">t1</span><span class="si">:</span><span class="s2">.2f</span><span class="si">}</span><span class="s2">] "</span><span class="p">)</span>
-</pre></div>
-</div>
+<div class="highlight-Python notranslate"><div class="highlight"><pre><span class="k">for</span> <span class="n">epoch</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="mi">1</span><span class="o">+</span><span class="mi">1</span><span class="p">)</span><span class="p">:</span><span class="w">
+</span>    <span class="n">t0</span> <span class="o">=</span> <a class="sphx-glr-backref-module-time sphx-glr-backref-type-py-function reference external" href="https://docs.python.org/3/library/time.html#time.time" title="time.time"><span class="n">time</span><span class="o">.</span><span class="n">time</span></a><span class="p">(</span><span class="p">)</span><span class="w">
+</span><span class="w">
+</span>    <span class="c1"># Manually zeroling out the flows</span><span class="w">
+</span>    <span class="n">pc</span><span class="o">.</span><span class="n">init_param_flows</span><span class="p">(</span><span class="n">flows_memory</span> <span class="o">=</span> <span class="mf">0.0</span><span class="p">)</span><span class="w">
+</span><span class="w">
+</span>    <span class="n">train_ll</span> <span class="o">=</span> <span class="mf">0.0</span><span class="w">
+</span>    <span class="k">for</span> <span class="n">batch</span> <span class="ow">in</span> <span class="n">train_loader</span><span class="p">:</span><span class="w">
+</span>        <span class="n">x</span> <span class="o">=</span> <span class="n">batch</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">device</span><span class="p">)</span><span class="w">
+</span><span class="w">
+</span>        <span class="c1"># We only run the forward and the backward pass, and accumulate the flows throughout the epoch</span><span class="w">
+</span>        <span class="n">lls</span> <span class="o">=</span> <span class="n">pc</span><span class="p">(</span><span class="n">x</span><span class="p">)</span><span class="w">
+</span>        <span class="n">lls</span><span class="o">.</span><span class="n">mean</span><span class="p">(</span><span class="p">)</span><span class="o">.</span><span class="n">backward</span><span class="p">(</span><span class="p">)</span><span class="w">
+</span><span class="w">
+</span>        <span class="n">train_ll</span> <span class="o">+</span><span class="o">=</span> <span class="n">lls</span><span class="o">.</span><span class="n">mean</span><span class="p">(</span><span class="p">)</span><span class="o">.</span><span class="n">detach</span><span class="p">(</span><span class="p">)</span><span class="o">.</span><span class="n">cpu</span><span class="p">(</span><span class="p">)</span><span class="o">.</span><span class="n">numpy</span><span class="p">(</span><span class="p">)</span><span class="o">.</span><span class="n">item</span><span class="p">(</span><span class="p">)</span><span class="w">
+</span><span class="w">
+</span>    <span class="c1"># Set step size to 1.0 for full-batch EM</span><span class="w">
+</span>    <span class="n">pc</span><span class="o">.</span><span class="n">mini_batch_em</span><span class="p">(</span><span class="n">step_size</span> <span class="o">=</span> <span class="mf">1.0</span><span class="p">,</span> <span class="n">pseudocount</span> <span class="o">=</span> <span class="mf">0.01</span><span class="p">)</span><span class="w">
+</span><span class="w">
+</span>    <span class="n">train_ll</span> <span class="o">/</span><span class="o">=</span> <span class="nb">len</span><span class="p">(</span><span class="n">train_loader</span><span class="p">)</span><span class="w">
+</span><span class="w">
+</span>    <span class="n">t1</span> <span class="o">=</span> <a class="sphx-glr-backref-module-time sphx-glr-backref-type-py-function reference external" href="https://docs.python.org/3/library/time.html#time.time" title="time.time"><span class="n">time</span><span class="o">.</span><span class="n">time</span></a><span class="p">(</span><span class="p">)</span><span class="w">
+</span>    <span class="n">test_ll</span> <span class="o">=</span> <span class="mf">0.0</span><span class="w">
+</span>    <span class="k">for</span> <span class="n">batch</span> <span class="ow">in</span> <span class="n">valid_loader</span><span class="p">:</span><span class="w">
+</span>        <span class="n">x</span> <span class="o">=</span> <span class="n">batch</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">pc</span><span class="o">.</span><span class="n">device</span><span class="p">)</span><span class="w">
+</span>        <span class="n">lls</span> <span class="o">=</span> <span class="n">pc</span><span class="p">(</span><span class="n">x</span><span class="p">)</span><span class="w">
+</span>        <span class="n">test_ll</span> <span class="o">+</span><span class="o">=</span> <span class="n">lls</span><span class="o">.</span><span class="n">mean</span><span class="p">(</span><span class="p">)</span><span class="o">.</span><span class="n">detach</span><span class="p">(</span><span class="p">)</span><span class="o">.</span><span class="n">cpu</span><span class="p">(</span><span class="p">)</span><span class="o">.</span><span class="n">numpy</span><span class="p">(</span><span class="p">)</span><span class="o">.</span><span class="n">item</span><span class="p">(</span><span class="p">)</span><span class="w">
+</span><span class="w">
+</span>    <span class="n">test_ll</span> <span class="o">/</span><span class="o">=</span> <span class="nb">len</span><span class="p">(</span><span class="n">valid_loader</span><span class="p">)</span><span class="w">
+</span>    <span class="n">t2</span> <span class="o">=</span> <a class="sphx-glr-backref-module-time sphx-glr-backref-type-py-function reference external" href="https://docs.python.org/3/library/time.html#time.time" title="time.time"><span class="n">time</span><span class="o">.</span><span class="n">time</span></a><span class="p">(</span><span class="p">)</span><span class="w">
+</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="s2">[Epoch </span><span class="si">{</span><span class="n">epoch</span><span class="si">}</span><span class="s2">/</span><span class="si">{</span><span class="mi">1</span><span class="si">}</span><span class="s2">][train LL: </span><span class="si">{</span><span class="n">train_ll</span><span class="si">:</span><span class="s2">.2f</span><span class="si">}</span><span class="s2">; val LL: </span><span class="si">{</span><span class="n">test_ll</span><span class="si">:</span><span class="s2">.2f</span><span class="si">}</span><span class="s2">].....[train forward+backward+step </span><span class="si">{</span><span class="n">t1</span><span class="o">-</span><span class="n">t0</span><span class="si">:</span><span class="s2">.2f</span><span class="si">}</span><span class="s2">; val forward </span><span class="si">{</span><span class="n">t2</span><span class="o">-</span><span class="n">t1</span><span class="si">:</span><span class="s2">.2f</span><span class="si">}</span><span class="s2">] </span><span class="s2">&quot;</span><span class="p">)</span><span class="w">
+</span></pre></div></div>
 <div class="sphx-glr-footer sphx-glr-footer-example docutils container" id="sphx-glr-download-getting-started-tutorials-01-train-pc-py">
 <div class="sphx-glr-download sphx-glr-download-jupyter docutils container">
 <p><a class="reference download internal" download="" href="../../_downloads/e598bde225aeff7f7f120dd63eb87317/01_train_pc.ipynb"><code class="xref download docutils literal notranslate"><span class="pre">Download</span> <span class="pre">Jupyter</span> <span class="pre">notebook:</span> <span class="pre">01_train_pc.ipynb</span></code></a></p>
