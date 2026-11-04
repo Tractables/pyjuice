@@ -19,13 +19,14 @@ from typing import Optional
 
 import numpy as np
 import torch
+from numba import njit
 
 from .backend import forward as F
 from ..kernels.common import pack_aligned
 from ..kernels.compact import (STORAGES, compact_buffers, held_elsewhere, held_moves, partial_carry, query_layout,
                                regather_into, resolve_storage, worth_parking)
 from ..kernels.live import live_successors, liveness
-from ..kernels.score import class_weight_rows, score_group, score_tables
+from ..kernels.score import class_weight_rows, class_weight_walk, score_group, score_tables
 from ..kernels.transitions import enumerated_args
 from .backend.plans import (PLANS_PER_POSITION, PLAN_CACHE_SIZE, per_sample_intervals, prior_regions, query_plan,
                     read_regions, scope_intervals, top_down_prior)
@@ -107,25 +108,101 @@ def _sample_columns(masses, score, g: int, pos: np.ndarray, B: int, prog) -> Opt
         first = np.where(real.any(axis = 1), tr[np.arange(len(tr)), real.argmax(axis = 1)], -1)
         mixed = ~(np.where(real, tr, first[:, None]) == first[:, None]).all(axis = 1)
         kept = rows[g] = (weakref.ref(masses), first, mixed)
-    first, mixed = kept[1][pos], kept[2][pos]
-    if mixed.any() or (masses.token_ids is not None and (first < 0).any() and (first >= 0).any()):
+    pos = np.asarray(pos, dtype = np.int64)
+    status, offset = _sample_offsets(kept[1], kept[2], pos, B, masses.token_stride, masses.token_width,
+                                     masses.token_ids is not None)
+    if status == 1:
         raise NotImplementedError("Conditionals at a position whose input nodes are reweighted by different per-sample "
                                   "inputs (or some only) are not supported.")
-    if (first < 0).all():
+    if status == 2:
         return None
     nodes = prog.__dict__.setdefault("sample_nodes", {})
     if g not in nodes:
         nodes[g] = torch.from_numpy(np.maximum(score.nodes[g], 0)).to(prog.dev)
-    off = first[:, None]
-    offset = np.where(off >= 0, (off + np.arange(B)[None, :] * masses.token_stride) * masses.token_width, -1)
-    return nodes[g], np.asarray(pos, dtype = np.int64), offset.reshape(-1)
+    return nodes[g], pos, offset
 
 
-def _as_int64(a: np.ndarray) -> np.ndarray:
-    """``a``'s bytes as int64 (zero-padded to whole ones): packed with int64 tables, viewed back as ``a``'s dtype on the
-    device."""
-    b = np.ascontiguousarray(a).view(np.uint8).ravel()
-    return np.concatenate([b, np.zeros((-b.size) % 8, dtype = np.uint8)]).view(np.int64)
+@njit(cache = True)
+def _sample_offsets(first, mixed, pos, B, stride, width, topk):
+    """``(status, offsets)`` of :func:`_sample_columns`' positions ``pos`` (``first``: per position, its nodes' weights'
+    row, -1 for none; ``mixed``: nodes of different rows): status 1 if a position's nodes are reweighted by different
+    inputs (or, ``topk``, some positions' only), 2 if no position's are, else 0 and every column's first weight
+    (``(first + b x stride) x width``, -1 for a position without), sample by sample within a position."""
+    none = 0
+    for i in range(pos.size):
+        if mixed[pos[i]]:
+            return 1, np.empty(0, dtype = np.int64)
+        if first[pos[i]] < 0:
+            none += 1
+    if topk and 0 < none < pos.size:
+        return 1, np.empty(0, dtype = np.int64)
+    if none == pos.size:
+        return 2, np.empty(0, dtype = np.int64)
+    offset = np.empty(pos.size * B, dtype = np.int64)
+    for i in range(pos.size):
+        f = first[pos[i]]
+        for b in range(B):
+            offset[i * B + b] = (f + b * stride) * width if f >= 0 else -1
+    return 0, offset
+
+
+@njit(cache = True)
+def _target_rows(tgt):
+    """``(rank, M, positions)`` of the targets ``tgt`` (bool [B, n]): every target's row (int64 [B, n], sample by
+    sample, positions in order: the targets before it; a non-target's the targets before it less one), their number,
+    and the positions some sample targets."""
+    B, n = tgt.shape
+    rank = np.empty((B, n), dtype = np.int64)
+    positions = np.zeros(n, dtype = np.bool_)
+    M = 0
+    for b in range(B):
+        for t in range(n):
+            if tgt[b, t]:
+                M += 1
+                positions[t] = True
+            rank[b, t] = M - 1
+    return rank, M, positions
+
+
+@njit(cache = True)
+def _column_rows(tgt, rank, pos):
+    """Every column's row (int64 [positions x B], column ``p * B + b`` sample ``b`` at position ``pos[p]``; -1 where it
+    is not a target)."""
+    B = tgt.shape[0]
+    out = np.empty(pos.size * B, dtype = np.int64)
+    for p in range(pos.size):
+        for b in range(B):
+            out[p * B + b] = rank[b, pos[p]] if tgt[b, pos[p]] else -1
+    return out
+
+
+@njit(cache = True)
+def _host_evidence(miss, data, token_class):
+    """``(tokens, classes, missing, bad)`` of a query's evidence on the host (``miss`` bool [B, n], ``data`` [B, n]),
+    packed as int64 for its upload: every token (0 where missing), its class (``token_class``'s, -1 where missing;
+    int32, two to an int64) and the missing flags (bytes, eight to an int64), and the first observed position (flat)
+    whose token is not in the vocabulary (-1: none; a negative one counts from its end, as an index does)."""
+    B, n = miss.shape
+    V = token_class.size
+    x = np.empty(B * n, dtype = np.int64)
+    cls = np.zeros((B * n + 1) // 2, dtype = np.int64)
+    m = np.zeros((B * n + 7) // 8, dtype = np.int64)
+    c32, m8 = cls.view(np.int32), m.view(np.uint8)
+    for b in range(B):
+        for t in range(n):
+            i = b * n + t
+            if miss[b, t]:
+                x[i] = 0
+                c32[i] = -1
+                m8[i] = 1
+            else:
+                v = data[b, t]
+                k = v + V if v < 0 else v
+                if k < 0 or k >= V:
+                    return x, cls, m, i
+                x[i] = v
+                c32[i] = np.int32(token_class[k])
+    return x, cls, m, -1
 
 
 def _scope_ivs(td, external) -> np.ndarray:
@@ -205,6 +282,15 @@ def class_weights(backend, data: torch.Tensor, missing: torch.Tensor, positions:
     # compact, a query needs its liveness even with nothing observed: every column is live, but only the regions it
     # computes per sample get rows (none, every value input-independent, inside fast_inference)
     lv = liveness(prog, obs_class, B, succ) if observed.any() or storage != "dense" or succ is not None else None
+    # the class weights' rows, issued while the liveness runs -- they read its live pairs alone, and the layout below
+    # waits for its counts (the lists with their ranks first, as the layout reads them: built once) --, unless a dense
+    # query observing nothing may give the liveness up below (its rows then every column's, as they were)
+    early = lv is not None and (observed.any() or succ is not None or storage == "compact")
+    if early:
+        if storage != "dense":
+            lv.lists(rank = True)
+        rows = class_weight_rows(prog, lv, col_pos, col_K, col_first, group_first, B,
+                                 backend.token_classes.stored_of_class)
     valid, kept = backend.state.prior_validity(masses.version)
     prior = prior_regions(prog, observed, B, kept, lv)
     pf = backend.state.prior_flows(np.zeros(len(backend.sum_regions), dtype = bool))
@@ -245,9 +331,11 @@ def class_weights(backend, data: torch.Tensor, missing: torch.Tensor, positions:
                               lambda: backend.state.flows(B, bufs, compact))
     else:
         flows = backend.state.flows(B, bufs, compact)
-    rows = class_weight_rows(prog, lv, col_pos, col_K, col_first, group_first, B,     # (their sizes copied behind
-                             backend.token_classes.stored_of_class)
-    gates = F.gate_context(backend, external)                                         # the forward pass's launches)
+    if not early:
+        rows = class_weight_rows(prog, lv, col_pos, col_K, col_first, group_first, B,
+                                 backend.token_classes.stored_of_class)
+    class_weight_walk(rows, prog, lv, compact)
+    gates = F.gate_context(backend, external)
     hold = None if partial is None or compact is None else dict(regions = partial, fresh = carry["fresh"])
     forward = lambda p, **kw: F.run_forward(backend, bufs, p, x, missing, obs_class, lv, precision, compact, masses,
                                             gates = gates, **kw)
@@ -325,35 +413,34 @@ def conditional(backend, data: torch.Tensor, missing_mask: Optional[torch.Tensor
     miss, tgt = _masks(missing_mask, targets, B, n)                          # on the host: the query's one wait
     V = backend.token_classes.token_class.numel()
     width = V if candidates is None else candidates.size(2)
-    rank = np.cumsum(tgt.ravel()).reshape(B, n) - 1                          # a target's row
-    M = int(tgt.sum())
+    rank, M, positions = _target_rows(tgt)                                   # a target's row, the rows, positions
     if M == 0 or not backend.satisfiable:
         out = torch.full((M, width), -float("inf"), device = dev)
         return (out, torch.full((M,), -float("inf"), device = dev)) if return_log_marginal else out
 
     prog = backend.program()
     score = score_tables(prog)
-    positions = tgt.any(axis = 0)
     groups, col, K, blocks = _layout(backend, positions, B)
     masses = backend.state.masses(external)                                  # (the query's, read twice)
     cols = [_sample_columns(masses, score, g, pos, B, prog) for g, pos, _ in groups]
     # every row group's columns' rows (-1: a sample not targeting the position), with the layout, every row's (sample,
     # position) under candidates, and the per-sample columns' positions and weights' offsets: in one copy
-    out_rows = [np.where(tgt[:, pos], rank[:, pos], -1).T.ravel() for _, pos, _ in groups]     # column p * B + b
+    out_rows = [_column_rows(tgt, rank, pos) for _, pos, _ in groups]                         # column p * B + b
     rows_bt = list(np.nonzero(tgt)) if candidates is not None else []          # every row's (sample, position)
     G = len(groups)
     ev = []
     if data.device.type == "cpu":                       # (a decoder's evidence, kept on the host): every token, and
-        x_h = np.where(miss, 0, data.numpy()).astype(np.int64)                 # its class, built here, in the copy
-        ev = [x_h.ravel(), _as_int64(np.where(miss, -1, backend.token_classes.host()[x_h]).astype(np.int32)),
-              _as_int64(miss)]
+        classes = backend.token_classes.host()                                # its class, built here, in the copy
+        *ev, bad = _host_evidence(miss, data.numpy(), classes)
+        if bad >= 0:
+            raise IndexError(f"Token {int(data.view(-1)[bad])} is not in the vocabulary of {classes.size} tokens.")
     arrays = [col, K, *out_rows, *(np.asarray(pos, dtype = np.int64) for _, pos, _ in groups), *rows_bt,
               *(a for c in cols if c is not None for a in c[1:])]
     lb = len(arrays)                                    # (the layout's blocks, then the evidence: the last three)
     tables, starts = pack_aligned(arrays + list(blocks) + ev, np.int64)
     tables = torch.from_numpy(tables).to(dev)
     starts = starts.tolist()
-    view = lambda i: tables[starts[i]:starts[i + 1]]
+    piece = lambda i, size: tables[starts[i]:starts[i] + size]               # (pieces padded: their own lengths)
     cand = None
     if candidates is not None:                                                # every row's candidates, [M, k]
         sb, st = starts[2 + 2 * G], starts[3 + 2 * G]
@@ -362,19 +449,19 @@ def conditional(backend, data: torch.Tensor, missing_mask: Optional[torch.Tensor
     for c in cols:
         samples.append(None if c is None else
                        dict(nodes = c[0], row = masses.row, stride = masses.stride, lognorm = masses.lognorm,
-                            logw = masses.token_logw, offset = view(i + 1)[:len(c[2])], width = masses.token_width,
+                            logw = masses.token_logw, offset = piece(i + 1, len(c[2])), width = masses.token_width,
                             ids = masses.token_ids))
         i += 0 if c is None else 2
     evidence = None
-    if ev:                                              # (the last three arrays)
+    if ev:                                              # (the last three arrays, [B, n] each)
         j = len(starts) - 4
-        x, missing = view(j)[:B * n].view(B, n), view(j + 2).view(torch.bool)[:B * n].view(B, n)
-        evidence = (x, view(j + 1).view(torch.int32)[:B * n].view(B, n))
+        x = tables.as_strided((B, n), (n, 1), starts[j])
+        missing = tables.view(torch.bool).as_strided((B, n), (n, 1), 8 * starts[j + 2])
+        evidence = (x, tables.view(torch.int32).as_strided((B, n), (n, 1), 2 * starts[j + 1]))
     else:
         missing = F.missing_tensor(missing_mask, B, n, dev) if missing_mask is None or missing_mask.is_cuda else \
             torch.from_numpy(miss).to(dev)
     with torch.no_grad():
-        piece = lambda i, size: tables[starts[i]:starts[i] + size]           # (pieces padded: their own lengths)
         layout = (groups, (piece(0, n), piece(1, n), *(piece(lb + i, len(a)) for i, a in enumerate(blocks))))
         groups, _ = class_weights(backend, data, missing, positions, precision, held,
                                   observed = (~miss).any(axis = 0), layout = layout, report = report,
@@ -387,10 +474,10 @@ def conditional(backend, data: torch.Tensor, missing_mask: Optional[torch.Tensor
         log_marginal = torch.empty(M + 1, device = dev) if return_log_marginal else None
         enum = enumerated_args(prog, masses)
         for gi, ((g, pos, w, row, rep), sample) in enumerate(zip(groups, samples)):
-            out_row = view(2 + gi)[:len(pos) * B]
+            out_row = piece(2 + gi, len(pos) * B)
             table = backend.state.token_table(g, score.rows[g], precision)
             logz = score_group(out, table, w, row, score.rows_t[g], masses.table, out_row, backend.token_classes,
-                               F.PRECISIONS[precision], view(2 + G + gi)[:len(pos)], enum, candidates = cand,
+                               F.PRECISIONS[precision], piece(2 + G + gi, len(pos)), enum, candidates = cand,
                                sample = sample, rep = rep)
             if log_marginal is not None:
                 log_marginal[torch.where(out_row >= 0, out_row, M)] = logz

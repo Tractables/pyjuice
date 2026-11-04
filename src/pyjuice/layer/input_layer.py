@@ -26,6 +26,7 @@ from pyjuice.utils.grad_fns import ReverseGrad
 from pyjuice.utils import BitSet
 from pyjuice.utils.source2fn import make_function_from_src
 from pyjuice.utils.kernel_launcher import triton_jit
+from pyjuice.utils.util import device_scalars
 from pyjuice.utils.fast_inference import param_copies_allowed, register_layer
 from .layer import Layer
 
@@ -132,6 +133,7 @@ class InputLayer(Layer, nn.Module):
         self._bk_cuda_ok = None  # cached gate for the CUDA backward (computed once, see backward())
         self.sample_fn = self.dist.get_sample_fn()
         self.em_fn = self.dist.get_em_fn()
+        self.em_layer_fn = self.dist.get_em_layer_fn()  # optional kernel of its own for the EM update (or None)
 
         try:
             self.post_fw_fns = self.dist.post_fw_fns
@@ -376,7 +378,9 @@ class InputLayer(Layer, nn.Module):
             self.param_flows = torch.zeros(shape, device = self.device)
         else:
             assert self.param_flows.size(0) == self.num_param_flows
-            if flows_memory < 1.0:
+            if flows_memory == 0.0:
+                self.param_flows.zero_()            # (a write pass, not a read-scale-write: see `TensorCircuit.init_param_flows`)
+            elif flows_memory < 1.0:
                 self.param_flows[:] *= flows_memory
 
         return None
@@ -957,10 +961,15 @@ class InputLayer(Layer, nn.Module):
 
                     layer_num_source_nodes = self.source_nids.size(0)
 
+                    constexprs = device_scalars([step_size, pseudocount], self.device, dtype = torch.float32)
+
+                    # The distribution's own kernel for the layer's update, where it has one and takes this layer
+                    # (`Distribution.get_em_layer_fn`); else `em_fn` in the template below
+                    if self.em_layer_fn is not None and self.em_layer_fn(self, constexprs, keep_zero_params):
+                        return None
+
                     if not self.provided("_em_kernel"):
                         self._em_kernel = self._compile_triton_kernel(self._em_kernel_template, em_fn = self.em_fn)
-
-                    constexprs = torch.tensor([step_size, pseudocount], dtype = torch.float32, device = self.device)
 
                     if hasattr(self.dist, "em_block_size"):
                         BLOCK_SIZE = self.dist.em_block_size

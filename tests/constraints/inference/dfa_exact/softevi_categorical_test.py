@@ -24,7 +24,7 @@ import pyjuice as juice
 import pyjuice.constraints as jc
 import pyjuice.nodes.distributions as dists
 from pyjuice.nodes import inputs, multiply, summate
-from pyjuice.constraints.distributions import TokenClasses, softevi_categorical
+from pyjuice.constraints.distributions import TokenClasses, categorical, softevi_categorical
 
 V = 3
 KINDS = {"hmm": 6, "hmm_untied": 6, "hmm_block_sparse": 6, "left_linear": 6, "pd": 6, "pd_prod_dominated": 6,
@@ -291,9 +291,10 @@ def test_grouping_is_the_querys(build_pc, monkeypatch):
     prog.trans_budget = prog.trans_size
     cc.backend.marginal(data[:1], missing[:1])                                # one set of masses: grouped again
     assert prog.trans.grouped and prog.trans_layout is None and cc.backend.grouped
-    prog.trans_budget = prog.trans_size - 1                                   # over the budget: the per-class tables
+    need = prog.trans_sig.size if prog.trans_sig is not None else prog.trans_size   # (by column signature: fewer)
+    prog.trans_budget = need - 1                                              # over the budget: the per-class tables
     cc.backend.marginal(data[:1], missing[:1])
-    assert not prog.grouped_for(prog.trans_size) and not prog.trans.grouped
+    assert not prog.grouped_for(need) and not prog.trans.grouped
 
 
 def test_a_plain_query_inside_a_session(build_pc):
@@ -925,6 +926,121 @@ def test_class_masses_match_a_float64_brute_force(kind, Be, classes, evidence_ki
             assert torch.equal(torch.isneginf(got), torch.isneginf(want))
             fin = torch.isfinite(want)
             assert (got[fin] - want[fin]).abs().max() < 1e-5
+
+
+@pytest.mark.parametrize("B", [1, 5, 24])
+@pytest.mark.parametrize("evidence_kind", ["none", "dense", "topk", "topk_transposed"])
+@pytest.mark.parametrize("kind", ["hmm", "hmm_untied", "hand_permuted"])
+def test_input_values_are_the_observed_tokens_against_float64(kind, evidence_kind, B, build_pc):
+    """Every node's value of the token its sample observes, 0 where missing: ``log p(d)``, under evidence ``+ log w(d)
+    - log Z`` (dense on the first 30 of 150 tokens, or top-k on 30 others), against float64 -- and with the library's
+    transposed table (top-k, in fast_inference) the same bits as from the parameter table; batches of one sample,
+    part of a tile of samples, and several tiles."""
+    Vb = 150
+    pc = build_pc(kind, 5 if kind != "hmm_untied" else 4, Vb, input_dist = dists.SoftEvidenceCategorical)
+    layer = next(iter(pc.input_layer_group))
+    first, end = layer._output_ind_range
+    g = torch.Generator().manual_seed(2)
+    n = 5 if kind != "hmm_untied" else 4
+    nv = int(torch.unique(layer.vids.view(-1)).numel())
+    x = torch.randint(0, Vb, (B, n), generator = g).to(DEV)
+    missing = (torch.rand(B, n, generator = g) < 0.3).to(DEV)
+    E = (torch.randn(B, nv, 30, generator = g) * 3).to(DEV)
+    tokens = TokenClasses(torch.zeros(Vb, dtype = torch.long, device = DEV), 1)
+    p = layer.params.view(-1, Vb).double()
+    w = torch.ones(B, nv, Vb, device = DEV, dtype = torch.float64)
+    if evidence_kind == "dense":
+        inputs = dict(categorical_evidence_logp = E)
+        w = torch.cat([E.double().exp(), torch.zeros(B, nv, Vb - 30, device = DEV, dtype = torch.float64)], dim = 2)
+    elif evidence_kind != "none":
+        ids = torch.argsort(torch.rand(B, nv, Vb, generator = g), dim = 2)[..., :30].to(DEV)
+        inputs = dict(categorical_evidence_logp = E, soft_evidence_cat_ids = ids)
+        w = torch.zeros(B, nv, Vb, device = DEV, dtype = torch.float64).scatter_(2, ids, E.double().exp())
+
+    def values(fast):
+        out = torch.full((end, B), float("nan"), device = DEV)
+        with juice.fast_inference() if fast else torch.no_grad():
+            si = None
+            if evidence_kind != "none":
+                masses = torch.empty((B, softevi_categorical.sample_rows(layer, inputs), 1), device = DEV)
+                si = softevi_categorical.sample_inputs(layer, tokens, inputs, masses)
+            assert (softevi_categorical._transposed_table(layer) is not None) == fast   # (built by the top-k masses)
+            softevi_categorical.input_values(layer, x, missing, out, si)
+        return out[first:end]
+
+    got = values(False)
+    rows = softevi_categorical.class_mass_rows(layer)
+    lvid = layer.var_idmapping[layer.vids.view(-1).long()]
+    var = layer.vids.view(-1).long()
+    d = x[:, var]                                                               # [B, nodes]: every node's token
+    pw = p[rows][None] * w[:, lvid]                                             # [B, nodes, V]
+    want = pw.gather(2, d[..., None]).squeeze(2).log()
+    if evidence_kind != "none":
+        want = want - pw.sum(dim = 2).log()
+    want = torch.where(missing[:, var], 0.0, want).t()
+    assert torch.equal(torch.isneginf(got), torch.isneginf(want)) and not got.isnan().any()
+    fin = torch.isfinite(want)
+    assert (got[fin].double() - want[fin]).abs().max() < 1e-5
+    if evidence_kind == "topk_transposed":
+        assert torch.equal(values(True).view(torch.int32), got.view(torch.int32))
+
+
+@pytest.mark.parametrize("storage", ["dense", "compact"])
+@pytest.mark.parametrize("evidence_kind", ["dense", "topk", "categorical"])
+@pytest.mark.parametrize("kind, n", [(k, None) for k in KINDS] +
+                         [(k, 12) for k in ("hmm", "hmm_untied", "pd", "pd_prod_dominated", "left_linear")] +
+                         [("hmm", 16), ("pd", 16)])
+def test_queries_compute_the_inputs_their_launches_read(kind, n, evidence_kind, storage, build_pc, monkeypatch):
+    """A query computes the input values of the positions its launches read alone (``QueryPlan.input_reads``): with
+    the input rows poisoned (NaN, or a finite value) before every query's layer writes them, a decoder session's
+    conditionals -- prefix decoding, any order, rows moved -- and marginals are the bits of the queries that compute
+    every input; short sequences and longer ones (launches over more positions). ``categorical``: a PC of Categorical
+    inputs, no evidence (the layers' values written by the backend's launch, at those positions too)."""
+    n = KINDS[kind] if n is None else n
+    module = categorical if evidence_kind == "categorical" else softevi_categorical
+    pc = build_pc(kind, n, V) if module is categorical else soft_pc(build_pc, kind, n)
+    assert all(type(layer.dist) is (dists.Categorical if module is categorical else dists.SoftEvidenceCategorical)
+               for layer in pc.input_layer_group)
+    cc = jc.compile(CONSTRAINTS["contains"](), pc)
+    B = 4
+    if evidence_kind == "dense":
+        data, _, E = evidence(n, B)
+        inputs = dict(categorical_evidence_logp = E)
+    elif evidence_kind == "topk":
+        data, _, inputs = topk_evidence(n, B)
+    else:
+        data, inputs = evidence(n, B)[0], {}
+    real = module.input_values
+
+    def poisoned(value):
+        def values(layer, x, missing, out, sample = None, positions = None):
+            first, end = layer._output_ind_range
+            out[first:end].fill_(value)
+            return real(layer, x, missing, out, sample, positions = positions)
+        return values
+
+    def every(layer, x, missing, out, sample = None, positions = None):
+        return real(layer, x, missing, out, sample)
+
+    prefix = lambda t: (torch.arange(n, device = DEV)[None, :] >= t).expand(B, n)
+    g = torch.Generator().manual_seed(1)
+    ranks = torch.stack([torch.randperm(n, generator = g) for _ in range(B)]).to(DEV)
+    calls = [(data, prefix(t), [t]) for t in range(n)] + [(data, ranks >= k, None) for k in range(n)]
+    calls += [(data[torch.tensor([2, 0, 1, 3], device = DEV)], prefix(n - 1), [n - 1])]
+
+    def session(values):
+        monkeypatch.setattr(module, "input_values", values)
+        with cc.decoder(storage = storage, **inputs) as d:
+            out = [d.conditional(x, m, targets = tg) for x, m, tg in calls]
+            out += [d.marginal(x, m) for x, m, _ in calls[::3]]
+        return out
+
+    want = session(every)
+    for value in (float("nan"), 3.0):                        # (a NaN a maximum may pass over; a value it may not)
+        got = session(poisoned(value))
+        assert len(got) == len(want)
+        for i, (a, b) in enumerate(zip(want, got)):
+            assert torch.equal(a.view(torch.int32), b.view(torch.int32)), (value, i)
 
 
 # -------------------------------------------------------------------------------------------------

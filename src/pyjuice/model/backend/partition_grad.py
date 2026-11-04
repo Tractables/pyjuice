@@ -18,6 +18,8 @@ import torch
 import triton
 import triton.language as tl
 
+from pyjuice.utils.util import device_scalars
+
 # In newer triton, the math functions moved (https://github.com/openai/triton/pull/3172).
 if hasattr(tl.extra, "cuda") and hasattr(tl.extra.cuda, "libdevice"):
     tlmath = tl.extra.cuda.libdevice
@@ -52,7 +54,9 @@ def _acc_all_kernel(node_flows_ptr, pfids_ptr, pids_ptr, params_ptr, param_flows
     pids = n_pids[:, None] + coffs[None, :]
     cmask = coffs < num_cats
 
-    params = tl.load(params_ptr + pids, mask = mask[:, None])
+    # (the tile is BLOCK_C wide, a power of two: the categories past `num_cats` -- the next node's parameters, or past
+    # the last node the tensor's end -- are masked out of the normalizer)
+    params = tl.load(params_ptr + pids, mask = mask[:, None] & cmask[None, :], other = 0.0).to(tl.float32)
     if norm_params:
         norm_param = params / (tl.sum(params, axis = 1)[:, None] + 1e-12)
     else:
@@ -86,7 +90,7 @@ def _acc_all_kernel_large(node_flows_ptr, pfids_ptr, pids_ptr, params_ptr, param
     for i in range(nc):
         pids = n_pids[:, None] + coffs1[None, :]
         cmask = coffs1 < num_cats
-        params = tl.load(params_ptr + pids, mask = (mask[:, None] & cmask[None, :]), other = 0.0)
+        params = tl.load(params_ptr + pids, mask = (mask[:, None] & cmask[None, :]), other = 0.0).to(tl.float32)
         cum_params += tl.sum(params, axis = 1)
         coffs1 += BLOCK_C
 
@@ -95,7 +99,7 @@ def _acc_all_kernel_large(node_flows_ptr, pfids_ptr, pids_ptr, params_ptr, param
         pfids = n_pfids[:, None] + coffs2[None, :]
         pids = n_pids[:, None] + coffs2[None, :]
         cmask = coffs2 < num_cats
-        params = tl.load(params_ptr + pids, mask = (mask[:, None] & cmask[None, :]), other = 0.0)
+        params = tl.load(params_ptr + pids, mask = (mask[:, None] & cmask[None, :]), other = 0.0).to(tl.float32)
         if norm_params:
             norm_param = params / (cum_params[:, None] + 1e-12)
         else:
@@ -141,7 +145,7 @@ def _accum_input_partition_flows(pc, layer, negate_pflows, norm_params):
 # Partition-function gradient: forward/backward with UNNORMALIZED parameters
 # ---------------------------------------------------------------------------------------------------
 
-def eval_partition_grad(pc, negate_pflows: bool = True, input_layer_norm_params: bool = True):
+def eval_partition_grad(pc, negate_pflows: bool = True, input_layer_norm_params: bool = True, params = None):
     """
     Run a forward/backward treating ``pc.params`` as unnormalized, so the root marginal is the
     log-partition ``log Z``, and accumulate the partition-function flow into ``pc.param_flows`` (and
@@ -150,6 +154,7 @@ def eval_partition_grad(pc, negate_pflows: bool = True, input_layer_norm_params:
     log-likelihood. Uses the same batch size as the most recent forward (``pc.node_mars.size(1)``).
     """
     B = pc.node_mars.size(1)
+    params = pc.params if params is None else params   # the sum layers' (a renormalization: their fp32 values)
 
     # Forward pass (unnormalized): an input node's marginal is the sum of its category parameters.
     pc._init_buffer(name = "node_mars", shape = (pc.num_nodes, B), set_value = 0.0)
@@ -165,7 +170,7 @@ def eval_partition_grad(pc, negate_pflows: bool = True, input_layer_norm_params:
         if layer_group.is_prod():
             layer_group(pc.node_mars, pc.element_mars)
         elif layer_group.is_sum():
-            layer_group(pc.node_mars, pc.element_mars, pc.params, propagation_alg = "LL", precision = pc.precision)
+            layer_group(pc.node_mars, pc.element_mars, params, propagation_alg = "LL", precision = pc.precision)
         else:
             raise ValueError(f"Unknown layer type {type(layer_group)}.")
 
@@ -181,7 +186,7 @@ def eval_partition_grad(pc, negate_pflows: bool = True, input_layer_norm_params:
         elif layer_group.is_sum():
             # Recompute the preceding product layer, then back-propagate the sum layer.
             pc.inner_layer_groups[layer_id - 1].forward(pc.node_mars, pc.element_mars)
-            layer_group.backward(pc.node_flows, pc.element_flows, pc.node_mars, pc.element_mars, pc.params,
+            layer_group.backward(pc.node_flows, pc.element_flows, pc.node_mars, pc.element_mars, params,
                                  param_flows = pc.param_flows, allow_modify_flows = False,
                                  propagation_alg = "LL", logspace_flows = True, negate_pflows = negate_pflows)
         else:
@@ -217,7 +222,7 @@ def _sgd_input_kernel(params_ptr, param_flows_ptr, s_pids_ptr, s_pfids_ptr, meta
 
     for cat_id in range(max_num_cats):
         cat_mask = mask & (cat_id < num_cats)
-        param = tl.load(params_ptr + s_pids + cat_id, mask = cat_mask, other = 0)
+        param = tl.load(params_ptr + s_pids + cat_id, mask = cat_mask, other = 0).to(tl.float32)
         flow = tl.load(param_flows_ptr + s_pfids + cat_id, mask = cat_mask, other = 0)
         new_param = tl.exp(tl.log(param) + lr * flow)
         tl.store(params_ptr + s_pids + cat_id, new_param, mask = cat_mask)
@@ -248,7 +253,7 @@ def sgd_input_layer_update(layer, lr: float):
     """Apply the log-space SGD update to an input layer's source parameters (no tied accumulation;
     callers consolidate tied flows beforehand)."""
     layer_num_source_nodes = layer.source_nids.size(0)
-    constexprs = torch.tensor([lr], dtype = torch.float32, device = layer.device)
+    constexprs = device_scalars([lr], layer.device, dtype = torch.float32)
     BLOCK_SIZE = 1024
     grid = (triton.cdiv(layer_num_source_nodes, BLOCK_SIZE),)
     _sgd_input_kernel[grid](

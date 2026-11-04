@@ -21,8 +21,10 @@
 // block's 32 rows x TN / 2 columns -- and share of the chunks (grid z): a first pass gives every (row block, column)
 // its shift
 //     T = max over the share's chunks of t + s,
-// then, per chunk, the chunk's weights (4 x 32 x 32), e (32 x TN), t and s are copied into shared memory a chunk
-// ahead (cp.async, two stages: the products of one under the copies of the next), every warp's products are summed
+// then, per chunk, the chunk's weights (4 x 32 x 32), e (32 x TN), t and s are copied into shared memory ahead of its
+// products (cp.async, a ring of stages: two -- the products of one under the copies of the next --, or at bf16 four,
+// three chunks' copies in flight under a chunk's products: a chunk's few products hid no copy, and bf16 stages, half
+// the floats', take four at the occupancy two took), every warp's products are summed
 // from zero over the chunk on the tensor cores (TF32, or 3 x TF32 for fp32-level products, from zero every 8: the
 // tensor cores' sums truncate) and added times the chunk's factors f = exp(t + s - T) <= 1 (every column's computed once
 // a warp, by one lane, and shuffled to its sums' lanes; at TF32 a chunk's sums are added under the next chunk's
@@ -42,6 +44,22 @@
 #include <c10/cuda/CUDAException.h>
 #include <math_constants.h>
 #include <cuda_bf16.h>
+
+// Programmatic dependent launch (sm_90 on; elsewhere the launches are plain and these do nothing): the pre-pass, the
+// fused sum and its merge each launch while the launch before them runs. The pre-pass waits for it (`pdl_wait`) first
+// thing and only then lets the sums launch (`pdl_trigger`), so when they start every launch before the pre-pass is done:
+// the sums read the program's and the query's tables under the pre-pass and wait for it only before its buffer, the
+// merge reads its tables under the sums and waits for them before their shares (`fused_sum_kernel`).
+__device__ __forceinline__ void pdl_wait() {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    cudaGridDependencySynchronize();
+#endif
+}
+__device__ __forceinline__ void pdl_trigger() {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    cudaTriggerProgrammaticLaunchCompletion();
+#endif
+}
 
 #define NBT 4              // row blocks per CTA
 #define BS 32              // rows per block, reduction rows per chunk
@@ -78,6 +96,8 @@ __device__ __forceinline__ void cp_async4(void* smem, const void* gmem, bool val
 }
 __device__ __forceinline__ void cp_commit() { asm volatile("cp.async.commit_group;\n" ::); }
 __device__ __forceinline__ void cp_wait_all() { asm volatile("cp.async.wait_group 0;\n" ::); }
+template <int N>                                        // every group but the N last committed in
+__device__ __forceinline__ void cp_wait_group() { asm volatile("cp.async.wait_group %0;\n" :: "n"(N)); }
 
 __device__ __forceinline__ unsigned to_tf32(float x) {
     unsigned r;
@@ -103,13 +123,16 @@ __device__ __forceinline__ void mma_bf16(float* c, const unsigned* a, unsigned b
 // A tile of TN columns: a stage of shared memory holds a chunk's weights, e, t and (external parameters) s. The
 // weights' rows are their memory's (32 floats: forward one child's nodes, top-down one child's parent nodes), padded:
 // A_LD 40 (forward: the products read a column of them), 36 (top-down: a row) -- or (FA) a block's 1024 in fragment
-// order. e: the tile's TN / 8 groups of 8 columns, 256 floats each, in fragment order.
-template <int TN, bool TD>
+// order. e: the tile's TN / 8 groups of 8 columns, 256 floats each, in fragment order. At bf16 (BF) both halve: a
+// block's 1024 weights in fragment order (2 KB, 16 floats a row) and e's 256 bf16 a group, so a stage of 16 columns is
+// 9.6 KB, not 23 -- an SM's 100 KB of shared memory holds more of them.
+template <int TN, bool TD, bool BF = false>
 struct Tile {
-    static constexpr int A_LD = TD ? 36 : 40;
+    static constexpr int STAGES = BF ? 4 : 2;          // the ring of chunks in flight (`fused_sum_kernel`)
+    static constexpr int A_LD = BF ? 16 : TD ? 36 : 40;
     static constexpr int J = TN / 16;                  // a warp's tiles of 8 columns
     static constexpr int SL = TN + 4;                  // a block's scales: its samples from a multiple of 4, or columns
-    static constexpr int A_ST = NBT * BS * A_LD, B_ST = BS * TN;
+    static constexpr int A_ST = NBT * BS * A_LD, B_ST = BF ? BS * TN / 2 : BS * TN;
     static constexpr int ST = A_ST + B_ST + TN + NBT * SL;
     static constexpr int SHARE = NBT * BS * TN + NBT * TN;          // a share's sums and shifts in the split buffer
     static constexpr int HEAD = 4 * TN;                             // a tile's columns (int64) and samples first
@@ -166,15 +189,18 @@ struct Where {
     long long reg, ncols, num_live;
 };
 
+// A CTA's `Where`, by threads 0 to NBT at once -- thread b < NBT block b's rows, thread NBT the region of columns the
+// blocks read (block 0's: a tile's block 0 is always one of the launch's) --, each a chain of a few dependent loads
+// (one thread ran the NBT + 1 of them one after another); thread `t` past NBT does nothing
 template <bool TD>
-__device__ __forceinline__ void where_of(const Args& a, Where& w) {
-    for (int b = 0; b < NBT; ++b) {
-        int i = blockIdx.x * NBT + b;
+__device__ __forceinline__ void where_of(const Args& a, Where& w, int t) {
+    if (t < NBT) {
+        const int b = t, i = blockIdx.x * NBT + b;
         const long long nb = i < a.num_blocks ? (a.indexed ? a.sel[i] : (long long)i) : -1;
         w.nbs[b] = nb;
         w.out[b] = nullptr;
         w.ow[b] = w.lzrow[b] = 0;
-        if (nb < 0) continue;
+        if (nb < 0) return;
         const long long row = a.rows[nb], r = a.rreg[nb];
         if (TD && r < 0) {                              // element rows
             w.out[b] = a.out0 + (row - a.elem_first) * a.elem_width;
@@ -184,10 +210,12 @@ __device__ __forceinline__ void where_of(const Args& a, Where& w) {
             w.out[b] = (TD ? a.out1 : a.out0) + a.reg_offset[r] + (row - a.reg_first[r]) * w.ow[b];
         }
         w.lzrow[b] = row;
+    } else if (t == NBT) {                              // (the blocks share their chunks: one region of columns)
+        const int i = blockIdx.x * NBT;
+        w.reg = a.colreg[a.indexed ? a.sel[i] : (long long)i];
+        w.ncols = (long long)a.B * a.reg_slots[w.reg];
+        w.num_live = a.prune ? (long long)a.reg_live[w.reg] : w.ncols;
     }
-    w.reg = a.colreg[w.nbs[0]];                         // (the blocks share their chunks: one region of columns)
-    w.ncols = (long long)a.B * a.reg_slots[w.reg];
-    w.num_live = a.prune ? (long long)a.reg_live[w.reg] : w.ncols;
 }
 
 __device__ __forceinline__ void put(const Where& w, int b, long long r, long long col, float o) {
@@ -205,6 +233,8 @@ __device__ __forceinline__ void put(const Where& w, int b, long long r, long lon
 
 template <bool TD, bool EXT, int FRAG>
 __global__ void __launch_bounds__(THREADS) prepass_kernel(Args a) {
+    pdl_wait();                                                      // (every launch before, done: the sums read
+    pdl_trigger();                                                   // tables under this kernel; they may launch)
     __shared__ float X[BS][PRE_COLS + 1];
     __shared__ float Tc[PRE_COLS];
     __shared__ long long cols[PRE_COLS];
@@ -298,9 +328,10 @@ __global__ void __launch_bounds__(THREADS) prepass_kernel(Args a) {
 
 template <bool EXT, bool X3, bool FA, bool BF, int TN, bool TD>
 __global__ void __launch_bounds__(THREADS) fused_sum_kernel(Args a) {
-    using TT = Tile<TN, TD>;
+    using TT = Tile<TN, TD, BF>;
+    constexpr int S = TT::STAGES;
     extern __shared__ float smem[];
-    float* Ts = smem + 2 * TT::ST;                                  // [NBT][TN] the shifts
+    float* Ts = smem + S * TT::ST;                                  // [NBT][TN] the shifts (past the S stages)
     long long* Cs = reinterpret_cast<long long*>(Ts + NBT * TN);   // [TN] the columns
     int* Ss = reinterpret_cast<int*>(Cs + TN);                      // [TN] their samples
     int* Cl = Ss + TN;                                              // EXT: [NBT][share] the chunks' cells
@@ -309,9 +340,15 @@ __global__ void __launch_bounds__(THREADS) fused_sum_kernel(Args a) {
     __shared__ Where w;
     __shared__ int s_lo, s_hi;                                      // EXT: the tile's columns' samples, a range
 
+    // The tables up to the first chunk's copies -- the blocks' rows, the chunks' cells and weights, the columns and their
+    // samples -- read under the launch before, where that is this call's pre-pass: it lets this kernel launch only once
+    // every launch before it is done (its wait, then its trigger), and only its buffer, the chunks' e and t, is its own
+    // writing. Else the wait first
+    if (!a.prepass) pdl_wait();                                     // (every earlier launch's)
+    pdl_trigger();                                                  // (the merge may launch: it waits for this)
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    where_of<TD>(a, w, tid);
     if (tid == 0) {
-        where_of<TD>(a, w);
         s_lo = 0x7fffffff;
         s_hi = -1;
     }
@@ -322,6 +359,7 @@ __global__ void __launch_bounds__(THREADS) fused_sum_kernel(Args a) {
 
     if (a.prune && col0 >= w.num_live) {                // a tile of dead columns: -inf, nothing read (its first
         if (blockIdx.z != 0) return;                    // share; not merged)
+        if (a.prepass) pdl_wait();                      // (no write under the launch before)
         for (int i = tid; i < NBT * BS * TN; i += THREADS) {
             int b = i / (BS * TN), m = (i / TN) % BS, c = i % TN;
             long long k = col0 + c;
@@ -440,7 +478,7 @@ __global__ void __launch_bounds__(THREADS) fused_sum_kernel(Args a) {
 
     auto load = [&](int ch, int st) {                   // chunk ch into stage st: the thread's copies at its offsets
         if (!DESC) settle();                            // (at the register cap: settled every chunk)
-        float* As = smem + (st ? TT::ST : 0);
+        float* As = smem + st * TT::ST;
         float* Bs = As + TT::A_ST;
         float* tS = Bs + TT::B_ST;
         float* sS = tS + TN;
@@ -495,8 +533,14 @@ __global__ void __launch_bounds__(THREADS) fused_sum_kernel(Args a) {
             }
         }
     };
+    if (a.prepass) pdl_wait();                          // (the pre-pass's e and t, from here on)
     load(ch0, 0);                                       // (under pass 1)
     cp_commit();
+    #pragma unroll
+    for (int k = 1; k < S - 1; ++k) {                   // (a deeper ring: its first S - 1 chunks in flight together)
+        if (ch0 + k < ch1) load(ch0 + k, k);
+        cp_commit();
+    }
 
     {   // pass 1: T = max over the share's chunks of t + s -- a thread's one or two (block, column)s together, which of
         // them are live tested once, outside the loops (a loop without a test: its loads in flight together)
@@ -566,10 +610,11 @@ __global__ void __launch_bounds__(THREADS) fused_sum_kernel(Args a) {
     // A chunk: its copies waited for, the next chunk's issued under its products, its sums into P and the lane's two
     // factors into G (shuffled to the fold)
     auto chunk = [&](int ch, float (&P)[2][TT::J][4], float (&G)[2]) {
-        const int st = (ch - ch0) & 1;
-        cp_wait_all();                                  // this chunk's copies in
-        __syncthreads();                                // (and visible; the other stage's products done)
-        if (ch + 1 < ch1) load(ch + 1, st ^ 1);         // the next chunk's under this one's products
+        const int st = (ch - ch0) % S;
+        cp_wait_group<S - 2>();                         // this chunk's copies in (the next S - 2 chunks' may fly on)
+        __syncthreads();                                // (and visible; the stage refilled below read by no warp now:
+                                                        // the chunk before's, its products done)
+        if (ch + S - 1 < ch1) load(ch + S - 1, (st + S - 1) % S);   // S - 1 chunks ahead, under this one's products
         cp_commit();
         const float* A = smem + st * TT::ST + wb * BS * TT::A_LD;
         const float* Bt = smem + st * TT::ST + TT::A_ST;
@@ -743,8 +788,9 @@ template <bool EXT, int TN, bool TD>
 __global__ void __launch_bounds__(THREADS) fused_sum_merge_kernel(Args a) {
     using TT = Tile<TN, TD>;
     __shared__ Where w;
-    if (threadIdx.x == 0) where_of<TD>(a, w);
+    where_of<TD>(a, w, threadIdx.x);                                // (the tables, under the sums: written before them)
     __syncthreads();
+    pdl_wait();                                                     // (the shares' sums)
     const int i = blockIdx.z * THREADS + threadIdx.x, r = i / TN, c = i % TN, b = r / BS, m = r % BS;
     const long long col0 = (long long)blockIdx.y * TN;
     if (r >= NBT * BS || w.nbs[b] < 0 || col0 + c >= w.ncols || (a.prune && col0 >= w.num_live)) return;
@@ -770,9 +816,9 @@ __global__ void __launch_bounds__(THREADS) fused_sum_merge_kernel(Args a) {
 }
 
 
-static size_t smem_bytes(int tn, bool td, bool ext, int share, bool affine) {
-    const int st = NBT * BS * (td ? 36 : 40) + BS * tn + tn + NBT * (tn + 4);
-    return (2 * st + NBT * tn) * sizeof(float) + tn * (sizeof(long long) + sizeof(int)) +
+static size_t smem_bytes(int tn, bool td, bool ext, int share, bool affine, bool bf) {
+    const int st = NBT * BS * (bf ? 16 : td ? 36 : 40) + BS * tn / (bf ? 2 : 1) + tn + NBT * (tn + 4);   // (`Tile`'s)
+    return ((bf ? 4 : 2) * st + NBT * tn) * sizeof(float) + tn * (sizeof(long long) + sizeof(int)) +
            (ext ? NBT * share * sizeof(int) + (OFF_SAMPLES + 1) * sizeof(long long) : 0) +
            (affine ? 0 : NBT * share * sizeof(long long));
 }
@@ -794,11 +840,32 @@ static const void* allowed() {
     return k;
 }
 
+// `kernel<<<grid, THREADS, smem, stream>>>(a)` as a programmatic dependent of the launch before it where the GPU has it
+// (compute capability 9 on)
+static bool pdl_supported() {
+    static int ok = -1;
+    if (ok < 0) {
+        int dev = 0, major = 0;
+        C10_CUDA_CHECK(cudaGetDevice(&dev));
+        C10_CUDA_CHECK(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev));
+        ok = major >= 9;
+    }
+    return ok == 1;
+}
+static void launch_dependent(void (*kernel)(Args), dim3 grid, size_t smem, cudaStream_t stream, const Args& a) {
+    cudaLaunchConfig_t lc = {};
+    lc.gridDim = grid; lc.blockDim = dim3(THREADS); lc.dynamicSmemBytes = smem; lc.stream = stream;
+    cudaLaunchAttribute at[1];
+    at[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    at[0].val.programmaticStreamSerializationAllowed = 1;
+    lc.attrs = at; lc.numAttrs = pdl_supported() ? 1 : 0;
+    C10_CUDA_CHECK(cudaLaunchKernelEx(&lc, kernel, a));
+}
+
 template <bool TD, bool EXT>
 static void launch_prepass(const Args& a, unsigned col_tiles, cudaStream_t stream) {
     dim3 pgrid((unsigned)a.nch, col_tiles);
-    if (a.frag == 2) prepass_kernel<TD, EXT, 2><<<pgrid, THREADS, 0, stream>>>(a);
-    else prepass_kernel<TD, EXT, 1><<<pgrid, THREADS, 0, stream>>>(a);
+    launch_dependent(a.frag == 2 ? prepass_kernel<TD, EXT, 2> : prepass_kernel<TD, EXT, 1>, pgrid, 0, stream, a);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
@@ -806,12 +873,12 @@ template <bool EXT, bool X3, bool FA, bool BF, int TN, bool TD>
 static void launch(const Args& a, dim3 grid, unsigned pre_tiles, cudaStream_t stream) {
     if (a.prepass) launch_prepass<TD, EXT>(a, pre_tiles, stream);
     allowed<EXT, X3, FA, BF, TN, TD>();
-    const size_t bytes = smem_bytes(TN, TD, EXT, a.share, a.affine);
-    fused_sum_kernel<EXT, X3, FA, BF, TN, TD><<<grid, THREADS, bytes, stream>>>(a);
+    const size_t bytes = smem_bytes(TN, TD, EXT, a.share, a.affine, BF);
+    launch_dependent(fused_sum_kernel<EXT, X3, FA, BF, TN, TD>, grid, bytes, stream, a);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     if (a.split > 1) {
         dim3 mgrid(grid.x, grid.y, (NBT * BS * TN + THREADS - 1) / THREADS);
-        fused_sum_merge_kernel<EXT, TN, TD><<<mgrid, THREADS, 0, stream>>>(a);
+        launch_dependent(fused_sum_merge_kernel<EXT, TN, TD>, mgrid, 0, stream, a);
         C10_CUDA_KERNEL_LAUNCH_CHECK();
     }
 }
@@ -995,9 +1062,11 @@ void fragment_weights(torch::Tensor weights, torch::Tensor frag, torch::Tensor w
 }
 
 
-// How many CTAs of a direction's kernel an SM holds at once (for the split's waves)
+// How many CTAs of a direction's kernel an SM holds at once (for the split's waves) -- at bf16 as many as the float
+// stages' ring of two allowed (`Tile`), which its four half-size stages may exceed: a launch splits by it, and the
+// split orders the merge's adds, so a launch's bits do not hang on the bf16 stages
 int64_t ctas_per_sm(bool td, bool ext, bool x3, bool fa, bool bf, int64_t tn, int64_t share, bool affine) {
-    const size_t bytes = smem_bytes((int)tn, td, ext, (int)share, affine);
+    const size_t bytes = smem_bytes((int)tn, td, ext, (int)share, affine, false);
     const void* k = nullptr;
 #define K_OF(T, E, X, F, B, N) \
     if (td == T && ext == E && x3 == X && fa == F && bf == B && tn == N) k = allowed<E, X, F, B, N, T>();
@@ -1037,14 +1106,15 @@ void ibtd_cuda(torch::Tensor element_flows, torch::Tensor temp_flows, torch::Ten
                torch::Tensor ccolumns, torch::Tensor crank, torch::Tensor children, torch::Tensor tiles,
                torch::Tensor ptr, torch::Tensor parents, torch::Tensor reg_offset, torch::Tensor reg_width,
                torch::Tensor reg_first, torch::Tensor tlist, torch::Tensor t2i, torch::Tensor ecum,
-               torch::Tensor terms, torch::Tensor cnt, torch::Tensor perm, torch::Tensor done, int64_t out_first,
-               int64_t out_width, int64_t temp_width, int64_t B, int64_t n, int64_t W, int64_t C,
+               torch::Tensor terms, torch::Tensor cnt, torch::Tensor perm, torch::Tensor done, torch::Tensor codes,
+               torch::Tensor ncodes, int64_t out_first, int64_t out_width, int64_t temp_width, int64_t B, int64_t n,
+               int64_t W, int64_t C,
                int64_t input_start, int64_t subs, int64_t tn, int64_t threads, bool warps, bool sort,
                int64_t lp_ld, int64_t cq_max, bool sample, int64_t c_kind, bool out_temp, bool c_full,
                bool out_full, torch::Tensor code, torch::Tensor tok_ptr, torch::Tensor eidx, torch::Tensor eprobs,
                torch::Tensor prow, torch::Tensor lognorm, torch::Tensor enum_logw, int64_t Cs, int64_t mw,
                int64_t num_enum, int64_t logw_stride, bool logw, torch::Tensor pred_class, torch::Tensor allowed,
-               int64_t a_stride, bool classes);
+               int64_t a_stride, bool classes, int64_t ms, torch::Tensor defer, int64_t defer_ctas);
 int64_t ibtd_smem_max();
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {

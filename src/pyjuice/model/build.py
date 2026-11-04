@@ -269,7 +269,7 @@ class _BuildMixin:
                 ns.gather_parameters(params)
 
         self._normalize_parameters(params, pseudocount = pseudocount)
-        self.params = nn.Parameter(params)
+        self.params = nn.Parameter(params.to(self.param_dtype))         # initialized and normalized in fp32, stored as asked
 
         # Due to the custom inplace backward pass implementation, we do not track 
         # gradient of PC parameters by PyTorch.

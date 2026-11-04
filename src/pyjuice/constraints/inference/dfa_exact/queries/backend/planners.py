@@ -273,9 +273,10 @@ def _forward_modes(todo, sample, data, offsets):
             part_slots, part_start, buf[:k])
 
 
-def _forward_steps(prog, todo: np.ndarray, sample: np.ndarray, lists: IndexLists) -> list:
+def _forward_steps(prog, todo: np.ndarray, sample: np.ndarray, lists: IndexLists) -> tuple:
     """The steps of a :class:`QueryPlan` (``todo`` / ``sample``: the intervals whose values it computes once / per
-    sample), from :func:`_forward_modes`; their index lists go into ``lists``."""
+    sample), from :func:`_forward_modes`, and the indices of those with anything to run, ascending; their index lists
+    go into ``lists``."""
     t, launches, full, runs_of, ivs_of = _forward_tables(prog)
     lc, lmax, cc, cs, gc, gs, run_sel, pc, pslots, ps, buf = _forward_modes(todo, sample, t.data, t.offsets)
     counts, part_counts, run_sel, run_ptr = lc.tolist(), pc.tolist(), run_sel.tolist(), t.part_dense_ptr.tolist()
@@ -305,8 +306,8 @@ def _forward_steps(prog, todo: np.ndarray, sample: np.ndarray, lists: IndexLists
         idle = prog.fw_idle_steps = [(kind, prod_index, [([], [], 0, 0) for _ in layers] if kind == "prod" else
                                       [(block_size, [], []) for block_size, _ in layers])
                                      for kind, prod_index, layers in prog.steps]
-    steps = list(idle)
-    for si in np.flatnonzero(active).tolist():
+    steps, busy = list(idle), np.flatnonzero(active).tolist()
+    for si in busy:
         kind, prod_index, layers = prog.steps[si]
         L, P = int(prog.fw_step_ranges[si, 0]), int(prog.fw_step_ranges[si, 2])
         layers_out = []
@@ -342,7 +343,7 @@ def _forward_steps(prog, todo: np.ndarray, sample: np.ndarray, lists: IndexLists
                     P += 1
                 layers_out.append((block_size, out[0], out[1]))
         steps[si] = (kind, prod_index, layers_out)
-    return steps
+    return steps, busy
 
 
 def _forward_active(prog, lc, pc, run_sel, part_dense_ptr) -> np.ndarray:
@@ -816,12 +817,12 @@ def _top_down_modes(req, positions, once, scoring, data, offsets, child_mode, ru
     return child_mode, unit_count, dest_sel, cw_count, foldrow_mode, run_mode, block_mode, group_count, prior
 
 
-def _top_down_steps(td, t, index, m, scoring: bool, lists: IndexLists) -> list:
+def _top_down_steps(td, t, index, m, scoring: bool, lists: IndexLists) -> tuple:
     """The steps of a top-down plan (:func:`~.plans.top_down_plan`), from :func:`_top_down_modes`'s
     output ``m`` over :func:`_top_down_tables`' ``t`` and ``index``: per product layer, its fold launches and, per stage
     in the order they run, its launches and class weight launches, each with the children it computes in a mode (kept
     once, per sample) as an index list added to ``lists`` (None for all of them); per sum layer, its dense runs and
-    fused node blocks in each mode."""
+    fused node blocks in each mode -- and the indices of the steps with anything to run, ascending."""
     child_mode, unit_count, dest_sel, cw_count, foldrow_mode, run_mode, block_mode, group_count, _ = m
     active = _top_down_active(td, index, unit_count, cw_count if scoring else None, foldrow_mode, run_mode,
                               group_count)
@@ -841,8 +842,8 @@ def _top_down_steps(td, t, index, m, scoring: bool, lists: IndexLists) -> list:
         idle = td.idle_steps = [(kind, pi, [(([], []), [], 0, 0) for _ in layers] if kind == "prod" else
                                  [(block_size, ([], []), ([], [])) for block_size, _, _ in layers])
                                 for kind, pi, layers in td.steps]
-    out = list(idle)
-    for si in np.flatnonzero(active).tolist():
+    out, busy = list(idle), np.flatnonzero(active).tolist()
+    for si in busy:
         kind, pi, layers = td.steps[si]
         layers_out = []
         if kind == "prod":
@@ -887,13 +888,13 @@ def _top_down_steps(td, t, index, m, scoring: bool, lists: IndexLists) -> list:
                             lst.append((cbs, tables, selection(block_mode[b0:b1], mode, group_count[g][mode])))
                 layers_out.append((block_size, dense, fused))
         out[si] = (kind, pi, layers_out)
-    return out
+    return out, busy
 
 
 def class_weight_writes(prog, steps: list, positions: np.ndarray) -> bool:
     """
-    The class weight launches of a scoring plan's top-down ``steps`` (:func:`_top_down_steps`' output, its index lists
-    not uploaded yet) as ``(launch, index list, store)``, in place: ``store`` where the launch is the first in the
+    The class weight launches of a scoring plan's top-down ``steps`` (:func:`_top_down_steps`' output, or those of its
+    steps with anything to run, in order; the index lists not uploaded yet) as ``(launch, index list, store)``, in place: ``store`` where the launch is the first in the
     order they run to write every destination it writes -- it stores the weights, the later ones log-add to them.
     Returns whether ``dfa_class_flow`` must be filled with -inf first: some launch log-adds to a destination nothing
     wrote before, or some (target position, row) of the buffer (``positions``: bool [n]) is never written.

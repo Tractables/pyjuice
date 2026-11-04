@@ -27,20 +27,24 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Optional
 
+import os
+
 import numpy as np
 import torch
 import triton
 import triton.language as tl
+from triton.language.extra.cuda import gdc_wait
 
 from pyjuice.constraints.distributions import find_token
 from pyjuice.utils.kernel_launcher import triton_jit
 from pyjuice.utils.util import host_cdiv, host_next_power_of_2
 
 from .common import (IDENTITY, NODE_TILE, _block_ptr, _exit_width, _interval, _next_col, _logaddexp_tile, _lse_step, _slot,
-                     _tf32_operand, _tile_rows, grid_chunks, node_groups, node_tiles, tensor)
+                     _tf32_operand, _tile_rows, grid_chunks, node_groups, node_tiles, tensor, pdl_launch)
 from .prod import _lse_step_one_exp
 from .prod_top_down import _once, _out_flows_ptr, _parent_base, _parent_lane
 from .sum import _num_sms
+from .c import get_class_weights_module
 
 
 
@@ -282,7 +286,8 @@ def _class_weight_kernel(dfa_class_flow, cw_col, cw_K, cw_count, cw_cls, cw_off,
                          C, K, pid0, HOMOGENEOUS: tl.constexpr, BLOCK_INPUT: tl.constexpr, S_KIND: tl.constexpr, OUT_TEMP: tl.constexpr,
                          PRUNE: tl.constexpr, OUT_FULL: tl.constexpr, S_FULL: tl.constexpr, UNIFORM: tl.constexpr,
                          COMPACT: tl.constexpr, MARS: tl.constexpr, STORE: tl.constexpr, WALK: tl.constexpr,
-                         TN: tl.constexpr, SUBS: tl.constexpr, TB: tl.constexpr, TC: tl.constexpr, TJ: tl.constexpr):
+                         TN: tl.constexpr, SUBS: tl.constexpr, TB: tl.constexpr, TC: tl.constexpr, TJ: tl.constexpr,
+                         PDL: tl.constexpr = False):
     """One program per (``TN`` destinations of a node tile, ``TB`` samples, ``TC`` classes), a lane per (sample,
     class): the log class weights of its steps' inputs (see the module docstring) -- a walk over the columns ``i`` of
     the input's boundary where the lane's class leads somewhere, then over the other boundary's columns ``TJ`` at a
@@ -307,6 +312,8 @@ def _class_weight_kernel(dfa_class_flow, cw_col, cw_K, cw_count, cw_cls, cw_off,
     (nor row). Dead (column, class) pairs are -inf terms either way, so both walks give the same bits. ``COMPACT``: the
     outputs' top-down values compact (:mod:`.compact`; ``tflow_width`` the scratch rows' width there, ``temp_width``
     their inside values'); ``MARS``: the other operands' inside values too (by the same layout)."""
+    if PDL:                                             # (the launch before it, done)
+        gdc_wait()
     d, real, d0 = _tile_rows(tiles, tl.program_id(0), TN, SUBS)
     lane = tl.arange(0, TB * TC)
     b = ((pid0 + tl.program_id(1)) * TB + lane // TC).to(tl.int64)
@@ -436,6 +443,89 @@ def _class_weight_kernel(dfa_class_flow, cw_col, cw_K, cw_count, cw_cls, cw_off,
         tl.store(dest, _logaddexp_tile(tl.load(dest, mask = dm, other = float("-inf")), val), mask = dm)
 
 
+#: Whether the class weights of ``input @ block`` steps with one exit column and one step a destination run the CUDA
+#: kernels (kernels/c/class_weights.cu, :func:`_class_weight_cuda`: the destinations' rows staged in shared memory, the
+#: class lists pre-filtered and interleaved by lane) where they apply -- compact storage under evidence pruning, a
+#: non-identity block, at most ``CLASS_WEIGHT_CUDA_CLASSES`` classes, the launch's longest live walk (the most live
+#: columns of a sample at its positions) at least ``CLASS_WEIGHT_CUDA_WALK`` --, the Triton kernel elsewhere. The two
+#: give the same bits (the kernels' terms in the Triton kernel's order with its arithmetic). The CUDA launch has a floor
+#: (~70 us: 16k CTAs staging their rows) where the Triton one costs ~16-26 us on a few live columns; past ~40 live
+#: columns the Triton kernel is bound by the L2 traffic of its per-lane gathers (ncu: 77% of the L2's peak, 5 of every
+#: 32 bytes used) and the CUDA kernels are 2-5x faster. MEASURED (HMM-4096 x hard_0 B8 diffusion, 32 calls, nsys,
+#: RTX PRO 6000; launches paired between the two sessions): class weights 1230 ms on Triton, 783 on CUDA, 457 under the
+#: rule (walk >= 41: the best threshold; the per-launch best of both 454).
+CLASS_WEIGHT_CUDA = os.environ.get("PYJUICE_CW_CUDA", "1") == "1"
+CLASS_WEIGHT_CUDA_CLASSES = 4096
+CLASS_WEIGHT_CUDA_WALK = int(os.environ.get("PYJUICE_CW_WALK", "40"))
+#: destinations a CTA (1, 2 or 4, the most whose rows fit in shared memory) and threads a CTA; the entry tables'
+#: work space at most (bytes)
+CLASS_WEIGHT_CUDA_DESTS = int(os.environ.get("PYJUICE_CW_DESTS", "2"))
+CLASS_WEIGHT_CUDA_THREADS = int(os.environ.get("PYJUICE_CW_THREADS", "256"))
+CLASS_WEIGHT_CUDA_TABLE_MAX = 1 << 28
+#: the shared memory a CTA's staged rows may take (bytes; sm_80+ opt in to ~99 KB, less the kernel's own 128 B)
+CLASS_WEIGHT_CUDA_SMEM = 96 * 1024
+
+
+def _long_walk(la, rows) -> bool:
+    """Whether the launch's longest live walk reaches :data:`CLASS_WEIGHT_CUDA_WALK` (host values, no wait)."""
+    bounds = la.host.get("bounds")
+    if bounds is None:
+        bounds = la.host["bounds"] = sorted(set(la.host["dests"][:, 0].tolist()))
+    walk = rows.walk
+    return max(walk[t] for t in bounds) >= CLASS_WEIGHT_CUDA_WALK
+
+
+def _class_weight_cuda(mod, la, tiles, height, cw, rows, prog, bufs, element_flows, temp_flows, node_mars, liveness,
+                       compact, prior, regions, elem_first, elem_width, temp_width, tflow_width, B, s_kind, out_temp,
+                       out_full, s_full, inside, store) -> bool:
+    """One launch on the CUDA kernels (see :data:`CLASS_WEIGHT_CUDA`), or False where they do not apply (several steps
+    a destination, rows too wide for shared memory, entry tables past :data:`CLASS_WEIGHT_CUDA_TABLE_MAX`, a CUDA graph
+    being captured before the launch's tables exist): the caller runs the Triton kernel then."""
+    h = la.host
+    st = h.get("cw_cuda")
+    if st is None:
+        if torch.cuda.is_current_stream_capturing():
+            return False
+        d = h["dests"]
+        ptr = np.asarray(h["ptr"])
+        ts = sorted(set(d[:, 0].tolist()))
+        maxl = getattr(prog, "_cw_max_list", None)
+        if maxl is None:                                               # every boundary's longest class list (once)
+            cp = prog.trans.cls_ptr.view(-1, prog.C + 1)
+            maxl = prog._cw_max_list = (cp[:, 1:] - cp[:, :-1]).amax(1).cpu().numpy()
+        t2i = np.full(prog.n + 1, -1, dtype = np.int32)
+        t2i[ts] = np.arange(len(ts), dtype = np.int32)
+        st = h["cw_cuda"] = dict(
+            steps = int((ptr[1:] - ptr[:-1]).max(initial = 0)),
+            tlist = torch.tensor(ts, dtype = torch.int32, device = prog.dev),
+            t2i = torch.from_numpy(t2i).to(prog.dev), T = len(ts), maxl = max(1, int(max(maxl[t] for t in ts))),
+            wt = max(prog.width[t] for t in ts), wt1 = max(prog.width[t + 1] for t in ts))
+    if st["steps"] != 1:
+        return False
+    lanes = host_cdiv(max(rows.most, 1), 32) * 32
+    if st["T"] * B * lanes * st["maxl"] * 4 > CLASS_WEIGHT_CUDA_TABLE_MAX:
+        return False
+    fits = [g for g in (4, 2, 1) if g <= CLASS_WEIGHT_CUDA_DESTS and height % g == 0 and
+            mod.cw_stage_smem(g, st["wt"], st["wt1"]) <= CLASS_WEIGHT_CUDA_SMEM]
+    if not fits:
+        return False
+    TN = fits[0]
+    temp, once_iv = bufs
+    count, start, columns = liveness.lists()
+    tab = torch.empty(st["T"] * B * lanes * st["maxl"], dtype = torch.int32, device = prog.dev)
+    cnt = torch.empty(st["T"] * B * lanes, dtype = torch.int32, device = prog.dev)
+    mod.cw_class_cuda(cw["buf"], cw["col"], cw["K"], rows.count, rows.cls, rows.off, element_flows, temp_flows,
+                      node_mars, prior["mars"], temp, prog.width_t, prog.intervals.of, prog.intervals.info,
+                      prog.intervals.table, once_iv, prog.trans.cls_ptr, prog.trans.cls_col, prog.trans.cls_succ,
+                      liveness.live, count, start, columns, compact.rank, compact.off, la.dests, tiles, la.ptr,
+                      la.parents, regions["offset"], regions["width"], regions["first"], prior["offset"],
+                      prior["width"], prior["reg_prior"], st["tlist"], st["t2i"], tab, cnt, int(elem_first),
+                      int(elem_width), int(temp_width), int(tflow_width), B, prog.n, prog.W, prog.C, lanes,
+                      st["maxl"], st["wt"], st["wt1"], height // TN, TN, CLASS_WEIGHT_CUDA_THREADS, int(s_kind),
+                      bool(out_temp), bool(out_full), bool(s_full), bool(inside), bool(store))
+    return True
+
+
 #: :func:`_class_weight_kernel`'s walk: 0, every program chooses (its lanes' longest class list against the columns
 #: it would walk otherwise); 1, the classes' columns; 2, the sample's columns (tests)
 CLASS_WEIGHT_WALK = 0
@@ -482,6 +572,8 @@ class ClassWeightRows:
     :ivar starts: every row group's first float, then the size (host; read on first use, see :attr:`most`)
     :ivar most: the most rows of any column (host): copied with :attr:`starts` as the rows are built, and waited for
         on first use -- a query asks after its forward pass's launches, so the wait is the rows' alone
+    :ivar walk: per boundary, the most live columns of any sample there (host, every column under no pruning; set by
+        :func:`class_weight_walk`): the class weights' longest walk at a position (:data:`CLASS_WEIGHT_CUDA_WALK`)
     """
 
     count: torch.Tensor
@@ -490,14 +582,18 @@ class ClassWeightRows:
     row: torch.Tensor
     _host: torch.Tensor
     _done: Any
+    _groups: int
     rep: Optional[torch.Tensor] = None
     _read: Optional[tuple] = None
+    _walk: Optional[list] = None
+    _walk_copy: Optional[tuple] = None
 
     def _sizes(self):
         if self._read is None:
             self._done.synchronize()
             v = self._host.tolist()
-            self._read = (v[:-1], int(v[-1]))
+            g = self._groups
+            self._read = (v[:g + 1], int(v[g + 1]))
         return self._read
 
     @property
@@ -508,14 +604,24 @@ class ClassWeightRows:
     def most(self) -> int:
         return self._sizes()[1]
 
+    @property
+    def walk(self) -> list:
+        if self._walk is None:                          # (copied behind the launches, see `class_weight_walk`)
+            host, done = self._walk_copy
+            done.synchronize()
+            self._walk = host.tolist()
+        return self._walk
+
 
 #: whether the live classes of a target column with the same live pairs share one row of class weights (see
 #: :class:`ClassWeightRows`): their weights walked once, their tokens scored from it
 CLASS_ROWS_SHARED = True
 #: the bits of the classes' keys (:func:`_row_key`) the grouping compares: a key only proposes the classes that may
 #: share a row, each is then checked exactly (:func:`_class_reps_kernel`); fewer bits (tests: 0, every class of a
-#: column one candidate) cost merges, never values
-CLASS_ROW_KEY_MASK = (1 << 62) - 1
+#: column one candidate) cost merges, never values. At most 48 (:data:`_KEY_BITS`): a column's sort in registers packs
+#: a class's rank below its key (:func:`_sorted_candidates_kernel`)
+CLASS_ROW_KEY_MASK = (1 << 48) - 1
+_KEY_BITS = tl.constexpr(48)
 _KEY_NONE = tl.constexpr((1 << 63) - 1)                 # (a dead class's key: after every live one)
 
 
@@ -547,8 +653,8 @@ def _row_key(h, cnt, stored, key_mask):
 
 
 @triton_jit
-def _live_classes_kernel(live, cls_ptr, cls_col, cls_succ, col_pos, col_K, row, floats, key, elen, stored, n, W, C, B,
-                         allowed, a_stride, key_mask, TC: tl.constexpr, TP: tl.constexpr, PRUNE: tl.constexpr,
+def _live_classes_kernel(live, cls_ptr, cls_col, cls_succ, col_pos, col_K, row, floats, off, key, elen, stored, n, W,
+                         C, B, N, allowed, a_stride, key_mask, TC: tl.constexpr, TP: tl.constexpr, PRUNE: tl.constexpr,
                          ALLOWED: tl.constexpr, KEYS: tl.constexpr):
     """One program per target column ``m`` (sample ``m % B`` of position ``col_pos[m // B]``) and tile of ``TC``
     classes: which of them are live -- a class whose list (``cls_ptr`` / ``cls_col`` / ``cls_succ``) has a pair live
@@ -558,7 +664,7 @@ def _live_classes_kernel(live, cls_ptr, cls_col, cls_succ, col_pos, col_K, row, 
     rows shared, see :class:`ClassWeightRows`): every live class's key (:func:`_row_key`; a dead one's
     :data:`_KEY_NONE`) into ``key[m, c]`` and its live pairs' number into ``elen[m, c]`` -- the rows are counted once
     the classes are grouped (:func:`_class_reps_kernel`); else the live classes' rows' floats (``col_K[m]`` a row)
-    added to ``floats[m]``."""
+    added to ``floats[m]``, and the ``N`` columns' first floats into ``off`` (:func:`_offsets_when_counted`)."""
     m = tl.program_id(0).to(tl.int64)
     t = tl.load(col_pos + m // B)
     b = m % B
@@ -597,16 +703,110 @@ def _live_classes_kernel(live, cls_ptr, cls_col, cls_succ, col_pos, col_K, row, 
         tl.store(elen + m * C + c, cnt, mask = c < C)
     else:
         tl.atomic_add(floats + m, tl.sum(on.to(tl.int64), axis = 0) * tl.load(col_K + m))
+        _offsets_when_counted(floats, off, N)
+
+
+_OFFSET_STEP = tl.constexpr(1024)
+
+
+@triton.jit
+def _offsets_when_counted(floats, off, N):
+    """Once every program of the launch added its column's floats to ``floats[:N]`` -- counted at ``floats[N]`` (0
+    before the launch) --, the last of them writes their running sums, every column's first float past the first,
+    into ``off[1:]`` (``off[0]`` 0 already), 1024 columns a step, read from L2 (where the others' atomics are)."""
+    tl.debug_barrier()                                                  # (this program's floats added)
+    if tl.atomic_add(floats + N, 1) == tl.num_programs(0) * tl.num_programs(1) - 1:
+        total = tl.zeros([], dtype = tl.int64)
+        for s0 in range(0, N, _OFFSET_STEP):
+            s = s0 + tl.arange(0, _OFFSET_STEP)
+            v = tl.load(floats + s, mask = s < N, other = 0, cache_modifier = ".cg")
+            tl.store(off + 1 + s, total + tl.cumsum(v, axis = 0), mask = s < N)
+            total += tl.sum(v, axis = 0)
+
+
+#: classes a step of :func:`_class_candidates_kernel` (one program per target column, every class of its boundary)
+CLASS_CANDIDATE_TILE = 1024
+#: the most classes (padded to a power of 2) whose candidates :func:`_sorted_candidates_kernel` finds, a column's keys
+#: sorted in registers -- one launch for the three of :func:`_ordered_keys_kernel`, a sort and
+#: :func:`_class_candidates_kernel` (~27 us of host time, 5 on its own) --, at any number of target columns up to
+#: ``CLASS_CANDIDATE_ANY`` of them, past it at most ``CLASS_CANDIDATE_COLUMNS`` (None: the device's SMs, one wave).
+#: Device time, the sort's vs the registers' (brezel): 100 classes x 8192 columns 99 vs 17 us, 500 x 8192 318 vs 119;
+#: 617 x 1024 67 vs 60, x 8192 373 vs 406; 1224 x 1 42 vs 39, x 1024 120 vs 172; 3000 x 1 54 vs 88
+CLASS_CANDIDATE_REGISTERS = 2048
+CLASS_CANDIDATE_ANY = 512
+CLASS_CANDIDATE_COLUMNS = None
 
 
 @triton_jit
-def _class_reps_kernel(live, cls_ptr, cls_col, cls_succ, col_pos, col_K, row, rep, elen, stored, floats, next_col,
-                       delta, state_id, col_of_state, n, W, C, B, K, TC: tl.constexpr, TP: tl.constexpr,
+def _ordered_keys_kernel(key, cls_order, col_pos, out, C, B, TC: tl.constexpr):
+    """One program per target column ``m`` and tile of ``TC`` ranks: ``out[m, r] = key[m, cls_order[t, r]]``, the
+    column's keys in its boundary's class order (``t = col_pos[m // B]``)."""
+    m = tl.program_id(0).to(tl.int64)
+    t = tl.load(col_pos + m // B)
+    r = tl.program_id(1) * TC + tl.arange(0, TC)
+    rm = r < C
+    c = tl.load(cls_order + t * C + r, mask = rm, other = 0)
+    tl.store(out + m * C + r, tl.load(key + m * C + c, mask = rm), mask = rm)
+
+
+@triton.jit
+def _max_combine(a, b):
+    return tl.maximum(a, b)
+
+
+@triton_jit
+def _class_candidates_kernel(keys, sidx, cls_order, col_pos, rep, C, B, TC: tl.constexpr):
+    """One program per target column ``m``: from its keys in class order sorted, stably (``keys``, and ``sidx`` their
+    ranks), every class's candidate -- the first class in the boundary's order (``cls_order[t]``) with its key --
+    into ``rep[m, c]`` (int32), ``TC`` sorted keys a step: a key's first place carried over the steps."""
+    m = tl.program_id(0).to(tl.int64)
+    t = tl.load(col_pos + m // B)
+    order, row = cls_order + t * C, m * C
+    first = tl.zeros([], dtype = tl.int32)                         # the last key's first place so far
+    for p0 in range(0, C, TC):
+        p = p0 + tl.arange(0, TC)
+        pm = p < C
+        k = tl.load(keys + row + p, mask = pm, other = 0)
+        prev = tl.load(keys + row + p - 1, mask = pm & (p > 0), other = 0)
+        start = tl.where(k != prev, p, 0)                            # (a key's first place; 0's anyway)
+        start = tl.maximum(tl.associative_scan(start, 0, _max_combine), first)
+        first = tl.max(tl.where(pm, start, 0), axis = 0)
+        r = tl.load(sidx + row + p, mask = pm, other = 0)
+        cand = tl.load(sidx + row + start, mask = pm, other = 0)
+        tl.store(rep + row + tl.load(order + r, mask = pm, other = 0),
+                 tl.load(order + cand, mask = pm, other = 0), mask = pm)
+
+
+@triton_jit
+def _sorted_candidates_kernel(key, cls_order, col_pos, rep, C, B, CP: tl.constexpr, RB: tl.constexpr):
+    """:func:`_class_candidates_kernel`'s candidates from the keys themselves, one program per target column ``m``: its
+    ``C <= CP`` keys in class order with their ranks below them (``RB`` bits, ``2^RB = CP``; a live key of at most
+    :data:`_KEY_BITS` bits, a dead one's :data:`_KEY_NONE` after every live one) sorted in registers -- the order of the
+    stable sort --, every class's candidate the class at its key's first place."""
+    m = tl.program_id(0).to(tl.int64)
+    t = tl.load(col_pos + m // B)
+    order, row = cls_order + t * C, m * C
+    r = tl.arange(0, CP)
+    rm = r < C
+    k = tl.load(key + row + tl.load(order + r, mask = rm, other = 0), mask = rm, other = 0)
+    k = tl.where(k == _KEY_NONE, 1 << _KEY_BITS, k)
+    s = tl.sort(tl.where(rm, (k << RB) | r.to(tl.int64), _KEY_NONE))      # (past C: last)
+    sk, sr = s >> RB, (s & (CP - 1)).to(tl.int32)
+    start = tl.where((r == 0) | (sk != tl.gather(sk, tl.maximum(r - 1, 0), 0)), r, 0)      # (a key's first place)
+    start = tl.associative_scan(start, 0, _max_combine)
+    tl.store(rep + row + tl.load(order + sr, mask = rm, other = 0),
+             tl.load(order + tl.gather(sr, start, 0), mask = rm, other = 0), mask = rm)
+
+
+@triton_jit
+def _class_reps_kernel(live, cls_ptr, cls_col, cls_succ, col_pos, col_K, row, rep, elen, stored, floats, off, next_col,
+                       delta, state_id, col_of_state, n, W, C, B, K, N, TC: tl.constexpr, TP: tl.constexpr,
                        PRUNE: tl.constexpr, HOMOGENEOUS: tl.constexpr):
     """One program per target column ``m`` and tile of ``TC`` classes: every live class's representative -- the
     candidate ``rep[m, c]`` its key proposed (the first class of the same key in the boundary's class order), if their
     live pairs are the same, else itself -- into ``rep[m, c]`` (-1 for a dead class), and the column's
-    representatives' rows' floats (``col_K[m]`` a row) added to ``floats[m]``. The same live pairs: as many
+    representatives' rows' floats (``col_K[m]`` a row) added to ``floats[m]`` (the ``N`` columns' first floats then
+    into ``off``, :func:`_offsets_when_counted`). The same live pairs: as many
     (``elen``), and each of the class's taken the same way by the candidate -- its column live at ``t``, its
     successor live at ``t + 1`` and the candidate's successor there (``next_col`` / ``delta``, see
     :func:`~.common._next_col`; the sequence end's one column) --, and the same kind (both stored, or both
@@ -643,6 +843,7 @@ def _class_reps_kernel(live, cls_ptr, cls_col, cls_succ, col_pos, col_K, row, re
     fin = tl.where(on, tl.where(bad, c, r), -1)
     tl.store(rep + m * C + c, fin, mask = cm)
     tl.atomic_add(floats + m, tl.sum((on & (fin == c)).to(tl.int64), axis = 0) * tl.load(col_K + m))
+    _offsets_when_counted(floats, off, N)
 
 
 @triton_jit
@@ -698,7 +899,8 @@ def class_weight_rows(prog, liveness, col_pos: torch.Tensor, col_K: torch.Tensor
     With ``stored`` (int32 [C] on the device: every class's stored column, -1 for an enumerated class) and
     :data:`CLASS_ROWS_SHARED`, the live classes of a column with the same live pairs share a row: every class's key
     (:func:`_live_classes_kernel`), the classes of a key grouped per column in the boundary's class order (a sort),
-    every class checked exactly against the first of its key (:func:`_class_reps_kernel`), then the rows.
+    every class checked exactly against the first of its key (:func:`_class_reps_kernel`), then the rows -- the
+    grouping in registers where it fits (:data:`CLASS_CANDIDATE_REGISTERS`).
 
     :param col_pos: int64 [N / B] on the device, every block of ``B`` columns' position
     :param col_K, col_first: int64 [N] on the device, every column's row group's rows and first column
@@ -708,7 +910,7 @@ def class_weight_rows(prog, liveness, col_pos: torch.Tensor, col_K: torch.Tensor
     N, G, dev = col_K.numel(), group_first.numel() - 1, prog.dev
     shared = CLASS_ROWS_SHARED and stored is not None and N > 0
     M, a, b = max(N, 1), N + 1 + (N + 1) % 2, G + 2 + G % 2                 # (pieces 16 B aligned)
-    z = torch.zeros(a + b + M, dtype = torch.int64, device = dev)
+    z = torch.zeros(a + b + M + 1, dtype = torch.int64, device = dev)      # (the floats' programs counted past them)
     off, sizes, floats = z.as_strided((N + 1,), (1,)), z.as_strided((G + 2,), (1,), a), z.as_strided((M,), (1,), a + b)
     NC, MP = M * C + (-M * C) % 4, M + (-M) % 4
     e = torch.empty((4 if shared else 2) * NC + MP, dtype = torch.int32, device = dev)
@@ -718,7 +920,7 @@ def class_weight_rows(prog, liveness, col_pos: torch.Tensor, col_K: torch.Tensor
         key = torch.empty(M, C, dtype = torch.int64, device = dev)
     else:
         rep, elen, key = row, row, floats
-    if N > 0:
+    if N > 0:                                       # (the last launch adding floats writes the columns' offsets)
         prune = liveness is not None
         classes = prune and liveness.allowed is not None                    # (a session's per-sample classes)
         a_stride = n * C if classes and liveness.allowed.size(0) > 1 else 0  # (one set: every sample's)
@@ -727,25 +929,29 @@ def class_weight_rows(prog, liveness, col_pos: torch.Tensor, col_K: torch.Tensor
             TC //= 2                                                                         # device)
         TP = max(1, LIVE_CLASS_LANES // TC)
         _live_classes_kernel[(N, host_cdiv(C, TC))](liveness.live if prune else row, tt.cls_ptr, tt.cls_col,
-                                                     tt.cls_succ, col_pos, col_K, row, floats, key, elen,
-                                                     stored if shared else row, n, W, C, B,
+                                                     tt.cls_succ, col_pos, col_K, row, floats, off, key, elen,
+                                                     stored if shared else row, n, W, C, B, N,
                                                      liveness.allowed if classes else row, a_stride, CLASS_ROW_KEY_MASK,
                                                      TC = TC, TP = TP, PRUNE = prune, ALLOWED = classes, KEYS = shared,
                                                      num_warps = 4)
         if shared:                                  # every class's candidate: the first of its key in class order
-            order = tt.cls_order.long()[col_pos.repeat_interleave(B)]      # [N, C]: every column's classes in order
-            keys, sidx = torch.sort(key.gather(1, order), dim = 1, stable = True)
-            first = torch.ones_like(keys, dtype = torch.bool)
-            first[:, 1:] = keys[:, 1:] != keys[:, :-1]
-            start = torch.where(first, torch.arange(C, device = dev), 0).cummax(dim = 1).values
-            cand = torch.empty_like(sidx).scatter_(1, sidx, sidx.gather(1, start))   # by rank: its candidate's rank
-            rep.scatter_(1, order, order.gather(1, cand).to(torch.int32))           # by class: its candidate
+            CP = max(2, host_next_power_of_2(C))
+            most = _num_sms(dev) if CLASS_CANDIDATE_COLUMNS is None else CLASS_CANDIDATE_COLUMNS
+            if CP <= CLASS_CANDIDATE_REGISTERS and (CP <= CLASS_CANDIDATE_ANY or N <= most) and \
+                    CLASS_ROW_KEY_MASK < (1 << _KEY_BITS.value):            # (8 warps the faster at 1024 only)
+                _sorted_candidates_kernel[(N,)](key, tt.cls_order, col_pos, rep, C, B, CP = CP,
+                                                RB = CP.bit_length() - 1, num_warps = 8 if CP == 1024 else 4)
+            else:
+                ordered = torch.empty(N, C, dtype = torch.int64, device = dev)
+                TK = min(CLASS_CANDIDATE_TILE, host_next_power_of_2(C))
+                _ordered_keys_kernel[(N, host_cdiv(C, TK))](key, tt.cls_order, col_pos, ordered, C, B, TC = TK)
+                keys, sidx = torch.sort(ordered, dim = 1, stable = True)
+                _class_candidates_kernel[(N,)](keys, sidx, tt.cls_order, col_pos, rep, C, B, TC = TK, num_warps = 4)
             _class_reps_kernel[(N, host_cdiv(C, TC))](liveness.live if prune else row, tt.cls_ptr, tt.cls_col,
-                                                      tt.cls_succ, col_pos, col_K, row, rep, elen, stored, floats,
+                                                      tt.cls_succ, col_pos, col_K, row, rep, elen, stored, floats, off,
                                                       prog.next_col_arg, prog.delta, prog.state_id, prog.col_of_state,
-                                                      n, W, C, B, prog.K, TC = TC, TP = TP, PRUNE = prune,
+                                                      n, W, C, B, prog.K, N, TC = TC, TP = TP, PRUNE = prune,
                                                       HOMOGENEOUS = prog.homogeneous, num_warps = 4)
-        torch.cumsum(floats, dim = 0, out = off[1:])
     TC = min(LIVE_CLASS_TILE, host_next_power_of_2(C))
     _class_rows_kernel[(max(N, G + 1),)](off, tt.cls_order, col_pos, col_K, col_first, group_first, row, rep, count,
                                          cls, sizes, N, G, C, B, TC = TC, SHARED = shared)
@@ -753,8 +959,26 @@ def class_weight_rows(prog, liveness, col_pos: torch.Tensor, col_K: torch.Tensor
     host.copy_(sizes, non_blocking = True)
     done = torch.cuda.Event()
     done.record(torch.cuda.current_stream(dev.index))
-    return ClassWeightRows(count = count, cls = cls, off = off, row = row, _host = host, _done = done,
+    return ClassWeightRows(count = count, cls = cls, off = off, row = row, _host = host, _done = done, _groups = G,
                            rep = rep if shared else None)
+
+
+def class_weight_walk(rows: ClassWeightRows, prog, liveness, compact = None):
+    """``rows``' longest walk at every boundary (:attr:`ClassWeightRows.walk`: the most live columns of any sample
+    there), the class weights' kernel choice (:data:`CLASS_WEIGHT_CUDA_WALK`): a compact query's layout's
+    (``compact.max_count``, on the host already), else its ``liveness``' lists' counts copied behind the launches, or
+    every column without pruning."""
+    n = prog.n
+    if compact is not None:
+        rows._walk = compact.max_count.tolist()
+    elif liveness is not None:
+        host = torch.empty(n + 1, dtype = torch.int64, pin_memory = True)
+        host.copy_(liveness.lists()[0].view(liveness.B, n + 1).amax(0), non_blocking = True)
+        done = torch.cuda.Event()
+        done.record(torch.cuda.current_stream(prog.dev.index))
+        rows._walk_copy = (host, done)
+    else:
+        rows._walk = prog.width[:n + 1]
 
 
 def run_class_weights(launches, cw: dict, prog, bufs, element_flows, temp_flows, node_mars, liveness, elem_first: int,
@@ -789,16 +1013,24 @@ def run_class_weights(launches, cw: dict, prog, bufs, element_flows, temp_flows,
     ctables = (compact.off, compact.rank) if compact is not None else (cw["K"],) * 2
     rows = cw["rows"]
     TC = min(64, host_next_power_of_2(max(rows.most, 1)))                   # (a lane a live class of a column)
+    mod = get_class_weights_module() if CLASS_WEIGHT_CUDA and prune and compact is not None else None
     for la, item, store in launches:
         idx = tensor(item)
         tiles, height = (la.tiles, la.tile_height) if idx is None else (idx, item.height)
         s_kind, out_temp, (out_full, *s_full) = la.kinds
         identity = la.form == "input_block" and s_kind == IDENTITY
+        if mod is not None and la.form == "input_block" and not identity and la.J_max == 1 and \
+                C <= CLASS_WEIGHT_CUDA_CLASSES and prog.W < 65535 and _long_walk(la, rows) and \
+                _class_weight_cuda(mod, la, tiles, height, cw, rows, prog, (temp, once_iv), element_flows, temp_flows,
+                                   node_mars, liveness, compact, prior, regions, elem_first, elem_width, temp_width,
+                                   tflow_width, B, s_kind, out_temp, out_full, all(s_full), inside, store):
+            continue
         TJ = 1 if identity else min(64, host_next_power_of_2(la.J_max))
         TN = min(height, CLASS_WEIGHT_NODES, max(1, CLASS_WEIGHT_LANES // (TC * TJ)))   # (powers of 2)
         TB = max(1, min(host_next_power_of_2(B), 128 // TC, CLASS_WEIGHT_LANES // (TC * TJ * TN)))
         lanes = TN * TB * TC * TJ
         warps = 1 if lanes <= 128 else 2 if lanes <= 512 else 4
+        pdl = pdl_launch(element_flows.device)
         for first, size in grid_chunks(host_cdiv(B, TB), 1):
             _class_weight_kernel[(tiles.numel() // NODE_TILE * (height // TN), size, host_cdiv(max(rows.most, 1), TC))](
                 cw["buf"], cw["col"], cw["K"], rows.count, rows.cls, rows.off, element_flows, temp_flows, node_mars,
@@ -813,7 +1045,7 @@ def run_class_weights(launches, cw: dict, prog, bufs, element_flows, temp_flows,
                 PRUNE = prune, OUT_FULL = out_full, S_FULL = all(s_full), UNIFORM = not prune or TB == 1,
                 COMPACT = compact is not None, MARS = inside, STORE = store, WALK = CLASS_WEIGHT_WALK, TN = TN,
                 HOMOGENEOUS = prog.homogeneous,
-                SUBS = height // TN, TB = TB, TC = TC, TJ = TJ, num_warps = warps)
+                SUBS = height // TN, TB = TB, TC = TC, TJ = TJ, PDL = pdl, launch_pdl = pdl, num_warps = warps)
 
 
 # -------------------------------------------------------------------------------------------------
@@ -1202,13 +1434,23 @@ def _score_candidates_kernel(table, w, row, shift, token_class, code, positions,
         tl.store(out + rr * KC + js, val, mask = jm)
 
 
-#: :func:`_score_candidates_kernel`'s and :func:`_score_tokens_kernel`'s ``(BV, BH, warps)`` -- tokens per program,
-#: the dot's chunk of rows -- for at most :data:`SCORE_CANDIDATE_PAIRS` (column, token) pairs, and for more: from a
-#: sweep of the cached decode step on Ctrl-G's HMM4096 (4096 rows) at 1/16/128 columns x 50/1024 candidates, the first
-#: within 2% of the best everywhere but 128 x 1024, where the second takes the step from 3.32 to 2.87 ms (scoring every
-#: token: 2.92)
-SCORE_CANDIDATE_TILES = ((16, 256, 4), (64, 64, 2))
+#: :func:`_score_tokens_kernel`'s ``(BV, BH, warps)`` -- tokens per program, the dot's chunk of rows -- for at most
+#: :data:`SCORE_CANDIDATE_PAIRS` (column, token) pairs, and for more: from a sweep of the cached decode step on Ctrl-G's
+#: HMM4096 (4096 rows) at 1/16/128 columns x 50/1024 candidates, the first within 2% of the best everywhere but
+#: 128 x 1024, where the second takes the step from 3.32 to 2.87 ms (scoring every token: 2.92)
+SCORE_TOKEN_TILES = ((16, 256, 4), (64, 64, 2))
+#: ... and :func:`_score_candidates_kernel`'s, from its launches' captured inputs (1024 candidates a column, 4096 rows):
+#: Codpula-4096 x JSON hard_0 diffusion, B8 / B32 / B64 (1024 / 4096 / 8192 columns) 1396 -> 942 / 1906 -> 1212 /
+#: 9843 -> 7729 us from (64, 64, 2), HMM-4096 x GPT-2 JSON with candidates (B16, 2048 columns) 1146 -> 755 -- 242
+#: registers a thread at 64 tokens, 12% occupancy --; l2r B8 / B32 (8 / 32 columns) 47 -> 43 / 101 -> 94 from
+#: (16, 256, 4). The same chunks of rows: every candidate's score the same bits; log Z's sums over the enumerated
+#: candidates run in other tiles: the conditionals within fp32 rounding (3.8e-6 in log at most there)
+SCORE_CANDIDATE_TILES = ((16, 256, 8), (16, 64, 2))
 SCORE_CANDIDATE_PAIRS = 1 << 16
+#: :func:`_score_weights_kernel`'s warps (its tiles, and so its arithmetic, unchanged by them). Its two launches on
+#: their captured inputs, Codpula-4096 x JSON hard_0: l2r B8 37 -> 29 us, diffusion B8 / B32 / B64 1185 -> 484 /
+#: 3180 -> 1491 / 5848 -> 2964 us from 4 (184 registers a thread: 16% occupancy)
+SCORE_WEIGHT_WARPS = 2
 
 
 #: :func:`_score_kernel`'s tiles ``(BB, BV, BH, warps, stages)`` by table dtype and dot precision, for at most 16, 64 and
@@ -1284,7 +1526,7 @@ def score_group(out: torch.Tensor, table: torch.Tensor, w: torch.Tensor, row: to
         part = torch.empty(N * ctiles * shares * 3 * TC if shares > 1 else 1, dtype = torch.float32, device = dev)
         args = (w, row, row if rep is None else rep, class_mars, rows, columns["nodes"], positions, columns["mrow"],
                 columns["mstride"], columns["lognorm"], shift, zc, part, classes.class_of_stored32, C, K, B, KS, Cs)
-        consts = dict(TC = TC, TK = TK, SHARES = shares, SPLIT = rep is not None, num_warps = 4, **modes)
+        consts = dict(TC = TC, TK = TK, SHARES = shares, SPLIT = rep is not None, num_warps = SCORE_WEIGHT_WARPS, **modes)
         _score_weights_kernel[(N, ctiles, shares)](*args, FINISH = False, **consts)
         if shares > 1 or rep is not None:
             _score_weights_kernel[(N, ctiles, shares)](*args, FINISH = True, **consts)
@@ -1294,7 +1536,7 @@ def score_group(out: torch.Tensor, table: torch.Tensor, w: torch.Tensor, row: to
     by_tokens = E > 0 and not run                                           # with a weight: their parts come with
     KC = (candidates.size(1) if candidates is not None else weights["KW"]) if candidates is not None or ids is not None \
         else 0
-    tokens_tile = SCORE_CANDIDATE_TILES[N * E > SCORE_CANDIDATE_PAIRS]
+    tokens_tile = SCORE_TOKEN_TILES[N * E > SCORE_CANDIDATE_PAIRS]
     cand_tile = SCORE_CANDIDATE_TILES[N * KC > SCORE_CANDIDATE_PAIRS]
     UT = host_cdiv(E, tokens_tile[0]) if by_tokens else host_cdiv(KC, cand_tile[0]) if run and E > 0 else 0
     uz = torch.empty(N, max(UT, 1), dtype = torch.float32, device = dev)

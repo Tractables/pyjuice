@@ -377,6 +377,7 @@ def ref_depth(schema):
     return depth(schema)
 
 
+@pytest.mark.slow                                       # (MEASURED: 22 s each, every form against outlines-core)
 @pytest.mark.parametrize("whitespace", [r"[ ]?", r"[ \n]*"])
 def test_the_texts_are_outlines_cores(whitespace):
     for schema in FORMS + [case[0] for case in CASES]:

@@ -50,6 +50,7 @@ from pyjuice.layer.external_sum_layer import EXTERNAL_PARAMS_KWARG
 from pyjuice.utils.fast_inference import fast_inference
 
 from .. import distributions
+from . import kernels
 from .plan import INPUT, PROD, SUM, Planner
 
 
@@ -460,6 +461,7 @@ class Decoder:
         self._used = False
         self._planner = None
         self._layout = None
+        self._cat_targets = None                 # `kernels.CategoricalTargets` of the input layer (made by the first call)
         self._batch = None                       # the batch size the session's state is for (None: no state)
 
     # ---------------------------------------------------------------------------------------------
@@ -610,8 +612,14 @@ class Decoder:
             if log_p is not None:
                 self._log_p = log_p + scale
 
-        out = distributions.backward(pc.input_layer_group[0], data, pc.node_flows, pc.node_mars,
-                                     **dict(kwargs, logspace_flows = True))
+        # A Categorical layer's one target on consecutive nodes and table rows: three launches (`kernels`); the input
+        # layer's general backward otherwise
+        if self._cat_targets is None or self._cat_targets.layer is not pc.input_layer_group[0]:
+            self._cat_targets = kernels.CategoricalTargets(pc.input_layer_group[0])
+        out = kernels.categorical_conditional(self._cat_targets, pc.node_flows, target_vars)
+        if out is None:
+            out = distributions.backward(pc.input_layer_group[0], data, pc.node_flows, pc.node_mars,
+                                         **dict(kwargs, logspace_flows = True))
         self._planner.commit(plan, outsides = self.early_stop)
         self._remember(data, miss)
         return out
@@ -754,6 +762,9 @@ class Decoder:
                 per = np.bincount(seg, weights = L.hi[groups] - L.lo[groups], minlength = t.size)
                 if per.size > 0 and per[0] > 0 and (per == per[0]).all():
                     rows.meta["target_rows"] = int(per[0])                # every target that many rows
+                # No row in two targets' (a variable listed twice; a group of several variables): what the fused
+                # normalization needs, its targets' programs writing their rows in place
+                rows.meta["disjoint_targets"] = bool(np.unique(groups).size == groups.size)
         rows.upload(self.pc.node_mars.device)
         return rows
 
@@ -767,6 +778,12 @@ class Decoder:
         if r is None:
             return None
         nf = self.pc.node_flows
+        # One launch (`kernels.normalize_target_flows`) where every target's rows are a part of one set of rows, in
+        # order: one target's (a slice or an index), or several of as many rows each, none of them in two targets' (the
+        # kernel writes them in place, one program per target); the torch form otherwise
+        if nf.dtype == torch.float32 and (num_targets == 1 or (rows.meta.get("target_rows") is not None
+                                                                and rows.meta.get("disjoint_targets", False))):
+            return kernels.normalize_target_flows(nf, r if num_targets == 1 else r[0], num_targets)
         if num_targets == 1:
             # One segment: its maximum and its result broadcast, not gathered row by row (the same values)
             vals = _get(nf, r)

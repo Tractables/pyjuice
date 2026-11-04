@@ -894,9 +894,12 @@ def test_fused_em_correction_matches_the_torch_reference(block_size, n_blocks, c
         bsmod._EM_FUSED = True
         fused = desc.compute_em_correction(*args, denom_sources = sources).clone()
         bsmod._EM_FUSED = False
+        desc.__dict__.pop("_em_specs_cache", None)          # (the gate is read where the specs are made: cached)
+        assert desc._fused_em_correction(*args, sources) is None, "the reference would be the fused path again"
         ref = desc.compute_em_correction(*args, denom_sources = sources).clone()
     finally:
         bsmod._EM_FUSED = prev
+        desc.__dict__.pop("_em_specs_cache", None)
 
     assert torch.isfinite(fused).all()
     rel = ((fused - ref).abs() / ref.abs().clamp_min(1e-20)).max().item()
@@ -971,7 +974,10 @@ def test_fused_em_correction_matches_reference_for_shared_layer_and_ties():
                 f"the fused path declined {tgt}; this case would compare the reference with itself"
             fused = desc.compute_em_correction(*args, denom_sources = sources).clone()
             bsmod._EM_FUSED = False
+            desc.__dict__.pop("_em_specs_cache", None)      # (the gate is read where the specs are made: cached)
+            assert desc._fused_em_correction(*args, sources) is None, "the reference would be the fused path again"
             ref = desc.compute_em_correction(*args, denom_sources = sources).clone()
+            desc.__dict__.pop("_em_specs_cache", None)
             rel = ((fused - ref).abs() / ref.abs().clamp_min(1e-20)).max().item()
             assert rel < 1e-5, f"{tgt}: fused differs from the reference (relmax={rel})"
     finally:
@@ -1954,7 +1960,7 @@ def _ref_dual_m_step(ns, theta, fp, fm, step_size, pseudocount, keep_zero_params
                 out[e, :, m] = th[e, :, m] * ((1.0 - step_size) + step_size * ratios[e]) / cum
     out = torch.clamp(out, min = 1e-30)
     if keep_zero_params:
-        out = torch.where(th < 1e-12, torch.zeros_like(out), out)
+        out = torch.where(th == 0.0, torch.zeros_like(out), out)
     return out.reshape(-1)
 
 
@@ -2070,6 +2076,87 @@ class _DenseModeDescriptor(ExternalSumParams):
 
 
 @cuda_only
+@pytest.mark.parametrize("mode", ["rowgroup", "dense", "generic"])
+@pytest.mark.parametrize("kz", [False, True])
+@pytest.mark.parametrize("fold", [True, False], ids = ["fused_passes", "passes_of_their_own"])
+def test_the_master_copys_correction_is_its_sync_update_and_copy(mode, kz, fold, monkeypatch):
+    """Parameters stored below fp32 (`stored`: the stored range beside the fp32 master copy, which is `params`): the
+    correction takes the stored value where it was written since the copy was last stored, and stores its result,
+    rounded -- what `sync_master`, the update on `F+` taken to the copy's values (`_rounded`, see
+    `params_master.flows_to_master`) and a `copy_` make, to the update kernels' reduction order (the fused first pass
+    lays its tile out apart: ~1e-7). Outside writes on a tenth of the range, 1.7x off (a missed one is
+    70% off); the stored values exactly the copy's rounding, nothing outside the range written. The check and store in
+    the update's passes (`_fold_master`: a range past the L2, forced here) and as passes of their own; both fused `F-`
+    modes, and the generic path (the fused one declined)."""
+    import pyjuice.nodes.external_params.blockscale.denominators as bsmod
+    from pyjuice.model.backend.params_master import sync_master
+
+    monkeypatch.setattr(ExternalSumParams, "_fold_master", staticmethod(lambda params, n: fold))
+
+    dev = torch.device("cuda:0")
+    root, ns = _build_shape(16, 4, 4)
+    pc = juice.compile(root, verbose = False).to(dev)
+    B = 64
+    torch.manual_seed(5)
+    x = torch.randint(0, NUM_CATS, [B, 2], device = dev)
+    phi = _phi(ns, B, dev)
+    pc(x, sum_external_params = {ns: phi})
+    pc.backward(x, sum_external_params = {ns: phi}, logspace_flows = True, flows_memory = 0.0,
+                allow_modify_flows = False)
+    srcs = pc._denom_correction_nss()
+    tgt = next(iter(srcs))
+    desc = tgt.external_params
+    if mode == "dense":
+        fm = desc.materialize_denom_flows(tgt, pc.params, pc.denom_param_flows, srcs[tgt]).clone()
+        desc = _DenseModeDescriptor(fm, tgt._param_flow_range[0])
+    ps, pe = tgt._param_range
+    torch.manual_seed(6)
+    master0 = pc.params.detach() * (1 + 1e-3 * torch.randn_like(pc.params))      # (off the bf16 grid)
+    if kz:                                                # what `keep_zero_params` freezes, and what it must not
+        r = torch.rand(pe - ps, device = dev)
+        master0[ps:pe][r < 0.1] = 0.0
+        master0[ps:pe][(r >= 0.1) & (r < 0.2)] = 1e-16
+    stored0 = master0.to(torch.bfloat16)
+    written = ps + torch.randperm(pe - ps, device = dev)[: (pe - ps) // 10]
+    stored0[written] = (stored0[written].float() * 1.7).to(torch.bfloat16)        # writes from outside
+    rest = (pc.param_flows, pc.denom_param_flows, 0.5, 0.1, kz)
+
+    prev = bsmod._EM_FUSED
+    try:
+        bsmod._EM_FUSED = mode != "generic"
+        probe = master0.clone()
+        fused = desc._fused_em_correction(tgt, probe, *rest, srcs[tgt], out = probe[ps:pe],
+                                          stored = stored0.clone()[ps:pe])
+        assert (fused is None) == (mode == "generic"), \
+            f"{mode}: the fused path {'ran' if fused is not None else 'declined'}"
+
+        ref_m, ref_s = master0.clone(), stored0.clone()
+        sync_master(ref_m[ps:pe], ref_s[ps:pe])
+        desc.compute_em_correction(tgt, ref_m, *rest, denom_sources = srcs[tgt], out = ref_m[ps:pe], _rounded = True)
+        ref_s[ps:pe].copy_(ref_m[ps:pe])
+
+        got_m, got_s = master0.clone(), stored0.clone()
+        desc.compute_em_correction(tgt, got_m, *rest, denom_sources = srcs[tgt], out = got_m[ps:pe],
+                                   stored = got_s[ps:pe])
+    finally:
+        bsmod._EM_FUSED = prev
+
+    rel = ((got_m - ref_m).abs() / ref_m.abs().clamp_min(1e-20)).max().item()
+    assert rel < 1e-5, f"{mode}: the master copy {rel:.2e} from sync + update + copy"
+    if kz:                                                # (`rel` above cannot see the momentum floor, 1e-30, against 0)
+        zero, tiny = master0[ps:pe] == 0, (master0[ps:pe] > 0) & (master0[ps:pe] < 1e-12)
+        assert zero.any() and tiny.any()
+        for what, got in (("the update", got_m), ("sync + update + copy", ref_m)):
+            assert torch.all(got[ps:pe][zero] == 0), f"{mode}: {what} moved a zero parameter"
+            assert torch.all(got[ps:pe][tiny] > 0), f"{mode}: {what} took a tiny parameter for zero"
+    assert torch.equal(got_s[ps:pe], got_m[ps:pe].to(torch.bfloat16)), f"{mode}: stored not the copy's rounding"
+    assert torch.equal(got_s[:ps], stored0[:ps]) and torch.equal(got_s[pe:], stored0[pe:]), \
+        f"{mode}: stored written outside the range"
+    assert torch.equal(got_m[:ps], master0[:ps]) and torch.equal(got_m[pe:], master0[pe:]), \
+        f"{mode}: the master copy written outside the range"
+
+
+@cuda_only
 @pytest.mark.parametrize("bs,nb,gcbs,step,pcount,kz",
                          [(4, 3, 2, 0.5, 0.1, False), (16, 4, 4, 1.0, 0.0, False),
                           (32, 2, 8, 0.3, 0.01, True)])
@@ -2126,3 +2213,58 @@ def test_dense_and_rowgroup_denom_modes_agree(bs, nb, gcbs, step, pcount, kz):
     ref = dense_desc.compute_em_correction(*args, denom_sources = srcs[tgt])
     rel2 = ((rowgroup - ref).abs() / ref.abs().clamp_min(1e-20)).max().item()
     assert rel2 < 1e-5, f"the fused modes disagree with the torch M-step (relmax = {rel2})"
+
+
+@cuda_only
+@pytest.mark.parametrize("fused", [False, True])
+@pytest.mark.parametrize("keep", [False, True])
+def test_em_correction_preserves_tiny_positive_parameters(fused, keep, monkeypatch):
+    """The fused and torch M-steps freeze exact zeros, not small positive weights."""
+    dev = torch.device("cuda:0")
+    root, ns = _build(gated = True)
+    pc = juice.compile(root, verbose = False).to(dev)
+    ps, pe = ns._param_range
+    E, cbs, bs = ns.edge_ids.size(1), ns.ch_block_size, ns.block_size
+    theta = pc.params[ps:pe].reshape(E, cbs, bs)
+    theta[:, 0, :] = 0.0
+    theta[:, 1, :] = 1e-16
+    nb = ns.edge_ids[0].to(device = dev, dtype = torch.long)
+    total = torch.zeros(ns.num_node_blocks, bs, device = dev)
+    total.index_add_(0, nb, theta.sum(1))
+    theta /= total[nb][:, None, :]
+    before = theta.clone()
+    zeroed, tiny = before == 0, (before > 0) & (before < 1e-12)
+    assert zeroed.any() and tiny.any()
+    if not fused:
+        monkeypatch.setattr(ExternalSumParams, "_fused_em_correction", lambda *args, **kwargs: None)
+    else:
+        fused_calls = []
+        original = ExternalSumParams._fused_em_correction
+
+        def checked_fused(*args, **kwargs):
+            result = original(*args, **kwargs)
+            assert result is not None, "the fused M-step unexpectedly fell back to torch"
+            fused_calls.append(True)
+            return result
+
+        monkeypatch.setattr(ExternalSumParams, "_fused_em_correction", checked_fused)
+    torch.manual_seed(17)
+    x = torch.randint(0, NUM_CATS, [32, 2], device = dev)
+    ext = {ns: _phi(ns, 32, dev)}
+    pc(x, sum_external_params = ext)
+    pc.backward(x, sum_external_params = ext, logspace_flows = True,
+                flows_memory = 0.0, allow_modify_flows = False)
+    fp = pc.param_flows[slice(*ns._param_flow_range)].clone()
+    fm = _fminus(pc, ns)[slice(*ns._param_flow_range)]
+    expected = _ref_dual_m_step(ns, before, fp, fm, 1.0, 0.1, keep).reshape_as(before)
+    pc.mini_batch_em(step_size = 1.0, pseudocount = 0.1, keep_zero_params = keep)
+    if fused:
+        assert fused_calls, "the fused M-step was not exercised"
+    actual = pc.params[ps:pe].reshape_as(before)
+    torch.testing.assert_close(actual.double(), expected, atol = 2e-6, rtol = 2e-4)
+    torch.testing.assert_close(actual[tiny].double(), expected[tiny], atol = 0, rtol = 2e-4)
+    assert bool((actual[tiny] > 0).all())
+    if keep:
+        assert bool((actual[zeroed] == 0).all())
+    else:
+        assert bool((actual[zeroed] > 0).all())
