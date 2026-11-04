@@ -11,9 +11,10 @@ from pyjuice.utils.util import device_scalars
 
 
 @triton_jit
-def cum_par_kernel(cum_pflows, mparams, par_start_ids, blk_sizes, blk_intervals, 
-                   global_nids, constexprs, BLOCK_ID: tl.constexpr, BLOCK_SIZE: tl.constexpr):
-
+def entry_sums_kernel(entry_sums, mparams, par_start_ids, blk_sizes, blk_intervals, constexprs,
+                      BLOCK_ID: tl.constexpr, BLOCK_SIZE: tl.constexpr):
+    # Every table entry's sum, each stored at its own place: no atomic adds, whose order would decide the rounding of a
+    # node's total where the node takes several entries (~1e-7, run to run)
     pid = tl.program_id(axis = 0)
 
     # Retrieve the constants
@@ -27,14 +28,12 @@ def cum_par_kernel(cum_pflows, mparams, par_start_ids, blk_sizes, blk_intervals,
     par_start = tl.load(par_start_ids + offs_m, mask = mask_m, other = 0)
     blk_size = tl.load(blk_sizes + offs_m, mask = mask_m, other = 0)
     blk_interval = tl.load(blk_intervals + offs_m, mask = mask_m, other = 0)
-    global_nid = tl.load(global_nids + offs_m, mask = mask_m, other = 0)
 
     offs_par = par_start[:,None] + offs_blk[None,:] * blk_interval[:,None]
     mask_par = mask_m[:,None] & (offs_blk[None,:] < blk_size[:,None])
     pars = tl.load(mparams + offs_par, mask = mask_par, other = 0).to(tl.float32)
-    sum_pars = tl.sum(pars, axis = 1)
 
-    tl.atomic_add(cum_pflows + global_nid, sum_pars, mask = mask_m)
+    tl.store(entry_sums + offs_m, tl.sum(pars, axis = 1), mask = mask_m)
 
 
 @triton_jit
@@ -124,10 +123,15 @@ def normalize_parameters(params, par_update_kwargs, pseudocount: float = 0.0):
 
         grid = (triton.cdiv(num_blocks, BLOCK_ID),)
 
-        cum_par_kernel[grid](
-            cum_pflows, params, par_start_ids, blk_sizes, blk_intervals, 
-            global_nids, constexprs, BLOCK_ID, BLOCK_SIZE
+        entry_sums = torch.empty([num_blocks], dtype = torch.float32, device = params.device)
+        entry_sums_kernel[grid](
+            entry_sums, params, par_start_ids, blk_sizes, blk_intervals, constexprs, BLOCK_ID, BLOCK_SIZE
         )
+
+        # The nodes' totals in the table's order, on the CPU (`index_add_` on the GPU is not ordered): the same bits on
+        # every run, and on every rank
+        cum_pflows.copy_(torch.zeros([tot_num_nodes], dtype = torch.float32).index_add_(
+            0, global_nids.cpu(), entry_sums.cpu()))
 
         par_update_kernel[grid](
             params, cum_pflows, nchs, par_start_ids, blk_sizes, blk_intervals,

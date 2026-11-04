@@ -18,6 +18,11 @@ from pyjuice.utils import BitSet
 
 from .backend import compile_cum_par_flows_fn, compile_par_update_fn, normalize_parameters
 
+#: From how many parameters a new circuit's normalization goes to the GPU: below, the kernels' first load costs more
+#: than it saves. MEASURED, a circuit's first construction in a process, CPU against GPU: 8.4 M parameters 1.15 s
+#: against 1.33 s, 33.6 M 1.65 s against 1.41 s, 131 M 3.14 s against 2.00 s.
+GPU_NORMALIZE_MIN_PARAMS = 2 ** 24
+
 
 class _BuildMixin:
     """Compiling the nodes into layers, for :class:`~pyjuice.model.tensorcircuit.TensorCircuit` (one of its bases)."""
@@ -253,22 +258,31 @@ class _BuildMixin:
         self._root_node_range = (self.num_nodes - self.num_root_nodes, self.num_nodes)
 
         # Initialize parameters
-        self._init_parameters()
+        with torch.cuda.device(f"cuda:{device}"):
+            self._init_parameters(use_cuda = force_gpu_compilation or (
+                not disable_gpu_compilation and self.num_sum_params >= GPU_NORMALIZE_MIN_PARAMS))
 
-    def _init_parameters(self, perturbation: float = 4.0, pseudocount: float = 0.0):
+    def _init_parameters(self, perturbation: float = 4.0, pseudocount: float = 0.0, use_cuda: bool = False):
         for ns in self.root_ns:
             if not ns.is_tied() and (ns.is_sum() or ns.is_input()) and not ns.has_params():
                 ns.init_parameters(perturbation = perturbation, recursive = False)
 
-        params = torch.exp(torch.rand([self.num_sum_params]) * -perturbation)
-        params[:self.num_dummy_params] = 0.0
+        # A slot's value comes from its node below. No node writes it only where a tied node's source is outside this
+        # circuit: for such a circuit, and only then, the slots start random. (Drawing them for every circuit,
+        # MEASURED ~1.5 s of a 521 M parameter circuit's construction went to values all overwritten.)
+        owners = [ns for ns in self.root_ns if ns.is_sum() and not ns.is_tied() and ns.has_params()]
+        written = self.num_dummy_params + sum(ns._param_range[1] - ns._param_range[0] for ns in owners)
+        if written < self.num_sum_params:
+            params = torch.exp(torch.rand([self.num_sum_params]) * -perturbation)
+            params[:self.num_dummy_params] = 0.0
+        else:
+            params = torch.zeros([self.num_sum_params])
 
         # Copy initial parameters if provided
-        for ns in self.root_ns:
-            if ns.is_sum() and not ns.is_tied() and ns.has_params():
-                ns.gather_parameters(params)
+        for ns in owners:
+            ns.gather_parameters(params)
 
-        self._normalize_parameters(params, pseudocount = pseudocount)
+        self._normalize_parameters(params, pseudocount = pseudocount, use_cuda = use_cuda)
         self.params = nn.Parameter(params.to(self.param_dtype))         # initialized and normalized in fp32, stored as asked
 
         # Due to the custom inplace backward pass implementation, we do not track 
@@ -279,9 +293,19 @@ class _BuildMixin:
         for idx, layer in enumerate(self.input_layer_group):
             layer._init_parameters(perturbation)
 
-    def _normalize_parameters(self, params, pseudocount: float = 0.0):
-        if params is not None:
+    def _normalize_parameters(self, params, pseudocount: float = 0.0, use_cuda: bool = False):
+        """Normalizes `params` in place. `use_cuda`, for parameters on the CPU: on the current GPU, and back -- MEASURED
+        on 521 M parameters, 5.8 s on the CPU against ~0.6 s with the copies, within 6.2e-7 relative of it."""
+        if params is None:
+            return
+        if not use_cuda:
             normalize_parameters(params, self.par_update_kwargs, pseudocount)
+            return
+        dev = torch.device(f"cuda:{torch.cuda.current_device()}")
+        on_device = params.to(dev)
+        normalize_parameters(on_device, tuple(x.to(dev) if torch.is_tensor(x) else x for x in self.par_update_kwargs),
+                             pseudocount)
+        params.copy_(on_device)
 
     def _create_node_layers(self):
         depth2nodes = dict()
