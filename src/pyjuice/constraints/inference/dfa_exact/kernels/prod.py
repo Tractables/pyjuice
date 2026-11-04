@@ -1138,7 +1138,7 @@ def skip_masks_for(reach: Reachability, specs, tm: int = 16, tn: int = 16, tk: i
     li = torch.tensor([lpos[a] for a, _ in specs], dtype = torch.long)
     ri = torch.tensor([rpos[b] for _, b in specs], dtype = torch.long)
     shifts = torch.arange(32, dtype = torch.int64)
-    chunk = max(1, (1 << 26) // (I * J * NC))
+    chunk = max(1, (1 << 26) // max(I * J * NC, 1))
     parts = []
     for g0 in range(0, len(specs), chunk):
         need = Ls[li[g0:g0 + chunk], :, None, :] & Rs[ri[g0:g0 + chunk]].transpose(1, 2)[:, None, :, :]

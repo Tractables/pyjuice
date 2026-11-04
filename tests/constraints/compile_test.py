@@ -202,6 +202,17 @@ def test_an_unsatisfiable_constraint_compiles():
         assert cc.backend.max_width == 0 and cc.backend.width_per_boundary.tolist() == [0] * (n + 1)
 
 
+def test_an_unsatisfiable_constraints_tables_can_be_built():
+    """Queries answer such a constraint without them, but nothing forbids asking: no column anywhere, on a chain and on
+    a tree."""
+    n = 8
+    ns = juice.structures.PD(data_shape = (n,), num_latents = 4, split_intervals = 1, input_node_params = {"num_cats": V})
+    for pc in (hmm(n), juice.compile(ns, verbose = False).to("cuda")):
+        cc = jc.compile(jc.DFA.contains([[1] * (n + 1)], vocab_size = V), pc)
+        assert not cc.backend.satisfiable
+        cc.backend.top_down_program()
+
+
 def test_with_pc_rebinds_to_the_same_structure_only():
     pa, pb = hmm(6, seed = 0), hmm(6, seed = 1)
     assert not torch.equal(pa.params, pb.params)
