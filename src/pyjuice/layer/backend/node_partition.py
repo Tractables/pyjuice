@@ -6,7 +6,7 @@ import math
 from typing import Union, Optional
 
 
-@njit()
+@njit(cache = True)
 def _partition_nodes_dp_simple_compiled(node_n_edges, dp, backtrace, max_num_partitions, target_overhead):
     num_nodes = node_n_edges.shape[0]
 
@@ -39,7 +39,7 @@ def _partition_nodes_dp_simple_compiled(node_n_edges, dp, backtrace, max_num_par
 
     return overhead, target_n_partition
 
-@njit
+@njit(cache = True)
 def _backtrace_fn(partitions, backtrace, target_n_partition, num_nodes):
     i = num_nodes - 1
     for n in range(target_n_partition, 0, -1):
@@ -68,7 +68,7 @@ def _partition_nodes_dp_simple(node_n_edges: np.ndarray, max_num_partitions: int
     return np.unique(node_n_edges[partitions]), overhead
 
 
-@njit
+@njit(cache = True)
 def _coalesce_fn(unique_vals, counts, keep_flag, unique_counts, tol_range):
     num_vals = unique_vals.shape[0]
 
@@ -114,7 +114,7 @@ def _coalesce(vals, tol_range = "auto"):
     return unique_vals[keep_flag], unique_counts[keep_flag]
 
 
-@njit()
+@njit(cache = True)
 def _weighted_partition_nodes_dp_simple_compiled(node_n_edges, cum_counts, dp, backtrace, max_num_partitions, target_overhead):
     num_nodes = node_n_edges.shape[0]
 
