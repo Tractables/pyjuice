@@ -354,6 +354,34 @@ def test_per_boundary_liveness_equals_per_sample(kind, build_pc, monkeypatch):
             assert torch.equal(oa.perm, ob.perm) and torch.equal(oa.rank, ob.rank) and torch.equal(oa.counts, ob.counts)
 
 
+@pytest.mark.slow
+def test_the_lane_order_past_2_to_the_31_columns(build_pc):
+    """Every sum interval's columns together past int32 (a PD by an automaton of 512 columns, a batch of 2048; two
+    lists of 10 GB or more): every interval's live columns as counted by hand, and the lists read at their true place."""
+    K, n, B = 512, 8, 2048
+    Vw = 2 * K
+    dfa = jc.DFA(Vw, torch.arange(Vw) % K, (torch.arange(K)[:, None] + torch.arange(K)[None, :]) % K, 0,
+                 torch.ones(K, dtype = torch.bool))
+    cc = jc.compile(dfa, build_pc("pd", n, Vw))
+    prog = cc.backend.program()
+    obs = torch.full((B, n), -1, dtype = torch.int32)
+    obs[B // 2:, 3] = 7
+    obs = obs.cuda()
+    lv = liveness(prog, obs, B)
+    counts = lv.num_live
+    order = lv._all
+    live = lv.live.view(B, n + 1, prog.W).bool()
+    for k, (a, e) in enumerate(prog.sum_ivs):
+        pairs = prog.reach.pairs(a, e).double().cuda()
+        X = pairs.size(1)
+        want = ((live[:, a, :pairs.size(0)].double() @ pairs) * live[:, e, :X].double()).sum()
+        assert counts[k] == int(want), (a, e)
+    last = int(np.argmax(order.first))
+    assert order.first[last] >= 1 << 31, "the lists are within int32: this test tests nothing"
+    S = prog.sum_iv_slots[last]
+    assert torch.equal(order.rank[order.first[last]:order.first[last] + S].cpu(), torch.arange(S, dtype = torch.int32))
+
+
 def test_the_shared_memory_sweep_over_wide_boundaries(build_pc, monkeypatch):
     """The CUDA sweep in shared memory over boundaries of over a thousand columns and successor entries -- several of
     each a thread -- gives the launches per boundary's live columns, through every class and through every sample's

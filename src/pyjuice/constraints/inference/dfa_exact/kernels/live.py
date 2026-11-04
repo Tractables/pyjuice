@@ -154,9 +154,9 @@ def _live_backward_kernel(live, back, obs_class, next_col, delta, state_id, col_
 def _live_columns(live, ivs, iv_of, iv_info, iv_table, width, k, tile, B, n, W, TILE: tl.constexpr):
     """Tile ``tile`` of sum interval ``k``'s ``B * slots`` columns (sample-major): ``(columns, in range, live, first
     column in the lists, slots)`` -- a column is live where its slot's two ends are live for its sample."""
-    a = tl.load(ivs + k * 4)
-    e = tl.load(ivs + k * 4 + 1)
-    first = tl.load(ivs + k * 4 + 2).to(tl.int64)
+    a = tl.load(ivs + k * 4).to(tl.int32)
+    e = tl.load(ivs + k * 4 + 1).to(tl.int32)
+    first = tl.load(ivs + k * 4 + 2)
     S, _, pairs = _interval(iv_of, iv_info, a, e, n)
     X = _exit_width(width, e, n)
     col = tile * TILE + tl.arange(0, TILE)
@@ -512,6 +512,9 @@ class Liveness:
         if tables is None:                           # where the intervals' columns and their tiles' counts go
             sel = np.nonzero(intervals)[0]
             sizes = [B * prog.sum_iv_slots[k] for k in sel]
+            if sizes and max(sizes) >= 1 << 31:                    # (an interval's columns are int32 in the lists)
+                raise ValueError(f"An interval's {max(sizes)} columns (batch {B}) are past what its lane order holds; "
+                                 f"use a smaller batch.")
             starts = np.cumsum([0] + sizes)
             tiles = np.cumsum([0] + [host_cdiv(z, LIST_TILE) for z in sizes])
             K = len(prog.sum_ivs)
@@ -522,7 +525,7 @@ class Liveness:
             regs = np.argsort(group, kind = "stable")                      # every ordered interval's regions, then
             reg_ptr = np.searchsorted(group[regs], np.arange(len(sel) + 2))  # the others'
             table = torch.tensor([(*prog.sum_ivs[k], f, t) for k, f, t in zip(sel, starts[:-1], tiles[:-1])],
-                                 dtype = torch.int32).reshape(-1, 4).to(dev)
+                                 dtype = torch.int64).reshape(-1, 4).to(dev)     # (all the intervals' columns: past 2^31)
             to_dev = lambda x: torch.from_numpy(np.ascontiguousarray(x)).to(dev)
             tables = (sizes, first.tolist(), index.tolist(), int(starts[-1]), int(tiles[-1]), table,
                       to_dev(regs.astype(np.int32)), to_dev(reg_ptr.astype(np.int32)),
