@@ -109,8 +109,8 @@ def score_tables(prog) -> ScoreTables:
         group_of[pos] = g
         col_of[at] = np.searchsorted(r, mass_row[at])
         nodes[g][pos, col_of[at]] = at
-    prog.score = ScoreTables(group_of = group_of, rows = rows,
-                             rows_t = [torch.from_numpy(r).to(prog.dev) for r in rows], col_of = col_of, nodes = nodes)
+    prog.score = prog.assembly.score = ScoreTables(group_of = group_of, rows = rows, col_of = col_of, nodes = nodes,
+                                                   rows_t = [torch.from_numpy(r).to(prog.dev) for r in rows])
     return prog.score
 
 
@@ -145,9 +145,10 @@ class ClassWeightLaunch:
     tile_height: int
 
 
-def class_weight_launch(launch, alive: np.ndarray, prog, score: ScoreTables) -> "ClassWeightLaunch | None":
-    """The :class:`ClassWeightLaunch` of a forward launch's input operands, ``alive`` marking the steps whose output
-    has a top-down value (the others add nothing); None when there is no such step or no input operand."""
+def class_weight_launch(launch, alive: np.ndarray, prog, score: ScoreTables):
+    """``(launch, boundaries)``, the :class:`ClassWeightLaunch` of a forward launch's input operands but for ``J_max``
+    (:func:`class_weight_exits`, of the outputs' ``boundaries``), ``alive`` marking the steps whose output has a top-down
+    value (the others add nothing); None when there is no such step or no input operand."""
     if launch.form not in ("input_block", "block_input") or not alive.any():
         return None
     rows = launch.rows.numpy()[alive]
@@ -160,10 +161,7 @@ def class_weight_launch(launch, alive: np.ndarray, prog, score: ScoreTables) -> 
     starts = np.nonzero(first)[0]
     ptr = np.append(starts, len(t)).astype(np.int64)
     dests = np.stack([t[starts], k[starts]], axis = 1)
-    if launch.form == "input_block":                                           # exit columns at t2
-        J = np.where(rows[:, 5] == prog.n, 1, np.asarray(prog.width)[rows[:, 5]])
-    else:                                                                      # entry columns at t0
-        J = np.asarray(prog.width)[rows[:, 3]]
+    boundaries = np.unique(rows[:, 5 if launch.form == "input_block" else 3]).tolist()   # exit columns at t2, entry at t0
     count = np.diff(ptr)                                    # destinations walking the same columns, together: at
     other = np.full((len(starts), int(count.max())), -1, dtype = np.int64)   # one position, steps to the same ends
     other[np.repeat(np.arange(len(starts)), count), np.arange(len(t)) - np.repeat(starts, count)] = \
@@ -171,8 +169,16 @@ def class_weight_launch(launch, alive: np.ndarray, prog, score: ScoreTables) -> 
     group = node_groups(dests[:, 0], other)
     tiles, height = node_tiles(group)
     i32 = lambda x: torch.from_numpy(np.ascontiguousarray(x)).to(prog.dev, torch.int32)
-    return ClassWeightLaunch(launch.form, launch.kinds, i32(dests), i32(ptr), i32(rows), int(J.max()),
-                             dict(dests = dests, ptr = ptr, parents = rows, group = group), i32(tiles), height)
+    return ClassWeightLaunch(launch.form, launch.kinds, i32(dests), i32(ptr), i32(rows), 0,
+                             dict(dests = dests, ptr = ptr, parents = rows, group = group), i32(tiles), height), boundaries
+
+
+def class_weight_exits(form: str, boundaries: list, prog) -> int:
+    """:attr:`ClassWeightLaunch.J_max` of a launch whose outputs' ``boundaries`` (:func:`class_weight_launch`) have
+    ``prog``'s columns."""
+    if form == "input_block":
+        return max(1 if t == prog.n else prog.width[t] for t in boundaries)
+    return max(prog.width[t] for t in boundaries)
 
 
 @triton.jit

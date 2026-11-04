@@ -12,7 +12,7 @@ nothing reads it, and its sum rows are filled with -inf.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, NamedTuple, Optional
 
 import numpy as np
 import torch
@@ -21,7 +21,7 @@ from ..external_params import block_scale
 from ..kernels.common import IDENTITY, SUM, TEMP, first_occurrence_groups, node_groups, node_tiles, packed
 from ..kernels.prod import skip_masks_for
 from ..kernels.prod_top_down import TopDownLaunch
-from ..kernels.score import class_weight_launch, score_tables
+from ..kernels.score import ClassWeightLaunch, class_weight_exits, class_weight_launch, score_tables
 
 
 
@@ -60,16 +60,93 @@ class TopDownProgram:
 
 
 def top_down_program(backend) -> TopDownProgram:
+    """The :class:`TopDownProgram` of a backend: its circuit's child-major tables, shared with its other backends
+    (:func:`top_down_template`), and what its layout says of them."""
     prog = backend.program()
+    t = prog.assembly.top_down
+    if t is None:
+        t = prog.assembly.top_down = top_down_template(backend, prog)
+    reach, slots = prog.reach, prog.slots
+
+    def child(c: _Child) -> TopDownLaunch:
+        kinds = c.kinds if c.c_full_at is None else \
+            (c.kinds[0], c.kinds[1], (all(reach.positions(x, y) is None for x, y in c.ivs), c.kinds[2]))
+        return TopDownLaunch(c.form, c.side, kinds, c.children, c.ptr, c.parents, max(prog._entry(x) for x, _ in c.ivs),
+                             max(prog._exit(y) for _, y in c.ivs), max(reach.slots(x, y) for x, y in c.ivs), dict(c.host),
+                             c.tiles, c.height)
+
+    def weights(cw, boundaries) -> ClassWeightLaunch:
+        return ClassWeightLaunch(cw.form, cw.kinds, cw.dests, cw.ptr, cw.parents,
+                                 class_weight_exits(cw.form, boundaries, prog), dict(cw.host), cw.tiles, cw.tile_height)
+
+    def group(tables: dict) -> dict:
+        dense = tables["dense"]
+        if dense is not None:                            # (the forward part, as the Program has it)
+            part = dense["part"]
+            dense = dict(dense, part = (*part[:4], max(slots[r] for r in part[4]), *part[5:]))
+        return dict(tables, max_slots = max(slots[r] for r in tables["max_slots"]), host = dict(tables["host"]),
+                    dense = dense)
+
+    steps = []
+    for (kind, prod_index, layers_t), (_, _, layers) in zip(t.steps, reversed(prog.steps)):
+        if kind == "sum":
+            steps.append(("sum", prod_index, [(block_size, dense_runs, {length: group(tables) for length, tables in fused.items()})
+                                              for block_size, dense_runs, fused in layers_t]))
+        else:
+            out = []
+            for info, (stages, num_temps, temp_slots) in zip(layers_t, layers):
+                fold_stages = [[l for l in launches if _out_temp(l)] for launches in stages]
+                out.append(([s for s in fold_stages if s],
+                            [([child(c) for c in children], inputs, folds, [weights(*cw) for cw in cws])
+                             for children, inputs, folds, cws in info], num_temps, temp_slots))
+            steps.append(("prod", prod_index, out))
+    return TopDownProgram(steps = steps, skip = skip_masks_for(reach, t.specs, device = prog.dev), dead = t.dead,
+                          dead_region = t.dead_region, iv_bounds = t.iv_bounds, reg_iv = t.reg_iv,
+                          elem_regions = t.elem_regions)
+
+
+class _Child(NamedTuple):
+    """A :class:`TopDownLaunch` but for what its automaton says: its columns and slots (of the distinct intervals
+    ``ivs``), and, where ``c_full_at`` is not None, whether every pair of the children's intervals is kept (``kinds``:
+    ``(child kind, parent kind, whether every pair of the output's is kept)`` then)."""
+
+    form: str
+    side: str
+    kinds: tuple
+    c_full_at: Optional[int]
+    children: torch.Tensor
+    ptr: torch.Tensor
+    parents: torch.Tensor
+    ivs: list
+    host: dict
+    tiles: Optional[torch.Tensor]
+    height: int
+
+
+class _Template(NamedTuple):
+    """:func:`top_down_template`'s tables, in :attr:`TopDownProgram.steps`' order."""
+
+    steps: list
+    specs: list
+    dead: np.ndarray
+    dead_region: np.ndarray
+    iv_bounds: np.ndarray
+    reg_iv: np.ndarray
+    elem_regions: list
+
+
+def _out_temp(launch) -> bool:
+    return launch.kinds[2] if launch.form == "block_block" else launch.kinds[1]
+
+
+def top_down_template(backend, prog) -> _Template:
+    """The child-major tables of the launches of ``prog``'s :class:`~.circuit.Assembly`: the circuit's alone."""
+    circuit, assembly = prog.assembly.circuit, prog.assembly
     dev, n = prog.dev, prog.n
-    reach = prog.reach
     firsts = prog.firsts
     score = score_tables(prog)
-    of = prog.intervals.of.cpu().numpy()
+    of = circuit.of
     iv_index = lambda a, b: of[np.asarray(a) * (n + 1) + np.asarray(b)].astype(np.int64)
-    width = np.asarray(prog.width, dtype = np.int64)
-    exits = width.copy()
-    exits[n] = 1                                                      # a sequence end: one column
     # what already has its top-down value: sum rows, every product layer group's element rows and every product layer's
     # scratch rows; what is never written has none (a node no chain of edges reaches) and is not read either
     sums = np.zeros(max(end for _, end, _ in backend.sum_regions), dtype = bool)
@@ -85,18 +162,15 @@ def top_down_program(backend) -> TopDownProgram:
             specs.append(spec)
         return spec_of[spec]
 
-    def out_temp_of(launch):
-        return launch.kinds[2] if launch.form == "block_block" else launch.kinds[1]
-
     def outputs_written(launch, rows, prod_index, layer):
         """bool [steps]: whether every step's output (``rows`` the launch's, numpy) has a top-down value."""
-        if out_temp_of(launch):
+        if _out_temp(launch):
             return temps[layer][rows[:, 0]]
         return elements[prod_index][rows[:, 0] - elem_firsts[prod_index]]
 
     def child_launch(launch, side, prod_index, layer):
-        """The :class:`TopDownLaunch` of one side of a forward launch, or None when that operand is an input or no
-        product of the launch has a top-down value."""
+        """The :class:`_Child` of one side of a forward launch, or None when that operand is an input or no product of
+        the launch has a top-down value."""
         form, kinds = launch.form, launch.kinds
         rows = launch.rows.numpy()
         live = outputs_written(launch, rows, prod_index, layer)
@@ -152,13 +226,12 @@ def top_down_program(backend) -> TopDownProgram:
         pa = par[:, out_a]
         pb = par[:, 5] + 1 if form == "block_input" else par[:, out_b]    # the product's interval
         ivs = [(int(v) // (n + 2), int(v) % (n + 2)) for v in np.unique(a * (n + 2) + b).tolist()]
-        S_max = max(reach.slots(x, y) for x, y in ivs)
+        c_full_at = None
         if form == "copy":
             okinds = (c_kind, out_temp)
         elif form in ("input_block", "block_input"):
-            c_full = all(reach.positions(x, y) is None for x, y in ivs)
-            out_full = kinds[2][0]
-            okinds = (c_kind, out_temp, (c_full, out_full))
+            c_full_at = 0
+            okinds = (c_kind, out_temp, kinds[2][0])
         else:
             okinds = (c_kind, r_kind if side == "L" else l_kind, out_temp)
         i32 = lambda x: torch.from_numpy(np.ascontiguousarray(x)).to(dev, torch.int32)
@@ -172,11 +245,10 @@ def top_down_program(backend) -> TopDownProgram:
             host["group"] = node_groups(a[ptr_np[:-1]], b[ptr_np[:-1]], np.diff(ptr_np), add)
             tiles, height = node_tiles(host["group"])
             tiles = torch.from_numpy(tiles).to(dev)
-        return TopDownLaunch(form, side, okinds, ch, i32(ptr_np), i32(par), int(width[a].max()), int(exits[b].max()),
-                             S_max, host, tiles, height)
+        return _Child(form, side, okinds, c_full_at, ch, i32(ptr_np), i32(par), ivs, host, tiles, height)
 
     steps = []
-    for kind, prod_index, layers in reversed(prog.steps):
+    for kind, prod_index, layers in reversed(circuit.steps):
         if kind == "sum":
             layers_out = []
             elem_first = backend.element_regions[prod_index][0]
@@ -198,10 +270,8 @@ def top_down_program(backend) -> TopDownProgram:
             steps.append(("sum", prod_index, layers_out))
         else:
             layers_out = []
-            for li, (stages, num_temps, temp_slots) in enumerate(layers):
+            for li, (stages, num_temps, _) in enumerate(assembly.layers.get(prod_index, ())):
                 temps[(prod_index, li)] = np.zeros(num_temps, dtype = bool)
-                fold_stages = [[l for l in launches if out_temp_of(l)] for launches in stages]
-                fold_stages = [s for s in fold_stages if s]
                 info = []
                 for launches in reversed(stages):            # in the order run_backward launches them
                     out, cws = [], []
@@ -214,8 +284,8 @@ def top_down_program(backend) -> TopDownProgram:
                         cw = class_weight_launch(launch, alive, prog, score)
                         if cw is not None:
                             cws.append(cw)
-                    info.append((out, _inputs(launches), _folds([l for l in launches if out_temp_of(l)]), cws))
-                layers_out.append((fold_stages, info[::-1], num_temps, temp_slots))
+                    info.append((out, _inputs(launches), _folds([l for l in launches if _out_temp(l)]), cws))
+                layers_out.append(info[::-1])
             steps.append(("prod", prod_index, layers_out))
     region_first = np.asarray([first for first, _, _ in backend.sum_regions], dtype = np.int64)
     region_end = np.asarray([end for _, end, _ in backend.sum_regions], dtype = np.int64)
@@ -230,10 +300,8 @@ def top_down_program(backend) -> TopDownProgram:
     dead_region = np.zeros(len(backend.sum_regions), dtype = bool)
     dead_region[dead[:, 1]] = True
     region_iv = prog.iv_bounds[prog.reg_iv_np]
-    return TopDownProgram(steps = steps, skip = skip_masks_for(reach, specs, device = dev),
-                          dead = dead, dead_region = dead_region, iv_bounds = iv_bounds,
-                          reg_iv = iv_index(region_iv[:, 0], region_iv[:, 1]),
-                          elem_regions = [(first, end) for first, end, _ in backend.element_regions])
+    return _Template(steps, specs, dead, dead_region, iv_bounds, iv_index(region_iv[:, 0], region_iv[:, 1]),
+                     [(first, end) for first, end, _ in backend.element_regions])
 
 
 def _inputs(launches) -> list:
@@ -406,7 +474,7 @@ def _fused_tables(prog, parts, block_size, elem_first, firsts, sums, elements, d
         groups[length] = dict(cb_row = t32(cb_row), cb_reg = t32(cb_reg), cb_add = t32(cb_add), cb_ivreg = t32(cb_ivreg),
                               par_ptr = t32(ptr), par_nid = t32(p_nid), par_reg = t32(p_reg),
                               par_pid = torch.from_numpy(p_pid).to(dev, torch.int64),
-                              max_slots = max(prog.slots[r] for r in np.unique(cb_ivreg).tolist()),
+                              max_slots = np.unique(cb_ivreg).tolist(),    # (of these regions: the backend's)
                               max_parents = int(np.diff(ptr).max()),
                               dense = dense,
                               gate = None if not gated else dict(
