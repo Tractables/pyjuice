@@ -42,12 +42,12 @@ def test_cat_soft_cond():
     assert (pc.node_mars[1,0].exp() - p0).abs() < 1e-4
     assert (pc.node_mars[2,0].exp() - p1).abs() < 1e-4
 
-    f1 = pc.node_flows[3,0]
-    f2 = pc.node_flows[4,0]
+    f1 = pc.node_flows[3,0].exp()      # `conditional` leaves log-space flows
+    f2 = pc.node_flows[4,0].exp()
     unnorm_o = f1 * pc.input_layer_group[0].params[4:8] + f2 * pc.input_layer_group[0].params[8:12]
     target_o = unnorm_o / unnorm_o.sum()
 
-    assert torch.all((target_o - outputs[0,1,:]) < 1e-4)
+    assert torch.all((target_o - outputs[0,1,:]).abs() < 1e-4)
 
 
 if __name__ == "__main__":

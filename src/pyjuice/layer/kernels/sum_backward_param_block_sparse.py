@@ -28,7 +28,7 @@ def _bk_triton_block_sparse_par_kernel(node_flows, node_mars, element_mars, mpar
                                        logspace_flows: tl.constexpr, TILE_SIZE_B: tl.constexpr, B_NUM_TILES: tl.constexpr, 
                                        TILE_SIZE_K: tl.constexpr, TILE_SIZE_M: tl.constexpr, BLOCK_SIZE_M: tl.constexpr, 
                                        TL_DOT: tl.constexpr, DOT_IEEE: tl.constexpr, propagation_alg_id: tl.constexpr, negate_pflows: tl.constexpr, 
-                                       allow_neg_flows: tl.constexpr, pid_m_offset = 0, alpha = 0.0):
+                                       allow_neg_flows: tl.constexpr, pid_m_offset = 0, alpha = 0.0, DOT_TF32X3: tl.constexpr = False):
 
     pid_k = tl.program_id(0) # ID of size-`TILE_SIZE_K` edges
     pid_m = tl.program_id(1) + pid_m_offset # ID of size-`TILE_SIZE_M` nodes
@@ -58,7 +58,7 @@ def _bk_triton_block_sparse_par_kernel(node_flows, node_mars, element_mars, mpar
     if propagation_alg_id == 1:
         par_start = tl.load(pids + nblock_id * num_edges + offs_edge)
         epars_offsets = offs_node[:,None] + par_start[None,:] # [TILE_SIZE_M, TILE_SIZE_K]
-        epars = tl.load(mparams + epars_offsets)
+        epars = tl.load(mparams + epars_offsets).to(tl.float32)
         elpars = tl.log(epars)
 
     # Inner loop
@@ -105,6 +105,8 @@ def _bk_triton_block_sparse_par_kernel(node_flows, node_mars, element_mars, mpar
                 if TL_DOT == 1:
                     if DOT_IEEE:
                         partial_flows = tl.dot(n_fdm_sub * nflows, scaled_emars, input_precision = "ieee")
+                    elif DOT_TF32X3:
+                        partial_flows = tl.dot(n_fdm_sub * nflows, scaled_emars, input_precision = "tf32x3")
                     else:
                         partial_flows = tl.dot(_round_to_tf32(n_fdm_sub * nflows), _round_to_tf32(scaled_emars))
                 else:
@@ -113,6 +115,8 @@ def _bk_triton_block_sparse_par_kernel(node_flows, node_mars, element_mars, mpar
                 if TL_DOT == 1:
                     if DOT_IEEE:
                         partial_flows = tl.dot(n_fdm_sub, scaled_emars, input_precision = "ieee")
+                    elif DOT_TF32X3:
+                        partial_flows = tl.dot(n_fdm_sub, scaled_emars, input_precision = "tf32x3")
                     else:
                         partial_flows = tl.dot(_round_to_tf32(n_fdm_sub), _round_to_tf32(scaled_emars))
                 else:
@@ -133,7 +137,7 @@ def _bk_triton_block_sparse_par_kernel(node_flows, node_mars, element_mars, mpar
     if propagation_alg_id != 1:
         par_start = tl.load(pids + nblock_id * num_edges + offs_edge)
         epars_offsets = offs_node[:,None] + par_start[None,:] # [TILE_SIZE_M, TILE_SIZE_K]
-        epars = tl.load(mparams + epars_offsets)
+        epars = tl.load(mparams + epars_offsets).to(tl.float32)
 
     if propagation_alg_id != 1:
         pflows = acc * epars
@@ -156,7 +160,8 @@ def _bk_triton_block_sparse_par_kernel_rmw(node_flows, node_mars, element_mars, 
                                            logspace_flows: tl.constexpr, TILE_SIZE_B: tl.constexpr, B_NUM_TILES: tl.constexpr,
                                            TILE_SIZE_K: tl.constexpr, TILE_SIZE_M: tl.constexpr, BLOCK_SIZE_M: tl.constexpr,
                                            TL_DOT: tl.constexpr, DOT_IEEE: tl.constexpr, propagation_alg_id: tl.constexpr, negate_pflows: tl.constexpr,
-                                           allow_neg_flows: tl.constexpr, pid_m_offset = 0, alpha = 0.0):
+                                           allow_neg_flows: tl.constexpr, pid_m_offset = 0, alpha = 0.0, DOT_TF32X3: tl.constexpr = False,
+                                           PF_STORE: tl.constexpr = False):
     """
     Faster variant of `_bk_triton_block_sparse_par_kernel`: identical computation, but the
     final accumulation into `param_flows` uses a non-atomic read-add-store instead of
@@ -164,6 +169,7 @@ def _bk_triton_block_sparse_par_kernel_rmw(node_flows, node_mars, element_mars, 
     slot (collision-free / untied param flows); the caller is responsible for guaranteeing
     this, falling back to the atomic kernel otherwise. On Blackwell the atomic is ~25% of the
     kernel, so this is ~1.3x faster. The body below mirrors the atomic kernel verbatim.
+    `PF_STORE`: the pass's first writer of these slots -- stores, the buffer's reset folded in.
     """
 
     pid_k = tl.program_id(0) # ID of size-`TILE_SIZE_K` edges
@@ -194,7 +200,7 @@ def _bk_triton_block_sparse_par_kernel_rmw(node_flows, node_mars, element_mars, 
     if propagation_alg_id == 1:
         par_start = tl.load(pids + nblock_id * num_edges + offs_edge)
         epars_offsets = offs_node[:,None] + par_start[None,:] # [TILE_SIZE_M, TILE_SIZE_K]
-        epars = tl.load(mparams + epars_offsets)
+        epars = tl.load(mparams + epars_offsets).to(tl.float32)
         elpars = tl.log(epars)
 
     # Inner loop
@@ -241,6 +247,8 @@ def _bk_triton_block_sparse_par_kernel_rmw(node_flows, node_mars, element_mars, 
                 if TL_DOT == 1:
                     if DOT_IEEE:
                         partial_flows = tl.dot(n_fdm_sub * nflows, scaled_emars, input_precision = "ieee")
+                    elif DOT_TF32X3:
+                        partial_flows = tl.dot(n_fdm_sub * nflows, scaled_emars, input_precision = "tf32x3")
                     else:
                         partial_flows = tl.dot(_round_to_tf32(n_fdm_sub * nflows), _round_to_tf32(scaled_emars))
                 else:
@@ -249,6 +257,8 @@ def _bk_triton_block_sparse_par_kernel_rmw(node_flows, node_mars, element_mars, 
                 if TL_DOT == 1:
                     if DOT_IEEE:
                         partial_flows = tl.dot(n_fdm_sub, scaled_emars, input_precision = "ieee")
+                    elif DOT_TF32X3:
+                        partial_flows = tl.dot(n_fdm_sub, scaled_emars, input_precision = "tf32x3")
                     else:
                         partial_flows = tl.dot(_round_to_tf32(n_fdm_sub), _round_to_tf32(scaled_emars))
                 else:
@@ -269,7 +279,7 @@ def _bk_triton_block_sparse_par_kernel_rmw(node_flows, node_mars, element_mars, 
     if propagation_alg_id != 1:
         par_start = tl.load(pids + nblock_id * num_edges + offs_edge)
         epars_offsets = offs_node[:,None] + par_start[None,:] # [TILE_SIZE_M, TILE_SIZE_K]
-        epars = tl.load(mparams + epars_offsets)
+        epars = tl.load(mparams + epars_offsets).to(tl.float32)
 
     if propagation_alg_id != 1:
         pflows = acc * epars
@@ -279,12 +289,22 @@ def _bk_triton_block_sparse_par_kernel_rmw(node_flows, node_mars, element_mars, 
     parflow_start = tl.load(pfids + nblock_id * num_edges + offs_edge)
     eparflows_offsets = offs_node[:,None] + parflow_start[None,:] # [TILE_SIZE_M, TILE_SIZE_K]
 
-    # Non-atomic accumulation (safe only when `eparflows_offsets` are collision-free across programs)
-    cur_pflows = tl.load(param_flows + eparflows_offsets)
-    if negate_pflows:
-        tl.store(param_flows + eparflows_offsets, cur_pflows - pflows)
+    if PF_STORE:
+        # The pass's first writer of these slots stores: the buffer's reset (`flows_memory = 0`) folded into the write
+        # (`SumLayer.param_flow_slot_plan`). A padding edge (child row 0) addresses slot 0's block, which a real edge
+        # owns: it stores nothing (the accumulating form adds its exact zero)
+        real_edge = edge_start != 0
+        if negate_pflows:
+            tl.store(param_flows + eparflows_offsets, -pflows, mask = real_edge[None, :])
+        else:
+            tl.store(param_flows + eparflows_offsets, pflows, mask = real_edge[None, :])
     else:
-        tl.store(param_flows + eparflows_offsets, cur_pflows + pflows)
+        # Non-atomic accumulation (safe only when `eparflows_offsets` are collision-free across programs)
+        cur_pflows = tl.load(param_flows + eparflows_offsets)
+        if negate_pflows:
+            tl.store(param_flows + eparflows_offsets, cur_pflows - pflows)
+        else:
+            tl.store(param_flows + eparflows_offsets, cur_pflows + pflows)
 
 
 # @triton.jit
@@ -324,7 +344,7 @@ def _bk_triton_block_sparse_par_csmm2_kernel(node_flows, node_mars, element_mars
     if propagation_alg_id == 1:
         par_start = tl.load(pids + nblock_id * num_edges + offs_edge)
         epars_offsets = offs_node[:,None] + par_start[None,:] # [TILE_SIZE_M, TILE_SIZE_K]
-        epars = tl.load(mparams + epars_offsets)
+        epars = tl.load(mparams + epars_offsets).to(tl.float32)
         elpars = tl.log(epars)
 
     # Inner loop
@@ -386,7 +406,7 @@ def _bk_triton_block_sparse_par_csmm2_kernel(node_flows, node_mars, element_mars
     if propagation_alg_id != 1:
         par_start = tl.load(pids + nblock_id * num_edges + offs_edge)
         epars_offsets = offs_node[:,None] + par_start[None,:] # [TILE_SIZE_M, TILE_SIZE_K]
-        epars = tl.load(mparams + epars_offsets)
+        epars = tl.load(mparams + epars_offsets).to(tl.float32)
 
     if propagation_alg_id != 1:
         pflows = acc * epars
@@ -406,7 +426,7 @@ def _bk_triton_block_sparse_par_csmm2_kernel(node_flows, node_mars, element_mars
 def _bk_triton_block_sparse_tempered_par_kernel(node_flows, node_mars_tempered, element_mars, mparams, param_flows, nids, cids, pids, pfids,
                                                 batch_size: tl.constexpr, num_edges: tl.constexpr, TILE_SIZE_B: tl.constexpr, B_NUM_TILES: tl.constexpr, 
                                                 TILE_SIZE_K: tl.constexpr, TILE_SIZE_M: tl.constexpr, BLOCK_SIZE_M: tl.constexpr, 
-                                                TL_DOT: tl.constexpr, DOT_IEEE: tl.constexpr, negate_pflows: tl.constexpr, pid_m_offset = 0, pflow_temperature = 1.0):
+                                                TL_DOT: tl.constexpr, DOT_IEEE: tl.constexpr, negate_pflows: tl.constexpr, pid_m_offset = 0, pflow_temperature = 1.0, DOT_TF32X3: tl.constexpr = False):
 
     pid_k = tl.program_id(0) # ID of size-`TILE_SIZE_K` edges
     pid_m = tl.program_id(1) + pid_m_offset # ID of size-`TILE_SIZE_M` nodes
@@ -452,6 +472,8 @@ def _bk_triton_block_sparse_tempered_par_kernel(node_flows, node_mars_tempered, 
         if TL_DOT == 1:
             if DOT_IEEE:
                 partial_flows = tl.dot(n_fdm_sub, scaled_emars, input_precision = "ieee")
+            elif DOT_TF32X3:
+                partial_flows = tl.dot(n_fdm_sub, scaled_emars, input_precision = "tf32x3")
             else:
                 partial_flows = tl.dot(_round_to_tf32(n_fdm_sub), _round_to_tf32(scaled_emars))
         else:
@@ -471,7 +493,7 @@ def _bk_triton_block_sparse_tempered_par_kernel(node_flows, node_mars_tempered, 
     # Initialize `params` (only when NOT using MPE propagation method)
     par_start = tl.load(pids + nblock_id * num_edges + offs_edge)
     epars_offsets = offs_node[:,None] + par_start[None,:] # [TILE_SIZE_M, TILE_SIZE_K]
-    epars = tl.load(mparams + epars_offsets)
+    epars = tl.load(mparams + epars_offsets).to(tl.float32)
 
     pflows = acc * tlmath.pow(epars, 1.0 / pflow_temperature)
 
@@ -547,7 +569,7 @@ def _bk_triton_block_sparse_tempered_par_csmm2_kernel(node_flows, node_mars_temp
     # Initialize `params`
     par_start = tl.load(pids + nblock_id * num_edges + offs_edge)
     epars_offsets = offs_node[:,None] + par_start[None,:] # [TILE_SIZE_M, TILE_SIZE_K]
-    epars = tl.load(mparams + epars_offsets)
+    epars = tl.load(mparams + epars_offsets).to(tl.float32)
 
     pflows = acc * tlmath.pow(epars, 1.0 / pflow_temperature)
 

@@ -28,7 +28,7 @@ def _cum_params_kernel(params_ptr, cum_params_ptr, node_ids_ptr, num_param_block
     p_offsets = m_offsets[:,None,None] * (batch_size * block_size) + reuse_offs
 
     mask = m_mask[:,None,None] & b_mask[None,None,:]
-    params = tl.load(params_ptr + p_offsets, mask = mask, other = 0)
+    params = tl.load(params_ptr + p_offsets, mask = mask, other = 0).to(tl.float32)
 
     tl.atomic_add(cum_params_ptr + n_offsets, params, mask = mask)
 
@@ -56,12 +56,12 @@ def _norm_params_kernel(params_ptr, cum_params_ptr, node_ids_ptr, node_nchs_ptr,
     p_offsets = m_offsets[:,None,None] * (batch_size * block_size) + reuse_offs
 
     mask = m_mask[:,None,None] & b_mask[None,None,:]
-    params = tl.load(params_ptr + p_offsets, mask = mask, other = 0)
+    params = tl.load(params_ptr + p_offsets, mask = mask, other = 0).to(tl.float32)
     cum_params = tl.load(cum_params_ptr + nb_offsets, mask = mask, other = 1)
     nchs = tl.load(node_nchs_ptr + n_offsets, mask = m_mask, other = 1)[:,None,None]
     
     normed_params = (params + pseudocount / nchs) / (cum_params + pseudocount)
-    tl.store(params_ptr + p_offsets, normed_params, mask = mask)
+    tl.store(params_ptr + p_offsets, normed_params.to(params_ptr.dtype.element_ty), mask = mask)
 
 
 def normalize_ns_parameters(params: torch.Tensor, node_ids: torch.Tensor, block_size: int, ch_block_size: int, 

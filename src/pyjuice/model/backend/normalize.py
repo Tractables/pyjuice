@@ -7,6 +7,7 @@ import triton.language as tl
 from numba import njit
 
 from pyjuice.utils.kernel_launcher import triton_jit
+from pyjuice.utils.util import device_scalars
 
 
 @triton_jit
@@ -30,7 +31,7 @@ def cum_par_kernel(cum_pflows, mparams, par_start_ids, blk_sizes, blk_intervals,
 
     offs_par = par_start[:,None] + offs_blk[None,:] * blk_interval[:,None]
     mask_par = mask_m[:,None] & (offs_blk[None,:] < blk_size[:,None])
-    pars = tl.load(mparams + offs_par, mask = mask_par, other = 0)
+    pars = tl.load(mparams + offs_par, mask = mask_par, other = 0).to(tl.float32)
     sum_pars = tl.sum(pars, axis = 1)
 
     tl.atomic_add(cum_pflows + global_nid, sum_pars, mask = mask_m)
@@ -58,14 +59,14 @@ def par_update_kernel(mparams, cum_pflows, nchs, par_start_ids, blk_sizes, blk_i
 
     offs_par = par_start[:,None] + offs_blk[None,:] * blk_interval[:,None]
     mask_par = mask_m[:,None] & (offs_blk[None,:] < blk_size[:,None])
-    pars = tl.load(mparams + offs_par, mask = mask_par, other = 0)
+    pars = tl.load(mparams + offs_par, mask = mask_par, other = 0).to(tl.float32)
 
     sum_pars = tl.load(cum_pflows + global_nid, mask = mask_m, other = 1)
     nch = tl.load(nchs + global_nid, mask = mask_m, other = 1)
 
     norm_param = (pars + pseudocount / nch[:,None]) / (sum_pars[:,None] + pseudocount)
 
-    tl.store(mparams + offs_par, norm_param, mask = mask_par)
+    tl.store(mparams + offs_par, norm_param.to(mparams.dtype.element_ty), mask = mask_par)
 
 
 @njit
@@ -119,7 +120,7 @@ def normalize_parameters(params, par_update_kwargs, pseudocount: float = 0.0):
         num_blocks = par_start_ids.size(0)
         BLOCK_ID = 2048 // BLOCK_SIZE
 
-        constexprs = torch.tensor([pseudocount, num_blocks]).to(params.device)
+        constexprs = device_scalars([pseudocount, num_blocks], params.device)
 
         grid = (triton.cdiv(num_blocks, BLOCK_ID),)
 

@@ -43,7 +43,7 @@ def _cute_available():
 needs_cute = pytest.mark.skipif(not _cute_available(), reason = "needs the CuTe/TMA extension")
 
 
-def _build(K, gate_cbs, seed = 0):
+def _build(K, gate_cbs, seed = 0, apply_z_correction = True):
     """One gated layer, one node block, one child block -- so a gate is (0, ck) and the reference short."""
     torch.manual_seed(seed)
     with juice.set_block_size(K):
@@ -51,7 +51,8 @@ def _build(K, gate_cbs, seed = 0):
               for v in range(2)]
         prod = multiply(*ni)
         ns = summate(prod, num_node_blocks = 1,
-                     external_params = BlockScaleSumParams(ch_block_size = gate_cbs))
+                     external_params = BlockScaleSumParams(ch_block_size = gate_cbs,
+                                                           apply_z_correction = apply_z_correction))
         root = summate(multiply(ns), num_node_blocks = 1, block_size = 1)
     torch.manual_seed(seed)
     root.init_parameters(perturbation = 2.0)
@@ -85,9 +86,9 @@ def _reference(pc, ns, prod, phi, gate_cbs, batch):
     return t1 - t2
 
 
-def _run(K, gate_cbs, batch, scale, seed = 0):
+def _run(K, gate_cbs, batch, scale, seed = 0, apply_z_correction = True):
     dev = torch.device("cuda:0")
-    root, ns, prod = _build(K, gate_cbs, seed)
+    root, ns, prod = _build(K, gate_cbs, seed, apply_z_correction)
     pc = juice.compile(root, verbose = False).to(dev)
     torch.manual_seed(seed + 7)
     data = torch.randint(0, NUM_CATS, [batch, 2], device = dev)
@@ -119,6 +120,26 @@ def test_gradient_matches_the_reference(K, gate_cbs, batch, scale):
     tol = 2e-2 if batch >= 16 else 1e-4
     d = float((got - ref).abs().max() / ref.abs().max())
     assert d < tol, f"gradient off by {d} (relative)"
+
+
+@cuda_only
+@needs_cute
+@pytest.mark.parametrize("K,gate_cbs,batch", [(64, 8, 8), (128, 8, 64)])
+def test_the_gradient_follows_the_parameters_across_an_em_step(K, gate_cbs, batch):
+    """The log-Z term's per-gate parameter sums (`_sigma`) are kept until the parameters change, keyed on their version
+    -- which an EM step, writing them with Triton kernels, did not move: the gradient after a step was built from the
+    sums before it (MEASURED: 1.3e-2 off gradients of ~2.5e-2). The plain M-step (`apply_z_correction = False`: the
+    corrected one happened to write through torch, which moves the version), then the reference on the new
+    parameters."""
+    pc, ns, prod, data, phi = _run(K, gate_cbs, batch, 1.0, apply_z_correction = False)
+    pc.mini_batch_em(step_size = 0.5, pseudocount = 0.1)
+    pc(data, sum_external_params = {ns: phi})
+    pc.backward(data, flows_memory = 0.0)
+    ref = _reference(pc, ns, prod, phi, gate_cbs, batch)
+    got = pc.get_external_params_grad(ns)[0].double()[:, 0, :]
+    tol = 2e-2 if batch >= 16 else 1e-4                           # (as `test_gradient_matches_the_reference`)
+    d = float((got - ref).abs().max() / ref.abs().max())
+    assert d < tol, f"gradient off by {d} (relative) after an EM step"
 
 
 @cuda_only
@@ -169,7 +190,11 @@ def test_every_fork_computes_the_same_gradient():
     layer = [l for gg in pc.inner_layer_groups if gg.is_sum() for l in gg.layers
              if hasattr(l, "external_node_infos")][0]
 
-    for forced in ("triton", "cute"):
+    from pyjuice.nodes.external_params.kernels.c import get_ele_prepass_module
+    elep = get_ele_prepass_module()
+    # (the pre-pass fork's configs too, where its extension builds)
+    pre = [("elep", int(c)) for c in elep.fitting_configs(128, 64, 8, 2)] if elep is not None else []
+    for forced in ["triton", "cute"] + pre:
         for k, v in layer._bs_bw_gate_cache.items():
             if isinstance(k, tuple) and k and k[0] == "eleplan":
                 v["kind"] = forced
@@ -182,34 +207,65 @@ def test_every_fork_computes_the_same_gradient():
 
 @cuda_only
 @needs_cute
-def test_tied_gates_accumulate_across_every_layer_that_shares_them():
+@pytest.mark.parametrize("post", ["per layer", "deferred", "deferred wide"])
+@pytest.mark.parametrize("two_per_layer", [False, True])
+def test_tied_gates_accumulate_across_every_layer_that_shares_them(post, two_per_layer, monkeypatch):
     """`tie_external` points every copy of a tied node at the SOURCE's gate tensor, so one gradient row
     is written by one layer per copy. The buffer is zeroed once per backward precisely so those add up,
     and the tied gradient must therefore equal the SUM of what the copies contribute separately.
 
     This is the invariant behind the emission being an atomic rather than a store, and it is checked
     against an UNTIED build of the same circuit fed the same gates -- an oracle that needs no reference
-    implementation and no assumption about what the right answer is."""
+    implementation and no assumption about what the right answer is.
+
+    The copies one a layer (a chain), or two in each of two layers (two node blocks of one partition writing the same
+    rows); the post-backward -- the log-Z term -- launched by each layer, or deferred to the end of the pass and run for
+    every layer at once (`blockscale.post_deferred`, the tuners' choice there forced: the deferred kernels, or their form
+    with the gradient over several gate tiles a program). A store into rows another writer of the launch adds to lost
+    terms in any: the per-layer kernel's in one partition, the deferred kernels' across layers."""
+    import pyjuice.layer.kernels.autotune as autotune
+    import pyjuice.nodes.external_params.blockscale.post_deferred as pdm
     dev = torch.device("cuda:0")
-    K, gate_cbs, batch, steps = 128, 8, 64, 4
+    # (the wide gradient's arm: gates of 2 children, 64 a node -- 2 gate tiles, which it is offered at)
+    K, gate_cbs, batch, steps = 128, (2 if post == "deferred wide" else 8), 64, (6 if two_per_layer else 4)
+    monkeypatch.setattr(autotune, "_CACHE", {})              # (a choice another test made is not the one forced)
+    if post != "per layer":
+        real_pick = autotune.pick
+        forced = lambda cands: "deferred" if post == "deferred" else next(c for c in cands if isinstance(c, tuple) and c[0])
+        monkeypatch.setattr(autotune, "pick", lambda key, cands, bench, *a, **kw: forced(cands)
+                            if key[0] == "bs_post_deferred" else real_pick(key, cands, bench, *a, **kw))
+        real_defer, deferred = pdm.try_defer, []
+        monkeypatch.setattr(pdm, "try_defer", lambda *a, **kw: real_defer(*a, **kw) and (deferred.append(1) or True))
+    else:
+        monkeypatch.setattr(pdm, "try_defer", lambda *a, **kw: False)
 
     def build(tie):
         torch.manual_seed(0)
+        cat = lambda v: inputs(v, num_node_blocks = 1, dist = dists.Categorical(num_cats = NUM_CATS))
         with juice.set_block_size(K):
-            ns = inputs(0, num_node_blocks = 1, dist = dists.Categorical(num_cats = NUM_CATS))
-            src, copies = None, []
-            for t in range(1, steps):
-                emit = inputs(t, num_node_blocks = 1, dist = dists.Categorical(num_cats = NUM_CATS))
-                prod = multiply(ns, emit)
-                if src is None:
-                    ns = summate(prod, num_node_blocks = 1,
-                                 external_params = BlockScaleSumParams(ch_block_size = gate_cbs,
-                                                                       tie_external = tie))
-                    src = ns
-                else:
-                    ns = src.duplicate(prod, tie_params = True)
-                copies.append(ns)
-            root = summate(multiply(ns), num_node_blocks = 1, block_size = 1)
+            if two_per_layer:
+                # A over (x0, x1) and B over (x2, x3) in one layer, C over (A, x4) and D over (B, x5) in the next
+                a = summate(multiply(cat(0), cat(1)), num_node_blocks = 1,
+                            external_params = BlockScaleSumParams(ch_block_size = gate_cbs, tie_external = tie))
+                b = a.duplicate(multiply(cat(2), cat(3)), tie_params = True)
+                c = a.duplicate(multiply(a, cat(4)), tie_params = True)
+                d = a.duplicate(multiply(b, cat(5)), tie_params = True)
+                copies, top = [a, b, c, d], multiply(c, d)
+            else:
+                ns = cat(0)
+                src, copies = None, []
+                for t in range(1, steps):
+                    prod = multiply(ns, cat(t))
+                    if src is None:
+                        ns = summate(prod, num_node_blocks = 1,
+                                     external_params = BlockScaleSumParams(ch_block_size = gate_cbs,
+                                                                           tie_external = tie))
+                        src = ns
+                    else:
+                        ns = src.duplicate(prod, tie_params = True)
+                    copies.append(ns)
+                top = multiply(ns)
+            root = summate(top, num_node_blocks = 1, block_size = 1)
         torch.manual_seed(0)
         root.init_parameters(perturbation = 2.0)
         return juice.compile(root, verbose = False).to(dev), copies
@@ -221,59 +277,23 @@ def test_tied_gates_accumulate_across_every_layer_that_shares_them():
 
     # THE TWO ARMS MUST TAKE THE SAME NUMERICAL PATH, or this measures the wrong thing.
     #
-    # `_logz_tile` picks the log-Z gradient kernel's (GATE_TILE, BLOCK_B) by MEASUREMENT, separately
-    # for each circuit -- and the candidates are not equally accurate. Scored against the reference-
-    # free zero-sum invariant on this shape, the `USE_DOT = 0` tiles (GATE_TILE 1 and 8, which fall
-    # back to a broadcast-sum over an [M, G, B] intermediate) come out at 7.8e-3 relative against
-    # 8.8e-4 for the `tl.dot` tiles -- about 9x worse. When the tied arm happened to pick one and the
-    # untied arm the other, the difference between them was 1e-3 to 2.6e-3 and this assert failed;
-    # when they happened to agree it was 7.8e-8. That is what made this test flaky (2 of 5 runs), and
-    # it was never about the accumulation this test exists to check.
+    # The element fork is picked by MEASUREMENT, separately for each circuit, and it produces this gradient's first
+    # term -- and the forks differ in precision (fp16 dot vs pure fp32). When the two arms picked differently the
+    # difference between them was 1e-3 to 2.6e-3 and this assert failed; when they agreed it was ~1e-7. That made this
+    # test flaky, and it was never about the accumulation this test exists to check.
     #
-    # So the second arm REPLAYS the first arm's choices. Recorded rather than hardcoded, so the test
-    # does not silently stop exercising the autotuner's real selection if the shape changes.
-    # EVERY autotuned choice is replayed, not just the log-Z tile: the element fork is chosen the
-    # same way and produces this gradient's first term, and the forks differ in precision (fp16 dot
-    # vs pure fp32). Replaying only the log-Z tile took this from 2-of-5 runs passing to 8-of-10 --
-    # better, and still flaky, because the element pick was free to diverge.
-    #
-    # The replay is POSITIONAL, so the two arms have to make the same sequence of `autotune` calls --
-    # and `_logz_tile` calls `autotune` itself. The recording arm therefore logged three extra entries
-    # that the replaying arm never asks for, because it short-circuits `_logz_tile` and returns the
-    # recorded plan directly. From the first of those the streams were off by one: the log-Z pick was
-    # offered where an element-fork pick was expected, no candidate matched, and the fallback ran a
-    # LIVE measurement -- one per copy, each free to land on a different fork. That is what was left of
-    # the flakiness (3 of 8 runs). Those nested calls are excluded from the recording below, which
-    # aligns the streams exactly (9 recorded, 9 consumed, 0 fallbacks) and takes `d` from 1.5e-3 on a
-    # bad run to 9.3e-8 on every run.
-    import pyjuice.nodes.external_params.block_scale as _bs
+    # So the second arm REPLAYS the first arm's `autotune` picks. Recorded rather than hardcoded, so the test does not
+    # silently stop exercising the autotuner's real selection if the shape changes. The replay is POSITIONAL, so the two
+    # arms have to make the same sequence of calls -- asserted below. (The log-Z term's tile is `autotune.pick`'s,
+    # cached by shape process-wide, so the second arm takes the first arm's without a replay.)
     import pyjuice.layer.kernels.c as _ck
-    original_tile = _bs.BlockScaleSumParams._logz_tile
     original_autotune = _ck.autotune
-    recorded, recorded_at = [], []
-
-    def record(self, layer, launch, grad_ext, b, bs_, n_gates, rows):
-        record_at.inside_logz = True                    # its own `autotune` calls are not part of the stream
-        try:
-            pick = original_tile(self, layer, launch, grad_ext, b, bs_, n_gates, rows)
-        finally:
-            record_at.inside_logz = False
-        recorded.append(pick)
-        return pick
-
-    def replay(self, layer, launch, grad_ext, b, bs_, n_gates, rows):
-        assert replay.i < len(recorded), "the untied arm built more log-Z plans than the tied one"
-        pick = recorded[replay.i]
-        replay.i += 1
-        return pick
-    replay.i = 0
+    recorded_at = []
 
     def record_at(cands, **kw):
         pick = original_autotune(cands, **kw)
-        if not record_at.inside_logz:
-            recorded_at.append((tuple(n for n, _ in cands), pick))
+        recorded_at.append((tuple(n for n, _ in cands), pick))
         return pick
-    record_at.inside_logz = False
 
     def replay_at(cands, **kw):
         # The two circuits are structurally identical, so the streams must line up exactly. Anything
@@ -297,21 +317,16 @@ def test_tied_gates_accumulate_across_every_layer_that_shares_them():
         return [pc.get_external_params_grad(n)[0].clone() for n in copies]
 
     try:
-        _bs.BlockScaleSumParams._logz_tile, _ck.autotune = record, record_at
+        _ck.autotune = record_at
         tied = run(True)
-        _bs.BlockScaleSumParams._logz_tile, _ck.autotune = replay, replay_at
+        _ck.autotune = replay_at
         untied = run(False)
     finally:
-        _bs.BlockScaleSumParams._logz_tile = original_tile
         _ck.autotune = original_autotune
 
-    assert recorded and replay.i == len(recorded), \
-        f"the two arms built different numbers of log-Z plans ({len(recorded)} vs {replay.i}), so " \
-        f"they did not take the same numerical path and the comparison below is not apples-to-apples"
-
-    # Same requirement for the rest of the autotuned choices. A single live fallback here is enough to
-    # put the two arms on differently-rounded kernels, so demand that every recorded choice was asked
-    # for, in order, with the candidate set it was recorded against -- silence is not evidence.
+    # A single live fallback here is enough to put the two arms on differently-rounded kernels, so demand that every
+    # recorded choice was asked for, in order, with the candidate set it was recorded against -- silence is not
+    # evidence.
     assert recorded_at and replay_at.hits == len(recorded_at) == replay_at.i, \
         f"the two arms made different sequences of autotune calls ({len(recorded_at)} recorded, " \
         f"{replay_at.i} consumed, {replay_at.hits} replayed), so at least one kernel was picked by a " \
@@ -325,6 +340,7 @@ def test_tied_gates_accumulate_across_every_layer_that_shares_them():
     total = torch.stack(untied).sum(dim = 0)
     d = float((tied[0] - total).abs().max() / total.abs().max())
     assert d < 1e-4, f"the tied gradient is not the sum over its copies (off by {d} relative)"
+    assert post == "per layer" or deferred, "nothing was deferred"
 
 
 @cuda_only

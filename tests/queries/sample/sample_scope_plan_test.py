@@ -16,6 +16,8 @@ import os
 import sys
 import subprocess
 
+import functools
+
 import pytest
 import torch
 
@@ -194,6 +196,13 @@ OVERLAPPING = ("mixture", "sparse_mixture")
 
 @pytest.fixture(scope = "module")
 def planned():
+    return _planned_once()
+
+
+@functools.cache
+def _planned_once():
+    """Every structure compiled and planned once a process (a module fixture alone is set up again each time a worker
+    comes back to the file, which the suite's duration ordering interleaves: 37 builds in a full suite at 5 workers)."""
     out = {}
     for name, build in STRUCTURES.items():
         torch.manual_seed(0)

@@ -195,8 +195,8 @@ def test_a_graph_keeps_what_it_baked_in_alive(monkeypatch):
     graph recorded with a plan bakes those buffers in; once evicted, a replay would write into memory since
     handed to something else. The graph holds a reference to everything the inner layers owned when it was
     captured, so the buffer stays alive exactly as long as the graph does."""
-    import pyjuice.nodes.external_params.block_scale as block_scale
-    monkeypatch.setattr(block_scale, "_FW_PLAN_CACHE", 1)
+    import pyjuice.nodes.external_params.blockscale.forward as bs_forward
+    monkeypatch.setattr(bs_forward, "_FW_PLAN_CACHE", 1)
     device = torch.device("cuda:0")
     pc, ns = _gated_pc(device, "blockscale")
     (xa, ea), (xb, eb) = _gated_inputs(ns, 32, device, 1), _gated_inputs(ns, 16, device, 2)

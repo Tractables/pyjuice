@@ -81,6 +81,7 @@ def full_batch_em_epoch(pc, train_loader, test_loader, device):
     print(f"[train LL: {train_ll:.2f}; test LL: {test_ll:.2f}].....[train forward+backward+step {t1-t0:.2f}; test forward {t2-t1:.2f}] ")
 
 
+@pytest.mark.slow
 def test_rat_spn():
 
     device = torch.device("cuda:0")

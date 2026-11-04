@@ -50,13 +50,13 @@ def test_discrete_logistic_soft_cond():
     assert (pc.node_mars[1,0].exp() - p0).abs() < 1e-4
     assert (pc.node_mars[2,0].exp() - p1).abs() < 1e-4
 
-    f1 = pc.node_flows[1,0]
-    f2 = pc.node_flows[2,0]
+    f1 = pc.node_flows[1,0].exp()      # `conditional` leaves log-space flows
+    f2 = pc.node_flows[2,0].exp()
     unnorm_o = f1 * torch.tensor([p00, p01], device = device) + \
                f2 * torch.tensor([p10, p11], device = device)
     target_o = unnorm_o / unnorm_o.sum()
 
-    assert torch.all((target_o - outputs[0,0,:2]) < 1e-4)
+    assert torch.all((target_o - outputs[0,0,:2]).abs() < 1e-4)
 
     mu0 = pc.input_layer_group[0].params[4]
     s0 = pc.input_layer_group[0].params[5]
@@ -74,13 +74,13 @@ def test_discrete_logistic_soft_cond():
     p12 = 1.0 / (1.0 + math.exp((mu1 - 0.75) / s1)) - p11 - p10
     p13 = 1.0 - p12 - p11 - p10
 
-    f1 = pc.node_flows[3,0]
-    f2 = pc.node_flows[4,0]
+    f1 = pc.node_flows[3,0].exp()      # `conditional` leaves log-space flows
+    f2 = pc.node_flows[4,0].exp()
     unnorm_o = f1 * torch.tensor([p00, p01, p02, p03], device = device) + \
                f2 * torch.tensor([p10, p11, p12, p13], device = device)
     target_o = unnorm_o / unnorm_o.sum()
 
-    assert torch.all((target_o - outputs[0,1,:]) < 1e-4)
+    assert torch.all((target_o - outputs[0,1,:]).abs() < 1e-4)
 
 
 if __name__ == "__main__":

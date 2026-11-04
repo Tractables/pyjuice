@@ -107,7 +107,7 @@ class CircuitOptimizer():
         if ws <= 1:
             return
 
-        tensors = [self.pc.params]
+        tensors = [self.pc._params_for_update()]       # below fp32: the master copy, stored back after
         for layer in self.pc.input_layer_group:
             p = getattr(layer, "params", None)
             if p is not None:
@@ -122,6 +122,7 @@ class CircuitOptimizer():
                 else:
                     dist.all_reduce(p, op = dist.ReduceOp.SUM, group = self.ddp_group)
                 p.div_(ws)
+        self.pc._store_updated_params()
 
     def _post_update_sync(self):
         # Called by each subclass's `step` AFTER the local EM update. In Local-SGD mode

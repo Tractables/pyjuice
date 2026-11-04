@@ -190,6 +190,7 @@ def test_hmm_viterbi_slow():
     assert best_valid_ll > -90.0
 
 
+@pytest.mark.slow
 def test_hmm_viterbi_fast():
     
     device = torch.device("cuda:0")

@@ -105,9 +105,9 @@ class GradientOptimizer(CircuitOptimizer):
         for layer in self.pc.input_layer_group:
             accum_input_tied_flows(layer)
 
-    def _clamp_params(self):
+    def _clamp_params(self, sum_params: torch.Tensor):
         with torch.no_grad():
-            self.pc.params.clamp_(max = self.max_param)
+            sum_params.clamp_(max = self.max_param)
             for layer in self.pc.input_layer_group:
                 layer.params.clamp_(max = self.max_param)
 
@@ -133,11 +133,15 @@ class GradientOptimizer(CircuitOptimizer):
         self._transform_gradient()
 
         # (6) log-space parameter update + clamp.
-        sgd_par_update(self.pc.params, self.pc.param_flows, par_update_kwargs = self.pc.par_update_kwargs,
+        # On parameters stored below fp32, their fp32 master copy -- stored back before the partition pass below reads
+        # `params` (`param_dtype`)
+        sum_params = self.pc._params_for_update()
+        sgd_par_update(sum_params, self.pc.param_flows, par_update_kwargs = self.pc.par_update_kwargs,
                        lr = lr_eff, keep_zero_params = False)
         for layer in self.pc.input_layer_group:
             sgd_input_layer_update(layer, lr = lr_eff)
-        self._clamp_params()
+        self._clamp_params(sum_params)
+        self.pc._store_updated_params()
 
         # (7) renormalize the (now unnormalized) circuit back onto the normalized manifold.
         #
@@ -146,8 +150,11 @@ class GradientOptimizer(CircuitOptimizer):
         # with `apply_z_correction` would run the conditional update `theta * F+ / F-` against
         # `F- == 0`, i.e. divide by `pseudocount * theta` (and by 1e-38 at `renorm_pseudocount = 0`) and
         # return inf. The plain projection is what is wanted here regardless of the parameterization.
+        #
+        # The partition pass on the fp32 values (below fp32, the master copy): run on the stored rounding, the projection
+        # would be computed from it and erase whatever of the update fell below its ulp (`param_dtype`)
         self.zero_flows()
-        eval_partition_grad(self.pc, negate_pflows = False)
+        eval_partition_grad(self.pc, negate_pflows = False, params = sum_params)   # (stored above: in line)
         self.pc.mini_batch_em(step_size = 1.0, pseudocount = self.renorm_pseudocount,
                               _apply_denom_correction = False)
 

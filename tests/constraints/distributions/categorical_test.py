@@ -1,0 +1,216 @@
+"""
+Categorical class masses (:mod:`pyjuice.constraints.distributions.categorical`) against a float64 brute force: per
+node, the log of the summed probabilities of each class's tokens, read through the node's row of the class-mass
+table (one row per parameter row, however many tied nodes share it). Both passes -- the natural token order (up to
+NATURAL_ORDER_MAX_CLASSES classes) and the class order (above) -- on tied (homogeneous HMM) and untied input layers
+(and one whose tied nodes come out of their rows' order), for one class, two, a skewed split, a class with no
+token, both sides of the boundary between the passes, and every token its own class; and on probabilities small
+enough to be subnormal, which tensor cores would flush to zero.
+"""
+import math
+from types import SimpleNamespace
+
+import numpy as np
+import pytest
+import torch
+
+import pyjuice as juice
+import pyjuice.nodes.distributions as dists
+from pyjuice.nodes import inputs, multiply, summate
+from pyjuice.constraints import distributions
+from pyjuice.constraints.distributions import TokenClasses, categorical
+
+V = 600
+DEV = torch.device("cuda:0")
+LABELS = ["one", "two", "skewed", "empty_class", "boundary", "past_boundary", "many", "each_token"]
+
+
+def build(kind):
+    torch.manual_seed(0)
+    if kind == "tied":
+        ns = juice.structures.HMM(seq_length = 4, num_latents = 8, num_emits = V)
+    elif kind == "untied":
+        ns = juice.structures.GeneralizedHMM(seq_length = 4, num_latents = 8, homogeneous = False,
+                                             input_dist = dists.Categorical(num_cats = V))
+    else:
+        # nodes out of their rows' order: variable 2's nodes are tied to variable 1's, which follow variable 0's
+        cat = lambda: dists.Categorical(num_cats = V)
+        x0 = inputs(0, num_node_blocks = 1, block_size = 2, dist = cat())
+        x1 = inputs(1, num_node_blocks = 2, block_size = 2, dist = cat())
+        x2 = x1.duplicate(2, tie_params = True)
+        m = [multiply(summate(x0, num_node_blocks = 2, block_size = 2), x1, x2)]
+        ns = summate(*m, num_node_blocks = 1, block_size = 1)
+    ns.init_parameters(perturbation = 4.0)
+    return juice.compile(ns, verbose = False).to(DEV)
+
+
+def labels(name):
+    """(token_class [V], number of classes)."""
+    g = torch.Generator().manual_seed(1)
+    M = categorical.NATURAL_ORDER_MAX_CLASSES
+    skew = lambda C: torch.cat([torch.arange(C), torch.where(torch.rand(V - C, generator = g) < 0.7, 0,
+                                                             torch.randint(1, C, (V - C,), generator = g))])
+    if name == "one":
+        return torch.zeros(V, dtype = torch.long), 1
+    if name == "two":
+        return torch.randint(0, 2, (V,), generator = g), 2
+    if name == "skewed":                       # like Ctrl-G's: most tokens in one class, a few in many small ones
+        return skew(10)[torch.randperm(V, generator = g)], 10
+    if name == "empty_class":
+        return torch.randint(0, 3, (V,), generator = g), 4
+    if name == "boundary":
+        return skew(M)[torch.randperm(V, generator = g)], M
+    if name == "past_boundary":
+        return skew(M + 1)[torch.randperm(V, generator = g)], M + 1
+    if name == "many":                         # the class order, with classes spanning many chunks and empty ones
+        lab = skew(100)[torch.randperm(V, generator = g)]
+        return lab, 103
+    assert name == "each_token"
+    return torch.randperm(V, generator = g), V
+
+
+def brute_force(layer, token_class, num_classes):
+    probs = layer.params.double()[layer.s_pids[:, None] + torch.arange(V, device = DEV)[None, :]]    # [nodes, V]
+    masses = torch.zeros(probs.size(0), num_classes, dtype = torch.float64, device = DEV)
+    return masses.index_add_(1, token_class.long(), probs).log()
+
+
+def check(got, want):
+    assert torch.equal(torch.isneginf(got), torch.isneginf(want))
+    fin = torch.isfinite(want)
+    assert (got[fin].double() - want[fin]).abs().max() < 1e-5
+
+
+@pytest.mark.parametrize("name", LABELS)
+@pytest.mark.parametrize("kind", ["tied", "untied", "tied_out_of_order"])
+def test_class_masses_match_brute_force(kind, name):
+    pc = build(kind)
+    token_class, C = labels(name)
+    classes = TokenClasses(token_class.to(DEV), C)
+    for layer in pc.input_layer_group:
+        if kind == "tied_out_of_order":
+            rows = layer.s_pids // V
+            assert not torch.equal(rows, torch.arange(rows.numel(), device = DEV) % (rows.max() + 1))
+        want = brute_force(layer, classes.token_class, C)
+        rows = categorical.class_mass_rows(layer)
+        num_rows = layer.params.numel() // V                              # one per parameter row
+        assert rows.shape == (layer.num_nodes,) and int(rows.max()) + 1 == num_rows
+        assert (num_rows < layer.num_nodes) == (kind != "untied")          # tied nodes share their row
+        got = categorical.class_masses(layer, classes)
+        assert got.shape == (num_rows, C) and got.dtype == torch.float32
+        check(got[rows], want)
+        assert torch.isneginf(want).any() == (name in ("empty_class", "many"))
+        out = torch.full((num_rows, C), float("nan"), device = DEV)
+        assert categorical.class_masses(layer, classes, out = out) is out
+        check(out[rows], want)
+    # the class order is built only past the boundary, once
+    assert bool(classes._by_class) == (C > categorical.NATURAL_ORDER_MAX_CLASSES)
+
+
+@pytest.mark.parametrize("name", ["skewed", "many"])
+def test_subnormal_probabilities_are_kept(name):
+    """Probabilities down to 1e-44 (subnormal in fp32): every class keeps its mass, even one whose tokens are all
+    subnormal."""
+    pc = build("untied")
+    layer = pc.input_layer_group[0]
+    token_class, C = labels(name)
+    g = torch.Generator(device = DEV).manual_seed(0)
+    with torch.no_grad():
+        layer.params.copy_(torch.exp(-torch.rand(layer.params.shape, device = DEV, generator = g) * 100.0))
+        layer.params[layer.s_pids[0] + torch.nonzero(token_class == 1).flatten().to(DEV)] = 1e-44
+    assert (layer.params < 1.17e-38).any()
+    classes = TokenClasses(token_class.to(DEV), C)
+    want = brute_force(layer, classes.token_class, C)
+    assert want[0, 1] < math.log(1.17e-38)                             # class 1 of node 0: a subnormal mass
+    check(categorical.class_masses(layer, classes)[categorical.class_mass_rows(layer)], want)
+
+
+def picked_rows(R, pick):
+    """Host rows of a [R, V] table: every one, a consecutive run, or a sorted third of them."""
+    if pick == "all":
+        return np.arange(R)
+    if pick == "consecutive":
+        return np.arange(1, R - 1)
+    return np.sort(np.random.default_rng(0).choice(R, max(1, R // 3), replace = False))
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("pick", ["all", "consecutive", "gathered"])
+@pytest.mark.parametrize("kind", ["tied", "untied", "wide"])
+def test_token_probs_are_the_rows_token_major(kind, pick, dtype):
+    """``token_probs`` into the columns of a wider table (and into a table whose columns are apart): torch's own
+    transposed copy, cast, bit for bit, and nothing written around it. ``wide``: rows and tokens over several of the
+    copy kernel's tiles, neither a multiple of them."""
+    if kind == "wide":
+        g = torch.Generator(device = DEV).manual_seed(0)
+        layer = SimpleNamespace(params = torch.rand(300 * 1000, device = DEV, generator = g),
+                                dist = SimpleNamespace(num_cats = 1000))
+    else:
+        layer = build(kind).input_layer_group[0]
+    num_cats = layer.dist.num_cats
+    table = layer.params.view(-1, num_cats)
+    rows = picked_rows(table.size(0), pick)
+    want = table[torch.as_tensor(rows, device = DEV)].t().to(dtype)
+    out = torch.full((num_cats, len(rows) + 5), float("nan"), dtype = dtype, device = DEV)
+    categorical.token_probs(layer, rows, out[:, 2:2 + len(rows)])
+    assert torch.equal(out[:, 2:2 + len(rows)], want)
+    assert out[:, :2].isnan().all() and out[:, 2 + len(rows):].isnan().all()
+    apart = torch.full((len(rows), num_cats), float("nan"), dtype = dtype, device = DEV).t()   # (stride(1) != 1)
+    categorical.token_probs(layer, rows, apart)
+    assert torch.equal(apart, want)
+
+
+@pytest.mark.parametrize("pick", ["all", "gathered"])
+@pytest.mark.parametrize("kind", ["tied", "untied"])
+def test_token_columns_are_the_tokens_probabilities(kind, pick):
+    layer = build(kind).input_layer_group[0]
+    table = layer.params.view(-1, V)
+    rows = picked_rows(table.size(0), pick)
+    tokens = torch.tensor([5, 0, V - 1, 17, 5], device = DEV)                  # any order, repeated
+    out = torch.full((len(rows), tokens.numel()), float("nan"), device = DEV)
+    categorical.token_columns(layer, rows, tokens, out)
+    assert torch.equal(out, table[torch.as_tensor(rows, device = DEV)][:, tokens])
+
+
+def test_the_class_order_is_built_once():
+    classes = TokenClasses(torch.randperm(V, device = DEV), V)
+    assert classes.by_class(categorical.CLASS_CHUNK) is classes.by_class(categorical.CLASS_CHUNK)
+    moved = classes.to(torch.device("cpu"))
+    assert moved.token_class.device.type == "cpu" and not moved._by_class
+
+
+@pytest.mark.parametrize("B", [1, 5, 24])
+@pytest.mark.parametrize("kind", ["tied", "untied", "tied_out_of_order"])
+def test_input_values_are_the_layers_own(kind, B):
+    """``input_values`` writes the layer's own forward's values bit for bit -- every observed token's log-probability,
+    0 where missing --, and with ``positions`` the nodes over the positions marked alone, the others' rows untouched;
+    batches of one sample, part of a tile of samples, and several tiles."""
+    pc = build(kind)
+    layer = pc.input_layer_group[0]
+    first, end = layer._output_ind_range
+    n = int(layer.vids.max()) + 1
+    g = torch.Generator().manual_seed(B)
+    x = torch.randint(0, V, (B, n), generator = g).to(DEV)
+    missing = (torch.rand(B, n, generator = g) < 0.4).to(DEV)
+    want = torch.full((end, B), float("nan"), device = DEV)
+    with torch.no_grad():
+        layer(x.permute(1, 0), want, missing_mask = missing)
+    got = torch.full((end, B), float("nan"), device = DEV)
+    categorical.input_values(layer, x, missing, got)
+    assert torch.equal(got[first:end].view(torch.int32), want[first:end].view(torch.int32))
+    marked = torch.rand(n, generator = g) < 0.5
+    some = torch.full((end, B), float("nan"), device = DEV)
+    categorical.input_values(layer, x, missing, some, positions = marked.to(torch.int32).to(DEV))
+    on = marked.to(DEV)[layer.vids.view(-1).long()]
+    assert torch.equal(some[first:end][on].view(torch.int32), want[first:end][on].view(torch.int32))
+    assert some[first:end][~on].isnan().all()
+
+
+def test_supported_distributions_are_matched_by_exact_type():
+    class MyCategorical(dists.Categorical):
+        pass
+
+    assert distributions.lookup(dists.Categorical(num_cats = 5)) is categorical
+    assert distributions.lookup(MyCategorical(num_cats = 5)) is None
+    assert distributions.lookup(dists.Gaussian(mu = 0.0, sigma = 1.0)) is None
+    assert categorical.num_values(dists.Categorical(num_cats = 7)) == 7

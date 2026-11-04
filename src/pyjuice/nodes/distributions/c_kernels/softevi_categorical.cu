@@ -15,7 +15,7 @@
 //
 // Each (row, cat) is owned by the thread(s) holding its reference list -- one, unless the list was long
 // enough to be cut into pieces -- so the phase-1 update is one coalesced atomic per owner rather than
-// one scattered atomic per reference. See the long note in softevi_categorical.py for why the
+// one scattered atomic per reference. See the long note in softevi/dense_index.py for why the
 // computation is organised this way rather than as a scatter over slots.
 //
 // Thread mapping (this is the whole point of the hand-written version):

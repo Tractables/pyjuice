@@ -1,220 +1,71 @@
 from __future__ import annotations
 
-import math
+import numpy as np
 import torch
 import torch.nn as nn
-import time
-import triton
-import triton.language as tl
-import warnings
 from collections import OrderedDict
-from tqdm import tqdm
 from functools import partial
-from typing import Optional, Sequence, Callable, Union, Tuple, Dict
-from contextlib import contextmanager
+from typing import Optional, Sequence, Callable, Union
 
-from pyjuice.nodes import CircuitNodes, InputNodes, ProdNodes, SumNodes, ExternalParamsSumNodes, \
-                          foreach, summate, multiply
-from pyjuice.layer import Layer, InputLayer, ProdLayer, SumLayer, ExternalParamsSumLayer, LayerGroup, \
-                          StagedExternalParams, EXTERNAL_PARAMS_KWARG, EXTERNAL_PARAMS_GRAD_KWARG, \
-                          EXTERNAL_PARAMS_BUFFER_KWARG, EXTERNAL_PARAMS_GRAD_BUFFER_KWARG
-from pyjuice.layer.external_sum_layer import validate_external_tensors
-from pyjuice.utils.grad_fns import ReverseGrad
-from pyjuice.utils import BitSet
-from pyjuice.utils.util import cuda_graph_key
+from pyjuice.nodes import CircuitNodes
+from pyjuice.layer.sum_layer import PRECISIONS, _pop_removed_precision_flags
 
-from .backend import compile_cum_par_flows_fn, compute_cum_par_flows, cum_par_flows_to_device, \
-                     compile_par_update_fn, em_par_update, par_update_to_device, \
-                     normalize_parameters, eval_top_down_probs
-
-
-# A buffer's backing storage is reallocated at the needed size once it is more than this many times larger
-# (see `TensorCircuit._init_buffer`)
-_BUFFER_SHRINK_RATIO = 4
-
-
-def _graph_option(value):
-    """An option of a captured pass as a hashable signature entry: tensors by the memory a capture bakes
-    in (`cuda_graph_key`), mappings and sequences elementwise, anything else as it is."""
-    if isinstance(value, torch.Tensor):
-        return cuda_graph_key(value)
-    if isinstance(value, dict):
-        return tuple((k, _graph_option(v)) for k, v in value.items())
-    if isinstance(value, (list, tuple)):
-        return tuple(_graph_option(v) for v in value)
-    return value
-
-
-def _graph_signature(pass_id, buffers, options, states = ()):
-    """
-    The key a recorded inner-layer pass is stored and looked up under: the buffers it bakes in, by
-    address (`cuda_graph_key`); every option the inner layers are called with -- built from the very dict
-    they are called with, so nothing reaches a captured pass without being part of its key; and, for a
-    backward, the identity of the state the forward left on the layers (see `Layer.cuda_graph_state`).
-
-    None when an option cannot be part of a key (it is not hashable), and the pass then runs eagerly.
-    """
-    try:
-        signature = (pass_id, tuple(cuda_graph_key(b) for b in buffers),
-                     tuple(sorted((name, _graph_option(v)) for name, v in options.items())),
-                     tuple(id(s) for s in states))
-        hash(signature)
-    except TypeError:
-        return None
-    return signature
-
-
-class _RecordedPass:
-    """A captured inner-layer pass, with what has to outlive or follow its replays."""
-
-    __slots__ = ("graph", "layer_states", "keepalive")
-
-    def __init__(self, graph, layer_states, keepalive):
-        self.graph = graph
-        # `(layer, state)` as the recording left them, put back after every replay (the Python that set
-        # them does not run)
-        self.layer_states = layer_states
-        # Everything the inner layers owned at capture time, so no pointer the graph baked in can be freed
-        # while it lives -- e.g. by a layer evicting a cached plan -- and the forward states its key names
-        self.keepalive = keepalive
-
-
-def _pc_model_backward_hook(grad, pc, inputs, record_cudagraph, apply_cudagraph, propagation_alg, **kwargs):
-    grad = grad.permute(1, 0)
-    pc.backward(
-        inputs = inputs,
-        ll_weights = grad / grad.sum() * grad.size(1),
-        compute_param_flows = pc._optim_hyperparams["compute_param_flows"], 
-        flows_memory = pc._optim_hyperparams["flows_memory"],
-        record_cudagraph = record_cudagraph,
-        apply_cudagraph = apply_cudagraph,
-        propagation_alg = propagation_alg,
-        **kwargs
-    )
-
-    return None
-
-
-def layer_iterator(pc, reverse = False, ret_layer_groups = False, ignore_input_layers = False):
-    if not reverse:
-        if ret_layer_groups:
-            if not ignore_input_layers:
-                yield pc.input_layer_group
-
-            for layer_group in pc.inner_layer_groups:
-                yield layer_group
-
-        else:
-            if not ignore_input_layers:
-                for layer in pc.input_layer_group:
-                    yield layer
-
-            for layer_group in pc.inner_layer_groups:
-                for layer in layer_group:
-                    yield layer
-    else:
-        if ret_layer_groups:
-            for layer_group in pc.inner_layer_groups[::-1]:
-                yield layer_group
-
-            if not ignore_input_layers:
-                yield pc.input_layer_group
-
-        else:
-            for layer_group in pc.inner_layer_groups[::-1]:
-                for layer in layer_group:
-                    yield layer
-
-            if not ignore_input_layers:
-                for layer in pc.input_layer_group:
-                    yield layer
-
-
-@contextmanager
-def device_grad_controller(device, no_grad = True):
-    device_type = device.type
-    if device_type == "cpu":
-        if no_grad:
-            with torch.no_grad():
-                yield
-        else:
-            yield
-    else:
-        # Pass the `torch.device` straight through: it handles an index-less CUDA device
-        # (`torch.device("cuda")`, `.index is None`) by selecting the current device, whereas
-        # `f"cuda:{device.index}"` would build the invalid string "cuda:None".
-        with torch.cuda.device(device):
-            if no_grad:
-                with torch.no_grad():
-                    yield
-            else:
-                yield
-
-
-from pyjuice.nodes.external_params.external_params import ExternalSumParams
+#: The dtypes the sum layers' parameters may be stored in (`TensorCircuit.param_dtype`)
+PARAM_DTYPES = (torch.float32, torch.bfloat16)
 from pyjuice.nodes.methods import is_structured_decomposable
 
+from .backend import cum_par_flows_to_device, par_update_to_device
 
-def _staging_transpose_fn():
-    """
-    The tiled-transpose backend for staging: the CUDA extension if it built, Triton otherwise, or None
-    to fall back to a generic strided `copy_`.
+from .build import _BuildMixin
+from .common import _pc_model_backward_hook, device_grad_controller, layer_iterator
+from .cuda_graphs import _CudaGraphsMixin
+from pyjuice.utils.deferred import deferred_scope
+from .external_params import _ExternalParamsMixin
+from .inspection import _InspectionMixin
+from .learning import _LearningMixin
 
-    Behind ONE function so a test can force each tier. The fallbacks are otherwise unreachable on any
-    machine where the extension compiled -- which is how a shape bug lived in one of them: staging a
-    whole GROUP hands this a flat destination, the per-node path hands it a storage-shaped one, and the
-    fallback only ever handled the second.
-    """
-    from pyjuice.nodes.external_params.kernels.c import get_module
-    mod = get_module()
-    if mod is not None:
-        return mod.staging_transpose
-
-    try:
-        from pyjuice.nodes.external_params.kernels.staging import staging_transpose_triton
-        return staging_transpose_triton
-    except Exception:
-        return None
+try:                                    # (torch's registries of the hooks every module call runs)
+    from torch.nn.modules.module import (_global_forward_hooks, _global_forward_pre_hooks, _global_backward_hooks,
+                                         _global_backward_pre_hooks)
+    _GLOBAL_HOOKS = (_global_forward_hooks, _global_forward_pre_hooks, _global_backward_hooks, _global_backward_pre_hooks)
+except ImportError:
+    _GLOBAL_HOOKS = None
 
 
-def _staged_copy(plain_d: list, plain_s: list, fast: list) -> None:
-    """
-    Issue the staging copies: a tiled transpose for the pairs that are one, a batched `copy_` for the
-    rest.
-
-    `Tensor.copy_` on a transposed view goes through TensorIterator, which handles arbitrary strides but
-    does not tile, so one side of the transpose is uncoalesced -- 8.2 us against 2.1 us for the same
-    4 MB. Staging is worth optimizing because it was 37-59% of the whole cost of applying a gate at
-    batch 256.
-
-    Which pairs qualify is decided by the CALLER from the parameterization's declared layout, not by
-    inspecting strides here: this runs on every forward, and building a permuted view per tensor just to
-    test it cost more Python than the kernel saved in GPU time.
-    """
-    if fast:
-        fn = _staging_transpose_fn()
-        for dst, src in fast:
-            batch = src.size(0)
-            n = src.numel() // max(batch, 1)
-            if fn is not None:
-                fn(dst, src, batch, n)
-            else:
-                # NORMALIZE both shapes rather than assuming either. `dst` is flat for a whole-group
-                # stage (`_group_fast_stage` returns a `narrow` of the buffer) and storage-shaped for a
-                # per-node one, so the old `src.permute(...)` matched only the second -- a group stage
-                # raised a shape mismatch here. It never showed up because this branch is unreachable
-                # wherever the CUDA extension built, which is everywhere it was tested.
-                #
-                # `view`, not `reshape`: a non-contiguous destination has to raise rather than quietly
-                # copy into a temporary that is then discarded.
-                plain_d.append(dst.view(n, batch))
-                plain_s.append(src.view(batch, n).permute(1, 0))
-
-    if plain_d:
-        torch._foreach_copy_(plain_d, plain_s)
+def _calls_its_forward(module: nn.Module) -> bool:
+    """Whether calling ``module`` would just call its `forward`: no hooks of its own or global ones, no compiled call, not
+    traced -- `nn.Module.__call__`'s own fast path, checked without the call. False where torch keeps the hooks elsewhere."""
+    if _GLOBAL_HOOKS is None:
+        return False
+    return not (module._forward_hooks or module._forward_pre_hooks or module._backward_hooks or module._backward_pre_hooks
+                or any(_GLOBAL_HOOKS) or getattr(module, "_compiled_call_impl", None) is not None
+                or torch._C._get_tracing_state())
 
 
-class TensorCircuit(nn.Module):
+# The work per layer from which the layers reading only shared fp32 parameters take their bf16 copy
+# (`TensorCircuit._param_operand_groups`): the parameters such a layer reads a sample, times the batch. MEASURED
+# (training steps of tied HMMs, the copy forced off and on): slower with it to 2^27 (HMM-1024 B 32 / 128 +2.4 / +2.2%,
+# HMM-2048 B 16 / 32 +1.5 / +1.1%), faster from 2^28 (HMM-1024 B 256 -2.2%, HMM-2048 B 64 -3.0%, HMM-4096 B 16 -3.5%;
+# 2^29: HMM-2048 B 128 -9.9%, HMM-4096 B 32 -7.1%; 2^31: HMM-4096 B 128 -38%).
+_COPY_MIN_WORK = 1 << 28
+
+# The forward options a fused product forward serves (`_stream_fusion_groups`): the plain regime's, and the external
+# parameters' (a gated layer whose parameterization takes the fused forward, `fuses_stream_children`)
+_STREAM_FUSION_FW_OPTS = frozenset(("precision", "pflow_temperature", "sum_external_params",
+                                    "sum_external_params_buffer"))
+
+# The backward options of the plain regime a fused product backward serves (`_stream_fusion_bk_groups`)
+_STREAM_FUSION_BK_OPTS = frozenset(("param_flows", "denom_param_flows", "allow_modify_flows", "logspace_flows",
+                                    "negate_pflows", "precision", "pflow_temperature", "temper_eflow",
+                                    "defer_param_flows", "pf_store_first", "sum_external_params",
+                                    "sum_external_params_buffer", "sum_external_params_grad",
+                                    "sum_external_params_grad_buffer"))
+# (a fused product backward's trials compute no gate gradients: the gradient buffers left out of them)
+_STREAM_FUSION_BK_GRADS = ("sum_external_params_grad", "sum_external_params_grad_buffer")
+
+
+class TensorCircuit(_BuildMixin, _CudaGraphsMixin, _ExternalParamsMixin, _LearningMixin, _InspectionMixin,
+                    nn.Module):
     """
     A class for compiled PCs. It is a subclass of `torch.nn.Module`.
 
@@ -278,11 +129,16 @@ class TensorCircuit(nn.Module):
                  force_gpu_compilation: bool = False,
                  max_tied_ns_per_parflow_block: int = 32,
                  device: Optional[Union[int,torch.device]] = None,
-                 verbose: bool = True, cuda_graphs: bool = False) -> None:
+                 verbose: bool = True, cuda_graphs: bool = False, precision: str = "auto",
+                 param_dtype: torch.dtype = torch.float32) -> None:
 
         super(TensorCircuit, self).__init__()
 
         self.cuda_graphs = bool(cuda_graphs)
+        self.precision = precision
+        self.param_dtype = param_dtype
+        # The fp32 master copy of `params` while a circuit storing them below fp32 trains (`_params_for_update`)
+        self.register_buffer("params_master", None, persistent = False)
 
         assert isinstance(root_ns, CircuitNodes), "`root_ns` should be an instance of `CircuitNodes`."
 
@@ -318,6 +174,10 @@ class TensorCircuit(nn.Module):
         # `_init_buffer` whenever the batch size changes.
         self.external_params = None
         self.external_params_grad = None
+
+        # Forward and backward passes run so far: a decoder session (`juice.decoder`) keeps its values in this
+        # circuit's buffers between its calls and starts over when another pass has run in between
+        self._num_runs = 0
         
         self._init_layers(
             layer_sparsity_tol = layer_sparsity_tol, 
@@ -358,14 +218,27 @@ class TensorCircuit(nn.Module):
         else:
             device = torch.device(device)
 
+        moved = getattr(self, "device", None) != device
+
         super(TensorCircuit, self).to(device)
 
         self.input_layer_group.to(device)
+
+        # `nn.Module.to` moves the inner layers' tables but not the tensors their passes derived from them
+        if moved:
+            for layer_group in self.inner_layer_groups:
+                layer_group.to(device)
 
         self.device = device
 
         # The layers' tables moved, and recorded graphs point at the old ones
         self._drop_cuda_graphs()
+
+        # The product groups' tables the fused stream forward was handed (`_stream_fusion_groups`), and its decisions,
+        # made anew on this device
+        if moved:
+            for name in ("_fused_child_tables", "_stream_fusion_", "_fused_child_parents", "_stream_fusion_bk_"):
+                self.__dict__.pop(name, None)
 
         # For parameter flow accumulation
         self.parflow_fusing_kwargs = cum_par_flows_to_device(self.parflow_fusing_kwargs, device)
@@ -401,9 +274,347 @@ class TensorCircuit(nn.Module):
         else:
             raise NotImplementedError(f"Unknown propagation algorithm {propagation_alg}.")
         
+    @property
+    def precision(self) -> str:
+        """
+        Precision of the sum layers' products, in the forward and the backward pass:
+
+        * ``"auto"`` (the default): the fastest per layer -- bf16 products in the block-sparse kernels from batch 16
+          (about 4e-3 in a log-likelihood), TF32 on large dense layers, which run through cuBLAS -- unless several layers
+          share their fp32 parameters (a tied HMM's transitions): those may read a bf16 copy made in every forward (its
+          backward reads the same) in their kernels whose products are bf16 -- the CUDA kernels that round the
+          parameters to bf16 anyway (the same bits, half the bytes), and the stream kernels, bf16 parameters only,
+          offered on the copy in the forward and the element flows --, every other kernel reading the fp32 parameters;
+          they do where the parameters such a layer reads a sample, times the batch, reach `_COPY_MIN_WORK` (below it a
+          step is host-bound, and the copy's host time costs more than the GPU time it saves), and are at least what
+          their parameterization takes it from (BlockScale's: 2^23);
+        * ``"tf32"``: never bf16 -- round-to-nearest TF32 products (about 5e-4);
+        * ``"fp32"``: fp32-level products in the forward and the backward (about 1e-6; ``tf32x3`` on tensor cores).
+
+        Batches below 16 run fp32 kernels in every mode. Settable at any time; a recorded CUDA graph is keyed on it.
+        """
+        return self.__dict__.get("_precision", "auto")
+
+    @precision.setter
+    def precision(self, value: str):
+        if value not in PRECISIONS:
+            raise ValueError(f"`precision` must be one of {PRECISIONS}, got {value!r}.")
+        self.__dict__["_precision"] = value
+
+    @property
+    def param_dtype(self) -> torch.dtype:
+        """
+        The dtype the sum layers' parameters (``params``) are STORED in: ``torch.float32`` (the default) or
+        ``torch.bfloat16``. Every kernel reads the parameters in that dtype and computes in fp32 (or in the bf16 / fp16
+        operand it already used): at fp32 nothing changes; at bf16 the parameters cost half the memory and the memory
+        traffic, which is what the large layers' time is -- and the forward's block-sparse kernels round the parameters
+        to bf16 for their products anyway (MEASURED: HCLT-1024 log-likelihoods 0.0000 nats apart on average, 5e-4 at
+        most). Parameter flows, node and element values stay fp32. Training keeps an fp32 master copy of the parameters
+        (``params_master``, made by the first update, 4 bytes a parameter until :meth:`drop_params_master`): the updates
+        run on it and store its rounding, because a bf16 value moves only by more than half its ulp (MEASURED: stored
+        alone, a mini-batch EM step of size 0.01 or an SGD step left 99.9-100% of the parameters unchanged); with it,
+        every optimizer follows its fp32 run (1-3e-3 relative). fp16 is not offered: its range turns small probabilities
+        into exact zeros. Set at compilation; :meth:`set_param_dtype` converts a compiled circuit.
+        """
+        return self.__dict__.get("_param_dtype", torch.float32)
+
+    @param_dtype.setter
+    def param_dtype(self, value: torch.dtype):
+        if value not in PARAM_DTYPES:
+            raise ValueError(f"`param_dtype` must be one of {PARAM_DTYPES}, got {value!r}.")
+        self.__dict__["_param_dtype"] = value
+
+    def set_param_dtype(self, dtype: torch.dtype) -> "TensorCircuit":
+        """Convert the sum layers' parameters in place to ``dtype`` (:attr:`param_dtype`); returns the circuit.
+
+        Converts the fp32 master copy where a training run left one (the precision the stored values rounded away), and
+        drops what was derived from the old tensor: the CUDA graphs recorded on it (never replayed -- keyed by it -- but
+        held) and the layers' operand caches, rebuilt by the next pass as after a device move (BlockScale's plans, whose
+        CUDA forks depend on the dtype, and its parameter sums, keyed by the tensor's version -- which a new tensor
+        restarts)."""
+        self.param_dtype = dtype
+        if self.params.dtype != dtype:
+            values = self._params_in_fp32()     # `params`, or the master copy in line with them
+            self.params = nn.Parameter(values.detach().to(dtype), requires_grad = self.params.requires_grad)
+            self._drop_cuda_graphs()
+            for group in self.inner_layer_groups:
+                for layer in group:
+                    drop = getattr(layer, "_drop_device_caches", None)
+                    if drop is not None:
+                        drop()
+        self.drop_params_master()
+        return self
+
+    def _load_from_state_dict(self, *args, **kwargs):
+        # `params` loaded in their stored dtype; the master copy of a training run is not part of the state. Dropped here
+        # rather than in `load_state_dict`, which a module holding the circuit does not call on it
+        super()._load_from_state_dict(*args, **kwargs)
+        self.drop_params_master()
+
+    # ---------------------------------------------------------------------------------------------
+    # The bf16 copy of shared fp32 parameters, for the sum layers' CUDA kernels
+    # ---------------------------------------------------------------------------------------------
+
+    def _param_operand_plan(self) -> tuple:
+        """``(groups, ranges)``: the inner sum layer groups whose every layer reads only parameters that several sum
+        nodes share (a tied node's source and its copies) and is a plain sum layer or an external-parameter one whose
+        parameterization takes the copy (`ExternalSumParams.reads_param_operands`), at offsets the bf16 kernels' 16-byte
+        loads can take, each such layer marked (`SumLayer._reads_param_operands`), and those parameters' ranges -- what
+        `_param_operands` copies. Shared ranges only: there one copy serves every layer that reads them, while an unshared
+        parameter would be copied (6 bytes) for one read (4). Built once, from the structure, with each group's size for
+        `_param_operand_groups` (`_param_operand_sizes_`)."""
+        plan = self.__dict__.get("_param_operand_plan_")
+        if plan is not None:
+            return plan
+        from pyjuice.layer.sum_layer import SumLayer
+        from pyjuice.layer.external_sum_layer import ExternalParamsSumLayer
+
+        def source(ns):
+            return ns.get_source_ns() if ns.is_tied() else ns
+
+        def aligned(layer):
+            # (a bf16 kernel loads 8 parameters as one 16-byte load: every parameter base -- a node block's first
+            # parameter of a child, the forward's and the backward's -- and the block a multiple of 8, as for bf16-stored
+            # parameters, `SumLayer._cuda_param_loads_aligned`; one sync a table, here once)
+            return layer.block_size % 8 == 0 and all(bool((t % 8 == 0).all()) for t in (*layer.partitioned_pids,
+                                                                                         *layer.partitioned_parpids))
+
+        readers = {}
+        for ns in self.root_ns:
+            if ns.is_sum():
+                readers[source(ns)] = readers.get(source(ns), 0) + 1
+        groups, ranges, sizes = [], set(), {}
+        for group in self.inner_layer_groups:
+            if not group.is_sum():
+                continue
+            marked = []
+            for layer in group:
+                takes = type(layer) is SumLayer or (isinstance(layer, ExternalParamsSumLayer)
+                                                   and layer.external_params.reads_param_operands)
+                srcs = [source(ns) for ns in layer.nodes] if takes else None
+                ok = srcs is not None and all(readers.get(s, 0) >= 2 for s in srcs) and aligned(layer)
+                layer.__dict__["_reads_param_operands"] = ok
+                marked.append(ok)
+                if ok:
+                    ranges.update(s._param_range for s in srcs)
+            if all(marked):
+                groups.append(group)
+                # (the parameters its layers read a sample -- their mean -- and the least its parameterizations
+                # take the copy from: `_param_operand_groups`)
+                sizes[id(group)] = (sum(layer.num_edges for layer in group) / len(group),
+                                    max(getattr(getattr(layer, "external_params", None), "param_operands_min_edges", 0)
+                                        for layer in group))
+        self.__dict__["_param_operand_sizes_"] = sizes
+        plan = self.__dict__["_param_operand_plan_"] = (frozenset(id(g) for g in groups), tuple(sorted(ranges)))
+        return plan
+
+    #: Overrides `_param_operand_groups`' rule: True gives the copy to every group it applies to, False to none; None:
+    #: the rule.
+    _param_operands_force: Optional[bool] = None
+
+    def _param_operand_groups(self, batch_size: int) -> frozenset:
+        """The groups (`_param_operand_plan`'s, by id) a pass at this batch size gives the bf16 copy (`_param_operands`,
+        where it applies; none: no copy made): those whose layers read enough parameters for the batch to make them
+        GPU-bound -- the parameters such a layer reads a sample (their mean over the group) times the batch at least
+        `_COPY_MIN_WORK` -- and at least what their parameterizations take it from
+        (`ExternalSumParams.param_operands_min_edges`). The kernels reading the copy are faster, but it costs host time
+        (made by every forward, handed through the layers), which a host-bound step pays in full while the GPU's
+        savings hide behind the host; a layer's GPU time grows with that work, its host time does not. A rule, not a
+        measurement of the caller's steps: every pass at a batch size computes with the same kernels -- the stream
+        kernels' bf16 products among them --, the first as the rest, as the kernels' own tuning keeps them (a
+        measurement would switch them while it measures). `_param_operands_force` overrides it."""
+        groups = self._param_operand_plan()[0]
+        force = self._param_operands_force
+        if force is not None:
+            return groups if force else frozenset()
+        cache = self.__dict__.setdefault("_param_operand_groups_", {})
+        taken = cache.get(batch_size)
+        if taken is None:
+            taken = cache[batch_size] = frozenset(
+                g for g, (edges, least) in self.__dict__["_param_operand_sizes_"].items()
+                if edges >= least and edges * batch_size >= _COPY_MIN_WORK)
+        return taken
+
+    def _param_operands(self, batch_size: int, refresh: Optional[bool] = True) -> Optional[torch.Tensor]:
+        """The bf16 copy of the fp32 parameters several sum layers share (`_param_operand_plan`), for those layers'
+        kernels whose products are bf16 under "auto" (`SumLayer.forward`'s and `backward`'s `op_params`): brought in
+        line with `params` by every forward that takes it (`_param_operand_groups`), inside its pass -- a graph recorded
+        from it copies them too; never keyed on a version counter, which a write through `params.data` does not move --,
+        and read by the backward that follows: the parameters its forward computed the node values with
+        (`_param_operands_made`); a backward whose forward made none (another precision, a batch below 16) makes it
+        before its pass. None where it does not apply: another
+        precision, below batch 16 (fp32 kernels in every mode), parameters stored below fp32 (the kernels read them as
+        they are), no such layer. ``refresh = False``: the buffer made, nothing copied (before a pass: a capture
+        allocates nothing); ``None``: copied unless the last forward made the copy in this buffer (the backward, before
+        its pass)."""
+        p = self.params
+        if self.precision != "auto" or batch_size < 16 or p.dtype != torch.float32 or not p.is_cuda:
+            return None
+        groups, ranges = self._param_operand_plan()
+        if not groups:
+            return None
+        op = self.__dict__.get("_param_operands_")
+        if op is None or op.device != p.device or op.numel() != p.numel():
+            op = self.__dict__["_param_operands_"] = torch.zeros(p.numel(), dtype = torch.bfloat16, device = p.device)
+            self.__dict__["_param_operands_made"] = False
+        if refresh is None:
+            refresh = not self.__dict__.get("_param_operands_made", False)
+        if refresh:
+            # The ranges' views, kept with the storage they slice rather than sliced again every call (one `copy_` a
+            # range): made anew once `params` is another tensor or its `.data` another storage -- the kept views hold
+            # the old storage, so no new one can start at its address
+            views = self.__dict__.get("_param_operands_views")
+            if views is None or views[0] is not p or views[1] != p.data_ptr() or views[2] is not op:
+                src = p.detach()
+                views = self.__dict__["_param_operands_views"] = (p, p.data_ptr(), op,
+                                                                  [(op[a:b], src[a:b]) for a, b in ranges])
+            for dst, src in views[3]:
+                dst.copy_(src)                               # (round to nearest even, as the kernels round)
+        return op
+
+    def _stream_fusion_groups(self, batch_size: int, sum_opts: dict, propagation_alg, op_groups) -> frozenset:
+        """The product layer groups (by index) whose forward the sum group above forms in its stream kernels' pre-pass
+        in a forward at this batch size (`SumLayer.forward`'s `stream_children`), the product layer's forward not
+        launched then: where every layer of that sum group is a plain `SumLayer` whose settled forward runs the stream
+        kernel and takes the fused copy (`SumLayer._stream_fusion`), and that copy MEASURES the faster -- against the
+        product group's forward and the sum group's (`autotune.pick`, keyed by the pair's shape; no margin: the same
+        bits either way, so the faster is taken). One more option of the tuners: decided once per batch size, at its
+        second plain forward (the first settles the layers' launches), and kept; none before, nor for a pass of another
+        regime (not LL, tempered, keyword arguments). Asked outside the pass: the trials run on the live buffers, whose
+        rows the pass then computes again."""
+        pt = sum_opts.get("pflow_temperature", 1.0)
+        if (propagation_alg != "LL" or pt != 1.0 or sum_opts.keys() - _STREAM_FUSION_FW_OPTS
+                or not self.node_mars.is_cuda):
+            return frozenset()
+        state = self.__dict__.setdefault("_stream_fusion_", {})
+        key = (batch_size, self.precision, self.params.dtype, op_groups, "sum_external_params" in sum_opts)
+        seen = state.get(key)
+        if isinstance(seen, frozenset):
+            return seen
+        if seen is None:                                     # (the first: the layers' launches settle in it)
+            state[key] = 1
+            return frozenset()
+        from pyjuice.layer.sum_layer import SumLayer
+        from pyjuice.layer.fused_children import element_children
+        import pyjuice.layer.kernels.autotune as autotune
+        tables = self.__dict__.get("_fused_child_tables")
+        if tables is None or len(tables) != len(self.inner_layer_groups):
+            tables = self.__dict__["_fused_child_tables"] = element_children(self)
+        groups, fused = self.inner_layer_groups, []
+        op = self._param_operands(batch_size, refresh = False) if op_groups else None
+        for k in range(len(groups) - 1):
+            prod, sumg = groups[k], groups[k + 1]
+            if not (prod.is_prod() and sumg.is_sum() and all(
+                    type(layer) is SumLayer or getattr(getattr(layer, "external_params", None), "fuses_stream_children",
+                                                       False) for layer in sumg)):
+                continue
+            opts = dict(sum_opts, op_params = op) if (op is not None and id(sumg) in op_groups) else sum_opts
+            plans = [layer._stream_fusion((batch_size, self.params.dtype, self.precision,
+                                           op is not None and id(sumg) in op_groups
+                                           and layer.__dict__.get("_reads_param_operands", False)), tables[k])
+                     for layer in sumg]
+            if any(plan is None for plan in plans):
+                continue
+            shape = ("prod_stream_fusion", batch_size, str(self.params.dtype), self.precision, op is not None,
+                     tuple((layer.num_nodes, layer.num_edges, layer.block_size, layer.num_fw_partitions) for layer in sumg),
+                     tuple((layer.num_nodes, layer.block_size) for layer in prod))
+
+            def bench(choice, prod = prod, sumg = sumg, opts = opts, table = tables[k]):
+                if choice == "fused":
+                    sumg.forward(self.node_mars, self.element_mars, self.params, propagation_alg = "LL",
+                                 stream_children = table, **opts)
+                else:
+                    prod.forward(self.node_mars, self.element_mars)
+                    sumg.forward(self.node_mars, self.element_mars, self.params, propagation_alg = "LL", **opts)
+            if autotune.pick(shape, ["unfused", "fused"], bench, margin = 1.0) == "fused":
+                fused.append(k)
+        state[key] = frozenset(fused)
+        return state[key]
+
+    def _stream_fusion_bk_groups(self, batch_size: int, sum_opts: dict, propagation_alg, op_groups) -> frozenset:
+        """The product layer groups (by index) whose backward this backward leaves to the sum group above: that group's
+        element flows by the stream kernel with the product fused into its merge, which writes the product's children's
+        node flows, and its parameter flows captured from the children (`SumLayer.backward`'s `stream_children`) -- so
+        the product layer's forward (the recompute) and backward are not launched. Where every layer of the sum group is
+        a plain `SumLayer` whose backward can take it (`SumLayer._stream_fusion_bk`: settled on the stream kernel,
+        parameter flows deferred), the products have two children each, and each of those children has no other parent
+        element in the circuit (its flow is the one element's: logaddexp(-inf, f) = f, what the product backward
+        writes); and where that MEASURES the faster -- the product layer's forward, the sum group's backward and the
+        product layer's backward against the sum group's fused backward, element flows only, into scratch flow buffers
+        (`autotune.pick`, keyed by the pair's shape; margin 1.0: the same bits). One more option of the tuners: decided
+        once per batch size at its second plain backward (the first settles the layers' kernels), and kept; none
+        before, nor for a backward of another regime (not LL in log space, tempered, negated or modified flows, keyword
+        arguments, layer callbacks)."""
+        if not (propagation_alg == "LL" and sum_opts.get("logspace_flows", False)
+                and not sum_opts.get("allow_modify_flows", False) and not sum_opts.get("negate_pflows", False)
+                and sum_opts.get("pflow_temperature", 1.0) == 1.0 and not sum_opts.get("temper_eflow", False)
+                and not (sum_opts.keys() - _STREAM_FUSION_BK_OPTS) and self.node_mars.is_cuda):
+            return frozenset()
+        pf = sum_opts.get("param_flows") is not None
+        state = self.__dict__.setdefault("_stream_fusion_bk_", {})
+        key = (batch_size, self.precision, self.params.dtype, op_groups, pf, "sum_external_params_buffer" in sum_opts)
+        seen = state.get(key)
+        if isinstance(seen, frozenset):
+            return seen
+        if seen is None:                                     # (the first: the layers' kernels settle in it)
+            state[key] = 1
+            return frozenset()
+        from pyjuice.layer.sum_layer import SumLayer
+        from pyjuice.layer.fused_children import element_children
+        import pyjuice.layer.kernels.autotune as autotune
+        tables = self.__dict__.get("_fused_child_tables")
+        if tables is None or len(tables) != len(self.inner_layer_groups):
+            tables = self.__dict__["_fused_child_tables"] = element_children(self)
+        parents = self.__dict__.get("_fused_child_parents")
+        if parents is None:                                  # (per node: its parent elements, over every product group)
+            parents = torch.zeros(self.num_nodes, dtype = torch.int32, device = self.node_mars.device)
+            for t in tables:
+                if t is not None:
+                    parents.index_add_(0, t[0].reshape(-1).long(), torch.ones_like(t[0].reshape(-1)))
+            parents = self.__dict__["_fused_child_parents"] = parents
+        groups, fused = self.inner_layer_groups, []
+        op = self._param_operands(batch_size, refresh = False) if op_groups else None
+        nf, ef = None, None
+        for k in range(len(groups) - 1):
+            prod, sumg = groups[k], groups[k + 1]
+            if not (prod.is_prod() and sumg.is_sum() and all(
+                    type(layer) is SumLayer or getattr(getattr(layer, "external_params", None), "fuses_stream_children",
+                                                       False) for layer in sumg)):
+                continue
+            table = tables[k]
+            given = op is not None and id(sumg) in op_groups
+            if not (table[0].size(1) == 2 and all(layer._stream_fusion_bk(
+                    batch_size, self.params.dtype, given and layer.__dict__.get("_reads_param_operands", False), pf)
+                    for layer in sumg)):
+                continue
+            if not bool((parents[table[0].reshape(-1).long()] == 1).all()):
+                continue
+            if nf is None:                                   # (scratch flows: the trials write children's rows; and
+                # node values: a gated layer's backward shifts its own rows by log Z and back, not to the bit)
+                nf, ef, nm = self.node_flows.clone(), self.element_flows.clone(), self.node_mars.clone()
+            opts = {k: v for k, v in sum_opts.items() if k not in _STREAM_FUSION_BK_GRADS}
+            opts.update(param_flows = None, denom_param_flows = None, defer_param_flows = False, pf_store_first = False,
+                        **(dict(op_params = op) if given else {}))
+            shape = ("prod_stream_fusion_bk", batch_size, str(self.params.dtype), self.precision, given,
+                     tuple((layer.num_nodes, layer.num_edges, layer.block_size, layer.num_bk_partitions) for layer in sumg),
+                     tuple((layer.num_nodes, layer.block_size) for layer in prod))
+
+            def bench(choice, prod = prod, sumg = sumg, opts = opts, table = table):
+                if choice == "fused":
+                    sumg.backward(nf, ef, nm, self.element_mars, self.params, propagation_alg = "LL",
+                                  stream_children = table, **opts)
+                else:
+                    prod.forward(nm, self.element_mars)
+                    sumg.backward(nf, ef, nm, self.element_mars, self.params, propagation_alg = "LL", **opts)
+                    prod.backward(nf, ef, logspace_flows = True)
+            if autotune.pick(shape, ["unfused", "fused"], bench, margin = 1.0) == "fused":
+                fused.append(k)
+        state[key] = frozenset(fused)
+        return state[key]
+
     def forward(self, inputs: torch.Tensor, input_layer_fn: Optional[Union[str,Callable]] = None,
                 cache: Optional[dict] = None, return_cache: bool = False, record_cudagraph: Optional[bool] = None, 
-                apply_cudagraph: bool = True, force_use_bf16: bool = False, force_use_fp32: bool = False, 
+                apply_cudagraph: bool = True, 
                 propagation_alg: Optional[Union[str,Sequence[str]]] = None, pflow_temperature: float = 1.0, 
                 _inner_layers_only: bool = False, _no_buffer_reset: bool = False, **kwargs):
         """
@@ -429,9 +640,15 @@ class TensorCircuit(nn.Module):
         :type apply_cudagraph: bool
         """
 
+        _pop_removed_precision_flags(kwargs)
+        self._num_runs = getattr(self, "_num_runs", 0) + 1
+
         with device_grad_controller(device = self.device, no_grad = True):
         
             B = inputs.size(0)
+            # (the groups this forward and its backward give the bf16 copy of shared parameters, if any:
+            # `_param_operand_groups`)
+            op_groups = self._param_operand_groups(B)
 
             origin_inputs = inputs
             if input_layer_fn is None:
@@ -492,20 +709,32 @@ class TensorCircuit(nn.Module):
             # Inner layers. Besides the buffers, everything they are given is in `sum_opts`, and a recorded
             # graph is keyed on that dict (`_graph_key_options`), so no option can reach a captured pass
             # without being part of its key.
-            sum_opts = dict(kwargs, force_use_bf16 = force_use_bf16, force_use_fp32 = force_use_fp32,
-                            pflow_temperature = pflow_temperature)
+            sum_opts = dict(kwargs, precision = self.precision, pflow_temperature = pflow_temperature)
 
             def _run_inner_layers():
+                # The buffers and parameters looked up once, and a group without hooks called at its `forward` -- what
+                # `nn.Module.__call__` does for it, less that call's 0.6 us (MEASURED, a step of an HMM: two groups)
+                node_mars, element_mars, params = self.node_mars, self.element_mars, self.params
+                per_layer_alg = not isinstance(propagation_alg, str)
+                # (the bf16 copy of shared fp32 parameters, made here, inside the pass: `_param_operands`)
+                op = self._param_operands(node_mars.size(1)) if op_groups else None
+                given = op_groups if op is not None else ()
                 for layer_id, layer_group in enumerate(self.inner_layer_groups):
+                    run = layer_group.forward if _calls_its_forward(layer_group) else layer_group
                     if layer_group.is_prod():
-                        # Prod layer
-                        layer_group(self.node_mars, self.element_mars)
+                        # Prod layer (none where the sum group above forms its values: `_stream_fusion_groups`)
+                        if layer_id not in fused:
+                            run(node_mars, element_mars)
 
                     elif layer_group.is_sum():
                         # Sum layer
-                        layer_group(self.node_mars, self.element_mars, self.params,
-                                    propagation_alg = propagation_alg if isinstance(propagation_alg, str) else propagation_alg[layer_id],
-                                    **sum_opts)
+                        alg = propagation_alg[layer_id] if per_layer_alg else propagation_alg
+                        extra = sum_opts if layer_id - 1 not in fused else \
+                            dict(sum_opts, stream_children = self.__dict__["_fused_child_tables"][layer_id - 1])
+                        if id(layer_group) in given:
+                            run(node_mars, element_mars, params, propagation_alg = alg, op_params = op, **extra)
+                        else:
+                            run(node_mars, element_mars, params, propagation_alg = alg, **extra)
 
                     else:
                         raise ValueError(f"Unknown layer type {type(layer)}.")
@@ -521,9 +750,17 @@ class TensorCircuit(nn.Module):
                 record, on_repeat = self.cuda_graphs, True          # the circuit's default: OFF unless compiled with it
             else:
                 record, on_repeat = False, False
+            # (the copy's buffer made outside a capture; whether this pass makes the copy -- eagerly or replayed from a
+            # graph, which runs none of `_run_inner_layers` -- kept for the backward that follows)
+            made = bool(op_groups) and self._param_operands(B, refresh = False) is not None
+            # (the product layer groups this pass leaves to the stream kernels of the sum group above: decided before
+            # the pass, outside a capture)
+            fused = self._stream_fusion_groups(B, sum_opts, propagation_alg, op_groups)
             self._run_inner_pass(_run_inner_layers, 0, (self.node_mars, self.element_mars, self.params),
-                                 self._graph_key_options(sum_opts, propagation_alg = propagation_alg),
+                                 self._graph_key_options(sum_opts, propagation_alg = propagation_alg,
+                                                         param_operands = op_groups, stream_fusion = fused),
                                  record = record, apply = apply_cudagraph, record_on_repeat = on_repeat)
+            self.__dict__["_param_operands_made"] = made
             if record:
                 register_cudagraph_owner(self)
 
@@ -560,6 +797,63 @@ class TensorCircuit(nn.Module):
         else:
             return lls.clone()
 
+    def _plan_param_flow_stores(self, B: int, flows_memory: float, pflow_temperature: float, propagation_alg,
+                                defer: bool, mode = None):
+        """The pass's parameter-flow STORES. At `flows_memory = 0` every slot of `param_flows` is reset before the
+        layers add their flows; instead, walking the sum layers in backward order, a partition whose kernel can store
+        (`SumLayer.param_flow_slot_plan`) and whose slots no earlier writer of the pass touched STORES them -- the reset
+        folded into its write --, and only the slots no storing writer covers are zeroed (`init_param_flows`'s
+        `_zero_ranges`; among them every slot written by an accumulating kernel and every slot nobody writes). Sets each
+        layer's `_pf_store_flags` (partition -> stores) for the pass -- read only by a backward given `pf_store_first`, the
+        circuit's option for this pass, so a layer's backward called on its own accumulates; the plan is cached per (batch, options). At any
+        other memory the flows are scaled as before and nothing stores. Returns the ranges to zero, or None for all.
+        The input layers' flow buffers are separate and untouched."""
+        groups = self.inner_layer_groups
+        sums = self.__dict__.get("_pf_sum_layers")
+        if sums is None:                                   # (the sum layers in backward order, once)
+            sums = self.__dict__["_pf_sum_layers"] = [(lid, layer) for lid in range(len(groups) - 1, -1, -1)
+                                                       if groups[lid].is_sum() for layer in groups[lid]]
+        if flows_memory != 0.0 or not sums:
+            if self.__dict__.get("_pf_applied_key") is not None:
+                for _, layer in sums:
+                    layer.__dict__["_pf_store_flags"] = {}
+                    layer.__dict__["_pf_store_key"] = None
+                self.__dict__["_pf_applied_key"] = None
+            return None
+        key = (B, float(pflow_temperature), propagation_alg if isinstance(propagation_alg, str) else tuple(propagation_alg),
+               bool(defer), mode, self.num_param_flows)
+        plans = self.__dict__.setdefault("_pf_store_plans", {})
+        plan = plans.get(key)
+        if plan is None:
+            from pyjuice.layer.sum_layer import _merge_ranges, _ranges_overlap, _ranges_complement
+            seen = np.zeros((0, 2), dtype = np.int64)
+            stored, flags = [], []
+            for lid, layer in sums:
+                alg = propagation_alg if isinstance(propagation_alg, str) else propagation_alg[lid]
+                f = {}
+                for pid, (ranges, capable) in enumerate(layer.param_flow_slot_plan(B, pflow_temperature, alg, defer, mode)):
+                    store = capable and not _ranges_overlap(seen, ranges)
+                    f[pid] = store
+                    if store:
+                        stored.append(ranges)
+                    if ranges.shape[0]:
+                        seen = _merge_ranges(np.concatenate([seen, ranges]))
+                flags.append(f)
+            covered = _merge_ranges(np.concatenate(stored)) if stored else np.zeros((0, 2), dtype = np.int64)
+            zero = _ranges_complement(covered, self.num_param_flows)
+            if len(zero) > 256 or zero == [(0, self.num_param_flows)]:   # (too fragmented, or nothing stored: one zero pass)
+                zero = None
+            # (each layer's decisions as the tuple its launch-plan key holds, built once here)
+            plan = plans[key] = (flags, [tuple(sorted(f.items())) for f in flags], zero)
+            self.__dict__["_pf_applied_key"] = None        # (a new plan: the layers take its decisions below)
+        flags, keys, zero = plan
+        if self.__dict__.get("_pf_applied_key") != key:   # (the layers hold the last plan's decisions)
+            for (_, layer), f, k in zip(sums, flags, keys):
+                layer.__dict__["_pf_store_flags"] = f
+                layer.__dict__["_pf_store_key"] = k
+            self.__dict__["_pf_applied_key"] = key
+        return zero
+
     def backward(self, inputs: Optional[torch.Tensor] = None, 
                  ll_weights: Optional[torch.Tensor] = None,
                  compute_param_flows: bool = True, 
@@ -577,7 +871,6 @@ class TensorCircuit(nn.Module):
                  negate_pflows: bool = False,
                  _inner_layers_only: bool = False,
                  _disable_buffer_init: bool = False,
-                 force_use_fp32: bool = False,
                  pflow_temperature: float = 1.0,
                  temper_eflow: bool = False,
                  compute_external_grads: bool = True,
@@ -601,11 +894,13 @@ class TensorCircuit(nn.Module):
         :type apply_cudagraph: bool
         """
 
+        self._num_runs = getattr(self, "_num_runs", 0) + 1
         self._run_params["allow_modify_flows"] = allow_modify_flows
         self._run_params["propagation_alg"] = propagation_alg
         self._run_params["logspace_flows"] = logspace_flows
         self._run_params["negate_pflows"] = negate_pflows
-        self._run_params["force_use_fp32"] = force_use_fp32
+        self._run_params["precision"] = self.precision
+        _pop_removed_precision_flags(kwargs)
         self._run_params["pflow_temperature"] = pflow_temperature
         self._run_params["temper_eflow"] = temper_eflow
 
@@ -659,8 +954,15 @@ class TensorCircuit(nn.Module):
                 self.node_flows[:,:] = cache["node_flows"]
 
             ## Initialize parameter flows ##
+            # (`flows_memory = 0`: the pass's first writer of a slot stores it, the reset folded into its write --
+            # `_plan_param_flow_stores`; only the slots no storing writer covers are zeroed here)
+            pf_defer = sum_layer_pre_backward_callback is None and sum_layer_post_backward_callback is None
             if compute_param_flows:
-                self.init_param_flows(flows_memory = flows_memory)
+                zero_ranges = self._plan_param_flow_stores(B, flows_memory, pflow_temperature, propagation_alg, pf_defer,
+                                                           kwargs.get("mode"))
+                self.init_param_flows(flows_memory = flows_memory, _zero_ranges = zero_ranges)
+            else:
+                self._plan_param_flow_stores(B, 1.0, pflow_temperature, propagation_alg, pf_defer)   # (flags cleared)
 
             ## External parameters: reuse what the forward staged; reset the gradient buffers ##
             self._check_external_params_kwargs(kwargs)
@@ -672,28 +974,41 @@ class TensorCircuit(nn.Module):
             # Inner layers. As in `forward`, everything the sum layers are given besides the buffers is in
             # `sum_opts`, which is also what a recorded graph is keyed on. A query's `compute_param_flows =
             # False` used to replay a training step's graph, which writes parameter flows.
+            #
+            # `defer_param_flows`: a layer may leave its parameter flows to the end of the pass (`deferred_scope`, e.g.
+            # a tied group's, added by one contraction) -- not when a layer callback is given, which sees the flows
+            # between layers.
             sum_opts = dict(kwargs,
                             param_flows = self.param_flows if compute_param_flows else None,
                             denom_param_flows = self.denom_param_flows if compute_param_flows else None,
                             allow_modify_flows = allow_modify_flows, logspace_flows = logspace_flows,
-                            negate_pflows = negate_pflows, force_use_fp32 = force_use_fp32,
-                            pflow_temperature = pflow_temperature, temper_eflow = temper_eflow)
+                            negate_pflows = negate_pflows, precision = self.precision,
+                            pflow_temperature = pflow_temperature, temper_eflow = temper_eflow,
+                            defer_param_flows = compute_param_flows and pf_defer,
+                            pf_store_first = compute_param_flows and flows_memory == 0.0)
 
-            def _run_inner_layers():
+            def _inner_layers():
+
+                # The bf16 copy of shared fp32 parameters, for the element kernels of the layers that read it
+                # (`_param_operands`, `SumLayer.backward`'s `op_params`): the forward's, or made before this pass
+                op = self._param_operands(B, refresh = False) if op_groups else None
+                given = op_groups if op is not None else ()
 
                 # Backward pass for inner layers
                 for layer_id in range(len(self.inner_layer_groups) - 1, -1, -1):
                     layer_group = self.inner_layer_groups[layer_id]
 
                     if layer_group.is_prod():
-                        # Prod layer
-                        layer_group.backward(self.node_flows, self.element_flows, logspace_flows = logspace_flows)
+                        # Prod layer (none where the sum group above wrote its children's flows: `_stream_fusion_bk_groups`)
+                        if layer_id not in fused_bk:
+                            layer_group.backward(self.node_flows, self.element_flows, logspace_flows = logspace_flows)
 
                     elif layer_group.is_sum():
                         # Sum layer
 
-                        # First recompute the previous product layer
-                        self.inner_layer_groups[layer_id-1].forward(self.node_mars, self.element_mars)
+                        # First recompute the previous product layer (none where this group forms its values itself)
+                        if layer_id - 1 not in fused_bk:
+                            self.inner_layer_groups[layer_id-1].forward(self.node_mars, self.element_mars)
 
                         # Execute pre-backward callback
                         layer_group.callback(
@@ -707,9 +1022,15 @@ class TensorCircuit(nn.Module):
                         )
 
                         # Backward sum layer
-                        layer_group.backward(self.node_flows, self.element_flows, self.node_mars, self.element_mars, self.params,
-                                             propagation_alg = propagation_alg if isinstance(propagation_alg, str) else propagation_alg[layer_id],
-                                             **sum_opts)
+                        alg = propagation_alg if isinstance(propagation_alg, str) else propagation_alg[layer_id]
+                        extra = sum_opts if layer_id - 1 not in fused_bk else \
+                            dict(sum_opts, stream_children = self.__dict__["_fused_child_tables"][layer_id - 1])
+                        if id(layer_group) in given:
+                            layer_group.backward(self.node_flows, self.element_flows, self.node_mars, self.element_mars,
+                                                 self.params, propagation_alg = alg, op_params = op, **extra)
+                        else:
+                            layer_group.backward(self.node_flows, self.element_flows, self.node_mars, self.element_mars,
+                                                 self.params, propagation_alg = alg, **extra)
 
                         # Execute post-backward callback
                         layer_group.callback(
@@ -725,12 +1046,29 @@ class TensorCircuit(nn.Module):
                     else:
                         raise ValueError(f"Unknown layer type {type(layer)}.")
 
+            def _run_inner_layers():
+                # What the layers deferred to the end of the pass, run inside it: a graph recorded from the pass replays it
+                with deferred_scope() as deferred:
+                    _inner_layers()
+                    deferred.run()
+
             # Callbacks run inside the captured region and could do anything, so they make the pass eager.
             use_graphs = sum_layer_pre_backward_callback is None and sum_layer_post_backward_callback is None
             record, on_repeat = (self.cuda_graphs, True) if record_cudagraph is None else (record_cudagraph, False)
+            # The copy the forward made -- the parameters it computed the node values with -- else made here, before the
+            # pass (outside a capture, so a replayed pass is preceded by it as an eager one is); for the groups that take
+            # it at this batch size (`_param_operand_groups`), as its forward's did
+            op_groups = self._param_operand_groups(B)
+            if op_groups:
+                self._param_operands(B, refresh = None)
+            # (the product layer groups whose forward and backward the sum group above takes over: decided before the
+            # pass, outside a capture; not where the flows did not start at -inf -- buffers kept or loaded from a cache)
+            fused_bk = (self._stream_fusion_bk_groups(B, sum_opts, propagation_alg, op_groups)
+                        if use_graphs and not _disable_buffer_init and cache is None else frozenset())
             self._run_inner_pass(_run_inner_layers, 1,
                                  (self.node_flows, self.element_flows, self.node_mars, self.element_mars, self.params),
-                                 self._graph_key_options(sum_opts, propagation_alg = propagation_alg),
+                                 self._graph_key_options(sum_opts, propagation_alg = propagation_alg,
+                                                         param_operands = op_groups, stream_fusion_bk = fused_bk),
                                  record = use_graphs and record, apply = use_graphs and apply_cudagraph,
                                  record_on_repeat = on_repeat, reads_layer_states = True)
 
@@ -767,654 +1105,6 @@ class TensorCircuit(nn.Module):
         else:
             return None
 
-    def _write_external_params_grads(self) -> None:
-        """
-        Copy the gradients into the buffers the caller supplied to `sum_external_params_grad`.
-
-        The kernels write the PC's internal buffer, which is in STORAGE layout (batch innermost); the
-        caller's tensors are in the layout they supplied the gates in. `from_storage` is what maps
-        between the two, so this is the exact inverse of what staging does on the forward, batched into
-        one `_foreach_copy_` rather than one op per node.
-        """
-        dsts = getattr(self, "_external_grad_dsts", None)
-        if not dsts:
-            return None
-
-        d, s = [], []
-        for ns, tensors in dsts.items():
-            src = ns.external_params.from_storage(ns, self._staged_external_params_grad[ns])
-            if torch.is_tensor(tensors):
-                tensors = (tensors,)
-            for dst, one in zip(tensors, src):
-                d.append(dst)
-                s.append(one)
-
-        if d:
-            torch._foreach_copy_(d, s)
-
-        self._external_grad_dsts = None
-
-    def _external_params_layout(self, batch_size: int):
-        """
-        Slot layout of the external-parameter staging buffer at `batch_size`.
-
-        Every node that takes external parameters gets its own contiguous slot for each tensor its
-        parameterization declares, laid out in `external_params_nodes` order. The shapes come from the
-        descriptor, so the layout is whatever the parameterization says it is; the buffer just gives
-        every tensor a known, contiguous home that the kernels can address and that keeps a stable
-        pointer across calls (which is what lets the caller pass freshly allocated tensors, and lets
-        the layers run under CUDA-graph capture).
-
-        Cached per batch size, since that is the only thing the layout depends on.
-
-        :returns: `(total_numel, {ns: [(offset, shape), ...]})`
-        """
-        layout = self._external_params_layouts.get(batch_size, None)
-        if layout is not None:
-            return layout
-
-        # Two passes so that a node may share another node's slots (see
-        # `ExternalSumParams.storage_owner`): allocate for the owners first, then alias the rest onto
-        # them. Aliased nodes still appear in the map, so the layers and kernels need no special case --
-        # they look up their own `ns` and simply find the same memory.
-        offset = 0
-        ns2slots = dict()
-        for ns in self.external_params_nodes:
-            if ns.external_params.storage_owner(ns) is not ns:
-                continue
-
-            slots = []
-            for shape in ns.external_params.storage_shapes(ns, batch_size):
-                slots.append((offset, tuple(shape)))
-                offset += math.prod(shape)
-
-            ns2slots[ns] = slots
-
-        for ns in self.external_params_nodes:
-            owner = ns.external_params.storage_owner(ns)
-            if owner is not ns:
-                assert owner in ns2slots, \
-                    f"`storage_owner` of {ns} is not itself an external-parameter node of this circuit."
-                ns2slots[ns] = ns2slots[owner]
-
-        layout = (offset, ns2slots)
-        self._external_params_layouts[batch_size] = layout
-
-        return layout
-
-    def _external_params_views(self, name: str, batch_size: int, set_value: Optional[float] = None):
-        """
-        (Re)allocate the staging buffer `name` for `batch_size` and return one contiguous view per
-        tensor slot, as `{ns: (view, ...)}`.
-
-        The views are what the layers and kernels consume, so a parameterization never has to know
-        that a shared buffer exists -- it just receives correctly shaped, contiguous, correctly placed
-        tensors.
-        """
-        total_numel, ns2slots = self._external_params_layout(batch_size)
-
-        self._init_buffer(name = name, shape = (total_numel,), set_value = set_value)
-
-        buffer = self.__dict__[name]
-
-        # Building these is pure Python -- one slice and one view per node -- and it runs on every
-        # forward. On a 32-timestep gated HMM it was 67 us of the 111 us the whole staging cost, six
-        # times what the copy itself takes, so it is cached. The views depend only on the layout (fixed
-        # per batch size) and the buffer's identity, so the check is `is` against the tensor the
-        # allocation just returned: a reallocation -- a new batch size, a `.to(device)` -- hands back a
-        # different object and rebuilds. `_init_buffer` still runs every time, since it is also what
-        # zeroes the gradient buffer.
-        #
-        # The returned dict is SHARED between calls. Both callers copy it into a `StagedExternalParams`
-        # before deleting entries, so nothing mutates it; a new caller must do the same.
-        key = (name, batch_size)
-        cached = self._external_params_views_cache.get(key)
-        if cached is not None and cached[0] is buffer:
-            return cached[1]
-
-        views = {ns: tuple(buffer[offset:offset + math.prod(shape)].view(shape)
-                           for offset, shape in slots)
-                 for ns, slots in ns2slots.items()}
-        self._external_params_views_cache[key] = (buffer, views)
-        return views
-
-    def register_external_params_group(self, name: str, nodes: Sequence[CircuitNodes],
-                                       dim: int = 1) -> None:
-        """
-        Address several nodes' external parameters with ONE concatenated tensor, under a name.
-
-        Nodes that share a parameterization usually share a shape too -- an HMM's per-timestep
-        transitions being the case this exists for -- and a head producing them naturally emits one
-        tensor already. Without a group the caller has to slice that tensor apart before every call,
-        once per node, only for the PC to copy each piece separately.
-
-        Once registered, the name is usable wherever an `ns` key is:
-
-        .. code-block:: python
-
-            pc.register_external_params_group("router", [t0, t1, t2])
-            pc(x, sum_external_params = {"router": phi})        # phi: [B, 3 * Nk, Ck]
-
-        and may be mixed freely with per-node entries in the same dict.
-
-        Members are split along `dim` by their OWN extents, so they need not have equal shapes there --
-        only on every other axis. Nothing is copied: each member receives a view.
-
-        :note: order is significant. `nodes[i]` receives the i-th slice, so the list is the contract.
-
-        :note: for a parameterization with several tensors per node (low-rank factors, say) the value
-               is a tuple of concatenated tensors, one per slot, each split the same way.
-
-        :param name: the key to use in `sum_external_params`
-        :type name: str
-
-        :param nodes: the nodes this group addresses, in slice order
-        :type nodes: Sequence[CircuitNodes]
-
-        :param dim: axis of the concatenation. Defaults to 1, the first non-batch axis; `0` is the
-                    batch and is rejected.
-        :type dim: int
-        """
-        assert isinstance(name, str) and name != "", "An external-parameter group needs a non-empty name."
-        assert name not in self.external_params_groups, \
-            f"External-parameter group '{name}' is already registered."
-        assert len(nodes) > 0, f"External-parameter group '{name}' is empty."
-        assert dim != 0, \
-            "`dim = 0` is the batch axis; a group concatenates along a PARAMETER axis (default 1)."
-
-        seen = set()
-        for ns in nodes:
-            assert ns in self.external_params_nodes, \
-                f"External-parameter group '{name}' contains a node this PC did not compile with an " \
-                f"external parameterization. Construct it with `pyjuice.summate(..., external_params = ...)`."
-            if id(ns) in seen:
-                raise AssertionError(f"External-parameter group '{name}' lists the same node twice.")
-            seen.add(id(ns))
-
-        sigs = {ns.external_params.get_signature() for ns in nodes}
-        assert len(sigs) == 1, \
-            f"External-parameter group '{name}' mixes parameterizations {sigs}; one concatenated " \
-            f"tensor cannot serve nodes whose layouts differ."
-
-        # Members that SHARE storage (a tied node and its copies) are fed once, by the owner. Handing
-        # such a pair two different slices is a contradiction, and silently letting one win would apply
-        # the wrong gate to the other -- so it is rejected here rather than resolved arbitrarily.
-        owners = [ns.external_params.storage_owner(ns) for ns in nodes]
-        if len(set(id(o) for o in owners)) != len(owners):
-            raise AssertionError(
-                f"External-parameter group '{name}' contains nodes that share one external tensor "
-                f"(`tie_external`). They are supplied once, through the storage owner, so they cannot "
-                f"also take separate slices of a concatenated tensor."
-            )
-
-        # Shapes must agree everywhere except along `dim`. Checked once, at registration, on a nominal
-        # batch of 1: the shapes are affine in the batch, so the comparison holds for every batch.
-        shapes = [ns.external_params.tensor_shapes(ns, 1) for ns in nodes]
-        n_slots = len(shapes[0])
-        assert all(len(sh) == n_slots for sh in shapes), \
-            f"External-parameter group '{name}' mixes nodes with different numbers of tensors."
-        for slot in range(n_slots):
-            ref = list(shapes[0][slot])
-            nd = len(ref)
-            assert -nd <= dim < nd, \
-                f"`dim = {dim}` is out of range for slot {slot} of group '{name}', whose tensors " \
-                f"have {nd} axes."
-            axis = dim % nd
-            for i, sh in enumerate(shapes[1:], start = 1):
-                got = list(sh[slot])
-                if [d for a, d in enumerate(got) if a != axis] != [d for a, d in enumerate(ref) if a != axis]:
-                    raise AssertionError(
-                        f"External-parameter group '{name}': node {i}'s slot-{slot} shape {tuple(got)} "
-                        f"disagrees with node 0's {tuple(ref)} on an axis other than {axis}."
-                    )
-
-        self.external_params_groups[name] = (list(nodes), int(dim))
-
-    def unregister_external_params_group(self, name: str) -> None:
-        """Remove a group registered by :func:`register_external_params_group`."""
-        assert name in self.external_params_groups, \
-            f"No external-parameter group named '{name}'."
-        del self.external_params_groups[name]
-
-    def _group_fast_stage(self, name: str, tensors, views: dict, batch_size: int,
-                          buffer: Optional[torch.Tensor] = None):
-        """
-        `(destination, source)` staging a WHOLE group in one transpose, or None if it cannot.
-
-        Splitting a group into per-node views is correct but costs: each slice of a batch-first
-        concatenated tensor is strided, so every member falls off the tiled-transpose path onto the
-        generic copy, and the group ends up SLOWER to stage than the per-node form it replaces.
-
-        It does not have to. When the members' slots happen to be adjacent in the staging buffer and
-        in the group's own order -- which is what compiling an HMM's transitions in depth order
-        produces -- the whole group is one contiguous destination, and `[B, sum Nk, Ck]` maps onto it
-        by exactly the transpose the fast kernel already does. One copy instead of T.
-
-        Every precondition is checked rather than assumed; anything unmet just returns None and the
-        per-member path runs.
-        """
-        nodes, dim = self.external_params_groups[name]
-
-        # `dim = 1` is what makes the concatenated axis the OUTERMOST storage axis, so that
-        # concatenating along it is the same thing as laying the members out back to back.
-        if dim != 1 or len(nodes) < 2:
-            return None
-
-        ep = nodes[0].external_params
-        perm = ep.storage_perm()
-        if not (perm is not None
-                and type(ep).to_storage is ExternalSumParams.to_storage
-                and tuple(perm) == tuple(range(1, len(perm))) + (0,)):
-            return None
-
-        if torch.is_tensor(tensors):
-            tensors = (tensors,)
-        if len(tensors) != 1:                       # one slot per node; the multi-slot case splits
-            return None
-        cat = tensors[0]
-        if not (cat.is_contiguous() and cat.dtype == torch.float32 and cat.dim() >= 3):
-            return None
-
-        base = views[nodes[0]][0]
-        # The buffer being staged INTO, which is not always the forward's: an unconditional
-        # `queries.sample()` stages into a private slab so it cannot disturb what the forward left
-        # for its backward, and `self.external_params` is then `None` on a circuit that has only
-        # ever been sampled from.
-        buf = buffer if buffer is not None else self.external_params
-        elem = buf.element_size()
-        total = 0
-        for ns in nodes:
-            d = views[ns][0]
-            if d.data_ptr() != base.data_ptr() + total * elem:
-                return None                          # not adjacent, or not in the group's order
-            total += d.numel()
-
-        if total != cat.numel():
-            return None
-        start = (base.data_ptr() - buf.data_ptr()) // elem
-        return buf.narrow(0, start, total), cat
-
-    def _expand_external_params_groups(self, ns2tensors: dict, batch_size: int) -> dict:
-        """
-        Replace every group-name key with one entry per member, holding a VIEW of the caller's tensor.
-
-        Splitting rather than copying is the point: the per-node staging below already accepts
-        arbitrary strides, so the views cost nothing here and the single batched copy absorbs them.
-        """
-        if not any(isinstance(k, str) for k in ns2tensors):
-            return ns2tensors
-
-        # Collected up front, because dict order is the caller's: a node supplied both directly and
-        # through a group must be caught whichever key comes first.
-        bare = {k for k in ns2tensors if not isinstance(k, str)}
-        claimed = {}
-
-        out = {}
-        for key, tensors in ns2tensors.items():
-            if not isinstance(key, str):
-                out[key] = tensors
-                continue
-
-            assert key in self.external_params_groups, \
-                f"`{EXTERNAL_PARAMS_KWARG}` names an unregistered external-parameter group: '{key}'. " \
-                f"Register it with `pc.register_external_params_group('{key}', [...])`."
-            nodes, dim = self.external_params_groups[key]
-
-            if torch.is_tensor(tensors):
-                tensors = (tensors,)
-            n_slots = len(nodes[0].external_params.tensor_shapes(nodes[0], batch_size))
-            assert len(tensors) == n_slots, \
-                f"External-parameter group '{key}' expects {n_slots} concatenated tensor(s), got " \
-                f"{len(tensors)}."
-
-            splits = []
-            for slot, cat in enumerate(tensors):
-                assert torch.is_tensor(cat), \
-                    f"External-parameter group '{key}', slot {slot}: expected a tensor, got {type(cat)}."
-                sizes = [ns.external_params.tensor_shapes(ns, batch_size)[slot] for ns in nodes]
-                axis = dim % len(sizes[0])
-                want = list(sizes[0])
-                want[axis] = sum(int(s[axis]) for s in sizes)
-                assert tuple(cat.size()) == tuple(want), \
-                    f"External-parameter group '{key}', slot {slot}: expected the concatenation of " \
-                    f"{len(nodes)} tensors along axis {axis}, i.e. shape {tuple(want)}, got " \
-                    f"{tuple(cat.size())}."
-                splits.append(torch.split(cat, [int(s[axis]) for s in sizes], dim = axis))
-
-            for i, ns in enumerate(nodes):
-                assert ns not in bare, \
-                    f"`{EXTERNAL_PARAMS_KWARG}` supplies a node both directly and through group '{key}'."
-                assert ns not in claimed, \
-                    f"`{EXTERNAL_PARAMS_KWARG}` supplies a node through two groups, "\
-                    f"'{claimed[ns]}' and '{key}'."
-                claimed[ns] = key
-                out[ns] = tuple(sp[i] for sp in splits)
-
-        return out
-
-    def _stage_external_params(self, kwargs: dict, batch_size: int,
-                               name: str = "external_params") -> None:
-        """
-        Copy the caller's external tensors into the staging buffer and replace the `sum_external_params`
-        entry with views into it, so the layers only ever see the buffer.
-
-        This is what decouples the caller's memory layout from the kernels'. The caller may hand over
-        slices of whatever their own head produced -- strided, freshly allocated each step, in any
-        arrangement -- and the layers still receive contiguous tensors at a stable address. The copy is
-        issued as ONE batched op rather than one per tensor: a per-tensor `copy_` would cost a kernel
-        launch per node, which for a model with many tied copies would dominate the correction itself.
-
-        Called from the forward pass. The backward reuses what was staged here rather than asking for
-        the tensors again, which also makes it impossible to run a backward whose external parameters
-        disagree with the forward that produced `node_mars`.
-
-        :note: what is staged always describes the MOST RECENT forward, including when that forward
-               supplied nothing -- see below.
-
-        :param name: which staging buffer to use. A caller that is NOT a forward pass -- an
-                     unconditional `queries.sample()` -- must pass its own name and gets a private
-                     slab, leaving `_staged_external_params` and the forward's views untouched.
-                     Sharing the default buffer is not merely untidy: `_external_params_views`
-                     reallocates it whenever the batch size differs, so a draw between a forward and
-                     its backward would invalidate the forward's views IN PLACE, and clearing the
-                     field would make the backward run ungated against gated `node_mars`.
-        """
-        owns_forward_state = (name == "external_params")
-        ns2tensors = kwargs.get(EXTERNAL_PARAMS_KWARG, None)
-
-        if ns2tensors is None:
-            # This forward runs the gated layers as plain sum layers, so whatever was staged earlier
-            # no longer describes the state `node_mars` was computed in. DROPPING it is what keeps the
-            # staged tensors a description of the latest forward rather than of some earlier one.
-            #
-            # Leaving them in place is a quiet trap, because the two consumers that read this field --
-            # `pc.backward()` and a conditional `queries.sample()` -- take it unconditionally. An
-            # ungated forward between a gated one and its consumer then applied a stale gate: at a
-            # matching batch size silently, and at a differing one as a confusing shape error from
-            # deep inside the sampler. `lls.backward()` was never exposed to it, since the hook
-            # carries the kwargs of the forward that registered it.
-            #
-            # The cost is that a FORGOTTEN gate is now silent rather than loud: the backward or draw
-            # simply runs ungated, consistent with the forward it follows. That is the honest reading
-            # of "no external parameters were supplied", and alternating gated and ungated forwards is
-            # legitimate (an ungated baseline likelihood, a marginal query), so it is not warned about.
-            if owns_forward_state:
-                self._staged_external_params = None
-            return None
-
-        if isinstance(ns2tensors, StagedExternalParams):
-            # Already staged: the caller handed back a dict this method produced. Not hypothetical --
-            # `forward` mutates `kwargs` in place and then registers the backward hook with `**kwargs`,
-            # so a staged dict really does come back round, and clearing here would break it.
-            return None
-
-        views = StagedExternalParams(self._external_params_views(
-            name = name, batch_size = batch_size
-        ))
-
-        # A group whose members land on a contiguous run of the buffer stages as ONE transpose; the
-        # rest resolve to per-node views and go through the loop below, which never learns that groups
-        # exist. Tried before the expansion because it is the concatenated tensor that is contiguous,
-        # not the slices of it.
-        # Conflicts are checked HERE, on the caller's dict, before either staging path touches it: a
-        # group taken wholesale is dropped before the expansion below, so the expansion's own check
-        # would never see it.
-        _bare = {k for k in ns2tensors if not isinstance(k, str)}
-        _claimed = {}
-        for key in ns2tensors:
-            if not isinstance(key, str):
-                continue
-            assert key in self.external_params_groups, \
-                f"`{EXTERNAL_PARAMS_KWARG}` names an unregistered external-parameter group: '{key}'. " \
-                f"Register it with `pc.register_external_params_group('{key}', [...])`."
-            for ns in self.external_params_groups[key][0]:
-                assert ns not in _bare, \
-                    f"`{EXTERNAL_PARAMS_KWARG}` supplies a node both directly and through group '{key}'."
-                assert ns not in _claimed, \
-                    f"`{EXTERNAL_PARAMS_KWARG}` supplies a node through two groups, " \
-                    f"'{_claimed[ns]}' and '{key}'."
-                _claimed[ns] = key
-
-        group_fast, group_done, fast_keys = [], set(), set()
-        for key, tensors in ns2tensors.items():
-            if not isinstance(key, str):
-                continue
-            assert key in self.external_params_groups, \
-                f"`{EXTERNAL_PARAMS_KWARG}` names an unregistered external-parameter group: '{key}'. " \
-                f"Register it with `pc.register_external_params_group('{key}', [...])`."
-            whole = self._group_fast_stage(key, tensors, views, batch_size,
-                                           buffer = self.__dict__[name])
-            if whole is not None:
-                group_fast.append(whole)
-                group_done.update(self.external_params_groups[key][0])
-                fast_keys.add(key)
-
-        # A group staged wholesale is dropped BEFORE the expansion: splitting it into T views and
-        # validating each, only for the loop below to skip them, was most of what was left of the cost.
-        if fast_keys:
-            ns2tensors = {k: v for k, v in ns2tensors.items() if k not in fast_keys}
-
-        ns2tensors = self._expand_external_params_groups(ns2tensors, batch_size)
-
-        # Validate against the buffer's own device rather than `self.device`, which may be index-less
-        # (`torch.device("cuda")`) and so compare unequal to an otherwise identical `cuda:0`
-        device = self.__dict__[name].device
-
-        dsts, srcs, fast = [], [], list(group_fast)
-        for ns, tensors in ns2tensors.items():
-            tensors = validate_external_tensors(
-                ns, ns.external_params, tensors, batch_size, device, require_contiguous = False
-            )
-
-            # The staging buffer may hold the tensors in a different LAYOUT than the caller uses --
-            # a different axis order (batch-innermost, so the kernels read them like `element_mars`),
-            # or a different shape entirely, where the caller's layout is the one that reads naturally
-            # for the model and storage keeps only the entries the kernels index. The copy absorbs
-            # whichever it is, so the caller never has to know about it.
-            #
-            # When that layout change is exactly "rotate the batch axis to the end", the copy is a
-            # transpose and gets the tiled kernel. Recognized from the DECLARED permutation -- a tuple
-            # comparison -- rather than from the tensors, so the test costs nothing per forward.
-            perm = ns.external_params.storage_perm()
-            rotates_batch = (perm is not None
-                             and type(ns.external_params).to_storage is ExternalSumParams.to_storage
-                             and tuple(perm) == tuple(range(1, len(perm))) + (0,))
-
-            if rotates_batch:
-                for dst, tensor in zip(views[ns], tensors):
-                    if tensor.is_contiguous() and tensor.dtype == torch.float32 and tensor.dim() >= 2:
-                        fast.append((dst, tensor))
-                    else:
-                        dsts.append(dst)
-                        srcs.append(tensor.permute(*range(1, tensor.dim()), 0))
-                continue
-
-            tensors = ns.external_params.to_storage(ns, tensors)
-
-            dsts.extend(views[ns])
-            srcs.extend(tensors)
-
-        _staged_copy(dsts, srcs, fast)
-
-        # Nodes the caller did NOT supply keep whatever the buffer held; drop them so a layer sees
-        # exactly the set that was staged.
-        #
-        # Membership is by STORAGE GROUP, not by node: when several nodes share one set of tensors (see
-        # `ExternalSumParams.storage_owner`) the caller supplies them once, and every node in that group
-        # is staged. Comparing node-by-node would keep only the one that was named and silently turn the
-        # rest into plain sum layers -- correct-looking output with the correction applied to one
-        # timestep out of many.
-        supplied_groups = {ns.external_params.storage_owner(ns)
-                           for ns in (set(ns2tensors) | group_done)}
-        for ns in list(views.keys()):
-            if ns.external_params.storage_owner(ns) not in supplied_groups:
-                del views[ns]
-
-        kwargs[EXTERNAL_PARAMS_KWARG] = views
-        kwargs[EXTERNAL_PARAMS_BUFFER_KWARG] = self.__dict__[name]
-        if owns_forward_state:
-            self._staged_external_params = views
-
-    def _resolve_backward_external_params(self, kwargs: dict) -> None:
-        """
-        Point the backward pass at the external parameters the forward actually staged.
-
-        The forward leaves `node_mars` in a form that only the matching external backward interprets
-        correctly, so running a backward against *different* external parameters -- or none -- would
-        silently produce wrong flows. Taking them from the staging buffer makes that impossible: the
-        values used are, by construction, the ones the forward used, and they are pyjuice's own
-        snapshot, so nothing the caller does to their tensors in between can perturb them.
-
-        A caller may still pass `sum_external_params` (the autograd hook forwards it), but it only has
-        to name the same set of nodes; the staged values are what gets used.
-        """
-        staged = self._staged_external_params
-
-        ns2tensors = kwargs.get(EXTERNAL_PARAMS_KWARG, None)
-        if ns2tensors is not None and not isinstance(ns2tensors, StagedExternalParams):
-            assert staged is not None, \
-                f"`{EXTERNAL_PARAMS_KWARG}` was given to the backward pass, but the forward pass did " \
-                f"not receive any external parameters."
-            named = set()
-            for k in ns2tensors:
-                named.update(self.external_params_groups[k][0] if isinstance(k, str) else [k])
-            assert named == set(staged.keys()), \
-                f"`{EXTERNAL_PARAMS_KWARG}` names a different set of nodes than the forward pass did."
-
-        if staged is not None:
-            kwargs[EXTERNAL_PARAMS_KWARG] = staged
-            kwargs[EXTERNAL_PARAMS_BUFFER_KWARG] = self.external_params
-
-    def _check_external_params_kwargs(self, kwargs: dict) -> None:
-        """
-        Check that every `sum_external_params` / `sum_external_params_grad` entry names a node this PC
-        actually compiled with an external parameterization.
-
-        Without this, a stale or mistyped `ns` key is silently ignored -- the PC runs on its shared
-        parameters and quietly returns a different answer than intended.
-        """
-        for kwarg_name in (EXTERNAL_PARAMS_KWARG,):
-            ns2tensors = kwargs.get(kwarg_name, None)
-            if ns2tensors is None:
-                continue
-
-            assert isinstance(ns2tensors, dict), \
-                f"`{kwarg_name}` should be a dict mapping nodes to tensors, got {type(ns2tensors)}."
-
-            for ns in ns2tensors:
-                if isinstance(ns, str):
-                    assert ns in self.external_params_groups, \
-                        f"`{kwarg_name}` names an unregistered external-parameter group: '{ns}'. " \
-                        f"Register it with `pc.register_external_params_group('{ns}', [...])`."
-                    continue
-                assert ns in self.external_params_nodes, \
-                    f"`{kwarg_name}` contains a node that this PC did not compile with an external " \
-                    f"parameterization: {ns}. Construct it with `pyjuice.summate(..., external_params = ...)`."
-
-    def _init_external_params_grads(self, kwargs: dict, batch_size: int, compute_external_grads: bool) -> None:
-        """
-        Allocate and zero the gradient buffer for the staged external parameters, and hand the layers
-        views into it.
-
-        It mirrors the value buffer slot for slot, so the gradient of a node's tensor lives at the
-        same offset as the tensor itself and :func:`get_external_params_grad` can hand back a view
-        rather than copying anything out. Zeroing happens once, here, because the layers ACCUMULATE --
-        which is what lets a node appear in several layers (a tied transition) and sum its
-        contributions.
-        """
-        # The caller may supply DESTINATIONS -- `{ns: buffer}` or `{group: buffer}`, exactly the
-        # forward's shape -- to have the gradients written into their own tensors. The kernels still
-        # write the PC's internal buffer (they address it by compiled offset), so this records the
-        # destinations and the copy-out happens once the backward is done; `get_external_params_grad`
-        # keeps working either way.
-        dsts = kwargs.pop(EXTERNAL_PARAMS_GRAD_KWARG, None)
-        self._external_grad_dsts = None
-        if dsts is not None:
-            assert isinstance(dsts, dict), \
-                f"`{EXTERNAL_PARAMS_GRAD_KWARG}` should be a dict mapping nodes (or group names) to " \
-                f"the buffers to fill, got {type(dsts)}."
-            assert self._staged_external_params is not None, \
-                f"`{EXTERNAL_PARAMS_GRAD_KWARG}` was given, but the forward pass received no external " \
-                f"parameters."
-            dsts = self._expand_external_params_groups(dsts, batch_size)
-            for ns, tensors in dsts.items():
-                assert ns in self._staged_external_params, \
-                    f"`{EXTERNAL_PARAMS_GRAD_KWARG}` names {ns}, which was not given external " \
-                    f"parameters in the forward pass."
-                validate_external_tensors(ns, ns.external_params, tensors, batch_size,
-                                          self.external_params.device, require_contiguous = False)
-            self._external_grad_dsts = dsts
-            compute_external_grads = True          # asking for them is asking for them
-
-        if self._staged_external_params is None or not compute_external_grads:
-            self._staged_external_params_grad = None
-            return None
-
-        grad_views = StagedExternalParams(self._external_params_views(
-            name = "external_params_grad", batch_size = batch_size, set_value = 0.0
-        ))
-
-        # Only the nodes that actually got external parameters this pass
-        for ns in list(grad_views.keys()):
-            if ns not in self._staged_external_params:
-                del grad_views[ns]
-
-        kwargs[EXTERNAL_PARAMS_GRAD_KWARG] = grad_views
-        # The flat buffer too: a kernel that writes gradients addresses it with the same compiled
-        # offsets as the forward uses for the tensors themselves (the two buffers share a layout).
-        kwargs[EXTERNAL_PARAMS_GRAD_BUFFER_KWARG] = self.external_params_grad
-        self._staged_external_params_grad = grad_views
-
-    def get_external_params_grad(self, ns: CircuitNodes):
-        """
-        Per-sample gradients of the external parameters of `ns`, as computed by the last backward pass.
-
-        Returned as views into the PC's gradient buffer, laid out exactly like the tensors that were
-        supplied for `ns` -- so there is nothing to allocate and nothing to copy out. They are valid
-        until the next backward pass overwrites them; clone if you need to keep them.
-
-        :param ns: a node that was given external parameters in the last forward pass
-        :type ns: CircuitNodes
-
-        A group name registered with :func:`register_external_params_group` is also accepted, and
-        returns the members' gradients concatenated along the group's axis -- laid out exactly like the
-        tensor that was supplied. Unlike the forward, this one COPIES: the per-node gradients are views
-        into a buffer in which a group's members are not generally adjacent.
-
-        :returns: a tuple of gradient tensors, matching the tensors supplied for `ns`
-        """
-        if isinstance(ns, str):
-            assert ns in self.external_params_groups, f"No external-parameter group named '{ns}'."
-            nodes, dim = self.external_params_groups[ns]
-            per_node = [self.get_external_params_grad(m) for m in nodes]
-            n_slots = len(per_node[0])
-            axis = dim % per_node[0][0].dim()
-            return tuple(torch.cat([g[slot] for g in per_node], dim = axis) for slot in range(n_slots))
-
-        assert self._staged_external_params_grad is not None, \
-            "No external-parameter gradients are available. Run a forward pass with " \
-            f"`{EXTERNAL_PARAMS_KWARG}` and then a backward pass with `compute_external_grads = True`."
-        assert ns in self._staged_external_params_grad, \
-            f"No external-parameter gradients for {ns}; it was not given external parameters in the " \
-            f"last forward pass."
-
-        # Refused HERE rather than in the backward, because the buffer is allocated and zeroed by
-        # default (`compute_external_grads = True`): a parameterization that computes the element and
-        # parameter flows but not its own gradient would otherwise either break every backward or hand
-        # back a plausible-looking tensor of zeros.
-        if not ns.external_params.computes_external_grads:
-            raise NotImplementedError(
-                f"`{ns.external_params.get_signature()}` does not compute gradients with respect to "
-                f"its own parameters yet. The element and parameter flows it contributes ARE computed, "
-                f"so `pc.backward()` and the EM optimizers work; only this read is unavailable."
-            )
-
-        grad_tensors = self._staged_external_params_grad[ns]
-
-        # Stored in the kernels' layout; hand them back in the caller's, so they line up
-        # element-for-element with the tensors that were supplied.
-        return ns.external_params.from_storage(ns, grad_tensors)
-
     def forward_ll(self, *args, **kwargs):
         self.forward(*args, propagation_alg = "LL", **kwargs)
 
@@ -1423,424 +1113,6 @@ class TensorCircuit(nn.Module):
 
     def forward_general_ll(self, *args, alpha: float = 1.0, **kwargs):
         self.forward(*args, propagation_alg = "GeneralLL", **kwargs)
-
-    def _denom_correction_nss(self):
-        """The sum nodes whose EM update is the conditional `theta <- normalize(theta * F+ / F-)`, each
-        with every `(layer, member_ns)` holding denominator flow for its parameters.
-
-        These are the OWNERS of the parameters -- a tied copy is folded into its source, which is the
-        node whose `_param_range` the M-step writes. Structural, built at compile."""
-        return getattr(self, "_denom_sources_of_ns", {})
-
-    def _par_update_kwargs_excluding(self, ranges):
-        """`par_update_kwargs` with the blocks of `ranges` (parameter ranges) removed, cached.
-
-        `compile_par_update_fn` emits its blocks PER `ns` -- each entry's `par_start_ids` is that node's
-        `_param_range[0]` plus an offset, and tied nodes are skipped -- so no block straddles a range
-        boundary and selecting on `par_start_ids` is exact rather than approximate.
-
-        Used so the standard M-step does not compute an update for parameters the conditional one is
-        about to overwrite. That work was previously done and discarded: on a gated HMM the corrected
-        ranges are ~94% of the sum parameters, so almost the whole pass was wasted.
-
-        Returns the unfiltered kwargs when `ranges` is empty, which is every circuit without the
-        correction -- their behaviour is untouched.
-        """
-        if not ranges:
-            return self.par_update_kwargs
-
-        key = tuple(sorted(ranges))
-        cache = self.__dict__.setdefault("_par_update_excl_cache", {})
-        kwargs = cache.get(key)
-        if kwargs is None:
-            par_start_ids, pflow_start_ids, blk_sizes, blk_intervals, global_nids, nchs, \
-                cum_pflows, metadata = self.par_update_kwargs
-            keep = torch.ones(par_start_ids.size(0), dtype = torch.bool,
-                              device = par_start_ids.device)
-            for ps, pe in key:
-                keep &= ~((par_start_ids >= ps) & (par_start_ids < pe))
-            kwargs = cache[key] = [par_start_ids[keep].contiguous(),
-                                   pflow_start_ids[keep].contiguous(),
-                                   blk_sizes[keep].contiguous(),
-                                   blk_intervals[keep].contiguous(),
-                                   global_nids[keep].contiguous(),
-                                   nchs[keep].contiguous(), cum_pflows, metadata]
-        return kwargs
-
-    def mini_batch_em(self, step_size: float, pseudocount: float = 0.0, keep_zero_params: bool = False,
-                      step_size_rescaling: bool = False, use_cudagraph: bool = False,
-                      _apply_denom_correction: bool = True):
-        """
-        Perform an EM parameter update step using the accumulated parameter flows.
-
-        :param step_size: Step size - updated_params <- (1-step_size) * params + step_size * new_params
-        :type step_size: float
-
-        :param pseudocount: a pseudo count added to the parameter flows
-        :type pseudocount: float
-
-        :param keep_zero_params: if `True`, freeze exactly zero parameters; positive parameters are updated
-            regardless of their magnitude (no implicit pruning threshold)
-        :type keep_zero_params: bool
-
-        :param step_size_rescaling: whether to rescale the step size by flows
-        :type step_size_rescaling: bool
-
-        :param _apply_denom_correction: internal. `False` runs the PLAIN M-step even on a circuit whose
-            parameterization requests the denominator flow (``apply_z_correction``). For callers that use
-            this method as a RENORMALIZER rather than as an EM step -- the gradient optimizers project
-            back onto the normalized manifold with ``param_flows`` holding the partition flow and the
-            denominator deliberately zeroed -- the conditional update is not merely inappropriate, it
-            divides by `pseudocount * theta` and returns inf at ``pseudocount = 0``. Not for user code;
-            an EM caller always wants the default.
-        :type _apply_denom_correction: bool
-        """
-        assert not step_size_rescaling or self._cum_flow > 0.0, "Please perform a backward pass before calling `mini_batch_em`."
-        assert 0.0 < step_size <= 1.0, "`step_size` should be between 0 and 1."
-
-        # `apply_z_correction` + `step_size_rescaling` (Anemone) now agree: `init_param_flows` scales
-        # BOTH flows by `step_size / cum_flow`, and `eval_top_down_probs` adds the same
-        # `(1 - step_size) * P_td[n] * theta[n,c]` term to the denominator as it does to `param_flows`
-        # (see the note there for why the identical term is the right one) -- through
-        # `accumulate_denom_top_down`, since the denominator has its own layout. The conditional M-step
-        # below therefore sees a numerator and denominator built the same way.
-        with device_grad_controller(device = self.device, no_grad = True):
-
-            # Apply step size rescaling according to the mini-batch EM objective derivation
-            if step_size_rescaling:
-                self.init_param_flows(flows_memory = step_size / self._cum_flow)
-
-                eval_top_down_probs(self, update_pflow = True, scale = (1.0 - step_size), use_cudagraph = use_cudagraph)
-
-                self._cum_flow = 0.0 # Zero out the cumulative flow value
-                step_size = 1.0 # We have applied the step size within the parameter flows
-
-            # Update input layers
-            for layer in self.input_layer_group:
-                layer.mini_batch_em(step_size = step_size, pseudocount = pseudocount, keep_zero_params = keep_zero_params)
-
-            # Accumulate parameter flows of tied nodes
-            compute_cum_par_flows(self.param_flows, self.parflow_fusing_kwargs)
-
-            # Conditional dual-flow M-step (`apply_z_correction`): each requesting `ns` computes its own
-            # parameters from the pre-update `theta`, F+ and F-, and the standard M-step below runs only
-            # on the ranges it still OWNS. All gated on `denom_param_flows` -- an ordinary PC has none,
-            # `corrections` is empty, and nothing here changes its behaviour.
-            #
-            # No `compute_cum_par_flows` on the denominator: it is not laid out in `pfid` space, so the
-            # numerator's tie fusing does not apply to it. The tie group is passed to the descriptor
-            # instead (`denom_sources`), which sums the copies' flow as it reconstructs `F-`.
-            denom_param_flows = self.denom_param_flows if _apply_denom_correction else None
-            corrections = ([] if denom_param_flows is None
-                           else list(self._denom_correction_nss().items()))
-
-            # Normalize and update parameters. The skipped ranges' results were previously computed here
-            # and then overwritten -- ~94% of the sum parameters on a gated HMM.
-            kwargs = self._par_update_kwargs_excluding([ns._param_range for ns, _ in corrections])
-            if kwargs[0].size(0) > 0:            # every block may belong to a corrected range
-                em_par_update(self.params, self.param_flows, kwargs,
-                              step_size = step_size, pseudocount = pseudocount,
-                              keep_zero_params = keep_zero_params)
-
-            # The conditional update, writing `params` in place -- which is what removes BOTH the
-            # discarded pass above and a separate write-back. It reads the PRE-update `theta` of its own
-            # range, which the call above no longer touches, so the ordering is safe either way round.
-            for ns, sources in corrections:
-                ps, pe = ns._param_range
-                ns.external_params.compute_em_correction(
-                    ns, self.params, self.param_flows, denom_param_flows,
-                    step_size, pseudocount, keep_zero_params, denom_sources = sources,
-                    out = self.params[ps:pe])
-
-    def cumulate_flows(self, inputs: torch.Tensor, params: Optional[torch.Tensor] = None):
-        with torch.no_grad():
-            self.forward(inputs, params)
-            self.backward(inputs = inputs, compute_param_flows = True, flows_memory = 1.0)
-
-    def init_param_flows(self, flows_memory: float = 1.0, batch_size: Optional[int] = None):
-        """
-        Initialize parameter flows.
-
-        :param flows_memory: the number that the current parameter flows (if any) will be multiplied by; equivalent to zeroling the flows if set to 0
-        :type flows_memory: float
-        """
-
-        assert 0.0 <= flows_memory <= 1.0, f"`flows_memory` should be in [0.0, 1.0]"
-
-        if batch_size is None:
-            pflow_shape = (self.num_param_flows,)
-        else:
-            pflow_shape = (self.num_param_flows, batch_size)
-            
-        self._init_buffer(name = "param_flows", shape = pflow_shape)
-
-        if flows_memory != 1.0:
-            self.param_flows[:] *= flows_memory
-
-        # The denominator flow buffer rides the identical reset/scale cadence, so `zero_param_flows`
-        # (which routes through here) zeros it too, and Anemone's `flows_memory = step_size / cum_flow`
-        # scales numerator and denominator by the same factor. Allocated only on request -- an ordinary
-        # PC keeps it `None` and pays nothing.
-        #
-        # Its size is `num_denom_flows`, fixed at compile by the requesting parameterizations, NOT
-        # `pflow_shape`: the denominator is not a `param_flows` mirror. `BlockScaleSumParams` keeps the
-        # gate-space contraction `W[node, gate]` instead, which is `gate_cbs` times smaller (MEASURED
-        # 64x at a 1024-state gated HMM, 128x at 2048) and reconstructs `F-` at M-step time. Scaling
-        # still commutes with the reconstruction because `F- = theta * W` is linear in `W`.
-        if self._requests_denom_param_flows:
-            self._init_buffer(name = "denom_param_flows", shape = (self.num_denom_flows,))
-            if flows_memory != 1.0:
-                self.denom_param_flows[:] *= flows_memory
-
-        # For input layers
-        for layer in self.input_layer_group:
-            layer.init_param_flows(flows_memory = flows_memory)
-
-        return None
-
-    def sync_param_flows(self, dtype: Optional[torch.dtype] = None, op = None, group = None,
-                         sync_cum_flow: bool = True):
-        """
-        All-reduce the parameter flows across a ``torch.distributed`` process group, for DDP EM
-        training. Sums ``self.param_flows`` (sum layers) and every input layer's ``param_flows`` so
-        each rank ends up with the total flow over the global batch. Call after ``backward(...)`` and
-        before the EM update (``mini_batch_em`` / ``full_batch_em``); it replaces the hand-rolled
-        ``dist.all_reduce(pc.param_flows); for l in pc.input_layer_group: dist.all_reduce(l.param_flows)``.
-
-        :param dtype: if given (e.g. ``torch.bfloat16``), reduce in this lower precision to halve the
-            communication on bandwidth-bound interconnects (validated ~2x faster; the param-flow
-            rounding is benign, ~1e-4 ΔLL). Each buffer is cast, reduced, and copied back in place;
-            stored ``param_flows`` stay float32.
-        :param op:    reduction op (default ``ReduceOp.SUM`` — flows are additive across data shards).
-        :param group: process group (default: the default group).
-        :param sync_cum_flow: also reduce the EM normalizer ``_cum_flow`` with the same op (default
-            True), so the post-sync EM update is correct under load imbalance without a manual
-            ``_cum_flow *= world_size``. It's a 1-element collective and its readback is the sync the
-            EM update would force anyway -> no measurable overhead vs the param-flow reduce.
-
-        No-op if ``torch.distributed`` is unavailable / uninitialized / ``world_size == 1``.
-        """
-        import torch.distributed as dist
-        if not dist.is_available() or not dist.is_initialized() or dist.get_world_size(group) <= 1:
-            return None
-        if op is None:
-            op = dist.ReduceOp.SUM
-
-        tensors = []
-        if getattr(self, "param_flows", None) is not None:
-            tensors.append(self.param_flows)
-        # The denominator flow is additive across data shards exactly like the numerator, so it must be
-        # reduced too -- otherwise a DDP M-step would divide by a partial `F-`. It stays a single
-        # collective even though its layout is the parameterization's own: the PC keeps every requesting
-        # layer's slices in ONE flat tensor, and a gate-space accumulator sums over samples like any
-        # other flow. (`BlockScaleSumParams` also makes this the CHEAPER reduce of the two, since `W` is
-        # `gate_cbs` times smaller than the param-flow mirror it replaced.)
-        if getattr(self, "denom_param_flows", None) is not None:
-            tensors.append(self.denom_param_flows)
-        for layer in self.input_layer_group:
-            pf = getattr(layer, "param_flows", None)
-            if pf is not None:
-                tensors.append(pf)
-
-        for pf in tensors:
-            if dtype is not None and pf.dtype != dtype:
-                buf = pf.to(dtype)
-                dist.all_reduce(buf, op = op, group = group)
-                pf.copy_(buf)
-            else:
-                dist.all_reduce(pf, op = op, group = group)
-
-        # Reduce the scalar EM normalizer in the SAME op. Must be called by ALL ranks unconditionally
-        # (collectives can't be value-gated, or they deadlock); _cum_flow always exists (init 0.0).
-        if sync_cum_flow:
-            ct = torch.tensor([float(self._cum_flow)], dtype = torch.float64, device = self.device)
-            dist.all_reduce(ct, op = op, group = group)
-            self._cum_flow = ct.item()
-
-        return None
-
-    def zero_param_flows(self):
-        """
-        Zero out parameter flows.
-        """
-        self.init_param_flows(flows_memory = 0.0)
-
-    def update_parameters(self, clone: bool = True):
-        """
-        Copy parameters from this `TensorCircuit` to the original `CircuitNodes`.
-
-        :param clone: whether to deepcopy parameters
-        :type clone: bool
-        """
-        params = self.params.detach().cpu()
-
-        for ns in self.root_ns:
-            if ns.is_sum() and not ns.is_tied():
-                ns.update_parameters(params, clone = clone)
-
-        for layer in self.input_layer_group:
-            layer.update_parameters()
-
-        return None
-
-    def update_param_flows(self, clone: bool = True, origin_ns_only: bool = True):
-        """
-        Copy parameter flows from this `TensorCircuit` to the original `CircuitNodes`.
-
-        :param clone: whether to deepcopy parameters
-        :type clone: bool
-        """
-        param_flows = self.param_flows.detach().cpu()
-
-        for ns in self.root_ns:
-            if ns.is_sum() and not ns.is_tied():
-                ns.update_param_flows(param_flows, clone = clone, origin_ns_only = origin_ns_only)
-
-    def print_statistics(self):
-        """
-        Print the statistics of the PC.
-        """
-        print(f"> Number of nodes: {self.num_nodes}")
-        print(f"> Number of edges: {self.num_edges}")
-        print(f"> Number of sum parameters: {self.num_sum_params}")
-
-        num_input_parameters = 0
-        for layer in self.input_layer_group:
-            try:
-                num_input_parameters += layer.params.numel()
-            except AttributeError:
-                pass
-        
-        print(f"> Number of input parameters: {num_input_parameters}")
-
-    def get_node_mars(self, ns: CircuitNodes):
-        """
-        Retrieve the node values of `ns` from the previous forward pass.
-
-        :params ns: the target nodes
-        :type ns: CircuitNodes
-        """
-        assert self.root_ns.contains(ns)
-        assert hasattr(self, "node_mars") and self.node_mars is not None
-        assert hasattr(self, "element_mars") and self.element_mars is not None
-
-        nsid, neid = ns._output_ind_range
-
-        if ns.is_sum() or ns.is_input():
-            return self.node_mars[nsid:neid,:].detach()
-        else:
-            assert ns.is_prod()
-
-            target_layer = None
-            for layer_group in self.inner_layer_groups:
-                for layer in layer_group:
-                    if layer.is_prod() and ns in layer.nodes:
-                        target_layer = layer
-                        break
-
-                if target_layer is not None:
-                    break
-
-            # Rerun the corresponding product layer to get the node values
-            layer(self.node_mars, self.element_mars)
-
-            return self.element_mars[nsid:neid,:].detach()
-
-    def get_node_flows(self, ns: CircuitNodes, **kwargs):
-        """
-        Retrieve the node flows of `ns` from the previous backward pass.
-
-        :params ns: the target nodes
-        :type ns: CircuitNodes
-        """
-        assert self.root_ns.contains(ns)
-        assert hasattr(self, "node_flows") and self.node_flows is not None
-        assert hasattr(self, "element_flows") and self.element_flows is not None
-
-        nsid, neid = ns._output_ind_range
-
-        if ns.is_sum() or ns.is_input():
-            return self.node_flows[nsid:neid,:].detach()
-        else:
-            assert ns.is_prod()
-
-            layer_id = None
-            for idx, layer_group in enumerate(self.inner_layer_groups):
-                for layer in layer_group:
-                    if layer.is_prod() and ns in layer.nodes:
-                        layer_id = idx
-                        break
-
-                if layer_id is not None:
-                    break
-
-            # Rerun the corresponding product layer to get the node values
-            self.inner_layer_groups[layer_id].forward(self.node_mars, self.element_mars)
-            self.inner_layer_groups[layer_id+1].backward(
-                self.node_flows, self.element_flows, self.node_mars, self.element_mars, self.params, 
-                param_flows = None, allow_modify_flows = self._run_params["allow_modify_flows"], 
-                propagation_alg = self._run_params["propagation_alg"], 
-                logspace_flows = self._run_params["logspace_flows"], 
-                negate_pflows = self._run_params["negate_pflows"],
-                force_use_fp32 = self._run_params["force_use_fp32"], **kwargs
-            )
-
-            return self.element_flows[nsid:neid,:].detach()
-
-    def get_node_params(self, ns: CircuitNodes, clone: bool = True, **kwargs):
-        """
-        Retrieve the node parameters of `ns`.
-
-        :params ns: the target nodes
-        :type ns: CircuitNodes
-
-        :params clone: whether to clone the parameters
-        :type clone: bool
-        """
-        assert self.root_ns.contains(ns)
-        assert hasattr(self, "params") and self.params is not None
-
-        if not ns.is_sum() or ns.is_tied():
-            return None
-
-        psid, peid = ns._param_range
-        if clone:
-            ns_params = self.params[psid:peid].detach().clone()
-        else:
-            ns_params = self.params[psid:peid]
-
-        local_parids = (ns._param_ids - psid) // (ns.block_size * ns.ch_block_size)
-        num_parblocks = local_parids.size(0)
-        ns_params = ns_params.reshape(num_parblocks, ns.ch_block_size, ns.block_size)
-
-        return ns_params[local_parids,:,:].permute(0, 2, 1)
-
-    def get_node_param_flows(self, ns: CircuitNodes, clone: bool = True, **kwargs):
-        """
-        Retrieve the node parameter flows of `ns`.
-
-        :params ns: the target nodes
-        :type ns: CircuitNodes
-
-        :params clone: whether to clone the parameter flows
-        :type clone: bool
-        """
-        assert self.root_ns.contains(ns)
-        assert hasattr(self, "param_flows") and self.param_flows is not None
-
-        if not ns.is_sum() or ns.is_tied():
-            return None
-
-        pfsid, pfeid = ns._param_flow_range
-        if clone:
-            ns_param_flows = self.param_flows[pfsid:pfeid].detach().clone()
-        else:
-            ns_param_flows = self.param_flows[pfsid:pfeid]
-
-        local_parfids = (ns._param_flow_ids - pfsid) // (ns.block_size * ns.ch_block_size)
-        num_parfblocks = local_parfids.size(0)
-        ns_param_flows = ns_param_flows.reshape(num_parfblocks, ns.ch_block_size, ns.block_size)
-        return ns_param_flows[local_parfids,:,:].permute(0, 2, 1)
 
     def layers(self, reverse: bool = False, ret_layer_groups: bool = False, ignore_input_layers: bool = False):
         """
@@ -1851,300 +1123,6 @@ class TensorCircuit(nn.Module):
         """
         return layer_iterator(self, reverse = reverse, ret_layer_groups = ret_layer_groups, ignore_input_layers = ignore_input_layers)
 
-    def _init_buffer(self, name: str, shape: Tuple, set_value: Optional[float] = None, check_device: bool = True):
-        """Make `self.<name>` a contiguous `shape` buffer on the circuit's device, filled with `set_value`
-        if one is given; a buffer that had to change shape (or device) comes back zeroed.
-
-        A shape change -- the batch size, typically -- re-cuts the buffer from ONE backing storage per
-        name, grown only when too small, instead of reallocating it. A captured CUDA graph bakes in buffer
-        addresses (`cuda_graph_key`), so with a fresh allocation per shape a loop whose batch size changes
-        every step put its buffers at new addresses, captured a new graph on nearly every step and kept
-        all of them: MEASURED on the CoDD PC (batch 10-26 at random, graphs on), 182 graphs after 80
-        steps and 21.7 ms per step, against 7.0 eager. Re-cut, a buffer keeps its address and there is
-        one graph per batch size. The views of different shapes share memory, which nothing holds across
-        calls (outputs are cloned). Growing a storage moves its buffer, so the graphs recorded against it
-        are dropped.
-
-        A storage more than `_BUFFER_SHRINK_RATIO` times what the shape needs is reallocated at the needed
-        size, unless graphs of the inner layers are recorded (their replays need the addresses to stay).
-        Grow-only, one large batch -- an evaluation pass, say -- held its buffers for the rest of the
-        process: MEASURED on an HMM with 1024 latents, 3.1 GB still allocated back at batch 16 after one
-        batch-4096 step, against 1.0 GB when every shape got its own allocation. Batch sizes that vary
-        within the ratio (CoDD's 10-26) keep one storage, as before.
-        """
-        tensor = self.__dict__.get(name)
-        on_device = lambda t: not check_device or self.device.index is None or t.device == self.device
-
-        if not (isinstance(tensor, torch.Tensor) and tuple(tensor.shape) == tuple(shape) and on_device(tensor)):
-            numel = math.prod(shape)
-            storage = self.__dict__.setdefault("_buffer_storage", dict()).get(name)
-            oversized = (storage is not None and storage.numel() > _BUFFER_SHRINK_RATIO * numel
-                         and not self.__dict__.get("_recorded_cuda_graphs"))
-            if storage is None or storage.numel() < numel or not on_device(storage) or oversized:
-                if storage is not None:
-                    self._drop_cuda_graphs()    # the old storage moves; a first allocation strands nothing
-                storage = torch.empty(numel, device = self.device)
-                self._buffer_storage[name] = storage
-            tensor = storage[:numel].view(shape)
-            tensor.zero_()
-            self.__dict__[name] = tensor
-
-        if set_value is not None:
-            tensor.fill_(set_value)
-
-    def _drop_cuda_graphs(self):
-        """Forget every recorded CUDA graph (inner layers and top-down): after a buffer they baked in has
-        moved, or when what the passes compute has changed in a way no key sees."""
-        self._clear_inner_graphs()
-        if hasattr(self, "_tdp_cudagraph"):
-            self._tdp_cudagraph.clear()
-
-    def _clear_inner_graphs(self):
-        """Forget the recorded inner-layer graphs, and how many were recorded per buffer layout."""
-        graphs = self.__dict__.get("_recorded_cuda_graphs")
-        if graphs is not None:
-            graphs.clear()
-        self.__dict__["_cuda_graph_records"] = dict()
-        self.__dict__["_cuda_graph_seen"] = OrderedDict()
-        self.__dict__["_cuda_graph_failed"] = OrderedDict()
-
-    def _graph_key_options(self, sum_opts: dict, **extra) -> dict:
-        """
-        What a graph of the inner layers is keyed on besides the buffers: the options the sum layers are
-        called with (`sum_opts`, plus `extra`), except the call kwargs only the input layers read
-        (`Distribution.call_kwargs`, `InputLayer.call_kwargs`) -- per-call evidence, a fresh tensor on
-        every call, which would otherwise stop every replay. The inner layers are still handed them, as
-        they always were; that no inner layer READS one is what makes leaving them out sound, and is
-        checked over the inner layers' source by a test.
-        """
-        names = self.__dict__.get("_input_call_kwargs")
-        if names is None:
-            names = set(InputLayer.call_kwargs)
-            for layer in self.input_layer_group:
-                for ns in layer.nodes:
-                    names.update(ns.dist.call_kwargs)
-            names = self.__dict__["_input_call_kwargs"] = frozenset(names)
-        return dict({k: v for k, v in sum_opts.items() if k not in names}, **extra)
-
-    def _run_inner_pass(self, run: Callable, pass_id: int, buffers: Tuple, options: dict, record: bool,
-                        apply: bool, record_on_repeat: bool = False, reads_layer_states: bool = False) -> None:
-        """
-        Run the inner layers once (`run`): by replaying a CUDA graph recorded under exactly this
-        signature (`_graph_signature`) when there is one and `apply`, and otherwise eagerly -- capturing
-        a graph as well when `record` (only from the second time this signature is seen if
-        `record_on_repeat`, so a pass that never repeats never pays a capture).
-
-        `options` must be what the inner layers are called with, besides `buffers`. `reads_layer_states`
-        marks a pass that consumes what an earlier pass left on the layers (the backward reads the
-        forward's, see `Layer.cuda_graph_state`); their identity is then part of its key.
-        """
-        graphs = self._recorded_cuda_graphs
-        if not (record or (apply and graphs)) or not self._cuda_graphs_usable(record):
-            run()
-            return
-
-        states = [layer.cuda_graph_state() for layer in self._cuda_graph_stateful_layers()] \
-            if reads_layer_states else []
-        signature = _graph_signature(pass_id, buffers, options, states)
-        entry = graphs.get(signature) if signature is not None else None
-
-        if entry is not None and apply:
-            graphs.move_to_end(signature)
-            entry.graph.replay()
-            for layer, state in entry.layer_states:
-                layer.restore_cuda_graph_state(state)
-        elif entry is None and record and self._may_record_cuda_graph(signature, record_on_repeat):
-            self._record_inner_pass(signature, run, states)
-        else:
-            run()
-
-    def _cuda_graphs_usable(self, record: bool) -> bool:
-        """
-        Whether this pass may replay or record a graph at all; if not, it simply runs eagerly.
-
-        Not on the CPU, where there is nothing to capture. Not while the current stream is ALREADY being
-        captured -- the caller's own `torch.cuda.graph`, say -- where the inner layers must run eagerly
-        so that they become part of the caller's graph (a nested capture fails). And not when an inner
-        layer's external parameterization does not declare itself graph-safe
-        (`ExternalSumParams.cuda_graph_safe`): its per-call Python would run twice on a recording call
-        and never on a replay.
-        """
-        if self.device.type != "cuda" or torch.cuda.is_current_stream_capturing():
-            return False
-        unsafe = self.__dict__.get("_cuda_graph_unsafe")
-        if unsafe is None:
-            unsafe = self.__dict__["_cuda_graph_unsafe"] = sorted({
-                type(layer.external_params).__name__ for layer_group in self.inner_layer_groups
-                for layer in layer_group if not layer.cuda_graph_safe})
-        if unsafe:
-            if record:
-                self._warn_cuda_graph_once("unsafe",
-                    f"not recording CUDA graphs: the external parameterization(s) {unsafe} do not set "
-                    f"`cuda_graph_safe = True`, so the inner layers always run eagerly.")
-            return False
-        return True
-
-    def _record_inner_pass(self, signature: tuple, run: Callable, states: list) -> None:
-        """
-        Run the inner layers for this call, then capture them into a graph stored under `signature`.
-
-        The run is the call's own work, done for real, and the capture after it executes nothing -- so
-        recording leaves exactly what an eager call would, with nothing to undo. Earlier this ran the pass
-        three times to warm up and once more to replay: the warm-ups accumulated into the flows (a
-        backward that recorded came out with ~4x its parameter flows) and later had to be undone by a
-        round trip of the flows through host memory, 0.6 s per recording on an HCLT with 256 latents. One
-        run is enough warm-up: it compiles the kernels, settles the autotuner (which decides on its first
-        call and never during capture) and builds the layers' caches, so the capture records the launches
-        of the steady state.
-
-        Captures with the bare `capture_begin`/`capture_end` rather than `torch.cuda.graph`, which
-        synchronizes the device and empties the allocator's cache first -- releasing memory every other
-        model in the process holds cached, on every recording.
-        """
-        side = torch.cuda.Stream()
-        side.wait_stream(torch.cuda.current_stream())
-        failure = None
-        with torch.cuda.stream(side):
-            run()
-
-            # "thread_local": only this thread's CUDA calls are checked against the capture. In the
-            # default "global" mode another thread's -- a DataLoader pinning host memory, MEASURED --
-            # failed both that thread and the capture.
-            graph = torch.cuda.CUDAGraph()
-            graph.capture_begin(capture_error_mode = "thread_local")
-            try:
-                run()
-                graph.capture_end()
-            except BaseException as e:
-                try:
-                    graph.capture_end()
-                except Exception:
-                    pass
-                if not isinstance(e, Exception):
-                    raise
-                failure = e
-        torch.cuda.current_stream().wait_stream(side)
-
-        if failure is not None:
-            # Some code on this path cannot be captured (a host sync, typically). The call's own work is
-            # done already, so it only has to stay eager -- and not try again on every call.
-            failed = self.__dict__.setdefault("_cuda_graph_failed", OrderedDict())
-            failed[signature] = None
-            while len(failed) > 4 * max(self.max_cuda_graphs, 1):
-                failed.popitem(last = False)
-            self._warn_cuda_graph_once(("failed",) + signature[:2],
-                f"could not capture a {'backward' if signature[0] else 'forward'} pass into a CUDA graph "
-                f"({type(failure).__name__}: {str(failure).splitlines()[0][:200]}); it runs eagerly.")
-            return
-
-        layer_states = [(layer, layer.cuda_graph_state()) for layer in self._cuda_graph_stateful_layers()]
-        graphs = self._recorded_cuda_graphs
-        graphs[signature] = _RecordedPass(graph, layer_states, (states, self._inner_layer_refs()))
-        while len(graphs) > max(self.max_cuda_graphs, 1):
-            graphs.popitem(last = False)
-
-    def _may_record_cuda_graph(self, signature: Optional[tuple], on_repeat: bool = False) -> bool:
-        """Whether to record a graph under `signature`: not when it has no key or could not be captured
-        before; with `on_repeat`, not the first time it is seen; and not when its buffer layout has already
-        had `max_cuda_graphs_per_layout` recordings (then some option changes on every call, or graphs are
-        being evicted as fast as they are made). Says why, once."""
-        if signature is None:
-            self._warn_cuda_graph_once(None,
-                "an option of this pass cannot be part of a CUDA-graph key (it is not hashable), so the "
-                "pass runs eagerly and no graph is recorded for it.")
-            return False
-        if signature in self.__dict__.get("_cuda_graph_failed", ()):
-            return False
-        if on_repeat:
-            seen = self.__dict__.setdefault("_cuda_graph_seen", OrderedDict())
-            if signature not in seen:
-                seen[signature] = None
-                while len(seen) > 4 * max(self.max_cuda_graphs, 1):
-                    seen.popitem(last = False)
-                return False
-
-        layout, options = signature[:2], signature[2]
-        recorded = self._cuda_graph_records.setdefault(layout, [])
-        if len(recorded) < self.max_cuda_graphs_per_layout:
-            recorded.append(options)
-            return True
-
-        missing = object()
-        varying = sorted({name for opts in recorded for name, value in opts
-                          if any(dict(other).get(name, missing) != value for other in recorded)})
-        why = (f"the option(s) {varying} took a new value on most calls -- if they are per-call inputs of "
-               f"an input distribution, list them in its `call_kwargs`" if varying else
-               f"its graphs kept being evicted -- raise `max_cuda_graphs` (now {self.max_cuda_graphs})")
-        self._warn_cuda_graph_once(layout,
-            f"stopped recording CUDA graphs for one {'backward' if layout[0] else 'forward'} pass shape "
-            f"after {len(recorded)} recordings, each of which costs a capture: {why}. The pass runs eagerly.")
-        return False
-
-    def _warn_cuda_graph_once(self, key, message: str) -> None:
-        warned = self.__dict__.setdefault("_cuda_graph_warned", set())
-        if key not in warned:
-            warned.add(key)
-            warnings.warn(f"pyjuice: {message}", RuntimeWarning)
-
-    def _cuda_graph_stateful_layers(self) -> list:
-        """The inner layers that hand host-side state from one pass to a later one (`Layer.cuda_graph_state`)."""
-        layers = self.__dict__.get("_cuda_graph_stateful")
-        if layers is None:
-            layers = [layer for layer_group in self.inner_layer_groups for layer in layer_group
-                      if type(layer).cuda_graph_state is not Layer.cuda_graph_state]
-            self.__dict__["_cuda_graph_stateful"] = layers
-        return layers
-
-    def _inner_layer_refs(self) -> list:
-        """
-        References to everything the inner layers (and their external-parameter descriptors) own right
-        now, expanded through containers.
-
-        Held by a recorded graph so that nothing its capture baked a pointer to can be freed while it may
-        still be replayed. A layer may drop a tensor from a cache after the capture -- BlockScale and
-        LowRank evict per-batch plans, each with its own `log Z` buffers -- and a replay would then write
-        into memory since handed to something else.
-        """
-        refs = []
-
-        def collect(obj, depth):
-            refs.append(obj)
-            if depth > 0:
-                if isinstance(obj, dict):
-                    for value in obj.values():
-                        collect(value, depth - 1)
-                elif isinstance(obj, (list, tuple)):
-                    for value in obj:
-                        collect(value, depth - 1)
-
-        for layer_group in self.inner_layer_groups:
-            for layer in layer_group:
-                collect(layer.__dict__, 4)
-                descriptor = layer.__dict__.get("external_params")
-                if descriptor is not None:
-                    collect(descriptor.__dict__, 4)
-
-        return refs
-
-    def _buffer_matches(self, name: str, cache: Optional[dict], check_device: bool = True):
-        if cache is None:
-            return False
-
-        assert name in self.__dict__
-
-        tensor = self.__dict__[name]
-        
-        if name not in cache:
-            return False
-
-        if tensor.size() != cache[name].size():
-            return False
-
-        if check_device and tensor.device != cache[name].device:
-            return False
-
-        return True
-
     def _get_num_vars(self, ns: CircuitNodes):
         num_vars = 0
         for v in ns.scope:
@@ -2152,358 +1130,14 @@ class TensorCircuit(nn.Module):
                 num_vars = v + 1
         return num_vars
 
-    def _init_layers(self, layer_sparsity_tol: Optional[float] = None, max_num_partitions: Optional[int] = None,
-                     disable_gpu_compilation: bool = False, force_gpu_compilation: bool = False, 
-                     max_tied_ns_per_parflow_block: int = 32, verbose: bool = True, device: Optional[Union[str,torch.device]] = None):
-
-        if hasattr(self, "input_layer_group") or hasattr(self, "inner_layer_groups"):
-            raise ValueError("Attempting to initialize a TensorCircuit for the second time. " + \
-                "Please instead create a new TensorCircuit instance by calling `pc = TensorCircuit(root_ns)`.")
-
-        # Clear hooks/pointers used by previous `TensorCircuit`s
-        self.root_ns._clear_tensor_circuit_hooks()
-
-        # TOtal number of variables
-        pc_num_vars = len(self.root_ns.scope)
-
-        # Create layers
-        depth2nodes, num_layers, max_node_block_size, max_ele_block_size = self._create_node_layers()
-
-        self.input_layer_group = None
-        self.inner_layer_groups = []
-
-        self.num_dummy_nodes = max_ele_block_size
-        self.num_dummy_eles = max_node_block_size
-        self.num_dummy_params = max_node_block_size * max_ele_block_size
-
-        # Nodes include `max_ele_block_size` dummy nodes and all input/sum nodes in the PC
-        num_nodes = self.num_dummy_nodes
-
-        # Total number of edges
-        num_edges = 0
-
-        # Elements include `max_node_block_size` dummy elements and all product nodes in the PC
-        num_elements = self.num_dummy_eles
-
-        # Number of parameters
-        num_parameters = self.num_dummy_params
-
-        # Number of parameter flows
-        num_param_flows = 0
-
-        # Stores distributed parameter flows
-        node2tiednodes = dict()
-
-        # Every `ns` in this PC that takes external parameters, mapped to the layer that compiled it.
-        # Insertion-ordered, and the order is what fixes each node's slot in the staging buffer, so it
-        # must stay deterministic. Also used to reject `sum_external_params` entries keyed by a node
-        # the PC does not have -- which would otherwise be a silent no-op.
-        self.external_params_nodes = dict()
-
-        # (batch size) -> (total numel, {ns: [(offset, shape), ...]}) for the staging buffer
-        self._external_params_layouts = dict()
-
-        # Views staged by the most recent forward pass; the backward reuses them, and writes the
-        # matching per-sample gradients into views of the same shape
-        self._staged_external_params = None
-        self._staged_external_params_grad = None
-        self._external_grad_dsts = None
-
-        # name -> (nodes, dim): several `ns` addressed by ONE concatenated tensor. See
-        # `register_external_params_group`.
-        self.external_params_groups = dict()
-
-        # (buffer name, batch size) -> (buffer, {ns: views}); see `_external_params_views`
-        self._external_params_views_cache = dict()
-
-        if verbose:
-            print(f"Compiling {num_layers} TensorCircuit layers...")
-
-        # Select device to use
-        if device is None:
-            device = torch.cuda.current_device()
-        elif isinstance(device, torch.device):
-            device = device.index
-
-        with torch.cuda.device(f"cuda:{device}"):
-            layer_id = 0
-            for depth in tqdm(range(num_layers), disable = not verbose):
-                if depth == 0:
-                    # Input layer
-                    signature2nodes = self._categorize_input_nodes(depth2nodes[0]["input"])
-                    input_layer_id = 0
-                    input_layers = []
-                    for signature, nodes in signature2nodes.items():
-                        input_layer = InputLayer(
-                            nodes = nodes, cum_nodes = num_nodes,
-                            max_tied_ns_per_parflow_block = max_tied_ns_per_parflow_block,
-                            pc_num_vars = pc_num_vars
-                        )
-
-                        # Special treatment for input layers with the `External` distribution
-                        if input_layer.dist.requires_external_inputs():
-                            scope = BitSet()
-                            for ns in input_layer.nodes:
-                                scope |= ns.scope
-                            vars = torch.sort(torch.tensor(scope.to_list())).values
-                            var_idmapping = torch.zeros([pc_num_vars], dtype = torch.long)
-                            var_idmapping[vars] = torch.arange(0, vars.size(0))
-                            input_layer.register_buffer("var_idmapping", var_idmapping)
-
-                        input_layers.append(input_layer)
-                        
-                        input_layer_id += 1
-                        num_nodes += input_layer.num_nodes
-
-                    self.input_layer_group = LayerGroup(input_layers)
-
-                else:
-                    assert len(depth2nodes[depth]["prod"]) > 0 and len(depth2nodes[depth]["sum"]) > 0, \
-                        "Depth {}: (# prod nodes: {}, # sum nodes: {})".format(depth, len(depth2nodes[depth]["prod"]), len(depth2nodes[depth]["sum"]))
-
-                    # Product layer(s)
-                    gsize2prod_nodes = dict()
-                    for ns in depth2nodes[depth]["prod"]:
-                        gsize = ns.block_size
-                        if gsize not in gsize2prod_nodes:
-                            gsize2prod_nodes[gsize] = []
-                        gsize2prod_nodes[gsize].append(ns)
-                    
-                    layer_num_elements = max_node_block_size
-                    prod_layers = []
-                    for gsize, nodes in gsize2prod_nodes.items():
-                        prod_layer = ProdLayer(
-                            nodes = nodes, 
-                            global_nid_start = layer_num_elements,
-                            layer_sparsity_tol = layer_sparsity_tol,
-                            max_num_partitions = max_num_partitions,
-                            disable_gpu_compilation = disable_gpu_compilation,
-                            force_gpu_compilation = force_gpu_compilation
-                        )
-
-                        layer_num_elements += prod_layer.num_nodes
-                        num_edges += prod_layer.num_edges
-
-                        prod_layers.append(prod_layer)
-                    
-                    prod_layer_group = LayerGroup(prod_layers)
-                    self.inner_layer_groups.append(prod_layer_group)
-                    self.add_module(f"prod_layer_{layer_id}", prod_layer_group)
-
-                    if layer_num_elements > num_elements:
-                        num_elements = layer_num_elements
-
-                    # Sum layer(s)
-                    # Nodes are grouped by (block size, external-parameter signature): one layer
-                    # compiles one set of kernels, so nodes whose effective parameters are formed
-                    # differently -- or not modified at all -- must not share a layer. This keeps the
-                    # standard sum-layer kernels free of any per-call branch on the parameterization.
-                    gsize2sum_nodes = dict()
-                    for ns in depth2nodes[depth]["sum"]:
-                        ext_signature = ns.get_external_signature() if isinstance(ns, ExternalParamsSumNodes) else None
-                        gsize = (ns.block_size, ext_signature)
-                        if gsize not in gsize2sum_nodes:
-                            gsize2sum_nodes[gsize] = []
-                        gsize2sum_nodes[gsize].append(ns)
-
-                    sum_layers = []
-                    for (gsize, ext_signature), nodes in gsize2sum_nodes.items():
-                        layer_class = SumLayer if ext_signature is None else ExternalParamsSumLayer
-
-                        sum_layer = layer_class(
-                            nodes = nodes,
-                            global_nid_start = num_nodes, 
-                            global_pid_start = num_parameters,
-                            global_pfid_start = num_param_flows,
-                            node2tiednodes = node2tiednodes,
-                            layer_sparsity_tol = layer_sparsity_tol,
-                            max_num_partitions = max_num_partitions,
-                            max_tied_ns_per_parflow_block = max_tied_ns_per_parflow_block,
-                            disable_gpu_compilation = disable_gpu_compilation,
-                            force_gpu_compilation = force_gpu_compilation
-                        )
-
-                        num_nodes += sum_layer.num_nodes
-                        num_edges += sum_layer.num_edges
-                        num_parameters += sum_layer.num_parameters
-                        num_param_flows += sum_layer.num_param_flows
-
-                        if ext_signature is not None:
-                            for ns in sum_layer.nodes:
-                                self.external_params_nodes[ns] = sum_layer
-
-                        sum_layers.append(sum_layer)
-
-                    sum_layer_group = LayerGroup(sum_layers)
-                    self.inner_layer_groups.append(sum_layer_group)
-                    self.add_module(f"sum_layer_{layer_id}", sum_layer_group)
-
-                    layer_id += 1
-
-        self.num_nodes = num_nodes
-        self.num_edges = num_edges
-        self.num_elements = num_elements
-        self.num_sum_params = num_parameters
-        self.num_param_flows = num_param_flows
-
-        # Does any layer need the denominator flow `F-`? Resolved once here, so `init_param_flows`
-        # allocates `denom_param_flows` only when it is actually used -- an ordinary PC never does and
-        # keeps `denom_param_flows = None`.
-        #
-        # Requesting layers are laid out end to end in ONE flat buffer, each getting the slices its
-        # parameterization asked for (`assign_denom_flow_offsets`). Sizing happens HERE, at compile,
-        # not at first forward, because `init_param_flows` may run before any forward pass.
-        #
-        # `_denom_sources_of_ns` is the denominator's answer to `compute_cum_par_flows`: tied copies
-        # share one `_param_range`, so every copy's flow has to reach the M-step of the node that owns
-        # those parameters. The numerator is fused in the `pfid` space it shares; the denominator, whose
-        # layout is the parameterization's own, is combined while `compute_em_correction` reconstructs
-        # `F-`, which is why the copies are collected rather than summed here.
-        denom_layers = [layer for group in self.inner_layer_groups for layer in group.layers
-                        if layer.requests_denom_param_flows]
-        self._requests_denom_param_flows = len(denom_layers) > 0
-        self.num_denom_flows = 0
-        self._denom_sources_of_ns = dict()
-        for layer in denom_layers:
-            self.num_denom_flows = layer.assign_denom_flow_offsets(self.num_denom_flows)
-            for ns in layer.nodes:
-                target = ns.get_source_ns() if ns.is_tied() else ns
-                self._denom_sources_of_ns.setdefault(target, []).append((layer, ns))
-
-        # For parameter flow accumulation
-        self.parflow_fusing_kwargs = compile_cum_par_flows_fn(node2tiednodes, MAX_NBLOCKS = 2048, BLOCK_SIZE = 2048)
-        
-        # For parameter update
-        self.par_update_kwargs = compile_par_update_fn(self.root_ns, BLOCK_SIZE = 32)
-
-        # Register root nodes
-        self.num_root_nodes = self.root_ns.num_nodes
-        self._root_node_range = (self.num_nodes - self.num_root_nodes, self.num_nodes)
-
-        # Initialize parameters
-        self._init_parameters()
-
-    def _init_parameters(self, perturbation: float = 4.0, pseudocount: float = 0.0):
-        for ns in self.root_ns:
-            if not ns.is_tied() and (ns.is_sum() or ns.is_input()) and not ns.has_params():
-                ns.init_parameters(perturbation = perturbation, recursive = False)
-
-        params = torch.exp(torch.rand([self.num_sum_params]) * -perturbation)
-        params[:self.num_dummy_params] = 0.0
-
-        # Copy initial parameters if provided
-        for ns in self.root_ns:
-            if ns.is_sum() and not ns.is_tied() and ns.has_params():
-                ns.gather_parameters(params)
-
-        self._normalize_parameters(params, pseudocount = pseudocount)
-        self.params = nn.Parameter(params)
-
-        # Due to the custom inplace backward pass implementation, we do not track 
-        # gradient of PC parameters by PyTorch.
-        self.params.requires_grad = False
-
-        # Initialize parameters for input layers
-        for idx, layer in enumerate(self.input_layer_group):
-            layer._init_parameters(perturbation)
-
-    def _normalize_parameters(self, params, pseudocount: float = 0.0):
-        if params is not None:
-            normalize_parameters(params, self.par_update_kwargs, pseudocount)
-
-    def _create_node_layers(self):
-        depth2nodes = dict()
-        nodes2depth = dict()
-
-        num_layers = 1
-        max_node_block_size = 0
-        max_ele_block_size = 0
-
-        def dfs(ns: CircuitNodes):
-
-            nonlocal num_layers
-            nonlocal max_node_block_size
-            nonlocal max_ele_block_size
-
-            if ns in nodes2depth:
-                return
-            if ns.is_input():
-                nodes2depth[ns] = 0
-                if 0 not in depth2nodes:
-                    depth2nodes[0] = {"input": []}
-                depth2nodes[0]["input"].append(ns)
-            else:
-                for cs in ns.chs:
-                    dfs(cs)
-
-                depth = max(map(lambda ms: nodes2depth[ms], ns.chs)) + (1 if ns.is_prod() else 0)
-                num_layers = max(depth + 1, num_layers)
-                nodes2depth[ns] = depth
-
-                if depth not in depth2nodes:
-                    depth2nodes[depth] = {"sum": [], "prod": []} # lists for sum and product nodes
-                
-                if ns.is_sum():
-                    for idx, cs in enumerate(ns.chs):
-                        cs_depth = nodes2depth[cs]
-                        if cs_depth < depth:
-                            # TODO: Make the block size be 1
-                            pass_sum_ns = summate(
-                                cs, num_node_blocks = cs.num_node_blocks, block_size = cs.block_size,
-                                edge_ids = torch.arange(0, cs.num_node_blocks)[None,:].repeat(2, 1),
-                                params = torch.eye(cs.block_size)[None,:,:].repeat(cs.num_node_blocks, 1, 1)
-                            )
-                            pass_prod_ns = multiply(pass_sum_ns)
-                            ns.chs[idx] = pass_prod_ns
-
-                            depth2nodes[cs_depth]["sum"].append(pass_sum_ns)
-
-                            nodes2depth[pass_sum_ns] = cs_depth
-                            nodes2depth[pass_prod_ns] = depth
-
-                    depth2nodes[depth]["sum"].append(ns)
-
-                    if ns.block_size > max_node_block_size:
-                        max_node_block_size = ns.block_size
-                elif ns.is_prod():
-                    if ns.block_size > max_ele_block_size:
-                        max_ele_block_size = ns.block_size
-                else:
-                    raise NotImplementedError(f"Unsupported node type {type(n)}.")
-
-        dfs(self.root_ns)
-
-        pns2layer = dict()
-        for layer in range(1, len(depth2nodes)):
-            for ns in depth2nodes[layer]["sum"]:
-                for cs in ns.chs:
-                    if cs.is_prod():
-                        if id(cs) in pns2layer:
-                            assert pns2layer[id(cs)] == layer, "Disallowed circumstance: a product node requested by sum nodes at different layers."
-                        else:
-                            depth2nodes[layer]["prod"].append(cs)
-
-                            pns2layer[id(cs)] = layer
-
-        return depth2nodes, num_layers, max_node_block_size, max_ele_block_size
-
-    def _categorize_input_nodes(self, nodes: Sequence[InputNodes]):
-        signature2nodes = dict()
-        for ns in nodes:
-            signature = ns.dist.get_signature()
-            if signature not in signature2nodes:
-                signature2nodes[signature] = []
-            signature2nodes[signature].append(ns)
-
-        return signature2nodes
-
 
 def compile(ns: CircuitNodes, layer_sparsity_tol: float = 0.5, 
             max_num_partitions: Optional[int] = None, disable_gpu_compilation: bool = False, 
             force_gpu_compilation: bool = False,
             max_tied_ns_per_parflow_block: int = 32,
             device: Optional[Union[int,torch.device]] = None,
-            verbose: bool = True, cuda_graphs: bool = False) -> nn.Module:
+            verbose: bool = True, cuda_graphs: bool = False, precision: str = "auto",
+            param_dtype: torch.dtype = torch.float32) -> nn.Module:
     """
     Compile a PC represented by a DAG into an equivalent `torch.nn.Module`.
 
@@ -2535,9 +1169,17 @@ def compile(ns: CircuitNodes, layer_sparsity_tol: float = 0.5,
         by default
     :type cuda_graphs: bool
 
+    :param precision: precision of the sum layers' products: "auto" (the default; the fastest per layer), "tf32"
+        or "fp32" (see :attr:`TensorCircuit.precision`; settable after compiling)
+    :type precision: str
+
+    :param param_dtype: the dtype the sum layers' parameters are stored in, ``torch.float32`` (the default) or
+        ``torch.bfloat16`` (see :attr:`TensorCircuit.param_dtype`)
+    :type param_dtype: torch.dtype
+
     :returns: the compiled PC with type `torch.nn.Module`
     """
     return TensorCircuit(ns, layer_sparsity_tol = layer_sparsity_tol, max_num_partitions = max_num_partitions,
                          disable_gpu_compilation = disable_gpu_compilation, force_gpu_compilation = force_gpu_compilation,
                          max_tied_ns_per_parflow_block = max_tied_ns_per_parflow_block, device = device, verbose = verbose,
-                         cuda_graphs = cuda_graphs)
+                         cuda_graphs = cuda_graphs, precision = precision, param_dtype = param_dtype)

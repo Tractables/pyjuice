@@ -72,7 +72,7 @@ class LayerGroup(nn.Module):
         return self.layer_type == "sum"
 
     def __len__(self):
-        self.num_layers
+        return self.num_layers
 
     def __getitem__(self, idx):
         return self.layers[idx]

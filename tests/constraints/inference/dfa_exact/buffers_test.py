@@ -1,0 +1,190 @@
+"""
+The lifted buffers: regions follow the PC's layers, every sum node group keeps exactly its own block per
+sample (the pairs of columns the automaton joins), regions are aligned and disjoint, an input layer writes the
+input region exactly as it writes a TensorCircuit's node_mars, and the storage is reused across batch sizes.
+"""
+import random
+
+import pytest
+import torch
+
+import pyjuice.constraints as jc
+from pyjuice.constraints.inference.dfa_exact.compiled.tables import ALIGN, buffer_layout
+
+V = 3
+KINDS = {"hmm": 6, "hmm_untied": 6, "hmm_block_sparse": 6, "pd": 8, "pd_prod_dominated": 8, "pd_blockified": 8,
+         "hand": 5, "hand_permuted": 5, "hand_unit": 4}                     # see conftest.py
+
+
+def compiled(build_pc, kind, constraint = None):
+    n = KINDS[kind]
+    return jc.compile(constraint or jc.DFA.contains([[1, 2]], V), build_pc(kind, n, V)), n
+
+
+def slots_of(cc, n, ns):
+    """The (entry column, exit column) pairs of a node group's block that the automaton joins, a sequence end
+    counting as one column, joined from every column that can still accept."""
+    (a, b), = cc.structure.node(ns).scope_runs
+    w, next_col = cc.backend.width_per_boundary.tolist(), cc.backend.layout.next_col_table()
+    joined = torch.eye(w[a], dtype = torch.bool)
+    for t in range(a, b + 1):
+        step = torch.zeros(w[a], w[t + 1], dtype = torch.bool)
+        for q in range(w[t]):
+            for c in next_col[t, q].tolist():
+                if c >= 0:
+                    step[:, c] |= joined[:, q]
+        joined = step
+    return int(joined.any(dim = 1).sum()) if b == n - 1 else int(joined.sum())
+
+
+def dense_slots_of(cc, n, ns):
+    """Entry columns x exit columns of a node group's block."""
+    (a, b), = cc.structure.node(ns).scope_runs
+    w = cc.backend.width_per_boundary.tolist()
+    return w[a] * (1 if b == n - 1 else w[b + 1])
+
+
+@pytest.mark.parametrize("kind", list(KINDS))
+def test_regions_follow_the_pcs_layers(kind, build_pc):
+    cc, n = compiled(build_pc, kind)
+    pc = cc.pc
+    want_sums = sorted((ns._output_ind_range[0], ns._output_ind_range[1], slots_of(cc, n, ns))
+                       for lg in pc.inner_layer_groups if lg.is_sum() for layer in lg.layers for ns in layer.nodes)
+    assert list(cc.backend.sum_regions) == want_sums
+    covered = [r for first, end, _ in cc.backend.sum_regions for r in range(first, end)]         # all sum rows, once
+    want_rows = [r for lg in pc.inner_layer_groups if lg.is_sum() for layer in lg.layers
+                 for r in range(*layer._layer_nid_range)]
+    assert sorted(covered) == sorted(want_rows) and len(set(covered)) == len(covered)
+    prod_groups = [lg for lg in pc.inner_layer_groups if lg.is_prod()]
+    assert len(cc.backend.element_regions) == len(prod_groups)
+    for (first, end, slots), lg in zip(cc.backend.element_regions, prod_groups):
+        assert first == min(l._layer_nid_range[0] for l in lg.layers) and end == max(l._layer_nid_range[1] for l in lg.layers)
+        assert slots == max(slots_of(cc, n, ns) for l in lg.layers for ns in l.nodes)
+
+
+@pytest.mark.parametrize("kind", ["hmm", "pd", "hand_permuted"])
+@pytest.mark.parametrize("B", [1, 3, 16, 33])
+def test_layout_is_aligned_disjoint_and_tight(kind, B, build_pc):
+    cc, _ = compiled(build_pc, kind)
+    lay = buffer_layout(cc.backend.input_range, cc.backend.sum_regions, cc.backend.element_regions, B)
+    input_start, input_end = cc.backend.input_range
+    spans = [(0, input_end * B)]
+    for (first, end, slots), offset, width in zip(cc.backend.sum_regions, lay["sum_offsets"], lay["sum_widths"]):
+        assert width == -(-B * slots // ALIGN) * ALIGN                        # the block, rounded up to ALIGN
+        spans.append((offset, offset + (end - first) * width))
+    assert all(start % ALIGN == 0 for start, _ in spans)
+    assert all(a_end <= b_start for (_, a_end), (b_start, _) in zip(spans, spans[1:]))     # in order, disjoint
+    assert lay["node_size"] == spans[-1][1]
+    assert lay["element_size"] == max((end - first) * w for (first, end, _), w in
+                                      zip(cc.backend.element_regions, lay["element_widths"]))
+    num_class_rows = sum(layer.params.numel() // V for layer in cc.pc.input_layer_group)
+    want = 4 * (lay["node_size"] + lay["element_size"] + num_class_rows * cc.backend.token_classes.num_stored)
+    assert cc.backend.buffer_bytes(B) == want                                 # (the enumerated classes: no column)
+
+
+def test_blocks_keep_only_the_joined_pairs(build_pc):
+    """A wide automaton on a PD: interval nodes keep a fraction of their entry x exit pairs, prefixes and suffixes
+    all of them."""
+    rng = random.Random(0)
+    K, n = 48, 8
+    dfa = jc.DFA.from_dense(V, [[rng.randrange(K) for _ in range(V)] for _ in range(K)], 0, rng.sample(range(K), 12))
+    cc = jc.compile(dfa, build_pc("pd", n, V))
+    kept = dense = 0
+    for info in cc.structure.nodes:
+        if info.kind == "sum":
+            (a, b), = info.scope_runs
+            slots, full = slots_of(cc, n, info.ns), dense_slots_of(cc, n, info.ns)
+            assert slots <= full and (slots == full or 0 < a <= b < n - 1)
+            kept += slots * info.ns.num_nodes
+            dense += full * info.ns.num_nodes
+    assert kept < 0.8 * dense
+    assert sum((end - first) * slots for first, end, slots in cc.backend.sum_regions) == kept
+
+
+def test_class_masses_take_one_row_per_parameter_row(build_pc):
+    """A tied HMM's input nodes (one group per position) share one set of emission parameters: the class masses keep
+    it once, n times fewer rows than input nodes, and every input node reads its own parameters' row."""
+    cc, n = compiled(build_pc, "hmm")
+    lo, hi = cc.backend.input_range
+    firsts, num_rows, mass_row = cc.backend.state.class_mass_rows()
+    assert num_rows * n == hi - lo
+    assert cc.backend.state.class_masses().shape == (num_rows, cc.backend.token_classes.num_stored)
+    for layer, first in zip(cc.pc.input_layer_group, firsts):
+        a, b = layer._output_ind_range
+        assert torch.equal(mass_row[a - lo:b - lo].long(), first + layer.s_pids // V)
+
+
+@pytest.mark.parametrize("kind", ["hmm", "pd", "hand_unit"])
+def test_an_input_layer_writes_the_input_region_as_in_a_tensor_circuit(kind, build_pc):
+    cc, n = compiled(build_pc, kind)
+    pc, B = cc.pc, 5
+    g = torch.Generator().manual_seed(0)
+    x = torch.randint(0, V, (B, n), generator = g).to(pc.device)
+    missing = (torch.rand(B, n, generator = g) < 0.4).to(pc.device)
+    bufs = cc.backend.state.buffers(B)
+    for layer in pc.input_layer_group:                                    # as TensorCircuit.forward calls them
+        layer(x.permute(1, 0), bufs["input_mars"], missing_mask = missing)
+    pc(x, missing_mask = missing)
+    lo, hi = cc.backend.input_range
+    assert torch.equal(bufs["input_mars"][lo:hi], pc.node_mars[lo:hi])
+
+
+@pytest.mark.parametrize("kind", ["hmm", "pd"])
+def test_views_sit_in_their_regions(kind, build_pc):
+    cc, n = compiled(build_pc, kind)
+    B = 5
+    bufs = cc.backend.state.buffers(B)
+    lay, node_mars = bufs["layout"], bufs["node_mars"]
+    assert bufs["input_mars"].data_ptr() == node_mars.data_ptr()                              # offset 0
+    # writing the input region (as an input layer does) leaves every other region untouched
+    node_mars.fill_(7.0)
+    x = torch.randint(0, V, (B, n), device = cc.pc.device)
+    for layer in cc.pc.input_layer_group:
+        layer(x.permute(1, 0), bufs["input_mars"])
+    end_of_inputs = cc.backend.input_range[1] * B
+    assert (node_mars[end_of_inputs:] == 7.0).all()
+
+
+def test_buffers_are_reused_across_batch_sizes(build_pc):
+    """A buffer's storage is re-cut while large enough and at most 4x too large, else replaced (larger, or smaller).
+    Every buffer is held: the storage it replaces stays allocated, so a replacement cannot land at its address (freed
+    first, the allocator may reuse it -- the address test failed in full runs, by what earlier tests left)."""
+    cc, _ = compiled(build_pc, "pd")
+    held = []
+
+    def buf(B):
+        held.append(cc.backend.state.buffers(B)["node_mars"])
+        return held[-1]
+
+    size = lambda t: t.untyped_storage().nbytes()
+    b64 = buf(64)
+    assert buf(32).data_ptr() == b64.data_ptr() == buf(64).data_ptr()     # within 4x: the same storage, re-cut
+    b128 = buf(128)
+    assert b128.data_ptr() != b64.data_ptr() and size(b128) > size(b64)    # too small: grown
+    b8 = buf(8)
+    assert b8.data_ptr() != b128.data_ptr() and size(b8) < size(b128)     # more than 4x too large: shrunk
+    fresh = cc.backend.state.buffers(256)["node_mars"]               # a new allocation: as FRESH_FILL says (the
+    assert torch.isnan(fresh).all()                                  # tests' NaN; unfilled in use)
+
+
+def test_per_group_widths_are_smaller_than_per_layer_widths(build_pc):
+    def per_layer(cc):
+        total = 0
+        for lg in cc.pc.inner_layer_groups:
+            if lg.is_sum():
+                for layer in lg.layers:
+                    lo, hi = layer._layer_nid_range
+                    total += (hi - lo) * max(s for first, _, s in cc.backend.sum_regions if lo <= first < hi)
+        return 4 * (total + max((e - f) * s for f, e, s in cc.backend.element_regions) + cc.backend.input_range[1])
+    hmm, _ = compiled(build_pc, "hmm")
+    assert hmm.backend.bytes_per_sample == per_layer(hmm)                          # one node group per sum layer
+    pd, _ = compiled(build_pc, "pd")
+    assert pd.backend.bytes_per_sample < per_layer(pd)
+
+
+def test_to_reallocates_the_buffers_on_the_new_device(build_pc):
+    cc, _ = compiled(build_pc, "hmm")
+    assert cc.backend.state.buffers(4)["node_mars"].device.type == "cuda"
+    cc.to("cpu")
+    bufs = cc.backend.state.buffers(4)
+    assert bufs["node_mars"].device.type == "cpu" and bufs["layout"]["sum_offsets_t"].device.type == "cpu"

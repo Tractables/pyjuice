@@ -869,7 +869,7 @@ def test_fused_em_correction_matches_the_torch_reference(block_size, n_blocks, c
     `_fused_em_correction` returning non-None is asserted as well: it declines shapes it cannot serve and
     the caller then runs the reference, which would make a comparison of "both paths" vacuous.
     """
-    import pyjuice.nodes.external_params.block_scale as bsmod
+    import pyjuice.nodes.external_params.blockscale.denominators as bsmod
 
     dev = torch.device("cuda:0")
     root, ns = _build_shape(block_size, n_blocks, ch_block_size)
@@ -894,9 +894,12 @@ def test_fused_em_correction_matches_the_torch_reference(block_size, n_blocks, c
         bsmod._EM_FUSED = True
         fused = desc.compute_em_correction(*args, denom_sources = sources).clone()
         bsmod._EM_FUSED = False
+        desc.__dict__.pop("_em_specs_cache", None)          # (the gate is read where the specs are made: cached)
+        assert desc._fused_em_correction(*args, sources) is None, "the reference would be the fused path again"
         ref = desc.compute_em_correction(*args, denom_sources = sources).clone()
     finally:
         bsmod._EM_FUSED = prev
+        desc.__dict__.pop("_em_specs_cache", None)
 
     assert torch.isfinite(fused).all()
     rel = ((fused - ref).abs() / ref.abs().clamp_min(1e-20)).max().item()
@@ -907,7 +910,7 @@ def test_fused_em_correction_matches_the_torch_reference(block_size, n_blocks, c
 def test_fused_em_correction_matches_reference_for_shared_layer_and_ties():
     """The two structural cases the per-shape test above cannot build: several gated `ns` in ONE layer
     (so `row_map` has to separate them) and a TIE GROUP (so the members' `W` have to be summed)."""
-    import pyjuice.nodes.external_params.block_scale as bsmod
+    import pyjuice.nodes.external_params.blockscale.denominators as bsmod
 
     dev = torch.device("cuda:0")
     B = 96
@@ -971,7 +974,10 @@ def test_fused_em_correction_matches_reference_for_shared_layer_and_ties():
                 f"the fused path declined {tgt}; this case would compare the reference with itself"
             fused = desc.compute_em_correction(*args, denom_sources = sources).clone()
             bsmod._EM_FUSED = False
+            desc.__dict__.pop("_em_specs_cache", None)      # (the gate is read where the specs are made: cached)
+            assert desc._fused_em_correction(*args, sources) is None, "the reference would be the fused path again"
             ref = desc.compute_em_correction(*args, denom_sources = sources).clone()
+            desc.__dict__.pop("_em_specs_cache", None)
             rel = ((fused - ref).abs() / ref.abs().clamp_min(1e-20)).max().item()
             assert rel < 1e-5, f"{tgt}: fused differs from the reference (relmax={rel})"
     finally:
@@ -1047,7 +1053,7 @@ def test_mini_batch_em_matches_the_pre_restructuring_sequence(circuit, step_size
     """
     from pyjuice.model.backend.parflow_fusing import compute_cum_par_flows
     from pyjuice.model.backend.par_update import em_par_update
-    import pyjuice.nodes.external_params.block_scale as bsmod
+    import pyjuice.nodes.external_params.blockscale.denominators as bsmod
 
     dev = torch.device("cuda:0")
     B = 96
@@ -2067,6 +2073,77 @@ class _DenseModeDescriptor(ExternalSumParams):
             out.copy_(self._fm)
             return out
         return self._fm
+
+
+@cuda_only
+@pytest.mark.parametrize("mode", ["rowgroup", "dense", "generic"])
+@pytest.mark.parametrize("kz", [False, True])
+@pytest.mark.parametrize("fold", [True, False], ids = ["fused_passes", "passes_of_their_own"])
+def test_the_master_copys_correction_is_its_sync_update_and_copy(mode, kz, fold, monkeypatch):
+    """Parameters stored below fp32 (`stored`: the stored range beside the fp32 master copy, which is `params`): the
+    correction takes the stored value where it was written since the copy was last stored, and stores its result,
+    rounded -- what `sync_master`, the update on `F+` taken to the copy's values (`_rounded`, see
+    `params_master.flows_to_master`) and a `copy_` make, to the update kernels' reduction order (the fused first pass
+    lays its tile out apart: ~1e-7). Outside writes on a tenth of the range, 1.7x off (a missed one is
+    70% off); the stored values exactly the copy's rounding, nothing outside the range written. The check and store in
+    the update's passes (`_fold_master`: a range past the L2, forced here) and as passes of their own; both fused `F-`
+    modes, and the generic path (the fused one declined)."""
+    import pyjuice.nodes.external_params.blockscale.denominators as bsmod
+    from pyjuice.model.backend.params_master import sync_master
+
+    monkeypatch.setattr(ExternalSumParams, "_fold_master", staticmethod(lambda params, n: fold))
+
+    dev = torch.device("cuda:0")
+    root, ns = _build_shape(16, 4, 4)
+    pc = juice.compile(root, verbose = False).to(dev)
+    B = 64
+    torch.manual_seed(5)
+    x = torch.randint(0, NUM_CATS, [B, 2], device = dev)
+    phi = _phi(ns, B, dev)
+    pc(x, sum_external_params = {ns: phi})
+    pc.backward(x, sum_external_params = {ns: phi}, logspace_flows = True, flows_memory = 0.0,
+                allow_modify_flows = False)
+    srcs = pc._denom_correction_nss()
+    tgt = next(iter(srcs))
+    desc = tgt.external_params
+    if mode == "dense":
+        fm = desc.materialize_denom_flows(tgt, pc.params, pc.denom_param_flows, srcs[tgt]).clone()
+        desc = _DenseModeDescriptor(fm, tgt._param_flow_range[0])
+    ps, pe = tgt._param_range
+    torch.manual_seed(6)
+    master0 = pc.params.detach() * (1 + 1e-3 * torch.randn_like(pc.params))      # (off the bf16 grid)
+    stored0 = master0.to(torch.bfloat16)
+    written = ps + torch.randperm(pe - ps, device = dev)[: (pe - ps) // 10]
+    stored0[written] = (stored0[written].float() * 1.7).to(torch.bfloat16)        # writes from outside
+    rest = (pc.param_flows, pc.denom_param_flows, 0.5, 0.1, kz)
+
+    prev = bsmod._EM_FUSED
+    try:
+        bsmod._EM_FUSED = mode != "generic"
+        probe = master0.clone()
+        fused = desc._fused_em_correction(tgt, probe, *rest, srcs[tgt], out = probe[ps:pe],
+                                          stored = stored0.clone()[ps:pe])
+        assert (fused is None) == (mode == "generic"), \
+            f"{mode}: the fused path {'ran' if fused is not None else 'declined'}"
+
+        ref_m, ref_s = master0.clone(), stored0.clone()
+        sync_master(ref_m[ps:pe], ref_s[ps:pe])
+        desc.compute_em_correction(tgt, ref_m, *rest, denom_sources = srcs[tgt], out = ref_m[ps:pe], _rounded = True)
+        ref_s[ps:pe].copy_(ref_m[ps:pe])
+
+        got_m, got_s = master0.clone(), stored0.clone()
+        desc.compute_em_correction(tgt, got_m, *rest, denom_sources = srcs[tgt], out = got_m[ps:pe],
+                                   stored = got_s[ps:pe])
+    finally:
+        bsmod._EM_FUSED = prev
+
+    rel = ((got_m - ref_m).abs() / ref_m.abs().clamp_min(1e-20)).max().item()
+    assert rel < 1e-5, f"{mode}: the master copy {rel:.2e} from sync + update + copy"
+    assert torch.equal(got_s[ps:pe], got_m[ps:pe].to(torch.bfloat16)), f"{mode}: stored not the copy's rounding"
+    assert torch.equal(got_s[:ps], stored0[:ps]) and torch.equal(got_s[pe:], stored0[pe:]), \
+        f"{mode}: stored written outside the range"
+    assert torch.equal(got_m[:ps], master0[:ps]) and torch.equal(got_m[pe:], master0[pe:]), \
+        f"{mode}: the master copy written outside the range"
 
 
 @cuda_only

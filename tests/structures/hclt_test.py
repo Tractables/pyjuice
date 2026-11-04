@@ -86,6 +86,7 @@ def full_batch_em_epoch(pc, train_loader, test_loader, device):
     print(f"[train LL: {train_ll:.2f}; test LL: {test_ll:.2f}].....[train forward+backward+step {t1-t0:.2f}; test forward {t2-t1:.2f}] ")
 
 
+@pytest.mark.slow
 def test_hclt():
 
     device = torch.device("cuda:0")
@@ -141,6 +142,7 @@ def test_hclt():
     assert test_ll > -785
 
 
+@pytest.mark.slow
 def test_hclt_logspace_flows():
 
     device = torch.device("cuda:0")
@@ -310,6 +312,7 @@ def test_large_hclt_full():
     assert test_ll > -640
 
 
+@pytest.mark.slow
 def test_hclt_logistic():
 
     device = torch.device("cuda:0")

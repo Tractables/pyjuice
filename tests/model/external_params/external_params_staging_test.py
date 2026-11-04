@@ -574,7 +574,7 @@ def test_every_staging_transpose_tier_agrees():
     reach whichever backend the machine happens to have.
 
     All three compute the same pure permutation, so they must agree BIT FOR BIT."""
-    from pyjuice.model import tensorcircuit as tc
+    from pyjuice.model import external_params as staging
     from pyjuice.nodes.external_params.kernels.c import get_module
     from pyjuice.nodes.external_params.kernels.staging import staging_transpose_triton
 
@@ -590,20 +590,139 @@ def test_every_staging_transpose_tier_agrees():
     if get_module() is not None:
         tiers["cuda"] = get_module().staging_transpose
 
-    orig = tc._staging_transpose_fn
+    orig = staging._staging_transpose_fn
     try:
         for name, fn in tiers.items():
-            tc._staging_transpose_fn = (lambda fn = fn: fn)
+            staging._staging_transpose_fn = (lambda fn = fn: fn)
 
             flat = torch.zeros([batch * n], device = device)          # a whole-group destination
-            tc._staged_copy([], [], [(flat, src)])
+            staging._staged_copy([], [], [(flat, src)])
             assert torch.equal(flat, expect), f"'{name}' tier, flat destination"
 
             shaped = torch.zeros([n_blk, gates, batch], device = device)   # a per-node destination
-            tc._staged_copy([], [], [(shaped, src)])
+            staging._staged_copy([], [], [(shaped, src)])
             assert torch.equal(shaped.reshape(-1), expect), f"'{name}' tier, storage-shaped destination"
     finally:
-        tc._staging_transpose_fn = orig
+        staging._staging_transpose_fn = orig
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs a GPU")
+def test_several_pairs_stage_in_one_launch_bit_for_bit():
+    """Several pairs -- a forward's every node -- go through the CUDA extension's batched transpose in one launch:
+    batches and widths not multiples of 32, both destination shapes, pairs of different sizes (the grid spans the
+    largest; the others' extra blocks return), more pairs than one launch takes (65: two). The pairs' addresses go
+    by value: new contents at the same addresses are read, a source moved elsewhere is read where it is. Bit for
+    bit, a pure permutation."""
+    from pyjuice.model import external_params as staging
+    from pyjuice.nodes.external_params.kernels.c import get_module
+    if get_module() is None or not hasattr(get_module(), "staging_transpose_batched"):
+        pytest.skip("the CUDA extension did not build")
+    device = torch.device("cuda:0")
+    torch.manual_seed(0)
+    shapes = [(33, 5, 7), (64, 1, 3), (100, 9, 4), (7, 2, 33), (1, 3, 5)]
+    srcs = [torch.randn(s, device = device) for s in shapes]
+    # the destinations stay where they are -- as the staging buffer's views do --, both shapes of them
+    dsts = [torch.empty([s.numel()], device = device) if i % 2 == 0 else
+            torch.empty(list(s.shape[1:]) + [s.size(0)], device = device) for i, s in enumerate(srcs)]
+
+    def run(srcs):
+        for d in dsts:
+            d.fill_(float("nan"))
+        staging._staged_copy([], [], list(zip(dsts, srcs)))
+        torch.cuda.synchronize()
+        for i, (dst, src) in enumerate(zip(dsts, srcs)):
+            expect = src.permute(*range(1, src.dim()), 0).reshape(-1)
+            assert torch.equal(dst.reshape(-1), expect), f"pair {i} {tuple(src.shape)}"
+
+    run(srcs)
+    for s in srcs:                                        # new contents, same addresses
+        s.copy_(torch.randn_like(s))
+    run(srcs)
+    srcs[2] = torch.randn(shapes[2], device = device)     # one source elsewhere
+    run(srcs)
+    many = [torch.randn(3, 5, device = device) for _ in range(65)]       # past one launch's pairs
+    outs = [torch.empty(5, 3, device = device) for _ in many]
+    staging._staged_copy([], [], list(zip(outs, many)))
+    torch.cuda.synchronize()
+    assert all(torch.equal(o, m.t()) for o, m in zip(outs, many))
+
+
+def test_the_gradients_are_written_back_in_one_launch():
+    """`sum_external_params_grad` destinations are filled by the staging transpose the other way round -- every
+    contiguous fp32 destination of a node whose storage rotates the batch axis to the end, in ONE launch of the CUDA
+    extension's batched transpose -- bit for bit what `from_storage` of the internal gradients holds (a pure
+    permutation). A non-contiguous destination (a slice of the caller's own buffer) takes the per-tensor copy; a single
+    pair the single transpose; the Triton / torch tier, where the extension is not built, the same values."""
+    from pyjuice.model import external_params as staging
+    from pyjuice.nodes.external_params.kernels.c import get_module
+    from pyjuice.nodes import BlockScaleSumParams
+    mod = get_module()
+    if mod is None or not hasattr(mod, "staging_transpose_batched"):
+        pytest.skip("the CUDA extension did not build")
+    device = torch.device("cuda:0")
+    batch = 40                                                              # (not a multiple of 32)
+    torch.manual_seed(0)
+    with juice.set_block_size(8):
+        ns = inputs(0, num_node_blocks = 3, dist = dists.Categorical(num_cats = 5))
+        gated = []
+        for t in range(1, 5):
+            emit = inputs(t, num_node_blocks = 3, dist = dists.Categorical(num_cats = 5))
+            ns = summate(multiply(ns, emit), num_node_blocks = 3,
+                         external_params = BlockScaleSumParams(ch_block_size = 4))
+            gated.append(ns)
+        root = summate(multiply(ns), num_node_blocks = 1, block_size = 1)
+    root.init_parameters(perturbation = 2.0)
+    pc = juice.compile(root, verbose = False).to(device)
+    data = torch.randint(0, 5, [batch, 5], device = device)
+    phi = {g: torch.randn(g.external_params.tensor_shapes(g, batch)[0], device = device) for g in gated}
+
+    calls = []
+    real_batched, real_single = mod.staging_transpose_batched, mod.staging_transpose
+
+    def batched(rows, max_b, max_n):
+        calls.append(("batched", len(rows) // 4))
+        return real_batched(rows, max_b, max_n)
+
+    def single(dst, src, B, N):
+        calls.append(("single", 1))
+        return real_single(dst, src, B, N)
+
+    def run(dsts):
+        pc(data, sum_external_params = phi)
+        calls.clear()                                                       # (the forward's own staging launch)
+        pc.backward(data, flows_memory = 0.0, sum_external_params_grad = dsts)
+        torch.cuda.synchronize()
+        for g, got in dsts.items():
+            ref = g.external_params.from_storage(g, pc._staged_external_params_grad[g])[0]
+            assert torch.equal(got, ref), f"{g}: the written gradient differs from the internal one"
+
+    mod.staging_transpose_batched, mod.staging_transpose = batched, single
+    try:
+        mine = {g: torch.empty_like(p) for g, p in phi.items()}             # contiguous: one launch for all four
+        run(mine)
+        assert calls == [("batched", 4)], calls
+        assert float(sum(m.abs().sum() for m in mine.values())) > 0.0
+        run({gated[0]: mine[gated[0]]})                                      # one pair: the single transpose
+        assert calls == [("single", 1)], calls
+        big = torch.empty([batch, len(gated), 2] + list(phi[gated[0]].shape[1:]), device = device)
+        sliced = {g: big[:, i, 1] for i, g in enumerate(gated)}              # non-contiguous: the per-tensor copy
+        run(sliced)
+        assert calls == [], calls
+        mixed = {gated[0]: mine[gated[0]], gated[1]: sliced[gated[1]], gated[2]: mine[gated[2]]}
+        run(mixed)
+        assert calls == [("batched", 2)], calls
+    finally:
+        mod.staging_transpose_batched, mod.staging_transpose = real_batched, real_single
+
+    # the tier below the extension: the same values
+    real_fn = staging._staging_transpose_fn
+    staging._staging_transpose_fn = lambda: None
+    try:
+        again = {g: torch.empty_like(p) for g, p in phi.items()}
+        run(again)
+        assert all(torch.equal(again[g], mine[g]) for g in gated)
+    finally:
+        staging._staging_transpose_fn = real_fn
 
 
 def test_an_ungated_forward_drops_a_previously_staged_gate():

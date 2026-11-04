@@ -18,9 +18,8 @@ import pytest
 
 import pyjuice as juice
 import pyjuice.nodes.distributions as dists
-from pyjuice.nodes.distributions.softevi_categorical import (
-    _evidence_cache_key, _evidence_cache_hit, _fw_linear_evidence,
-)
+from pyjuice.nodes.distributions.softevi.common import _evidence_cache_key, _evidence_cache_hit
+from pyjuice.nodes.distributions.softevi.forward import _fw_linear_evidence
 
 
 def _realloc_at_same_address(shape, dtype, device, make):

@@ -55,7 +55,7 @@ def _bk_triton_sparse_par_kernel(node_flows, node_mars, element_mars, mparams, p
     if propagation_alg_id == 1:
         par_start = tl.load(pids + nblock_id * num_edges + offs_edge)
         epars_ptr = mparams + par_start + tile_id
-        epars = tl.load(epars_ptr) # [BLOCK_K]
+        epars = tl.load(epars_ptr).to(tl.float32) # [BLOCK_K]
         elpars = tl.log(epars)
 
     # Inner loop
@@ -116,7 +116,7 @@ def _bk_triton_sparse_par_kernel(node_flows, node_mars, element_mars, mparams, p
     if propagation_alg_id != 1:
         par_start = tl.load(pids + nblock_id * num_edges + offs_edge)
         epars_ptr = mparams + par_start + tile_id
-        epars = tl.load(epars_ptr) # [BLOCK_K]
+        epars = tl.load(epars_ptr).to(tl.float32) # [BLOCK_K]
 
     parflow_start = tl.load(pfids + nblock_id * num_edges + offs_edge)
     eparflows_ptr = param_flows + parflow_start + tile_id
@@ -195,7 +195,7 @@ def _bk_triton_sparse_tempered_par_kernel(node_flows, node_mars_tempered, elemen
 
     par_start = tl.load(pids + nblock_id * num_edges + offs_edge)
     epars_ptr = mparams + par_start + tile_id
-    epars = tl.load(epars_ptr) # [BLOCK_K]
+    epars = tl.load(epars_ptr).to(tl.float32) # [BLOCK_K]
 
     parflow_start = tl.load(pfids + nblock_id * num_edges + offs_edge)
     eparflows_ptr = param_flows + parflow_start + tile_id

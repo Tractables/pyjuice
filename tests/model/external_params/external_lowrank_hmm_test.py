@@ -452,6 +452,43 @@ def test_lowrank_hmm_kernel_matches_torch_reference():
     assert torch.all(torch.abs(kernel_lls - torch_lls) < 1e-4)
 
 
+def test_lowrank_hmm_flows_without_external_grads():
+    """
+    A backward that does not ask for the external parameters' gradients (`compute_external_grads = False`)
+    computes the flows one that does computes. The low-rank term's share of the child flows comes from the kernel
+    that writes those gradients, which once ran only when they were asked for -- leaving every flow below a
+    low-rank layer with the shared parameters' term alone (off by up to 13 nats here).
+    """
+
+    device = torch.device("cuda:0")
+
+    batch_size = 16
+
+    pc, root_ns, trans_ns = _compiled(external = True)
+
+    torch.manual_seed(12)
+    data = torch.randint(0, NUM_EMITS, [batch_size, SEQ_LENGTH]).to(device)
+
+    U = torch.randn([batch_size, 1, NUM_LATENTS, RANK], device = device) - 2.0
+    V = torch.randn([batch_size, 1, NUM_LATENTS, RANK], device = device) - 2.0
+
+    mapping = {ns: (U, V) for ns in pc.external_params_nodes}
+
+    flows = []
+    for compute_external_grads in (True, False):
+        pc(data, sum_external_params = mapping)
+        pc.backward(data, flows_memory = 0.0, compute_external_grads = compute_external_grads)
+        flows.append((pc.node_flows.clone(), pc.param_flows.clone()))
+
+    (nf_with, pf_with), (nf_without, pf_without) = flows
+    assert torch.equal(torch.isfinite(nf_with), torch.isfinite(nf_without))
+    finite = torch.isfinite(nf_with)
+    # The gradient kernel accumulates with atomics: equal to float rounding, not to the bit
+    assert torch.allclose(nf_with[finite], nf_without[finite], atol = 1e-6), \
+        float((nf_with[finite] - nf_without[finite]).abs().max())
+    assert torch.allclose(pf_with, pf_without, rtol = 1e-5, atol = 1e-6)
+
+
 if __name__ == "__main__":
     test_lowrank_hmm_compilation()
     test_lowrank_hmm_reference_semantics()

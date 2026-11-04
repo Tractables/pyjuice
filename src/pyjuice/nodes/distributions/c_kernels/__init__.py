@@ -1,7 +1,8 @@
 """Optional plain-CUDA fast-path kernels for input distributions.
 
-One source file per distribution, named after its Python module (e.g. `softevi_categorical.cu` holds
-every CUDA kernel for `SoftEvidenceCategorical` in `softevi_categorical.py`).
+Source files named after their distribution's Python module (e.g. `softevi_categorical.cu` holds the
+CUDA kernels for `SoftEvidenceCategorical` in `softevi_categorical.py`, launched from `softevi/`; a later
+form of one of them, a module of its own: `softevi_rows.cu`, the row-form top-k forward).
 
 Mirrors ``pyjuice.layer.kernels.c.input_layers``: each kernel JIT-compiles on first use and disables
 itself -- falling back to the Triton implementation -- if anything required is missing (no CUDA, no
@@ -80,3 +81,45 @@ def softevi_forward_dense(params, node_mars, Z, log_ex_p, data, vids, s_pids, ni
         int(max_refs), int(num_slots), int(num_blocks), int(layer_num_nodes), int(batch_size),
         int(node_offset), int(TL), int(threads), int(cat_blocks), int(zero_z), int(run_epilogue),
         int(swizzle))
+
+
+_rows_module = None
+_rows_attempted = False
+
+
+def softevi_rows_available() -> bool:
+    """Whether the row-form top-k forward (`softevi_rows.cu`) is usable (lazily JIT-compiles once)."""
+    global _rows_module, _rows_attempted
+    if not _rows_attempted:
+        _rows_attempted = True
+        _rows_module = _jit_plain("pyjuice_softevi_rows", "softevi_rows.cu")
+    return _rows_module is not None
+
+
+def softevi_forward_rows(params, node_mars, Z, T, log_ex_p, data, vids, s_pids, nids, var_idmapping, keys, p_base,
+                         elem_key, pt, num_keys, num_cats, num_latents, chunk, B, V, K, layer_num_nodes, node_offset,
+                         threads = 128, unroll = 4):
+    _rows_module.softevi_forward_rows(
+        params, node_mars, Z, T, log_ex_p, data, vids, s_pids, nids, var_idmapping, keys, p_base, elem_key, pt,
+        int(num_keys), int(num_cats), int(num_latents), int(chunk), int(B), int(V), int(K), int(layer_num_nodes),
+        int(node_offset), int(threads), int(unroll))
+
+
+def softevi_hot_flows(params, param_flows, G, keys, p_base, pf_base, num_hot, num_latents, num_cats):
+    _rows_module.softevi_hot_flows(params, param_flows, G, keys, p_base, pf_base, int(num_hot), int(num_latents),
+                                   int(num_cats))
+
+
+def softevi_rows_table(params, keys, p_base, T, num_keys, num_latents, num_cats, l0, lc):
+    _rows_module.softevi_rows_table(params, keys, p_base, T, int(num_keys), int(num_latents), int(num_cats), int(l0),
+                                    int(lc))
+
+
+def softevi_rows_z_cold(T, elem_key, pt, Zh, Z, B, V, K, num_latents, l0, lc):
+    _rows_module.softevi_rows_z_cold(T, elem_key, pt, Zh, Z, int(B), int(V), int(K), int(num_latents), int(l0), int(lc))
+
+
+def softevi_rows_epilogue(params, node_mars, Z, log_ex_p, data, vids, s_pids, nids, var_idmapping, layer_num_nodes, B,
+                          node_offset, num_latents):
+    _rows_module.softevi_rows_epilogue(params, node_mars, Z, log_ex_p, data, vids, s_pids, nids, var_idmapping,
+                                       int(layer_num_nodes), int(B), int(node_offset), int(num_latents))
