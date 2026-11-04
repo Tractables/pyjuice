@@ -99,6 +99,18 @@ class DFA(Constraint):
         out._live, out._accept_in, out._device_tables = None, None, {}
         return out
 
+    @classmethod
+    def _of_numbered_classes(cls, vocab_size: int, token_class: torch.Tensor, delta: torch.Tensor, initial: int,
+                             accept: torch.Tensor) -> "DFA":
+        """:meth:`_of_classes` of classes numbered by their smallest token, none of them empty, whose columns may repeat
+        (a look at the vocabulary only if they do)."""
+        table = delta.numpy()
+        group, first = _column_classes(table)
+        if first.size < table.shape[1]:
+            token_class = torch.from_numpy(group[token_class.numpy()])
+            delta = torch.from_numpy(np.ascontiguousarray(table[:, first]))
+        return cls._of_classes(vocab_size, token_class, delta, initial, accept)
+
     # ---------------------------------------------------------------------------------------------
     # Tables
     # ---------------------------------------------------------------------------------------------
@@ -269,8 +281,8 @@ class DFA(Constraint):
         block, num_blocks = hopcroft(d, acc)
         rep = np.empty(num_blocks, dtype = np.int64)
         rep[block] = np.arange(reach.size)                      # any member represents its block
-        merged = DFA(self.vocab_size, self._token_class, torch.from_numpy(block[d[rep]]), int(block[0]),
-                     torch.from_numpy(acc[rep]))
+        merged = DFA._of_numbered_classes(self.vocab_size, self._token_class, torch.from_numpy(block[d[rep]]), int(block[0]),
+                                          torch.from_numpy(acc[rep]))
         return merged._renumbered()
 
     def equivalent(self, other: "DFA") -> bool:
@@ -378,10 +390,19 @@ class DFA(Constraint):
         for s in range(len(goto)):
             if final[s]:
                 delta[s] = [s] * (len(alphabet) + 1)
-        token_class = torch.full((vocab_size,), len(alphabet), dtype = torch.long)
-        token_class[torch.as_tensor(alphabet)] = torch.arange(len(alphabet))
-        accept = [s for s in range(len(goto)) if final[s]]
-        return cls(vocab_size, token_class, delta, 0, accept).minimize()
+        # the classes numbered by their smallest token: every other token's after the alphabet's below its first
+        first = next((i for i, t in enumerate(alphabet) if t != i), len(alphabet))
+        tokens = np.asarray(alphabet, dtype = np.int64)
+        table = np.asarray(delta, dtype = np.int64)
+        accepting = torch.from_numpy(np.asarray(final, dtype = bool))
+        if first == vocab_size:                                 # (no other token)
+            token_class = torch.from_numpy(tokens.argsort())
+            return cls._of_numbered_classes(vocab_size, token_class, torch.from_numpy(table[:, :-1]), 0, accepting).minimize()
+        order = np.r_[np.arange(first), len(alphabet), np.arange(first, len(alphabet))]
+        token_class = np.full(vocab_size, first, dtype = np.int64)
+        token_class[tokens] = np.where(np.arange(tokens.size) < first, np.arange(tokens.size), np.arange(tokens.size) + 1)
+        return cls._of_numbered_classes(vocab_size, torch.from_numpy(token_class), torch.from_numpy(table[:, order]), 0,
+                                        accepting).minimize()
 
     # ---------------------------------------------------------------------------------------------
     # Identity
@@ -457,20 +478,19 @@ def _joint_classes(dfas: Sequence[DFA]):
         raise ValueError("Cannot combine DFAs over different vocabularies.")
     sizes = [d.num_classes for d in dfas]
     if float(np.prod(sizes, dtype = np.float64)) <= 2 ** 24:
-        # mixed-radix key per token, then a counting pass: O(V + prod(C_i)), no sort over V
-        key = torch.zeros(vocab, dtype = torch.long)
+        # mixed-radix key per token, then a counting pass: O(V + prod(C_i)), no sort over V (no thread team for a look)
+        key = np.zeros(vocab, dtype = np.int64)
         for d, c in zip(dfas, sizes):
-            key = key * c + d._token_class
-        present = torch.bincount(key, minlength = int(np.prod(sizes))) > 0
-        keys = torch.nonzero(present).flatten()                            # sorted joint keys
-        remap = torch.cumsum(present.long(), dim = 0) - 1
-        token_class = remap[key]
-        child_class = torch.empty(keys.numel(), len(dfas), dtype = torch.long)
-        rest = keys.clone()
+            key = key * c + d._token_class.numpy()
+        present = np.bincount(key, minlength = int(np.prod(sizes))) > 0
+        keys = np.flatnonzero(present)                                      # sorted joint keys
+        remap = np.cumsum(present) - 1
+        child_class = np.empty((keys.size, len(dfas)), dtype = np.int64)
+        rest = keys.copy()
         for i in range(len(dfas) - 1, -1, -1):
             child_class[:, i] = rest % sizes[i]
-            rest = rest // sizes[i]
-        return token_class, child_class
+            rest //= sizes[i]
+        return torch.from_numpy(remap[key]), torch.from_numpy(child_class)
     stacked = torch.stack([d._token_class for d in dfas], dim = 1)          # [V, k]
     child_class, token_class = torch.unique(stacked, dim = 0, return_inverse = True)
     return token_class, child_class
@@ -515,7 +535,7 @@ def product(dfas: Sequence[DFA], mode: str) -> DFA:
 
 def complement(dfa: DFA) -> DFA:
     """Sequences the DFA rejects (a complete DFA: flip the accepting states)."""
-    return DFA(dfa.vocab_size, dfa._token_class, dfa._delta, dfa.initial, ~dfa._accept).minimize()
+    return DFA._of_classes(dfa.vocab_size, dfa._token_class, dfa._delta, dfa.initial, ~dfa._accept).minimize()
 
 
 def concatenate(dfas: Sequence[DFA]) -> DFA:

@@ -211,6 +211,11 @@ def test_a_tokenizer_for_a_vocabulary(byte_level):
     transformers = pytest.importorskip("transformers")
     wrapped = transformers.PreTrainedTokenizerFast(tokenizer_object = tok, eos_token = "<|endoftext|>")
     assert jc.Regex("[a-z]+", wrapped) == jc.Regex("[a-z]+", jc.Vocabulary.from_tokenizer(wrapped))
+    # read once, while it says the same: a constraint per example pays neither the reading nor the byte trie
+    assert jc.Regex("a", wrapped).vocabulary is jc.Regex("b", wrapped).vocabulary
+    before = jc.Regex("a", wrapped).vocabulary
+    wrapped.add_tokens(["<another>"])
+    assert jc.Regex("a", wrapped).vocabulary is not before and jc.Regex("a", wrapped).vocab_size == before.size + 1
 
 
 #: every construct, as `re` reads it: those the reader has to take apart, the corners of what Python accepts

@@ -20,6 +20,7 @@ built on first use.
 from __future__ import annotations
 
 import re
+import weakref
 from typing import Optional
 
 import torch
@@ -124,6 +125,31 @@ def _checked(pattern: str):
     return tree
 
 
+#: the vocabularies of the tokenizers given for one, by the tokenizer (reading one takes 0.1-0.2 s, and its byte trie goes
+#: with its vocabulary): a constraint per example should not pay them
+_TOKENIZERS = weakref.WeakKeyDictionary()
+
+
+def _vocabulary_of(tokenizer) -> Vocabulary:
+    """:meth:`Vocabulary.from_tokenizer` of ``tokenizer``, kept while it lives and says the same of its size and end of
+    sequence (a tokenizer that cannot be referred to weakly is read every time)."""
+    backend = getattr(tokenizer, "backend_tokenizer", tokenizer)
+    size = backend.get_vocab_size(with_added_tokens = True) if hasattr(backend, "get_vocab_size") else None
+    said = (size, getattr(tokenizer, "eos_token_id", None))
+    try:
+        kept = _TOKENIZERS.get(tokenizer)
+    except TypeError:
+        return Vocabulary.from_tokenizer(tokenizer)
+    if kept is not None and kept[0] == said:
+        return kept[1]
+    vocabulary = Vocabulary.from_tokenizer(tokenizer)
+    try:
+        _TOKENIZERS[tokenizer] = (said, vocabulary)
+    except TypeError:
+        pass
+    return vocabulary
+
+
 class _Text(Constraint):
     """
     Token sequences whose TEXT -- the tokens' bytes concatenated, valid UTF-8 -- is in a set of texts, under the
@@ -134,7 +160,7 @@ class _Text(Constraint):
 
     def __init__(self, vocabulary, eos_padding: bool):
         if not isinstance(vocabulary, Vocabulary):
-            vocabulary = Vocabulary.from_tokenizer(vocabulary)
+            vocabulary = _vocabulary_of(vocabulary)
         if eos_padding and not vocabulary.eos:
             raise ValueError("The vocabulary has no end-of-sequence ids, which `eos_padding` needs: give them to the "
                              "Vocabulary (`eos = ...`), or pass `eos_padding = False`.")
