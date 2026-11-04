@@ -84,7 +84,7 @@ def multiply(nodes1: ProdNodesChs, *args, edge_ids: Optional[Tensor] = None, spa
     :param args: the remaining child nodes
     :type args: Union[SumNodes,InputNodes]
 
-    :param edge_ids: a matrix of size [# product node blocks, # children] - the ith product node block is connected to the `edge_ids[i,j]`th node block in the jth child
+    :param edge_ids: a matrix of size [# product node blocks, # children] - the ith product node block is connected to node block `edge_ids[i,j]` of the jth child
     :type edge_ids: Optional[Tensor]
 
     :param sparse_edges: if set to `True`, the size of `edge_ids` becomes [# product nodes, # children] (i.e., we assume the block size of every child is 1)

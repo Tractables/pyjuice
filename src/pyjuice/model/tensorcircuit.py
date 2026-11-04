@@ -93,7 +93,7 @@ class TensorCircuit(_BuildMixin, _CudaGraphsMixin, _ExternalParamsMixin, _Learni
                4 accumulator blocks to 1: `param_flows` 4.14 -> 1.04 GB, backward 16.8 -> 13.4 ms and
                `init_param_flows` 5.7 -> 1.4 ms (1.41x on the step), with parameters after an EM step
                agreeing to ~2e-5 relative -- flow-accumulation reassociation only. For scale, on the same
-               GPU 268M `atomic_add`s all targeting ONE address cost 3.7 ms, versus 44 ms for the same
+               GPU 268M `atomic_add` calls all targeting ONE address cost 3.7 ms, versus 44 ms for the same
                count scattered over a 4 GB table: contention is the cheap side of the trade. Lower it
                only for a model where atomic stalls are demonstrably the bottleneck.
 
