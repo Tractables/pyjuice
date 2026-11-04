@@ -593,8 +593,9 @@ class Assembly:
     :ivar pos_steps: int64 [n] on the device, the input steps per position
     :ivar steps_host: the same on the host
     :ivar trans_job: the steps :func:`~..kernels.transitions.transition_masses` builds for, or None
-    :ivar score, top_down: built for the first program that asks (:func:`~..kernels.score.score_tables`,
-        :func:`~.top_down_program.top_down_template`)
+    :ivar score, top_down, forward_shape, position_classes: built for the first program that asks
+        (:func:`~..kernels.score.score_tables`, :func:`~.top_down_program.top_down_template`,
+        :func:`~..queries.backend.planners._forward_shape`, :func:`~..kernels.transition_signatures.position_classes`)
     """
 
     def __init__(self, circuit: CircuitTables, full: Dict[Tuple[int, int], bool]):
@@ -649,6 +650,8 @@ class Assembly:
                                     layer.num_temps, layer.temp_ivs) for li, layer in enumerate(layers)]
         self.score = None
         self.top_down = None
+        self.forward_shape = None
+        self.position_classes = None
 
     def _launch(self, form: str, kinds: tuple, rows: torch.Tensor, parts: list) -> LaunchTemplate:
         """The :class:`LaunchTemplate` of a stage's steps (``rows`` [S, fields] int64, of the emits ``parts``); a query

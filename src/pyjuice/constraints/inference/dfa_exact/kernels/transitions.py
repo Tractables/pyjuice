@@ -441,15 +441,26 @@ def transition_job(rows: torch.Tensor, dev):
     [tiles, 3] (first row, number of rows, position) cutting them into tiles of at most ``TS`` rows at one position
     (fewer when there are few rows, so that there are enough programs).
     """
-    TS = min(TRANSITION_TILES["TS"], max(16, host_next_power_of_2(rows.size(0)) // 32))
+    TS = job_tile(rows.size(0))
     rows = rows[torch.argsort(rows[:, 1], stable = True)]
     pos, counts = torch.unique_consecutive(rows[:, 1], return_counts = True)
-    tiles, start = [], 0
-    for t, k in zip(pos.tolist(), counts.tolist()):
-        tiles += [(start + i, min(TS, k - i), t) for i in range(0, k, TS)]
-        start += k
-    i32 = lambda x: torch.as_tensor(x, dtype = torch.int32).reshape(-1, 3).to(dev).contiguous()
-    return i32(rows), i32(tiles), TS
+    i32 = lambda x: x.to(dev, torch.int32).contiguous()
+    return i32(rows), i32(job_tiles(pos, counts, TS)), TS
+
+
+def job_tile(rows: int) -> int:
+    """:func:`transition_job`'s most rows a tile, for so many rows."""
+    return min(TRANSITION_TILES["TS"], max(16, host_next_power_of_2(rows) // 32))
+
+
+def job_tiles(pos: torch.Tensor, counts: torch.Tensor, TS: int) -> torch.Tensor:
+    """int64 [tiles, 3], ``(first row, number of rows, position)``: the rows of the positions ``pos`` (``counts`` of each,
+    one position's after another's) cut into tiles of at most ``TS``."""
+    per = (counts + TS - 1) // TS
+    owner = torch.repeat_interleave(torch.arange(pos.numel(), device = pos.device), per)
+    within = torch.arange(owner.numel(), device = pos.device) - (torch.cumsum(per, dim = 0) - per)[owner]
+    first = (torch.cumsum(counts, dim = 0) - counts)[owner] + within * TS
+    return torch.stack([first, (counts[owner] - within * TS).clamp(max = TS), pos[owner]], dim = 1)
 
 
 @triton_jit

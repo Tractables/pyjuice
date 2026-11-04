@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import NamedTuple, Optional, Tuple
 
 import numpy as np
 import torch
@@ -34,7 +34,7 @@ from pyjuice.utils.util import host_cdiv, host_next_power_of_2
 
 from ....distributions.categorical import _exact_dot
 from .common import _next_col_of, grid_chunks
-from .transitions import TRANSITION_PAIR_TILE, TRANSITION_TILES, transition_job
+from .transitions import TRANSITION_PAIR_TILE, TRANSITION_TILES, job_tile, job_tiles
 
 #: Whether a query's one set of transition masses is laid out by column signature where that saves at least
 #: ``SIGNATURE_MIN_SAVING`` times the floats (see the module docstring)
@@ -140,6 +140,40 @@ def _unique_rows(columns: list) -> Tuple[torch.Tensor, torch.Tensor]:
     return order[new], inverse
 
 
+class PositionClasses(NamedTuple):
+    """The positions reading the same class-mass rows in rank order (:func:`position_classes`): ``of`` int64 [n], every
+    position's class (-1: no step reads its masses), and ``steps`` int64 [classes], the steps of a position of each, for
+    the row map ``row``."""
+
+    row: torch.Tensor
+    of: np.ndarray
+    steps: np.ndarray
+
+
+def position_classes(prog, masses) -> PositionClasses:
+    """The :class:`PositionClasses` of ``prog``'s input steps under ``masses``' row map: every step's row, a look at each
+    (HMM-4096: half a million) on the host, kept with the circuit's steps: they say nothing of the automaton."""
+    kept = prog.assembly.position_classes
+    if kept is not None and (kept.row is masses.row or torch.equal(kept.row, masses.row)):
+        return kept
+    rows = prog.trans_job[0].long()                                # (input row, position, rank), by position
+    mass_row = masses.row.long()[rows[:, 0] - prog.input_start]
+    rows_h, mass_h = rows.cpu().numpy(), mass_row.cpu().numpy()
+    pos, counts = np.unique(rows_h[:, 1], return_counts = True)
+    steps = np.zeros(prog.n, dtype = np.int64)
+    steps[pos] = counts
+    order = np.lexsort((rows_h[:, 2], rows_h[:, 1]))
+    by_pos = np.split(mass_h[order], np.cumsum(counts)[:-1])
+    of, classes = np.full(prog.n, -1, dtype = np.int64), {}
+    for t, mr in zip(pos.tolist(), by_pos):
+        of[t] = classes.setdefault(mr.tobytes(), len(classes))
+    csteps = np.zeros(len(classes), dtype = np.int64)
+    for t in pos.tolist():
+        csteps[of[t]] = steps[t]
+    kept = prog.assembly.position_classes = PositionClasses(masses.row, of, csteps)
+    return kept
+
+
 def signature_masses(prog, masses, trans_size: int) -> Optional[SignatureMasses]:
     """
     The :class:`SignatureMasses` of ``prog``'s grouped tables (``prog.succ``) for ``masses``' class-mass row map (one
@@ -158,8 +192,6 @@ def signature_masses(prog, masses, trans_size: int) -> Optional[SignatureMasses]
     entry_succ, entry_x = long(tt.entry_succ), long(tt.entry_x)
     pred_ptr, pred_x = long(tt.pred_ptr).view(n, W + 1), long(tt.pred_x)
     enum = en.num > 0
-    rows = long(job[0])                                            # (input row, position, rank), by position
-    mass_row = long(masses.row)[rows[:, 0] - prog.input_start]
 
     # every column (t, q) and its pairs (entries: by column, then successor)
     T, Q = _spread(width[:n])
@@ -205,18 +237,8 @@ def signature_masses(prog, masses, trans_size: int) -> Optional[SignatureMasses]
     slots = int(sig_pairs.sum())
 
     # the positions' classes: the same class-mass rows in rank order
-    rows_h, mass_h = rows.cpu().numpy(), mass_row.cpu().numpy()
-    pos, counts = np.unique(rows_h[:, 1], return_counts = True)
-    steps = np.zeros(n, dtype = np.int64)
-    steps[pos] = counts
-    order = np.lexsort((rows_h[:, 2], rows_h[:, 1]))
-    by_pos = np.split(mass_h[order], np.cumsum(counts)[:-1])
-    cls_of, classes = np.full(n, -1, dtype = np.int64), {}
-    for t, mr in zip(pos.tolist(), by_pos):
-        cls_of[t] = classes.setdefault(mr.tobytes(), len(classes))
-    csteps = np.zeros(len(classes), dtype = np.int64)
-    for t in pos.tolist():
-        csteps[cls_of[t]] = steps[t]
+    classes = position_classes(prog, masses)
+    cls_of, csteps = classes.of, classes.steps
     cbase = np.cumsum(csteps * slots) - csteps * slots
     size = int((csteps * slots).sum())
     if size * SIGNATURE_MIN_SAVING > trans_size:
@@ -255,11 +277,16 @@ def signature_masses(prog, masses, trans_size: int) -> Optional[SignatureMasses]
     if (slot_p < 0).any() or not torch.equal(pxs[pidx], slot_p):
         return None
 
-    keep = np.isin(rows_h[:, 1], np.unique(rep_t.cpu().numpy()))
+    # the representatives' steps: every step of a position with one, as `transition_job` cuts them
+    kept = torch.unique(rep_t)
+    on = torch.zeros(n, dtype = torch.bool, device = dev)
+    on[kept] = True
+    rep_rows = job[0][on[job[0][:, 1].long()]].contiguous()
+    TS = job_tile(rep_rows.size(0))
     i32 = lambda x: x.to(torch.int32).contiguous()
     return SignatureMasses(pair_off = torch.from_numpy(pair_off).to(dev), pairs = torch.from_numpy(pairs).to(dev),
                            entry_x = i32(exs), pred_x = i32(pxs), size = size,
-                           job = transition_job(torch.from_numpy(rows_h[keep]), dev), rep_ptr = i32(rep_ptr),
+                           job = (rep_rows, i32(job_tiles(kept, prog.pos_steps[kept], TS)), TS), rep_ptr = i32(rep_ptr),
                            rep_col = i32(rep_q), rep_shift = rep_shift.contiguous(),
                            max_reps = int(rep_count.max()) if rep_count.numel() else 0,
                            saving = trans_size / max(size, 1))

@@ -48,6 +48,8 @@ class TopDownProgram:
         (pyjuice's PD has such nodes); no launch writes them: :func:`run_backward` fills those of the regions it
         computes with -inf (``prior_flows`` is -inf where never written)
     :ivar dead_region: bool [sum regions] (host): those with a dead row
+    :ivar shared: what query plans keep of these tables whatever the automaton (:mod:`..queries.backend.planners`), the
+        circuit's: one dict for the programs of one :class:`~.circuit.Assembly`
     """
 
     steps: list
@@ -57,6 +59,7 @@ class TopDownProgram:
     iv_bounds: np.ndarray
     reg_iv: np.ndarray
     elem_regions: list
+    shared: dict
 
 
 def top_down_program(backend) -> TopDownProgram:
@@ -102,7 +105,7 @@ def top_down_program(backend) -> TopDownProgram:
             steps.append(("prod", prod_index, out))
     return TopDownProgram(steps = steps, skip = skip_masks_for(reach, t.specs, device = prog.dev), dead = t.dead,
                           dead_region = t.dead_region, iv_bounds = t.iv_bounds, reg_iv = t.reg_iv,
-                          elem_regions = t.elem_regions)
+                          elem_regions = t.elem_regions, shared = t.shared)
 
 
 class _Child(NamedTuple):
@@ -133,6 +136,7 @@ class _Template(NamedTuple):
     iv_bounds: np.ndarray
     reg_iv: np.ndarray
     elem_regions: list
+    shared: dict
 
 
 def _out_temp(launch) -> bool:
@@ -301,7 +305,7 @@ def top_down_template(backend, prog) -> _Template:
     dead_region[dead[:, 1]] = True
     region_iv = prog.iv_bounds[prog.reg_iv_np]
     return _Template(steps, specs, dead, dead_region, iv_bounds, iv_index(region_iv[:, 0], region_iv[:, 1]),
-                     [(first, end) for first, end, _ in backend.element_regions])
+                     [(first, end) for first, end, _ in backend.element_regions], {})
 
 
 def _inputs(launches) -> list:

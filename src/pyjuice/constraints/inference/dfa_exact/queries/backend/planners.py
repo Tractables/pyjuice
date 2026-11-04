@@ -9,7 +9,7 @@ of one interval or source, which values every launch, dense run and node block c
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import NamedTuple, Optional
 
 import numpy as np
 import torch
@@ -99,24 +99,57 @@ def _runs(keys: np.ndarray):
     return starts, np.r_[starts[1:], keys.size]
 
 
-def _forward_tables(prog):
-    """``(tables, launches, full cuts, parts, part intervals)``: what :func:`_forward_modes` reads
-    (:data:`_FW_FIELDS`), every product launch in the Program's order with the :class:`~.prod.Cut` running all of its
-    steps, every sum layer part's dense runs, and the intervals of its fused node blocks' regions (``prog.intervals``'
-    numbers, as a :class:`~...kernels.compact.CompactLayout` counts their lanes; None for none) -- built on first use,
-    kept on the Program."""
-    if getattr(prog, "fw_flat", None) is not None:
-        return prog.fw_flat
-    F = _Flat(*_FW_FIELDS)
-    reg_iv, slots = np.asarray(prog.reg_iv_host), np.asarray(prog.slots)
-    launches, full, runs_of, ivs_of = [], [], [], []
+class _ForwardShape(NamedTuple):
+    """What :func:`_forward_tables` reads off the launches of a circuit's :class:`~...compiled.circuit.Assembly`, whatever
+    the automaton (kept there).
+
+    :ivar arrays: :data:`_FW_FIELDS` but the sizes (``run_E``, ``run_X``, ``run_S``, ``brun_slots``)
+    :ivar part_a, part_b: int64: the ends of every launch's outputs' intervals (its ``parts``), one launch's after another's
+    :ivar part_iv: int64: which of the distinct intervals ``ivs`` every one of them is
+    :ivar ivs: the distinct intervals of the parts
+    :ivar run_ptr, run_part: int64: the parts of every run of steps (a CSR)
+    :ivar cuts: per launch, what the :class:`~...kernels.prod.Cut` running all of its steps says: ``(chunks, groups, steps)``
+    :ivar runs_of, ivs_of: per sum layer part, its dense runs, and the intervals of its fused node blocks' regions
+    :ivar idle: every step with nothing to run (never mutated: a pass reads them)
+    :ivar step_ranges: int64 [steps, 4]: every step's launches and sum layer parts ``(first, end, first, end)``
+    """
+
+    arrays: dict
+    part_a: np.ndarray
+    part_b: np.ndarray
+    part_iv: np.ndarray
+    ivs: list
+    run_ptr: np.ndarray
+    run_part: np.ndarray
+    cuts: list
+    runs_of: list
+    ivs_of: list
+    idle: list
+    step_ranges: np.ndarray
+
+
+def _forward_shape(prog) -> _ForwardShape:
+    """The :class:`_ForwardShape` of ``prog``'s :class:`~...compiled.circuit.Assembly`."""
+    assembly = prog.assembly
+    F = _Flat(*(name for name in _FW_FIELDS if name not in ("run_E", "run_X", "run_S", "brun_slots")))
+    reg_iv = np.asarray(prog.reg_iv_host)
+    cuts, runs_of, ivs_of, ranges, idle = [], [], [], [], []
+    part_a, part_b, run_ptr, run_part = [], [], [0], []
     nc = nr = ng = ngr = nd = nbr = 0
-    for kind, _, layers in prog.steps:
+    L = P = 0
+    for kind, prod_index, layers in prog.steps:
+        L0, P0 = L, P
         if kind == "prod":
-            for stages, _, _ in layers:
-                for launch in (la for st in stages for la in st):
-                    S, iv, sizes = launch.rows.size(0), launch.iv.numpy(), launch.sizes.numpy()
-                    chunks = launch.steps[1] if launch.form in ("input_block", "block_input") else [(0, S, None)]
+            idle.append((kind, prod_index, [([], [], 0, 0) for _ in layers]))
+            for stages, _, _ in assembly.layers.get(prod_index, ()):
+                for t in (t for st in stages for t in st):
+                    S, iv = t.rows.size(0), t.iv.numpy()
+                    walks = t.form in ("input_block", "block_input")
+                    chunks = t.steps[1] if walks else [(0, S, None)]
+                    part0 = len(part_a)
+                    part_a += [a for a, _ in t.parts]
+                    part_b += [b for _, b in t.parts]
+                    of_step = None if t.part_of is None else t.part_of.numpy()
                     F.add("launch_chunk_ptr", nc)
                     for s0, s1, _ in chunks:
                         F.add("chunk_lo", s0)
@@ -126,12 +159,13 @@ def _forward_tables(prog):
                         F.add("run_iv", iv[s0:s1][a])
                         F.add("run_lo", a)
                         F.add("run_hi", b)
-                        for k, name in enumerate(("run_E", "run_X", "run_S")):
-                            F.add(name, [sizes[s0 + x:s0 + y, k].max() for x, y in zip(a, b)])
+                        for x, y in zip(a.tolist(), b.tolist()):        # (a run's outputs: of the launch's parts)
+                            run_part += [part0] if of_step is None else (part0 + np.unique(of_step[s0 + x:s0 + y])).tolist()
+                            run_ptr.append(len(run_part))
                         nr += len(a)
                         nc += 1
                     F.add("launch_gsize_ptr", ng)
-                    for firsts in (launch.groups_host or {}).values():
+                    for firsts in (t.groups_host or {}).values():
                         giv = iv[firsts[:-1]]                         # a group's steps share their interval
                         a, b = _runs(giv)
                         F.add("gsize_run_ptr", ngr)
@@ -140,9 +174,11 @@ def _forward_tables(prog):
                         F.add("grun_hi", b)
                         ngr += len(a)
                         ng += 1
-                    launches.append(launch)
-                    full.append(cut_launch(launch, np.ones(S, dtype = bool), IndexLists()))
+                    groups = None if t.groups_host is None else {G: (None, firsts.size - 1) for G, firsts in t.groups_host.items()}
+                    cuts.append(([(s0, s1, job, None, s1 - s0) for s0, s1, job in chunks], groups, S))
+                    L += 1
         else:
+            idle.append((kind, prod_index, [(block_size, [], []) for block_size, _ in layers]))
             for _, parts in layers:
                 for dense, _, fused in parts:
                     runs = list(dense.items())
@@ -153,18 +189,47 @@ def _forward_tables(prog):
                     ivs_of.append(None if fused is None else np.unique(prog.reg_iv_all[fused[3].cpu().numpy()]))
                     if fused is not None:
                         biv = reg_iv[fused[3].cpu().numpy()]
-                        bsl = slots[fused[3].cpu().numpy()]
                         a, b = _runs(biv)
                         F.add("brun_iv", biv[a])
                         F.add("brun_lo", a)
                         F.add("brun_hi", b)
-                        F.add("brun_slots", [bsl[x:y].max() for x, y in zip(a, b)])
                         nbr += len(a)
                     runs_of.append(runs)
+                    P += 1
+        ranges.append((L0, L, P0, P))
     for name, value in (("launch_chunk_ptr", nc), ("chunk_run_ptr", nr), ("launch_gsize_ptr", ng),
                         ("gsize_run_ptr", ngr), ("part_dense_ptr", nd), ("part_brun_ptr", nbr)):
         F.add(name, value)
-    prog.fw_flat = (_Packed(_FW_FIELDS, F.done()), launches, full, runs_of, ivs_of)
+    ends = list(dict.fromkeys(zip(part_a, part_b)))
+    number = {iv: k for k, iv in enumerate(ends)}
+    int64 = lambda x: np.asarray(x, dtype = np.int64)
+    return _ForwardShape(F.done(), int64(part_a), int64(part_b), int64([number[iv] for iv in zip(part_a, part_b)]), ends,
+                         int64(run_ptr), int64(run_part), cuts, runs_of, ivs_of, idle, int64(ranges).reshape(-1, 4))
+
+
+def _forward_tables(prog):
+    """``(tables, launches, full cuts, parts, part intervals)``: what :func:`_forward_modes` reads
+    (:data:`_FW_FIELDS`), every product launch in the Program's order with the :class:`~.prod.Cut` running all of its
+    steps, every sum layer part's dense runs, and the intervals of its fused node blocks' regions (``prog.intervals``'
+    numbers, as a :class:`~...kernels.compact.CompactLayout` counts their lanes; None for none) -- built on first use,
+    kept on the Program, from what the circuit's launches say (:class:`_ForwardShape`) and the columns and slots of the
+    intervals, a few array operations."""
+    if getattr(prog, "fw_flat", None) is not None:
+        return prog.fw_flat
+    shape = prog.assembly.forward_shape
+    if shape is None:
+        shape = prog.assembly.forward_shape = _forward_shape(prog)
+    reach, width = prog.reach, np.asarray(prog.width, dtype = np.int64)
+    exits = width.copy()
+    exits[prog.n] = 1
+    slots = np.asarray([reach.slots(a, b) for a, b in shape.ivs], dtype = np.int64).reshape(-1)[shape.part_iv]
+    sizes = np.stack([width[shape.part_a], exits[shape.part_b], slots], axis = 1)
+    most = np.maximum.reduceat(sizes[shape.run_part], shape.run_ptr[:-1], axis = 0) if shape.run_part.size else sizes[:0]
+    arrays = dict(shape.arrays, run_E = most[:, 0], run_X = most[:, 1], run_S = most[:, 2],
+                  brun_slots = prog.iv_slots[shape.arrays["brun_iv"]])
+    launches = [la for kind, _, layers in prog.steps if kind == "prod" for stages, _, _ in layers for st in stages for la in st]
+    full = [Cut(chunks, groups, la.E_max, la.X_max, la.S_max, S) for la, (chunks, groups, S) in zip(launches, shape.cuts)]
+    prog.fw_flat = (_Packed(_FW_FIELDS, arrays), launches, full, shape.runs_of, shape.ivs_of)
     return prog.fw_flat
 
 
@@ -301,15 +366,11 @@ def _forward_steps(prog, todo: np.ndarray, sample: np.ndarray, lists: IndexLists
                 groups[size] = (None if n == len(firsts) - 1 else lists.add(buf[gs[G, m]:gs[G, m] + n]), n)
         return Cut(chunks, groups, int(lmax[L, m, 0]), int(lmax[L, m, 1]), int(lmax[L, m, 2]), int(count))
 
-    idle = getattr(prog, "fw_idle_steps", None)             # every step with nothing to run, built once (never
-    if idle is None:                                          # mutated: a pass reads them)
-        idle = prog.fw_idle_steps = [(kind, prod_index, [([], [], 0, 0) for _ in layers] if kind == "prod" else
-                                      [(block_size, [], []) for block_size, _ in layers])
-                                     for kind, prod_index, layers in prog.steps]
-    steps, busy = list(idle), np.flatnonzero(active).tolist()
+    shape = prog.assembly.forward_shape
+    steps, busy = list(shape.idle), np.flatnonzero(active).tolist()
     for si in busy:
         kind, prod_index, layers = prog.steps[si]
-        L, P = int(prog.fw_step_ranges[si, 0]), int(prog.fw_step_ranges[si, 2])
+        L, P = int(shape.step_ranges[si, 0]), int(shape.step_ranges[si, 2])
         layers_out = []
         if kind == "prod":
             for stages, num_temps, temp_slots in layers:
@@ -349,19 +410,9 @@ def _forward_steps(prog, todo: np.ndarray, sample: np.ndarray, lists: IndexLists
 def _forward_active(prog, lc, pc, run_sel, part_dense_ptr) -> np.ndarray:
     """bool [steps]: the Program's steps with a launch computing something in a mode (``lc`` [launches, 2] counts),
     or a sum part with fused blocks (``pc`` [parts, 2]) or dense runs (``run_sel`` [runs, 2]) in one -- by prefix
-    sums over the steps' ranges of launches and parts (``prog.fw_step_ranges``, built once), so that a query whose
-    steps mostly do nothing (decoding left to right: all but the target's) plans in time proportional to the rest."""
-    ranges = getattr(prog, "fw_step_ranges", None)
-    if ranges is None:
-        ranges, L, P = [], 0, 0
-        for kind, _, layers in prog.steps:
-            L0, P0 = L, P
-            if kind == "prod":
-                L += sum(len(st) for stages, _, _ in layers for st in stages)
-            else:
-                P += sum(len(parts) for _, parts in layers)
-            ranges.append((L0, L, P0, P))
-        prog.fw_step_ranges = ranges = np.asarray(ranges, dtype = np.int64).reshape(-1, 4)
+    sums over the steps' ranges of launches and parts (:attr:`_ForwardShape.step_ranges`), so that a query whose steps
+    mostly do nothing (decoding left to right: all but the target's) plans in time proportional to the rest."""
+    ranges = prog.assembly.forward_shape.step_ranges
     lcum = np.concatenate([[0], np.cumsum(lc.any(axis = 1))])
     sel = np.asarray(run_sel).reshape(-1, 2).any(axis = 1) if len(run_sel) else np.zeros(0, dtype = bool)
     rcum = np.concatenate([[0], np.cumsum(sel)])
@@ -415,9 +466,9 @@ def _top_down_tables(prog, td):
     """``(tables, index)``: the :func:`_top_down_tables` of ``td`` and, per step, where its launches are in them --
     per product layer ``([(first launch, first class weight launch)] per stage, [[(first row, end row)] per fold
     launch] per fold stage)``, per sum layer ``(first run, [(group, first block, end block)])`` (built on first use,
-    kept on ``td``)."""
-    if getattr(td, "flat", None) is not None:
-        return td.flat
+    kept with the circuit's tables, ``td.shared``: they say nothing of the automaton)."""
+    if "flat" in td.shared:
+        return td.shared["flat"]
     F = _Flat("layer_pi", "layer_temps", "layer_stage_ptr", "layer_foldrow_ptr", "stage_unit_ptr", "stage_input_ptr",
               "stage_cw_ptr", "stage_fold_ptr", "unit_child_ptr", "unit_run_ptr", "run_child_ptr", "run_src",
               "run_iv", "run_par_ptr", "par_lo", "par_hi", "run_sib_ptr", "sib_id", "unit_child_temp", "unit_out_temp",
@@ -574,16 +625,16 @@ def _top_down_tables(prog, td):
                            ("dpos", arrays["cw_dest_ptr"], arrays["dest_pos"])):
         groups = _position_groups(ptr, pos, prog.n)
         arrays.update({f"{name}_{k}": v for k, v in zip(("ptr", "pos", "first", "end", "idx"), groups)})
-    td.flat = (_Packed(_TD_FIELDS, arrays), index)
-    return td.flat
+    td.shared["flat"] = (_Packed(_TD_FIELDS, arrays), index)
+    return td.shared["flat"]
 
 
 def _top_down_active(td, index, unit_count, cw_count, foldrow_mode, run_mode, group_count) -> np.ndarray:
     """bool [steps]: the top-down program's steps with anything computed -- a launch's child in a mode (``unit_count``
     [units, 2]), a class weight destination (``cw_count`` [launches]; None: no scoring), a fold row
     (``foldrow_mode`` >= 0), a dense run (``run_mode`` >= 0) or a fused block (``group_count`` [groups, 2]) -- by
-    prefix sums over the steps' ranges in the flat tables (``td.step_ranges``, built once from ``index``)."""
-    ranges = getattr(td, "step_ranges", None)
+    prefix sums over the steps' ranges in the flat tables (``td.shared``' ``step_ranges``, built once from ``index``)."""
+    ranges = td.shared.get("step_ranges")
     if ranges is None:
         ranges = np.zeros((len(td.steps), 10), dtype = np.int64)            # u0 u1 w0 w1 f0 f1 r0 r1 g0 g1
         for si, (kind, pi, layers) in enumerate(td.steps):
@@ -612,7 +663,7 @@ def _top_down_active(td, index, unit_count, cw_count, foldrow_mode, run_mode, gr
                     groups += [g for g, _, _ in grp]
                 g0 = min(groups) if groups else 0
                 r[:] = (0, 0, 0, 0, 0, 0, max(r0, 0), max(r0, 0) + runs, g0, g0 + len(groups))
-        td.step_ranges = ranges
+        td.shared["step_ranges"] = ranges
     cum = lambda flags: np.concatenate([[0], np.cumsum(flags)])
     on = lambda c, lo, hi: c[ranges[:, hi]] > c[ranges[:, lo]]
     active = on(cum(unit_count.any(axis = 1)), 0, 1) | on(cum(foldrow_mode >= 0), 4, 5) | \
@@ -837,11 +888,11 @@ def _top_down_steps(td, t, index, m, scoring: bool, lists: IndexLists) -> tuple:
             return selection(modes, mode, count)
         return None if count == modes.size else lists.add(*node_tiles(la.host["group"], np.nonzero(modes == mode)[0]))
 
-    idle = getattr(td, "idle_steps", None)                  # every step with nothing computed, built once (never
+    idle = td.shared.get("idle_steps")                      # every step with nothing computed, built once (never
     if idle is None:                                          # mutated: a pass reads them)
-        idle = td.idle_steps = [(kind, pi, [(([], []), [], 0, 0) for _ in layers] if kind == "prod" else
-                                 [(block_size, ([], []), ([], [])) for block_size, _, _ in layers])
-                                for kind, pi, layers in td.steps]
+        idle = td.shared["idle_steps"] = [(kind, pi, [(([], []), [], 0, 0) for _ in layers] if kind == "prod" else
+                                           [(block_size, ([], []), ([], [])) for block_size, _, _ in layers])
+                                          for kind, pi, layers in td.steps]
     out, busy = list(idle), np.flatnonzero(active).tolist()
     for si in busy:
         kind, pi, layers = td.steps[si]
