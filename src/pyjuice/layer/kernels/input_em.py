@@ -59,23 +59,20 @@ def categorical_em_kernel(params_ptr, param_flows_ptr, s_pids_ptr, s_pfids_ptr, 
         if keep_zero_params:
             param = tl.load(params_ptr + p_base + cat_start, mask = cat_mask, other = 0.0)
             # (a lane past the node's categories loads param 0: its term is 0 here as well)
-            cum_flow += tl.sum(tl.where(param < 1e-12, 0.0, flow + numerate_pseudocount[:, None]), axis = 1)
+            cum_flow += tl.sum(tl.where(param == 0.0, 0.0, flow + numerate_pseudocount[:, None]), axis = 1)
         else:
             cum_flow += tl.sum(flow, axis = 1)
 
     # Parameter update (the template's expressions)
-    cum_flow += pseudocount
+    if not keep_zero_params:
+        cum_flow += pseudocount
     for cat_start in range(0, max_num_cats, CHUNK):
         cat_mask = mask[:, None] & ((cat_start + cats)[None, :] < num_cats[:, None])
         param = tl.load(params_ptr + p_base + cat_start, mask = cat_mask, other = 0.0)
         flow = tl.load(param_flows_ptr + pf_base + cat_start, mask = cat_mask, other = 0.0)
+        new_param = (1.0 - step_size) * param + step_size * (flow + numerate_pseudocount[:, None]) / cum_flow[:, None]
         if keep_zero_params:
-            new_param = (1.0 - step_size) * param + step_size * (flow + numerate_pseudocount[:, None]) / \
-                (cum_flow - pseudocount)[:, None]
-            new_param = tl.where(param < 1e-12, 0.0, new_param)
-        else:
-            new_param = (1.0 - step_size) * param + step_size * (flow + numerate_pseudocount[:, None]) / \
-                cum_flow[:, None]
+            new_param = tl.where(param == 0.0, 0.0, new_param)
         tl.store(params_ptr + p_base + cat_start, new_param, mask = cat_mask)
 
 

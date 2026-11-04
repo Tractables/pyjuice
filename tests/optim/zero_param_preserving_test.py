@@ -44,7 +44,7 @@ def test_zero_param_preserving_col():
 
     alpha_new = root_ns.chs[0].chs[1].get_source_ns()._params.clone().reshape(128, 128)
 
-    assert torch.all((alpha > 1e-12) | (alpha_new < 1e-12))
+    assert torch.all((alpha != 0) | (alpha_new == 0))
 
     pc.mini_batch_em(step_size = 0.1, pseudocount = 1e-6, step_size_rescaling = True, keep_zero_params = True)
 
@@ -52,7 +52,7 @@ def test_zero_param_preserving_col():
 
     alpha_new = root_ns.chs[0].chs[1].get_source_ns()._params.clone().reshape(128, 128)
 
-    assert torch.all((alpha > 1e-12) | (alpha_new < 1e-12))
+    assert torch.all((alpha != 0) | (alpha_new == 0))
 
 
 def test_zero_param_preserving_rand():
@@ -88,7 +88,7 @@ def test_zero_param_preserving_rand():
 
     alpha_new = root_ns.chs[0].chs[1].get_source_ns()._params.clone().reshape(128, 128)
 
-    assert torch.all((alpha > 1e-12) | (alpha_new < 1e-12))
+    assert torch.all((alpha != 0) | (alpha_new == 0))
 
     pc.mini_batch_em(step_size = 0.1, pseudocount = 1e-6, step_size_rescaling = True, keep_zero_params = True)
 
@@ -96,7 +96,7 @@ def test_zero_param_preserving_rand():
 
     alpha_new = root_ns.chs[0].chs[1].get_source_ns()._params.clone().reshape(128, 128)
 
-    assert torch.all((alpha > 1e-12) | (alpha_new < 1e-12))
+    assert torch.all((alpha != 0) | (alpha_new == 0))
 
 
 @pytest.mark.slow
@@ -144,7 +144,7 @@ def test_zero_param_preserving_slow():
                     num_node_blocks, num_node_blocks, block_size, block_size).permute(
                         0, 2, 1, 3).reshape(num_latents, num_latents)
 
-                assert torch.all((alpha > 1e-12) | (alpha_new < 1e-12))
+                assert torch.all((alpha != 0) | (alpha_new == 0))
 
                 pc.mini_batch_em(step_size = 0.1, pseudocount = 1e-6, step_size_rescaling = True, keep_zero_params = True)
 
@@ -154,7 +154,7 @@ def test_zero_param_preserving_slow():
                     num_node_blocks, num_node_blocks, block_size, block_size).permute(
                         0, 2, 1, 3).reshape(num_latents, num_latents)
 
-                assert torch.all((alpha > 1e-12) | (alpha_new < 1e-12))
+                assert torch.all((alpha != 0) | (alpha_new == 0))
 
 
 @pytest.mark.parametrize("num_emits", [256, 512])

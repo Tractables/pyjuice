@@ -116,10 +116,10 @@ def _em_node_block_one_pass_kernel(stored_ptr, master, param_flows, cum_pflows, 
         old = tl.load(stored_ptr + par0 + rel, mask = mask, other = 0).to(tl.float32)
     if KEEP_ZERO:
         shifted = pflows + pseudocount / nch
-        tot = tl.sum(tl.where(mask & ~(old < 1e-12), shifted, 0.0), axis = 0)
+        tot = tl.sum(tl.where(mask & (old != 0.0), shifted, 0.0), axis = 0)
         tl.store(cum_pflows + gnid + offs_n, tot, mask = offs_n < nv)
         new_param = shifted / tot[None, :]
-        upd = tl.where(old < 1e-12, 0.0, (1.0 - step_size) * old + step_size * new_param)
+        upd = tl.where(old == 0.0, 0.0, (1.0 - step_size) * old + step_size * new_param)
     else:
         tot = tl.sum(pflows, axis = 0)
         tl.store(cum_pflows + gnid + offs_n, tot, mask = offs_n < nv)
@@ -167,7 +167,7 @@ def _em_block_kernel(stored_ptr, master, param_flows, cum_pflows, t_par, t_pflow
             old = tl.load(stored_ptr + par0 + rel, mask = mask, other = 0).to(tl.float32)
         if KEEP_ZERO:
             pflows += pseudocount / nch
-            tot += tl.sum(tl.where(mask & ~(old < 1e-12), pflows, 0.0), axis = 0)      # (the original's test)
+            tot += tl.sum(tl.where(mask & (old != 0.0), pflows, 0.0), axis = 0)        # (the original's test)
         else:
             tot += tl.sum(pflows, axis = 0)
     tl.store(cum_pflows + gnid + offs_n, tot, mask = mask_n)
@@ -190,7 +190,7 @@ def _em_block_kernel(stored_ptr, master, param_flows, cum_pflows, t_par, t_pflow
         else:
             new_param = (pflows + pseudocount / nch) / (tot[None, :] + pseudocount)
         if KEEP_ZERO:
-            upd = tl.where(old < 1e-12, 0.0, (1.0 - step_size) * old + step_size * new_param)
+            upd = tl.where(old == 0.0, 0.0, (1.0 - step_size) * old + step_size * new_param)
         else:
             upd = (1.0 - step_size) * old + step_size * new_param
         if HAS_MASTER:
@@ -234,7 +234,7 @@ def _em_split_partials_kernel(stored_ptr, master, param_flows, partials, t_par, 
                 old = tl.load(stored_ptr + par0 + rel, mask = mask, other = 0).to(tl.float32)
             if KEEP_ZERO:
                 pflows += pseudocount / nch
-                tot += tl.sum(tl.where(mask & ~(old < 1e-12), pflows, 0.0), axis = 0)
+                tot += tl.sum(tl.where(mask & (old != 0.0), pflows, 0.0), axis = 0)
             else:
                 tot += tl.sum(pflows, axis = 0)
         tl.store(partials + c.to(tl.int64) * G + gnid + offs_n, tot, mask = mask_n)
@@ -294,7 +294,7 @@ def _em_split_update_kernel(stored_ptr, master, param_flows, cum_pflows, t_par, 
             else:
                 new_param = (pflows + pseudocount / nch) / (tot[None, :] + pseudocount)
             if KEEP_ZERO:
-                upd = tl.where(old < 1e-12, 0.0, (1.0 - step_size) * old + step_size * new_param)
+                upd = tl.where(old == 0.0, 0.0, (1.0 - step_size) * old + step_size * new_param)
             else:
                 upd = (1.0 - step_size) * old + step_size * new_param
             if HAS_MASTER:

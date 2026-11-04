@@ -188,7 +188,7 @@ def test_hclt_zero_preserving():
 
             mask = ns2mask[ns]
 
-            assert torch.all(~mask | (params < 1e-12))
+            assert torch.all(~mask | (params == 0))
 
 
 @pytest.mark.slow
@@ -285,7 +285,7 @@ def test_hmm_zero_preserving():
 
             mask = ns2mask[ns]
 
-            assert torch.all(~mask | (params < 1e-12))
+            assert torch.all(~mask | (params == 0))
 
 
 @pytest.mark.slow
@@ -382,7 +382,7 @@ def test_hmm_zero_preserving_node_zeroling():
 
             mask = ns2mask[ns]
 
-            assert torch.all(~mask | (params.sum(dim = 0) < 1e-12))
+            assert torch.all(~mask | (params.sum(dim = 0) == 0))
 
 
 if __name__ == "__main__":

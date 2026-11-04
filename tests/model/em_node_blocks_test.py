@@ -38,12 +38,12 @@ def _ref64(pc, params, flows, step_size, pseudocount, keep_zero, exclude = ()):
     f = flows.double()[fidx]
     if keep_zero:
         f = f + pseudocount / nch
-    contrib = torch.where(old < 1e-12, 0.0, f) if keep_zero else f
+    contrib = torch.where(old == 0, 0.0, f) if keep_zero else f
     tot = torch.zeros([int(gnid.max()) + 1], dtype = torch.float64, device = DEV).index_add_(0, node, contrib)
     newp = f / tot[node] if keep_zero else (f + pseudocount / nch) / (tot[node] + pseudocount)
     upd = (1 - step_size) * old + step_size * newp
     if keep_zero:
-        upd = torch.where(old < 1e-12, 0.0, upd)
+        upd = torch.where(old == 0, 0.0, upd)
     out = params.double().clone()
     out[pidx] = upd
     return out
@@ -111,7 +111,9 @@ def test_every_form_is_the_update(cfg, dtype, kind, monkeypatch):
                                         (0.5, 0.1, True, ()), (0.3, 0.1, False, (sums[-2]._param_range,))):
         start = pc.params.detach().clone()
         if kz:
-            start[torch.rand(start.shape, device = DEV) < 0.1] = 0.0           # parameters at zero stay there
+            r = torch.rand(start.shape, device = DEV)
+            start[r < 0.1] = 0.0                                               # parameters at zero stay there
+            start[(r >= 0.1) & (r < 0.2)] = 1e-16                              # ... and only those: no magnitude cutoff
         want = _ref64(pc, start.float(), flows, step_size, pcount, kz, excl)
         old, cum_old = _run(pc, flows, start, step_size, pcount, kz, excl, "old")
         new, cum_new = _run(pc, flows, start, step_size, pcount, kz, excl, "new")
@@ -121,6 +123,11 @@ def test_every_form_is_the_update(cfg, dtype, kind, monkeypatch):
         e_old, e_new = float((old - want).abs().max()), float((new - want).abs().max())
         assert e_new <= 2 * e_old + 1e-9, (step_size, pcount, kz, excl, e_old, e_new)
         assert torch.equal(new, again)                                     # one order of summation: to the bit
+        if kz:                                                             # (both paths: their totals agree above)
+            zero, tiny = start == 0, (start > 0) & (start < 1e-12)
+            assert zero.any() and tiny.any()
+            for got in (old, new):
+                assert torch.all(got[zero] == 0) and torch.all(got[tiny] > 0)
         if excl:                                                           # an excluded range is left as it was
             lo, hi = excl[0]
             assert torch.equal(new[lo:hi], start[lo:hi].double())

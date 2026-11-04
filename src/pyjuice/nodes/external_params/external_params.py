@@ -738,7 +738,7 @@ class ExternalSumParams():
         # EVERY scalar the kernels use, fp32, on the DEVICE -- including the clamp thresholds. Triton
         # types a Python float KERNEL ARGUMENT as fp64, and a float LITERAL inside the kernel promotes
         # too, so either one silently turns the whole `den`/`ratio`/`new` chain into double precision.
-        # Order must match the `tl.load(consts + i)` offsets in `kernels/dual_em.py`.
+        # Order must match the `tl.load(consts + i)` offsets in `kernels/dual_em.py` and `kernels/dual_em_master.py`.
         # CACHED by value: every `ns` of one EM step uses the same step size and pseudocount, so
         # building this per `ns` was 15 host-to-device copies per step -- MEASURED 1007 -> 1185 us.
         ckey = (float(pseudocount), float(step_size), str(dev))

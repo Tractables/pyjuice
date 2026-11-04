@@ -2112,6 +2112,10 @@ def test_the_master_copys_correction_is_its_sync_update_and_copy(mode, kz, fold,
     ps, pe = tgt._param_range
     torch.manual_seed(6)
     master0 = pc.params.detach() * (1 + 1e-3 * torch.randn_like(pc.params))      # (off the bf16 grid)
+    if kz:                                                # what `keep_zero_params` freezes, and what it must not
+        r = torch.rand(pe - ps, device = dev)
+        master0[ps:pe][r < 0.1] = 0.0
+        master0[ps:pe][(r >= 0.1) & (r < 0.2)] = 1e-16
     stored0 = master0.to(torch.bfloat16)
     written = ps + torch.randperm(pe - ps, device = dev)[: (pe - ps) // 10]
     stored0[written] = (stored0[written].float() * 1.7).to(torch.bfloat16)        # writes from outside
@@ -2139,6 +2143,12 @@ def test_the_master_copys_correction_is_its_sync_update_and_copy(mode, kz, fold,
 
     rel = ((got_m - ref_m).abs() / ref_m.abs().clamp_min(1e-20)).max().item()
     assert rel < 1e-5, f"{mode}: the master copy {rel:.2e} from sync + update + copy"
+    if kz:                                                # (`rel` above cannot see the momentum floor, 1e-30, against 0)
+        zero, tiny = master0[ps:pe] == 0, (master0[ps:pe] > 0) & (master0[ps:pe] < 1e-12)
+        assert zero.any() and tiny.any()
+        for what, got in (("the update", got_m), ("sync + update + copy", ref_m)):
+            assert torch.all(got[ps:pe][zero] == 0), f"{mode}: {what} moved a zero parameter"
+            assert torch.all(got[ps:pe][tiny] > 0), f"{mode}: {what} took a tiny parameter for zero"
     assert torch.equal(got_s[ps:pe], got_m[ps:pe].to(torch.bfloat16)), f"{mode}: stored not the copy's rounding"
     assert torch.equal(got_s[:ps], stored0[:ps]) and torch.equal(got_s[pe:], stored0[pe:]), \
         f"{mode}: stored written outside the range"

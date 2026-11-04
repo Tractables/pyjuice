@@ -69,10 +69,13 @@ def _instance(builder, seed = 0):
     torch.manual_seed(seed)
     root, cats = builder()
     pc = juice.compile(root, verbose = False).to(DEV)
-    # A few exactly-zero parameters (`keep_zero_params`' case; left unnormalized -- the update reads them as they are)
+    # A few exactly-zero parameters (`keep_zero_params`' case; left unnormalized -- the update reads them as they are),
+    # and a few tiny positive ones, which it must not take for zero
     for layer in pc.input_layer_group:
         with torch.no_grad():
-            layer.params[torch.rand_like(layer.params) < 0.05] = 0.0
+            r = torch.rand_like(layer.params)
+            layer.params[r < 0.05] = 0.0
+            layer.params[(r >= 0.05) & (r < 0.1)] = 1e-16
     x =torch.stack([torch.randint(0, c, (128,)) for c in cats], dim = 1).to(DEV)
     pc(x)
     pc.backward(x, flows_memory = 0.0)
@@ -103,7 +106,7 @@ def _reference(layer, params, flows, step_size, pseudocount, keep_zero_params):
         theta, fl = p64[pid:pid + nc], f64[pfid:pfid + nc]
         num_pc = pseudocount / nc
         if keep_zero_params:
-            zero = theta < 1e-12
+            zero = theta == 0
             cum = (fl + num_pc)[~zero].sum()
             new = (1.0 - step_size) * theta + step_size * (fl + num_pc) / cum
             new[zero] = 0.0
@@ -151,6 +154,10 @@ def test_its_own_kernel_and_the_template_give_the_reference(name, builder, keep_
         assert rel < 2e-5, f"{name}: the kernel and the template differ by {rel:.2e}"
         if keep_zero_params:
             assert torch.all(own[before == 0] == 0), f"{name}: a zero parameter moved"
+            tiny = (before > 0) & (before < 1e-12)
+            assert tiny.any()
+            for what, got in (("the kernel", own), ("the template", template)):
+                assert torch.all(got[tiny] > 0), f"{name}: {what} took a tiny parameter for zero"
 
 
 @cuda_only
