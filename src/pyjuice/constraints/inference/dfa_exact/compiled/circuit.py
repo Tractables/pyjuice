@@ -326,9 +326,10 @@ def _split_aliased(fused, alias_row, alias_reg, elem_first: int, dev):
     row 0, below every region) and the children that copy a sum, read in the sum's own row -- under a gate, each with
     its gate cell (``idx``, ``a_idx``) and child place (``lc``, ``a_lc``)."""
     nids, cids, pids, nb_reg, max_slots, _, gate = fused
-    c, p = cids.cpu().long(), pids.cpu().long()
+    c, p = cids.long(), pids.long()
     inside = c >= elem_first
-    row = torch.where(inside, alias_row[(c - elem_first).clamp(min = 0, max = alias_row.numel() - 1)].long(), -1)
+    element = (c - elem_first).clamp(min = 0, max = alias_row.numel() - 1)
+    row = torch.where(inside, alias_row.to(dev)[element].long(), -1)
     is_alias = inside & (row >= 0)
     if not is_alias.any():
         return fused
@@ -342,18 +343,17 @@ def _split_aliased(fused, alias_row, alias_reg, elem_first: int, dev):
             out.append(torch.where(torch.gather(keep, 1, order)[:, :k], g, torch.full_like(g, v)))
         return [t.to(dev, torch.int32).contiguous() for t in out]
 
-    reg = torch.where(is_alias, alias_reg[(c - elem_first).clamp(min = 0, max = alias_row.numel() - 1)].long(), 0)
+    reg = torch.where(is_alias, alias_reg.to(dev)[element].long(), 0)
     if gate is None:
         ce, pe = pack(~is_alias, c, p, pad = (0, 0))
         ar, ag, ap = pack(is_alias, row, reg, p, pad = (-1, 0, 0))
         return nids, ce, pe, nb_reg, max_slots, (ar, ag, ap), None
-    g, lc = gate["idx"].cpu().long(), torch.from_numpy(gate["lc"])
-    ce, pe, ge, le = pack(~is_alias, c, p, g, lc, pad = (0, 0, 0, 0))
-    ar, ag, ap, ga, la = pack(is_alias, row, reg, p, g, lc, pad = (-1, 0, 0, 0, 0))
-    host = lambda t: t.cpu().long().numpy()
-    gate = dict(gate, idx = ge, lc = host(le), a_idx = ga, a_lc = host(la), dense_run = None,
-                uniform = block_scale.uniform_chunks(host(ge), host(ce) >= elem_first),
-                a_uniform = block_scale.uniform_chunks(host(ga), host(ar) >= 0))
+    g = gate["idx"].long()
+    ce, pe, ge = pack(~is_alias, c, p, g, pad = (0, 0, 0))
+    ar, ag, ap, ga, la = pack(is_alias, row, reg, p, g, block_scale.child_places(gate, c), pad = (-1, 0, 0, 0, 0))
+    gate = dict(gate, idx = ge, a_idx = ga, a_lc = la, dense_run = None,
+                uniform = block_scale.uniform_chunks(ge, ce >= elem_first),
+                a_uniform = block_scale.uniform_chunks(ga, ar >= 0))
     return nids, ce, pe, nb_reg, max_slots, (ar, ag, ap), gate
 
 
@@ -434,11 +434,12 @@ class CircuitTables:
                             rest_regs = regs[rest.cpu().numpy()]
                             gate = None
                             nb_reg = torch.from_numpy(rest_regs.astype(np.int64)).to(dev)
+                            # (every node block: the layer's own tables, no copy of a [K, E])
+                            rn, rc, rp = (t.data if rest.numel() == nids.numel() else t[rest] for t in (nids, cids, pids))
                             if gated:
-                                gate = block_scale.edge_tables(gate_cells, layer, nids[rest], cids[rest], elem_first, dev)
-                                gate["dense_run"] = block_scale.dense_run(nids[rest], cids[rest], nb_reg,
-                                                                          layer.block_size, elem_first)
-                            fused = (nids[rest].contiguous(), cids[rest].contiguous(), pids[rest].contiguous(), nb_reg,
+                                gate = block_scale.edge_tables(gate_cells, layer, rn, rc, elem_first, dev)
+                                gate["dense_run"] = block_scale.dense_run(rn, rc, nb_reg, layer.block_size, elem_first)
+                            fused = (rn.contiguous(), rc.contiguous(), rp.contiguous(), nb_reg,
                                      np.unique(rest_regs).tolist(), None, gate)
                         parts.append((dense, cids.size(1), fused))
                     layers.append((layer.block_size, parts))

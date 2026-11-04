@@ -68,24 +68,23 @@ def cells(pc) -> Cells:
 
 def edge_tables(layout: Cells, layer, nids: torch.Tensor, cids: torch.Tensor, elem_first: int, dev) -> dict:
     """
-    The gate of every edge of a gated sum layer's node blocks (``nids`` [K], ``cids`` [K, E]: their first node rows and
-    children): ``idx`` int32 [K, E] on the device, its cell (its node block's first row's); ``ck`` int32 [K] on the
-    device, the grid's row length of every node block's node group -- the cells one node gate apart -- and ``node_gate``
-    the layer's node gate size; for the top-down tables, every node block's grid row ``row`` (the cell of its first
-    row's node gate and child gate 0, int64 [K]), its node group's child gate size ``cbs`` (int64 [K]) and every edge's
-    child's place among the node group's children ``lc`` (int64 [K, E]; the children concatenated in ``ns.chs`` order),
-    on the host; ``layer``: the layer's index among the gated ones. Padding edges (children below ``elem_first``) read
-    cell 0.
+    The gate of every edge of a gated sum layer's node blocks (``nids`` [K], ``cids`` [K, E] on the device: their first
+    node rows and children): ``idx`` int32 [K, E] on the device, its cell (its node block's first row's); ``ck`` int32
+    [K] on the device, the grid's row length of every node block's node group -- the cells one node gate apart -- and
+    ``node_gate`` the layer's node gate size; for the top-down tables, every node block's grid row ``row`` (the cell of
+    its first row's node gate and child gate 0, int64 [K]) and its node group's child gate size ``cbs`` (int64 [K]) on
+    the host, and what :func:`child_places` reads; ``layer``: the layer's index among the gated ones. Padding edges
+    (children below ``elem_first``) read cell 0.
     """
     nodes = sorted(layer.nodes, key = lambda ns: ns._output_ind_range[0])
     starts = np.asarray([ns._output_ind_range[0] for ns in nodes], dtype = np.int64)
-    nid_h, cid_h = nids.cpu().long().numpy(), cids.cpu().long().numpy()
-    K, E = cid_h.shape
-    row, cbs, lc = np.zeros(K, dtype = np.int64), np.ones(K, dtype = np.int64), np.zeros((K, E), dtype = np.int64)
-    ck = np.zeros(K, dtype = np.int64)
+    nid_h = nids.cpu().long().numpy()
+    K = nid_h.size
+    row, cbs, ck = np.zeros(K, dtype = np.int64), np.ones(K, dtype = np.int64), np.zeros(K, dtype = np.int64)
     node_gates = {ns.external_params.gate_sizes(ns)[0] for ns in nodes}
     assert len(node_gates) == 1, node_gates          # a layer's nodes share their block size and gate signature
     groups = np.searchsorted(starts, nid_h, side = "right") - 1
+    places = []
     for at in np.unique(groups).tolist():            # (every node group's node blocks together)
         ks = np.nonzero(groups == at)[0]
         ns = nodes[at]
@@ -100,14 +99,36 @@ def edge_tables(layout: Cells, layer, nids: torch.Tensor, cids: torch.Tensor, el
                                       "supported under a constraint.")
         cum = np.cumsum([0] + [cs.num_nodes for cs in ns.chs])[:-1]
         order = np.argsort(first)
-        c = cid_h[ks]
-        j = order[np.clip(np.searchsorted(first[order], c, side = "right") - 1, 0, None)]
-        lc[ks] = np.where(c >= elem_first, cum[j] + c - first[j], 0)
-    idx = np.where(cid_h >= elem_first, row[:, None] + lc // cbs[:, None], 0)
-    i32 = lambda a: torch.from_numpy(np.ascontiguousarray(a)).to(dev, torch.int32)
-    return dict(idx = i32(idx), ck = i32(ck), ck_host = ck, node_gate = node_gates.pop(), row = row, cbs = cbs, lc = lc,
-                layer = next(k for k, gl in enumerate(layout.layers) if gl is layer),
-                uniform = uniform_chunks(idx, cid_h >= elem_first))
+        places.append((None if ks.size == K else ks, first[order], (cum - first)[order]))
+    gate = dict(ck = torch.from_numpy(ck).to(dev, torch.int32), ck_host = ck, node_gate = node_gates.pop(), row = row,
+                cbs = cbs, places = places, elem_first = elem_first,
+                layer = next(k for k, gl in enumerate(layout.layers) if gl is layer))
+    valid = cids >= elem_first
+    cell = torch.from_numpy(row).to(dev)[:, None] + child_places(gate, cids) // torch.from_numpy(cbs).to(dev)[:, None]
+    gate["idx"] = torch.where(valid, cell, 0).to(torch.int32)
+    gate["uniform"] = uniform_chunks(gate["idx"], valid)
+    return gate
+
+
+def child_places(gate: dict, cids: torch.Tensor) -> torch.Tensor:
+    """Every edge's child's place among its node group's children (the children concatenated in ``ns.chs`` order), the
+    shape and dtype of ``cids`` [K, E], the node blocks' of :func:`edge_tables`' ``gate`` (padding edges: 0)."""
+    dev, out = cids.device, None
+    for ks, first, shift in gate["places"]:
+        at = None if ks is None else torch.from_numpy(ks).to(dev)
+        c = cids if at is None else cids[at]
+        if first.size == 1:
+            lc = c + int(shift[0])
+        else:
+            j = (torch.searchsorted(torch.from_numpy(first).to(dev, c.dtype), c, right = True) - 1).clamp(min = 0)
+            lc = c + torch.from_numpy(shift).to(dev, c.dtype)[j]
+        lc = torch.where(c >= gate["elem_first"], lc, 0)
+        if at is None:
+            return lc
+        if out is None:
+            out = torch.zeros_like(cids)
+        out[at] = lc
+    return out
 
 
 def dense_run(nids: torch.Tensor, cids: torch.Tensor, nb_reg: torch.Tensor, block_size: int,
@@ -118,13 +139,13 @@ def dense_run(nids: torch.Tensor, cids: torch.Tensor, nb_reg: torch.Tensor, bloc
     (:func:`sample_weights`) make one matrix, and its sums one matrix product: ``dict(c0, E, nid0, rows, reg)`` (host
     ints; ``rows`` the run's node rows from ``nid0``), else None.
     """
-    nid_h, cid_h, reg_h = nids.cpu().long().numpy(), cids.cpu().long().numpy(), nb_reg.cpu().long().numpy()
-    K, E = cid_h.shape
-    c0, nid0 = int(cid_h[0, 0]), int(nid_h[0])
-    if c0 < elem_first or not (cid_h == c0 + np.arange(E)[None, :]).all() or (reg_h != reg_h[0]).any() or \
-            not (nid_h == nid0 + block_size * np.arange(K)).all():
+    K, E = cids.shape
+    dev = cids.device
+    c0, nid0 = int(cids[0, 0]), int(nids[0])
+    if c0 < elem_first or not (cids == c0 + torch.arange(E, device = dev)[None, :]).all() or (nb_reg != nb_reg[0]).any() or \
+            not (nids == nid0 + block_size * torch.arange(K, device = dev)).all():
         return None
-    return dict(c0 = c0, E = E, nid0 = nid0, rows = K * block_size, reg = int(reg_h[0]))
+    return dict(c0 = c0, E = E, nid0 = nid0, rows = K * block_size, reg = int(nb_reg[0]))
 
 
 @triton.jit
@@ -174,17 +195,14 @@ def sample_weights(out: torch.Tensor, params: torch.Tensor, pids: torch.Tensor, 
 GATE_CHUNKS = (1, 2, 4, 8, 16, 32, 64, 128)
 
 
-def uniform_chunks(idx: np.ndarray, valid: np.ndarray) -> dict:
+def uniform_chunks(idx: torch.Tensor, valid: torch.Tensor) -> dict:
     """Chunk size -> whether every aligned chunk of that many edges of every node block (``idx`` [K, E], the edges'
     cells, ``valid`` the real ones) reads one gate cell: the forward then reads one gate per chunk and column."""
-    out = {}
-    E = idx.shape[1]
     if valid.all():                                  # (a chunk is uniform where no block's cell changes inside it)
-        change = np.nonzero((idx[:, 1:] != idx[:, :-1]).any(axis = 0))[0] + 1
+        change = torch.nonzero((idx[:, 1:] != idx[:, :-1]).any(dim = 0)).flatten().cpu().numpy() + 1
         return {T: not (change % T).any() for T in GATE_CHUNKS}
-    for T in GATE_CHUNKS:
-        out[T] = bool(np.all(~valid | (idx == idx[:, (np.arange(E) // T) * T])))
-    return out
+    edge = torch.arange(idx.size(1), device = idx.device)
+    return {T: bool((~valid | (idx == idx[:, (edge // T) * T])).all()) for T in GATE_CHUNKS}
 
 
 def uniform_tiles(lc: np.ndarray, cbs: np.ndarray, length: int) -> dict:

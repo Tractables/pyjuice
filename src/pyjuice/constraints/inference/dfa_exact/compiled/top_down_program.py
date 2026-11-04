@@ -338,20 +338,23 @@ def _folds(launches) -> list:
     return out
 
 
-def _fused_runs(cols: np.ndarray, pids: np.ndarray, valid: np.ndarray, BS: int, group = None, lc = None):
+def _fused_runs(cols: torch.Tensor, pids: torch.Tensor, valid: torch.Tensor, BS: int, group = None, lc = None):
     """Per row of ``cols`` [K, E], its maximal runs of valid consecutive children with weights ``BS`` apart (and, given
     ``group``, in one group: the sum region of aliased children; given ``lc``, consecutive places), row by row: ``(row,
-    first child, length, pid base, group, first place)``, arrays of a value per run."""
+    first child, length, pid base, group, first place)``, int64 arrays of a value per run, on the host (the tables on
+    the device, every edge of a layer: a few runs per row, usually)."""
     cont = valid[:, 1:] & valid[:, :-1] & (cols[:, 1:] == cols[:, :-1] + 1) & (pids[:, 1:] == pids[:, :-1] + BS)
     if group is not None:
         cont &= group[:, 1:] == group[:, :-1]
     if lc is not None:
         cont &= lc[:, 1:] == lc[:, :-1] + 1
-    none = np.zeros((valid.shape[0], 1), dtype = bool)
-    k, a = np.nonzero(valid & ~np.concatenate([none, cont], axis = 1))
-    _, b = np.nonzero(valid & ~np.concatenate([cont, none], axis = 1))
-    return (k, cols[k, a], b - a + 1, pids[k, a], np.full(k.size, -1, dtype = np.int64) if group is None else group[k, a],
-            np.zeros(k.size, dtype = np.int64) if lc is None else lc[k, a])
+    none = torch.zeros(valid.size(0), 1, dtype = torch.bool, device = valid.device)
+    k, a = torch.nonzero(valid & ~torch.cat([none, cont], dim = 1), as_tuple = True)
+    _, b = torch.nonzero(valid & ~torch.cat([cont, none], dim = 1), as_tuple = True)
+    host = lambda x: x.long().cpu().numpy()
+    return (host(k), host(cols[k, a]), host(b - a + 1), host(pids[k, a]),
+            np.full(k.numel(), -1, dtype = np.int64) if group is None else host(group[k, a]),
+            np.zeros(k.numel(), dtype = np.int64) if lc is None else host(lc[k, a]))
 
 
 def _fused_tables(prog, parts, block_size, elem_first, firsts, sums, elements, dev) -> dict:
@@ -369,7 +372,7 @@ def _fused_tables(prog, parts, block_size, elem_first, firsts, sums, elements, d
     part -- what its products by sample need (see :func:`~..kernels.sum.per_sample_dense_sum_top_down`); else None."""
     BS = block_size
     found = {"E": [], "S": []}           # kind -> per part, a value per run: first row, length, pid base, region, nid,
-    firsts_np = np.asarray(firsts)       # reg, place, gate row, gate size, grid row length
+    firsts_t = torch.as_tensor(firsts, dtype = torch.long, device = dev)   # reg, place, gate row, gate size, grid row length
     gated = False
     for nids, cids, pids, nb_reg, _, aliased, gate in parts:
         gated = gate is not None
@@ -377,8 +380,9 @@ def _fused_tables(prog, parts, block_size, elem_first, firsts, sums, elements, d
         at = np.nonzero(sums[nids_h[:, None] + np.arange(BS)].any(axis = 1))[0]
         if at.size == 0:
             continue
+        kept = None if at.size == nids_h.size else torch.from_numpy(at).to(dev)
+        rows_of = (lambda t: t) if kept is None else (lambda t: t[kept])   # (of the node blocks with a top-down value)
         nids_h, regs_h = nids_h[at], nb_reg.cpu().long().numpy()[at]
-        cids_h, pids_h = cids.cpu().long().numpy()[at], pids.cpu().long().numpy()[at]
         if gated:
             g_row, g_cbs, g_ck = gate["row"][at], gate["cbs"][at], gate["ck_host"][at]
         else:
@@ -388,13 +392,14 @@ def _fused_tables(prog, parts, block_size, elem_first, firsts, sums, elements, d
             k, c0, length, p0, creg, lc0 = run
             found[kind].append((c0, length, p0, creg, nids_h[k], regs_h[k], lc0, g_row[k], g_cbs[k], g_ck[k]))
 
-        collect("E", _fused_runs(cids_h, pids_h, cids_h >= elem_first, BS,        # padding: below the region
-                                 lc = gate["lc"][at] if gated else None))
+        cols = rows_of(cids)
+        collect("E", _fused_runs(cols, rows_of(pids), cols >= elem_first, BS,     # padding: below the region
+                                 lc = rows_of(block_scale.child_places(gate, cids)) if gated else None))
         if aliased is not None:
-            a_rows, a_regs, a_pids = (t.cpu().long().numpy()[at] for t in aliased)
+            a_rows, a_regs, a_pids = (rows_of(t) for t in aliased)
             valid = a_rows >= 0
-            collect("S", _fused_runs(np.where(valid, a_rows + firsts_np[a_regs], -1), a_pids, valid, BS, a_regs,
-                                     lc = gate["a_lc"][at] if gated else None))
+            collect("S", _fused_runs(torch.where(valid, a_rows + firsts_t[a_regs], -1), a_pids, valid, BS, a_regs,
+                                     lc = rows_of(gate["a_lc"]) if gated else None))
     # the child blocks: per kind, as they first occur; a block's parents, in their runs' order
     tables = []
     for kind, runs in found.items():
