@@ -98,7 +98,7 @@ def _cum_pflow_master_kernel(cum_pflows, master, stored, param_flows, nchs, par_
     if keep_zero_params:
         nch = tl.load(nchs + offs_m, mask = mask_m, other = 1)
         pflows += (pseudocount / nch[:,None])
-        nflows = tl.sum(tl.where(old_param < 1e-12, 0.0, pflows), axis = 1)
+        nflows = tl.sum(tl.where(old_param == 0.0, 0.0, pflows), axis = 1)
     else:
         nflows = tl.sum(pflows, axis = 1)
 
@@ -150,7 +150,7 @@ def _em_par_update_master_kernel(master, stored, param_flows, cum_pflows, nchs, 
         new_param = (pflows + pseudocount / nch[:,None]) / (nflows[:,None] + pseudocount)
 
     if keep_zero_params:
-        updated_params = tl.where(old_param < 1e-12, 0.0, (1.0 - step_size) * old_param + step_size * new_param)
+        updated_params = tl.where(old_param == 0.0, 0.0, (1.0 - step_size) * old_param + step_size * new_param)
     else:
         updated_params = (1.0 - step_size) * old_param + step_size * new_param
 

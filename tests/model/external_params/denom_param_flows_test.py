@@ -1960,7 +1960,7 @@ def _ref_dual_m_step(ns, theta, fp, fm, step_size, pseudocount, keep_zero_params
                 out[e, :, m] = th[e, :, m] * ((1.0 - step_size) + step_size * ratios[e]) / cum
     out = torch.clamp(out, min = 1e-30)
     if keep_zero_params:
-        out = torch.where(th < 1e-12, torch.zeros_like(out), out)
+        out = torch.where(th == 0.0, torch.zeros_like(out), out)
     return out.reshape(-1)
 
 
@@ -2112,6 +2112,10 @@ def test_the_master_copys_correction_is_its_sync_update_and_copy(mode, kz, fold,
     ps, pe = tgt._param_range
     torch.manual_seed(6)
     master0 = pc.params.detach() * (1 + 1e-3 * torch.randn_like(pc.params))      # (off the bf16 grid)
+    if kz:                                                # what `keep_zero_params` freezes, and what it must not
+        r = torch.rand(pe - ps, device = dev)
+        master0[ps:pe][r < 0.1] = 0.0
+        master0[ps:pe][(r >= 0.1) & (r < 0.2)] = 1e-16
     stored0 = master0.to(torch.bfloat16)
     written = ps + torch.randperm(pe - ps, device = dev)[: (pe - ps) // 10]
     stored0[written] = (stored0[written].float() * 1.7).to(torch.bfloat16)        # writes from outside
@@ -2139,6 +2143,12 @@ def test_the_master_copys_correction_is_its_sync_update_and_copy(mode, kz, fold,
 
     rel = ((got_m - ref_m).abs() / ref_m.abs().clamp_min(1e-20)).max().item()
     assert rel < 1e-5, f"{mode}: the master copy {rel:.2e} from sync + update + copy"
+    if kz:                                                # (`rel` above cannot see the momentum floor, 1e-30, against 0)
+        zero, tiny = master0[ps:pe] == 0, (master0[ps:pe] > 0) & (master0[ps:pe] < 1e-12)
+        assert zero.any() and tiny.any()
+        for what, got in (("the update", got_m), ("sync + update + copy", ref_m)):
+            assert torch.all(got[ps:pe][zero] == 0), f"{mode}: {what} moved a zero parameter"
+            assert torch.all(got[ps:pe][tiny] > 0), f"{mode}: {what} took a tiny parameter for zero"
     assert torch.equal(got_s[ps:pe], got_m[ps:pe].to(torch.bfloat16)), f"{mode}: stored not the copy's rounding"
     assert torch.equal(got_s[:ps], stored0[:ps]) and torch.equal(got_s[pe:], stored0[pe:]), \
         f"{mode}: stored written outside the range"
@@ -2203,3 +2213,58 @@ def test_dense_and_rowgroup_denom_modes_agree(bs, nb, gcbs, step, pcount, kz):
     ref = dense_desc.compute_em_correction(*args, denom_sources = srcs[tgt])
     rel2 = ((rowgroup - ref).abs() / ref.abs().clamp_min(1e-20)).max().item()
     assert rel2 < 1e-5, f"the fused modes disagree with the torch M-step (relmax = {rel2})"
+
+
+@cuda_only
+@pytest.mark.parametrize("fused", [False, True])
+@pytest.mark.parametrize("keep", [False, True])
+def test_em_correction_preserves_tiny_positive_parameters(fused, keep, monkeypatch):
+    """The fused and torch M-steps freeze exact zeros, not small positive weights."""
+    dev = torch.device("cuda:0")
+    root, ns = _build(gated = True)
+    pc = juice.compile(root, verbose = False).to(dev)
+    ps, pe = ns._param_range
+    E, cbs, bs = ns.edge_ids.size(1), ns.ch_block_size, ns.block_size
+    theta = pc.params[ps:pe].reshape(E, cbs, bs)
+    theta[:, 0, :] = 0.0
+    theta[:, 1, :] = 1e-16
+    nb = ns.edge_ids[0].to(device = dev, dtype = torch.long)
+    total = torch.zeros(ns.num_node_blocks, bs, device = dev)
+    total.index_add_(0, nb, theta.sum(1))
+    theta /= total[nb][:, None, :]
+    before = theta.clone()
+    zeroed, tiny = before == 0, (before > 0) & (before < 1e-12)
+    assert zeroed.any() and tiny.any()
+    if not fused:
+        monkeypatch.setattr(ExternalSumParams, "_fused_em_correction", lambda *args, **kwargs: None)
+    else:
+        fused_calls = []
+        original = ExternalSumParams._fused_em_correction
+
+        def checked_fused(*args, **kwargs):
+            result = original(*args, **kwargs)
+            assert result is not None, "the fused M-step unexpectedly fell back to torch"
+            fused_calls.append(True)
+            return result
+
+        monkeypatch.setattr(ExternalSumParams, "_fused_em_correction", checked_fused)
+    torch.manual_seed(17)
+    x = torch.randint(0, NUM_CATS, [32, 2], device = dev)
+    ext = {ns: _phi(ns, 32, dev)}
+    pc(x, sum_external_params = ext)
+    pc.backward(x, sum_external_params = ext, logspace_flows = True,
+                flows_memory = 0.0, allow_modify_flows = False)
+    fp = pc.param_flows[slice(*ns._param_flow_range)].clone()
+    fm = _fminus(pc, ns)[slice(*ns._param_flow_range)]
+    expected = _ref_dual_m_step(ns, before, fp, fm, 1.0, 0.1, keep).reshape_as(before)
+    pc.mini_batch_em(step_size = 1.0, pseudocount = 0.1, keep_zero_params = keep)
+    if fused:
+        assert fused_calls, "the fused M-step was not exercised"
+    actual = pc.params[ps:pe].reshape_as(before)
+    torch.testing.assert_close(actual.double(), expected, atol = 2e-6, rtol = 2e-4)
+    torch.testing.assert_close(actual[tiny].double(), expected[tiny], atol = 0, rtol = 2e-4)
+    assert bool((actual[tiny] > 0).all())
+    if keep:
+        assert bool((actual[zeroed] == 0).all())
+    else:
+        assert bool((actual[zeroed] > 0).all())
