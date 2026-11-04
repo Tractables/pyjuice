@@ -221,7 +221,8 @@ selected per-call by passing <cite>propagation_alg=…</cite> directly to <a cla
 <dd class="field-odd"><ul class="simple">
 <li><p><strong>step_size</strong> (<a class="reference external" href="https://docs.python.org/3/builtins/functions.html#float" title="(in Python v3.15)"><em>float</em></a>) – Step size - updated_params &lt;- (1-step_size) * params + step_size * new_params</p></li>
 <li><p><strong>pseudocount</strong> (<a class="reference external" href="https://docs.python.org/3/builtins/functions.html#float" title="(in Python v3.15)"><em>float</em></a>) – a pseudo count added to the parameter flows</p></li>
-<li><p><strong>keep_zero_params</strong> (<a class="reference external" href="https://docs.python.org/3/builtins/functions.html#bool" title="(in Python v3.15)"><em>bool</em></a>) – if set to <cite>True</cite>, do not add pseudocounts to zero parameters</p></li>
+<li><p><strong>keep_zero_params</strong> (<a class="reference external" href="https://docs.python.org/3/builtins/functions.html#bool" title="(in Python v3.15)"><em>bool</em></a>) – if <cite>True</cite>, freeze exactly zero parameters; positive parameters are updated
+regardless of their magnitude (no implicit pruning threshold)</p></li>
 <li><p><strong>step_size_rescaling</strong> (<a class="reference external" href="https://docs.python.org/3/builtins/functions.html#bool" title="(in Python v3.15)"><em>bool</em></a>) – whether to rescale the step size by flows</p></li>
 <li><p><strong>_apply_denom_correction</strong> (<a class="reference external" href="https://docs.python.org/3/builtins/functions.html#bool" title="(in Python v3.15)"><em>bool</em></a>) – internal. <cite>False</cite> runs the PLAIN M-step even on a circuit whose
 parameterization requests the denominator flow (<code class="docutils literal notranslate"><span class="pre">apply_z_correction</span></code>). For callers that use
