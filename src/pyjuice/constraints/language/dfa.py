@@ -62,9 +62,10 @@ class DFA(Constraint):
         if delta.dim() != 2 or delta.size(0) < 1:
             raise ValueError(f"`delta` must be [num_states, num_classes], got {tuple(delta.shape)}.")
         K, C = delta.shape
-        if token_class.min() < 0 or token_class.max() >= C:
+        tokens, table = token_class.numpy(), delta.numpy()                 # (no thread team for a look at each)
+        if tokens.min() < 0 or tokens.max() >= C:
             raise ValueError(f"`token_class` values must lie in [0, {C}).")
-        if delta.min() < 0 or delta.max() >= K:
+        if table.min() < 0 or table.max() >= K:
             raise ValueError(f"`delta` successors must lie in [0, {K}) (the DFA must be complete).")
         if not 0 <= int(initial) < K:
             raise ValueError(f"`initial` must lie in [0, {K}), got {initial}.")

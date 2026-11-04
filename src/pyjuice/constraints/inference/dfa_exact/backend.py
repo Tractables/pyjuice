@@ -75,7 +75,7 @@ class DFAExactBackend(Backend):
         self.automaton = automaton
         self.layout = layout
         if token_classes is None or token_classes.token_class.device != self.device:
-            sizes = torch.bincount(layout.token_class, minlength = automaton.num_classes)
+            sizes = np.bincount(layout.token_class.numpy(), minlength = automaton.num_classes)
             small = int(((sizes > 0) & (sizes <= ENUMERATE_MAX_TOKENS)).sum())
             enumerate_max = ENUMERATE_MAX_TOKENS if small >= ENUMERATE_MIN_FRACTION * automaton.num_classes else 0
             token_classes = distributions.TokenClasses(layout.token_class.to(self.device), automaton.num_classes,
