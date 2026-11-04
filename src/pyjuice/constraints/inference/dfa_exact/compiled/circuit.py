@@ -28,6 +28,8 @@ from typing import Any, Dict, List, NamedTuple, Optional, Tuple
 import numpy as np
 import torch
 
+from pyjuice.nodes.nodes import compilations
+
 from ....errors import ConstraintCompileError
 from ..external_params import block_scale
 from ..kernels.common import IDENTITY, SUM, TEMP
@@ -64,6 +66,7 @@ class CircuitRows:
     def __init__(self, structure, pc):
         info_of = {info.ns: info for info in structure.nodes}
         first_row, numbered = {}, []
+        self._checked_at = None
 
         def number(layer, row):
             for ns in layer.nodes:
@@ -118,8 +121,14 @@ class CircuitRows:
     def check(self):
         """Refuses a circuit whose node groups no longer describe it: their record of their rows describes the circuit
         their graph was compiled into LAST, so a graph compiled again into another circuit is not read with this one's
-        rows."""
+        rows. Node groups' records change when a circuit is compiled: read again only if one was since the last look (they
+        may be tens of thousands, and this runs for every constraint)."""
+        epoch = compilations()
+        if self._checked_at == epoch:
+            return
         stale = sum(tuple(getattr(ns, "_output_ind_range", ())) != (first, end) for ns, first, end in self.numbered)
+        if not stale:
+            self._checked_at = epoch
         if stale:
             raise ConstraintCompileError(
                 f"The PC's node groups no longer describe this circuit: {stale} of them record other rows than "
@@ -576,9 +585,8 @@ def _operand_table(product_rows, firsts: np.ndarray, n: int, input_end: int, iv_
 # -------------------------------------------------------------------------------------------------
 
 class LaunchTemplate(NamedTuple):
-    """A :class:`~..kernels.prod.Launch` but for what its automaton says: its steps' outputs' intervals, ``parts``
-    (``part_a``, ``part_b``: their ends; ``part_iv``: their numbers, ``CircuitTables``' ``all_ivs``), and ``part_of``
-    [S], every step's among them (None: one part)."""
+    """A :class:`~..kernels.prod.Launch` but for what its automaton says: its steps' outputs' intervals, ``parts``, and
+    ``part_of`` [S], every step's among them (None: one part)."""
 
     form: str
     kinds: tuple
@@ -589,9 +597,6 @@ class LaunchTemplate(NamedTuple):
     part_of: Optional[torch.Tensor]
     groups_host: Optional[dict]
     out_ivs: np.ndarray
-    part_a: np.ndarray
-    part_b: np.ndarray
-    part_iv: np.ndarray
 
 
 class Assembly:
@@ -600,6 +605,8 @@ class Assembly:
 
     :ivar layers: per product layer group (by number), per layer, ``(stages of LaunchTemplate, num_temps, the intervals
         of what its scratch rows hold, by their numbers)``
+    :ivar part_a, part_b, part_iv, part_ptr: int64: the ends and numbers (``CircuitTables``' ``all_ivs``) of the launches'
+        ``parts``, one launch's after another's in :attr:`layers`' order, launch ``k``'s from ``part_ptr[k]``
     :ivar triple_of, skip_triples: every ``block @ block`` step's boundary triple, in the order the skip masks are built
     :ivar pos_steps: int64 [n] on the device, the input steps per position
     :ivar steps_host: the same on the host
@@ -661,6 +668,15 @@ class Assembly:
                 self.layers[pi] = [([[self._launch(*launch) for launch in launches_] for launches_ in hosts[(pi, li)]],
                                     layer.num_temps, np.asarray([number[iv] for iv in layer.temp_ivs], dtype = np.int64))
                                    for li, layer in enumerate(layers)]
+        ends = [iv for layers in self.layers.values() for stages, _, _ in layers for launches_ in stages
+                for t in launches_ for iv in t.parts]
+        counts = [len(t.parts) for layers in self.layers.values() for stages, _, _ in layers for launches_ in stages
+                  for t in launches_]
+        number = circuit.attrs["iv_index"]
+        self.part_a = np.asarray([a for a, _ in ends], dtype = np.int64)
+        self.part_b = np.asarray([b for _, b in ends], dtype = np.int64)
+        self.part_iv = np.asarray([number[iv] for iv in ends], dtype = np.int64)
+        self.part_ptr = np.cumsum([0] + counts, dtype = np.int64)
         self.score = None
         self.top_down = None
         self.forward_shape = None
@@ -698,10 +714,8 @@ class Assembly:
         else:
             steps = rows.to(dev, torch.int32).contiguous()
         index = circuit.attrs["iv_index"]                               # the outputs' intervals
-        part_iv = np.asarray([index[iv_] for iv_ in ends], dtype = np.int64)
-        return LaunchTemplate(form, kinds, steps, rows, iv, ends, part_of, groups_host, np.unique(part_iv),
-                              np.asarray([a for a, _ in ends], dtype = np.int64),
-                              np.asarray([b for _, b in ends], dtype = np.int64), part_iv)
+        out_ivs = np.unique(np.asarray([index[iv_] for iv_ in ends], dtype = np.int64))
+        return LaunchTemplate(form, kinds, steps, rows, iv, ends, part_of, groups_host, out_ivs)
 
 
 def _cat_fields(parts: List[Emit]) -> torch.Tensor:
@@ -723,9 +737,7 @@ def _step_groups(st: torch.Tensor, sizes):
     return order, {G: torch.cat([torch.nonzero((k - run_first) % G == 0).flatten(), end]) for G in sizes}
 
 
-def launch_of(t: LaunchTemplate, entries: np.ndarray, exits: np.ndarray, slots: np.ndarray) -> Launch:
-    """The :class:`~..kernels.prod.Launch` of a template under a layout: every output's columns and slots read off the
-    layout (``entries``, ``exits``: int64 by boundary; ``slots``: int64, by the number of an interval)."""
-    parts = np.stack([entries[t.part_a], exits[t.part_b], slots[t.part_iv]], axis = 1)
-    E_max, X_max, S_max = parts.max(axis = 0).tolist()
-    return Launch(t.form, t.kinds, t.steps, E_max, X_max, S_max, t.rows, t.iv, parts, t.part_of, t.groups_host, t.out_ivs)
+def launch_of(t: LaunchTemplate, parts: np.ndarray, most: list) -> Launch:
+    """The :class:`~..kernels.prod.Launch` of a template under a layout: ``parts`` int64 [parts, 3], the columns and slots
+    of its parts, and ``most`` their most."""
+    return Launch(t.form, t.kinds, t.steps, most[0], most[1], most[2], t.rows, t.iv, parts, t.part_of, t.groups_host, t.out_ivs)

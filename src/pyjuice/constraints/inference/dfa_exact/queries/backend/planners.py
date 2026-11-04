@@ -104,10 +104,7 @@ class _ForwardShape(NamedTuple):
     the automaton (kept there).
 
     :ivar arrays: :data:`_FW_FIELDS` but the sizes (``run_E``, ``run_X``, ``run_S``, ``brun_slots``)
-    :ivar part_a, part_b: int64: the ends of every launch's outputs' intervals (its ``parts``), one launch's after another's
-    :ivar part_iv: int64: which of the distinct intervals ``ivs`` every one of them is
-    :ivar ivs: the distinct intervals of the parts
-    :ivar run_ptr, run_part: int64: the parts of every run of steps (a CSR)
+    :ivar run_ptr, run_part: int64: the launches' parts (``Assembly.part_ptr``'s numbers) of every run of steps (a CSR)
     :ivar cuts: per launch, what the :class:`~...kernels.prod.Cut` running all of its steps says: ``(chunks, groups, steps)``
     :ivar runs_of, ivs_of: per sum layer part, its dense runs, and the intervals of its fused node blocks' regions
     :ivar idle: every step with nothing to run (never mutated: a pass reads them)
@@ -115,10 +112,6 @@ class _ForwardShape(NamedTuple):
     """
 
     arrays: dict
-    part_a: np.ndarray
-    part_b: np.ndarray
-    part_iv: np.ndarray
-    ivs: list
     run_ptr: np.ndarray
     run_part: np.ndarray
     cuts: list
@@ -134,7 +127,8 @@ def _forward_shape(prog) -> _ForwardShape:
     F = _Flat(*(name for name in _FW_FIELDS if name not in ("run_E", "run_X", "run_S", "brun_slots")))
     reg_iv = np.asarray(prog.reg_iv_host)
     cuts, runs_of, ivs_of, ranges, idle = [], [], [], [], []
-    part_a, part_b, run_ptr, run_part = [], [], [0], []
+    run_ptr, run_part = [0], []
+    part_first = assembly.part_ptr.tolist()
     nc = nr = ng = ngr = nd = nbr = 0
     L = P = 0
     for kind, prod_index, layers in prog.steps:
@@ -146,9 +140,7 @@ def _forward_shape(prog) -> _ForwardShape:
                     S, iv = t.rows.size(0), t.iv.numpy()
                     walks = t.form in ("input_block", "block_input")
                     chunks = t.steps[1] if walks else [(0, S, None)]
-                    part0 = len(part_a)
-                    part_a += [a for a, _ in t.parts]
-                    part_b += [b for _, b in t.parts]
+                    part0 = part_first[L]
                     of_step = None if t.part_of is None else t.part_of.numpy()
                     F.add("launch_chunk_ptr", nc)
                     for s0, s1, _ in chunks:
@@ -200,11 +192,8 @@ def _forward_shape(prog) -> _ForwardShape:
     for name, value in (("launch_chunk_ptr", nc), ("chunk_run_ptr", nr), ("launch_gsize_ptr", ng),
                         ("gsize_run_ptr", ngr), ("part_dense_ptr", nd), ("part_brun_ptr", nbr)):
         F.add(name, value)
-    ends = list(dict.fromkeys(zip(part_a, part_b)))
-    number = {iv: k for k, iv in enumerate(ends)}
     int64 = lambda x: np.asarray(x, dtype = np.int64)
-    return _ForwardShape(F.done(), int64(part_a), int64(part_b), int64([number[iv] for iv in zip(part_a, part_b)]), ends,
-                         int64(run_ptr), int64(run_part), cuts, runs_of, ivs_of, idle, int64(ranges).reshape(-1, 4))
+    return _ForwardShape(F.done(), int64(run_ptr), int64(run_part), cuts, runs_of, ivs_of, idle, int64(ranges).reshape(-1, 4))
 
 
 def _forward_tables(prog):
@@ -219,11 +208,7 @@ def _forward_tables(prog):
     shape = prog.assembly.forward_shape
     if shape is None:
         shape = prog.assembly.forward_shape = _forward_shape(prog)
-    reach, width = prog.reach, np.asarray(prog.width, dtype = np.int64)
-    exits = width.copy()
-    exits[prog.n] = 1
-    slots = np.asarray([reach.slots(a, b) for a, b in shape.ivs], dtype = np.int64).reshape(-1)[shape.part_iv]
-    sizes = np.stack([width[shape.part_a], exits[shape.part_b], slots], axis = 1)
+    sizes = prog.launch_parts
     most = np.maximum.reduceat(sizes[shape.run_part], shape.run_ptr[:-1], axis = 0) if shape.run_part.size else sizes[:0]
     arrays = dict(shape.arrays, run_E = most[:, 0], run_X = most[:, 1], run_S = most[:, 2],
                   brun_slots = prog.iv_slots[shape.arrays["brun_iv"]])

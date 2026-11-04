@@ -153,6 +153,7 @@ class Program:
         self.iv_slots = np.array(self.sum_iv_slots, dtype = np.int64)
         # every boundary's columns and every interval's slots and whether it keeps every pair (host, by the interval's
         # number in `all_ivs`): what the launches' sizes read
+        self.reach.prepare(self.all_ivs)
         ends = self.iv_ends_np
         self.entries = np.asarray(self.width, dtype = np.int64)
         self.exits = self.entries.copy()
@@ -168,13 +169,25 @@ class Program:
         # (:mod:`..external_params.block_scale`) run every node block fused, each edge with its gate
         assembly = self.assembly = circuit.assembly(self.reach)
         self.score = assembly.score
-        reach, entries, exits, all_slots = self.reach, self.entries, self.exits, self.all_iv_slots
+        reach, all_slots = self.reach, self.all_iv_slots
         slots = regions[:, 2]
+        # every launch's parts' columns and slots, at once
+        self.launch_parts = np.stack([self.entries[assembly.part_a], self.exits[assembly.part_b],
+                                      all_slots[assembly.part_iv]], axis = 1)
+        ptr = assembly.part_ptr.tolist()
+        most = np.maximum.reduceat(self.launch_parts, assembly.part_ptr[:-1], axis = 0).tolist() if len(ptr) > 1 else []
+        at = 0
+
+        def launch(t):
+            nonlocal at
+            at += 1
+            return launch_of(t, self.launch_parts[ptr[at - 1]:ptr[at]], most[at - 1])
+
         self.steps = []
         for kind, prod_index, layers in circuit.steps:
             if kind == "prod":
                 self.steps.append(("prod", prod_index, [
-                    ([[launch_of(t, entries, exits, all_slots) for t in launches] for launches in stages], num_temps,
+                    ([[launch(t) for t in launches] for launches in stages], num_temps,
                      int(all_slots[temp_ivs].max(initial = 1)))
                     for stages, num_temps, temp_ivs in assembly.layers.get(prod_index, ())]))
             else:

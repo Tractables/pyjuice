@@ -86,11 +86,12 @@ def advance(bits: torch.Tensor, t: int, next_width: int, tables: SweepTables) ->
 
 
 def pairs_of_bits(bits: torch.Tensor, entries: int) -> torch.Tensor:
-    """bool [``entries``, columns]: which column each entry column reaches."""
-    columns, words = bits.shape
-    out = torch.zeros(entries, columns, dtype = torch.bool, device = bits.device)
+    """bool [..., ``entries``, columns]: which column each entry column reaches (``bits`` int32 [..., columns, words]:
+    several sweeps of one shape, stacked, in as many device calls as one)."""
+    *batch, columns, words = bits.shape
+    out = torch.zeros(*batch, entries, columns, dtype = torch.bool, device = bits.device)
     shifts = torch.arange(32, device = bits.device, dtype = torch.int32)
     for c0 in range(0, columns, 1024):                             # (a word a bit, 32 times: not all at once)
-        chunk = (bits[c0:c0 + 1024, :, None] >> shifts) & 1
-        out[:, c0:c0 + 1024] = chunk.view(chunk.size(0), words * 32)[:, :entries].t() != 0
+        chunk = (bits[..., c0:c0 + 1024, :, None] >> shifts) & 1
+        out[..., c0:c0 + 1024] = chunk.view(*batch, chunk.size(-3), words * 32)[..., :entries].transpose(-1, -2) != 0
     return out

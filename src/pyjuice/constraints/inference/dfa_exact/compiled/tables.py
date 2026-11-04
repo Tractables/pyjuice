@@ -83,6 +83,7 @@ def build_pc_tables(structure, layout: BoundaryLayout, pc) -> Dict[str, Any]:
     from .circuit import circuit_rows                # (it imports the kernels, which import this module)
     rows = circuit_rows(structure, pc)
     reach = layout.reachability
+    reach.prepare(rows.node_ivs)
     slots = np.fromiter((reach.slots(a, b) for a, b in rows.node_ivs), dtype = np.int64, count = len(rows.node_ivs))
     return dict(columns_per_sample = max(1, int(slots.max(initial = 1))),
                 product_rows = rows.on_device(pc.device), input_range = rows.input_range, root_rows = rows.root_rows,

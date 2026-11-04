@@ -70,12 +70,19 @@ def top_down_program(backend) -> TopDownProgram:
     if t is None:
         t = prog.assembly.top_down = top_down_template(backend, prog)
     reach, slots = prog.reach, np.asarray(prog.slots, dtype = np.int64)
-    entries, exits, iv_slots, iv_full = prog.entries, prog.exits, prog.all_iv_slots, prog.all_iv_full
+    # every child launch's columns, slots and whether it keeps every pair, at once
+    ptr = t.child_ptr[:-1]
+    has = ptr.size > 0
+    most_entries = np.maximum.reduceat(prog.entries[t.child_a], ptr).tolist() if has else []
+    most_exits = np.maximum.reduceat(prog.exits[t.child_b], ptr).tolist() if has else []
+    most_slots = np.maximum.reduceat(prog.all_iv_slots[t.child_iv], ptr).tolist() if has else []
+    all_full = np.logical_and.reduceat(prog.all_iv_full[t.child_iv], ptr).tolist() if has else []
 
     def child(c: _Child) -> TopDownLaunch:
-        kinds = c.kinds if c.c_full_at is None else (c.kinds[0], c.kinds[1], (bool(iv_full[c.iv_num].all()), c.kinds[2]))
-        return TopDownLaunch(c.form, c.side, kinds, c.children, c.ptr, c.parents, int(entries[c.iv_a].max()),
-                             int(exits[c.iv_b].max()), int(iv_slots[c.iv_num].max()), dict(c.host), c.tiles, c.height)
+        k = c.number
+        kinds = c.kinds if c.c_full_at is None else (c.kinds[0], c.kinds[1], (all_full[k], c.kinds[2]))
+        return TopDownLaunch(c.form, c.side, kinds, c.children, c.ptr, c.parents, most_entries[k], most_exits[k],
+                             most_slots[k], dict(c.host), c.tiles, c.height)
 
     def weights(cw, boundaries) -> ClassWeightLaunch:
         return ClassWeightLaunch(cw.form, cw.kinds, cw.dests, cw.ptr, cw.parents,
@@ -107,10 +114,10 @@ def top_down_program(backend) -> TopDownProgram:
 
 
 class _Child(NamedTuple):
-    """A :class:`TopDownLaunch` but for what its automaton says: its columns and slots (of the distinct intervals, their
-    ends ``iv_a``, ``iv_b`` and numbers ``iv_num``), and, where ``c_full_at`` is not None, whether every pair of the
-    children's intervals is kept (``kinds``: ``(child kind, parent kind, whether every pair of the output's is kept)``
-    then)."""
+    """A :class:`TopDownLaunch` but for what its automaton says: its columns and slots (of its children's distinct
+    intervals: ``number``, its among the template's child launches, see :class:`_Template`), and, where ``c_full_at`` is
+    not None, whether every pair of those intervals is kept (``kinds``: ``(child kind, parent kind, whether every pair of
+    the output's is kept)`` then)."""
 
     form: str
     side: str
@@ -119,16 +126,16 @@ class _Child(NamedTuple):
     children: torch.Tensor
     ptr: torch.Tensor
     parents: torch.Tensor
-    iv_a: np.ndarray
-    iv_b: np.ndarray
-    iv_num: np.ndarray
+    number: int
     host: dict
     tiles: Optional[torch.Tensor]
     height: int
 
 
 class _Template(NamedTuple):
-    """:func:`top_down_template`'s tables, in :attr:`TopDownProgram.steps`' order."""
+    """:func:`top_down_template`'s tables, in :attr:`TopDownProgram.steps`' order; ``child_a``, ``child_b``, ``child_iv``
+    int64: the ends and numbers of every child launch's children's distinct intervals, the launch ``number``'s from
+    ``child_ptr[number]``."""
 
     steps: list
     specs: list
@@ -138,6 +145,10 @@ class _Template(NamedTuple):
     reg_iv: np.ndarray
     elem_regions: list
     shared: dict
+    child_a: np.ndarray
+    child_b: np.ndarray
+    child_iv: np.ndarray
+    child_ptr: np.ndarray
 
 
 def _out_temp(launch) -> bool:
@@ -160,6 +171,7 @@ def top_down_template(backend, prog) -> _Template:
     elements = [np.zeros(end - first, dtype = bool) for first, end, _ in backend.element_regions]
     temps = {}
     specs, spec_of = [], {}
+    child_ends = []
 
     def spec_index(spec):
         if spec not in spec_of:
@@ -252,8 +264,8 @@ def top_down_template(backend, prog) -> _Template:
             host["group"] = node_groups(a[ptr_np[:-1]], b[ptr_np[:-1]], np.diff(ptr_np), add)
             tiles, height = node_tiles(host["group"])
             tiles = torch.from_numpy(tiles).to(dev)
-        return _Child(form, side, okinds, c_full_at, ch, i32(ptr_np), i32(par), iv_a, iv_b, iv_index(iv_a, iv_b), host,
-                      tiles, height)
+        child_ends.append((iv_a, iv_b, iv_index(iv_a, iv_b)))
+        return _Child(form, side, okinds, c_full_at, ch, i32(ptr_np), i32(par), len(child_ends) - 1, host, tiles, height)
 
     steps = []
     for kind, prod_index, layers in reversed(circuit.steps):
@@ -308,8 +320,10 @@ def top_down_template(backend, prog) -> _Template:
     dead_region = np.zeros(len(backend.sum_regions), dtype = bool)
     dead_region[dead[:, 1]] = True
     region_iv = prog.iv_bounds[prog.reg_iv_np]
+    joined = lambda k: np.concatenate([ends[k] for ends in child_ends]) if child_ends else np.zeros(0, dtype = np.int64)
     return _Template(steps, specs, dead, dead_region, iv_bounds, iv_index(region_iv[:, 0], region_iv[:, 1]),
-                     [(first, end) for first, end, _ in backend.element_regions], {})
+                     [(first, end) for first, end, _ in backend.element_regions], {}, joined(0), joined(1), joined(2),
+                     np.cumsum([0] + [ends[0].size for ends in child_ends], dtype = np.int64))
 
 
 def _inputs(launches) -> list:
