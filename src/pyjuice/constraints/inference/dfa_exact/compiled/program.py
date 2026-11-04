@@ -8,17 +8,18 @@ transition and skip tables they read. A query runs the subsets of them its plan 
 from __future__ import annotations
 
 from collections import OrderedDict
+from functools import cached_property
 from typing import Optional, Tuple
 
 import numpy as np
 import torch
 
-from ..kernels.prod import skip_masks
+from ..kernels.prod import skip_masks_for
 from ..kernels.live import live_successors
 from ..kernels.sample_transitions import sample_transition_masses
 from ..kernels.transitions import (SampleMasses, boundary_groups, enumerated_tokens, next_col_table, sample_classes,
                                    sample_masses, transition_masses, transition_stats, transition_tables)
-from ..kernels.common import most_in_runs
+from ..kernels.common import available_memory, most_in_runs
 from .circuit import TRANS_COLS, circuit_tables
 from .layout import interval_tables
 
@@ -101,8 +102,7 @@ def transition_budget(dev) -> int:
     that is more."""
     if dev.type != "cuda":
         return TRANSITION_BUDGET
-    free = torch.cuda.mem_get_info(dev)[0] + torch.cuda.memory_reserved(dev) - torch.cuda.memory_allocated(dev)
-    return max(TRANSITION_BUDGET, int(TRANSITION_MEMORY_SHARE * free) // 4)
+    return max(TRANSITION_BUDGET, int(TRANSITION_MEMORY_SHARE * available_memory(dev)) // 4)
 
 
 def entry_loop(stats: Tuple[int, int, int], C: int) -> bool:
@@ -152,8 +152,8 @@ class Program:
         self.slots = regions[:, 2].tolist()
         self.reg_slots = torch.from_numpy(regions[:, 2].copy()).to(dev)
         # every sum interval's slots, for evidence pruning and query plans (host)
-        self.sum_iv_slots = [self.reach.slots(a, b) for a, b in self.sum_ivs]
-        self.iv_slots = np.array(self.sum_iv_slots, dtype = np.int64)
+        self.iv_slots = self.reach.slots_of(self.iv_bounds)
+        self.sum_iv_slots = self.iv_slots.tolist()
         # every boundary's columns and every interval's slots and whether it keeps every pair (host, by the interval's
         # number in `all_ivs`): what the launches' sizes read
         self.reach.prepare(self.all_ivs)
@@ -161,8 +161,7 @@ class Program:
         self.entries = np.asarray(self.width, dtype = np.int64)
         self.exits = self.entries.copy()
         self.exits[n] = 1
-        self.all_iv_slots = np.fromiter((self.reach.slots(a, b) for a, b in self.all_ivs), dtype = np.int64,
-                                        count = len(self.all_ivs))
+        self.all_iv_slots = self.reach.slots_of(self.iv_ends_np)
         self.all_iv_full = self.all_iv_slots == self.entries[ends[:, 0]] * self.exits[ends[:, 1]]
         self.live_tables = OrderedDict()                               # (batch size, intervals) -> lane order tables
         self.plans = OrderedDict()                                     # query plans, see :mod:`.plans`
@@ -179,14 +178,14 @@ class Program:
                                       all_slots[assembly.part_iv]], axis = 1)
         self.temp_slots = most_in_runs(all_slots[assembly.temp_iv], assembly.temp_ptr, 1).tolist()
         self.steps = assembly.steps
-        self.intervals = interval_tables(reach, self.all_ivs, dev, of = circuit.of_t)
+        self.intervals = interval_tables(reach, self.all_ivs, dev, of = circuit.of_t, ends = self.iv_ends_np)
         self.elem_slots = np.asarray([slots for _, _, slots in backend.element_regions], dtype = np.int64)
 
         # which (output tile, shared chunk) pairs every block @ block step can skip: one mask per boundary triple,
         # each step's launch carrying its triple's index
         self.triple_of = assembly.triple_of
         self.skip_triples = assembly.skip_triples
-        self.skip = skip_masks(reach, self.skip_triples, device = dev)
+        self.skip = skip_masks_for(reach, assembly.skip_table, device = dev)
 
         # a missing token's transitions, GROUPED by successor -- every input @ block / block @ input step's transition
         # masses, a row per entry of the step's boundary, all kept and built once per computation of the class masses
@@ -199,7 +198,6 @@ class Program:
         # (`SampleMasses`)
         pairs = torch.tensor(self.succ.num_pairs, dtype = torch.long)
         self.group_worth = grouped_worth(self.transition_stats, int(pairs.sum()))
-        self.trans_budget = transition_budget(dev)
         self.entry_loop = entry_loop(self.transition_stats, self.C)    # ungrouped kernels: entries, or every class
         self.trans_pairs = pairs
         self._tr, self._ungrouped = tr, None
@@ -235,7 +233,15 @@ class Program:
     def grouped_for(self, size: int) -> bool:
         """Whether a query whose transition masses would take ``size`` floats takes the grouped transitions: worth it
         (:func:`grouped_worth`), and the masses within the budget (:func:`transition_budget`)."""
-        return self.group_worth and size <= self.trans_budget
+        if not self.group_worth:
+            return False
+        if "trans_budget" not in self.__dict__ and size <= TRANSITION_BUDGET:   # (it is at least that: no look at the device)
+            return True
+        return size <= self.trans_budget
+
+    @cached_property
+    def trans_budget(self) -> int:
+        return transition_budget(self.dev)
 
     def most_of(self, launch) -> list:
         """The most entry columns, exit columns and slots of a :class:`~..kernels.prod.Launch`'s steps' outputs."""

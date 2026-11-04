@@ -1114,58 +1114,71 @@ def skip_masks_for(reach: Reachability, specs, tm: int = 16, tn: int = 16, tk: i
         raise ValueError(f"Tiles ({tm}, {tn}, {tk}) must be multiples of the occupancy tile {T}.")
     if len(specs) == 0:
         return SkipMasks(torch.zeros(1, dtype = torch.int32, device = device), 0, 0, 1, tm, tn, tk)
+    table = np.asarray(specs, dtype = np.int64).reshape(len(specs), 6)       # (a, b, transposed) twice (or as such, at hand)
+    whole = tm == T and tn == T and tk == T                                  # (no tiling: the occupancy as it is)
 
-    def tiles_of(sides, tr, tc):
-        """The occupancy of every side tiled, a matrix per distinct occupancy (alike intervals keep one, see
-        :class:`Reachability`), and every side's among them: of a matrix, ``(tiled, the occupancy, whether transposed)``."""
-        matrices, numbers, at = [], {}, {}
-        for side in sides:
-            a, b, transposed = side
-            m = reach.device_occupancy(a, b)
-            key = (id(m), transposed)
-            k = numbers.get(key)
-            if k is None:
-                k = numbers[key] = len(matrices)
-                matrices.append((_tile_any(m.t() if transposed else m, tr, tc), m, transposed))
-            at[side] = k
-        return matrices, at
+    def sides_of(side):
+        """The distinct operands of a side of the specs, ``(a, b, transposed)`` int64, and every spec's among them."""
+        key = (side[:, 0] * (reach.n + 1) + side[:, 1]) * 2 + side[:, 2]
+        distinct, inverse = np.unique(key, return_inverse = True)
+        return distinct // 2 // (reach.n + 1), distinct // 2 % (reach.n + 1), distinct % 2, inverse
 
-    L, lpos = tiles_of({a for a, _ in specs}, tm // T, tk // T)                 # [output row tiles, chunks]
-    R, rpos = tiles_of({b for _, b in specs}, tk // T, tn // T)                 # [chunks, output column tiles]
-    I = max(m.size(0) for m, _, _ in L)
-    J = max(m.size(1) for m, _, _ in R)
-    words = max(1, math.ceil(max(max(m.size(1) for m, _, _ in L), max(m.size(0) for m, _, _ in R)) / 32))
-    NC = 32 * words
-
-    where = L[0][0].device
-    shifts = torch.arange(32, dtype = torch.int64, device = where)
-    whole = tm == T and tn == T and tk == T                                     # (no tiling: the occupancy as it is)
-
-    def packed(ms, rows, columns, transposed):
-        """int32 [len(ms), rows, words]: the shared chunks' flags of every matrix, a word per 32 chunks (bit by chunk)."""
-        out = torch.zeros(len(ms), rows, NC, dtype = torch.bool, device = where)
-        stacks = {}                                                             # (of many at once, a device call)
-        for k, (m, source, flip) in enumerate(ms):
-            place = reach.occupancy_place(source) if whole else None
-            if place is None:
-                m = m.t() if transposed else m
-                out[k, :m.size(0), :m.size(1)] = m
-            else:
-                key = (id(place[0]), flip != transposed)
-                ks, at = stacks.setdefault(key, ([], []))[:2]
-                ks.append(k)
-                at.append(place[1])
-                stacks[key] = (ks, at, place[0])
-        for (_, swap), (ks, at, stack) in stacks.items():
-            part = stack[torch.tensor(at, device = where)]
-            part = (part.transpose(1, 2) if swap else part)[:, :rows, :NC]      # (what is cut: no column reaches it)
-            out[torch.tensor(ks, device = where), :part.size(1), :part.size(2)] = part
-        w = (out.view(len(ms), rows, words, 32).to(torch.int64) << shifts).sum(dim = -1)
+    def packed(a, b, transposed, rows, chunks_along_rows):
+        """int32 [operands, rows, words]: the shared chunks' flags of every operand, a word per 32 chunks (bit by chunk);
+        ``chunks_along_rows``: its rows' side is the shared one in its output's order. Its occupancy is read from its
+        stack, all of them in a device call a stack; an interval whose every pair is joined is all set."""
+        out = torch.zeros(a.size, rows, NC, dtype = torch.bool, device = where)
+        stack, place = reach.occupancy_places(a, b)
+        for s in np.unique(stack[stack >= 0]).tolist():
+            for flip in (0, 1):
+                own = np.flatnonzero((stack == s) & (transposed == flip))
+                if own.size == 0:
+                    continue
+                part = reach._stacks[s][0][torch.from_numpy(place[own]).to(where).long()]
+                if bool(flip) != chunks_along_rows:
+                    part = part.transpose(1, 2)
+                part = part[:, :rows, :NC]                               # (what is cut: no column reaches it)
+                out[torch.from_numpy(own).to(where), :part.size(1), :part.size(2)] = part
+        for k in np.flatnonzero(stack < 0).tolist():                     # (not swept together: every pair, or alone)
+            m = reach.device_occupancy(int(a[k]), int(b[k]))
+            m = m.t() if bool(transposed[k]) != chunks_along_rows else m
+            out[k, :m.size(0), :m.size(1)] = m
+        w = (out.view(a.size, rows, words, 32).to(torch.int64) << shifts).sum(dim = -1)
         return torch.where(w >= 2 ** 31, w - 2 ** 32, w).to(torch.int32)
 
-    Lw, Rw = packed(L, I, NC, False), packed(R, J, NC, True)          # [lefts, I, words], [rights, J, words]
-    li = torch.tensor([lpos[a] for a, _ in specs], dtype = torch.long, device = where)
-    ri = torch.tensor([rpos[b] for _, b in specs], dtype = torch.long, device = where)
+    la, lb, lt, li = sides_of(table[:, :3])
+    ra, rb, rt, ri = sides_of(table[:, 3:])
+    where = reach.device_occupancy(int(la[0]), int(lb[0])).device
+    shifts = torch.arange(32, dtype = torch.int64, device = where)
+    if whole:
+        widths = np.asarray(reach.width, dtype = np.int64)
+        tiles = lambda v: (v + T - 1) // T
+        exits = lambda b: np.where(b == reach.n, 1, widths[np.minimum(b, reach.n)])
+        lrows, lchunks = np.where(lt, tiles(exits(lb)), tiles(widths[la])), np.where(lt, tiles(widths[la]), tiles(exits(lb)))
+        rrows, rchunks = np.where(rt, tiles(widths[ra]), tiles(exits(rb))), np.where(rt, tiles(exits(rb)), tiles(widths[ra]))
+        I, J = int(lrows.max()), int(rrows.max())
+        words = max(1, math.ceil(max(int(lchunks.max()), int(rchunks.max())) / 32))
+        NC = 32 * words
+        Lw, Rw = packed(la, lb, lt, I, False), packed(ra, rb, 1 - rt, J, False)
+    else:
+        def tiled(a, b, transposed, tr, tc):
+            return [_tile_any(reach.device_occupancy(int(x), int(y)).t() if t else reach.device_occupancy(int(x), int(y)), tr, tc)
+                    for x, y, t in zip(a, b, transposed)]
+
+        L, R = tiled(la, lb, lt, tm // T, tk // T), tiled(ra, rb, rt, tk // T, tn // T)   # [output row tiles, chunks], [chunks, ...]
+        I, J = max(m.size(0) for m in L), max(m.size(1) for m in R)
+        words = max(1, math.ceil(max(max(m.size(1) for m in L), max(m.size(0) for m in R)) / 32))
+        NC = 32 * words
+
+        def stacked(ms, rows):
+            out = torch.zeros(len(ms), rows, NC, dtype = torch.bool, device = where)
+            for k, m in enumerate(ms):
+                out[k, :m.size(0), :m.size(1)] = m
+            w = (out.view(len(ms), rows, words, 32).to(torch.int64) << shifts).sum(dim = -1)
+            return torch.where(w >= 2 ** 31, w - 2 ** 32, w).to(torch.int32)
+
+        Lw, Rw = stacked(L, I), stacked([m.t() for m in R], J)
+    li, ri = torch.from_numpy(li).to(where), torch.from_numpy(ri).to(where)
     chunk = max(1, (1 << 26) // max(I * J * words, 1))
     parts = []
     for g0 in range(0, len(specs), chunk):

@@ -80,16 +80,17 @@ def build_pc_tables(structure, layout: BoundaryLayout, pc) -> Dict[str, Any]:
 
         :func:`buffer_layout` turns the regions into offsets and widths for a batch size.
     """
+    from ..kernels.common import most_in_runs
     from .circuit import circuit_rows                # (it imports the kernels, which import this module)
     rows = circuit_rows(structure, pc)
     reach = layout.reachability
     reach.prepare(rows.node_ivs)
-    slots = np.fromiter((reach.slots(a, b) for a, b in rows.node_ivs), dtype = np.int64, count = len(rows.node_ivs))
+    slots = reach.slots_of(rows.node_ends)
+    most = most_in_runs(slots[rows.group_iv], rows.group_ptr).tolist()
     return dict(columns_per_sample = max(1, int(slots.max(initial = 1))),
                 product_rows = rows.on_device(pc.device), input_range = rows.input_range, root_rows = rows.root_rows,
                 sum_regions = Regions(np.concatenate([rows.sum_rows, slots[rows.sum_iv][:, None]], axis = 1)),
-                element_regions = tuple((first, end, max(reach.slots(a, b) for a, b in ivs))
-                                        for first, end, ivs in rows.product_groups))
+                element_regions = tuple((first, end, m) for (first, end, _), m in zip(rows.product_groups, most)))
 
 
 #: Every region starts, and every sum and product row is padded, to a multiple of this many floats (64 bytes),

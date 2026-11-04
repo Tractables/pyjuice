@@ -53,6 +53,7 @@ from typing import Any, Optional
 import numpy as np
 import torch
 import triton
+from numba import njit
 import triton.language as tl
 
 from pyjuice.nodes.distributions import Categorical, SoftEvidenceCategorical
@@ -136,7 +137,8 @@ class TokenClasses:
     :ivar num_enumerated: the enumerated classes
     """
 
-    def __init__(self, token_class: torch.Tensor, num_classes: int, enumerate_max: int = 0):
+    def __init__(self, token_class: torch.Tensor, num_classes: int, enumerate_max: int = 0,
+                 host: Optional[np.ndarray] = None):
         self.token_class = token_class.to(torch.int32).contiguous()
         self.num_classes = int(num_classes)
         self.enumerate_max = int(enumerate_max)
@@ -156,12 +158,12 @@ class TokenClasses:
         self.enumerated_token[self.token_class[single].long()] = single.to(torch.int32)
         self.enumerated_tokens = self.enumerated_token[self.enumerated_token >= 0].contiguous()   # in class order
         self._by_class = {}
-        self._host = None
+        self._host = None if host is None else host.astype(np.int32)    # (``host``: at hand, a wait for the device spared)
         self._class_tiles = {}
 
     def to(self, device) -> "TokenClasses":
         """The same classes on ``device`` (a new object: nothing derived is carried over)."""
-        return TokenClasses(self.token_class.to(device), self.num_classes, self.enumerate_max)
+        return TokenClasses(self.token_class.to(device), self.num_classes, self.enumerate_max, self._host)
 
     def host(self) -> np.ndarray:
         """``token_class`` on the host (int32), copied on first use."""
@@ -184,21 +186,39 @@ class TokenClasses:
         stored classes' tokens alone (scoring: an enumerated class's token is scored on its own, no tile of one)."""
         found = self._class_tiles.get((width, stored))
         if found is None:
-            tc = self.token_class.long()
-            dev = tc.device
-            order = torch.argsort(tc, stable = True)
-            if stored:
-                order = order[self.stored_class[order] >= 0]
-            cls = tc[order]
-            counts = torch.bincount(cls, minlength = self.num_classes)
-            tiles = (counts + width - 1) // width                               # per class
-            first_tile = torch.cumsum(tiles, 0) - tiles
-            first_token = torch.cumsum(counts, 0) - counts
-            tokens = torch.full((int(tiles.sum()) * width,), -1, dtype = torch.long, device = dev)
-            tokens[first_tile[cls] * width + torch.arange(order.numel(), device = dev) - first_token[cls]] = order
-            tile_class = torch.repeat_interleave(torch.arange(self.num_classes, device = dev), tiles)
-            found = self._class_tiles[(width, stored)] = (tokens.to(torch.int32), tile_class.to(torch.int32))
+            dev = self.token_class.device
+            tokens, tile_class = _class_tiles(self.host(), self.num_classes, self.enumerate_max if stored else 0, width)
+            found = self._class_tiles[(width, stored)] = (torch.from_numpy(tokens).to(dev), torch.from_numpy(tile_class).to(dev))
         return found
+
+
+@njit(cache = True)
+def _class_tiles(token_class, num_classes, enumerated, width):
+    """:meth:`TokenClasses.class_tiles`: the tokens in class order (a counting sort: by id within a class), the classes of
+    at most ``enumerated`` tokens left out."""
+    counts = np.zeros(num_classes, dtype = np.int64)
+    for c in token_class:
+        counts[c] += 1
+    place = np.empty(num_classes, dtype = np.int64)
+    total = 0
+    for c in range(num_classes):
+        if counts[c] <= enumerated:
+            counts[c] = 0
+        place[c] = total * width
+        total += (counts[c] + width - 1) // width
+    tokens = np.full(total * width, -1, dtype = np.int32)
+    tile_class = np.empty(total, dtype = np.int32)
+    for t in range(token_class.shape[0]):
+        c = token_class[t]
+        if counts[c] > 0:
+            tokens[place[c]] = t
+            place[c] += 1
+    at = 0
+    for c in range(num_classes):
+        for _ in range((counts[c] + width - 1) // width):
+            tile_class[at] = c
+            at += 1
+    return tokens, tile_class
 
 
 @dataclass(frozen = True)

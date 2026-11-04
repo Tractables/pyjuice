@@ -56,10 +56,11 @@ class CircuitRows:
 
     :ivar numbered: every node group and its first row, to check against the node group's record of it
     :ivar product_rows: per product layer, ``(out_rows [R], child_rows [R, k], boundaries [R, k + 1])`` int64
-    :ivar node_ivs: the intervals of every sum and product node group, each once
+    :ivar node_ivs: the intervals of every sum and product node group, each once, and ``node_ends`` those, int64
     :ivar sum_groups: per sum node group, in row order, ``(first row, end row, a, b)``, its interval ``[a, b)``;
         ``sum_rows`` int64 [groups, 2] their rows, ``sum_iv`` int64 [groups] their intervals' numbers in ``node_ivs``
-    :ivar product_groups: per product layer group, ``(first row, end row, intervals of its node groups, each once)``
+    :ivar product_groups: per product layer group, ``(first row, end row, intervals of its node groups, each once)``;
+        ``group_iv`` int64 their numbers in ``node_ivs``, a group's from ``group_ptr``
     :ivar input_range, root_rows: the rows of all input nodes, and of the roots
     """
 
@@ -113,6 +114,9 @@ class CircuitRows:
                 rows = [layer._layer_nid_range for layer in lg.layers]
                 self.product_groups.append((min(r[0] for r in rows), max(r[1] for r in rows),
                                             list({interval(ns): True for layer in lg.layers for ns in layer.nodes})))
+        self.node_ends = np.asarray(self.node_ivs, dtype = np.int64).reshape(-1, 2)
+        self.group_iv = np.asarray([number[iv] for _, _, ivs in self.product_groups for iv in ivs], dtype = np.int64)
+        self.group_ptr = np.cumsum([0] + [len(ivs) for _, _, ivs in self.product_groups], dtype = np.int64)
         ranges = [layer._output_ind_range for layer in pc.input_layer_group]
         self.input_range = (min(r[0] for r in ranges), max(r[1] for r in ranges))
         self.root_rows = tuple(pc._root_node_range)
@@ -631,6 +635,8 @@ class Assembly:
                 for e in parts:
                     triples.setdefault((e.entry, e.reads[1][1], e.exit), len(triples))
         self.triple_of, self.skip_triples = triples, list(triples)
+        t = np.asarray(self.skip_triples, dtype = np.int64).reshape(-1, 3)        # (as :func:`~..kernels.prod.skip_masks_for` reads them)
+        self.skip_table = np.stack([t[:, 0], t[:, 1], 0 * t[:, 0], t[:, 1], t[:, 2], 0 * t[:, 0]], axis = 1)
 
         # every input @ block / block @ input step's rank among its position's: which block of the boundary's masses
         # are its own (field 6, set here once)

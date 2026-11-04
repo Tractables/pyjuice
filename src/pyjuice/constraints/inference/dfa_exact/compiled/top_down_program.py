@@ -81,7 +81,7 @@ def top_down_program(backend) -> TopDownProgram:
                              most_in_runs(prog.all_iv_slots[t.child_iv], ptr)], axis = 1).ravel().tolist()
     prog.cw_most = most_in_runs(prog.exits[t.cw_bound], t.cw_ptr).tolist()
     prog.td_slots = most_in_runs(np.asarray(prog.slots, dtype = np.int64)[t.group_reg], t.group_ptr).tolist()
-    return TopDownProgram(steps = t.steps, skip = skip_masks_for(prog.reach, t.specs, device = prog.dev), dead = t.dead,
+    return TopDownProgram(steps = t.steps, skip = skip_masks_for(prog.reach, t.spec_table, device = prog.dev), dead = t.dead,
                           dead_region = t.dead_region, iv_bounds = t.iv_bounds, reg_iv = t.reg_iv,
                           elem_regions = t.elem_regions, shared = t.shared)
 
@@ -113,7 +113,7 @@ class _Template(NamedTuple):
     group's sum regions (its ``number``)."""
 
     steps: list
-    specs: list
+    spec_table: np.ndarray
     dead: np.ndarray
     dead_region: np.ndarray
     iv_bounds: np.ndarray
@@ -329,7 +329,7 @@ def top_down_template(backend, prog) -> _Template:
     dead_region = np.zeros(len(backend.sum_regions), dtype = bool)
     dead_region[dead[:, 1]] = True
     region_iv = prog.iv_bounds[prog.reg_iv_np]
-    return _Template(steps, specs, dead, dead_region, iv_bounds, iv_index(region_iv[:, 0], region_iv[:, 1]),
+    return _Template(steps, np.asarray(specs, dtype = np.int64).reshape(len(specs), 6), dead, dead_region, iv_bounds, iv_index(region_iv[:, 0], region_iv[:, 1]),
                      [(first, end) for first, end, _ in backend.element_regions], {}, joined(0), joined(1), child_iv, child_ptr,
                      int64([np.asarray(b, dtype = np.int64) for b in cw_bounds]),
                      np.cumsum([0] + [len(b) for b in cw_bounds], dtype = np.int64), int64(group_regs),

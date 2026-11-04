@@ -86,20 +86,21 @@ def advance(bits: torch.Tensor, t: int, next_width: int, tables: SweepTables) ->
     return out
 
 
-def stack_bits(bits: list, columns: np.ndarray, most_columns: int, entries: int) -> torch.Tensor:
-    """int32 [sweeps, ``most_columns``, words of ``entries``]: the sweeps' bits (int32 [``columns[k]``, their words]) one
-    above the other, zeros past their columns and words, in a few device calls."""
-    dev = bits[0].device
+def stack_bits(swept: list, most_columns: int, entries: int) -> torch.Tensor:
+    """int32 [sweeps, ``most_columns``, words of ``entries``]: the bits of ``swept``, ``(table, first word, words)``: of
+    every sweep the ``words`` of ``table`` [its columns, ...] from its first, one above the other, zeros past their columns
+    and words -- a few device calls a table."""
+    dev = swept[0][0].device
     words = max(host_cdiv(entries, 32), 1)
-    own = np.asarray([b.size(1) for b in bits], dtype = np.int64)
-    if (columns == most_columns).all() and (own == words).all():
-        return torch.stack(bits)
-    out = torch.zeros(len(bits), most_columns, words, dtype = torch.int32, device = dev)
-    sizes = columns * own
-    sweep = np.repeat(np.arange(len(bits)), sizes)                   # every word's sweep, and its place in the sweep's
-    place = np.arange(sweep.size) - np.repeat(np.cumsum(sizes) - sizes, sizes)
-    at = sweep * (most_columns * words) + (place // own[sweep]) * words + place % own[sweep]
-    out.view(-1)[torch.from_numpy(at).to(dev)] = torch.cat([b.view(-1) for b in bits])
+    out = torch.zeros(len(swept), most_columns, words, dtype = torch.int32, device = dev)
+    tables = {}
+    for k, (table, first, own) in enumerate(swept):
+        tables.setdefault((id(table), own), (table, own, [], []))
+        tables[id(table), own][2].append(k)
+        tables[id(table), own][3].append(first)
+    for table, own, ks, firsts in tables.values():
+        at = np.asarray(firsts, dtype = np.int64)[:, None] + np.arange(own, dtype = np.int64)[None, :]
+        out[torch.tensor(ks, device = dev), :table.size(0), :own] = table[:, torch.from_numpy(at).to(dev)].transpose(0, 1)
     return out
 
 

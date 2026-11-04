@@ -79,7 +79,7 @@ class DFAExactBackend(Backend):
             small = int(((sizes > 0) & (sizes <= ENUMERATE_MAX_TOKENS)).sum())
             enumerate_max = ENUMERATE_MAX_TOKENS if small >= ENUMERATE_MIN_FRACTION * automaton.num_classes else 0
             token_classes = distributions.TokenClasses(layout.token_class.to(self.device), automaton.num_classes,
-                                                       enumerate_max)
+                                                       enumerate_max, host = layout.token_class.numpy())
         self.token_classes = token_classes
         self.columns_per_sample = tables["columns_per_sample"]
         self.product_rows = tables["product_rows"]

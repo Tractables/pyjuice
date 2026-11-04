@@ -346,3 +346,11 @@ def most_in_runs(values: np.ndarray, ptr: np.ndarray, floor: int = 0) -> np.ndar
     if some.any():
         out[some] = np.maximum(np.maximum.reduceat(values, ptr[:-1][some]), floor)
     return out
+
+
+def available_memory(dev: torch.device) -> int:
+    """The bytes this process can still take on a GPU: its free memory and the blocks the caching allocator holds unused
+    (read in one call: :func:`torch.cuda.memory_stats` flattens every statistic, a millisecond on the host)."""
+    stats = torch.cuda.memory_stats_as_nested_dict(dev)
+    held = stats["reserved_bytes"]["all"]["current"] - stats["allocated_bytes"]["all"]["current"] if stats else 0
+    return torch.cuda.mem_get_info(dev)[0] + held

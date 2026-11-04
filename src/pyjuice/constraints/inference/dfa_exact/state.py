@@ -35,6 +35,7 @@ from pyjuice.utils.fast_inference import bf16_params_allowed, is_active, param_c
 
 from ...distributions import lookup
 from .compiled.tables import ALIGN, _align, buffer_layout
+from .kernels.common import available_memory
 
 
 @dataclass(eq = False)
@@ -243,7 +244,7 @@ class PriorPool:
             budget = self.budget
         else:                                          # the memory this process can take: the device's free memory
             if dev.type == "cuda":                     # and the blocks its caching allocator holds unused
-                free = torch.cuda.mem_get_info(dev)[0] + torch.cuda.memory_reserved(dev) - torch.cuda.memory_allocated(dev)
+                free = available_memory(dev)
             else:
                 free = full * 4
             budget = full * 4 if full * 4 <= free else int(PRIOR_MEMORY_SHARE * free)

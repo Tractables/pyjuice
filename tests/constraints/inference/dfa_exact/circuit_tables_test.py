@@ -232,12 +232,20 @@ def test_reachability_on_the_device_is_the_hosts(seed, tile):
         got, want = skip_masks(device, specs, device = torch.device("cuda")), skip_masks(host, specs, device = torch.device("cuda"))
         assert (got.tiles_i, got.tiles_j, got.words) == (want.tiles_i, want.tiles_j, want.words)
         assert torch.equal(got.bits, want.bits)
-    got, want = (interval_tables(r, intervals, torch.device("cuda")) for r in (device, host))
+    assert_interval_tables_read_alike(device, host, intervals)
+
+
+def assert_interval_tables_read_alike(one, other, intervals):
+    """The :class:`IntervalTables` of two :class:`Reachability`s, as the kernels read them: an interval's slots, its
+    positions and its slots' pairs, wherever they are in the table."""
+    got, want = (interval_tables(r, intervals, torch.device("cuda")) for r in (one, other))
     assert torch.equal(got.of, want.of)
-    for (S, at, ap), (S2, at2, ap2) in zip(got.info.tolist(), want.info.tolist()):
-        assert S == S2 and (at < 0) == (at2 < 0)
+    for (a, b), (S, at, ap), (S2, at2, ap2) in zip(intervals, got.info.tolist(), want.info.tolist()):
+        assert S == S2 and (at < 0) == (at2 < 0), (a, b)
         if at >= 0:
-            assert torch.equal(got.table[at:ap + S], want.table[at2:ap2 + S2])
+            size = one.width[a] * one.exit_width(b)
+            assert torch.equal(got.table[at:at + size], want.table[at2:at2 + size]), (a, b)
+            assert torch.equal(got.table[ap:ap + S], want.table[ap2:ap2 + S2]), (a, b)
 
 
 @pytest.mark.parametrize("seed", range(4))
@@ -277,13 +285,7 @@ def test_intervals_prepared_together_are_those_swept_alone(seed, tile, budget, m
         got, want = (skip_masks_for(r, specs, device = torch.device("cuda")) for r in (together, alone))
         assert (got.tiles_i, got.tiles_j, got.words) == (want.tiles_i, want.tiles_j, want.words)
         assert torch.equal(got.bits, want.bits)
-    intervals = [(a, b) for a, b in pairs if b > a]
-    got, want = (interval_tables(r, intervals, torch.device("cuda")) for r in (together, alone))
-    assert torch.equal(got.of, want.of)
-    for (S, at, ap), (S2, at2, ap2) in zip(got.info.tolist(), want.info.tolist()):
-        assert S == S2 and (at < 0) == (at2 < 0)
-        if at >= 0:
-            assert torch.equal(got.table[at:ap + S], want.table[at2:ap2 + S2])
+    assert_interval_tables_read_alike(together, alone, [(a, b) for a, b in pairs if b > a])
 
 
 def test_alike_intervals_share_their_positions():
