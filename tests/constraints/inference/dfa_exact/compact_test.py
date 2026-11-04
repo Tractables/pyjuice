@@ -74,6 +74,109 @@ def test_rectangles_ranks_and_rows(kind, build_pc):
     assert mars["lanes"] == int(lanes[inside].max(initial = 0))
 
 
+def _reference_layout(total, regions, inside, reg_iv, reg_rows, pad, slots, elem_rows, align, base):
+    """compact_layout's host arrays as numpy computes them (the layout's helpers before `_layout_host`)."""
+    aligned = lambda x: (np.asarray(x, dtype = np.int64) + align - 1) // align * align
+    lanes = total[reg_iv]
+
+    def of(keep):
+        width = np.where(keep, aligned(lanes), 0)
+        offset = np.zeros(len(width), dtype = np.int64)
+        np.cumsum((reg_rows * width)[:-1], out = offset[1:])
+        ivs = np.zeros(len(total), dtype = bool)
+        ivs[reg_iv[keep]] = True
+        group = np.where(np.append(ivs, False)[pad], np.append(total, 0)[pad], 0).max(axis = 1)
+        widths = aligned(np.maximum(group, slots))
+        return (width, offset, ivs, widths, int((elem_rows * widths).max(initial = 0)), int((reg_rows * width).sum()),
+                int(lanes[keep].max(initial = 0)))
+
+    return lanes, of(regions), of(inside) if inside is not None else None
+
+
+@pytest.mark.parametrize("seed", range(6))
+def test_the_layouts_host_arrays_are_numpys(seed):
+    """`_layout_host` (numba) gives the arrays and sizes numpy's formulas give -- every region's rows' width and place,
+    its intervals, every product group's width, the sizes and most lanes, of the top-down values and (``mars``) the
+    inside ones after the input rows -- and the device's arrays in one buffer, 16 bytes apart; odd and even numbers of
+    regions, some regions or none kept, groups padded past the last interval."""
+    from pyjuice.constraints.inference.dfa_exact.kernels.compact import _layout_host
+    rng = np.random.default_rng(seed)
+    K, R, G, P = int(rng.integers(1, 40)), int(rng.integers(1, 30)), int(rng.integers(1, 8)), int(rng.integers(1, 6))
+    total = rng.integers(0, 300, K).astype(np.int64)
+    reg_iv = rng.integers(0, K, R).astype(np.int64)
+    reg_rows = rng.integers(1, 64, R).astype(np.int64)
+    pad = rng.integers(0, K + 1, (G, P)).astype(np.int64)                # (K: padding, an interval without lanes)
+    slots, elem_rows = rng.integers(0, 100, G).astype(np.int64), rng.integers(1, 32, G).astype(np.int64)
+    for regions, inside in ((rng.random(R) < 0.5, rng.random(R) < 0.5), (np.zeros(R, bool), None),
+                            (np.ones(R, bool), np.zeros(R, bool))):
+        base = int(rng.integers(0, 100)) * 16
+        mars = inside is not None
+        got = _layout_host(total, regions, inside if mars else regions, mars, reg_iv, reg_rows, pad, slots, elem_rows,
+                           16, base)
+        lanes, want, want_m = _reference_layout(total, regions, inside, reg_iv, reg_rows, pad, slots, elem_rows, 16,
+                                                base)
+        buf, step = got[0], got[1]
+        assert step % 2 == 0 and step >= R and buf.size == (5 if mars else 3) * step
+        assert np.array_equal(got[2], lanes)
+        for g, w in zip(got[3:10], want):
+            assert np.array_equal(np.asarray(g), np.asarray(w)), (g, w)
+        rows = [want[1], want[0], lanes]
+        if mars:
+            m_width, m_offset, m_ivs, m_groups, m_size_e, m_size, m_most = want_m
+            assert np.array_equal(got[10], m_width) and np.array_equal(got[11], base + m_offset)
+            assert np.array_equal(got[12], m_ivs) and np.array_equal(got[13], m_groups)
+            assert (got[14], got[15], got[16]) == (m_size_e, base + m_size, m_most)
+            rows += [base + m_offset, m_width]
+        for i, a in enumerate(rows):
+            assert np.array_equal(buf[i * step:i * step + R], a) and not buf[i * step + R:(i + 1) * step].any()
+
+
+@pytest.mark.parametrize("seed", range(6))
+def test_the_regathers_host_arrays_are_numpys(seed):
+    """The regathers' host work (numba) is numpy's formulas: `_regather_table`'s table -- a row per region of the
+    regions (rows' old place and width, new place and width, rows, interval and its ends) -- and its most lanes and
+    rows, `_region_floats`' floats of the regions' rows and of every region's, and `_largest_gap`'s longest stretch of
+    a storage holding none of the regions' rows (rows packed in any order, gaps 16 bytes aligned, the first of the
+    longest), or none; some regions, none, or all."""
+    from pyjuice.constraints.inference.dfa_exact.kernels.compact import _largest_gap, _regather_table, _region_floats
+    rng = np.random.default_rng(seed)
+    K, R = int(rng.integers(1, 40)), int(rng.integers(1, 30))
+    total = rng.integers(0, 300, K).astype(np.int64)
+    iv_ends = np.sort(rng.integers(0, 100, (K, 2)), axis = 1).astype(np.int64)
+    reg_iv = rng.integers(0, K, R).astype(np.int64)
+    reg_rows = rng.integers(1, 64, R).astype(np.int64)
+    old_offset, old_width, dst, new_width = (rng.integers(0, 1 << 20, R).astype(np.int64) for _ in range(4))
+    for regions in (rng.random(R) < 0.5, np.zeros(R, bool), np.ones(R, bool)):
+        regs = np.nonzero(regions)[0]
+        table, lanes, most = _regather_table(regions, old_offset, old_width, dst, new_width, reg_rows, reg_iv, iv_ends,
+                                             total)
+        k = reg_iv[regs]
+        want = np.stack([old_offset[regs], old_width[regs], dst[regs], new_width[regs], reg_rows[regs], k,
+                         iv_ends[k, 0], iv_ends[k, 1]], axis = 1)
+        assert table.dtype == np.int64 and np.array_equal(table, want.reshape(-1, 8))
+        assert lanes == (int(total[k].max()) if regs.size else 0) and most == (int(reg_rows[regs].max()) if regs.size
+                                                                                 else 0)
+        sizes = reg_rows[regs] * new_width[regs]
+        assert _region_floats(regions, reg_rows, new_width) == (int(sizes.sum()), int((reg_rows * new_width).sum()))
+        width = rng.integers(1, 9, R).astype(np.int64)                      # rows packed in a random order, apart
+        offset = np.zeros(R, dtype = np.int64)
+        at = int(rng.integers(0, 40))
+        for r in rng.permutation(R):
+            offset[r] = at
+            at += int(reg_rows[r] * width[r]) + int(rng.integers(0, 60)) * int(rng.random() < 0.6)
+        for numel in (at + int(rng.integers(0, 200)), at):
+            lo = offset[regs]
+            order = np.argsort(lo)
+            lo, hi = lo[order], (lo + reg_rows[regs] * width[regs])[order]
+            starts = -(-np.concatenate([[0], hi]) // 4) * 4
+            ends = np.concatenate([lo, [numel]])
+            j = int(np.argmax(ends - starts))
+            start, end = _largest_gap(regions, offset, width, reg_rows, numel)
+            assert (end > start) == (ends[j] > starts[j])
+            if end > start:
+                assert (start, end) == (int(starts[j]), int(ends[j]))
+
+
 @pytest.mark.parametrize("kind", list(KINDS))
 def test_every_product_groups_intervals_in_one_table(kind, build_pc):
     """The Program's table of the product groups' intervals: a row per group, its products' intervals, then padding one

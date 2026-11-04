@@ -5,6 +5,8 @@ import triton.language as tl
 import os
 from typing import Optional, Any
 
+from pyjuice.utils.transpose import transposed_rows
+
 from .distributions import Distribution
 
 from .softevi.backward import _condition_apply_bk_params_kernel, _condition_apply_bk_softevi_kernel, \
@@ -22,6 +24,7 @@ from .softevi.forward import _condition_apply_fw_gemm, _condition_apply_fw_kerne
                              _prep_args_apply_fw_kernel, _prep_args_apply_fw_w_value_mask_kernel, \
                              _prep_args_fw_cuda_kernel
 from .softevi.kernels import _KernelsMixin
+from .softevi.prologue import _DensePrologueDispatch
 
 
 class SoftEvidenceCategorical(_KernelsMixin, Distribution):
@@ -93,7 +96,7 @@ class SoftEvidenceCategorical(_KernelsMixin, Distribution):
             # Dense top-k denominator path (dedicated kernels; mutually exclusive with the scattered
             # `bk_softevi_kernel` above, which stays the fallback for every other case). Order matters:
             # the prologue writes the ratio scratch that the denominator kernel reads.
-            (self.bk_dense_prologue_kernel, _condition_bk_dense_prologue, _prep_args_bk_dense_prologue),
+            (_DensePrologueDispatch(), _condition_bk_dense_prologue, _prep_args_bk_dense_prologue),
             (self._dense_denom_dispatch, _condition_bk_dense_denom, _prep_args_bk_dense_denom),
             # Last: only fires when the caller's evidence gradient is not float32 (see `_grad_scratch`).
             (_GradCastEpilogue(), _condition_grad_cast, _prep_args_grad_cast)
@@ -222,7 +225,9 @@ class SoftEvidenceCategorical(_KernelsMixin, Distribution):
         if int(rows.max()) >= num_rows:
             return None
 
-        return params.detach().view(num_rows, num_cats).t().contiguous()
+        table = params.detach().view(num_rows, num_cats)
+        out = torch.empty(num_cats, num_rows, dtype = table.dtype, device = table.device)
+        return transposed_rows(table, out)                  # (the same values as `.t().contiguous()`, twice as fast)
 
     def preprocess_fw_kwargs(self, layer, kwargs):
         """

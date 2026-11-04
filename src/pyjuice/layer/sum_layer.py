@@ -1,7 +1,9 @@
 
 from __future__ import annotations
 
+import contextlib
 import os
+import numpy as np
 import torch
 import torch.nn as nn
 import triton
@@ -18,6 +20,7 @@ from typing import Sequence, List, Optional, Tuple
 from pyjuice.nodes import SumNodes
 from pyjuice.utils.parameter_list import FastParamList
 from pyjuice.utils.util import host_cdiv, host_next_power_of_2
+from pyjuice.utils.launch_plans import LaunchPlans
 from .kernels import sum_forward_block_sparse as fw_bsparse
 from .kernels import sum_forward_block_sparse_fused as fw_fused
 from .kernels import sum_forward_sparse as fw_sparse
@@ -94,6 +97,8 @@ FORWARD_SUM_TUNED = True
 # unsupported layer shape, it transparently falls back to the Triton kernel. Set False to disable.
 FORWARD_SUM_CUDA = True
 from .kernels import c as cuda_kernels
+from . import deferred_par
+from .fused_children import form_elements, scatter_flows
 
 # Node-tile sizes for the small-batch (batch < 16) block-sparse path. At tiny batch the GPU is
 # filled by splitting the *node* dimension into many tiles (the batch dimension is too short to
@@ -132,10 +137,14 @@ _BLOCK_SPARSE_EDGE_TRIM = os.environ.get("PYJUICE_EDGE_TRIM", "1") != "0"
 
 # Precision of a circuit's sum layers (`TensorCircuit.precision`). Forward: "auto" is the fastest per layer --
 # bf16 products in the block-sparse kernels from batch 16 (~4e-3 in the log-likelihood of a 4096-latent HMM
-# layer), TF32 on dense layers that take cuBLAS (below); "tf32" never uses bf16 (round-to-nearest TF32 in the
+# layer), TF32 on dense layers that take cuBLAS (below) -- but not on those whose fp32 parameters several layers
+# share: those read a bf16 copy, `TensorCircuit._param_operands`, in the block-sparse kernels' bf16 products;
+# "tf32" never uses bf16 (round-to-nearest TF32 in the
 # Triton kernels, TF32 cuBLAS; ~5e-4); "fp32" gives fp32-level products (`tf32x3` in the Triton tlmm kernel,
 # exact fp32 cuBLAS; ~1e-6). Batches below 16 run fp32 kernels in every mode. Backward: "auto" and "tf32" keep
-# the round-to-nearest TF32 products; "fp32" takes `tf32x3` products (fp32-level, on tensor cores).
+# the round-to-nearest TF32 products -- under "auto" the element flows of the layers reading the bf16 copy have
+# the stream kernel among their arms, on the copy (bf16 products, as on bf16-stored parameters; `SumLayer.backward`'s
+# `op_params`); "fp32" takes `tf32x3` products (fp32-level, on tensor cores).
 PRECISIONS = ("auto", "tf32", "fp32")
 
 
@@ -229,6 +238,43 @@ def _sm_count(device) -> int:
     return n
 
 
+def _merge_ranges(r: np.ndarray) -> np.ndarray:
+    """Sorted disjoint `[start, end)` ranges (int64 [n, 2]) covering the union of `r`'s (adjacent ones joined)."""
+    if r.shape[0] == 0:
+        return np.zeros((0, 2), dtype = np.int64)
+    r = r[np.argsort(r[:, 0], kind = "stable")]
+    out = [list(r[0])]
+    for s, e in r[1:]:
+        if s <= out[-1][1]:
+            out[-1][1] = max(out[-1][1], e)
+        else:
+            out.append([s, e])
+    return np.asarray(out, dtype = np.int64)
+
+
+def _ranges_overlap(a: np.ndarray, b: np.ndarray) -> bool:
+    """Whether two sorted disjoint range sets share a slot."""
+    if a.shape[0] == 0 or b.shape[0] == 0:
+        return False
+    # a range of `a` holding b's start, or an `a` start inside a `b` range
+    i = np.searchsorted(a[:, 0], b[:, 0], side = "right") - 1
+    if bool(np.any((i >= 0) & (a[np.maximum(i, 0), 1] > b[:, 0]))):
+        return True
+    return bool(np.any(np.searchsorted(a[:, 0], b[:, 1], side = "left") > np.searchsorted(a[:, 0], b[:, 0], side = "right")))
+
+
+def _ranges_complement(a: np.ndarray, n: int):
+    """The `[start, end)` gaps of sorted disjoint ranges `a` within `[0, n)`, as a list of pairs."""
+    out, pos = [], 0
+    for s, e in a.tolist():
+        if s > pos:
+            out.append((pos, s))
+        pos = max(pos, e)
+    if pos < n:
+        out.append((pos, n))
+    return out
+
+
 class SumLayer(Layer, nn.Module):
 
     BLOCK_SPARSE = 0
@@ -298,8 +344,9 @@ class SumLayer(Layer, nn.Module):
 
         # nids:      List[[partition_size]]                      stores node block ids
         # cids:      List[[partition_size, partition_max_n_chs]] stores indices of child node blocks
-        # pids:      List[[partition_size, partition_max_n_chs]] stores indices of edge parameters (1st parameter of every block)
-        # pfids:     List[[partition_size, partition_max_n_chs]] stores indices of edge parameter flows (1st parameter flow of every block)
+        # pids:      List[[partition_size, partition_max_n_chs]] stores indices of edge parameters (1st parameter of
+        # every block) pfids:     List[[partition_size, partition_max_n_chs]] stores indices of edge parameter flows
+        # (1st parameter flow of every block)
         nids, cids, pids, pfids, layer_pid_end, layer_pfid_end = sum_layer_forward_compilation(
             self.nodes, fw_partition_max_chs, fw_n_partition_ids, fw_n_id_in_partition, 
             fw_num_ngs_in_partition, n_chs, global_nid_start, global_pid_start, global_pfid_start, node2tiednodes,
@@ -325,9 +372,18 @@ class SumLayer(Layer, nn.Module):
         # where sb_ebase/sb_pbase are the per-node-block first child / first param and sb_ok records
         # whether the layer's children are GLOBALLY contiguous + params block_size-strided.
         self._cached_fw_sb = dict()
+        self._cached_fw_sb_scratch = dict()           # the tensor-core small-batch forward's partials, per signature
+        self._cached_bk_ele_mma = dict()              # the tensor-core small-batch element backward's 64-parent tables
+        self._cached_bk_ele_mma_scratch = dict()      # ... and its partials, per signature
+        # Below fp32 only: whether the CUDA kernels' 8-parameter loads are aligned for this layer's parameter bases,
+        # per (kind, signature) -- see `_cuda_param_loads_aligned`. Never consulted at fp32.
+        self._cached_param_align8 = dict()
         # Per partition: its plan on the dense cuBLAS path, or None where that path does not take it (see
         # `_dense_blocks`).
         self._cached_fw_dense = dict()
+        # The settled forward (`forward`'s fast path): per (batch size, params dtype, precision) of a plain call, every
+        # partition's tuned CUDA tlmm launch -- its tuner key and choice, its tables -- recorded by the full dispatch
+        self._fw_fast = dict()
 
         # Layer info
         self._layer_nid_range = (layer_nid_start, layer_nid_start + self.num_nodes)
@@ -381,8 +437,9 @@ class SumLayer(Layer, nn.Module):
                 min_n_pars = max_n_pars + 1
 
             # chids:      List[[partition_num_chs]]                         stores child block ids
-            # parids:     List[[partition_num_chs, partition_max_n_pargs]]  stores parent node blocks' ids for each child node
-            # parpids:    List[[partition_num_chs, partition_max_n_pargs]]  param id for the edges to parent (correspond to `parids`)
+            # parids:     List[[partition_num_chs, partition_max_n_pargs]]  stores parent node blocks' ids for each
+            # child node parpids:    List[[partition_num_chs, partition_max_n_pargs]]  param id for the edges to parent
+            # (correspond to `parids`)
             curr_chids, curr_parids, curr_parpids = sum_layer_backward_compilation(
                 nodes = ch_gsize2cs[ch_gsize], 
                 cs2parns = cs2parns,
@@ -413,6 +470,7 @@ class SumLayer(Layer, nn.Module):
         # Optional CUDA ele-backward fast path: per-signature (ebase, pbase, cuda_ok), per-(signature,
         # batch) autotuned choice, and a reused scratch output buffer for corruption-safe autotuning.
         self._cached_bk_ele_cuda = dict()
+        self._cached_bk_ele_pre = dict()
         self._cached_bk_ele_choice = dict()
         self._cached_bk_ele_sb = dict()
         self._bk_ele_scratch = None
@@ -459,12 +517,38 @@ class SumLayer(Layer, nn.Module):
         """Forget the tensors derived from the layer's tables (index tables, CUDA operands, scratch buffers), to be
         rebuilt on the tables' device by the next pass: after the tables moved, those would point at the old device.
         What the caches keep of the host only (tuning choices, dense plans) stays."""
-        for cache in (self._cached_fw_pcids, self._cached_fw_cuda, self._cached_fw_sb, self._cached_bk_parids,
-                      self._cached_bk_ele_cuda, self._cached_bk_ele_sb, self._cached_bk_par_cuda,
-                      self._cached_bk_par_trim):
+        for cache in (self._cached_fw_pcids, self._cached_fw_cuda, self._cached_fw_sb, self._cached_fw_sb_scratch,
+                      self._cached_bk_ele_mma, self._cached_bk_ele_mma_scratch,
+                      self._cached_bk_parids,
+                      self._cached_bk_ele_cuda, self._cached_bk_ele_pre, self._cached_bk_ele_sb, self._cached_bk_par_cuda,
+                      self._cached_bk_par_trim, self._cached_param_align8, self._fw_fast,
+                      self.__dict__.setdefault("_cached_tile_index", {}),
+                      self.__dict__.setdefault("_stream_fusion_plans", {}),
+                      self.__dict__.setdefault("_bk_stream_parts", {}), self.__dict__.setdefault("_bk_par_deferred", {}),
+                      self.__dict__.setdefault("_bk_fusion_ready_", {})):
             cache.clear()
+        LaunchPlans.of(self).clear()
         self._bk_ele_scratch = None
         self._bk_par_scratch = None
+        self.__dict__.pop("_element_rows_", None)
+
+    def _cuda_param_loads_aligned(self, params: torch.Tensor, key, pbase: torch.Tensor, row_stride: int) -> bool:
+        """Whether the CUDA kernels' 8-parameter loads (`c/param_load.cuh`) are aligned for parameters stored as
+        `params` are. At fp32 they are two 16-byte loads of 4 floats -- the layout the kernels always assumed -- and
+        this is True without a look. Below fp32 they are ONE 16-byte load of 8 values, so every base offset in `pbase`
+        and `row_stride` (the kernel's step between the parameter rows it loads) must be multiples of 8. `compilation`
+        packs the nodes' parameter ranges without padding, so a sum node whose parameter count is 4 mod 8 ahead of this
+        layer breaks that (MEASURED: CUDA "misaligned address" on bf16 parameters where fp32 ran). Checked once per
+        `key` -- a device sync, on the first pass below fp32 -- and kept; during a CUDA graph capture an unchecked key
+        takes the Triton kernel instead (uncached)."""
+        if params.dtype == torch.float32:
+            return True
+        ok = self._cached_param_align8.get(key)
+        if ok is None:
+            if torch.cuda.is_current_stream_capturing():
+                return False
+            ok = self._cached_param_align8[key] = (row_stride % 8 == 0) and bool((pbase % 8 == 0).all())
+        return ok
 
     @property
     def num_parameters(self):
@@ -481,6 +565,7 @@ class SumLayer(Layer, nn.Module):
     def forward(self, node_mars: torch.Tensor, element_mars: torch.Tensor, params: torch.Tensor,
                 propagation_alg: str = "LL", pflow_temperature: float = 1.0, precision: str = "auto",
                 partition_runs: Optional[Sequence] = None, compute_children: Optional[Tuple[torch.Tensor, int]] = None,
+                op_params: Optional[torch.Tensor] = None, stream_children: Optional[Tuple[torch.Tensor, int]] = None,
                 **kwargs) -> None:
         """
         Computes the forward pass of a sum layer.
@@ -500,29 +585,211 @@ class SumLayer(Layer, nn.Module):
                           values may be stale, and every partition forms them itself from `node_mars` (the fused
                           kernel of the `tlmm` regime; nothing is written to `element_mars`). Only for a layer whose
                           every partition `fuses_children` at this batch; another raises.
+        `op_params`:      None, or the circuit's bf16 copy of fp32 parameters shared by several layers
+                          (`TensorCircuit._param_operands`), every parameter this layer reads among them: taken by the
+                          layer the circuit marked so (`_reads_param_operands`) for its CUDA kernels whose products are
+                          bf16 -- the `tlmm` kernels and the small-batch tensor-core one, which round the parameters to
+                          bf16 anyway (the same bits, half the bytes), and the stream kernel, which reads bf16
+                          parameters only and joins them --; the dense cuBLAS path is then left out, and the fp32
+                          kernels read `params`.
+        `stream_children`: None, or the product layer group below's `(table, first_row)` (as `compute_children`), whose
+                          forward the caller did not run: where `_stream_fusion` gives a plan for the call (a plain one
+                          whose settled launch is the stream forward), every partition runs it with the product layer
+                          fused into its pre-pass (`tlmm_forward_sum_stream_fused.cu`: the children's values formed
+                          from their two child node values, the same bits as the product layer's forward and the
+                          stream kernel); else the product layer's values are formed into `element_mars`
+                          (`fused_children.form_elements`, the same bits) and the forward runs as without it. (The
+                          circuit's passes: `TensorCircuit._stream_fusion_groups`.)
         """
-        assert not (propagation_alg != "LL" and abs(pflow_temperature - 1.0) > 1e-6), "`pflow_temperature` can only be 1 if `propagation_alg` is not 'LL'."
+        op = op_params if op_params is not None and self.__dict__.get("_reads_param_operands", False) else None
+
+        # A plain call -- LL, no tempering, whole partitions, nothing else passed -- whose every partition the full
+        # dispatch below sent to a tuned CUDA tlmm kernel launches those kernels straight away (`_fw_fast_launch`, which
+        # checks first that the CUDA kernels are still on and each choice is still the tuner's). MEASURED, host time of
+        # an HMM-1024 layer at B 64: the dispatch's checks, tables and keys 5.7 of its 10.6 us.
+        fast_key = None
+        plain = (propagation_alg == "LL" and pflow_temperature == 1.0 and partition_runs is None
+                 and compute_children is None and not kwargs and node_mars.is_cuda)
+        if plain:
+            fast_key = (node_mars.size(1), params.dtype, precision, op is not None)
+        if stream_children is not None:
+            fused = SumLayer._stream_fusion(self, fast_key, stream_children) if plain else None
+            if fused is not None:
+                p, batch_size = (params if op is None else op), node_mars.size(1)
+                for cbase, (_, (_, c), nids, _, pbase, knt, groups) in fused:
+                    cuda_kernels.tlmm_forward_sum_stream_fused(node_mars, cbase, p, nids, pbase, groups, batch_size,
+                                                               self.block_size, knt, c)
+                return None
+            # (no fused forward for this call -- not a plain one, or none planned for its shape: the product layer's
+            # values formed here as its forward forms them, and the forward as without it)
+            form_elements(element_mars, node_mars, stream_children)
+        if plain:
+            fast = self._fw_fast.get(fast_key)
+            if fast is not None and self._fw_fast_launch(fast, node_mars, element_mars, params if op is None else op):
+                return None
+
+        assert not (propagation_alg != "LL" and abs(pflow_temperature - 1.0) > 1e-6), \
+            "`pflow_temperature` can only be 1 if `propagation_alg` is not 'LL'."
         if precision not in PRECISIONS:
             raise ValueError(f"`precision` must be one of {PRECISIONS}, got {precision!r}.")
         if "force_use_bf16" in kwargs or "force_use_fp32" in kwargs:      # the shim only when needed: hot path
             _pop_removed_precision_flags(kwargs)
 
-        for partition_id in range(self.num_fw_partitions):
-            runs = None if partition_runs is None else partition_runs[partition_id]
-            if runs is not None and len(runs) == 0:
-                continue
-            nids = self.partitioned_nids[partition_id]
-            cids = self.partitioned_cids[partition_id]
-            pids = self.partitioned_pids[partition_id]
+        # (a subclass overriding the dispatch below records nothing: its launches are not this class's to replay)
+        record = fast_key is not None and type(self)._forward is SumLayer._forward and \
+            type(self)._forward_block_sparse is SumLayer._forward_block_sparse
+        self.__dict__["_fw_recording"] = [] if record else None
+        try:
+            for partition_id in range(self.num_fw_partitions):
+                runs = None if partition_runs is None else partition_runs[partition_id]
+                if runs is not None and len(runs) == 0:
+                    continue
+                nids = self.partitioned_nids[partition_id]
+                cids = self.partitioned_cids[partition_id]
+                pids = self.partitioned_pids[partition_id]
 
-            self._forward(
-                node_mars, element_mars, params, nids, cids, pids, 
-                partition_id = partition_id, propagation_alg = propagation_alg, 
-                pflow_temperature = pflow_temperature, precision = precision, runs = runs,
-                children = compute_children, **kwargs
-            )
+                self._forward(
+                    node_mars, element_mars, params, nids, cids, pids,
+                    partition_id = partition_id, propagation_alg = propagation_alg,
+                    pflow_temperature = pflow_temperature, precision = precision, runs = runs,
+                    children = compute_children, **({} if op is None else dict(op_params = op)), **kwargs
+                )
+            recorded = self.__dict__["_fw_recording"]
+            if recorded is not None and len(recorded) == self.num_fw_partitions:
+                self._fw_fast[fast_key] = tuple(recorded)
+        finally:
+            self.__dict__["_fw_recording"] = None
 
         return None
+
+    def _fw_fast_launch(self, fast: tuple, node_mars: torch.Tensor, element_mars: torch.Tensor,
+                        params: torch.Tensor) -> bool:
+        """`forward`'s settled launch: every partition's recorded CUDA tlmm kernel, as the full dispatch launches it --
+        if the CUDA kernels are still on (`FORWARD_SUM_CUDA`) and every recorded choice is still what the tuner holds
+        for its key (a cleared or retuned cache: no); else nothing launched and False, the call then taking the full
+        dispatch, which records the entry anew. (What is tuned is shaped by which arms are available, the pre-pass
+        copy's
+        among them: a choice the tuner holds runs, here as there.)"""
+        if not FORWARD_SUM_CUDA:
+            return False
+        for key, choice, *_ in fast:
+            if autotune.cached(key) != choice:
+                return False
+        batch_size = node_mars.size(1)
+        for _, choice, nids, ebase, pbase, k_num_tiles, tiles in fast:
+            if choice[0] == "cuda_prepass":
+                cuda_kernels.tlmm_forward_sum_prepass(node_mars, element_mars, params, nids, tiles[0], tiles[1], pbase,
+                                                      batch_size, self.block_size, k_num_tiles, choice[1], tiles[2])
+            elif choice[0] == "cuda_stream":
+                cuda_kernels.tlmm_forward_sum_stream(node_mars, element_mars, params, nids, ebase, pbase, tiles,
+                                                     batch_size, self.block_size, k_num_tiles, choice[1])
+            else:
+                kernel = (cuda_kernels.tlmm_forward_sum if choice[0] == "cuda" else
+                          cuda_kernels.tlmm_forward_sum_pipelined)
+                kernel(node_mars, element_mars, params, nids, ebase, pbase, batch_size, self.block_size, k_num_tiles,
+                       choice[1])
+        return True
+
+    def _stream_fusion(self, fast_key: tuple, children: Tuple[torch.Tensor, int]) -> Optional[tuple]:
+        """The fused stream forward of this layer for a plain call of ``fast_key`` (`forward`'s) over the product layer
+        group below (``children``: its `(table, first_row)`, `pyjuice.layer.fused_children`), per partition
+        ``(cbase, record)`` -- or None where it does not apply (yet). It applies where the call's settled launch
+        (`_fw_fast`) runs the stream forward in every partition; the products have two children each; and every pre-pass
+        chunk of 32 element rows is either dummy rows (before the group's first row: -inf) or rows whose two children
+        are runs of 32 consecutive node rows -- ``cbase`` int32 [rows, knt, 2, 2] their first rows, -1 a dummy chunk.
+        Made once (one sync a partition) and kept with the table it was made from (another table -- a moved circuit's --
+        makes it anew), at the configs the settled launch held then: a pass that left the product layer's forward to it
+        has nothing to fall back to (a later retune of the plain forward's choice changes nothing here)."""
+        table, first_row = children
+        plans = self.__dict__.setdefault("_stream_fusion_plans", {})
+        hit = plans.get(fast_key)
+        if hit is not None and hit[0] is table:
+            return hit[1]
+        fast = self._fw_fast.get(fast_key)
+        if (fast is None or not FORWARD_SUM_CUDA or table.size(1) != 2 or
+                any(choice[0] != "cuda_stream" for _, choice, *_ in fast) or
+                not cuda_kernels.stream_fused_is_available()):
+            return None
+        out = []
+        for record in fast:
+            cbase = self._stream_fusion_cbase(record[3], table, first_row)
+            if cbase is None:
+                plans[fast_key] = (table, None)               # (the structure's: no fused forward for this table)
+                return None
+            out.append((cbase, record))
+        plans[fast_key] = (table, tuple(out))
+        return plans[fast_key][1]
+
+    def _stream_fusion_bk(self, batch_size: int, dtype: torch.dtype, op: bool, param_flows: bool) -> bool:
+        """Whether a backward of this layer at ``batch_size`` (its parameters' ``dtype``, given the bf16 copy or not:
+        ``op``; with parameter flows or not) can take `stream_children`: every backward partition's element flows
+        settled on the whole-partition stream kernel (recorded by the full dispatch: `_bk_stream_parts`), and with
+        parameter flows every forward partition's deferred (`_bk_par_deferred`), the fused modules available."""
+        parts = self.__dict__.get("_bk_stream_parts", {}).get((batch_size, dtype, op))
+        if not parts or not all(parts.get(pid) for pid in range(self.num_bk_partitions)):
+            return False
+        if param_flows:
+            deferred = self.__dict__.get("_bk_par_deferred", {})
+            if not all(deferred.get((batch_size, pid)) for pid in range(self.num_fw_partitions)):
+                return False
+            if cuda_kernels.get_par_deferred_fused_module() is None:
+                return False
+        return True
+
+    @staticmethod
+    def _stream_fusion_cbase(ebase: torch.Tensor, table: torch.Tensor, first_row: int) -> Optional[torch.Tensor]:
+        """`_stream_fusion`'s ``cbase`` for a partition's edge tiles (``ebase`` [rows, knt], a tile's first element row),
+        or None where a chunk of 32 element rows is neither all dummy rows nor rows of two runs of consecutive children."""
+        e0 = ebase.to(torch.int64)[:, :, None] + torch.tensor([0, 32], device = ebase.device)       # [rows, knt, 2]
+        rel = e0 - first_row
+        dummy = e0 + 31 < first_row
+        inside = (rel >= 0) & (rel + 31 < table.size(0))
+        if not bool((dummy | inside).all()):
+            return None
+        rows = rel.clamp(min = 0)[..., None] + torch.arange(32, device = ebase.device)               # [rows, knt, 2, 32]
+        rows = torch.where(dummy[..., None], 0, rows)
+        ch = table.to(torch.int64)[rows]                                                              # [.., 32, 2]
+        runs = ch == ch[..., :1, :] + torch.arange(32, device = ebase.device)[:, None]
+        if not bool((runs.all(-1).all(-1) | dummy).all()):
+            return None
+        return torch.where(dummy[..., None], -1, ch[..., 0, :]).to(torch.int32).contiguous()        # [rows, knt, 2, 2]
+
+    def _tile_index(self, kind: str, signature, ebase: torch.Tensor):
+        """A pre-pass kernel's ``(tiles, tix, shared)`` of ``ebase`` (`cuda_kernels.tile_index`), built once per
+        (``kind``, ``signature``) -- one device sync, at the first call."""
+        cache = self.__dict__.setdefault("_cached_tile_index", {})
+        key = (kind, signature)
+        tiles = cache.get(key)
+        if tiles is None:
+            tiles = cache[key] = cuda_kernels.tile_index(ebase)
+        return tiles
+
+    def _sb_mma_grouped(self, signature, ebase: torch.Tensor, pbase: torch.Tensor, kind: str = "fwg") -> int:
+        """How many consecutive node (or element) blocks a tensor-core small-batch tile may span: `row_groups`' grouping
+        of ``ebase`` (an edge tile's first row per tile), capped where the blocks' parameter offsets would not fit the
+        kernel's int deltas (``pbase``: a block's first parameter). Built once per (``kind``, ``signature``)."""
+        cache = self.__dict__.setdefault("_cached_tile_index", {})
+        key = ("sbmma", kind, signature)
+        g = cache.get(key)
+        if g is None:
+            g = self._row_groups(signature, ebase, kind)[2] if ebase.size(0) > 1 else 1
+            while g > 1:
+                d = pbase.reshape(-1)[:pbase.size(0) // g * g].view(-1, g, *pbase.shape[1:])
+                if int((d - d[:, :1]).abs().max()) < (1 << 31) - (1 << 24):
+                    break
+                g //= 2
+            cache[key] = g
+        return g
+
+    def _row_groups(self, signature, ebase: torch.Tensor, kind: str = "fwg"):
+        """A stream kernel's ``(ugrp, grep, grouped)`` of ``ebase`` (`cuda_kernels.row_groups`: blocks of equal rows
+        share its pre-pass), built once per (``kind``, ``signature``) -- one device sync, at the first call."""
+        cache = self.__dict__.setdefault("_cached_tile_index", {})
+        key = (kind, signature)
+        groups = cache.get(key)
+        if groups is None:
+            groups = cache[key] = cuda_kernels.row_groups(ebase)
+        return groups
 
     def _fw_block_sparse_tiles(self, num_edges: int, batch_size: int, propagation_alg_id: int,
                                pflow_tempered_enabled: bool):
@@ -667,15 +934,24 @@ class SumLayer(Layer, nn.Module):
             ok.append(not (plan is not None and plan[1] * batch_size >= _DENSE_MIN_WORK and plan[3] > 1))
         return ok
 
-    def backward(self, node_flows: torch.Tensor, element_flows: torch.Tensor, 
-                 node_mars: torch.Tensor, element_mars: torch.Tensor, 
+    def _bk_copy(self) -> Optional[torch.Tensor]:
+        """The circuit's bf16 copy of shared fp32 parameters where this backward call gave it to the layer (`backward`'s
+        `op_params`, set on the layer per call), else None: what the element kernels whose products are bf16 read (the
+        stream kernels), every other kernel reading `params`. The full path and a launch plan's launchers both read it
+        here: a launcher is replayed with `params`."""
+        return self.__dict__.get("_bk_op_params")
+
+    def backward(self, node_flows: torch.Tensor, element_flows: torch.Tensor,
+                 node_mars: torch.Tensor, element_mars: torch.Tensor,
                  params: torch.Tensor, param_flows: Optional[torch.Tensor] = None,
                  allow_modify_flows: bool = False, propagation_alg: str = "LL", 
                  logspace_flows: bool = False, negate_pflows: bool = False, 
                  accumulate_ch_flows: bool = False, allow_neg_flows: bool = False,
                  precision: str = "auto", pflow_temperature: float = 1.0, 
                  temper_eflow: bool = False, partition_runs: Optional[Sequence] = None,
-                 compute_children: Optional[Tuple[torch.Tensor, int]] = None, **kwargs) -> None:
+                 compute_children: Optional[Tuple[torch.Tensor, int]] = None,
+                 op_params: Optional[torch.Tensor] = None, stream_children: Optional[Tuple[torch.Tensor, int]] = None,
+                 **kwargs) -> None:
         """
         Computes the forward pass of a sum layer:
         ```
@@ -702,20 +978,94 @@ class SumLayer(Layer, nn.Module):
                           values may be stale, and the element-flow kernel forms them itself from `node_mars` (the
                           fused kernel of the `tlmm` regime). Element flows only, for a layer whose every partition
                           `fuses_children_backward` at this batch; another raises.
+        `op_params`:      None, or the circuit's bf16 copy of fp32 parameters shared by several layers
+                          (`TensorCircuit._param_operands`), as in `forward`: for a layer marked to take it, the
+                          element kernels whose products are bf16 read it -- the stream kernel, bf16 parameters only,
+                          offered with it --, every other kernel `params`, as without it (the fp16 and fp32 element
+                          kernels, the parameter flows). Set on the layer per call (`_bk_copy`), where a plan's
+                          launcher reads it as the full path does.
+        `stream_children`: None, or the product layer group below's `(table, first_row)` (as `compute_children`): every
+                          partition's element flows by the stream kernel with the product layer fused into its merge
+                          (`ele_backward_sum_stream_fused.cu`: each element's value formed from its two children, its
+                          flow written as both children's node flows) and its parameter flows deferred with the
+                          product fused into the capture (`par_deferred_fp16_fused.cu`) -- the same bits as the product
+                          layer's forward before this backward and its backward after it, which the caller leaves out:
+                          only for children of one parent each, log-space flows -inf before (the circuit's backward,
+                          `TensorCircuit._stream_fusion_bk_groups`), where `_stream_fusion_bk` holds (a call whose
+                          parameter-flow deferral declines forms the element values itself for the per-step kernels).
+                          Set on the layer per call (`_bk_stream_children`), read by the launchers as `_bk_copy` is.
         """
+        # The copy this call's element flows may read (`_bk_copy`): set before the plan lookup, as
+        # `_defer_param_flows` below, since a plan's element launchers read it too
+        op = op_params if op_params is not None and self.__dict__.get("_reads_param_operands", False) else None
+        self.__dict__["_bk_op_params"] = op
+        fallback = None
+        if stream_children is not None and not self._bk_fusion_ready(node_flows.size(1), params.dtype, op is not None,
+                                                                      param_flows is not None):
+            # (this call's partitions not all settled on the fused kernels -- another shape than the decision's: the
+            # product layer's values formed for the kernels that read them, the backward as without the tables, and its
+            # element flows written as the children's node flows after: the bits of the product layer's passes)
+            form_elements(element_mars, node_mars, stream_children)
+            fallback, stream_children = stream_children, None
+        self.__dict__["_bk_stream_children"] = stream_children
+
+        # A launch plan (`pyjuice.utils.launch_plans`): what an earlier call with this signature launched, its decisions
+        # made once. The standard regime only -- LL, no tempering, whole partitions, flows not modified in place --,
+        # where the decisions below read nothing but what the key holds (`kwargs` by name: their values are read by
+        # the tempered kernels alone). A converted site adds one launcher per partition and kind of flow; any other
+        # leaves the count short, and the call is not planned -- nor the recording around it, if one is open (a gated
+        # layer's, `ExternalParamsSumLayer.backward`, whose own sites this call's converted ones reach): so does a
+        # call in another regime, which records nothing.
+        #
+        # `defer_param_flows` (the circuit's backward sets it when no layer callback sees the flows between layers): a
+        # tied partition may leave its parameter flows to the end of the pass (`deferred_par`). Read per call by the
+        # parameter-flow site and a plan's launcher alike -- so before the lookup --, past `nn.Module.__setattr__`.
+        self.__dict__["_defer_param_flows"] = bool(kwargs.get("defer_param_flows", False))
+        pkey = None
+        if (partition_runs is None and compute_children is None and not allow_modify_flows and propagation_alg == "LL"
+                and pflow_temperature == 1.0 and not temper_eflow):
+            pkey = ("backward", node_flows.size(1), node_flows.device, node_flows.dtype, params.dtype,
+                    None if param_flows is None else param_flows.dtype, logspace_flows, negate_pflows,
+                    accumulate_ch_flows, allow_neg_flows, precision, self._ext_bw_ele_hook is not None,
+                    self._ext_bw_par_hook is not None, self._ext_bw_par_sb_hook is not None,
+                    self._ext_bw_par_triton_hook is not None, tuple(sorted(kwargs)),
+                    # the pass's first-writer stores (`_plan_param_flow_stores`): a launcher bakes its partition's
+                    # decision, so the key holds every partition's
+                    self.__dict__.get("_pf_store_key") if kwargs.get("pf_store_first", False) else None,
+                    op is not None, stream_children is not None)
+            plan = LaunchPlans.of(self).lookup(pkey)
+            if plan is not None:
+                for launch in plan:
+                    launch(node_flows, element_flows, node_mars, element_mars, params, param_flows)
+                if fallback is not None:
+                    scatter_flows(node_flows, element_flows, fallback, self._element_rows())
+                return None
+        elif LaunchPlans.nested():
+            LaunchPlans.fail()
+
         if compute_children is not None and (param_flows is not None or allow_modify_flows):
             raise ValueError("`compute_children` serves a backward of element flows only.")
+        if stream_children is not None and (pkey is None or not logspace_flows or accumulate_ch_flows or allow_neg_flows):
+            raise ValueError("`stream_children` takes a plain call with log-space flows (LL, no tempering, whole "
+                             "partitions, flows neither modified, accumulated nor negative).")
 
         if partition_runs is not None and (param_flows is not None or allow_modify_flows):
             raise ValueError("`partition_runs` restricts a backward's element flows: it takes neither "
                              "`param_flows` nor `allow_modify_flows`, which read whole partitions.")
-        assert not (allow_modify_flows and logspace_flows), "`allow_modify_flows` should be set to `False` when using `logspace_flows`."
-        assert not (accumulate_ch_flows and logspace_flows), "`accumulate_ch_flows` should be set to `False` when using `logspace_flows`."
-        assert not (accumulate_ch_flows and allow_modify_flows), "`accumulate_ch_flows` should be set to `False` when `allow_modify_flows=True`."
-        assert not (allow_neg_flows and logspace_flows), "`allow_neg_flows` should be set to `False` when using `logspace_flows`."
-        assert not (allow_neg_flows and allow_modify_flows), "`allow_neg_flows` should be set to `False` when `allow_modify_flows=True`."
-        assert not (propagation_alg != "LL" and abs(pflow_temperature - 1.0) > 1e-6), "`pflow_temperature` can only be 1 if `propagation_alg` is not 'LL'."
-        assert logspace_flows or abs(pflow_temperature - 1.0) < 1e-6, "`pflow_temperature` can only be enabled when `logspace_flows = True`."
+        assert not (allow_modify_flows and logspace_flows), \
+            "`allow_modify_flows` should be set to `False` when using `logspace_flows`."
+        assert not (accumulate_ch_flows and logspace_flows), \
+            "`accumulate_ch_flows` should be set to `False` when using `logspace_flows`."
+        assert not (accumulate_ch_flows and allow_modify_flows), \
+            "`accumulate_ch_flows` should be set to `False` when `allow_modify_flows=True`."
+        assert not (allow_neg_flows and logspace_flows), \
+            "`allow_neg_flows` should be set to `False` when using `logspace_flows`."
+        assert not (allow_neg_flows and allow_modify_flows), \
+            "`allow_neg_flows` should be set to `False` when `allow_modify_flows=True`."
+        assert not (propagation_alg != "LL" and abs(pflow_temperature - 1.0) > 1e-6), \
+            "`pflow_temperature` can only be 1 if `propagation_alg` is not 'LL'."
+        assert logspace_flows or abs(pflow_temperature - 1.0) < 1e-6, \
+            "`pflow_temperature` can only be enabled when `logspace_flows = True`."
         if precision not in PRECISIONS:
             raise ValueError(f"`precision` must be one of {PRECISIONS}, got {precision!r}.")
         if "force_use_bf16" in kwargs or "force_use_fp32" in kwargs:      # the shim only when needed: hot path
@@ -732,77 +1082,105 @@ class SumLayer(Layer, nn.Module):
                     propagation_alg = propagation_alg, **kwargs
                 )
         
-        ## Compute flows w.r.t. elements (i.e., product nodes) ##
-        for partition_id in range(self.num_bk_partitions):
-            runs = None if partition_runs is None else partition_runs[partition_id]
-            if runs is not None and len(runs) == 0:
-                continue
-            chids = self.partitioned_chids[partition_id]
-            parids = self.partitioned_parids[partition_id]
-            parpids = self.partitioned_parpids[partition_id]
-            cs_block_size = self.cs_block_sizes[partition_id]
-
-            self._backward(
-                node_flows, element_flows, params, node_mars, 
-                element_mars, param_flows, 
-                chids = chids, parids = parids, parpids = parpids,
-                cs_block_size = cs_block_size,
-                partition_id = partition_id,
-                allow_modify_flows = allow_modify_flows,
-                propagation_alg = propagation_alg,
-                logspace_flows = logspace_flows,
-                negate_pflows = negate_pflows, 
-                accumulate_ch_flows = accumulate_ch_flows,
-                allow_neg_flows = allow_neg_flows,
-                force_use_fp32 = force_use_fp32,
-                pflow_temperature = pflow_temperature,
-                temper_eflow = temper_eflow,
-                runs = runs,
-                children = compute_children,
-                **kwargs
-            )
-
-        ## Compute flows w.r.t. sum parameters ##
-        if param_flows is not None:
-            for partition_id in range(self.num_fw_partitions):
-                nids = self.partitioned_nids[partition_id]
-                cids = self.partitioned_cids[partition_id]
-                pids = self.partitioned_pids[partition_id]
-                pfids = self.partitioned_pfids[partition_id]
+        with (LaunchPlans.record() if pkey is not None else contextlib.nullcontext()) as rec:
+            ## Compute flows w.r.t. elements (i.e., product nodes) ##
+            for partition_id in range(self.num_bk_partitions):
+                runs = None if partition_runs is None else partition_runs[partition_id]
+                if runs is not None and len(runs) == 0:
+                    continue
+                chids = self.partitioned_chids[partition_id]
+                parids = self.partitioned_parids[partition_id]
+                parpids = self.partitioned_parpids[partition_id]
+                cs_block_size = self.cs_block_sizes[partition_id]
 
                 self._backward(
-                    node_flows, element_flows, params, node_mars, 
-                    element_mars, param_flows, nids = nids, 
-                    cids = cids, pids = pids, pfids = pfids, 
+                    node_flows, element_flows, params, node_mars,
+                    element_mars, param_flows,
+                    chids = chids, parids = parids, parpids = parpids,
+                    cs_block_size = cs_block_size,
                     partition_id = partition_id,
                     allow_modify_flows = allow_modify_flows,
                     propagation_alg = propagation_alg,
                     logspace_flows = logspace_flows,
                     negate_pflows = negate_pflows, 
-                    allow_neg_flows = allow_neg_flows, 
+                    accumulate_ch_flows = accumulate_ch_flows,
+                    allow_neg_flows = allow_neg_flows,
                     force_use_fp32 = force_use_fp32,
                     pflow_temperature = pflow_temperature,
                     temper_eflow = temper_eflow,
+                    runs = runs,
+                    children = compute_children,
                     **kwargs
                 )
 
+            ## Compute flows w.r.t. sum parameters ##
+            if param_flows is not None:
+                for partition_id in range(self.num_fw_partitions):
+                    nids = self.partitioned_nids[partition_id]
+                    cids = self.partitioned_cids[partition_id]
+                    pids = self.partitioned_pids[partition_id]
+                    pfids = self.partitioned_pfids[partition_id]
+
+                    self._backward(
+                        node_flows, element_flows, params, node_mars, 
+                        element_mars, param_flows, nids = nids, 
+                        cids = cids, pids = pids, pfids = pfids, 
+                        partition_id = partition_id,
+                        allow_modify_flows = allow_modify_flows,
+                        propagation_alg = propagation_alg,
+                        logspace_flows = logspace_flows,
+                        negate_pflows = negate_pflows, 
+                        allow_neg_flows = allow_neg_flows, 
+                        force_use_fp32 = force_use_fp32,
+                        pflow_temperature = pflow_temperature,
+                        temper_eflow = temper_eflow,
+                        **kwargs
+                    )
+
+        if pkey is not None:
+            LaunchPlans.of(self).store(pkey, rec, self.num_bk_partitions + (self.num_fw_partitions
+                                                                            if param_flows is not None else 0))
+        if fallback is not None:
+            scatter_flows(node_flows, element_flows, fallback, self._element_rows())
         return None
+
+    def _element_rows(self) -> torch.Tensor:
+        """Every element row this layer's backward computes the flows of (its backward partitions' child blocks, int64),
+        made once: what `scatter_flows` writes to the children where a call handed the product group below did not
+        take the fused kernels."""
+        rows = self.__dict__.get("_element_rows_")
+        if rows is None:
+            rows = self.__dict__["_element_rows_"] = torch.cat([
+                (chids.long()[:, None] + torch.arange(cbs, device = chids.device)[None, :]).reshape(-1)
+                for chids, cbs in zip(self.partitioned_chids, self.cs_block_sizes)])
+        return rows
+
+    def _bk_fusion_ready(self, batch_size: int, dtype: torch.dtype, op: bool, param_flows: bool) -> bool:
+        """`_stream_fusion_bk` for a call, kept until the records it reads change (one lookup a call)."""
+        memo = self.__dict__.setdefault("_bk_fusion_ready_", {})
+        key = (batch_size, dtype, op, param_flows)
+        hit = memo.get(key)
+        if hit is None:
+            hit = memo[key] = self._stream_fusion_bk(batch_size, dtype, op, param_flows)
+        return hit
 
     def is_sum(self):
         return True
 
     def __repr__(self):
-        return f"SumLayer(nid_range=({self._layer_nid_range[0]}, {self._layer_nid_range[1]}), num_nodes={self.num_nodes}, num_edges={self.num_edges})"
+        return (f"SumLayer(nid_range=({self._layer_nid_range[0]}, {self._layer_nid_range[1]}), "
+                f"num_nodes={self.num_nodes}, num_edges={self.num_edges})")
 
     def _forward(self, node_mars: torch.Tensor, element_mars: torch.Tensor,
                  params: torch.Tensor, nids: torch.Tensor, cids: torch.Tensor,
                  pids: torch.Tensor,
                  partition_id: int = -1, mode: Optional[str] = None,
                  propagation_alg: str = "LL", pflow_temperature: float = 1.0, precision: str = "auto",
-                 runs: Optional[Sequence] = None, children: Optional[torch.Tensor] = None, **kwargs) -> None:
+                 runs: Optional[Sequence] = None, children: Optional[torch.Tensor] = None,
+                 op_params: Optional[torch.Tensor] = None, **kwargs) -> None:
         """
         Forward pass of sum layers.
-        
+
         Parameters:
         `node_mars`:    [N, B]
         `element_mars`: [M, B]
@@ -811,6 +1189,7 @@ class SumLayer(Layer, nn.Module):
         `cids`:         [ng, c]
         `pids`:         [ng, c]
         `runs`:         the rows of the tables to compute (`(start, end)`), or None for all (see `forward`)
+        `op_params`:    the block-sparse mode's CUDA kernels' bf16 parameters, or None (see `forward`)
         """
 
         num_edges = cids.size(1)
@@ -845,9 +1224,9 @@ class SumLayer(Layer, nn.Module):
         if mode == self.BLOCK_SPARSE:
             self._forward_block_sparse(
                 node_mars, element_mars, params, nids, cids, pids,
-                partition_id = partition_id, propagation_alg = propagation_alg, 
+                partition_id = partition_id, propagation_alg = propagation_alg,
                 pflow_temperature = pflow_temperature, precision = precision, runs = runs, children = children,
-                **kwargs
+                **({} if op_params is None else dict(op_params = op_params)), **kwargs
             )
 
         elif mode == self.SPARSE:
@@ -858,7 +1237,8 @@ class SumLayer(Layer, nn.Module):
             )
 
         elif mode == self.PYTORCH:
-            assert abs(pflow_temperature - 1.0) < 1e-6, "`pflow_temperature != 1.0` not supported by the PyTorch backend."
+            assert abs(pflow_temperature - 1.0) < 1e-6, \
+                "`pflow_temperature != 1.0` not supported by the PyTorch backend."
             if runs is not None:
                 raise NotImplementedError("The PyTorch forward computes whole partitions only.")
 
@@ -876,10 +1256,10 @@ class SumLayer(Layer, nn.Module):
                               partition_id: int = -1, propagation_alg: str = "LL", 
                               pflow_temperature: float = 1.0, precision: str = "auto",
                               runs: Optional[Sequence] = None, children: Optional[torch.Tensor] = None,
-                              **kwargs) -> None:
+                              op_params: Optional[torch.Tensor] = None, **kwargs) -> None:
         """
         Forward pass of sum layers with the block-sparse processing kernel.
-        
+
         Parameters:
         `node_mars`:    [N, B]
         `element_mars`: [M, B]
@@ -892,9 +1272,14 @@ class SumLayer(Layer, nn.Module):
                         rows only: the Triton kernels by their tile offset (`pid_m_offset`) into the whole tables,
                         the CUDA ones on views of them. A launch of some rows never tunes (it would time the whole
                         partition in place): a choice not made yet -- by a whole launch -- takes the default.
+        `op_params`:    None, or a bf16 copy of the fp32 `params` (see `forward`), read by the CUDA kernels whose
+                        products are bf16: the `tlmm` kernels (the stream kernel, bf16 parameters only, offered with
+                        it) and the small-batch tensor-core one -- never the dense cuBLAS path; the Triton kernels and
+                        the small-batch fp32 ones read `params`.
         """
 
         assert params.dim() == 1, "Expecting a 1D `params`."
+        p_cuda = params if op_params is None else op_params             # what the bf16-product CUDA kernels read
 
         num_nblocks = nids.size(0)
         layer_n_nodes = num_nblocks * self.block_size
@@ -918,9 +1303,13 @@ class SumLayer(Layer, nn.Module):
                 "node_mars_tempered": kwargs["node_mars_tempered"]
             }
 
-        # Dense node blocks through cuBLAS where that is faster (see `_DENSE_MIN_BLOCK_SIZE`)
-        if (propagation_alg_id == 0 and not pflow_tempered_enabled and node_mars.is_cuda
-                and self.block_size >= _DENSE_MIN_BLOCK_SIZE and batch_size >= 16):
+        # Dense node blocks through cuBLAS where that is faster (see `_DENSE_MIN_BLOCK_SIZE`) -- fp32 parameters only:
+        # `torch.mm` on bf16 operands returns bf16, too coarse for log-space node values, so bf16-stored parameters take
+        # the block-sparse kernels, which read them as they are and accumulate in fp32; so do fp32 ones with a bf16 copy
+        # (`op_params`), whose stream kernel is the faster (MEASURED, HMM-4096 B 128: 69 us a layer on cuBLAS's TF32
+        # GEMMs against the stream kernel's ~28)
+        if (propagation_alg_id == 0 and not pflow_tempered_enabled and node_mars.is_cuda and op_params is None
+                and params.dtype == torch.float32 and self.block_size >= _DENSE_MIN_BLOCK_SIZE and batch_size >= 16):
             dense = self._dense_blocks(partition_id, nids, cids, pids)
             if dense is not None and dense[1] * batch_size >= _DENSE_MIN_WORK:
                 if children is not None:
@@ -935,9 +1324,10 @@ class SumLayer(Layer, nn.Module):
                                                                         pflow_tempered_enabled)
         K_NUM_TILES = num_edges // TILE_SIZE_K
 
-        assert TILE_SIZE_K >= 4, f"`TILE_SIZE_K` should be greater than 4 (but got {TILE_SIZE_K}) in order to use the block-sparse kernel. " \
-                                  "This is an internal error of PyJuice. Please consider checking the kernel dispatching criterions and use the " \
-                                  "corresponding sparse kernel instead."
+        assert TILE_SIZE_K >= 4, f"`TILE_SIZE_K` should be greater than 4 (but got {TILE_SIZE_K}) in order to use " \
+                                  "the block-sparse kernel. This is an internal error of PyJuice. Please consider " \
+                                  "checking the kernel dispatching criterions and use the corresponding sparse " \
+                                  "kernel instead."
 
         signature = ("block_sparse", partition_id, TILE_SIZE_K)
         if signature not in self._cached_fw_pcids:
@@ -1026,7 +1416,7 @@ class SumLayer(Layer, nn.Module):
                 raise ValueError("`compute_children` takes the block-sparse `tlmm` regime (see `fuses_children`).")
             default_cfg = (TILE_SIZE_M, BLOCK_B, None)                     # (TILE_SIZE_M, BLOCK_B, num_warps)
             fused_key = (fw_fused._fw_triton_block_sparse_tlmm_fused_kernel, self.block_size, TILE_SIZE_K, K_NUM_TILES,
-                         batch_size, num_nblocks, use_bf16, fp32_dot, children[0].size(1), default_cfg)
+                         batch_size, num_nblocks, use_bf16, fp32_dot, children[0].size(1), params.dtype, default_cfg)
 
             def _launch_fused(cfg, r = None):
                 self._forward_block_sparse_fused(node_mars, params, nids, cids_start, cids_increment, pids_start,
@@ -1103,14 +1493,15 @@ class SumLayer(Layer, nn.Module):
 
         # The heuristic default is part of the key so that the `OutOfResources` retry below -- which
         # re-enters with a smaller default -- looks up a fresh entry instead of the config that just
-        # failed (which would loop forever).
+        # failed (which would loop forever). The parameters' dtype too: the kernels read them as stored, and their
+        # speeds differ (as do the element- and parameter-flow keys below).
         fw_key = (fw_kernel, self.block_size, TILE_SIZE_K, K_NUM_TILES, batch_size, num_nblocks,
-                  use_bf16, fp32_dot, propagation_alg_id, pflow_tempered_enabled, default_fw_cfg)
+                  use_bf16, fp32_dot, propagation_alg_id, pflow_tempered_enabled, params.dtype, default_fw_cfg)
 
         # Optional CUDA (CuTe/TMA) fast path for the `tlmm` regime. It is numerically equivalent to
         # the Triton tlmm kernel and only valid here: LL propagation (`propagation_alg_id == 0`), the
-        # bf16 dot path (`use_bf16`), no pflow tempering, TILE_SIZE_K == 64 with num_edges a multiple of it, and a contiguous
-        # edge/param layout (`cuda_ok`). `is_available()` JIT-compiles on first call and self-disables
+        # bf16 dot path (`use_bf16`), no pflow tempering, TILE_SIZE_K == 64 with num_edges a multiple of it, and a
+        # contiguous edge/param layout (`cuda_ok`). `is_available()` JIT-compiles on first call and self-disables
         # (-> Triton) on an unsuitable GPU/toolchain/CUTLASS, so this is a no-op without the CUDA
         # prerequisites. The best tile config (or Triton) is measured once per launch SHAPE.
         if (FORWARD_SUM_CUDA and use_bf16 and propagation_alg_id == 0
@@ -1118,14 +1509,25 @@ class SumLayer(Layer, nn.Module):
                 and TILE_SIZE_K == 64 and num_edges % TILE_SIZE_K == 0
                 and node_mars.is_cuda and cuda_kernels.is_available()):
             ebase, pbase, cuda_ok = self._cached_fw_cuda[signature]
+            cuda_ok = cuda_ok and self._cuda_param_loads_aligned(p_cuda, ("fw", signature), pbase, self.block_size)
             valid_cfgs = cuda_kernels.valid_configs(self.block_size, batch_size) if cuda_ok else []
-            if valid_cfgs:
+            # (the pre-pass copy has tile shapes of its own -- 32-node blocks among them, which no other kernel takes)
+            prepass_cfgs = (cuda_kernels.prepass_valid_configs(self.block_size, batch_size)
+                            if cuda_ok and cuda_kernels.prepass_is_available() else [])
+            # (the stream copy: bf16 parameters, one stabilizer per split range -- c/tlmm_forward_sum_stream.cu; the
+            # pre-pass kernel beside it takes the runs its grouped tiles cannot)
+            stream_arms = (cuda_kernels.stream_arms(self.block_size, batch_size, K_NUM_TILES, nids.numel(),
+                                                    self._row_groups(signature, ebase)[2])
+                           if prepass_cfgs and p_cuda.dtype == torch.bfloat16 and cuda_kernels.stream_is_available()
+                           else [])
+            if valid_cfgs or prepass_cfgs or stream_arms:
                 # The best config depends on the shape (which tile shapes are valid, and their speed).
                 # Measured once per SHAPE and cached process-wide (`autotune.choose`), not per layer: the
                 # arms agree only to ~1e-6, so structurally identical layers that measured on their own
                 # could each take a different one, and identical models disagree in the last bits (a
                 # CUDA-graph replay against an eager twin caught it, tests/model/precision_option_test.py).
-                tlmm_key = ("sum_fw_tlmm_cuda", num_edges) + fw_key
+                # (With a bf16 copy, a choice of its own: the stream kernel is among the arms.)
+                tlmm_key = ("sum_fw_tlmm_cuda", num_edges) + fw_key + (() if op_params is None else ("operands",))
                 choice = autotune.cached(tlmm_key)
                 if choice is None and runs is not None:
                     choice = ("triton", -1)              # not measured yet: the reference (see `runs`)
@@ -1135,7 +1537,7 @@ class SumLayer(Layer, nn.Module):
                     cands = [(("triton", -1), (lambda: _launch_fw(default_fw_cfg)))]
                     cands += [(("cuda", c),
                                (lambda c=c: cuda_kernels.tlmm_forward_sum(
-                                   node_mars, element_mars, params, nids, ebase, pbase,
+                                   node_mars, element_mars, p_cuda, nids, ebase, pbase,
                                    batch_size, self.block_size, K_NUM_TILES, c)))
                               for c in valid_cfgs]
                     # The warp-specialized copy of the kernel (c/tlmm_forward_sum_pipelined.cu, bit-identical:
@@ -1144,20 +1546,80 @@ class SumLayer(Layer, nn.Module):
                     if cuda_kernels.pipe_is_available():
                         cands += [(("cuda_pipe", c),
                                    (lambda c=c: cuda_kernels.tlmm_forward_sum_pipelined(
-                                       node_mars, element_mars, params, nids, ebase, pbase,
+                                       node_mars, element_mars, p_cuda, nids, ebase, pbase,
                                        batch_size, self.block_size, K_NUM_TILES, c)))
                                   for c in cuda_kernels.pipe_valid_configs(self.block_size, batch_size)]
+                    # The pre-pass copy (c/tlmm_forward_sum_prepass.cu, bit-identical: the distinct element tiles'
+                    # maxima and exponentials computed once, then a streaming kernel over the parameter tiles), its
+                    # configs as more arms -- MEASURED on HCLT-1024's widest layer at B 128, bf16 params: 385 against
+                    # the pipelined kernel's 541 us; HMM-1024 at B 64: 18.3 against 35.7
+                    # (and, where the grid is small, its configs cut into split-K ranges: `prepass_arms`)
+                    if prepass_cfgs:
+                        tiles = self._tile_index("fw", signature, ebase)
+                        cands += [(("cuda_prepass", c),
+                                   autotune.charged(lambda c=c: cuda_kernels.tlmm_forward_sum_prepass(
+                                       node_mars, element_mars, p_cuda, nids, tiles[0], tiles[1], pbase,
+                                       batch_size, self.block_size, K_NUM_TILES, c, tiles[2]),
+                                                    autotune.LAUNCH_S if c >> 8 else 0.0))   # (a split: its merge launch)
+                                  for c in cuda_kernels.prepass_arms(self.block_size, batch_size, K_NUM_TILES,
+                                                                     nids.numel())]
+                    # The stream copy (c/tlmm_forward_sum_stream.cu: a pre-pass per split range under ONE stabilizer,
+                    # a GEMM of mbarrier'd cp.async stages without per-tile merges, a merge of the ranges), its configs
+                    # and splits as more arms, each charged its two extra launches -- MEASURED HMM-4096 B128 bf16: 47.7
+                    # -> 33-36 us a layer against the pre-pass copy's best
+                    if stream_arms:
+                        groups = self._row_groups(signature, ebase)
+                        cands += [(("cuda_stream", c),
+                                   autotune.charged(lambda c=c: cuda_kernels.tlmm_forward_sum_stream(
+                                       node_mars, element_mars, p_cuda, nids, ebase, pbase, groups,
+                                       batch_size, self.block_size, K_NUM_TILES, c), 2 * autotune.LAUNCH_S))
+                                  for c in stream_arms]
                     choice = autotune.choose(tlmm_key, cands)
 
-                if choice[0] in ("cuda", "cuda_pipe"):
-                    kernel = cuda_kernels.tlmm_forward_sum if choice[0] == "cuda" else cuda_kernels.tlmm_forward_sum_pipelined
+                if choice[0] in ("cuda", "cuda_pipe", "cuda_prepass", "cuda_stream"):
+                    if choice[0] == "cuda_prepass":
+                        tiles = self._tile_index("fw", signature, ebase)
+
+                        def kernel(node_mars, element_mars, params, nids, ebase, pbase, batch_size, block_size, knt, c,
+                                   a = None, b = None):
+                            # (a launch over some node blocks: the shared tiles whole, their index sliced; unshared,
+                            # the run's own tiles -- a tile per (block, edge tile), flat)
+                            cuda_kernels.tlmm_forward_sum_prepass(
+                                node_mars, element_mars, params, nids,
+                                tiles[0] if tiles[2] else tiles[0].view(-1, knt)[a:b].reshape(-1),
+                                tiles[1][a:b], pbase, batch_size, block_size, knt, c, tiles[2])
+                    elif choice[0] == "cuda_stream":
+                        tiles = self._row_groups(signature, ebase)
+                        pre_tiles = self._tile_index("fw", signature, ebase)
+
+                        def kernel(node_mars, element_mars, params, nids, ebase, pbase, batch_size, block_size, knt, c,
+                                   a = None, b = None):
+                            # (a launch over some node blocks: the run's own groups -- its blocks' rows of ebase; a run
+                            # too short for the partition's grouped tiles takes the pre-pass kernel's first config)
+                            groups = tiles if a is None else cuda_kernels.row_groups(ebase)
+                            if a is None or cuda_kernels.stream_run_fits(c, block_size, nids.numel(), groups[2]):
+                                cuda_kernels.tlmm_forward_sum_stream(node_mars, element_mars, params, nids, ebase, pbase,
+                                                                     groups, batch_size, block_size, knt, c)
+                            else:
+                                cuda_kernels.tlmm_forward_sum_prepass(
+                                    node_mars, element_mars, params, nids,
+                                    pre_tiles[0] if pre_tiles[2] else pre_tiles[0].view(-1, knt)[a:b].reshape(-1),
+                                    pre_tiles[1][a:b], pbase, batch_size, block_size, knt, prepass_cfgs[0], pre_tiles[2])
+                    else:
+                        tiles = None
+                        kernel = (cuda_kernels.tlmm_forward_sum if choice[0] == "cuda" else
+                                  cuda_kernels.tlmm_forward_sum_pipelined)
                     if runs is None:
-                        kernel(node_mars, element_mars, params, nids, ebase, pbase,
+                        kernel(node_mars, element_mars, p_cuda, nids, ebase, pbase,
                                batch_size, self.block_size, K_NUM_TILES, choice[1])
+                        recording = self.__dict__.get("_fw_recording")
+                        if recording is not None and autotune.cached(tlmm_key) == choice:
+                            recording.append((tlmm_key, choice, nids, ebase, pbase, K_NUM_TILES, tiles))
                     else:
                         for a, b in runs:                    # (views of the tables: the grid comes from them)
-                            kernel(node_mars, element_mars, params, nids[a:b], ebase[a:b], pbase[a:b],
-                                   batch_size, self.block_size, K_NUM_TILES, choice[1])
+                            kernel(node_mars, element_mars, p_cuda, nids[a:b], ebase[a:b], pbase[a:b],
+                                   batch_size, self.block_size, K_NUM_TILES, choice[1],
+                                   **({} if tiles is None else dict(a = a, b = b)))
                     return None
                 # choice == ("triton", -1): fall through to the Triton launch below
 
@@ -1192,37 +1654,74 @@ class SumLayer(Layer, nn.Module):
             sb_ebase, sb_pbase, sb_ok = sb
             if sb_ok:
                 n_sb_cfg = len(cuda_kernels.smallbatch_fw_configs())
+                # The batch-tiled copy (`smallbatch_forward_sum_bt.cu`): the parameters loaded once per BT batch
+                # columns instead of once per sample. Its configs are arms of the same pick; it wins from a few
+                # samples on (HMM-4096 layer: batch 4 57 -> 27 us, 8 110 -> 33, 16 Triton 77 -> 49).
+                n_bt_cfg = len(cuda_kernels.smallbatch_fw_bt_configs()) if cuda_kernels.smallbatch_fw_bt_is_available() else 0
+                # The tensor-core copy (`smallbatch_forward_sum_mma.cu`): the element tile shared by a node tile, split-K
+                # ranges merged by a dependent launch; its arms are (config, split) codes for this shape. It takes the
+                # batches from 4 to 63 on the tied HMMs (HMM-4096 layer, bf16: batch 16 Triton 75 -> 18 us, 32 -> 27).
+                sb_launch = {"cuda": cuda_kernels.smallbatch_forward_sum, "cuda_bt": cuda_kernels.smallbatch_forward_sum_bt,
+                             "cuda_mma": cuda_kernels.smallbatch_forward_sum_mma}
+
+                def _mma_scratch(code):
+                    # the partials buffer of a split arm, cached per shape (an allocation per call is host time)
+                    n = cuda_kernels.smallbatch_fw_mma_scratch(code, batch_size, self.block_size, nids.numel())
+                    buf = self._cached_fw_sb_scratch.get(signature)
+                    if n and (buf is None or buf.numel() < n or buf.device != node_mars.device):
+                        buf = self._cached_fw_sb_scratch[signature] = torch.empty(n, device = node_mars.device)
+                    return buf
+
+                def _sb_run(cfg, nids_, ebase_, pbase_):
+                    if cfg[0] == "cuda_mma" and nids_.numel() % cuda_kernels.smallbatch_fw_mma_rows(cfg[1], self.block_size):
+                        # (a run that splits a grouped tile's blocks: the batch-tiled FMA kernel takes it)
+                        cuda_kernels.smallbatch_forward_sum_bt(node_mars, element_mars, params, nids_, ebase_, pbase_,
+                                                               batch_size, self.block_size, num_edges, 0)
+                    elif cfg[0] == "cuda_mma":                # (bf16 products: the copy where the call has one)
+                        cuda_kernels.smallbatch_forward_sum_mma(node_mars, element_mars, p_cuda, nids_, ebase_, pbase_,
+                                                                batch_size, self.block_size, num_edges, cfg[1],
+                                                                _mma_scratch(cfg[1]))
+                    else:
+                        sb_launch[cfg[0]](node_mars, element_mars, params, nids_, ebase_, pbase_,
+                                          batch_size, self.block_size, num_edges, cfg[1])
 
                 def _launch_sb(cfg):
-                    if cfg[0] == "cuda":
-                        cuda_kernels.smallbatch_forward_sum(
-                            node_mars, element_mars, params, nids, sb_ebase, sb_pbase,
-                            batch_size, self.block_size, num_edges, cfg[1])
+                    if cfg[0] in sb_launch:
+                        # a split arm's merge is a second launch: charged its host time in the trial (see `charged`)
+                        extra = autotune.LAUNCH_S if (cfg[0] == "cuda_mma" and cfg[1] >> 8 > 1) else 0.0
+                        autotune.charged(lambda: _sb_run(cfg, nids, sb_ebase, sb_pbase), extra)()
                     else:
                         _launch_fw(default_fw_cfg)
 
-                # Autotune the CUDA SPLIT configs against the Triton launch that would run on
-                # fall-through. Every candidate overwrites node_mars with the same result, so it stays
-                # correct. Keyed by SHAPE and cached process-wide (`autotune.pick`), not per layer: the
-                # two sides agree only to ~1.5e-6, so structurally identical layers that tuned on their
-                # own could each take a different one and disagree in the last bits -- a cross-model
-                # bit-identity test caught exactly that (2.4e-7) once this path reached batch 32.
-                sb_key = ("sum_fw_smallbatch_cuda", num_edges) + fw_key
+                # Autotune the CUDA configs against the Triton launch that would run on fall-through. Every
+                # candidate overwrites node_mars with the same result, so it stays correct. Keyed by SHAPE and
+                # cached process-wide (`autotune.pick`), not per layer: the arms agree only to ~1.5e-6, so
+                # structurally identical layers that tuned on their own could each take a different one and
+                # disagree in the last bits -- a cross-model bit-identity test caught exactly that (2.4e-7) once
+                # this path reached batch 32.
+                # The tensor-core arms round the operands to bf16: only under the circuit's default precision ("auto",
+                # as the other tensor-core forwards), and with the parameter bases aligned for its 16-byte loads. Part
+                # of the key: "tf32" and "auto" share the rest of it at these batches. (On the bf16 copy, a choice of
+                # its own: that arm reads half the bytes.)
+                mma_ok = (precision == "auto"
+                          and self._cuda_param_loads_aligned(p_cuda, ("fw_sb_mma", signature), sb_pbase, self.block_size))
+                sb_key = (("sum_fw_smallbatch_cuda", num_edges, mma_ok) + fw_key
+                          + (() if op_params is None else ("operands",)))
                 choice = autotune.cached(sb_key)
                 if choice is None:
+                    mma_arms = (cuda_kernels.smallbatch_fw_mma_arms(self.block_size, batch_size, num_edges, nids.numel(),
+                                                                     self._sb_mma_grouped(signature, self._cached_fw_cuda[signature][0], sb_pbase))
+                                if mma_ok and not torch.cuda.is_current_stream_capturing() else [])
                     choice = ("triton", -1) if runs is not None else autotune.pick(
-                        sb_key, [("triton", -1)] + [("cuda", c) for c in range(n_sb_cfg)], _launch_sb)
+                        sb_key, [("triton", -1)] + [("cuda", c) for c in range(n_sb_cfg)]
+                        + [("cuda_bt", c) for c in range(n_bt_cfg)] + [("cuda_mma", c) for c in mma_arms], _launch_sb)
 
-                if choice[0] == "cuda":
+                if choice[0] in sb_launch:
                     if runs is None:
-                        cuda_kernels.smallbatch_forward_sum(
-                            node_mars, element_mars, params, nids, sb_ebase, sb_pbase,
-                            batch_size, self.block_size, num_edges, choice[1])
+                        _sb_run(choice, nids, sb_ebase, sb_pbase)
                     else:
                         for a, b in runs:
-                            cuda_kernels.smallbatch_forward_sum(
-                                node_mars, element_mars, params, nids[a:b], sb_ebase[a:b], sb_pbase[a:b],
-                                batch_size, self.block_size, num_edges, choice[1])
+                            _sb_run(choice, nids[a:b], sb_ebase[a:b], sb_pbase[a:b])
                     return None
                 # choice == ("triton", -1): fall through to the Triton launch below
 
@@ -1243,6 +1742,7 @@ class SumLayer(Layer, nn.Module):
                 raise
             self._fw_tuning_oom = True
             self.__dict__.pop("_fw_tiles_memo", None)         # the tiles read `_fw_tuning_oom`
+            self._fw_fast.clear()
             warnings.warn("Forward sum-layer tile tuning (FORWARD_SUM_TUNED) exceeded shared "
                           "memory on this GPU; falling back to the default launch config.", RuntimeWarning)
             return self._forward_block_sparse(
@@ -1465,7 +1965,8 @@ class SumLayer(Layer, nn.Module):
     @staticmethod
     @torch.compile
     def _forward_pytorch_kernel(node_mars: torch.Tensor, element_mars: torch.Tensor, params: torch.Tensor, 
-                                nids: torch.Tensor, cids: torch.Tensor, pids: torch.Tensor, propagation_alg_id: int, alpha: float = 0.0):
+                                nids: torch.Tensor, cids: torch.Tensor, pids: torch.Tensor, propagation_alg_id: int,
+                                alpha: float = 0.0):
 
         num_nblocks = nids.size(0)
         num_edges = cids.size(1)
@@ -1473,7 +1974,8 @@ class SumLayer(Layer, nn.Module):
             torch.arange(0, self.block_size, device = nids.device)[None,:]).reshape(num_nblocks * self.block_size)
         cids = cids[:,None,:].repeat(1, self.block_size, 1).reshape(num_nblocks * self.block_size, num_edges)
         pids = (pids[:,None,:].repeat(1, self.block_size, 1) + \
-            torch.arange(0, self.block_size, device = cids.device)[None,:,None]).reshape(num_nblocks * self.block_size, num_edges)
+            torch.arange(0, self.block_size, device = cids.device)[None,:,None]).reshape(
+                num_nblocks * self.block_size, num_edges)
 
         ch_mars = element_mars[cids]
 
@@ -1493,7 +1995,8 @@ class SumLayer(Layer, nn.Module):
         return None
 
     def _forward_pytorch(node_mars: torch.Tensor, element_mars: torch.Tensor, params: torch.Tensor, 
-                         nids: torch.Tensor, cids: torch.Tensor, pids: torch.Tensor, propagation_alg: str = "LL", **kwargs):
+                         nids: torch.Tensor, cids: torch.Tensor, pids: torch.Tensor, propagation_alg: str = "LL",
+                         **kwargs):
 
         # Propagation algorithm
         propagation_alg_id = self.propagation_alg_mapping[propagation_alg]
@@ -1569,6 +2072,8 @@ class SumLayer(Layer, nn.Module):
         else:
             mode = self.BLOCK_SPARSE
 
+        if mode == self.PYTORCH and param_flows is not None and self._pf_planned_store(partition_id, kwargs):
+            self._pf_reset(partition_id, param_flows)        # (the PyTorch reference accumulates)
         if mode != self.BLOCK_SPARSE and (self._ext_bw_ele_hook is not None
                                           or self._ext_bw_par_hook is not None
                                           or self._ext_bw_par_sb_hook is not None):
@@ -1700,11 +2205,14 @@ class SumLayer(Layer, nn.Module):
     def _backward_block_sparse(self, node_flows: torch.Tensor, element_flows: torch.Tensor, 
                                params: torch.Tensor, node_mars: torch.Tensor, 
                                element_mars: torch.Tensor, param_flows: torch.Tensor, 
-                               nids: Optional[torch.Tensor], cids: Optional[torch.Tensor], pids: Optional[torch.Tensor], pfids: Optional[torch.Tensor],
-                               chids: Optional[torch.Tensor], parids: Optional[torch.Tensor], parpids: Optional[torch.Tensor], 
+                               nids: Optional[torch.Tensor], cids: Optional[torch.Tensor], pids: Optional[torch.Tensor],
+                               pfids: Optional[torch.Tensor],
+                               chids: Optional[torch.Tensor], parids: Optional[torch.Tensor],
+                               parpids: Optional[torch.Tensor],
                                cs_block_size: int,
                                partition_id: int = -1, allow_modify_flows: bool = False, propagation_alg: str = "LL", 
-                               logspace_flows: bool = False, negate_pflows: bool = False, accumulate_ch_flows: bool = False, 
+                               logspace_flows: bool = False, negate_pflows: bool = False,
+                               accumulate_ch_flows: bool = False,
                                allow_neg_flows: bool = False, force_use_fp32 = False, pflow_temperature: float = 1.0, 
                                temper_eflow: bool = False, runs: Optional[Sequence] = None,
                                children: Optional[torch.Tensor] = None, **kwargs) -> None:
@@ -1868,9 +2376,10 @@ class SumLayer(Layer, nn.Module):
                                                                eflow_temperature)
         K_NUM_TILES = num_edges // TILE_SIZE_K
 
-        assert TILE_SIZE_K >= 4, f"`TILE_SIZE_K` should be greater than 4 (but got {TILE_SIZE_K}) in order to use the block-sparse kernel. " \
-                                  "This is an internal error of PyJuice. Please consider checking the kernel dispatching criterions and use the " \
-                                  "corresponding sparse kernel instead."
+        assert TILE_SIZE_K >= 4, f"`TILE_SIZE_K` should be greater than 4 (but got {TILE_SIZE_K}) in order to use " \
+                                  "the block-sparse kernel. This is an internal error of PyJuice. Please consider " \
+                                  "checking the kernel dispatching criterions and use the corresponding sparse " \
+                                  "kernel instead."
 
         # A second tile family for the autotuner: the one this heuristic picks for a 16-wide batch tile
         # (`TILE_SIZE_K` 128 where the batch-sized one has 64). Neither family wins everywhere -- MEASURED,
@@ -1909,11 +2418,18 @@ class SumLayer(Layer, nn.Module):
             def _cumbase(start, incr):
                 c = torch.cumsum(incr.to(torch.int64), 1)
                 sh = torch.zeros_like(c); sh[:, 1:] = c[:, :-1]
-                return (start[:, None, :].to(torch.int64) + sh)[:, :, 0].contiguous()
-            ele_ebase = _cumbase(parids_start, parids_increment)    # [n_eleblocks, K_NUM_TILES]
-            ele_pbase = _cumbase(parpids_start, parpids_increment)
+                return (start[:, None, :].to(torch.int64) + sh).contiguous()  # [n_eleblocks, K_NUM_TILES, ptr_inc_step]
+            full_ebase, full_pbase = _cumbase(parids_start, parids_increment), _cumbase(parpids_start, parpids_increment)
+            ele_ebase = full_ebase[:, :, 0].contiguous()                # [n_eleblocks, K_NUM_TILES]
+            ele_pbase = full_pbase[:, :, 0].contiguous()
             ele_cuda_ok = (ptr_inc_step == 1)
             self._cached_bk_ele_cuda[signature] = [ele_ebase, ele_pbase, ele_cuda_ok]
+            # The pre-pass copy takes a tile of several parent blocks too (32-node blocks: two a tile), a parameter
+            # offset per block -- given the tile's parents are contiguous node rows across them
+            _ar = torch.arange(ptr_inc_step, device = ele_ebase.device, dtype = torch.int64) * self.block_size
+            pre_ok = ele_cuda_ok or (ptr_inc_step * self.block_size == TILE_SIZE_K
+                                     and torch.equal(full_ebase, ele_ebase[:, :, None] + _ar.view(1, 1, -1)))
+            self._cached_bk_ele_pre[signature] = [full_pbase.view(full_pbase.size(0), -1), pre_ok]
 
         # Keep `num_edges` consistent with the (possibly trimmed) tile count: the small-batch CUDA ele
         # backward iterates `edge in [0, num_edges)` off the per-block first child, so it must not run
@@ -1957,11 +2473,18 @@ class SumLayer(Layer, nn.Module):
         # The two kernel families take different extra arguments.
         ele_extra = dict(node_mars_tempered = kwargs["node_mars_tempered"],
                          eflow_temperature = eflow_temperature) if ele_tempered else \
-                    dict(node_mars = node_mars, allow_modify_flows = allow_modify_flows,
+                    dict(allow_modify_flows = allow_modify_flows,
                          logspace_flows = logspace_flows, allow_neg_flows = allow_neg_flows,
                          propagation_alg_id = propagation_alg_id, **propagation_alg_kwargs)
 
-        def _launch_ele(cfg, out, first = 0, count = None):
+        # The launches below take the call's tensors (`t`: node_flows, node_mars, element_mars, params) as an argument
+        # -- `cur` for this call; a launch plan's launcher (`LaunchPlans`) passes those of the call it replays for, and
+        # holds none of this call's (held, a plan would keep the buffers of its first call alive)
+        # (`op`: the circuit's bf16 copy of the parameters where the call has one, `_bk_copy` -- the stream kernel's)
+        op = self._bk_copy()
+        cur = dict(node_flows = node_flows, node_mars = node_mars, element_mars = element_mars, params = params, op = op)
+
+        def _launch_ele(cfg, out, t, first = 0, count = None):
             """The child-node tiles (of `cfg`'s `TILE_SIZE_M`) ``[first, first + count)`` of the whole tables -- all of
             them by default; a child block is `BLOCK_SIZE_M // TILE_SIZE_M` tiles."""
             tk, tm, bb = cfg
@@ -1970,10 +2493,10 @@ class SumLayer(Layer, nn.Module):
             for pid_m_start in range(0, g[1], 32768):
                 curr_grid = (g[0], min(pid_m_start + 32768, g[1]) - pid_m_start)
                 ele_kernel[curr_grid](
-                    node_flows = node_flows,
+                    node_flows = t["node_flows"],
                     element_flows = out,
-                    element_mars = element_mars,
-                    mparams = params,
+                    element_mars = t["element_mars"],
+                    mparams = t["params"],
                     chids = chids,
                     parids_start = ps,
                     parids_increment = pi,
@@ -1992,7 +2515,7 @@ class SumLayer(Layer, nn.Module):
                     pid_m_offset = first + pid_m_start,
                     num_stages = 1,
                     **dot_kwargs,
-                    **ele_extra
+                    **(ele_extra if ele_tempered else dict(ele_extra, node_mars = t["node_mars"]))
                 )
 
         # `TILE_SIZE_M` tiles the child-node outputs and `BLOCK_B` the batch; the parent reduction
@@ -2027,9 +2550,9 @@ class SumLayer(Layer, nn.Module):
         ele_key = (ele_kernel, self.block_size, cs_block_size, TILE_SIZE_K, K_NUM_TILES,
                    ptr_inc_step, batch_size, num_nblocks, TL_DOT, bool(dot_kwargs), accumulate_ch_flows,
                    allow_modify_flows, logspace_flows, allow_neg_flows, propagation_alg_id,
-                   default_ele_cfg)
+                   params.dtype, default_ele_cfg)
 
-        def _tuned_ele_cfg():
+        def _tuned_ele_cfg(element_flows, t):
             cfg = autotune.cached(ele_key)
             if cfg is not None:
                 return cfg
@@ -2045,7 +2568,7 @@ class SumLayer(Layer, nn.Module):
             out = element_flows if not on_scratch else autotune.scratch_like(element_flows)
             if out is None:
                 return default_ele_cfg                 # no scratch -> leave this launch untuned
-            return autotune.pick(ele_key, ele_cfgs, lambda c: _launch_ele(c, out))
+            return autotune.pick(ele_key, ele_cfgs, lambda c: _launch_ele(c, out, t))
 
         # An external parameterization owns this computation. ONE interception for every regime: it is
         # handed the operands of all of them -- the per-tile tables the CuTe kernel wants, the general
@@ -2061,7 +2584,7 @@ class SumLayer(Layer, nn.Module):
                     and self._ext_bw_ele_hook is None):
                 raise ValueError("`compute_children` takes the plain block-sparse element-flow kernel (see "
                                  "`fuses_children_backward`).")
-            cfg = _tuned_ele_cfg()
+            cfg = _tuned_ele_cfg(element_flows, cur)
             tk, tm, bb = cfg
             ps, pi, pps, ppi, step = _parent_tables(tk)
             table, first_row = children
@@ -2092,17 +2615,29 @@ class SumLayer(Layer, nn.Module):
                     "accumulate_ch_flows off)."
                 )
             ele_ebase, ele_pbase, ele_cuda_ok = self._cached_bk_ele_cuda[signature]
-            self._ext_bw_ele_hook(dict(
-                element_flows = element_flows, element_mars = element_mars, node_flows = node_flows,
-                node_mars = node_mars, params = params, chids = chids,
+            static = dict(
+                chids = chids,
                 ele_ebase = ele_ebase, ele_pbase = ele_pbase, ele_cuda_ok = ele_cuda_ok,
+                # (the 8-parameter loads of a CUDA kernel reading `ele_pbase` -- `_cuda_param_loads_aligned`)
+                ele_loads_aligned = self._cuda_param_loads_aligned(params, ("ele", signature), ele_pbase,
+                                                                   self.block_size),
                 parids_start = parids_start, parids_increment = parids_increment,
                 parpids_start = parpids_start, parpids_increment = parpids_increment,
                 ptr_inc_step = ptr_inc_step, batch_size = batch_size, block_size = self.block_size,
                 cs_block_size = cs_block_size, num_edges = num_edges, signature = signature,
                 BLOCK_B = BLOCK_B, TILE_SIZE_K = TILE_SIZE_K, K_NUM_TILES = K_NUM_TILES,
                 TILE_SIZE_M = TILE_SIZE_M, TL_DOT = TL_DOT, grid = grid, partition_id = partition_id,
-            ))
+            )
+
+            def _hook(node_flows, element_flows, node_mars, element_mars, params, param_flows, static = static):
+                # (the hook installed for THIS call: the parameterization's `pre_backward_layer` sets it each backward;
+                # `op` the call's bf16 copy of the parameters, or None -- `_bk_copy`)
+                self._ext_bw_ele_hook(dict(static, element_flows = element_flows, element_mars = element_mars,
+                                           node_flows = node_flows, node_mars = node_mars, params = params,
+                                           op = self._bk_copy()))
+
+            LaunchPlans.add(_hook)
+            _hook(node_flows, element_flows, node_mars, element_mars, params, None)
             return None
 
         # Optional CUDA (CuTe/fp16/TMA) fast path for the element-flow backward `tlmm` regime. It is
@@ -2114,31 +2649,79 @@ class SumLayer(Layer, nn.Module):
         # {CUDA, Triton} is autotuned once per (signature, batch) -- INTO A SCRATCH buffer, never the
         # live element_flows (which is read-accumulate-write when accumulate_ch_flows is on) -- and
         # cached. Otherwise it falls through to the Triton launch below.
+        # The plain and pipelined kernels take child blocks of 128 rows; the pre-pass copy has tile shapes of its own
+        # (`ele_prepass_valid_configs`: 32-node blocks among them, an HCLT's, which the Triton kernel alone took)
+        ele_pre_cfgs = (cuda_kernels.ele_prepass_valid_configs(cs_block_size, batch_size)
+                        if BACKWARD_ELE_FLOW_CUDA and cuda_kernels.ele_prepass_is_available() else [])
+        ele_plain_ok = cs_block_size % 128 == 0
         if (BACKWARD_ELE_FLOW_CUDA and propagation_alg_id == 0 and abs(eflow_temperature - 1.0) < 1e-6
                 and allow_modify_flows == 0 and logspace_flows and not allow_neg_flows
                 and not accumulate_ch_flows and not force_use_fp32
                 and TILE_SIZE_K == 64 and num_edges % TILE_SIZE_K == 0
-                and cs_block_size % 128 == 0 and batch_size % 64 == 0
+                and (ele_plain_ok or ele_pre_cfgs) and batch_size % 64 == 0
                 and node_flows.is_cuda and cuda_kernels.ele_is_available()):
             ele_ebase, ele_pbase, ele_cuda_ok = self._cached_bk_ele_cuda[signature]
-            if ele_cuda_ok:
-                def _cuda_ele(tgt):
+            pre_pbase, pre_ok = self._cached_bk_ele_pre[signature]
+            ele_plain_ok = ele_plain_ok and ele_cuda_ok
+            ele_pre_cfgs = ele_pre_cfgs if pre_ok else []
+            # (the stream copy, c/ele_backward_sum_stream.cu: bf16 parameters -- or the call's bf16 copy of fp32 ones,
+            # `op` --, the pre-pass kernel's tables)
+            ele_groups = (self._row_groups(signature, ele_ebase, "eleg")
+                          if pre_ok and (params.dtype == torch.bfloat16 or op is not None)
+                          and cuda_kernels.ele_stream_is_available() else None)
+            # (the pre-pass kernel beside it takes the runs its grouped tiles cannot)
+            ele_stream_arms = (cuda_kernels.ele_stream_arms(cs_block_size, batch_size, self.block_size, K_NUM_TILES,
+                                                            chids.numel(), ele_groups[2])
+                               if ele_groups is not None and ele_pre_cfgs else [])
+            if ((ele_plain_ok or ele_pre_cfgs or ele_stream_arms)
+                    and self._cuda_param_loads_aligned(params, ("ele", signature), pre_pbase, self.block_size)):
+                ele_tiles = self._tile_index("ele", signature, ele_ebase) if ele_pre_cfgs else None
+
+                def _cuda_ele(tgt, t):
                     cuda_kernels.ele_backward_sum(
-                        tgt, element_mars, node_flows, node_mars, params, chids, ele_ebase, ele_pbase,
-                        batch_size, self.block_size, cs_block_size, K_NUM_TILES)
+                        tgt, t["element_mars"], t["node_flows"], t["node_mars"], t["params"], chids, ele_ebase,
+                        ele_pbase, batch_size, self.block_size, cs_block_size, K_NUM_TILES)
 
                 def _triton_ele(tgt):
-                    _launch_ele(default_ele_cfg, tgt)
+                    _launch_ele(default_ele_cfg, tgt, cur)
 
                 # The warp-specialized copy of the kernel (c/ele_backward_sum_pipelined.cu, bit-identical: producer
                 # warps stream the operands a tile ahead of the MMA warps) as a third arm -- MEASURED on HCLT-1024's
                 # widest layer: 0.70 against 0.83 ms at B 128, 0.55 against 0.60 at B 64
-                def _cuda_ele_pipe(tgt, a = None, b = None):
+                def _cuda_ele_pipe(tgt, t, a = None, b = None):
                     cuda_kernels.ele_backward_sum_pipelined(
-                        tgt, element_mars, node_flows, node_mars, params, chids[a:b], ele_ebase[a:b], ele_pbase[a:b],
-                        batch_size, self.block_size, cs_block_size, K_NUM_TILES)
+                        tgt, t["element_mars"], t["node_flows"], t["node_mars"], t["params"], chids[a:b],
+                        ele_ebase[a:b], ele_pbase[a:b], batch_size, self.block_size, cs_block_size, K_NUM_TILES)
 
-                choice_key = (signature, batch_size)
+                # The pre-pass copy (c/ele_backward_sum_prepass.cu, bit-identical: the parents' log ratios' maxima and
+                # exponentials once per element block, then a streaming kernel over the parameter tiles), its configs as
+                # more arms -- MEASURED, bf16 params: HMM-1024 at B 64 22.5 against the pipelined kernel's 46.4 us;
+                # HCLT-1024's largest partition at B 128 541 against 570
+                def _cuda_ele_prepass(tgt, c, t, a = None, b = None):
+                    # (a launch over some element blocks: the shared tiles whole, their index sliced; unshared, the
+                    # run's own tiles -- a tile per (block, parent tile), flat)
+                    cuda_kernels.ele_backward_sum_prepass(
+                        tgt, t["element_mars"], t["node_flows"], t["node_mars"], t["params"], chids[a:b],
+                        ele_tiles[0] if ele_tiles[2] else ele_tiles[0].view(-1, K_NUM_TILES)[a:b].reshape(-1),
+                        ele_tiles[1][a:b], pre_pbase[a:b], batch_size, self.block_size, cs_block_size, K_NUM_TILES, c,
+                        ele_tiles[2])
+
+                def _cuda_ele_stream(tgt, c, t, a = None, b = None, groups = None):
+                    # (a launch over some element blocks: the run's own groups -- its blocks' rows of ebase)
+                    if a is None:
+                        groups = ele_groups
+                    elif groups is None:
+                        groups = cuda_kernels.row_groups(ele_ebase[a:b])
+                    cuda_kernels.ele_backward_sum_stream(
+                        tgt, t["element_mars"], t["node_flows"], t["node_mars"], t["params"] if t["op"] is None else t["op"],
+                        chids[a:b], ele_ebase[a:b], pre_pbase[a:b], groups, batch_size, self.block_size, cs_block_size,
+                        K_NUM_TILES, c)
+
+                # (keyed on the parameters' dtype too, as the small-batch choice is: the arms depend on it -- the stream
+                # copy takes bf16 parameters alone -- and one circuit runs both, SGD's renormalization on the fp32
+                # master copy of bf16 parameters, where a cached stream arm met no row groups; and on whether the call
+                # has the bf16 copy of fp32 ones, on which the stream copy is offered)
+                choice_key = (signature, batch_size, params.dtype, op is not None)
                 choice = self._cached_bk_ele_choice.get(choice_key)
                 if choice is None:
                     # autotune into a SCRATCH clone (corruption-safe); the live element_flows is
@@ -2147,18 +2730,71 @@ class SumLayer(Layer, nn.Module):
                             or self._bk_ele_scratch.dtype != element_flows.dtype):
                         self._bk_ele_scratch = torch.empty_like(element_flows)
                     scr = self._bk_ele_scratch
-                    cands = [(("triton", -1), (lambda: _triton_ele(scr))),
-                             (("cuda", 0), (lambda: _cuda_ele(scr)))]
-                    if cuda_kernels.ele_pipe_is_available():
-                        cands.append((("cuda_pipe", 0), (lambda: _cuda_ele_pipe(scr))))
+                    cands = [(("triton", -1), (lambda: _triton_ele(scr)))]
+                    if ele_plain_ok:
+                        cands.append((("cuda", 0), (lambda: _cuda_ele(scr, cur))))
+                        if cuda_kernels.ele_pipe_is_available():
+                            cands.append((("cuda_pipe", 0), (lambda: _cuda_ele_pipe(scr, cur))))
+                    # (the pre-pass configs and, where the grid is small, their split-K ranges: `ele_prepass_arms`)
+                    cands += [(("cuda_prepass", c), autotune.charged(lambda c=c: _cuda_ele_prepass(scr, c, cur),
+                                                                    autotune.LAUNCH_S if c >> 8 else 0.0))
+                              for c in (cuda_kernels.ele_prepass_arms(cs_block_size, batch_size, K_NUM_TILES,
+                                                                      chids.numel()) if ele_pre_cfgs else [])]
+                    # the stream copy's configs and splits, each charged its two extra launches
+                    cands += [(("cuda_stream", c), autotune.charged(lambda c=c: _cuda_ele_stream(scr, c, cur),
+                                                                   2 * autotune.LAUNCH_S))
+                              for c in ele_stream_arms]
                     choice = autotune.best_of(cands) or ("triton", -1)
                     self._cached_bk_ele_choice[choice_key] = choice
-                if choice[0] in ("cuda", "cuda_pipe"):
-                    if choice[0] == "cuda_pipe":
-                        for a, b in ([(None, None)] if runs is None else runs):
-                            _cuda_ele_pipe(element_flows, a, b)
-                    elif runs is None:
-                        _cuda_ele(element_flows)
+                # (whether this partition's element flows settled on the whole-partition stream kernel, which a
+                # backward with the product layer below fused takes: `_stream_fusion_bk`)
+                stream_parts = self.__dict__.setdefault("_bk_stream_parts", {}).setdefault(
+                    (batch_size, params.dtype, op is not None), {})
+                ready = (choice[0] == "cuda_stream" and runs is None and cuda_kernels.ele_stream_fused_is_available())
+                if stream_parts.get(partition_id) != ready:
+                    stream_parts[partition_id] = ready
+                    self.__dict__.pop("_bk_fusion_ready_", None)
+                if self.__dict__.get("_bk_stream_children") is not None and not stream_parts[partition_id]:
+                    raise ValueError("`stream_children`: this partition's element flows did not settle on the stream "
+                                     "kernel (see `_stream_fusion_bk`).")
+                if choice[0] in ("cuda", "cuda_pipe", "cuda_prepass", "cuda_stream"):
+                    if runs is None:
+                        kind, c = choice
+
+                        def _ele(node_flows, element_flows, node_mars, element_mars, params, param_flows):
+                            t = dict(node_flows = node_flows, node_mars = node_mars, element_mars = element_mars,
+                                     params = params, op = self._bk_copy())
+                            if kind == "cuda_pipe":
+                                _cuda_ele_pipe(element_flows, t)
+                            elif kind == "cuda_prepass":
+                                _cuda_ele_prepass(element_flows, c, t)
+                            elif kind == "cuda_stream":
+                                sc = self.__dict__.get("_bk_stream_children")
+                                if sc is None:
+                                    _cuda_ele_stream(element_flows, c, t)
+                                else:                    # (the product layer below fused: its children's node flows)
+                                    cuda_kernels.ele_backward_sum_stream_fused(
+                                        node_flows, node_mars, sc, params if t["op"] is None else t["op"], chids,
+                                        ele_ebase, pre_pbase, ele_groups, batch_size, self.block_size, cs_block_size,
+                                        K_NUM_TILES, c)
+                            else:
+                                _cuda_ele(element_flows, t)
+
+                        LaunchPlans.add(_ele)
+                        _ele(node_flows, element_flows, node_mars, element_mars, params, None)
+                    elif choice[0] == "cuda_pipe":
+                        for a, b in runs:
+                            _cuda_ele_pipe(element_flows, cur, a, b)
+                    elif choice[0] == "cuda_prepass":
+                        for a, b in runs:
+                            _cuda_ele_prepass(element_flows, choice[1], cur, a, b)
+                    elif choice[0] == "cuda_stream":
+                        for a, b in runs:
+                            groups = cuda_kernels.row_groups(ele_ebase[a:b])
+                            if cuda_kernels.ele_stream_run_fits(choice[1], cs_block_size, b - a, groups[2]):
+                                _cuda_ele_stream(element_flows, choice[1], cur, a, b, groups)
+                            else:                        # (a run too short for the partition's grouped tiles)
+                                _cuda_ele_prepass(element_flows, ele_pre_cfgs[0], cur, a, b)
                     else:
                         for a, b in runs:                    # (views of the tables: the grid comes from them)
                             cuda_kernels.ele_backward_sum(
@@ -2167,52 +2803,108 @@ class SumLayer(Layer, nn.Module):
                                 K_NUM_TILES)
                     return None
                 # choice == ("triton", -1): fall through to the Triton launch below
+        if self.__dict__.get("_bk_stream_children") is not None:
+            raise ValueError("`stream_children`: this partition's element flows take no stream kernel (see "
+                             "`_stream_fusion_bk`).")
 
-        # Small-batch (batch < 16) CUDA element-flow backward. The block-sparse Triton kernel (csmm2)
-        # under-tiles the node dimension at tiny batch; this plain-CUDA kernel gives each child node
-        # its own warp and streams its flows directly from global -- no shared staging, no barrier
-        # (a component ablation showed the staged variant spent ~88% of its time in that barrier),
-        # numerically equivalent ~3e-6. Gated to the same regime as the small-batch tiling heuristic
-        # above (batch<16, block_size>=128), LL, no tempering/partial-eval, contiguous layout, and
-        # allow_modify_flows / allow_neg_flows / accumulate_ch_flows off. Autotuned vs the Triton
-        # small-batch launch INTO A SCRATCH buffer (corruption-safe: the live element_flows is touched
-        # only by the single real run below); used only when it wins, else falls through to Triton.
-        if (BACKWARD_ELE_FLOW_CUDA and batch_size < 16 and self.block_size >= _SMALL_BATCH_MIN_BLOCK_SIZE
+        # Small-batch (batch < 64) CUDA element-flow backwards, autotuned against the Triton launch that would run on
+        # fall-through, INTO A SCRATCH buffer (corruption-safe: the live element_flows is touched only by the single
+        # real run below), used only where one wins. Gated to LL, no tempering, contiguous layout, and
+        # allow_modify_flows / allow_neg_flows / accumulate_ch_flows off.
+        #   * ("cuda", WARPS cfg), batch < 16: the plain-CUDA kernel giving each child node its own warp, streaming its
+        #     flows from global -- no shared staging, no barrier (a component ablation showed the staged variant spent
+        #     ~88% of its time in that barrier); numerically equivalent ~3e-6. It re-reads every parent's flows per
+        #     child: the batch-1 kernel (HMM-4096 layer: batch 1 37 us, 4 70, 8 189).
+        #   * ("cuda_mma", cfg | split << 8): the tensor-core copy (c/smallbatch_ele_backward_mma.cu: a child tile x a
+        #     batch tile x a range of 64-parent tiles per block, bf16 operands, the ranges merged by a dependent
+        #     launch) on 64-parent tile tables -- the layer's own where its tile is 64, else built for 64; the fp16 /
+        #     bf16 dot regime of the other CUDA element kernels (not "fp32" precision) and the parameter bases
+        #     aligned for its 16-byte loads. HMM-4096 layer, bf16: batch 4 Triton ~67 -> 21 us, 16 ~60 -> 27.
+        if (BACKWARD_ELE_FLOW_CUDA and batch_size < 64 and self.block_size >= _SMALL_BATCH_MIN_BLOCK_SIZE
                 and propagation_alg_id == 0 and abs(eflow_temperature - 1.0) < 1e-6
                 and allow_modify_flows == 0 and logspace_flows and not allow_neg_flows
-                and not accumulate_ch_flows and not force_use_fp32
-                and num_edges % TILE_SIZE_K == 0 and cs_block_size % 32 == 0
-                and node_flows.is_cuda and cuda_kernels.smallbatch_ele_is_available()):
-            sb = self._cached_bk_ele_sb.get(signature)
-            if sb is None:
-                # Per-node-block first parent / first param (column 0 of the cached per-tile
-                # ebase/pbase) and verify GLOBAL contiguity: parents step by 1 across edges and by
-                # TILE_SIZE_K across tiles; per-child params are edge-contiguous (the pbase steps by
-                # TILE_SIZE_K across tiles). cuda_ok already checked within-tile contiguity; here we
-                # also require the tiles to chain globally.
-                ele_ebase, ele_pbase, cuda_ok = self._cached_bk_ele_cuda[signature]
-                _art = torch.arange(K_NUM_TILES, device = ele_ebase.device, dtype = torch.int64).view(1, -1)
-                sb_ok = bool(cuda_ok
-                             and torch.equal(ele_ebase, ele_ebase[:, :1] + _art * TILE_SIZE_K)
-                             and torch.equal(ele_pbase, ele_pbase[:, :1] + _art * TILE_SIZE_K))
-                sb = (ele_ebase[:, 0].contiguous(), ele_pbase[:, 0].contiguous(), sb_ok)
-                self._cached_bk_ele_sb[signature] = sb
-            sb_ebase, sb_pbase, sb_ok = sb
-            if sb_ok:
-                n_sb_cfg = len(cuda_kernels.smallbatch_ele_configs())
+                and not accumulate_ch_flows and not force_use_fp32 and node_flows.is_cuda):
+            sb_ok = False
+            if (batch_size < 16 and num_edges % TILE_SIZE_K == 0 and cs_block_size % 32 == 0
+                    and cuda_kernels.smallbatch_ele_is_available()):
+                sb = self._cached_bk_ele_sb.get(signature)
+                if sb is None:
+                    # The kernel takes the cached per-tile ebase / pbase tables themselves (a tile's first parent and
+                    # first parameter), so it needs only what `cuda_ok` already states: one parameter-block group per
+                    # tile. (It used to take one base per node block and require the tiles to chain across the whole
+                    # row, which no layer of more than one parent block satisfies -- it never ran on an HMM-4096.)
+                    ele_ebase, ele_pbase, cuda_ok = self._cached_bk_ele_cuda[signature]
+                    sb = (ele_ebase.contiguous(), ele_pbase.contiguous(), bool(cuda_ok))
+                    self._cached_bk_ele_sb[signature] = sb
+                sb_ebase, sb_pbase, sb_ok = sb
+            # The tensor-core copy's tables: 64-parent tiles of contiguous parent rows over one parameter block, or two
+            # of 32 (an HCLT's) -- the layer's own where its tile is 64, else built for 64; with the element blocks'
+            # grouping (`row_groups`: blocks sharing their parents). Built at the first use, cached; None where the
+            # kernel does not apply (or its 16-byte parameter loads would be misaligned).
+            def _mma_tables():
+                if not (self.block_size % 8 == 0 and num_edges_full >= 64 and num_edges_full % 64 == 0
+                        and cs_block_size % 8 == 0 and cuda_kernels.smallbatch_ele_mma_is_available()):
+                    return None
+                sig64 = ("block_sparse", partition_id, 64)
+                mma = self._cached_bk_ele_mma.get(sig64)
+                if mma is None:
+                    if TILE_SIZE_K == 64:
+                        e64 = self._cached_bk_ele_cuda[signature][0]
+                        full_p, pre_ok = self._cached_bk_ele_pre[signature]
+                        pinc, k64 = ptr_inc_step, K_NUM_TILES
+                        ok = pinc == 1 or (pinc == 2 and pre_ok)
+                    else:
+                        ps, pi, pps, ppi, pinc = _parent_tables(64)
+                        def _cumbase(start, incr):
+                            c = torch.cumsum(incr.to(torch.int64), 1)
+                            sh = torch.zeros_like(c); sh[:, 1:] = c[:, :-1]
+                            return (start[:, None, :].to(torch.int64) + sh).contiguous()   # [n, K, pinc]
+                        full_e, full_pp = _cumbase(ps, pi), _cumbase(pps, ppi)
+                        e64, k64 = full_e[:, :, 0].contiguous(), pi.size(1)
+                        full_p = full_pp.view(full_pp.size(0), -1)
+                        ok = pinc == 1 or (pinc == 2 and bool(torch.equal(full_e[:, :, 1], full_e[:, :, 0] + self.block_size)))
+                    ok = ok and pinc * self.block_size >= 64 and (pinc == 1 or pinc * self.block_size == 64)
+                    grouped = (self._row_groups(sig64, e64, "sbele")[2] if ok and e64.size(0) > 1 else 1)
+                    mma = self._cached_bk_ele_mma[sig64] = (e64.contiguous(), full_p.contiguous(), int(pinc), bool(ok),
+                                                            k64 * 64, grouped)
+                if not (mma[3] and self._cuda_param_loads_aligned(params, ("ele_sb_mma", sig64), mma[1], self.block_size)):
+                    return None
+                return mma
 
-                def _cuda_ele_sb(tgt, c):
+            choice_key = (signature, batch_size, "sb", params.dtype)   # (a choice must not outlive `set_param_dtype`)
+            choice = self._cached_bk_ele_choice.get(choice_key)
+            mma = _mma_tables() if (choice is None or choice[0] == "cuda_mma") else None
+            if choice is not None and choice[0] == "cuda_mma" and mma is None:
+                choice = ("triton", -1)                          # (defensive: its tables no longer apply)
+            mma_arms = (cuda_kernels.smallbatch_ele_mma_arms(cs_block_size, self.block_size, batch_size, mma[4],
+                                                             chids.numel(), mma[5])
+                        if (mma is not None and choice is None) else [])
+            if sb_ok or mma_arms or (choice is not None and choice[0] != "triton"):
+                n_sb_cfg = len(cuda_kernels.smallbatch_ele_configs()) if sb_ok else 0
+
+                def _cuda_ele_sb(tgt, c, t):
                     cuda_kernels.smallbatch_ele_backward_sum(
-                        tgt, element_mars, node_flows, node_mars, params, chids, sb_ebase, sb_pbase,
-                        batch_size, self.block_size, cs_block_size, num_edges, c)
+                        tgt, t["element_mars"], t["node_flows"], t["node_mars"], t["params"], chids, sb_ebase,
+                        sb_pbase, batch_size, self.block_size, cs_block_size, num_edges, TILE_SIZE_K, c)
+
+                def _mma_scratch(code):
+                    n = cuda_kernels.smallbatch_ele_mma_scratch(code, batch_size, cs_block_size, chids.numel())
+                    buf = self._cached_bk_ele_mma_scratch.get(signature)
+                    if n and (buf is None or buf.numel() < n or buf.device != node_flows.device):
+                        buf = self._cached_bk_ele_mma_scratch[signature] = torch.empty(n, device = node_flows.device)
+                    return buf
+
+                def _cuda_ele_mma(tgt, code, t, a = None, b = None):
+                    cuda_kernels.smallbatch_ele_backward_sum_mma(
+                        tgt, t["element_mars"], t["node_flows"], t["node_mars"], t["params"], chids[a:b],
+                        mma[0][a:b], mma[1][a:b], batch_size, self.block_size, cs_block_size, mma[4], code,
+                        _mma_scratch(code), mma[2])
 
                 # Compare against the Triton launch that would actually run on fall-through (the
                 # tuned config and the kernel `ele_kernel` selects), not a hard-coded csmm2 one.
                 def _triton_ele_sb(tgt):
-                    _launch_ele(default_ele_cfg, tgt)
+                    _launch_ele(default_ele_cfg, tgt, cur)
 
-                choice_key = (signature, batch_size, "sb")
-                choice = self._cached_bk_ele_choice.get(choice_key)
                 if choice is None:
                     # autotune into a SCRATCH clone (corruption-safe); the live element_flows is
                     # touched only by the single real run below.
@@ -2221,28 +2913,57 @@ class SumLayer(Layer, nn.Module):
                         self._bk_ele_scratch = torch.empty_like(element_flows)
                     scr = self._bk_ele_scratch
                     cands = [(("triton", -1), (lambda: _triton_ele_sb(scr)))]
-                    cands += [(("cuda", c), (lambda c = c: _cuda_ele_sb(scr, c))) for c in range(n_sb_cfg)]
+                    cands += [(("cuda", c), (lambda c = c: _cuda_ele_sb(scr, c, cur))) for c in range(n_sb_cfg)]
+                    # (a split arm's merge is a second launch: charged its host time in the trial)
+                    cands += [(("cuda_mma", c), autotune.charged(lambda c = c: _cuda_ele_mma(scr, c, cur),
+                                                                 autotune.LAUNCH_S if c >> 8 > 1 else 0.0))
+                              for c in mma_arms]
                     choice = autotune.best_of(cands) or ("triton", -1)
                     self._cached_bk_ele_choice[choice_key] = choice
-                if choice[0] == "cuda":
+                if choice[0] in ("cuda", "cuda_mma"):
                     if runs is None:
-                        _cuda_ele_sb(element_flows, choice[1])
-                    else:
+                        c = choice[1]
+                        if choice[0] == "cuda":
+                            def _ele_sb(node_flows, element_flows, node_mars, element_mars, params, param_flows):
+                                _cuda_ele_sb(element_flows, c, dict(node_flows = node_flows, node_mars = node_mars,
+                                                                    element_mars = element_mars, params = params))
+                        else:
+                            def _ele_sb(node_flows, element_flows, node_mars, element_mars, params, param_flows):
+                                _cuda_ele_mma(element_flows, c, dict(node_flows = node_flows, node_mars = node_mars,
+                                                                     element_mars = element_mars, params = params))
+
+                        LaunchPlans.add(_ele_sb)
+                        _ele_sb(node_flows, element_flows, node_mars, element_mars, params, None)
+                    elif choice[0] == "cuda":
                         for a, b in runs:
                             cuda_kernels.smallbatch_ele_backward_sum(
                                 element_flows, element_mars, node_flows, node_mars, params, chids[a:b],
                                 sb_ebase[a:b], sb_pbase[a:b], batch_size, self.block_size, cs_block_size,
-                                num_edges, choice[1])
+                                num_edges, TILE_SIZE_K, choice[1])
+                    else:
+                        g = cuda_kernels.smallbatch_ele_mma_rows(choice[1], cs_block_size)
+                        for a, b in runs:
+                            if a % g or b % g:                   # (a run that splits a grouped tile's blocks: Triton)
+                                cfg = _tuned_ele_cfg(element_flows, cur)
+                                per = BLOCK_SIZE_M // cfg[1]
+                                _launch_ele(cfg, element_flows, cur, a * per, (b - a) * per)
+                            else:
+                                _cuda_ele_mma(element_flows, choice[1], cur, a, b)
                     return None
                 # choice == ("triton", -1): fall through to the Triton launch below
 
         if runs is None:
-            _launch_ele(_tuned_ele_cfg(), element_flows)
+            def _ele_triton(node_flows, element_flows, node_mars, element_mars, params, param_flows):
+                t = dict(node_flows = node_flows, node_mars = node_mars, element_mars = element_mars, params = params)
+                _launch_ele(_tuned_ele_cfg(element_flows, t), element_flows, t)
+
+            LaunchPlans.add(_ele_triton)
+            _ele_triton(node_flows, element_flows, node_mars, element_mars, params, None)
         else:
-            cfg = _tuned_ele_cfg()
+            cfg = _tuned_ele_cfg(element_flows, cur)
             per = BLOCK_SIZE_M // cfg[1]                     # child-node tiles per row
             for a, b in runs:
-                _launch_ele(cfg, element_flows, a * per, (b - a) * per)
+                _launch_ele(cfg, element_flows, cur, a * per, (b - a) * per)
 
         return None
 
@@ -2268,6 +2989,87 @@ class SumLayer(Layer, nn.Module):
                     bool((sorted_ids[1:] - sorted_ids[:-1] >= self.block_size).all().item())
             self._par_collision_free_cache[key] = collision_free
         return self._par_collision_free_cache[key]
+
+    def _par_tile_sizes(self, batch_size: int, num_edges: int, propagation_alg_id: int):
+        """`(TILE_SIZE_M, TILE_SIZE_K, TILE_SIZE_B)` of the block-sparse parameter-flow kernels for a partition of
+        `num_edges` edges at `batch_size` -- the heuristic the dispatch applies (and `param_flow_slot_plan` predicts)."""
+        BATCH_SIZE_NP2 = host_next_power_of_2(batch_size)
+        base_size = min(self.block_size, num_edges, BATCH_SIZE_NP2)
+        if base_size >= 64:
+            TILE_SIZE_B = min(2048 // 32, BATCH_SIZE_NP2)
+        else:
+            remainder = 2048 // (base_size ** 2)
+            TILE_SIZE_B = min(2048 // remainder, base_size * remainder, BATCH_SIZE_NP2)
+        TILE_SIZE_M = min(2048 // TILE_SIZE_B, self.block_size)
+        TILE_SIZE_K = min(2048 // TILE_SIZE_B, num_edges)
+        if propagation_alg_id == 1:
+            # The kernel will stall if the tile sizes are too large
+            TILE_SIZE_M = min(TILE_SIZE_M, 16)
+            TILE_SIZE_K = min(TILE_SIZE_K, 16)
+            TILE_SIZE_B = min(TILE_SIZE_B, 16)
+        return TILE_SIZE_M, TILE_SIZE_K, TILE_SIZE_B
+
+    def param_flow_slot_ranges(self, partition_id: int) -> np.ndarray:
+        """The `param_flows` slots a backward partition writes, as sorted disjoint `[start, end)` ranges (int64
+        [n, 2], host): every real edge block (child row not 0) writes the `block_size` slots from its `pfids` entry.
+        Computed once per partition."""
+        cache = self.__dict__.setdefault("_pf_slot_ranges", {})
+        ranges = cache.get(partition_id)
+        if ranges is None:
+            pfids, cids = self.partitioned_pfids[partition_id], self.partitioned_cids[partition_id]
+            starts = torch.unique(pfids[cids != 0]).cpu().numpy().astype(np.int64)
+            ranges = _merge_ranges(np.stack([starts, starts + self.block_size], axis = 1)) if starts.size else \
+                np.zeros((0, 2), dtype = np.int64)
+            cache[partition_id] = ranges
+        return ranges
+
+    def _pf_planned_store(self, partition_id: int, kwargs) -> bool:
+        """Whether the circuit's plan for this pass (`pf_store_first` given, `_pf_store_flags` set) left this
+        partition's slots un-reset for its kernel to store."""
+        return bool(kwargs.get("pf_store_first", False)) and \
+            bool(self.__dict__.get("_pf_store_flags", {}).get(partition_id, False))
+
+    def _pf_reset(self, partition_id: int, param_flows: torch.Tensor) -> None:
+        """The safety net of the plan: a path that ACCUMULATES into slots the plan expected stored resets them first
+        (the plan predicts the dispatch; a prediction a path does not honour costs this reset, never correctness)."""
+        for a, b in self.param_flow_slot_ranges(partition_id).tolist():
+            param_flows[a:b].zero_()
+        self.__dict__["_pf_fallback_resets"] = self.__dict__.get("_pf_fallback_resets", 0) + 1
+
+    def param_flow_slot_plan(self, batch_size: int, pflow_temperature: float, propagation_alg: str, defer: bool,
+                             mode = None):
+        """Per backward partition `(ranges, capable)`: the slots it writes (`param_flow_slot_ranges`) and whether its
+        kernel can STORE them -- the pass's first writer of a slot then folds the buffer's reset into its write, and
+        the circuit zeroes only what no storing writer covers (`TensorCircuit._plan_param_flow_stores`). Capable: the
+        block-sparse regime (batch at least `_BLOCK_SPARSE_PAR_MIN_BATCH`; 16 with an external hook, which keeps the
+        small-batch path), no external-parameter hook (its kernels accumulate), untempered flows, tiles of 8 or more
+        (the dot kernels; csmm2 adds atomically), collision-free slots (the read-add-store kernel, or the CUDA kernel's
+        store mode) and no deferral (a deferred tied group's flush adds at the end of the pass). The same conditions
+        the dispatch applies, so a partition told to store runs a storing kernel; a path it mispredicts resets the slots
+        itself (`_pf_reset`). An external-parameter layer's partitions (its hooks accumulate) and a backward forced to
+        another `mode` are never capable."""
+        out = []
+        alg_id = self.propagation_alg_mapping[propagation_alg]
+        if getattr(self, "external_params", None) is not None or (mode is not None and mode != "block_sparse"):
+            return [(self.param_flow_slot_ranges(p), False) for p in range(self.num_bk_partitions)]
+        for partition_id in range(self.num_bk_partitions):
+            ranges = self.param_flow_slot_ranges(partition_id)
+            nids, cids, pids, pfids = (self.partitioned_nids[partition_id], self.partitioned_cids[partition_id],
+                                       self.partitioned_pids[partition_id], self.partitioned_pfids[partition_id])
+            num_edges = cids.size(1)
+            ext = (self._ext_bw_par_hook is not None or self._ext_bw_par_triton_hook is not None
+                   or self._ext_bw_par_sb_hook is not None)
+            capable = (not ext and batch_size >= _BLOCK_SPARSE_PAR_MIN_BATCH and abs(pflow_temperature - 1.0) < 1e-6
+                       and ranges.shape[0] > 0 and self._par_flow_collision_free(pfids))
+            if capable:
+                tm, tk, tb = self._par_tile_sizes(batch_size, num_edges, alg_id)
+                capable = tm >= 8 and tk >= 8 and tb >= 8
+            if capable and defer:
+                ctx = dict(partition_id = partition_id, batch_size = batch_size, block_size = self.block_size,
+                           num_edges = num_edges, nids = nids, cids = cids, pids = pids, pfids = pfids)
+                capable = not deferred_par.may_defer(cuda_kernels.get_par_deferred_module(), ctx, 1)
+            out.append((ranges, bool(capable)))
+        return out
 
     def _backward_block_sparse_par_flows(self, node_flows: torch.Tensor, params: torch.Tensor, node_mars: torch.Tensor,
                                          element_mars: torch.Tensor, param_flows: torch.Tensor, nids: torch.Tensor,
@@ -2304,21 +3106,9 @@ class SumLayer(Layer, nn.Module):
         propagation_alg_id = self.propagation_alg_mapping[propagation_alg]
         propagation_alg_kwargs = self._get_propagation_alg_kwargs(propagation_alg, **kwargs)
 
-        # Heuristic to set `TILE_SIZE_M`, `TILE_SIZE_K`, and `BLOCK_B`
-        base_size = min(self.block_size, num_edges, BATCH_SIZE_NP2)
-        if base_size >= 64:
-            TILE_SIZE_B = min(2048 // 32, BATCH_SIZE_NP2)
-        else:
-            remainder = 2048 // (base_size ** 2)
-            TILE_SIZE_B = min(2048 // remainder, base_size * remainder, BATCH_SIZE_NP2)
-        TILE_SIZE_M = min(2048 // TILE_SIZE_B, self.block_size)
-        TILE_SIZE_K = min(2048 // TILE_SIZE_B, num_edges)
-        
-        if propagation_alg_id == 1:
-            # The kernel will stall if the tile sizes are too large
-            TILE_SIZE_M = min(TILE_SIZE_M, 16)
-            TILE_SIZE_K = min(TILE_SIZE_K, 16)
-            TILE_SIZE_B = min(TILE_SIZE_B, 16)
+        # Heuristic to set `TILE_SIZE_M`, `TILE_SIZE_K`, and `BLOCK_B` (`_par_tile_sizes`: the plan of the pass's
+        # parameter-flow stores reads it too)
+        TILE_SIZE_M, TILE_SIZE_K, TILE_SIZE_B = self._par_tile_sizes(batch_size, num_edges, propagation_alg_id)
 
         # CEIL, not floor. With floor the trailing `batch_size % TILE_SIZE_B` samples are never
         # visited by the kernel's batch loop and their parameter flows are SILENTLY DROPPED -- at
@@ -2339,9 +3129,10 @@ class SumLayer(Layer, nn.Module):
 
         allow_modify_flows = 1 if allow_modify_flows else 0
 
-        assert TILE_SIZE_B >= 4, f"`TILE_SIZE_B` should be greater than 4 (but got {TILE_SIZE_B}) in order to use the block-sparse kernel. " \
-                                  "This is an internal error of PyJuice. Please consider checking the kernel dispatching criterions and use the " \
-                                  "corresponding sparse kernel instead."
+        assert TILE_SIZE_B >= 4, f"`TILE_SIZE_B` should be greater than 4 (but got {TILE_SIZE_B}) in order to use " \
+                                  "the block-sparse kernel. This is an internal error of PyJuice. Please consider " \
+                                  "checking the kernel dispatching criterions and use the corresponding sparse " \
+                                  "kernel instead."
 
         # `force_use_fp32` ("fp32") runs the same dots in three TF32 passes, as the element-flow backward
         # does (see `_PAR_DOT_IEEE`); unset otherwise, so the other modes launch exactly as before.
@@ -2436,17 +3227,31 @@ class SumLayer(Layer, nn.Module):
                     dict(allow_modify_flows = allow_modify_flows, logspace_flows = logspace_flows,
                          propagation_alg_id = propagation_alg_id, allow_neg_flows = allow_neg_flows,
                          **propagation_alg_kwargs)
+        # The pass's first writer of this partition's flow slots STORES them -- the buffer's reset folded into the
+        # write (`param_flow_slot_plan`; the circuit's backward sets `_pf_store_flags` from every layer's plan before
+        # the pass, and keys its launch plans on it): the read-add-store Triton kernel with `PF_STORE`, the CUDA kernel
+        # in its store mode. Any other kernel accumulates, and the circuit zeroes its slots.
+        pf_planned = self._pf_planned_store(partition_id, kwargs)
+        pf_store = pf_planned and par_kernel is bk_par_bsparse._bk_triton_block_sparse_par_kernel_rmw
 
-        def _launch_par(cfg, out):
+        # The launches below take the call's tensors (`t`: node_flows, node_mars, element_mars, params) as an argument
+        # -- `cur` for this call; a launch plan's launcher (`LaunchPlans`) passes those of the call it replays for, and
+        # holds none of this call's (held, a plan would keep the buffers of its first call alive)
+        cur = dict(node_flows = node_flows, node_mars = node_mars, element_mars = element_mars, params = params)
+        node_mars_tempered = kwargs["node_mars_tempered"] if par_tempered else None
+
+        def _launch_par(cfg, out, t):
+            if pf_planned and not pf_store:
+                self._pf_reset(partition_id, out)        # (an accumulating kernel on slots the plan left un-reset)
             tk, warps = cfg
             ne, cs, ps, fs = _par_edges(tk)
             g = (host_cdiv(ne, tk), host_cdiv(layer_n_nodes, TILE_SIZE_M))
             for pid_m_start in range(0, g[1], 32768):
                 curr_grid = (g[0], min(pid_m_start + 32768, g[1]) - pid_m_start)
                 par_kernel[curr_grid](
-                    node_flows = node_flows,
-                    element_mars = element_mars,
-                    mparams = params,
+                    node_flows = t["node_flows"],
+                    element_mars = t["element_mars"],
+                    mparams = t["params"],
                     param_flows = out,
                     nids = nids,
                     cids = cs,
@@ -2465,9 +3270,10 @@ class SumLayer(Layer, nn.Module):
                     pid_m_offset = pid_m_start,
                     num_stages = 1,
                     **dot_kwargs,
-                    **({"node_mars_tempered": kwargs["node_mars_tempered"]} if par_tempered
-                       else {"node_mars": node_mars}),
+                    **({"node_mars_tempered": node_mars_tempered} if par_tempered
+                       else {"node_mars": t["node_mars"]}),
                     **par_extra,
+                    **({"PF_STORE": True} if pf_store else {}),
                     **({} if warps is None else {"num_warps": warps})
                 )
 
@@ -2495,9 +3301,9 @@ class SumLayer(Layer, nn.Module):
         # which re-enters with the untuned default -- cannot look up the config that just failed.
         par_key = (par_kernel, self.block_size, raw_num_edges, num_nblocks, batch_size,
                    TILE_SIZE_M, TILE_SIZE_B, B_NUM_TILES, TL_DOT, bool(dot_kwargs), allow_modify_flows,
-                   logspace_flows, negate_pflows, allow_neg_flows, propagation_alg_id, default_par_cfg)
+                   logspace_flows, negate_pflows, allow_neg_flows, propagation_alg_id, params.dtype, default_par_cfg)
 
-        def _tuned_par_cfg():
+        def _tuned_par_cfg(param_flows, t):
             cfg = autotune.cached(par_key)
             if cfg is not None:
                 return cfg
@@ -2516,10 +3322,11 @@ class SumLayer(Layer, nn.Module):
             if scr is None:
                 return default_par_cfg
             try:
-                return autotune.pick(par_key, par_cfgs, lambda c: _launch_par(c, scr))
+                return autotune.pick(par_key, par_cfgs, lambda c: _launch_par(c, scr, t))
             finally:
                 del scr
 
+        par_planned = False                                  # whether a site below added this partition's launcher
         # Optional CUDA fast path (CuTe/fp16/TMA), autotuned vs Triton INTO A SCRATCH buffer so the
         # autotune timing runs never corrupt the live param_flows (the kernel is read-accumulate-write).
         # Only intercepts when CUDA wins; Triton / unsupported shapes fall through to the dispatch below
@@ -2549,61 +3356,129 @@ class SumLayer(Layer, nn.Module):
                 # way the element flows already do. Handing it only the CuTe operands forced that fork
                 # even where the ungated layer's own autotuner prefers Triton -- 63 -> 123 us at batch
                 # 1024, the single largest item in the gated backward's overhead.
-                self._ext_bw_par_hook(dict(
-                    param_flows = param_flows, node_flows = node_flows, node_mars = node_mars,
-                    element_mars = element_mars, params = params,
+                static = dict(
                     nbase = nbase, cbase = cbase, pbase = pbase, fbase = fbase, cute_ok = True,
                     nids = nids, cids = cids, pids = pids, pfids = pfids,
                     batch_size = batch_size, block_size = self.block_size, num_edges = num_edges,
                     TILE_SIZE_B = TILE_SIZE_B, B_NUM_TILES = B_NUM_TILES, TILE_SIZE_K = TILE_SIZE_K,
                     TILE_SIZE_M = TILE_SIZE_M, TL_DOT = TL_DOT, grid = grid,
                     partition_id = partition_id, signature = id(pfids),
-                ))
+                )
+
+                def _hook(node_flows, element_flows, node_mars, element_mars, params, param_flows, static = static):
+                    if pf_planned:
+                        self._pf_reset(partition_id, param_flows)   # (the external hooks accumulate)
+                    self._ext_bw_par_hook(dict(static, param_flows = param_flows, node_flows = node_flows,
+                                               node_mars = node_mars, element_mars = element_mars, params = params))
+
+                LaunchPlans.add(_hook)
+                _hook(node_flows, None, node_mars, element_mars, params, param_flows)
                 return None
 
             if par_ok:
-                def _cuda_par(tgt):
-                    # mode 0 = read-accumulate-write (RMW): always correct (accumulates onto prior
-                    # param_flows, e.g. multi-batch). The kernel also has a store-only mode that skips
-                    # the RMW read, but that is only valid when param_flows is freshly zeroed; not used
-                    # here to keep the path unconditionally correct.
-                    cuda_kernels.par_backward_sum(tgt, node_flows, node_mars, element_mars, params,
-                        nbase, cbase, pbase, fbase, batch_size, self.block_size, num_edges, 0)
+                def _cuda_par(tgt, t):
+                    # mode 0 = read-accumulate-write (RMW: accumulates onto prior param_flows, e.g. multi-batch);
+                    # mode 2 = store-only, for the pass's first writer of these slots (`pf_store`: the reset folded in)
+                    if pf_planned and not pf_store:
+                        self._pf_reset(partition_id, tgt)
+                    cuda_kernels.par_backward_sum(tgt, t["node_flows"], t["node_mars"], t["element_mars"], t["params"],
+                        nbase, cbase, pbase, fbase, batch_size, self.block_size, num_edges, 2 if pf_store else 0)
 
-                def _triton_par(tgt):
-                    _launch_par(default_par_cfg, tgt)
+                def _triton_par(tgt, t):
+                    _launch_par(default_par_cfg, tgt, t)
 
                 choice_key = (par_sig, batch_size)
-                choice = self._cached_bk_par_choice.get(choice_key)
-                if choice is None:
-                    # autotune into a scratch clone (corruption-safe; the kernel is read-accumulate-write).
-                    # `param_flows` is the full param array (can be GBs), so the scratch is LOCAL and freed
-                    # right after the autotune (run once per signature; the choice is then cached). If the
-                    # scratch can't be allocated (memory-constrained GPU), fall back to Triton.
-                    try:
-                        scr = torch.empty_like(param_flows)
-                        choice = autotune.best_of(
-                            [("triton", (lambda: _triton_par(scr))), ("cuda", (lambda: _cuda_par(scr)))]) or "triton"
-                        del scr
-                    except torch.cuda.OutOfMemoryError:
-                        choice = "triton"
-                    self._cached_bk_par_choice[choice_key] = choice
-                if choice == "cuda":
-                    _cuda_par(param_flows)
+
+                def _choice(param_flows, t):
+                    """The faster of the CUDA kernel and the Triton default, measured once per (partition, batch)."""
+                    choice = self._cached_bk_par_choice.get(choice_key)
+                    if choice is None:
+                        # autotune into a scratch clone (corruption-safe; the kernel is read-accumulate-write).
+                        # `param_flows` is the full param array (can be GBs), so the scratch is LOCAL and freed
+                        # right after the autotune (run once per signature; the choice is then cached). If the
+                        # scratch can't be allocated (memory-constrained GPU), fall back to Triton.
+                        try:
+                            scr = torch.empty_like(param_flows)
+                            choice = autotune.best_of(
+                                [("triton", (lambda: _triton_par(scr, t))), ("cuda", (lambda: _cuda_par(scr, t)))]) \
+                                or "triton"
+                            del scr
+                        except torch.cuda.OutOfMemoryError:
+                            choice = "triton"
+                        self._cached_bk_par_choice[choice_key] = choice
+                    return choice
+
+                # A tied step's flows into its group's slots (`deferred_par`: the flush after the pass) where the
+                # partition's shape allows it (`may_defer`) and the call does (`try_defer`: the backward's
+                # `defer_param_flows`, a scope open, the group's tables). Sound here because `par_ok` holds -- the
+                # kernels the flush replaces write without a hazard: collision-free flows, contiguous tables -- and the
+                # regime is the CUDA kernel's (LL, log-space flows, no tempering / negation / fp32-level dots).
+                pd_mod = cuda_kernels.get_par_deferred_module()
+                ctx = dict(partition_id = partition_id, batch_size = batch_size, block_size = self.block_size,
+                           num_edges = num_edges, nids = nids, cids = cids, pids = pids, pfids = pfids)
+                defers = deferred_par.may_defer(pd_mod, ctx, 1)
+                blk = self.block_size
+
+                def _defer(param_flows, t):
+                    if defers and pf_planned:
+                        self._pf_reset(partition_id, param_flows)   # (the deferred flush accumulates at the pass's end)
+                    sc = self.__dict__.get("_bk_stream_children")
+                    done = defers and deferred_par.try_defer(pd_mod, self, dict(ctx, param_flows = param_flows,
+                                                                                children = sc, **t),
+                                                             None, None, blk, blk, 0, 1)
+                    if sc is not None and not done:
+                        # (the product layer below fused, these flows not deferred after all -- a call whose deferral
+                        # declines: the per-step kernels read the element values, formed here as its forward forms
+                        # them: the same bits)
+                        form_elements(t["element_mars"], t["node_mars"], sc)
+                    return done
+
+                # The partition's flows as ONE launcher of a plan (`LaunchPlans`): deferred, or the measured kernel --
+                # the Triton one at its tuned config, as the dispatch below launches it
+                def _par(node_flows, element_flows, node_mars, element_mars, params, param_flows):
+                    t = dict(node_flows = node_flows, node_mars = node_mars, element_mars = element_mars,
+                             params = params)
+                    if _defer(param_flows, t):
+                        return
+                    if _choice(param_flows, t) == "cuda":
+                        _cuda_par(param_flows, t)
+                    else:
+                        _launch_par(_tuned_par_cfg(param_flows, t), param_flows, t)
+
+                LaunchPlans.add(_par)
+                par_planned = True
+                if _defer(param_flows, cur):
+                    # (deferred at this batch: what a backward with the product layer below fused needs)
+                    deferred = self.__dict__.setdefault("_bk_par_deferred", {})
+                    if not deferred.get((batch_size, partition_id)):
+                        deferred[(batch_size, partition_id)] = True
+                        self.__dict__.pop("_bk_fusion_ready_", None)
                     return None
-                # choice == "triton": fall through to the Triton dispatch below
+                if _choice(param_flows, cur) == "cuda":
+                    _cuda_par(param_flows, cur)
+                    return None
+                # choice == "triton": fall through to the Triton dispatch below (its OOM retry)
 
         if self._ext_bw_par_triton_hook is not None:
             # The CuTe fork did not claim this shape (it needs num_edges % 128 and block_size % 64).
             # The Triton fork has neither requirement, so it covers what the CUDA forks cannot.
-            self._ext_bw_par_triton_hook(dict(
-                node_flows = node_flows, node_mars = node_mars, element_mars = element_mars,
-                params = params, param_flows = param_flows, nids = nids, cids = cids, pids = pids,
+            static = dict(
+                nids = nids, cids = cids, pids = pids,
                 pfids = pfids, batch_size = batch_size, num_edges = num_edges,
                 block_size = self.block_size, TILE_SIZE_B = TILE_SIZE_B, B_NUM_TILES = B_NUM_TILES,
                 TILE_SIZE_K = TILE_SIZE_K, TILE_SIZE_M = TILE_SIZE_M, TL_DOT = TL_DOT, grid = grid,
                 partition_id = partition_id,
-            ))
+            )
+
+            def _hook(node_flows, element_flows, node_mars, element_mars, params, param_flows, static = static):
+                if pf_planned:
+                    self._pf_reset(partition_id, param_flows)       # (the external hooks accumulate)
+                self._ext_bw_par_triton_hook(dict(static, node_flows = node_flows, node_mars = node_mars,
+                                                  element_mars = element_mars, params = params,
+                                                  param_flows = param_flows))
+
+            LaunchPlans.add(_hook)
+            _hook(node_flows, None, node_mars, element_mars, params, param_flows)
             return None
 
         if self._ext_bw_par_hook is not None:
@@ -2620,7 +3495,7 @@ class SumLayer(Layer, nn.Module):
         # OOM-safe tuned launch: `OutOfResources` is raised at COMPILE time, before any write to
         # `param_flows`, so retrying from scratch cannot double-accumulate.
         try:
-            _launch_par(_tuned_par_cfg(), param_flows)
+            _launch_par(_tuned_par_cfg(param_flows, cur), param_flows, cur)
         except _TritonOutOfResources:
             if default_par_cfg[1] is None:
                 raise
@@ -2635,13 +3510,20 @@ class SumLayer(Layer, nn.Module):
                 force_use_fp32 = force_use_fp32, partition_id = partition_id,
                 pflow_temperature = pflow_temperature, **kwargs)
 
+        if not par_planned:                                  # (the CUDA-regime site above added its own)
+            def _par_triton(node_flows, element_flows, node_mars, element_mars, params, param_flows):
+                t = dict(node_flows = node_flows, node_mars = node_mars, element_mars = element_mars, params = params)
+                _launch_par(_tuned_par_cfg(param_flows, t), param_flows, t)
+
+            LaunchPlans.add(_par_triton)
         return None
 
     def _backward_sparse(self, node_flows: torch.Tensor, element_flows: torch.Tensor, 
                          params: torch.Tensor, node_mars: torch.Tensor, 
                          element_mars: torch.Tensor, param_flows: torch.Tensor, 
-                         nids: Optional[torch.Tensor], cids: Optional[torch.Tensor], pids: Optional[torch.Tensor], pfids: Optional[torch.Tensor],
-                         chids: Optional[torch.Tensor], parids: Optional[torch.Tensor], parpids: Optional[torch.Tensor], 
+                         nids: Optional[torch.Tensor], cids: Optional[torch.Tensor], pids: Optional[torch.Tensor],
+                         pfids: Optional[torch.Tensor],
+                         chids: Optional[torch.Tensor], parids: Optional[torch.Tensor], parpids: Optional[torch.Tensor],
                          cs_block_size: int,
                          partition_id: int = -1, allow_modify_flows: bool = False, 
                          propagation_alg: str = "LL", logspace_flows: bool = False, 
@@ -2898,6 +3780,8 @@ class SumLayer(Layer, nn.Module):
         `pids`:          [ng, c]
         """
 
+        if self._pf_planned_store(partition_id, kwargs):
+            self._pf_reset(partition_id, param_flows)            # (every kernel of this path accumulates)
         assert params.dim() == 1, "Expecting a 1D `params`."
 
         num_nblocks = nids.size(0)
@@ -2913,11 +3797,13 @@ class SumLayer(Layer, nn.Module):
         if num_edges <= 1024:
             BLOCK_B = max(min(2048 // num_edges, BATCH_SIZE_NP2), 1)
             BLOCK_K = num_edges
-            BLOCK_M = self.block_size # The kernel recovers the node block via `pid_m // BLOCK_M`, so this must equal `block_size`
+            # The kernel recovers the node block via `pid_m // BLOCK_M`, so this must equal `block_size`
+            BLOCK_M = self.block_size
         else:
             BLOCK_B = min(512, BATCH_SIZE_NP2)
             BLOCK_K = min(2048 // BLOCK_B, num_edges)
-            BLOCK_M = self.block_size # The kernel recovers the node block via `pid_m // BLOCK_M`, so this must equal `block_size`
+            # The kernel recovers the node block via `pid_m // BLOCK_M`, so this must equal `block_size`
+            BLOCK_M = self.block_size
         B_NUM_BLOCKS = host_cdiv(batch_size, BLOCK_B)
         K_NUM_BLOCKS = host_cdiv(num_edges, BLOCK_K)
 
@@ -2963,9 +3849,13 @@ class SumLayer(Layer, nn.Module):
                 and batch_size < 16 and self.block_size % 32 == 0
                 and node_flows.is_cuda and cuda_kernels.smallbatch_par_is_available()
                 and self._ext_bw_par_sb_hook is not None):
-            self._ext_bw_par_sb_hook(
-                param_flows, node_flows, node_mars, element_mars, params, nids, cids, pids, pfids,
-                batch_size, self.block_size, num_edges, partition_id)
+            static = (nids, cids, pids, pfids, batch_size, self.block_size, num_edges, partition_id)
+
+            def _hook(node_flows, element_flows, node_mars, element_mars, params, param_flows, static = static):
+                self._ext_bw_par_sb_hook(param_flows, node_flows, node_mars, element_mars, params, *static)
+
+            LaunchPlans.add(_hook)
+            _hook(node_flows, None, node_mars, element_mars, params, param_flows)
             return None
 
         if (BACKWARD_PAR_FLOW_CUDA and propagation_alg_id == 0 and abs(pflow_temperature - 1.0) < 1e-6
@@ -3167,6 +4057,10 @@ class SumLayer(Layer, nn.Module):
 
         assert propagation_alg == "LL"
 
+        # fp32 math whatever the parameters are stored in (`params.log()` would otherwise run in bf16); the identity at
+        # fp32
+        params = params.float()
+
         # Flows w.r.t. input elements (product nodes)
         if chids is not None:
             self._backward_pytorch_ele_kernel(
@@ -3192,13 +4086,19 @@ class SumLayer(Layer, nn.Module):
 
         num_nblocks = chids.size(0)
         num_eblocks = parids.size(1)
-        parids = (parids[:,:,None].repeat(1, 1, self.block_size) + torch.arange(0, self.block_size, device = parids.device)).reshape(num_nblocks, num_eblocks * self.block_size)
+        parids = (parids[:,:,None].repeat(1, 1, self.block_size)
+                  + torch.arange(0, self.block_size, device = parids.device)).reshape(
+            num_nblocks, num_eblocks * self.block_size)
         parpids = (parpids[:,:,None] + torch.arange(0, self.block_size, device = parids.device)).reshape(
             num_nblocks, num_eblocks * self.block_size)
 
-        chids = (chids[:,None].repeat(1, cs_block_size) + torch.arange(0, cs_block_size, device = chids.device)).reshape(num_nblocks * cs_block_size)
-        parids = parids[:,None,:].repeat(1, cs_block_size, 1).reshape(num_nblocks * cs_block_size, num_eblocks * self.block_size)
-        parpids = (parpids[:,None,:].repeat(1, cs_block_size, 1) + torch.arange(0, cs_block_size * self.block_size, self.block_size, device = parpids.device)[None,:,None]).reshape(
+        chids = (chids[:,None].repeat(1, cs_block_size)
+                 + torch.arange(0, cs_block_size, device = chids.device)).reshape(num_nblocks * cs_block_size)
+        parids = parids[:,None,:].repeat(1, cs_block_size, 1).reshape(num_nblocks * cs_block_size,
+                                                                      num_eblocks * self.block_size)
+        parpids = (parpids[:,None,:].repeat(1, cs_block_size, 1)
+                   + torch.arange(0, cs_block_size * self.block_size, self.block_size,
+                                  device = parpids.device)[None,:,None]).reshape(
             num_nblocks * cs_block_size, num_eblocks * self.block_size
         )
         
@@ -3231,14 +4131,18 @@ class SumLayer(Layer, nn.Module):
             torch.arange(0, self.block_size, device = nids.device)[None,:]).reshape(num_nblocks * self.block_size)
         cids = cids[:,None,:].repeat(1, self.block_size, 1).reshape(num_nblocks * self.block_size, num_edges)
         pids = (pids[:,None,:].repeat(1, self.block_size, 1) + \
-            torch.arange(0, self.block_size, device = cids.device)[None,:,None]).reshape(num_nblocks * self.block_size, num_edges)
+            torch.arange(0, self.block_size, device = cids.device)[None,:,None]).reshape(
+                num_nblocks * self.block_size, num_edges)
         pfids = (pfids[:,None,:].repeat(1, self.block_size, 1) + \
-            torch.arange(0, self.block_size, device = cids.device)[None,:,None]).reshape(num_nblocks * self.block_size, num_edges)
+            torch.arange(0, self.block_size, device = cids.device)[None,:,None]).reshape(
+                num_nblocks * self.block_size, num_edges)
 
         if logspace_flows:
-            parflows = (node_flows[nids].exp().unsqueeze(1) * params[pids].unsqueeze(-1) * (element_mars[cids] - node_mars[nids].unsqueeze(1)).exp()).sum(dim = 2)
+            parflows = (node_flows[nids].exp().unsqueeze(1) * params[pids].unsqueeze(-1)
+                        * (element_mars[cids] - node_mars[nids].unsqueeze(1)).exp()).sum(dim = 2)
         else:
-            parflows = (node_flows[nids].unsqueeze(1) * params[pids].unsqueeze(-1) * (element_mars[cids] - node_mars[nids].unsqueeze(1)).exp()).sum(dim = 2)
+            parflows = (node_flows[nids].unsqueeze(1) * params[pids].unsqueeze(-1)
+                        * (element_mars[cids] - node_mars[nids].unsqueeze(1)).exp()).sum(dim = 2)
 
         for i in range(num_nblocks):
             sid, eid = ns_block_size * i, ns_block_size * (i + 1)

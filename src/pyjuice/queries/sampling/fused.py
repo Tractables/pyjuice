@@ -259,7 +259,7 @@ def _fused_top_down_kernel(
             m2 = lane[:, None] & (offs_e[None, :] < E_S)
             base = lvl * NB * E_S + safe_nid[:, None] * E_S + offs_e[None, :]
             par_id = tl.load(sum_pids + base, mask = m2, other = 0)
-            epars = tl.load(mparams + par_id + l_off[:, None], mask = m2, other = 0.0)
+            epars = tl.load(mparams + par_id + l_off[:, None], mask = m2, other = 0.0).to(tl.float32)
             ch_id = tl.load(sum_cids + base, mask = m2, other = -1)
 
             # A product node's marginal is the sum of its own children's `node_mars`, so it is

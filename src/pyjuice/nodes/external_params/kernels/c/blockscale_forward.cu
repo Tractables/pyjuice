@@ -38,6 +38,7 @@
 // layer raises `NotImplementedError` outside all of that rather than falling back to something slower.
 
 #include <torch/extension.h>
+#include "../../../../layer/kernels/c/param_load.cuh"   // `ParamLoad<TP>`: the parameters in their stored dtype
 #include <cuda_bf16.h>
 #include <cuda.h>
 #include <c10/cuda/CUDAStream.h>
@@ -179,9 +180,9 @@ int smem_bytes(int BM, int BN, int gate_cbs) {
 // loop no longer unrolls, which measured +2.6 to +2.9% on dense shapes. Specialized, the common
 // case generates exactly the single-transfer, fully-unrolled code it did before this kernel
 // learned to read the tables. Same reason `gate_pass` is specialized on the gate width.
-template <int BM, int BN, int WM, int WN, bool SINGLE_RUN>
+template <int BM, int BN, int WM, int WN, bool SINGLE_RUN, typename TP>
 __global__ void __launch_bounds__(WM * WN * 32) blockscale_tlmm_kernel(
-        float* __restrict__ node_mars, const float* __restrict__ mp,
+        float* __restrict__ node_mars, const TP* __restrict__ mp,
         const float* __restrict__ ext, const long* __restrict__ nids,
         const long* __restrict__ cids, const long* __restrict__ pids,
         const long* __restrict__ gate, float* __restrict__ log_z_out,
@@ -404,13 +405,11 @@ __global__ void __launch_bounds__(WM * WN * 32) blockscale_tlmm_kernel(
             const long pcr = ep[kt] + (long)tile_id * BM;
             for (int i = tid; i < (BM * BK) / 8; i += NTH) {
                 int e = i / (BM / 8), mm = (i % (BM / 8)) * 8;
-                const float* g = &mp[pcr + (long)e * block_size + mm];
-                float4 a = *(const float4*)g, b = *(const float4*)(g + 4);
+                float v[8];
+                ParamLoad<TP>::load8(&mp[pcr + (long)e * block_size + mm], v);
                 bfloat16_t r[8];
-                r[0] = static_cast<bfloat16_t>(a.x); r[1] = static_cast<bfloat16_t>(a.y);
-                r[2] = static_cast<bfloat16_t>(a.z); r[3] = static_cast<bfloat16_t>(a.w);
-                r[4] = static_cast<bfloat16_t>(b.x); r[5] = static_cast<bfloat16_t>(b.y);
-                r[6] = static_cast<bfloat16_t>(b.z); r[7] = static_cast<bfloat16_t>(b.w);
+                CUTE_UNROLL
+                for (int j = 0; j < 8; j++) r[j] = static_cast<bfloat16_t>(v[j]);
                 *(float4*)&sAt(mm, e) = *(const float4*)r;
             }
         } else {
@@ -419,13 +418,11 @@ __global__ void __launch_bounds__(WM * WN * 32) blockscale_tlmm_kernel(
                 const int e_off = r0 * step;
                 for (int i = tid; i < (BM * step) / 8; i += NTH) {
                     int e = i / (BM / 8), mm = (i % (BM / 8)) * 8;
-                    const float* g = &mp[pcr + (long)e * block_size + mm];
-                    float4 a = *(const float4*)g, b = *(const float4*)(g + 4);
+                    float v[8];
+                    ParamLoad<TP>::load8(&mp[pcr + (long)e * block_size + mm], v);
                     bfloat16_t r[8];
-                    r[0] = static_cast<bfloat16_t>(a.x); r[1] = static_cast<bfloat16_t>(a.y);
-                    r[2] = static_cast<bfloat16_t>(a.z); r[3] = static_cast<bfloat16_t>(a.w);
-                    r[4] = static_cast<bfloat16_t>(b.x); r[5] = static_cast<bfloat16_t>(b.y);
-                    r[6] = static_cast<bfloat16_t>(b.z); r[7] = static_cast<bfloat16_t>(b.w);
+                    CUTE_UNROLL
+                    for (int j = 0; j < 8; j++) r[j] = static_cast<bfloat16_t>(v[j]);
                     *(float4*)&sAt(mm, e_off + e) = *(const float4*)r;
                 }
             }
@@ -478,7 +475,7 @@ __global__ void __launch_bounds__(WM * WN * 32) blockscale_tlmm_kernel(
 
 // ============================================================ launchers
 
-template <int BM, int BN, int WM, int WN>
+template <int BM, int BN, int WM, int WN, typename TP>
 static void launch_cfg(torch::Tensor node_mars, torch::Tensor element_mars, torch::Tensor params,
                        torch::Tensor ext, torch::Tensor nids, torch::Tensor cids,
                        torch::Tensor pids, torch::Tensor gate, torch::Tensor log_z,
@@ -510,8 +507,8 @@ static void launch_cfg(torch::Tensor node_mars, torch::Tensor element_mars, torc
 
     const bool single = (step == BK);
     const int smem = smem_bytes(BM, BN, gate_cbs);
-    TORCH_CHECK(cudaFuncSetAttribute(single ? (const void*)blockscale_tlmm_kernel<BM, BN, WM, WN, true>
-                                            : (const void*)blockscale_tlmm_kernel<BM, BN, WM, WN, false>,
+    TORCH_CHECK(cudaFuncSetAttribute(single ? (const void*)blockscale_tlmm_kernel<BM, BN, WM, WN, true, TP>
+                                            : (const void*)blockscale_tlmm_kernel<BM, BN, WM, WN, false, TP>,
                                      cudaFuncAttributeMaxDynamicSharedMemorySize, smem)
                     == cudaSuccess,
                 "blockscale forward: this tile needs ", smem, " B of shared memory, which this device "
@@ -523,9 +520,9 @@ static void launch_cfg(torch::Tensor node_mars, torch::Tensor element_mars, torc
         int chunk = (total_m - off < MAX_Y) ? (total_m - off) : MAX_Y;
         dim3 grid(batch / BN, chunk);
 #define BS_LAUNCH(SR)                                                                              \
-        blockscale_tlmm_kernel<BM, BN, WM, WN, SR><<<grid, NTH, smem,                              \
+        blockscale_tlmm_kernel<BM, BN, WM, WN, SR, TP><<<grid, NTH, smem,                          \
                                                      c10::cuda::getCurrentCUDAStream()>>>(         \
-            node_mars.data_ptr<float>(), params.data_ptr<float>(), ext.data_ptr<float>(),          \
+            node_mars.data_ptr<float>(), param_ptr<TP>(params), ext.data_ptr<float>(),             \
             nids.data_ptr<long>(), cids.data_ptr<long>(), pids.data_ptr<long>(),                   \
             gate.data_ptr<long>(),                                                                 \
             log_z.numel() ? log_z.data_ptr<float>() : nullptr,                                     \
@@ -610,26 +607,30 @@ void blockscale_forward(torch::Tensor node_mars, torch::Tensor element_mars, tor
                 "blockscale forward: cids/pids must hold one entry per step-run (",
                 num_edges / step, "), got ", cids.size(1));
 
-    switch (cfg) {
-        case 0: launch_cfg<128, 64, 2, 2>(node_mars, element_mars, params, ext, nids, cids, pids,
-                                          gate, log_z, batch, (int)block_size, knt,
-                                          (int)node_cbs, (int)gate_cbs, node_sh, gate_sh, (long)ext_base, step_sh); break;
-        case 1: launch_cfg<64, 64, 2, 2>(node_mars, element_mars, params, ext, nids, cids, pids,
-                                         gate, log_z, batch, (int)block_size, knt,
-                                         (int)node_cbs, (int)gate_cbs, node_sh, gate_sh, (long)ext_base, step_sh); break;
-        case 2: launch_cfg<256, 64, 4, 2>(node_mars, element_mars, params, ext, nids, cids, pids,
-                                          gate, log_z, batch, (int)block_size, knt,
-                                          (int)node_cbs, (int)gate_cbs, node_sh, gate_sh, (long)ext_base, step_sh); break;
-        case 3: launch_cfg<128, 128, 2, 4>(node_mars, element_mars, params, ext, nids, cids, pids,
-                                           gate, log_z, batch, (int)block_size, knt,
-                                           (int)node_cbs, (int)gate_cbs, node_sh, gate_sh, (long)ext_base, step_sh); break;
-        case 4: launch_cfg<64, 64, 4, 2>(node_mars, element_mars, params, ext, nids, cids, pids,
-                                         gate, log_z, batch, (int)block_size, knt,
-                                         (int)node_cbs, (int)gate_cbs, node_sh, gate_sh, (long)ext_base, step_sh); break;
-        default: launch_cfg<128, 64, 4, 2>(node_mars, element_mars, params, ext, nids, cids, pids,
-                                           gate, log_z, batch, (int)block_size, knt,
-                                           (int)node_cbs, (int)gate_cbs, node_sh, gate_sh, (long)ext_base, step_sh); break;
-    }
+    auto run = [&](auto tag) {
+        using TP = decltype(tag);
+        switch (cfg) {
+            case 0: launch_cfg<128, 64, 2, 2, TP>(node_mars, element_mars, params, ext, nids, cids, pids,
+                                              gate, log_z, batch, (int)block_size, knt,
+                                              (int)node_cbs, (int)gate_cbs, node_sh, gate_sh, (long)ext_base, step_sh); break;
+            case 1: launch_cfg<64, 64, 2, 2, TP>(node_mars, element_mars, params, ext, nids, cids, pids,
+                                             gate, log_z, batch, (int)block_size, knt,
+                                             (int)node_cbs, (int)gate_cbs, node_sh, gate_sh, (long)ext_base, step_sh); break;
+            case 2: launch_cfg<256, 64, 4, 2, TP>(node_mars, element_mars, params, ext, nids, cids, pids,
+                                              gate, log_z, batch, (int)block_size, knt,
+                                              (int)node_cbs, (int)gate_cbs, node_sh, gate_sh, (long)ext_base, step_sh); break;
+            case 3: launch_cfg<128, 128, 2, 4, TP>(node_mars, element_mars, params, ext, nids, cids, pids,
+                                               gate, log_z, batch, (int)block_size, knt,
+                                               (int)node_cbs, (int)gate_cbs, node_sh, gate_sh, (long)ext_base, step_sh); break;
+            case 4: launch_cfg<64, 64, 4, 2, TP>(node_mars, element_mars, params, ext, nids, cids, pids,
+                                             gate, log_z, batch, (int)block_size, knt,
+                                             (int)node_cbs, (int)gate_cbs, node_sh, gate_sh, (long)ext_base, step_sh); break;
+            default: launch_cfg<128, 64, 4, 2, TP>(node_mars, element_mars, params, ext, nids, cids, pids,
+                                               gate, log_z, batch, (int)block_size, knt,
+                                               (int)node_cbs, (int)gate_cbs, node_sh, gate_sh, (long)ext_base, step_sh); break;
+        }
+    };
+    if (params.scalar_type() == torch::kBFloat16) run(__nv_bfloat16{}); else run(float{});
 }
 
 

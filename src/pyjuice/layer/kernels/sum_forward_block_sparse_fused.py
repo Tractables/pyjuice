@@ -112,7 +112,7 @@ def _fw_triton_block_sparse_tlmm_fused_kernel(node_mars, mparams, nids, cids_sta
     acc = tl.zeros([TILE_SIZE_M, BLOCK_B], dtype = tl.float32) - float("inf")
 
     for k in range(0, K_NUM_TILES):
-        epars = tl.load(epars_ptr)
+        epars = tl.load(epars_ptr).to(tl.float32)
 
         # The element values: the sum of the children's node values (`_children_sum`), the dummy element -inf
         emars = _children_sum(node_mars, ele_children + (edge_rows - ele_first_row) * K_CH, edge_rows != 0, offs_batch,

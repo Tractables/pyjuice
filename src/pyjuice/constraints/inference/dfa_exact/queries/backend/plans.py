@@ -49,7 +49,9 @@ from typing import Optional
 
 import numpy as np
 import torch
+from numba import njit
 
+from ...compiled.program import TRANS_COLS
 from .planners import IndexLists, _forward_steps, _mode_workspace, _top_down_modes, _top_down_steps, _top_down_tables, \
     class_weight_writes
 
@@ -77,6 +79,10 @@ class QueryPlan:
     :ivar reg_prior: int32 [sum regions] (device): 1 where a region's values are in ``prior_mars`` for this query
     :ivar sample: bool [sum intervals] (host): the inside values the query computes per sample
     :ivar top_down: None, or the query's :class:`TopDownPlan`
+    :ivar busy: the indices of the steps with anything to run, ascending (the others' parts are all empty)
+    :ivar input_reads: None (every position), or int32 [n] (device): 1 at the positions whose input values its
+        launches read (:func:`input_reads`), the only ones a query computes, and ``input_positions`` those (bool,
+        host)
     """
 
     steps: list
@@ -87,6 +93,9 @@ class QueryPlan:
     reg_prior: torch.Tensor
     sample: np.ndarray
     top_down: Optional["TopDownPlan"] = None
+    busy: Optional[list] = None
+    input_reads: Optional[torch.Tensor] = None
+    input_positions: Optional[np.ndarray] = None
 
 
 @dataclass
@@ -114,6 +123,8 @@ class TopDownPlan:
         (see :class:`~.top_down_program.TopDownProgram`), and ``dead_regions``, their regions
     :ivar cw_fill: a scoring plan's: whether ``dfa_class_flow`` must hold -inf before its class weight launches run
         (:func:`~.planners.class_weight_writes`; their entries ``(launch, index list, store)``)
+    :ivar busy: the indices of the steps with anything to run, ascending (the others' parts are all empty)
+    :ivar input_reads: bool [n] (host): the positions whose input values its launches read (:func:`input_reads`)
     """
 
     steps: list
@@ -127,6 +138,72 @@ class TopDownPlan:
     dead: Optional[torch.Tensor]
     dead_regions: list
     cw_fill: bool = True
+    busy: Optional[list] = None
+    input_reads: Optional[np.ndarray] = None
+
+
+def _stage_inputs(stages, out: np.ndarray):
+    """Into ``out`` (bool [n]): the positions whose input values the product ``stages`` read -- lists of ``(launch,
+    cut)``: an ``input @ block`` or ``block @ input`` step reads its input's, the others none -- every step the cut
+    runs, by chunk, and by group where the grouped kernel runs them (an index list on the device alone: all of
+    them)."""
+    for stage in stages:
+        for launch, cut in stage:
+            col = TRANS_COLS.get(launch.form)
+            if col is None:
+                continue
+            t = launch.rows.numpy()[:, col[1]]
+            for s0, s1, _, idx, _ in cut.chunks:
+                every = idx is None or idx.host is None
+                out[t[s0:s1] if every else t[s0 + np.asarray(idx.host, dtype = np.int64)]] = True
+            for G, (idx, _) in (cut.groups or {}).items():
+                firsts = np.asarray(launch.groups_host[G], dtype = np.int64)
+                every = idx is None or idx.host is None
+                g = np.arange(firsts.size - 1) if every else np.asarray(idx.host, dtype = np.int64)
+                run = np.zeros(t.size + 1, dtype = np.int64)       # (the steps of the groups run)
+                np.add.at(run, firsts[g], 1)
+                np.add.at(run, firsts[g + 1], -1)
+                out[t[np.cumsum(run[:-1]) > 0]] = True
+
+
+def input_reads(n: int, steps: list, top_down: bool = False) -> np.ndarray:
+    """
+    bool [n]: the positions whose input values (the input layers' rows of ``node_mars``) a plan's launches read, its
+    ``steps``' index lists on the host still: the product stages' steps (:func:`_stage_inputs`) -- forward, kept once
+    or per sample, or (``top_down``) the folds the top-down pass computes again -- and the top-down launches of
+    ``input @ block`` and ``block @ input`` steps, which read their parents' inputs (their children's every parent,
+    the children a launch walks). Those launches are the only readers (an input's value is read only where its token
+    is observed -- a missing one through its transition masses; a sum layer reads products, the class weights flows
+    and blocks), so a query computes the inputs of these positions alone.
+    """
+    out = np.zeros(n, dtype = bool)
+    for step in steps:
+        if step is None or step[0] != "prod":
+            continue
+        for layer in step[2]:
+            if not top_down:
+                _stage_inputs(layer[0], out)
+                _stage_inputs(layer[1], out)
+                continue
+            folds, stages = layer[0], layer[1]
+            _stage_inputs(folds[0], out)
+            _stage_inputs(folds[1], out)
+            for once_l, sample_l, _ in stages:
+                for la, item in list(once_l) + list(sample_l):
+                    col = TRANS_COLS.get(la.form)
+                    if col is None:
+                        continue
+                    ptr = np.asarray(la.host["ptr"], dtype = np.int64)
+                    if item is None or item.host is None:
+                        c = np.arange(ptr.size - 1)
+                    else:
+                        c = np.asarray(item.host, dtype = np.int64).ravel()
+                        c = c[c >= 0]                                # (node tiles' padding)
+                    run = np.zeros(ptr[-1] + 1, dtype = np.int64)    # (the children's parents)
+                    np.add.at(run, ptr[c], 1)
+                    np.add.at(run, ptr[c + 1], -1)
+                    out[np.asarray(la.host["parents"])[np.cumsum(run[:-1]) > 0, col[1]]] = True
+    return out
 
 
 def _prefix(mask: np.ndarray) -> np.ndarray:
@@ -135,10 +212,23 @@ def _prefix(mask: np.ndarray) -> np.ndarray:
     return out
 
 
+@njit(cache = True)
+def _unobserved(observed, bounds, outside):
+    """Per interval ``[a, b)`` of ``bounds``: whether ``observed`` (bool [n]) holds no position inside it -- or, with
+    ``outside``, none outside it."""
+    P = np.zeros(observed.size + 1, dtype = np.int64)
+    for i in range(observed.size):
+        P[i + 1] = P[i] + observed[i]
+    out = np.empty(bounds.shape[0], dtype = np.bool_)
+    for k in range(bounds.shape[0]):
+        a, b = bounds[k, 0], bounds[k, 1]
+        out[k] = (P[a] == 0 and P[-1] == P[b]) if outside else P[b] == P[a]
+    return out
+
+
 def free_regions(prog, observed: np.ndarray) -> np.ndarray:
     """bool [sum intervals]: the input-independent ones -- no sample observes a position of the interval."""
-    P = _prefix(observed)
-    return P[prog.iv_bounds[:, 1]] == P[prog.iv_bounds[:, 0]]
+    return _unobserved(np.ascontiguousarray(observed, dtype = bool), prog.iv_bounds, False)
 
 
 def prior_regions(prog, observed: np.ndarray, B: int, kept: bool, liveness) -> np.ndarray:
@@ -235,12 +325,17 @@ def query_plan(prog, observed: np.ndarray, targets: Optional[np.ndarray], valid:
     prior_read = read | todo
 
     lists = IndexLists()                                 # every index list, copied to the device together
-    steps = _forward_steps(prog, todo, sample, lists)
+    steps, busy = _forward_steps(prog, todo, sample, lists)
     reg_prior = lists.add(prior[prog.reg_iv_np].astype(np.int32))
+    positions = input_reads(prog.n, steps)
+    if td is not None:
+        positions |= td.input_reads
+    reads = lists.add(positions.astype(np.int32))
     lists.upload(prog.dev)
     plan = QueryPlan(steps = steps, todo = torch.from_numpy(todo), prior_read = prior_read,
                      prior = bool(prior_read.any()), root_prior = bool(prior[prog.reg_iv_host[prog.root_region]]),
-                     reg_prior = reg_prior.tensor, sample = sample, top_down = td)
+                     reg_prior = reg_prior.tensor, sample = sample, top_down = td, busy = busy,
+                     input_reads = reads.tensor, input_positions = positions)
     _keep(prog, key, plan)
     return plan
 
@@ -255,14 +350,14 @@ def kept_plan(prog, todo: np.ndarray, prior: np.ndarray, keep: np.ndarray) -> Qu
     """
     lists = IndexLists()
     sample = np.zeros_like(todo)
-    steps = _forward_steps(prog, todo, sample, lists)
+    steps, busy = _forward_steps(prog, todo, sample, lists)
     reg_prior = lists.add(prior[prog.reg_iv_np].astype(np.int32))
     lists.upload(prog.dev)
     read = todo.copy()
     for k in np.nonzero(todo)[0]:
         read[prog.iv_children[k]] = True
     return QueryPlan(steps = steps, todo = torch.from_numpy(todo), prior_read = (read & prior) | keep, prior = True,
-                     root_prior = False, reg_prior = reg_prior.tensor, sample = sample)
+                     root_prior = False, reg_prior = reg_prior.tensor, sample = sample, busy = busy)
 
 
 def read_regions(prog, plan: QueryPlan, root: bool = False) -> np.ndarray:
@@ -309,8 +404,7 @@ def held_intervals(prog, held: np.ndarray) -> np.ndarray:
 def top_down_free(td, observed: np.ndarray) -> np.ndarray:
     """bool [intervals] (by ``prog.intervals``' numbers): the input-independent top-down values -- no sample observes
     a position outside the interval."""
-    P = _prefix(observed)
-    return (P[td.iv_bounds[:, 0]] == 0) & (P[-1] == P[td.iv_bounds[:, 1]])
+    return _unobserved(np.ascontiguousarray(observed, dtype = bool), td.iv_bounds, True)
 
 
 def scope_intervals(td, scopes) -> np.ndarray:
@@ -388,8 +482,8 @@ def top_down_plan(prog, td, targets: Optional[np.ndarray], once: np.ndarray, val
     t, index = _top_down_tables(prog, td)
     m = _top_down_modes(req, positions, once, scoring, t.data, t.offsets, *_mode_workspace(t, td))
     lists = IndexLists()                                 # every index list, copied to the device together
-    out = _top_down_steps(td, t, index, m, scoring, lists)
-    cw_fill = class_weight_writes(prog, out, positions) if scoring else True
+    out, busy = _top_down_steps(td, t, index, m, scoring, lists)
+    cw_fill = class_weight_writes(prog, [out[si] for si in busy], positions) if scoring else True
     prior = m[-1]
     root = prog.root_region
     sample = req & ~r_once
@@ -397,10 +491,12 @@ def top_down_plan(prog, td, targets: Optional[np.ndarray], once: np.ndarray, val
     reads = np.zeros(prog.iv_bounds.shape[0], dtype = bool)                    # by sum interval
     reads[prog.reg_iv_np[prior]] = True
     once_iv, dead_rows = lists.add(once.astype(np.int32)), lists.add(dead.ravel()) if dead.size else None
+    positions = input_reads(n, out, top_down = True)                          # (the index lists on the host still)
     lists.upload(dev)
     return TopDownPlan(steps = out, root = (bool(req[root]), bool(r_once[root])),
                        once = r_once & needed[td.reg_iv], todo = req & r_once, sample = sample,
                        per_sample = needed[td.reg_iv] & ~r_once,
                        once_iv = once_iv.tensor, prior = reads,
                        dead = None if dead_rows is None else dead_rows.tensor.view(-1, 2),
-                       dead_regions = np.nonzero(sample & td.dead_region)[0].tolist(), cw_fill = cw_fill)
+                       dead_regions = np.nonzero(sample & td.dead_region)[0].tolist(), cw_fill = cw_fill,
+                       busy = busy, input_reads = positions)

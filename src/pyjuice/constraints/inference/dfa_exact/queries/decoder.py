@@ -43,6 +43,7 @@ from typing import Optional
 
 import numpy as np
 import torch
+from numba import njit
 
 from ....decoder import Decoder
 from ..kernels.blocks import move_blocks, move_table
@@ -51,6 +52,49 @@ from ..kernels.compact import CompactLayout
 from ..kernels.live import Liveness
 from .conditional import conditional
 from .marginal import marginal
+
+
+@njit(cache = True)
+def _scope_masks(new, asked, a, b, kept_inside, kept_top_down, fresh_rows):
+    """Per sum region (scope ``[a, b)``), from the rows' newly observed positions ``new`` (bool [B, n]) and the asked
+    ones ``asked`` (bool [n]): ``unseen`` (no row newly observes a position of the scope), the kept ``inside`` values
+    that hold (kept and unseen) and the kept ``top_down`` ones (kept, nothing new outside the scope), whether the scope
+    misses an asked position (``asked_out``) or meets one (``asked_in``), and with ``fresh_rows`` the rows newly
+    observing a position of it (``fresh``, bool [R, B]) and the kept inside values that hold for some rows only
+    (``partial``)."""
+    B, n = new.shape
+    R = len(a)
+    cum, ask = np.zeros(n + 1, np.int64), np.zeros(n + 1, np.int64)
+    for t in range(n):
+        seen = False
+        for r in range(B):
+            seen = seen or new[r, t]
+        cum[t + 1] = cum[t] + seen
+        ask[t + 1] = ask[t] + asked[t]
+    unseen, inside, top_down = np.zeros(R, np.bool_), np.zeros(R, np.bool_), np.zeros(R, np.bool_)
+    asked_out, asked_in = np.zeros(R, np.bool_), np.zeros(R, np.bool_)
+    for i in range(R):
+        on = cum[b[i]] - cum[a[i]]
+        unseen[i] = on == 0
+        inside[i] = kept_inside[i] and unseen[i]
+        top_down[i] = kept_top_down[i] and on == cum[n]
+        on_asked = ask[b[i]] - ask[a[i]]
+        asked_out[i] = on_asked < ask[n]
+        asked_in[i] = on_asked > 0
+    fresh = np.zeros((R if fresh_rows else 0, B), np.bool_)
+    partial = np.zeros(R if fresh_rows else 0, np.bool_)
+    if fresh_rows:
+        row = np.zeros(n + 1, np.int64)
+        every = np.ones(R, np.bool_)
+        for r in range(B):
+            for t in range(n):
+                row[t + 1] = row[t] + new[r, t]
+            for i in range(R):
+                fresh[i, r] = row[b[i]] - row[a[i]] > 0
+                every[i] = every[i] and fresh[i, r]
+        for i in range(R):
+            partial[i] = kept_inside[i] and not unseen[i] and not every[i]
+    return unseen, inside, top_down, asked_out, asked_in, fresh, partial
 
 
 def _empty(numel: int, device) -> torch.Tensor:
@@ -186,12 +230,9 @@ class DFAExactDecoder(Decoder):
 
         _, bounds, _, _ = self._region_tables(be.program())
         a, b = bounds[:, 0], bounds[:, 1]
-        cum = np.zeros(be.n + 1, dtype = np.int64)                      # positions newly observed, then targeted,
-        np.cumsum(new.any(axis = 0), out = cum[1:])                     # before every boundary
-        on_new = cum[b] - cum[a]                                        # (in every region's scope)
-        unseen = on_new == 0
-        inside = kept.inside & unseen                                   # nothing new on the scope
-        top_down = kept.top_down & (on_new == cum[-1])                  # nothing new outside it
+        unseen, inside, top_down, asked_out, asked_in, fresh, partial = _scope_masks(   # (nothing new on a scope: its
+            new, np.zeros(be.n, dtype = bool) if marginal else asked, a, b, kept.inside, kept.top_down,   # inside values
+            kept.compact is not None)                                                    # hold; outside it, top-down)
         parked = [dict(p, inside = p["inside"] & unseen) for p in kept.parked]
         parked = [p for p in parked if p["inside"].any()]
         every = inside.copy()                                           # in the buffers, or parked
@@ -200,16 +241,14 @@ class DFAExactDecoder(Decoder):
         if marginal:                                                    # every inside value; no top-down one
             held = (every, np.zeros_like(top_down))
         else:                                                           # those of a scope missing a target; meeting one
-            np.cumsum(asked, out = cum[1:])
-            on_asked = cum[b] - cum[a]
-            held = (every & (on_asked < cum[-1]), top_down & (on_asked > 0))
+            held = (every & asked_out, top_down & asked_in)
         identity = B == kept.B and (parents == np.arange(B)).all()
         if not identity and external is not None and external.batch > 1:   # another row's inputs
             return None, None, None, None
         if kept.compact is not None:                                    # compact: the call re-gathers what it reads
-            carry = None                                                # (and keeps the rest of what it holds)
-            fresh = self._fresh_samples(new, a, b)                      # per region: the rows it must compute again
-            partial = kept.inside & ~unseen & ~fresh.all(axis = 1)      # (some rows' inside values hold)
+            carry = None                                                # (and keeps the rest of what it holds;
+                                                                        # `fresh`: per region, the rows it must
+                                                                        # compute again, `partial`: some rows' hold)
             if held[0].any() or held[1].any() or partial.any():
                 if identity:                                            # every row its own: the same parents
                     rows = self._identity(B, be.device)
@@ -293,14 +332,6 @@ class DFAExactDecoder(Decoder):
         parked = report.get("parked", []) if storage == "compact" and compact is not None else []
         self._kept = _Kept(weakref.ref(be.state), be.state.epoch, precision, storage, B, inside, top_down,
                            report.get("liveness"), compact, parked)
-
-    @staticmethod
-    def _fresh_samples(new: np.ndarray, a: np.ndarray, b: np.ndarray) -> np.ndarray:
-        """bool [sum regions, B]: per region (scope ``[a, b)``), the rows newly observing a position of its scope --
-        whose inside values change; the others' hold (``new``: bool [B, n], the rows' newly observed positions)."""
-        cum = np.zeros((new.shape[0], new.shape[1] + 1), dtype = np.int64)
-        np.cumsum(new, axis = 1, out = cum[:, 1:])
-        return (cum[:, b] - cum[:, a] > 0).T
 
     def _region_tables(self, prog):
         """``(prog, bounds, rows, slots)``: every sum region's scope ``[a, b)`` (int64 [R, 2]), rows and slots per

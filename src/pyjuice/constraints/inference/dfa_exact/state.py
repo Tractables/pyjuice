@@ -691,7 +691,14 @@ class State:
         if self._enum_probs is not None:
             return self._enum_probs
         tokens = self._backend.token_classes.enumerated_tokens.long()
-        table = self.token_major()[tokens].t().contiguous()
+        layers = list(self._backend.pc.input_layer_group)
+        if all(hasattr(lookup(layer.dist), "token_columns") for layer in layers):     # the tokens' columns alone
+            firsts, num_rows, _ = self.class_mass_rows()
+            table = torch.empty(num_rows, tokens.numel(), dtype = torch.float32, device = self._device)
+            for layer, first, end in zip(layers, firsts, firsts[1:] + [num_rows]):
+                lookup(layer.dist).token_columns(layer, np.arange(end - first), tokens, table[first:end])
+        else:
+            table = self.token_major()[tokens].t().contiguous()
         if param_copies_allowed():
             self._enum_probs = table
             register_layer(self)                                    # its exit calls `_release_fast_inference_params`

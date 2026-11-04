@@ -3,6 +3,7 @@ A query's inputs in the one form backends read (:mod:`pyjuice.constraints.eviden
 prefixes and ``missing_mask``; targets given as positions; candidates in every form.
 """
 import pytest
+import numpy as np
 import torch
 
 from pyjuice.constraints.evidence import candidate_tensor, evidence, target_mask
@@ -71,6 +72,30 @@ def test_targets_as_positions_are_the_mask():
         target_mask(torch.zeros(3, 1, dtype = torch.long), 2, n)
     with pytest.raises(TypeError, match = "targets"):
         target_mask(torch.zeros(2), 2, n)
+
+
+@pytest.mark.parametrize("seed", range(4))
+def test_targets_as_positions_are_numpys_mask(seed):
+    """Positions ([k] for every sample, or [B, k]; -1 pads; repeated, any integer dtype) make numpy's mask, and a
+    position out of 0..n-1 anywhere is refused."""
+    rng = np.random.default_rng(seed)
+    B, n_, k = int(rng.integers(1, 6)), int(rng.integers(1, 40)), int(rng.integers(1, 9))
+    for shape in ((k,), (B, k)):
+        for dtype in (np.int64, np.int32, np.uint8):
+            pos = rng.integers(-1 if dtype != np.uint8 else 0, n_, shape).astype(dtype)
+            want = np.zeros((B, n_ + 1), dtype = bool)
+            if len(shape) == 1:
+                want[:, pos.astype(np.int64)] = True
+            else:
+                want[np.arange(B)[:, None], pos.astype(np.int64)] = True
+            got = target_mask(pos, B, n_)
+            assert got.dtype == torch.bool and torch.equal(got, torch.from_numpy(want[:, :n_]))
+        bad = rng.integers(0, n_, shape)
+        bad.flat[int(rng.integers(0, bad.size))] = n_ if rng.random() < 0.5 else -2
+        with pytest.raises(ValueError, match = "targets"):
+            target_mask(bad, B, n_)
+    assert not target_mask(np.zeros((B, 0), dtype = np.int64), B, n_).any()          # no position
+    assert not target_mask(np.zeros(0, dtype = np.int64), B, n_).any()
 
 
 def test_candidates_in_every_form():

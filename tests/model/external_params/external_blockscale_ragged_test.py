@@ -176,7 +176,10 @@ def _fw_fork(layer):
     plans = getattr(layer, "_bs_fw_plans", None)
     assert plans, "no forward plan was built"
     fname = next(iter(plans.values()))[0][1]
-    return {"blockscale_forward": "cute", "blockscale_sb_forward": "sb"}[fname]
+    # (the small-batch family: the per-sample kernel, its batch-tiled and tensor-core copies -- the same tables and the
+    # same per-edge-block bases)
+    return {"blockscale_forward": "cute", "blockscale_sb_forward": "sb", "blockscale_sb_forward_bt": "sb",
+            "blockscale_sb_forward_mma": "sb", "blockscale_forward_prepass": "pre"}[fname]
 
 
 def _run(name, batch = 64, gate_cbs = 8, scale = 0.7, seed = 0):
@@ -354,7 +357,7 @@ def test_forward_matches_materialized_pc(name, batch):
 
 @cuda_only
 @needs_cute
-def test_both_forward_forks_actually_serve_a_padded_shape():
+def test_both_forward_forks_actually_serve_a_padded_shape(monkeypatch):
     """COVERAGE, asserted rather than hoped for.
 
     `_build_plan` collects the CuTe/TMA fork and the plain-CUDA small-batch fork and picks between
@@ -370,7 +373,11 @@ def test_both_forward_forks_actually_serve_a_padded_shape():
     # Scanned across topologies AND batches rather than asserting that a particular batch picks a
     # particular fork. The choice is made by MEASUREMENT, so which fork wins where is a property of
     # the hardware and shifts when either kernel changes; what must hold is that both are exercised
-    # somewhere, which is the actual coverage question.
+    # somewhere, which is the actual coverage question. The CuTe fork's pre-pass copy is left out (as if
+    # its extension had not built): it takes the CuTe fork's shapes where it is faster, and its own
+    # padded coverage is blockscale_forward_prepass_test.py's.
+    import pyjuice.nodes.external_params.kernels.c as bs_c
+    monkeypatch.setattr(bs_c, "get_prepass_module", lambda: None)
     seen = {}
     for name in NONDENSE:
         for batch in (64, 256):
@@ -466,6 +473,38 @@ def test_backward_matches_reference_over_repeats(name):
 
 
 @cuda_only
+@pytest.mark.parametrize("batch", [64, 256])
+@pytest.mark.parametrize("name", list(TOPOLOGIES))
+def test_the_triton_param_flows_are_unbiased(name, batch, monkeypatch):
+    """`_bs_triton_par_kernel`'s parameter flows against the float64 reference, by their SIGNED mean relative error --
+    a bias every bar on the largest error above lets through. Its TF32 dot truncated both operands (the tensor cores
+    drop an fp32's low 13 bits): MEASURED -6.4e-4 .. -6.9e-4 on every topology here at either batch; rounded to TF32
+    first (`_tf32_rna`, as the element kernel's), -5e-6 .. +3.5e-5."""
+    import pyjuice.nodes.external_params.kernels.blockscale_backward as kb
+    launches, real = [], kb._bs_triton_par_kernel
+
+    class Spy:
+        def __getitem__(self, grid):
+            def run(*args, **kwargs):
+                launches.append(kwargs.get("TL_DOT"))
+                return real[grid](*args, **kwargs)
+            return run
+    monkeypatch.setattr(kb, "_bs_triton_par_kernel", Spy())
+    gate_cbs = 8
+    pc, root, ns, layer, data, phi = _run(name, batch = batch, gate_cbs = gate_cbs)
+    pc(data, sum_external_params = {ns: phi})
+    pc.backward(data, flows_memory = 0.0)
+    if 1 not in launches:
+        pytest.skip(f"{name}: the parameter flows were not the Triton kernel's dot form here")
+    _, ref_pf = _flow_reference(pc, ns, phi, gate_cbs, batch)
+    ns.update_param_flows(pc.param_flows)
+    got = ns.get_param_flows().double().to(ref_pf.device)
+    live = ref_pf > 1e-30
+    rel = (got[live] - ref_pf[live]) / ref_pf[live]
+    assert abs(float(rel.mean())) < 1.5e-4, f"{name}: the parameter flows are biased by {float(rel.mean()):+.2e}"
+
+
+@cuda_only
 @needs_cute
 @pytest.mark.parametrize("name", NONDENSE)
 def test_param_flows_are_bit_stable_across_repeats(name):
@@ -541,7 +580,7 @@ def test_a_ragged_gated_layer_runs_end_to_end():
 @cuda_only
 @needs_cute
 @pytest.mark.parametrize("name", RAGGED)
-def test_ragged_small_batch_computes_correct_param_flows(name):
+def test_ragged_small_batch_computes_correct_param_flows(name, monkeypatch):
     """Below batch 16 the param flows route to `_backward_sparse_par_flows`, whose only gated hook
     used to sit behind `_par_flow_collision_free` -- which padding defeats -- so the layer RAISED.
 
@@ -552,7 +591,10 @@ def test_ragged_small_batch_computes_correct_param_flows(name):
     would race a real one for pfid 0) and `PF_ATOMIC` covers slots that still collide afterwards.
 
     The bar here is TIGHT -- ~1e-4 rather than the fp16 dot's ~1e-3 -- because at this batch the
-    small-batch fork is pure fp32, so a real defect has nowhere to hide."""
+    small-batch fork is pure fp32, so a real defect has nowhere to hide -- the tensor-core small-batch forward (bf16
+    operands, its own tests) taken out, as if its extension had not built."""
+    import pyjuice.nodes.external_params.kernels.c as bs_c
+    monkeypatch.setattr(bs_c, "get_sb_mma_module", lambda: None)
     gate_cbs, batch = 8, 8
     pc, root, ns, layer, data, phi = _run(name, batch = batch, gate_cbs = gate_cbs)
     pc(data, sum_external_params = {ns: phi})
@@ -734,12 +776,12 @@ def test_unconnected_gate_cells_are_never_read(name):
 @pytest.mark.parametrize("name", ["dense", "pad_tiles", "mixed", "sparse_ragged", "narrow"])
 @pytest.mark.parametrize("batch", [8, 64])
 def test_the_portable_triton_forward_serves_every_topology(name, batch):
-    """The PORTABLE forward, exercised by hiding both CUDA extensions.
+    """The PORTABLE forward, exercised by hiding the CUDA extensions.
 
     Note this test is NOT marked `needs_cute`: its whole point is the machine that cannot build them.
-    Both other forks are CUDA -- the CuTe one wants nvcc, CUTLASS and sm_90+, the small-batch one
-    wants nvcc -- so without a CUDA toolchain `BlockScaleSumParams` used to be refused outright
-    rather than merely being slow.
+    The other forks are CUDA -- the CuTe one and its pre-pass copy want nvcc, CUTLASS and sm_90+, the
+    small-batch one wants nvcc -- so without a CUDA toolchain `BlockScaleSumParams` used to be refused
+    outright rather than merely being slow.
 
     It also has no layout requirements at all: it reads `nids` / `cids` / `pids` PER LANE instead of
     deriving addresses from a per-tile base, so it needs neither contiguous children nor strided
@@ -751,16 +793,17 @@ def test_the_portable_triton_forward_serves_every_topology(name, batch):
     misunderstanding between them cannot pass."""
     gate_cbs = 8
     import pyjuice.nodes.external_params.kernels.c as _kc
-    saved = _kc.get_cute_module, _kc.get_sb_module
+    saved = _kc.get_cute_module, _kc.get_sb_module, _kc.get_prepass_module
     _kc.get_cute_module = lambda: None
     _kc.get_sb_module = lambda: None
+    _kc.get_prepass_module = lambda: None
     try:
         pc_a, root_a, ns_a, layer, data, phi = _run(name, batch = batch, gate_cbs = gate_cbs)
         lls_a = pc_a(data, sum_external_params = {ns_a: phi})
         assert next(iter(layer._bs_fw_plans.values()))[0][0] == "triton", \
             "the CUDA forks were hidden but a CUDA fork still ran"
     finally:
-        _kc.get_cute_module, _kc.get_sb_module = saved
+        _kc.get_cute_module, _kc.get_sb_module, _kc.get_prepass_module = saved
 
     dev = torch.device("cuda:0")
     root_b, ns_b = _build(name, gate_cbs = gate_cbs, gated = False)

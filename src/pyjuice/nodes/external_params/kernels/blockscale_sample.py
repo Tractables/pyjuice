@@ -58,7 +58,7 @@ def _gate_weights(cids, pids, element_mars, mparams, ext, gate,
     mask = mask_edge[:,None] & mask_lane[None,:]
 
     par_id = tl.load(pids + local_nids[None,:] * num_edges + offs_edge[:,None], mask = mask, other = 0)
-    epars = tl.load(mparams + par_id + local_nid_offs[None,:], mask = mask, other = 0.0)
+    epars = tl.load(mparams + par_id + local_nid_offs[None,:], mask = mask, other = 0.0).to(tl.float32)
 
     # The gate row of each edge, addressed exactly as the forward addresses it: the compiled table
     # holds the start of the edge block's gate sub-grid, and the kernel adds only the two refinements

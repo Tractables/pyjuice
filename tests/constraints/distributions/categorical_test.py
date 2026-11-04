@@ -8,7 +8,9 @@ token, both sides of the boundary between the passes, and every token its own cl
 enough to be subnormal, which tensor cores would flush to zero.
 """
 import math
+from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 
@@ -123,11 +125,85 @@ def test_subnormal_probabilities_are_kept(name):
     check(categorical.class_masses(layer, classes)[categorical.class_mass_rows(layer)], want)
 
 
+def picked_rows(R, pick):
+    """Host rows of a [R, V] table: every one, a consecutive run, or a sorted third of them."""
+    if pick == "all":
+        return np.arange(R)
+    if pick == "consecutive":
+        return np.arange(1, R - 1)
+    return np.sort(np.random.default_rng(0).choice(R, max(1, R // 3), replace = False))
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("pick", ["all", "consecutive", "gathered"])
+@pytest.mark.parametrize("kind", ["tied", "untied", "wide"])
+def test_token_probs_are_the_rows_token_major(kind, pick, dtype):
+    """``token_probs`` into the columns of a wider table (and into a table whose columns are apart): torch's own
+    transposed copy, cast, bit for bit, and nothing written around it. ``wide``: rows and tokens over several of the
+    copy kernel's tiles, neither a multiple of them."""
+    if kind == "wide":
+        g = torch.Generator(device = DEV).manual_seed(0)
+        layer = SimpleNamespace(params = torch.rand(300 * 1000, device = DEV, generator = g),
+                                dist = SimpleNamespace(num_cats = 1000))
+    else:
+        layer = build(kind).input_layer_group[0]
+    num_cats = layer.dist.num_cats
+    table = layer.params.view(-1, num_cats)
+    rows = picked_rows(table.size(0), pick)
+    want = table[torch.as_tensor(rows, device = DEV)].t().to(dtype)
+    out = torch.full((num_cats, len(rows) + 5), float("nan"), dtype = dtype, device = DEV)
+    categorical.token_probs(layer, rows, out[:, 2:2 + len(rows)])
+    assert torch.equal(out[:, 2:2 + len(rows)], want)
+    assert out[:, :2].isnan().all() and out[:, 2 + len(rows):].isnan().all()
+    apart = torch.full((len(rows), num_cats), float("nan"), dtype = dtype, device = DEV).t()   # (stride(1) != 1)
+    categorical.token_probs(layer, rows, apart)
+    assert torch.equal(apart, want)
+
+
+@pytest.mark.parametrize("pick", ["all", "gathered"])
+@pytest.mark.parametrize("kind", ["tied", "untied"])
+def test_token_columns_are_the_tokens_probabilities(kind, pick):
+    layer = build(kind).input_layer_group[0]
+    table = layer.params.view(-1, V)
+    rows = picked_rows(table.size(0), pick)
+    tokens = torch.tensor([5, 0, V - 1, 17, 5], device = DEV)                  # any order, repeated
+    out = torch.full((len(rows), tokens.numel()), float("nan"), device = DEV)
+    categorical.token_columns(layer, rows, tokens, out)
+    assert torch.equal(out, table[torch.as_tensor(rows, device = DEV)][:, tokens])
+
+
 def test_the_class_order_is_built_once():
     classes = TokenClasses(torch.randperm(V, device = DEV), V)
     assert classes.by_class(categorical.CLASS_CHUNK) is classes.by_class(categorical.CLASS_CHUNK)
     moved = classes.to(torch.device("cpu"))
     assert moved.token_class.device.type == "cpu" and not moved._by_class
+
+
+@pytest.mark.parametrize("B", [1, 5, 24])
+@pytest.mark.parametrize("kind", ["tied", "untied", "tied_out_of_order"])
+def test_input_values_are_the_layers_own(kind, B):
+    """``input_values`` writes the layer's own forward's values bit for bit -- every observed token's log-probability,
+    0 where missing --, and with ``positions`` the nodes over the positions marked alone, the others' rows untouched;
+    batches of one sample, part of a tile of samples, and several tiles."""
+    pc = build(kind)
+    layer = pc.input_layer_group[0]
+    first, end = layer._output_ind_range
+    n = int(layer.vids.max()) + 1
+    g = torch.Generator().manual_seed(B)
+    x = torch.randint(0, V, (B, n), generator = g).to(DEV)
+    missing = (torch.rand(B, n, generator = g) < 0.4).to(DEV)
+    want = torch.full((end, B), float("nan"), device = DEV)
+    with torch.no_grad():
+        layer(x.permute(1, 0), want, missing_mask = missing)
+    got = torch.full((end, B), float("nan"), device = DEV)
+    categorical.input_values(layer, x, missing, got)
+    assert torch.equal(got[first:end].view(torch.int32), want[first:end].view(torch.int32))
+    marked = torch.rand(n, generator = g) < 0.5
+    some = torch.full((end, B), float("nan"), device = DEV)
+    categorical.input_values(layer, x, missing, some, positions = marked.to(torch.int32).to(DEV))
+    on = marked.to(DEV)[layer.vids.view(-1).long()]
+    assert torch.equal(some[first:end][on].view(torch.int32), want[first:end][on].view(torch.int32))
+    assert some[first:end][~on].isnan().all()
 
 
 def test_supported_distributions_are_matched_by_exact_type():

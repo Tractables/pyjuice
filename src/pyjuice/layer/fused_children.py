@@ -35,6 +35,30 @@ def element_children(pc) -> List[Optional[Tuple[torch.Tensor, int]]]:
     return out
 
 
+def form_elements(element_mars: torch.Tensor, node_mars: torch.Tensor, children: Tuple[torch.Tensor, int]) -> None:
+    """Write a product layer group's element values into ``element_mars`` from ``children`` (its `(table, first_row)`,
+    `element_children`): each element the sum of its two child node values, one fp32 add -- what the product layer's
+    forward writes for products of two children, the same bits. What a layer handed the product group below (its
+    `stream_children`) does where it cannot form them in its own kernels: the product layer's forward was not run."""
+    table, first = children
+    if table.size(1) != 2:
+        raise ValueError("`stream_children`: products of two children only.")
+    element_mars[first:first + table.size(0)] = node_mars[table[:, 0].long()] + node_mars[table[:, 1].long()]
+
+
+def scatter_flows(node_flows: torch.Tensor, element_flows: torch.Tensor, children: Tuple[torch.Tensor, int],
+                  rows: torch.Tensor) -> None:
+    """Write the element flows of ``rows`` (int64 element rows) as their two children's node flows (``children``: the
+    product group's `(table, first_row)`): what the product layer's backward writes for children of one parent element
+    whose log-space flows are -inf before -- logaddexp(-inf, f) = f, the same bits. What a sum layer handed the product
+    group below (`stream_children`) does where it computed its element flows without the fused kernels."""
+    table, first = children
+    ch = table[rows - first].long()
+    flows = element_flows[rows]
+    node_flows[ch[:, 0]] = flows
+    node_flows[ch[:, 1]] = flows
+
+
 def attach_element_children(group, first_row: int) -> None:
     """Build a product layer group's table (rows ``[first_row, ...)`` of its layers) and keep it as a buffer of the
     group, ``group.element_children``, with ``group.element_children_first_row``. A block-sparse product layer's node

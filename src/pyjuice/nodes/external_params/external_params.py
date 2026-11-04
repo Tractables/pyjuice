@@ -13,6 +13,7 @@ _EM_TILE_BUDGET = int(os.environ.get("PYJUICE_DUAL_EM_TILE",
                                      os.environ.get("PYJUICE_BLOCKSCALE_EM_TILE", "1024")))
 
 _SM_COUNT = {}
+_L2_BYTES = {}                           # device -> its L2's bytes (`ExternalSumParams._fold_master`)
 
 
 def _sm_count(device):
@@ -72,6 +73,17 @@ class ExternalSumParams():
     #: sums cannot do that (the partials are gone once the standard kernel has summed them), so it sets
     #: this and takes over the whole computation.
     replaces_shared_forward: bool = False
+
+    #: Whether the parameterization's kernels take the circuit's bf16 copy of fp32 parameters that several sum layers
+    #: share (`TensorCircuit._param_operands`), for those whose products are bf16: `forward_layer`'s `op_params`, and
+    #: in the backward the layer's per-call copy (`SumLayer._bk_copy`, the element-flow hook's `op`). `False` -- the
+    #: default -- leaves such a layer on `params`.
+    reads_param_operands: bool = False
+
+    #: The least parameters a layer of this parameterization reads a sample (`SumLayer.num_edges`) for it to take that
+    #: copy (`TensorCircuit._param_operand_groups`), beside the circuit's rule on the work, those times the batch: for
+    #: kernels on the copy whose host cost only a large layer's GPU savings repay. 0 -- the default -- adds none.
+    param_operands_min_edges: int = 0
 
     #: The backward counterpart. `False` -- the default -- means the standard element-flow and
     #: param-flow kernels run and the descriptor corrects what they wrote. A parameterization whose
@@ -343,6 +355,26 @@ class ExternalSumParams():
             self.pre_backward(layer, ns_info, tensors, node_flows, element_flows, node_mars,
                               element_mars, params, **kwargs)
 
+    #: The tag of a layer backward's recording (`pyjuice.utils.launch_plans`): a parameterization's launch sites add
+    #: their launchers with it, so the sum layer's own sites -- the standard backward between the two hooks -- never
+    #: add to it, nor theirs to the sum layer's plans.
+    BACKWARD_PLAN_TAG = "external_sum_backward"
+
+    def backward_plan(self, layer, ns_tensors, ns_grad_tensors, node_mars, param_flows, denom_param_flows, kwargs):
+        """
+        `(key, launchers)` for a launch plan of this call's whole layer backward -- :func:`pre_backward_layer`, the
+        standard backward and :func:`post_backward_layer` --, or None (the default): every call takes the full path.
+
+        A parameterization that plans returns in `key` everything those three decide from at this call beyond what
+        the layer's own key holds (`ExternalParamsSumLayer.backward`: the batch, dtypes, device and flags) -- the
+        state its forward left, its own options --, and in `launchers` how many launchers its launch sites add with
+        `BACKWARD_PLAN_TAG` on the full path: one per unit of work, each taking `(node_flows, element_flows,
+        node_mars, element_mars, params, param_flows, denom_param_flows, kwargs)` -- `kwargs` the backward's, its
+        staging buffers among them -- and capturing no tensor of the call it was recorded in. Its checks of a call
+        must be in the key or here: a plan's replay runs none of them.
+        """
+        return None
+
     def post_backward_layer(self, layer, ns_tensors, ns_grad_tensors, node_flows, element_flows,
                             node_mars, element_mars, params, param_flows = None,
                             denom_param_flows = None, **kwargs) -> None:
@@ -505,6 +537,21 @@ class ExternalSumParams():
         return plan
 
     @staticmethod
+    def _fold_master(params, n) -> bool:
+        """Whether the fp32 master copy's check and store go into the update's own passes
+        (`kernels/dual_em_master.py`) for a range of `n` parameters: where its master copy is larger than the L2.
+        Below, the separate sync leaves the copy in the L2 for the update's first pass and the copy back reads it from
+        there, and the fused passes, reading the stored values too, are the slower (MEASURED: HMM-4096's 64 MB copy of
+        a 128 MB L2, 297 -> 309 us an M-step; HMM-6144's 144 MB 874 -> 776). A property of the device, not a timed
+        choice: every process makes the same one (the two orders' bits differ by ~1e-7)."""
+        dev = params.device
+        l2 = _L2_BYTES.get(dev)
+        if l2 is None:
+            l2 = _L2_BYTES[dev] = (torch.cuda.get_device_properties(dev).L2_cache_size if dev.type == "cuda"
+                                   else 0)
+        return n * 4 > l2
+
+    @staticmethod
     def _em_tile_candidates(block_size, num_edges, n_rows, dev):
         """
         `(TILE_SIZE_M, TILE_SIZE_K)` candidates for the shared dual-EM kernels, heuristic default first.
@@ -553,8 +600,86 @@ class ExternalSumParams():
                 out.append(c)
         return out
 
+    def _em_specs(self, sources, denom_param_flows):
+        """
+        Per forward partition `(mode, addends, n_groups, group_cbs, denom_base)` of the tie group `sources` -- its
+        members' `denom_kernel_spec`s, their statistics as the addends -- or None where one declines or they do not
+        add up elementwise. A structure property and views of `denom_param_flows`, so cached per (the group's layers,
+        that buffer), both held and compared by identity: the buffer persists across steps (zeroed in place), and
+        re-deriving the same views every M-step cost ~90 us of host time at a group of 15 (MEASURED).
+        """
+        layers = tuple(layer for layer, _ in sources)
+        cache = self.__dict__.setdefault("_em_specs_cache", {})
+        key = tuple(id(layer) for layer in layers)
+        hit = cache.get(key)
+        if hit is not None and hit[0] is denom_param_flows and all(a is b for a, b in zip(hit[1], layers)):
+            return hit[2]
+        layer, block_size = layers[0], layers[0].block_size
+        specs = []
+        for pid in range(layer.num_fw_partitions):
+            s0 = self.denom_kernel_spec(layer, denom_param_flows, pid)
+            if s0 is None:
+                specs = None
+                break
+            mode, tensor, n_groups, group_cbs, denom_base = s0
+            addends = [tensor]
+            for other in layers[1:]:
+                so = (self.denom_kernel_spec(other, denom_param_flows, pid)
+                      if other.num_fw_partitions == layer.num_fw_partitions and other.block_size == block_size
+                      else None)
+                if so is None or so[0] != mode or so[2] != n_groups or so[3] != group_cbs \
+                        or so[1].shape != tensor.shape:
+                    addends = None                   # not elementwise-addable onto the source's
+                    break
+                addends.append(so[1])
+            if addends is None:
+                specs = None
+                break
+            specs.append((mode, addends, n_groups, group_cbs, denom_base))
+        if len(cache) >= 16:
+            cache.clear()
+        cache[key] = (denom_param_flows, layers, specs)
+        return specs
+
+    def _sum_addends(self, addends):
+        """
+        `addends[0] + addends[1] + ...`, added in that order, as a new tensor: a tie group's `F-` statistics, one per
+        member. In ONE launch where they are contiguous fp32 views of one buffer -- each a slice of
+        `denom_param_flows`, as `denom_kernel_spec` returns them -- the same bits as the torch adds. MEASURED (a tied
+        gated HMM-2048 x4, 15 members): a clone and 14 adds per M-step, ~15 launches of host time. Their offsets in
+        that buffer are a structure property, cached by value; the pointer is the live tensor's every call. Else the
+        adds.
+        """
+        import triton
+
+        a0 = addends[0]
+        storage = a0.untyped_storage().data_ptr()
+        if a0.is_cuda and all(a.dtype == torch.float32 and a.is_contiguous() and a.shape == a0.shape
+                              and a.device == a0.device and a.untyped_storage().data_ptr() == storage
+                              for a in addends):
+            from .kernels.dual_em import _sum_slices_kernel
+            from pyjuice.utils.util import device_scalars
+
+            offs = tuple((a.data_ptr() - a0.data_ptr()) // a0.element_size() for a in addends)
+            cache = self.__dict__.setdefault("_sum_slices_offsets", {})
+            key = (offs, str(a0.device))
+            table = cache.get(key)
+            if table is None:
+                if len(cache) >= 32:
+                    cache.clear()
+                table = cache[key] = device_scalars(list(offs), a0.device, dtype = torch.int64)
+            out = torch.empty_like(a0)
+            n, BLOCK = a0.numel(), 1024
+            _sum_slices_kernel[(triton.cdiv(n, BLOCK),)](a0, table, out, n, len(addends), BLOCK = BLOCK)
+            return out
+        out = a0.clone()
+        for extra in addends[1:]:
+            out = out + extra
+        return out
+
     def _fused_em_correction(self, ns, params, param_flows, denom_param_flows, step_size,
-                             pseudocount, keep_zero_params, denom_sources, out = None):
+                             pseudocount, keep_zero_params, denom_sources, out = None, stored = None,
+                             rounded = False):
         """
         The conditional M-step as two shared Triton kernels, or `None` when this shape is not served
         (:func:`compute_em_correction` then runs the generic torch path, which is also what this is
@@ -564,9 +689,17 @@ class ExternalSumParams():
         :func:`denom_kernel_spec` selects, and `F-` is never materialized -- it is computed inside the
         kernels from whatever statistic was stored. A parameterization gets all of this by
         implementing that one method.
+
+        With `stored` (see :func:`compute_em_correction`), the two kernels of `kernels/dual_em_master.py`: the master
+        copy's check against the stored values in the first pass, the store back in the second. `rounded`: the
+        shared kernels' `ROUNDED` (`compute_em_correction`'s `_rounded`).
         """
         import triton
-        from .kernels.dual_em import _dual_em_cum_kernel, _dual_em_update_kernel
+        if stored is None:
+            from .kernels.dual_em import _dual_em_cum_kernel, _dual_em_update_kernel
+        else:
+            from .kernels.dual_em_master import _dual_em_cum_sync_kernel as _dual_em_cum_kernel
+            from .kernels.dual_em_master import _dual_em_update_store_kernel as _dual_em_update_kernel
 
         sources = list(denom_sources)
         if len(sources) == 0:
@@ -576,23 +709,9 @@ class ExternalSumParams():
         block_size = layer.block_size
 
         # ---- gather the per-partition `F-` recipes, and the tie group's addends ----
-        specs = []
-        for pid in range(layer.num_fw_partitions):
-            s0 = self.denom_kernel_spec(layer, denom_param_flows, pid)
-            if s0 is None:
-                return None
-            mode, tensor, n_groups, group_cbs, denom_base = s0
-            addends = [tensor]
-            for other, _ in sources[1:]:
-                if (other.num_fw_partitions != layer.num_fw_partitions
-                        or other.block_size != block_size):
-                    return None
-                so = self.denom_kernel_spec(other, denom_param_flows, pid)
-                if so is None or so[0] != mode or so[2] != n_groups or so[3] != group_cbs \
-                        or so[1].shape != tensor.shape:
-                    return None                  # not elementwise-addable onto the source's
-                addends.append(so[1])
-            specs.append((mode, addends, n_groups, group_cbs, denom_base))
+        specs = self._em_specs(sources, denom_param_flows)
+        if specs is None:
+            return None
 
         plan = self._em_plan(ns, layer, dev)
         if plan is None:
@@ -607,6 +726,7 @@ class ExternalSumParams():
         # every element of a node's parameter range is covered by exactly one real edge slot, so each
         # is written exactly once.
         by_par = out is not None
+        assert stored is None or (by_par and stored.numel() == pe - ps), "`stored` comes with `out`, both `[ps:pe]`"
         if by_par:
             assert out.numel() == pe - ps, (out.numel(), pe - ps)
             out_base, out_size_ = ps, pe - ps
@@ -647,11 +767,7 @@ class ExternalSumParams():
             num_edges = cids.size(1)
             n_rows = part["row_map"].numel()      # rows of THIS `ns`, not of the whole partition
 
-            denom = addends[0]
-            if len(addends) > 1:
-                denom = denom.clone()
-                for extra in addends[1:]:
-                    denom = denom + extra
+            denom = addends[0] if len(addends) == 1 else self._sum_addends(addends)
 
             common = dict(mparams = params, param_flows = param_flows, denom = denom,
                           cids = cids, pids = layer.partitioned_pids[pid],
@@ -661,13 +777,16 @@ class ExternalSumParams():
                           BLOCK_SIZE_M = block_size, GROUP_CBS = group_cbs,
                           consts = consts, cum_base = plan["cum_base"], denom_base = denom_base,
                           DENOM_MODE = mode, num_stages = 1)
+            # (the first pass with `stored`: the copy's check in it, and the copy's taking of a write from outside --
+            # idempotent, so the tile trials below may run it on the live copy)
+            cum_master = dict(ROUNDED = int(rounded)) if stored is None else dict(stored = stored, out_base = out_base)
             cands = self._em_tile_candidates(block_size, num_edges, n_rows, dev)
-            akey = (num_edges, n_groups, block_size, group_cbs, n_rows, mode)
+            akey = (num_edges, n_groups, block_size, group_cbs, n_rows, mode, stored is not None, bool(rounded))
 
             def _cum(cfg, target_cum):
                 tm, tk = cfg
                 _dual_em_cum_kernel[(triton.cdiv(num_edges, tk), n_rows * (block_size // tm))](
-                    cum = target_cum, TILE_SIZE_K = tk, TILE_SIZE_M = tm, **common)
+                    cum = target_cum, TILE_SIZE_K = tk, TILE_SIZE_M = tm, **common, **cum_master)
 
             # BENCHMARK INTO A SCRATCH. This kernel is read-accumulate-write (`tl.atomic_add` into
             # `cum`), so timing it on the live buffer would add its contribution once per trial and
@@ -691,30 +810,34 @@ class ExternalSumParams():
         for common, cands, akey, n_rows in staged:
             num_edges = common["num_edges"]
 
-            def _upd(cfg, target_out):
+            def _upd(cfg, target_out, target_stored = None):
                 tm, tk = cfg
+                extra = (dict(OUT_BY_PAR = 1 if by_par else 0, ROUNDED = int(rounded)) if stored is None
+                         else dict(stored = target_stored))
                 _dual_em_update_kernel[(triton.cdiv(num_edges, tk),
                                         n_rows * (block_size // tm))](
                     cum = cum, out = target_out, out_base = out_base,
                     out_size = out_size_, KEEP_ZERO = 1 if keep_zero_params else 0,
-                    OUT_BY_PAR = 1 if by_par else 0,
-                    TILE_SIZE_K = tk, TILE_SIZE_M = tm, **common)
+                    TILE_SIZE_K = tk, TILE_SIZE_M = tm, **common, **extra)
 
             # A pure overwrite, so re-running it is harmless -- but it is still benchmarked into a
             # scratch, because it reads `cum` and writes the buffer this function RETURNS, and a trial
             # left in `out` for a partition the real launch then skips would be returned as a result.
+            # (With `stored`, into a scratch of that too.)
             key = ("dual_em_upd",) + akey + (bool(keep_zero_params), by_par)
             cfg = autotune.cached(key)
             if cfg is None:
                 so = autotune.scratch_like(out) if autotune.should_tune(key, len(cands)) else None
-                cfg = cands[0] if so is None else autotune.pick(key, cands,
-                                                                lambda c: _upd(c, so))
-            _upd(cfg, out)
+                ss = None if so is None or stored is None else autotune.scratch_like(stored)
+                cfg = cands[0] if so is None or (stored is not None and ss is None) else autotune.pick(
+                    key, cands, lambda c: _upd(c, so, ss))
+            _upd(cfg, out, stored)
 
         return out
 
     def compute_em_correction(self, ns, params, param_flows, denom_param_flows, step_size,
-                              pseudocount, keep_zero_params, denom_sources = (), out = None):
+                              pseudocount, keep_zero_params, denom_sources = (), out = None, stored = None,
+                              _rounded = False):
         """
         The conditional dual-flow EM update for `ns`: `theta <- normalize(theta * F+ / F-)`, in the
         multiplicative MAP form. Returns the new parameters for `ns._param_range` as a flat tensor --
@@ -740,18 +863,40 @@ class ExternalSumParams():
         :param out: a `pe - ps` tensor to write the result into, in place of allocating one. The PC
             passes `params[ps:pe]`, i.e. the very range being updated, which is safe because every
             element of it is written exactly once and this is the only writer.
+        :param stored: with `out`, for parameters stored below fp32 (`params` then their fp32 master copy): the
+            stored parameters' `[ps:pe]`. The update then is the one `sync_master(params[ps:pe], stored)` before and
+            `stored.copy_(out)` after would make -- `theta` the stored value where that is no longer the master's
+            rounding, the result stored, rounded -- and the fused kernels do both in their own passes where the
+            range's master copy is larger than the L2 (:func:`_fold_master`). `F+`, which the backward made with the
+            stored values, is taken to the master copy's first (`params_master.flows_to_master`).
+        :param _rounded: internal -- `params` is a master copy in line with bf16-stored parameters, `F+` made with
+            those (the update of the branch above that keeps the copy's passes apart).
         """
         if not self.requests_denom_param_flows:
             return None
 
-        fused = self._fused_em_correction(ns, params, param_flows, denom_param_flows, step_size,
-                                          pseudocount, keep_zero_params, denom_sources, out = out)
-        if fused is not None:
-            return fused
+        ps, pe = ns._param_range
+        if stored is not None:
+            assert out is not None and out.numel() == stored.numel() == pe - ps, \
+                "`stored` comes with `out`, both `[ps:pe]`"
+        if stored is None or self._fold_master(params, pe - ps):
+            fused = self._fused_em_correction(ns, params, param_flows, denom_param_flows, step_size, pseudocount,
+                                              keep_zero_params, denom_sources, out = out, stored = stored,
+                                              rounded = _rounded)
+            if fused is not None:
+                return fused
+        if stored is not None:                                  # the master copy's passes of their own around it
+            from pyjuice.model.backend.params_master import sync_master
+
+            sync_master(params[ps:pe], stored)
+            self.compute_em_correction(ns, params, param_flows, denom_param_flows, step_size, pseudocount,
+                                       keep_zero_params, denom_sources = denom_sources, out = out,
+                                       _rounded = True)
+            stored.copy_(out)
+            return out
 
         import torch
 
-        ps, pe = ns._param_range
         pfs, pfe = ns._param_flow_range
         bs, cbs = ns.block_size, ns.ch_block_size
         E = ns.edge_ids.size(1)
@@ -760,6 +905,9 @@ class ExternalSumParams():
         # node-in-block) -- the same one `params` uses.
         theta = params[ps:pe].reshape(E, cbs, bs)
         Fp = param_flows[pfs:pfe].reshape(E, cbs, bs)
+        if _rounded:                                            # (`params_master.flows_to_master`)
+            s = theta.to(torch.bfloat16).float()
+            Fp = Fp * torch.where((s == 0) | (s == theta), torch.ones_like(theta), theta / s)
         Fm = self.materialize_denom_flows(ns, params, denom_param_flows,
                                           denom_sources).reshape(E, cbs, bs)
 

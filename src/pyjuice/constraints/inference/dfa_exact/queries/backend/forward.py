@@ -26,7 +26,7 @@ from ...compiled.tables import _align
 from ...kernels.prod import run_products as products
 from ...external_params import block_scale
 from ...kernels.compact import fresh_counts, fresh_order
-from ...kernels.sum import dense_sum, fused_sum, stacked_weights
+from ...kernels.sum import dense_sum, fused_sum, query_weights, stacked_weights
 from .plans import kept_plan
 
 
@@ -178,16 +178,17 @@ def run_forward(backend, bufs: dict, plan, x: torch.Tensor, missing: torch.Tenso
     else:
         hold = None
     masses = backend.state.masses() if masses is None else masses
-    for k, layer in enumerate(pc.input_layer_group):                   # the input region: pyjuice's own layout
-        values = getattr(lookup(layer.dist), "input_values", None)
-        if values is not None:
-            values(layer, x, missing, bufs["input_mars"], masses.sample.get(k))
+    for k, layer in enumerate(pc.input_layer_group):                   # the input region: pyjuice's own layout --
+        values = getattr(lookup(layer.dist), "input_values", None)      # where it can, at the positions the plan's
+        if values is not None:                                          # launches read alone
+            values(layer, x, missing, bufs["input_mars"], masses.sample.get(k), positions = plan.input_reads)
         else:
             layer(x.permute(1, 0), bufs["input_mars"], missing_mask = missing)
     prog.transitions(masses)
     stacks, kept = backend.state.weight_stacks()
 
-    for kind, prod_index, layers in plan.steps:
+    for si in range(len(plan.steps)) if plan.busy is None else plan.busy:      # (the others run nothing)
+        kind, prod_index, layers = plan.steps[si]
         elem_first = backend.element_regions[prod_index][0]
         elem_width = lay["element_widths"][prod_index]
         if kind == "prod":
@@ -269,6 +270,7 @@ def _sums(backend, parts, block_size: int, nodes: torch.Tensor, element_mars: to
     compact -- a batch of one whose slots are the lanes (``regions``' ``slots``), every lane computed. ``gates``,
     ``hold``: see :func:`run_forward`."""
     prog, pc = backend.program(), backend.pc
+    params = query_weights(pc.params, stacks)       # fp32 (a kept copy where stored below fp32)
     dot = PRECISIONS[precision]
     for runs, num_edges, fused in parts:
         for r, c0, blocks, key in runs:
@@ -294,9 +296,9 @@ def _sums(backend, parts, block_size: int, nodes: torch.Tensor, element_mars: to
             width = cols[2] if cols is not None else ncols                                # the product's columns
             if key is not None and width <= STACK_MAX_COLUMNS[precision] and (kept or prog.stack_uses[key] > 1):
                 if key not in stacks:
-                    stacks[key] = stacked_weights(pc.params, key[2], num_edges, block_size)
+                    stacks[key] = stacked_weights(params, key[2], num_edges, block_size)
                 stacked = {c0: stacks[key]}
-            dense_sum(nodes, element_mars, pc.params, {c0: blocks}, num_edges, block_size, region, elem_first,
+            dense_sum(nodes, element_mars, params, {c0: blocks}, num_edges, block_size, region, elem_first,
                       elem_width, ncols, dot, live = cols, stacked = stacked, bf16 = precision == "bf16",
                       copies = stacks, keep = keep)
         if fused is not None:
@@ -307,7 +309,7 @@ def _sums(backend, parts, block_size: int, nodes: torch.Tensor, element_mars: to
             order = None                                # (some rows hold their values: their lanes left as they are)
             if hold is not None and any(iv in hold["ivset"] for iv in ivs.tolist()):   # (a part's few intervals)
                 order = hold["order"]()
-            fused_sum(nodes, element_mars, pc.params, nids, cids, pids, nb_reg,
+            fused_sum(nodes, element_mars, params, nids, cids, pids, nb_reg,
                       regions if order is None else dict(regions, slots = order.slots), elem_first, elem_width,
                       B if compact is None else 1, block_size, max_cols = max_cols, precision = dot, aliased = aliased,
                       liveness = liveness if compact is None else order, sel = None if sel is None else sel.tensor,

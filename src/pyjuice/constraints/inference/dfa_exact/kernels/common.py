@@ -8,6 +8,7 @@ slots and column pairs, log-space accumulation, a TF32 dot's operands.
 from typing import Optional, Sequence, Tuple
 
 import numpy as np
+import torch
 import triton
 import triton.language as tl
 from numba import njit
@@ -240,3 +241,17 @@ def _logaddexp_tile(a, b):
     hi = tl.maximum(a, b)
     s = tl.where(hi == float("-inf"), 0.0, hi)
     return tl.where(hi == float("-inf"), float("-inf"), tl.log(tl.exp(a - s) + tl.exp(b - s)) + s)
+
+
+_PDL = {}
+
+
+def pdl_launch(dev: torch.device) -> bool:
+    """Whether a launch on ``dev`` may be a programmatic dependent of the launch before it (compute capability 9 on):
+    the kernels taking it (a ``PDL`` constexpr) wait for that launch first thing (``gdc_wait``), so only their launch
+    overlaps it -- and they finish after it, as every launch after them may assume."""
+    key = dev.index if dev.index is not None else torch.cuda.current_device()
+    hit = _PDL.get(key)
+    if hit is None:
+        hit = _PDL[key] = torch.cuda.get_device_capability(key)[0] >= 9
+    return hit
