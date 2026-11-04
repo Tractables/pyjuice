@@ -228,7 +228,8 @@ class _LearningMixin:
         Initialize parameter flows.
 
         :param flows_memory: the number that the current parameter flows (if any) will be multiplied by; equivalent to
-        zeroling the flows if set to 0 :type flows_memory: float
+            zeroing the flows if set to 0
+        :type flows_memory: float
 
         `_zero_ranges` (the circuit's backward, at 0): the `[start, end)` slot ranges of the sum layers' flows to zero
         -- the rest the pass's first writers store (`_plan_param_flow_stores`); None zeroes them all.
