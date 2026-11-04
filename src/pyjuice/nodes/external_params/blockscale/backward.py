@@ -909,7 +909,7 @@ class _BackwardMixin:
                         no_grad if grad is None else grad, batch, blk, cbs, knt, gate_cbs, ext_base)
 
             elif isinstance(kind, tuple) and kind[0] == "elep":
-                gt, cfg, tri = plan["gate_tile"], kind[1], _ele_fn(ctx, plan, "triton")
+                gt, cfg, tri = plan["gate_tile"], kind[1], _ele_triton_fn(ctx, plan)
 
                 def run(tgt, node_flows, node_mars, element_mars, params, ext, grad):
                     if ext.data_ptr() % 16:                    # (its log-gate rows are 16-byte copies)
@@ -920,7 +920,7 @@ class _BackwardMixin:
                         0 if grad is None else 1, cfg)
 
             elif isinstance(kind, tuple) and kind[0] == "eles":
-                tb, code, tri = plan["eles"], kind[1], _ele_fn(ctx, plan, "triton")
+                tb, code, tri = plan["eles"], kind[1], _ele_triton_fn(ctx, plan)
 
                 def run(tgt, node_flows, node_mars, element_mars, params, ext, grad):
                     # (the product layer group below handed to this call, its passes not run: `_bk_stream_children`)
@@ -1026,33 +1026,44 @@ class _BackwardMixin:
                         no_grad if grad is None else grad, gp, batch, blk, cbs, ne, tk_sb, gate_cbs, ext_base, cfg)
 
             else:                                             # "triton"
-                from ..kernels.blockscale_backward import _bs_triton_ele_kernel
-                gb, grid = plan["gate_tile"], ctx["grid"]
-                ps, pi, pps, ppi = ctx["parids_start"], ctx["parids_increment"], ctx["parpids_start"], \
-                    ctx["parpids_increment"]
-                step, bb, tk, tm, tl_dot = ctx["ptr_inc_step"], ctx["BLOCK_B"], ctx["TILE_SIZE_K"], \
-                    ctx["TILE_SIZE_M"], ctx["TL_DOT"]
-                grad_atomic = 0 if plan.get("grad_store_ok") else 1
-                chunks = [((grid[0], min(s0 + 32768, grid[1]) - s0), s0) for s0 in range(0, grid[1], 32768)]
+                return _ele_triton_fn(ctx, plan)
 
-                def run(tgt, node_flows, node_mars, element_mars, params, ext, grad):
-                    for cg, s0 in chunks:
-                        _bs_triton_ele_kernel[cg](
-                            node_flows = node_flows, element_flows = tgt,
-                            node_mars = node_mars, element_mars = element_mars,
-                            mparams = params, ext = ext, gate = gb, chids = chids,
-                            parids_start = ps, parids_increment = pi,
-                            parpids_start = pps,
-                            parpids_increment = ppi,
-                            batch_size = batch, ptr_inc_step = step,
-                            BLOCK_B = bb, TILE_SIZE_K = tk,
-                            K_NUM_TILES = knt, TILE_SIZE_M = tm,
-                            BLOCK_SIZE_M = cbs, BLOCK_SIZE_K = blk, TL_DOT = tl_dot,
-                            GATE_CBS = gate_cbs, gate_stride = gb.size(1), ext_base = ext_base,
-                            grad_ext = ext if grad is None else grad,
-                            WRITE_GRAD = 0 if grad is None else 1,
-                            GRAD_ATOMIC = grad_atomic,
-                            pid_m_offset = s0, num_stages = 1)
+            return run
+
+        def _ele_triton_fn(ctx, plan):
+            """`_ele_fn`'s launch of the Triton fork, which two of its other forks fall back to. A function of its own:
+            `_ele_fn` calling itself made it a reference cycle (the function, the cell of itself in its closure), one per
+            call left to Python's garbage collector -- MEASURED: 1550 a step of a joint CoDD2.0 training."""
+            from ..kernels.blockscale_backward import _bs_triton_ele_kernel
+            chids = ctx["chids"]
+            batch, blk, cbs = ctx["batch_size"], ctx["block_size"], ctx["cs_block_size"]
+            knt = ctx["K_NUM_TILES"]
+            gb, grid = plan["gate_tile"], ctx["grid"]
+            ps, pi, pps, ppi = ctx["parids_start"], ctx["parids_increment"], ctx["parpids_start"], \
+                ctx["parpids_increment"]
+            step, bb, tk, tm, tl_dot = ctx["ptr_inc_step"], ctx["BLOCK_B"], ctx["TILE_SIZE_K"], \
+                ctx["TILE_SIZE_M"], ctx["TL_DOT"]
+            grad_atomic = 0 if plan.get("grad_store_ok") else 1
+            chunks = [((grid[0], min(s0 + 32768, grid[1]) - s0), s0) for s0 in range(0, grid[1], 32768)]
+
+            def run(tgt, node_flows, node_mars, element_mars, params, ext, grad):
+                for cg, s0 in chunks:
+                    _bs_triton_ele_kernel[cg](
+                        node_flows = node_flows, element_flows = tgt,
+                        node_mars = node_mars, element_mars = element_mars,
+                        mparams = params, ext = ext, gate = gb, chids = chids,
+                        parids_start = ps, parids_increment = pi,
+                        parpids_start = pps,
+                        parpids_increment = ppi,
+                        batch_size = batch, ptr_inc_step = step,
+                        BLOCK_B = bb, TILE_SIZE_K = tk,
+                        K_NUM_TILES = knt, TILE_SIZE_M = tm,
+                        BLOCK_SIZE_M = cbs, BLOCK_SIZE_K = blk, TL_DOT = tl_dot,
+                        GATE_CBS = gate_cbs, gate_stride = gb.size(1), ext_base = ext_base,
+                        grad_ext = ext if grad is None else grad,
+                        WRITE_GRAD = 0 if grad is None else 1,
+                        GRAD_ATOMIC = grad_atomic,
+                        pid_m_offset = s0, num_stages = 1)
 
             return run
 

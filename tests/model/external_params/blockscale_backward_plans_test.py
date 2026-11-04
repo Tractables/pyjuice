@@ -10,6 +10,9 @@ and a stale sum is another partition's or other parameters', each an error of th
 two circuits choosing their forks by measurement differ by.
 """
 
+import gc
+import inspect
+
 import pytest
 import torch
 
@@ -17,6 +20,7 @@ import pyjuice as juice
 import pyjuice.nodes.distributions as dists
 from pyjuice.nodes import inputs, multiply, summate
 from pyjuice.nodes import BlockScaleSumParams
+from pyjuice.utils import launch_plans
 
 
 NUM_CATS = 4
@@ -93,3 +97,27 @@ def test_parameters_loaded_as_new_tensors_are_summed_anew():
     assert used.params._version == version and not torch.equal(used.params, _compile(seed = 0)[0].params), \
         "the case is OTHER parameters at an EQUAL version"
     _assert_close(_outputs(used, ns, data, phi), _outputs(other, ons, data, phi), "after load_state_dict(assign)")
+
+
+@cuda_only
+@pytest.mark.parametrize("batch", [8, 64])
+def test_a_backward_leaves_no_reference_cycle(monkeypatch, batch):
+    """The full path of a gated layer's backward builds its launches in nested functions at every call. One of them
+    naming itself is a cycle that only Python's garbage collector frees, one per call (`_ele_triton_fn`). With plans
+    off: a plan replayed would spare the full path here."""
+    monkeypatch.setattr(launch_plans, "ENABLED", False)
+    pc, ns, _ = _compile()
+    data, phi = _inputs(ns, batch)
+    for _ in range(3):                                  # (the tuners settled)
+        _outputs(pc, ns, data, phi)
+    gc.collect()
+    gc.garbage.clear()
+    gc.set_debug(gc.DEBUG_SAVEALL)
+    try:
+        _outputs(pc, ns, data, phi)
+        gc.collect()
+        left = [o.__qualname__ for o in gc.garbage if inspect.isfunction(o) and "pyjuice" in o.__code__.co_filename]
+    finally:
+        gc.set_debug(0)
+        gc.garbage.clear()
+    assert not left, f"reference cycles left to the garbage collector: {sorted(set(left))}"
