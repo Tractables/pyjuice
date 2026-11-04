@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Tuple
 
 import numpy as np
 import torch
@@ -72,30 +72,72 @@ class SignatureMasses:
     saving: float
 
 
-def _mix(v: np.ndarray, salt: int) -> np.ndarray:
-    """A 64-bit mix of int64 values (splitmix64's finalizer, salted)."""
-    with np.errstate(over = "ignore"):
-        z = v.astype(np.uint64) + np.uint64(0x9E3779B97F4A7C15 ^ salt)
-        z = (z ^ (z >> np.uint64(30))) * np.uint64(0xBF58476D1CE4E5B9)
-        z = (z ^ (z >> np.uint64(27))) * np.uint64(0x94D049BB133111EB)
-        return z ^ (z >> np.uint64(31))
+def _signed(value: int) -> int:
+    """A 64-bit constant as the int64 of its bits."""
+    return value - (1 << 64) if value >= 1 << 63 else value
 
 
-def _segment_hash(vals: np.ndarray, seg: np.ndarray, starts: np.ndarray, lengths: np.ndarray, salt: int) -> np.ndarray:
+def _shift_right(z: torch.Tensor, bits: int) -> torch.Tensor:
+    """The bits of ``z`` (int64) shifted right as unsigned."""
+    return (z >> bits) & ((1 << (64 - bits)) - 1)
+
+
+def _mix(v: torch.Tensor, salt: int) -> torch.Tensor:
+    """A 64-bit mix of int64 values (splitmix64's finalizer, salted; wrapping)."""
+    z = v + _signed(0x9E3779B97F4A7C15 ^ salt)
+    z = (z ^ _shift_right(z, 30)) * _signed(0xBF58476D1CE4E5B9)
+    z = (z ^ _shift_right(z, 27)) * _signed(0x94D049BB133111EB)
+    return z ^ _shift_right(z, 31)
+
+
+def _segment_hash(vals: torch.Tensor, seg: torch.Tensor, starts: torch.Tensor, lengths: torch.Tensor,
+                  salt: int) -> torch.Tensor:
     """Every segment's polynomial hash of its values (``vals`` int64, ``seg`` every value's segment, ``starts`` /
-    ``lengths`` the segments' in ``vals``): 0 for an empty segment."""
-    out = np.zeros(lengths.size, dtype = np.uint64)
-    if vals.size == 0:
+    ``lengths`` the segments' in ``vals``), wrapping: 0 for an empty segment."""
+    out = torch.zeros(lengths.numel(), dtype = torch.int64, device = vals.device)
+    if vals.numel() == 0:
         return out
-    k = np.arange(vals.size, dtype = np.int64) - starts[seg]
-    base = np.uint64(0x100000001B3 + 2 * salt)
-    pw = np.ones(int(k.max()) + 1, dtype = np.uint64)
-    with np.errstate(over = "ignore"):
-        for i in range(1, pw.size):
-            pw[i] = pw[i - 1] * base
-        terms = _mix(vals, salt) * pw[k]
-    np.add.at(out, seg, terms)                                     # (uint64: wraps)
-    return out
+    k = torch.arange(vals.numel(), device = vals.device) - starts[seg]
+    base = 0x100000001B3 + 2 * salt
+    powers, power = [], 1
+    for _ in range(int(k.max()) + 1):
+        powers.append(_signed(power))
+        power = power * base % (1 << 64)
+    pw = torch.tensor(powers, dtype = torch.int64, device = vals.device)
+    return out.index_add_(0, seg, _mix(vals, salt) * pw[k])
+
+
+def _spread(counts: torch.Tensor):
+    """``(at, within)`` for runs of ``counts`` items: every item's run and its place in the run."""
+    dev = counts.device
+    at = torch.repeat_interleave(torch.arange(counts.numel(), device = dev), counts)
+    return at, torch.arange(at.numel(), device = dev) - (torch.cumsum(counts, dim = 0) - counts)[at]
+
+
+def _first_of(group: torch.Tensor, groups: int) -> torch.Tensor:
+    """Every group's first index in ``group``."""
+    first = torch.full((groups,), group.numel(), dtype = torch.int64, device = group.device)
+    return first.scatter_reduce_(0, group, torch.arange(group.numel(), device = group.device), "amin")
+
+
+def _unique_rows(columns: list) -> Tuple[torch.Tensor, torch.Tensor]:
+    """``(first, inverse)`` of the rows of ``columns`` (int64 [rows] each) as ``np.unique(axis = 0)`` gives them: the
+    distinct rows in lexicographic order of signed values, every one's first row, and every row's number."""
+    N = columns[0].numel()
+    dev = columns[0].device
+    order = torch.arange(N, device = dev)
+    for col in reversed(columns):                                  # (stable sorts, the last column first)
+        order = order[torch.argsort(col[order], stable = True)]
+    new = torch.zeros(N, dtype = torch.bool, device = dev)
+    if N:
+        new[0] = True
+    for col in columns:
+        at = col[order]
+        new[1:] |= at[1:] != at[:-1]
+    number = torch.cumsum(new, dim = 0) - 1
+    inverse = torch.empty_like(number)
+    inverse[order] = number
+    return order[new], inverse
 
 
 def signature_masses(prog, masses, trans_size: int) -> Optional[SignatureMasses]:
@@ -103,75 +145,72 @@ def signature_masses(prog, masses, trans_size: int) -> Optional[SignatureMasses]
     The :class:`SignatureMasses` of ``prog``'s grouped tables (``prog.succ``) for ``masses``' class-mass row map (one
     set: ``masses.batch`` 1, no per-sample token weights), or None where it saves less than
     :data:`SIGNATURE_MIN_SAVING` times the per-column layout's ``trans_size`` floats, nothing is to be built, or a check
-    fails. On the host, once a program and row map (two device copies: the tables and the rows).
+    fails. On the device, once a program and row map.
     """
     tt, en, job = prog.succ, prog.enum, prog.trans_job
     if job is None or not tt.grouped or masses.batch != 1 or masses.enum_logw is not None:
         return None
     n, W, dev = prog.n, prog.W, prog.dev
-    width = np.asarray(prog.width, dtype = np.int64)
-    host = lambda x: x.cpu().numpy().astype(np.int64)
-    sid = host(prog.state_id).reshape(n + 1, W)
-    entry_ptr = host(tt.entry_ptr).reshape(n, W + 1)
-    entry_succ, entry_x = host(tt.entry_succ), host(tt.entry_x)
-    pred_ptr, pred_x = host(tt.pred_ptr).reshape(n, W + 1), host(tt.pred_x)
+    long = lambda x: x.long()
+    width = torch.tensor(prog.width, dtype = torch.int64, device = dev)
+    sid = long(prog.state_id).view(n + 1, W)
+    entry_ptr = long(tt.entry_ptr).view(n, W + 1)
+    entry_succ, entry_x = long(tt.entry_succ), long(tt.entry_x)
+    pred_ptr, pred_x = long(tt.pred_ptr).view(n, W + 1), long(tt.pred_x)
     enum = en.num > 0
-    rows = host(job[0])                                            # (input row, position, rank), by position
-    mass_row = host(masses.row)[rows[:, 0] - prog.input_start]
+    rows = long(job[0])                                            # (input row, position, rank), by position
+    mass_row = long(masses.row)[rows[:, 0] - prog.input_start]
 
     # every column (t, q) and its pairs (entries: by column, then successor)
-    T = np.repeat(np.arange(n, dtype = np.int64), width[:n])
-    Q = np.arange(T.size, dtype = np.int64) - np.repeat(np.cumsum(width[:n]) - width[:n], width[:n])
+    T, Q = _spread(width[:n])
     es, ee = entry_ptr[T, Q], entry_ptr[T, Q + 1]
     npairs = ee - es
-    cstart = np.cumsum(npairs) - npairs
-    ecol = np.repeat(np.arange(T.size), npairs)                    # every (column, pair) visit
-    ek = np.arange(ecol.size, dtype = np.int64) - cstart[ecol]
+    cstart = torch.cumsum(npairs, dim = 0) - npairs
+    ecol, ek = _spread(npairs)                                     # every (column, pair) visit
     eidx = es[ecol] + ek
     gfirst = es - entry_ptr[T, 0]                                  # a column's first pair's number (the kernels')
-    if not np.array_equal(entry_x[eidx], gfirst[ecol] + ek):      # (its pairs: consecutive numbers from it)
+    if not torch.equal(entry_x[eidx], gfirst[ecol] + ek):          # (its pairs: consecutive numbers from it)
         return None
     end = T[ecol] + 1 == n
-    succ_state = np.where(end, -7, sid[np.minimum(T[ecol] + 1, n), np.where(end, 0, entry_succ[eidx])])
+    next_t = (T[ecol] + 1).clamp(max = n)
+    succ_state = torch.where(end, -7, sid[next_t, torch.where(end, torch.zeros_like(eidx), entry_succ[eidx])])
     # its enumerated tokens: (token's column of the probabilities, pair relative to the column's first)
     if enum:
-        enum_ptr = host(tt.enum_ptr).reshape(n, W + 1)
-        enum_e, enum_pair = host(tt.enum_e), host(tt.enum_pair)
-        tok_ptr, tok_index = host(en.ptr), host(en.index)
+        enum_ptr = long(tt.enum_ptr).view(n, W + 1)
+        enum_e, enum_pair = long(tt.enum_e), long(tt.enum_pair)
+        tok_ptr, tok_index = long(en.ptr), long(en.index)
         ns_, ne_ = enum_ptr[T, Q], enum_ptr[T, Q + 1]
         nenum = ne_ - ns_
-        nstart = np.cumsum(nenum) - nenum
-        ncol = np.repeat(np.arange(T.size), nenum)
-        nk = np.arange(ncol.size, dtype = np.int64) - nstart[ncol]
+        nstart = torch.cumsum(nenum, dim = 0) - nenum
+        ncol, nk = _spread(nenum)
         nidx = ns_[ncol] + nk
         tok = tok_index[tok_ptr[T[ncol]] + enum_e[nidx]]
         rel = enum_pair[nidx] - gfirst[ncol]
         evals = tok * 65536 + rel
     else:
-        nenum = np.zeros(T.size, dtype = np.int64)
-        nstart, ncol, evals = nenum, np.zeros(0, dtype = np.int64), np.zeros(0, dtype = np.int64)
-    keys = np.stack([sid[T, Q], npairs, nenum, (T + 1 == n).astype(np.int64)] +
-                    [_segment_hash(succ_state, ecol, cstart, npairs, s).view(np.int64) for s in (1, 2)] +
-                    [_segment_hash(evals, ncol, nstart, nenum, s).view(np.int64) for s in (3, 4)], axis = 1)
-    _, first, sig = np.unique(keys, axis = 0, return_index = True, return_inverse = True)
-    sig = sig.reshape(-1)
+        nenum = torch.zeros(T.numel(), dtype = torch.int64, device = dev)
+        nstart, ncol, evals = nenum, torch.zeros(0, dtype = torch.int64, device = dev), torch.zeros(0, dtype = torch.int64, device = dev)
+    first, sig = _unique_rows([sid[T, Q], npairs, nenum, (T + 1 == n).long()] +
+                              [_segment_hash(succ_state, ecol, cstart, npairs, h) for h in (1, 2)] +
+                              [_segment_hash(evals, ncol, nstart, nenum, h) for h in (3, 4)])
     rep = first[sig]                                               # every column's signature's first column
     # exact: every column's operands are its first's (no hash collision)
-    if not np.array_equal(succ_state, succ_state[cstart[rep[ecol]] + ek]):
+    if not torch.equal(succ_state, succ_state[cstart[rep[ecol]] + ek]):
         return None
-    if enum and not np.array_equal(evals, evals[nstart[rep[ncol]] + nk]):
+    if enum and not torch.equal(evals, evals[nstart[rep[ncol]] + nk]):
         return None
-    S = first.size
+    S = first.numel()
     sig_pairs = npairs[first]
-    sig_off = np.cumsum(sig_pairs) - sig_pairs
+    sig_off = torch.cumsum(sig_pairs, dim = 0) - sig_pairs
     slots = int(sig_pairs.sum())
 
     # the positions' classes: the same class-mass rows in rank order
-    pos, counts = np.unique(rows[:, 1], return_counts = True)
+    rows_h, mass_h = rows.cpu().numpy(), mass_row.cpu().numpy()
+    pos, counts = np.unique(rows_h[:, 1], return_counts = True)
     steps = np.zeros(n, dtype = np.int64)
     steps[pos] = counts
-    order = np.lexsort((rows[:, 2], rows[:, 1]))
-    by_pos = np.split(mass_row[order], np.cumsum(counts)[:-1])
+    order = np.lexsort((rows_h[:, 2], rows_h[:, 1]))
+    by_pos = np.split(mass_h[order], np.cumsum(counts)[:-1])
     cls_of, classes = np.full(n, -1, dtype = np.int64), {}
     for t, mr in zip(pos.tolist(), by_pos):
         cls_of[t] = classes.setdefault(mr.tobytes(), len(classes))
@@ -186,41 +225,44 @@ def signature_masses(prog, masses, trans_size: int) -> Optional[SignatureMasses]
     pairs = np.where(cls_of >= 0, slots, 0)
 
     # representatives: every (class, signature)'s first column at a position of the class's
-    live = cls_of[T] >= 0
-    cand = np.nonzero(live)[0]
-    _, rfirst = np.unique(np.stack([cls_of[T[cand]], sig[cand]], axis = 1), axis = 0, return_index = True)
-    reps = np.sort(cand[rfirst])                                   # by position, then column
+    cls_t = torch.from_numpy(cls_of).to(dev)
+    cand = torch.nonzero(cls_t[T] >= 0).flatten()
+    _, group = torch.unique(cls_t[T[cand]] * S + sig[cand], return_inverse = True)
+    reps = torch.sort(cand[_first_of(group, int(group.max()) + 1 if group.numel() else 0)]).values   # by position, then column
     rep_t, rep_q = T[reps], Q[reps]
     rep_shift = sig_off[sig[reps]] - gfirst[reps]
-    rep_count = np.bincount(rep_t, minlength = n)
-    rep_ptr = np.concatenate([[0], np.cumsum(rep_count)])
+    rep_count = torch.bincount(rep_t, minlength = n)
+    rep_ptr = torch.cat([torch.zeros(1, dtype = torch.int64, device = dev), torch.cumsum(rep_count, dim = 0)])
 
     # the entries' and predecessors' mass indices: their pair's slot (alike boundaries share entries: one value)
-    exs = entry_x.copy()
+    exs = entry_x.clone()
     slot_e = sig_off[sig[ecol]] + ek
     exs[eidx] = slot_e
-    if not np.array_equal(exs[eidx], slot_e):
+    if not torch.equal(exs[eidx], slot_e):
         return None
-    pairbase = np.concatenate([[0], np.cumsum(np.asarray(tt.num_pairs, dtype = np.int64))])
-    pslot = np.full(int(pairbase[-1]), -1, dtype = np.int64)
+    pairbase = torch.cat([torch.zeros(1, dtype = torch.int64, device = dev),
+                          torch.cumsum(torch.as_tensor(tt.num_pairs, dtype = torch.int64, device = dev), dim = 0)])
+    pslot = torch.full((int(pairbase[-1]),), -1, dtype = torch.int64, device = dev)
     pslot[pairbase[T[ecol]] + entry_x[eidx]] = slot_e
-    jw = np.where(np.arange(n) + 1 == n, 1, width[1:n + 1])       # columns at t + 1 (a sequence end: one)
-    ps, pe = pred_ptr[np.arange(n), 0], pred_ptr[np.arange(n), jw]
-    pt = np.repeat(np.arange(n, dtype = np.int64), pe - ps)
-    pidx = ps[pt] + (np.arange(pt.size, dtype = np.int64) - np.repeat(np.cumsum(pe - ps) - (pe - ps), pe - ps))
+    jw = torch.where(torch.arange(n, device = dev) + 1 == n, 1, width[1:n + 1])    # columns at t + 1 (a sequence end: one)
+    boundaries = torch.arange(n, device = dev)
+    ps, pe = pred_ptr[boundaries, 0], pred_ptr[boundaries, jw]
+    pt, within = _spread(pe - ps)
+    pidx = ps[pt] + within
     slot_p = pslot[pairbase[pt] + pred_x[pidx]]
-    pxs = pred_x.copy()
+    pxs = pred_x.clone()
     pxs[pidx] = slot_p
-    if (slot_p < 0).any() or not np.array_equal(pxs[pidx], slot_p):
+    if (slot_p < 0).any() or not torch.equal(pxs[pidx], slot_p):
         return None
 
-    keep = np.isin(rows[:, 1], np.unique(rep_t))
-    i32 = lambda x: torch.from_numpy(np.ascontiguousarray(x, dtype = np.int32)).to(dev)
-    i64 = lambda x: torch.from_numpy(np.ascontiguousarray(x, dtype = np.int64)).to(dev)
-    return SignatureMasses(pair_off = i64(pair_off), pairs = i64(pairs), entry_x = i32(exs), pred_x = i32(pxs),
-                           size = size, job = transition_job(torch.from_numpy(rows[keep]), dev),
-                           rep_ptr = i32(rep_ptr), rep_col = i32(rep_q), rep_shift = i64(rep_shift),
-                           max_reps = int(rep_count.max(initial = 0)), saving = trans_size / max(size, 1))
+    keep = np.isin(rows_h[:, 1], np.unique(rep_t.cpu().numpy()))
+    i32 = lambda x: x.to(torch.int32).contiguous()
+    return SignatureMasses(pair_off = torch.from_numpy(pair_off).to(dev), pairs = torch.from_numpy(pairs).to(dev),
+                           entry_x = i32(exs), pred_x = i32(pxs), size = size,
+                           job = transition_job(torch.from_numpy(rows_h[keep]), dev), rep_ptr = i32(rep_ptr),
+                           rep_col = i32(rep_q), rep_shift = rep_shift.contiguous(),
+                           max_reps = int(rep_count.max()) if rep_count.numel() else 0,
+                           saving = trans_size / max(size, 1))
 
 
 @triton_jit
