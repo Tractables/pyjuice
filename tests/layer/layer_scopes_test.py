@@ -1,4 +1,4 @@
-"""A layer's unique scopes, found with a set: a `BitSet`'s hash must agree with its `__eq__` (blind to trailing zeros)."""
+"""A layer's unique scopes, found with a set: a `BitSet`'s hash must agree with `__eq__` (blind to trailing zeros)."""
 
 from types import SimpleNamespace
 

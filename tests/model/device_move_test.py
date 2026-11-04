@@ -72,7 +72,7 @@ def chain(dist_fn, external = None):
     return root, trans
 
 
-def build(kind, dev):
+def build(kind, dev, precision):
     torch.manual_seed(0)
     trans = None
     if kind == "hmm":
@@ -89,7 +89,7 @@ def build(kind, dev):
         ns, _ = chain(lambda: dists.SoftEvidenceCategorical(num_cats = C))
     else:
         ns, trans = chain(lambda: dists.Categorical(num_cats = C), external = kind)
-    return juice.compile(ns, verbose = False).to(dev), trans
+    return juice.compile(ns, verbose = False, precision = precision).to(dev), trans
 
 
 def run(pc, trans, kind, dev, B, V):
@@ -112,20 +112,28 @@ def run(pc, trans, kind, dev, B, V):
     return lls, pc.param_flows.clone(), cond
 
 
-for kind, B, V in [("hmm", 4, 12), ("hmm", 32, 12), ("hclt", 4, 10), ("hclt", 32, 10), ("pd", 32, 16),
-                   ("softevi", 4, 6), ("softevi", 32, 6), ("blockscale", 32, 6), ("lowrank", 32, 6)]:
-    torch.cuda.set_device(d0)
-    pc, trans = build(kind, d0)
-    run(pc, trans, kind, d0, B, V)
-    torch.cuda.set_device(d1)
-    twin, twin_trans = build(kind, d1)
-    want = run(twin, twin_trans, kind, d1, B, V)
-    pc.to(d1)
-    got = run(pc, trans, kind, d1, B, V)
-    assert torch.equal(got[0], want[0]), (kind, B, "lls")
-    # The backward's CUDA and Triton arms, picked per layer by timing, agree to ~1e-6; the conditional's add atomically
-    assert torch.allclose(got[1], want[1], rtol = 1e-5, atol = 1e-6), (kind, B, "param flows")
-    assert torch.allclose(got[2], want[2], atol = 1e-6), (kind, B, "conditional")
+# At "fp32" the backward's CUDA and Triton arms, picked per layer by timing, agree to ~1e-6. At "auto" the kernels
+# a circuit may take round differently: MEASURED up to 1.0e-4 between a moved circuit and its twin, intermittently,
+# with the log-likelihoods the same to the bit and "fp32" the same to the bit too. Stale state shows at either.
+# (External parameters' backward has no "fp32".)
+PLAIN, EXTERNAL = (("fp32", 1e-5), ("auto", 1e-3)), (("auto", 1e-3),)
+for kind, B, V, precisions in [("hmm", 4, 12, PLAIN), ("hmm", 32, 12, PLAIN), ("hclt", 4, 10, PLAIN),
+                               ("hclt", 32, 10, PLAIN), ("pd", 32, 16, PLAIN), ("softevi", 4, 6, PLAIN),
+                               ("softevi", 32, 6, PLAIN), ("blockscale", 32, 6, EXTERNAL),
+                               ("lowrank", 32, 6, EXTERNAL)]:
+    for precision, rtol in precisions:
+        torch.cuda.set_device(d0)
+        pc, trans = build(kind, d0, precision)
+        run(pc, trans, kind, d0, B, V)
+        torch.cuda.set_device(d1)
+        twin, twin_trans = build(kind, d1, precision)
+        want = run(twin, twin_trans, kind, d1, B, V)
+        pc.to(d1)
+        got = run(pc, trans, kind, d1, B, V)
+        assert torch.equal(got[0], want[0]), (precision, kind, B, "lls")
+        assert torch.allclose(got[1], want[1], rtol = rtol, atol = 1e-6), (precision, kind, B, "param flows")
+        # (the conditional's add atomically)
+        assert torch.allclose(got[2], want[2], atol = 1e-6), (precision, kind, B, "conditional")
 print("CHILD_OK")
 """
 
