@@ -69,7 +69,7 @@ def par_update_kernel(mparams, cum_pflows, nchs, par_start_ids, blk_sizes, blk_i
     tl.store(mparams + offs_par, norm_param.to(mparams.dtype.element_ty), mask = mask_par)
 
 
-@njit
+@njit(cache = True)
 def cum_par_numba_kernel(cum_pflows, params, par_start_ids, blk_sizes, blk_intervals, global_nids):
     for i in range(par_start_ids.shape[0]):
         par_start_id = par_start_ids[i]
@@ -84,7 +84,7 @@ def cum_par_numba_kernel(cum_pflows, params, par_start_ids, blk_sizes, blk_inter
         cum_pflows[global_nid] += cum_par
 
 
-@njit
+@njit(cache = True)
 def par_update_numba_kernel(params, cum_pflows, nchs, par_start_ids, blk_sizes, blk_intervals, global_nids, pseudocount):
     for i in range(par_start_ids.shape[0]):
         par_start = par_start_ids[i]

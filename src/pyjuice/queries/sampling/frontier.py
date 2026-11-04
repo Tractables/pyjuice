@@ -14,7 +14,7 @@ import torch
 from numba import njit
 
 
-@njit
+@njit(cache = True)
 def assign_cids_ind_target(ind_target, element_pointers, ind_b, num_samples):
     """
     Allocate one slot of `element_samples` per selected sum node.
@@ -29,7 +29,7 @@ def assign_cids_ind_target(ind_target, element_pointers, ind_b, num_samples):
         element_pointers[bid] = ind_t + 1
 
 
-@njit
+@njit(cache = True)
 def assign_nids_ind_target(ind_target, ind_target_sid, node_pointers, ind_b, num_samples):
     """
     Allocate slots of `node_samples` for the children of every selected product node.

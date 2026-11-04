@@ -174,7 +174,7 @@ def get_sum_layer_backward_stats(nodes: Sequence[SumNodes]):
     return ch_gsize2cs, ch_gsize2num_nblocks, ch_gsize2n_pargs, cs2parns
 
 
-@njit
+@njit(cache = True)
 def _assign_chid_kernel(chs_offsets, ns_nchs, edge_ids):
     for i in range(edge_ids.shape[1]):
         nid = edge_ids[0,i]
@@ -584,7 +584,7 @@ def sum_layer_forward_compilation(nodes, fw_partition_max_chs, n_partition_ids, 
     return nids, cids, pids, pfids, global_pid_start, global_pfid_start
 
 
-@njit
+@njit(cache = True)
 def _assign_chid_kernel(chs_offsets, ns_nchs, edge_ids):
     for i in range(edge_ids.shape[1]):
         nid = edge_ids[0,i]
@@ -593,7 +593,7 @@ def _assign_chid_kernel(chs_offsets, ns_nchs, edge_ids):
         ns_nchs[nid] = idx + 1
 
 
-@njit
+@njit(cache = True)
 def _assign_parid_kernel(pars_offsets, cs_npars, edge_ids, edge_sid):
     for i in range(edge_ids.shape[1]):
         cid = edge_ids[1,i]
@@ -993,7 +993,7 @@ def get_prod_layer_parstats(flat_cids: torch.Tensor, global_nid_start: int):
     return u_cids, par_counts
 
 
-@njit
+@njit(cache = True)
 def _assign_c_idx_kernel(flat_cids, flat_par_offsets, cum_c_nodes):
     for i in range(flat_cids.shape[0]):
         cid = flat_cids[i]
@@ -1002,7 +1002,7 @@ def _assign_c_idx_kernel(flat_cids, flat_par_offsets, cum_c_nodes):
         cum_c_nodes[cid] = idx + 1
 
 
-@njit
+@njit(cache = True)
 def _assign_cid2_block_local_id(flat_u_cids, n_block_ids, n_id_in_block, cid2block_id, cid2local_id):
     for i in range(flat_u_cids.shape[0]):
         cid = flat_u_cids[i]

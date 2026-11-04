@@ -14,7 +14,7 @@ from pyjuice.utils.util import max_cdf_power_of_2
 from pyjuice.utils.kernel_launcher import FastJITFunction
 
 
-@njit
+@njit(cache = True)
 def _compute_param_target_ids_kernel(target_id0, target_id1, target_id2, edge_ids, new_edge_ids, 
                                      block_mul_size, ch_block_mul_size, block_size, ch_block_size):
     for i in range(edge_ids.shape[1]):
