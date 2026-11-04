@@ -18,7 +18,8 @@ from ..kernels.live import live_successors
 from ..kernels.sample_transitions import sample_transition_masses
 from ..kernels.transitions import (SampleMasses, boundary_groups, enumerated_tokens, next_col_table, sample_classes,
                                    sample_masses, transition_masses, transition_stats, transition_tables)
-from .circuit import TRANS_COLS, circuit_tables, launch_of
+from ..kernels.common import most_in_runs
+from .circuit import TRANS_COLS, circuit_tables
 from .layout import interval_tables
 
 
@@ -165,6 +166,7 @@ class Program:
         self.all_iv_full = self.all_iv_slots == self.entries[ends[:, 0]] * self.exits[ends[:, 1]]
         self.live_tables = OrderedDict()                               # (batch size, intervals) -> lane order tables
         self.plans = OrderedDict()                                     # query plans, see :mod:`.plans`
+        self.cw_walks = {}                                             # (see :func:`~..kernels.score._class_weight_cuda`)
         self.layouts = OrderedDict()                                   # conditionals' class weights, see .conditional
 
         # every product layer's launches, what the layout says of them; gated sum layers
@@ -172,31 +174,11 @@ class Program:
         assembly = self.assembly = circuit.assembly(self.reach)
         self.score = assembly.score
         reach, all_slots = self.reach, self.all_iv_slots
-        slots = regions[:, 2]
-        # every launch's parts' columns and slots, at once
+        # what the automaton says of the launches: their parts' columns and slots, the slots of the scratch rows
         self.launch_parts = np.stack([self.entries[assembly.part_a], self.exits[assembly.part_b],
                                       all_slots[assembly.part_iv]], axis = 1)
-        ptr = assembly.part_ptr.tolist()
-        most = np.maximum.reduceat(self.launch_parts, assembly.part_ptr[:-1], axis = 0).tolist() if len(ptr) > 1 else []
-        at = 0
-
-        def launch(t):
-            nonlocal at
-            at += 1
-            return launch_of(t, self.launch_parts[ptr[at - 1]:ptr[at]], most[at - 1])
-
-        self.steps = []
-        for kind, prod_index, layers in circuit.steps:
-            if kind == "prod":
-                self.steps.append(("prod", prod_index, [
-                    ([[launch(t) for t in launches] for launches in stages], num_temps,
-                     int(all_slots[temp_ivs].max(initial = 1)))
-                    for stages, num_temps, temp_ivs in assembly.layers.get(prod_index, ())]))
-            else:
-                self.steps.append(("sum", prod_index, [
-                    (block_size, [(dense, E, None if fused is None else
-                                   (*fused[:4], int(slots[fused[4]].max()), *fused[5:]))
-                                  for dense, E, fused in parts]) for block_size, parts in layers]))
+        self.temp_slots = most_in_runs(all_slots[assembly.temp_iv], assembly.temp_ptr, 1).tolist()
+        self.steps = assembly.steps
         self.intervals = interval_tables(reach, self.all_ivs, dev, of = circuit.of_t)
         self.elem_slots = np.asarray([slots for _, _, slots in backend.element_regions], dtype = np.int64)
 
@@ -254,6 +236,11 @@ class Program:
         """Whether a query whose transition masses would take ``size`` floats takes the grouped transitions: worth it
         (:func:`grouped_worth`), and the masses within the budget (:func:`transition_budget`)."""
         return self.group_worth and size <= self.trans_budget
+
+    def most_of(self, launch) -> list:
+        """The most entry columns, exit columns and slots of a :class:`~..kernels.prod.Launch`'s steps' outputs."""
+        ptr = self.assembly.part_ptr
+        return self.launch_parts[ptr[launch.number]:ptr[launch.number + 1]].max(axis = 0).tolist()
 
     def sample_layout(self, masses, succ) -> SampleMasses:
         """The layout of ``masses``' per-sample transition masses over the successor lists ``succ`` (their

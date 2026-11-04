@@ -584,29 +584,19 @@ def _operand_table(product_rows, firsts: np.ndarray, n: int, input_end: int, iv_
 # The launches of a pattern
 # -------------------------------------------------------------------------------------------------
 
-class LaunchTemplate(NamedTuple):
-    """A :class:`~..kernels.prod.Launch` but for what its automaton says: its steps' outputs' intervals, ``parts``, and
-    ``part_of`` [S], every step's among them (None: one part)."""
-
-    form: str
-    kinds: tuple
-    steps: Any
-    rows: torch.Tensor
-    iv: torch.Tensor
-    parts: list
-    part_of: Optional[torch.Tensor]
-    groups_host: Optional[dict]
-    out_ivs: np.ndarray
-
-
 class Assembly:
     """
     A circuit's steps grouped into launches, under one pattern of which intervals keep every pair.
 
-    :ivar layers: per product layer group (by number), per layer, ``(stages of LaunchTemplate, num_temps, the intervals
-        of what its scratch rows hold, by their numbers)``
+    :ivar layers: per product layer group (by number), per layer, ``(stages of Launch, num_temps, the intervals of what
+        its scratch rows hold, by their numbers)``
+    :ivar launches: every :class:`~..kernels.prod.Launch`, by its ``number``: in :attr:`layers`' order
+    :ivar steps: the Program's steps: its product layers ``(stages, num_temps, layer's number)``, its sum layers the
+        circuit's
+    :ivar temp_iv, temp_ptr: int64: the intervals of what every product layer's scratch rows hold (CSR, by its number)
     :ivar part_a, part_b, part_iv, part_ptr: int64: the ends and numbers (``CircuitTables``' ``all_ivs``) of the launches'
-        ``parts``, one launch's after another's in :attr:`layers`' order, launch ``k``'s from ``part_ptr[k]``
+        ``ends``, one launch's after another's in :attr:`layers`' order, launch ``k``'s from ``part_ptr[k]``
+    :ivar plans: the query plans of its programs, as they are whatever the automaton (:mod:`..queries.backend.plans`)
     :ivar triple_of, skip_triples: every ``block @ block`` step's boundary triple, in the order the skip masks are built
     :ivar pos_steps: int64 [n] on the device, the input steps per position
     :ivar steps_host: the same on the host
@@ -670,14 +660,24 @@ class Assembly:
                                     layer.num_temps, np.asarray([number[iv] for iv in layer.temp_ivs], dtype = np.int64))
                                    for li, layer in enumerate(layers)]
         tables.upload(dev)
-        for layers in self.layers.values():
-            for stages, _, _ in layers:
-                for launches_ in stages:
-                    launches_[:] = [t._replace(steps = settled(t.steps)) for t in launches_]
-        ends = [iv for layers in self.layers.values() for stages, _, _ in layers for launches_ in stages
-                for t in launches_ for iv in t.parts]
-        counts = [len(t.parts) for layers in self.layers.values() for stages, _, _ in layers for launches_ in stages
-                  for t in launches_]
+        self.launches = [t for layers in self.layers.values() for stages, _, _ in layers for launches_ in stages
+                         for t in launches_]
+        for k, t in enumerate(self.launches):
+            t.steps, t.number = settled(t.steps), k
+        ends = [iv for t in self.launches for iv in t.ends]
+        counts = [len(t.ends) for t in self.launches]
+        temps, self.steps = [], []
+        for kind, pi, layers in circuit.steps:
+            if kind == "prod":
+                self.steps.append((kind, pi, []))
+                for stages, num_temps, temp_ivs in self.layers.get(pi, ()):
+                    self.steps[-1][2].append((stages, num_temps, len(temps)))
+                    temps.append(temp_ivs)
+            else:
+                self.steps.append((kind, pi, layers))
+        self.temp_iv = np.concatenate(temps) if temps else np.zeros(0, dtype = np.int64)
+        self.temp_ptr = np.cumsum([0] + [t.size for t in temps], dtype = np.int64)
+        self.plans = OrderedDict()
         number = circuit.attrs["iv_index"]
         self.part_a = np.asarray([a for a, _ in ends], dtype = np.int64)
         self.part_b = np.asarray([b for _, b in ends], dtype = np.int64)
@@ -688,9 +688,9 @@ class Assembly:
         self.forward_shape = None
         self.position_classes = None
 
-    def _launch(self, tables: OneCopy, form: str, kinds: tuple, rows: np.ndarray, parts: list) -> LaunchTemplate:
-        """The :class:`LaunchTemplate` of a stage's steps (``rows`` [S, fields] int64, of the emits ``parts``); a query
-        plan runs a subset of them through index lists (:class:`~..kernels.prod.Cut`)."""
+    def _launch(self, tables: OneCopy, form: str, kinds: tuple, rows: np.ndarray, parts: list) -> Launch:
+        """The :class:`~..kernels.prod.Launch` of a stage's steps (``rows`` [S, fields] int64, of the emits ``parts``); a
+        query plan runs a subset of them through index lists (:class:`~..kernels.prod.Cut`)."""
         circuit = self.circuit
         S = rows.shape[0]
         to_device = lambda a: tables.add(a.astype(np.int32))
@@ -722,8 +722,8 @@ class Assembly:
             steps = to_device(rows)
         index = circuit.attrs["iv_index"]                               # the outputs' intervals
         out_ivs = np.unique(np.asarray([index[iv_] for iv_ in ends], dtype = np.int64))
-        return LaunchTemplate(form, kinds, steps, torch.from_numpy(rows), torch.from_numpy(iv), ends,
-                              None if part_of is None else torch.from_numpy(part_of), groups_host, out_ivs)
+        return Launch(form, kinds, steps, torch.from_numpy(rows), torch.from_numpy(iv), ends,
+                      None if part_of is None else torch.from_numpy(part_of), groups_host, out_ivs)
 
 
 def _cat_fields(parts: List[Emit]) -> np.ndarray:
@@ -745,7 +745,3 @@ def _step_groups(st: np.ndarray, sizes):
     return order, {G: np.concatenate([np.flatnonzero((k - run_first) % G == 0), end]) for G in sizes}
 
 
-def launch_of(t: LaunchTemplate, parts: np.ndarray, most: list) -> Launch:
-    """The :class:`~..kernels.prod.Launch` of a template under a layout: ``parts`` int64 [parts, 3], the columns and slots
-    of its parts, and ``most`` their most."""
-    return Launch(t.form, t.kinds, t.steps, most[0], most[1], most[2], t.rows, t.iv, parts, t.part_of, t.groups_host, t.out_ivs)

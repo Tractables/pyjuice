@@ -18,10 +18,11 @@ import numpy as np
 import torch
 
 from ..external_params import block_scale
-from ..kernels.common import IDENTITY, SUM, TEMP, OneCopy, first_occurrence_groups, node_groups, node_tiles, packed, settled
+from ..kernels.common import IDENTITY, SUM, TEMP, OneCopy, first_occurrence_groups, most_in_runs, node_groups, node_tiles, packed, \
+    settled
 from ..kernels.prod import skip_masks_for
 from ..kernels.prod_top_down import TopDownLaunch
-from ..kernels.score import ClassWeightLaunch, class_weight_exits, class_weight_launch, score_tables
+from ..kernels.score import ClassWeightLaunch, class_weight_launch, score_tables
 
 
 
@@ -35,7 +36,7 @@ class TopDownProgram:
         ``dense_runs`` a list of ``(region, c0, E, (lo, hi), blocks, key, add)`` (children ``c0 + lo .. c0 + hi`` of a
         dense run over ``E``), ``fused_groups`` ``{child block size: tables}``
         for :func:`~.sum.fused_sum_top_down` (with host copies under ``"host"``) -- and ``("prod", prod_index,
-        [(fold_stages, stages, num_temps, temp_slots)])``: ``fold_stages`` the forward launches that write scratch rows,
+        [(fold_stages, stages, num_temps, layer's number)])``: ``fold_stages`` the forward launches that write scratch rows,
         ``stages`` per forward stage, in the forward's order, ``(launches, inputs, folds, class_weights)`` -- the
         stage's :class:`~.prod_top_down.TopDownLaunch` es, its products' input operands ``(out_temp, out rows,
         positions)``, per fold launch, ``(out rows, scratch operand rows or None, [sum operands' regions])``, and the
@@ -50,6 +51,10 @@ class TopDownProgram:
     :ivar dead_region: bool [sum regions] (host): those with a dead row
     :ivar shared: what query plans keep of these tables whatever the automaton (:mod:`..queries.backend.planners`), the
         circuit's: one dict for the programs of one :class:`~.circuit.Assembly`
+
+    Its ``steps`` and ``shared`` are the :class:`~.circuit.Assembly`'s, one for every automaton of its pattern: what an
+    automaton says of them -- the launches' most columns and slots -- is in ``prog.td_most``, ``prog.cw_most`` and
+    ``prog.td_slots``, by their ``number``.
     """
 
     steps: list
@@ -69,46 +74,14 @@ def top_down_program(backend) -> TopDownProgram:
     t = prog.assembly.top_down
     if t is None:
         t = prog.assembly.top_down = top_down_template(backend, prog)
-    reach, slots = prog.reach, np.asarray(prog.slots, dtype = np.int64)
-    # every child launch's columns, slots and whether it keeps every pair, at once
-    ptr = t.child_ptr[:-1]
-    has = ptr.size > 0
-    most_entries = np.maximum.reduceat(prog.entries[t.child_a], ptr).tolist() if has else []
-    most_exits = np.maximum.reduceat(prog.exits[t.child_b], ptr).tolist() if has else []
-    most_slots = np.maximum.reduceat(prog.all_iv_slots[t.child_iv], ptr).tolist() if has else []
-    all_full = np.logical_and.reduceat(prog.all_iv_full[t.child_iv], ptr).tolist() if has else []
-
-    def child(c: _Child) -> TopDownLaunch:
-        k = c.number
-        kinds = c.kinds if c.c_full_at is None else (c.kinds[0], c.kinds[1], (all_full[k], c.kinds[2]))
-        return TopDownLaunch(c.form, c.side, kinds, c.children, c.ptr, c.parents, most_entries[k], most_exits[k],
-                             most_slots[k], c.host, c.tiles, c.height)
-
-    def weights(cw, boundaries) -> ClassWeightLaunch:
-        return ClassWeightLaunch(cw.form, cw.kinds, cw.dests, cw.ptr, cw.parents,
-                                 class_weight_exits(cw.form, boundaries, prog), cw.host, cw.tiles, cw.tile_height)
-
-    def group(tables: dict) -> dict:
-        dense = tables["dense"]
-        if dense is not None:                            # (the forward part, as the Program has it)
-            part = dense["part"]
-            dense = dict(dense, part = (*part[:4], int(slots[part[4]].max()), *part[5:]))
-        return dict(tables, max_slots = int(slots[tables["max_slots"]].max()), host = dict(tables["host"]), dense = dense)
-
-    steps = []
-    for (kind, prod_index, layers_t), (_, _, layers) in zip(t.steps, reversed(prog.steps)):
-        if kind == "sum":
-            steps.append(("sum", prod_index, [(block_size, dense_runs, {length: group(tables) for length, tables in fused.items()})
-                                              for block_size, dense_runs, fused in layers_t]))
-        else:
-            out = []
-            for info, (stages, num_temps, temp_slots) in zip(layers_t, layers):
-                fold_stages = [[l for l in launches if _out_temp(l)] for launches in stages]
-                out.append(([s for s in fold_stages if s],
-                            [([child(c) for c in children], inputs, folds, [weights(*cw) for cw in cws])
-                             for children, inputs, folds, cws in info], num_temps, temp_slots))
-            steps.append(("prod", prod_index, out))
-    return TopDownProgram(steps = steps, skip = skip_masks_for(reach, t.specs, device = prog.dev), dead = t.dead,
+    # what the automaton says of its launches, at once: their most columns and slots, a class weight launch's outputs'
+    # columns, a fused group's regions' slots
+    ptr = t.child_ptr
+    prog.td_most = np.stack([most_in_runs(prog.entries[t.child_a], ptr), most_in_runs(prog.exits[t.child_b], ptr),
+                             most_in_runs(prog.all_iv_slots[t.child_iv], ptr)], axis = 1).ravel().tolist()
+    prog.cw_most = most_in_runs(prog.exits[t.cw_bound], t.cw_ptr).tolist()
+    prog.td_slots = most_in_runs(np.asarray(prog.slots, dtype = np.int64)[t.group_reg], t.group_ptr).tolist()
+    return TopDownProgram(steps = t.steps, skip = skip_masks_for(prog.reach, t.specs, device = prog.dev), dead = t.dead,
                           dead_region = t.dead_region, iv_bounds = t.iv_bounds, reg_iv = t.reg_iv,
                           elem_regions = t.elem_regions, shared = t.shared)
 
@@ -133,9 +106,11 @@ class _Child(NamedTuple):
 
 
 class _Template(NamedTuple):
-    """:func:`top_down_template`'s tables, in :attr:`TopDownProgram.steps`' order; ``child_a``, ``child_b``, ``child_iv``
-    int64: the ends and numbers of every child launch's children's distinct intervals, the launch ``number``'s from
-    ``child_ptr[number]``."""
+    """:func:`top_down_template`'s tables: ``steps``, :attr:`TopDownProgram.steps`, the circuit's alone; ``child_a``,
+    ``child_b``, ``child_iv`` int64: the ends and numbers of every child launch's children's distinct intervals, the
+    launch ``number``'s from ``child_ptr[number]``; ``cw_bound``, ``cw_ptr``: every class weight launch's outputs'
+    boundaries (:class:`~..kernels.score.ClassWeightLaunch`, by its ``number``); ``group_reg``, ``group_ptr``: every fused
+    group's sum regions (its ``number``)."""
 
     steps: list
     specs: list
@@ -149,6 +124,10 @@ class _Template(NamedTuple):
     child_b: np.ndarray
     child_iv: np.ndarray
     child_ptr: np.ndarray
+    cw_bound: np.ndarray
+    cw_ptr: np.ndarray
+    group_reg: np.ndarray
+    group_ptr: np.ndarray
 
 
 def _out_temp(launch) -> bool:
@@ -171,7 +150,7 @@ def top_down_template(backend, prog) -> _Template:
     elements = [np.zeros(end - first, dtype = bool) for first, end, _ in backend.element_regions]
     temps = {}
     specs, spec_of = [], {}
-    child_ends = []
+    child_ends, group_regs, cw_bounds = [], [], []
     tables = OneCopy()                                    # (the launches' tables on the device: in one copy)
 
     def spec_index(spec):
@@ -287,6 +266,9 @@ def top_down_template(backend, prog) -> _Template:
                             dense_runs.append((r, c0, E, (lo, hi), blocks, key, add))
                 fused_groups = _fused_tables(prog, [fused for _, _, fused in parts if fused is not None], block_size,
                                              elem_first, firsts, sums, elements[prod_index], dev)
+                for group in fused_groups.values():
+                    group["number"] = len(group_regs)
+                    group_regs.append(group["regions"])
                 layers_out.append((block_size, dense_runs, fused_groups))
             steps.append(("sum", prod_index, layers_out))
         else:
@@ -304,20 +286,36 @@ def top_down_template(backend, prog) -> _Template:
                         alive = outputs_written(launch, launch.rows.numpy(), prod_index, (prod_index, li))
                         cw = class_weight_launch(launch, alive, prog, score, tables)
                         if cw is not None:
+                            cw, boundaries = cw
+                            cw.number = len(cw_bounds)
+                            cw_bounds.append(boundaries)
                             cws.append(cw)
                     info.append((out, _inputs(launches), _folds([l for l in launches if _out_temp(l)]), cws))
                 layers_out.append(info[::-1])
             steps.append(("prod", prod_index, layers_out))
     tables.upload(dev)
-    for kind, _, layers_out in steps:
+    joined = lambda k: np.concatenate([ends[k] for ends in child_ends]) if child_ends else np.zeros(0, dtype = np.int64)
+    child_iv, child_ptr = joined(2), np.cumsum([0] + [ends[0].size for ends in child_ends], dtype = np.int64)
+    all_full = np.logical_and.reduceat(prog.all_iv_full[child_iv], child_ptr[:-1]).tolist() if child_ends else []
+
+    def child(c: _Child) -> TopDownLaunch:                     # (a pattern says which intervals keep every pair)
+        kinds = c.kinds if c.c_full_at is None else (c.kinds[0], c.kinds[1], (all_full[c.number], c.kinds[2]))
+        return TopDownLaunch(c.form, c.side, kinds, c.children.tensor, c.ptr.tensor, c.parents.tensor, c.host,
+                             settled(c.tiles), c.height, c.number)
+
+    for k, (kind, prod_index, layers_out), (_, _, layers) in zip(range(len(steps)), list(steps), reversed(assembly.steps)):
         if kind != "prod":
             continue
-        for info in layers_out:
-            for out, _, _, cws in info:
-                out[:] = [c._replace(children = c.children.tensor, ptr = c.ptr.tensor, parents = c.parents.tensor,
-                                     tiles = settled(c.tiles)) for c in out]
-                for cw, _ in cws:
+        out = []
+        for info, (stages, num_temps, temp_no) in zip(layers_out, layers):
+            fold_stages = [[l for l in launches if _out_temp(l)] for launches in stages]
+            for _, _, _, cws in info:
+                for cw in cws:
                     cw.dests, cw.ptr, cw.parents, cw.tiles = cw.dests.tensor, cw.ptr.tensor, cw.parents.tensor, cw.tiles.tensor
+            out.append(([s for s in fold_stages if s], [([child(c) for c in children], inputs, folds, cws)
+                                                        for children, inputs, folds, cws in info], num_temps, temp_no))
+        steps[k] = ("prod", prod_index, out)
+    int64 = lambda parts: np.concatenate(parts).astype(np.int64) if parts else np.zeros(0, dtype = np.int64)
     region_first = np.asarray([first for first, _, _ in backend.sum_regions], dtype = np.int64)
     region_end = np.asarray([end for _, end, _ in backend.sum_regions], dtype = np.int64)
     rows = np.nonzero(~sums)[0]
@@ -331,10 +329,11 @@ def top_down_template(backend, prog) -> _Template:
     dead_region = np.zeros(len(backend.sum_regions), dtype = bool)
     dead_region[dead[:, 1]] = True
     region_iv = prog.iv_bounds[prog.reg_iv_np]
-    joined = lambda k: np.concatenate([ends[k] for ends in child_ends]) if child_ends else np.zeros(0, dtype = np.int64)
     return _Template(steps, specs, dead, dead_region, iv_bounds, iv_index(region_iv[:, 0], region_iv[:, 1]),
-                     [(first, end) for first, end, _ in backend.element_regions], {}, joined(0), joined(1), joined(2),
-                     np.cumsum([0] + [ends[0].size for ends in child_ends], dtype = np.int64))
+                     [(first, end) for first, end, _ in backend.element_regions], {}, joined(0), joined(1), child_iv, child_ptr,
+                     int64([np.asarray(b, dtype = np.int64) for b in cw_bounds]),
+                     np.cumsum([0] + [len(b) for b in cw_bounds], dtype = np.int64), int64(group_regs),
+                     np.cumsum([0] + [r.size for r in group_regs], dtype = np.int64))
 
 
 def _inputs(launches) -> list:
@@ -512,7 +511,7 @@ def _fused_tables(prog, parts, block_size, elem_first, firsts, sums, elements, d
         groups[length] = dict(cb_row = t32(cb_row), cb_reg = t32(cb_reg), cb_add = t32(cb_add), cb_ivreg = t32(cb_ivreg),
                               par_ptr = t32(ptr), par_nid = t32(p_nid), par_reg = t32(p_reg),
                               par_pid = torch.from_numpy(p_pid).to(dev, torch.int64),
-                              max_slots = np.unique(cb_ivreg),             # (of these regions: the backend's)
+                              regions = np.unique(cb_ivreg),               # (their slots: ``prog.td_slots``, by ``number``)
                               max_parents = int(np.diff(ptr).max()),
                               dense = dense,
                               gate = None if not gated else dict(

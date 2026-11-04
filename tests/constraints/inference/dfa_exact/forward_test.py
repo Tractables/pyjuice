@@ -758,8 +758,10 @@ def test_narrow_launches_run_one_step_per_program(build_pc, reference, monkeypat
     cc = jc.compile(CONSTRAINTS["contains"](), build_pc("hmm", n, V))
     data, missing = evidence(n, 4)
     assert input_block_groups(cc)
-    lanes = max(4 * l.S_max for kind, _, layers in cc.backend.program().steps if kind == "prod"
-                for stages, _, _ in layers for launches in stages for l in launches if l.form == "input_block" and l.steps[2] is not None)
+    prog = cc.backend.program()
+    lanes = max(4 * prog.most_of(l)[2] for kind, _, layers in prog.steps if kind == "prod"
+                for stages, _, _ in layers for launches in stages for l in launches
+                if l.form == "input_block" and l.steps[2] is not None)
     want = reference.marginal(cc, data, missing)
     for limit, launched in ((lanes, False), (lanes - 1, True)):
         monkeypatch.setattr(prod, "GROUP_MIN_LANES", limit)

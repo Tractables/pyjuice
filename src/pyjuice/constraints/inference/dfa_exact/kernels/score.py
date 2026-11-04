@@ -127,11 +127,12 @@ class ClassWeightLaunch:
     :ivar dests: int32 [D, 2] on the device: position, column
     :ivar ptr: int32 [D + 1], every destination's steps in ``parents``
     :ivar parents: int32 [P, 7], the forward step rows (see :mod:`.prod`), every destination's contiguous
-    :ivar J_max: the most exit columns (``input_block``) or entry columns (``block_input``) of the outputs
     :ivar host: for query plans, numpy copies of ``dests``, ``ptr`` and ``parents``, and every destination's node tile
         ``group`` (:func:`~.common.node_groups`: its position, and its steps' other boundaries in order)
     :ivar tiles, tile_height: every destination in node tiles (int32 on the device) and their height
         (:func:`~.common.node_tiles`) -- a query plan's lists of destinations are tiles too
+    :ivar number: its place among its circuit's: ``prog.cw_most[number]``, the most exit columns (``input_block``) or
+        entry columns (``block_input``) of the outputs (what an automaton says of them)
     """
 
     form: str
@@ -139,18 +140,17 @@ class ClassWeightLaunch:
     dests: torch.Tensor
     ptr: torch.Tensor
     parents: torch.Tensor
-    J_max: int
     host: Any
     tiles: torch.Tensor
     tile_height: int
-    walk_tables: Any = None
+    number: int = 0
 
 
 def class_weight_launch(launch, alive: np.ndarray, prog, score: ScoreTables, tables):
-    """``(launch, boundaries)``, the :class:`ClassWeightLaunch` of a forward launch's input operands but for ``J_max``
-    (:func:`class_weight_exits`, of the outputs' ``boundaries``), ``alive`` marking the steps whose output has a top-down
-    value (the others add nothing); None when there is no such step or no input operand. Its tables are places of
-    ``tables`` (a :class:`~.common.OneCopy`) until they are uploaded."""
+    """``(launch, boundaries)``, the :class:`ClassWeightLaunch` of a forward launch's input operands and its outputs'
+    ``boundaries``, ``alive`` marking the steps whose output has a top-down value (the others add nothing); None when
+    there is no such step or no input operand. Its tables are places of ``tables`` (a :class:`~.common.OneCopy`) until
+    they are uploaded."""
     if launch.form not in ("input_block", "block_input") or not alive.any():
         return None
     rows = launch.rows.numpy()[alive]
@@ -171,16 +171,8 @@ def class_weight_launch(launch, alive: np.ndarray, prog, score: ScoreTables, tab
     group = node_groups(dests[:, 0], other)
     tiles, height = node_tiles(group)
     i32 = lambda x: tables.add(np.asarray(x, dtype = np.int32))
-    return ClassWeightLaunch(launch.form, launch.kinds, i32(dests), i32(ptr), i32(rows), 0,
+    return ClassWeightLaunch(launch.form, launch.kinds, i32(dests), i32(ptr), i32(rows),
                              dict(dests = dests, ptr = ptr, parents = rows, group = group, walk = {}), i32(tiles), height), boundaries
-
-
-def class_weight_exits(form: str, boundaries: list, prog) -> int:
-    """:attr:`ClassWeightLaunch.J_max` of a launch whose outputs' ``boundaries`` (:func:`class_weight_launch`) have
-    ``prog``'s columns."""
-    if form == "input_block":
-        return max(1 if t == prog.n else prog.width[t] for t in boundaries)
-    return max(prog.width[t] for t in boundaries)
 
 
 @triton.jit
@@ -491,8 +483,8 @@ def _class_weight_boundaries(prog) -> None:
     CUDA tables say whatever the automaton (a launch's dict, the same for its program of any constraint): ``ts``, its
     destinations' boundaries, ``tlist`` / ``t2i`` the same on the device, in one copy (copies wait for the stream), and
     the most steps of a destination."""
-    launches = [cw.host for kind, _, layers in prog.assembly.top_down.steps if kind == "prod" for info in layers
-                for _, _, _, cws in info for cw, _ in cws]
+    launches = [cw.host for kind, _, layers in prog.assembly.top_down.steps if kind == "prod" for _, stages, _, _ in layers
+                for _, _, _, cws in stages for cw in cws]
     n, arrays, ts = prog.n, [], []
     for h in launches:
         x = np.unique(h["dests"][:, 0])
@@ -515,34 +507,37 @@ def _class_weight_cuda(mod, la, tiles, height, cw, rows, prog, bufs, element_flo
     """One launch on the CUDA kernels (see :data:`CLASS_WEIGHT_CUDA`), or False where they do not apply (several steps
     a destination, rows too wide for shared memory, entry tables past :data:`CLASS_WEIGHT_CUDA_TABLE_MAX`, a CUDA graph
     being captured before the launch's tables exist): the caller runs the Triton kernel then."""
-    h = la.host
-    st = la.walk_tables
-    if st is None:
+    st = la.host["walk"]
+    if "ts" not in st:
         if torch.cuda.is_current_stream_capturing():
             return False
-        walk = h["walk"]
-        if "ts" not in walk:
-            _class_weight_boundaries(prog)
-        ts = walk["ts"]
+        _class_weight_boundaries(prog)
+    # (what the automaton says of its boundaries, of a program's launches: once)
+    kept = prog.cw_walks.get(la.number)
+    if kept is None:
+        if torch.cuda.is_current_stream_capturing():
+            return False
+        ts = st["ts"]
         maxl = getattr(prog, "_cw_max_list", None)
         if maxl is None:                                               # every boundary's longest class list (once)
             cp = prog.trans.cls_ptr.view(-1, prog.C + 1)
             maxl = prog._cw_max_list = (cp[:, 1:] - cp[:, :-1]).amax(1).cpu().numpy()
-        st = la.walk_tables = dict(walk, maxl = max(1, int(max(maxl[t] for t in ts))), wt = max(prog.width[t] for t in ts),
-                                 wt1 = max(prog.width[t + 1] for t in ts))
+        kept = prog.cw_walks[la.number] = (max(1, int(max(maxl[t] for t in ts))), max(prog.width[t] for t in ts),
+                                           max(prog.width[t + 1] for t in ts))
     if st["steps"] != 1:
         return False
+    longest, wt, wt1 = kept
     lanes = host_cdiv(max(rows.most, 1), 32) * 32
-    if st["T"] * B * lanes * st["maxl"] * 4 > CLASS_WEIGHT_CUDA_TABLE_MAX:
+    if st["T"] * B * lanes * longest * 4 > CLASS_WEIGHT_CUDA_TABLE_MAX:
         return False
     fits = [g for g in (4, 2, 1) if g <= CLASS_WEIGHT_CUDA_DESTS and height % g == 0 and
-            mod.cw_stage_smem(g, st["wt"], st["wt1"]) <= CLASS_WEIGHT_CUDA_SMEM]
+            mod.cw_stage_smem(g, wt, wt1) <= CLASS_WEIGHT_CUDA_SMEM]
     if not fits:
         return False
     TN = fits[0]
     temp, once_iv = bufs
     count, start, columns = liveness.lists()
-    tab = torch.empty(st["T"] * B * lanes * st["maxl"], dtype = torch.int32, device = prog.dev)
+    tab = torch.empty(st["T"] * B * lanes * longest, dtype = torch.int32, device = prog.dev)
     cnt = torch.empty(st["T"] * B * lanes, dtype = torch.int32, device = prog.dev)
     mod.cw_class_cuda(cw["buf"], cw["col"], cw["K"], rows.count, rows.cls, rows.off, element_flows, temp_flows,
                       node_mars, prior["mars"], temp, prog.width_t, prog.intervals.of, prog.intervals.info,
@@ -551,7 +546,7 @@ def _class_weight_cuda(mod, la, tiles, height, cw, rows, prog, bufs, element_flo
                       la.parents, regions["offset"], regions["width"], regions["first"], prior["offset"],
                       prior["width"], prior["reg_prior"], st["tlist"], st["t2i"], tab, cnt, int(elem_first),
                       int(elem_width), int(temp_width), int(tflow_width), B, prog.n, prog.W, prog.C, lanes,
-                      st["maxl"], st["wt"], st["wt1"], height // TN, TN, CLASS_WEIGHT_CUDA_THREADS, int(s_kind),
+                      longest, wt, wt1, height // TN, TN, CLASS_WEIGHT_CUDA_THREADS, int(s_kind),
                       bool(out_temp), bool(out_full), bool(s_full), bool(inside), bool(store))
     return True
 
@@ -1049,13 +1044,14 @@ def run_class_weights(launches, cw: dict, prog, bufs, element_flows, temp_flows,
         tiles, height = (la.tiles, la.tile_height) if idx is None else (idx, item.height)
         s_kind, out_temp, (out_full, *s_full) = la.kinds
         identity = la.form == "input_block" and s_kind == IDENTITY
-        if mod is not None and la.form == "input_block" and not identity and la.J_max == 1 and \
+        J_max = prog.cw_most[la.number]
+        if mod is not None and la.form == "input_block" and not identity and J_max == 1 and \
                 C <= CLASS_WEIGHT_CUDA_CLASSES and prog.W < 65535 and _long_walk(la, rows) and \
                 _class_weight_cuda(mod, la, tiles, height, cw, rows, prog, (temp, once_iv), element_flows, temp_flows,
                                    node_mars, liveness, compact, prior, regions, elem_first, elem_width, temp_width,
                                    tflow_width, B, s_kind, out_temp, out_full, all(s_full), inside, store):
             continue
-        TJ = 1 if identity else min(64, host_next_power_of_2(la.J_max))
+        TJ = 1 if identity else min(64, host_next_power_of_2(J_max))
         TN = min(height, CLASS_WEIGHT_NODES, max(1, CLASS_WEIGHT_LANES // (TC * TJ)))   # (powers of 2)
         TB = max(1, min(host_next_power_of_2(B), 128 // TC, CLASS_WEIGHT_LANES // (TC * TJ * TN)))
         lanes = TN * TB * TC * TJ

@@ -145,7 +145,7 @@ def run_backward(backend, bufs: dict, flows: dict, plan, x: torch.Tensor, missin
                                           bf16 = precision == "bf16", copies = stacks)
                     for cbs, tables, idx in fused_groups[part]:
                         max_cols = compact.lanes(tables["host"]["ivs"]) if part == 1 and compact is not None else \
-                            nb * tables["max_slots"]                     # (its regions' most)
+                            nb * prog.td_slots[tables["number"]]         # (its regions' most)
                         if max_cols == 0:
                             continue
                         gated = F.part_gates(gates, tables["gate"], compact if part == 1 else None, prog, part == 0)
@@ -171,9 +171,10 @@ def run_backward(backend, bufs: dict, flows: dict, plan, x: torch.Tensor, missin
             if visit is not None:
                 visit(prod_index)
         else:
-            for folds, stages, num_temps, temp_slots in layers:
+            for folds, stages, num_temps, temp_no in layers:
                 temp, temp_flows, temp_width, tw = node_mars, node_mars, 0, 0
                 if num_temps > 0:
+                    temp_slots = prog.temp_slots[temp_no]
                     temp_width = F.scratch_width(B, temp_slots, folds[1], mars)   # the folds' inside values'
                     tw = _align(B * temp_slots) if compact is None else \
                         compact.row_width(_sample_temp_intervals(stages), temp_slots)
@@ -181,10 +182,11 @@ def run_backward(backend, bufs: dict, flows: dict, plan, x: torch.Tensor, missin
                     temp_flows = backend.state.storage_view("product_scratch_flows", num_temps * tw)
                 if folds[0]:                             # the folds' inside values, for a batch of one ...
                     products(folds[0], (temp, temp_width), prog, regions, element_mars, node_mars, masses,
-                             prog.no_evidence, None, elem_first, elem_width, 1, srcs, exact = True)
+                             prog.no_evidence, None, elem_first, elem_width, 1, srcs, exact = True, sizes = td.fold_sizes)
                 if folds[1]:                             # ... and per sample
                     products(folds[1], (temp, temp_width), prog, regions, element_mars, node_mars, masses,
-                             obs_class, live, elem_first, elem_width, B, srcs, exact = exact, compact = mars)
+                             obs_class, live, elem_first, elem_width, B, srcs, exact = exact, compact = mars,
+                             sizes = td.fold_sizes)
                 for once_launches, sample_launches, cw_launches in stages:
                     if once_launches:
                         run_top_down(once_launches, (temp, temp_width), prog, once, element_flows, temp_flows,

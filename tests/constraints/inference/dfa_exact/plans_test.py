@@ -128,7 +128,7 @@ def test_input_reads_count_every_step_a_plan_runs(seed):
                 for k in (range(firsts.size - 1) if g is None else g):
                     want[rows[firsts[k]:firsts[k + 1], col]] = True
             launch = NS(form = form, rows = torch.from_numpy(rows), groups_host = groups_host)
-            out.append([(launch, Cut(chunks, groups, 1, 1, 1, 1))])
+            out.append([(launch, Cut(chunks, groups, 0, 1))])
         return out
 
     def walks(want):

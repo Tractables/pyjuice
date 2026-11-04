@@ -63,7 +63,6 @@ class TopDownLaunch:
     :ivar ptr: int32 [C + 1], every child's parents in ``parents``
     :ivar parents: int32 [P, fields], the forward step rows, every child's contiguous; ``block_block`` rows carry the
         parent's triple index in a 9th field
-    :ivar E_max, X_max, S_max: the most entry columns, exit columns and slots of the children's blocks
     :ivar host: for query plans, numpy copies: ``children`` [C, 3] (row, region, add), ``ptr``, ``parents``, and every
         child's (``child_iv``) and parent's (``parent_iv``) interval, by ``prog.intervals``' numbers -- and those
         intervals each once (``child_ivs``, ``parent_ivs``; for compact storage, see :mod:`.compact`); for
@@ -71,6 +70,8 @@ class TopDownLaunch:
         interval, number of parents and ``add``)
     :ivar tiles, tile_height: for ``input_block`` / ``block_input``, every child in node tiles (int32 on the device)
         and their height (:func:`~.common.node_tiles`) -- a query plan's lists of these launches are tiles too
+    :ivar number: its place among its circuit's: ``prog.td_most[3 * number:]``, the most entry columns, exit columns and
+        slots of the children's blocks (what an automaton says of them)
     """
 
     form: str
@@ -79,13 +80,10 @@ class TopDownLaunch:
     children: torch.Tensor
     ptr: torch.Tensor
     parents: torch.Tensor
-    E_max: int
-    X_max: int
-    S_max: int
     host: Any
     tiles: Optional[torch.Tensor] = None
     tile_height: int = 1
-    walk_tables: Any = None
+    number: int = 0
 
 
 @triton.jit
@@ -906,7 +904,7 @@ def _walk_boundaries(prog) -> None:
     :func:`_input_block_boundaries` says whatever the automaton (a launch's dict, the same for its program of any
     constraint), in one copy to the device: copies wait for the stream."""
     template = prog.assembly.top_down
-    kids = [c for kind, _, layers in template.steps if kind == "prod" for info in layers for out, _, _, _ in info
+    kids = [c for kind, _, layers in template.steps if kind == "prod" for _, stages, _, _ in layers for out, _, _, _ in stages
             for c in out if c.form == "input_block"]
     n = prog.n
     ts = [np.unique(c.host["parents"][:, 2]).astype(np.int64) for c in kids]
@@ -924,33 +922,30 @@ def _walk_boundaries(prog) -> None:
     template.shared["walk_ts"] = ts
 
 
-def _input_block_boundaries(la: TopDownLaunch, prog) -> dict:
-    """An ``input @ block`` launch's boundaries for the CUDA kernels, built on first use: ``ts`` (its parents' ``t``,
-    ascending; ``tlist`` int32 on the device), ``t2i`` (int32 [n] on the device: every one's place among them),
-    ``ecum`` (int64 [T + 1], host and ``ecum_t`` device: the predecessor entries at the boundaries before), and every
-    child's interval as ``(t, t2)`` (``ta``, ``te``). Of a program's launches together, in a copy each: what its
-    automaton says, the predecessor entries, and what it does not (:func:`_walk_boundaries`)."""
-    st = la.walk_tables
-    if st is None:
-        walk = la.host["walk"]
-        if not walk:
-            _walk_boundaries(prog)
-        kept = getattr(prog, "walk_entries", None)
-        if kept is None:
-            n, W = prog.n, prog.W
-            pp = prog.ungrouped_tables().pred_ptr.view(n, W + 1).cpu().numpy().astype(np.int64)   # (the CUDA walk runs
-            counts = pp[:, W] - pp[:, 0]                                   # ungrouped: every boundary's predecessors)
-            ecums = []
-            for x in prog.assembly.top_down.shared["walk_ts"]:
-                ecum = np.zeros(x.size + 1, dtype = np.int64)
-                np.cumsum(counts[x], out = ecum[1:])
-                ecums.append(ecum)
-            buf, starts = pack_aligned(ecums, np.int64)
-            kept = prog.walk_entries = (ecums, torch.from_numpy(buf).to(prog.dev), starts.tolist())
-        ecums, tables, starts = kept
-        k = walk["at"]
-        st = la.walk_tables = dict(walk, ecum = ecums[k], ecum_t = tables[starts[k]:starts[k] + ecums[k].size])
-    return st
+def _input_block_boundaries(la: TopDownLaunch, prog) -> tuple:
+    """An ``input @ block`` launch's boundaries for the CUDA kernels: ``host["walk"]`` (:func:`_walk_boundaries`, whatever
+    the automaton: ``ts``, its parents' ``t``, ascending, ``tlist`` int32 on the device, ``t2i``, int32 [n] on the device:
+    every one's place among them, and every child's interval as ``(t, t2)``, ``ta`` and ``te``), and what the automaton
+    says: ``ecum`` (int64 [T + 1]) and ``ecum_t`` (the same on the device), the predecessor entries at the boundaries
+    before -- a program's launches' together, in one copy."""
+    walk = la.host["walk"]
+    if not walk:
+        _walk_boundaries(prog)
+    kept = getattr(prog, "walk_entries", None)
+    if kept is None:
+        n, W = prog.n, prog.W
+        pp = prog.ungrouped_tables().pred_ptr.view(n, W + 1).cpu().numpy().astype(np.int64)   # (the CUDA walk runs
+        counts = pp[:, W] - pp[:, 0]                                   # ungrouped: every boundary's predecessors)
+        ecums = []
+        for x in prog.assembly.top_down.shared["walk_ts"]:
+            ecum = np.zeros(x.size + 1, dtype = np.int64)
+            np.cumsum(counts[x], out = ecum[1:])
+            ecums.append(ecum)
+        buf, starts = pack_aligned(ecums, np.int64)
+        kept = prog.walk_entries = (ecums, torch.from_numpy(buf).to(prog.dev), starts.tolist())
+    ecums, tables, starts = kept
+    k = walk["at"]
+    return walk, ecums[k], tables[starts[k]:starts[k] + ecums[k].size]
 
 
 def _work_space(prog, size: int, counters: int):
@@ -1011,7 +1006,7 @@ def _input_block_cuda(la: TopDownLaunch, tiles: torch.Tensor, height: int, prog,
     xb = max(1, (mw - 1).bit_length())                      # the stored columns, a boundary's most enumerated tokens
     if mod is None or xb >= 32 or W >= 1 << (32 - xb) or B > 65535:
         return None
-    st = _input_block_boundaries(la, prog)
+    st, ecum, ecum_t = _input_block_boundaries(la, prog)
     mc = compact.max_count
     cq = int(mc[st["ts"] + 1].max())                                         # a sample's most live columns at t + 1
     lp = max(int((mc[st["ta"]] * mc[st["te"]]).max()), 1)                   # ... lanes of a parent's row
@@ -1026,7 +1021,7 @@ def _input_block_cuda(la: TopDownLaunch, tiles: torch.Tensor, height: int, prog,
     items = cq * int(mc[st["te"]].max()) * max(tn // 4, 1)                  # a sample's most (lane, 4 children)
     warps = items <= INPUT_BLOCK_CUDA_WARP_ITEMS and 8 * staged(tn) <= INPUT_BLOCK_CUDA_SMEM
     threads = 256 if warps or items >= INPUT_BLOCK_CUDA_WIDE else 128
-    T, nterms = st["ts"].size, B * int(st["ecum"][-1])
+    T, nterms = st["ts"].size, B * int(ecum[-1])
     space = nterms + 2 * T * B * W + T * B * (mw + 1)                       # (terms, cnt, perm, codes, ncodes)
     if space > INPUT_BLOCK_CUDA_SPACE or 4 * (2 * ((mw + 31) // 32) + 1) > 48 * 1024:
         return None
@@ -1041,7 +1036,7 @@ def _input_block_cuda(la: TopDownLaunch, tiles: torch.Tensor, height: int, prog,
                   masses.stride if sample else masses.row, tt.pred_ptr, tt.pred_col, tt.pred_x, prog.width_t, ivs.of,
                   ivs.info, ivs.table, once_iv, compact.off, compact.count, compact.start, compact.columns,
                   compact.rank, la.children, tiles, la.ptr, la.parents, common["reg_offset"], common["reg_width"],
-                  common["reg_first"], st["tlist"], st["t2i"], st["ecum_t"], ws[:nterms],
+                  common["reg_first"], st["tlist"], st["t2i"], ecum_t, ws[:nterms],
                   ws[nterms:nterms + T * B * W], ws[nterms + T * B * W:nterms + 2 * T * B * W], done,
                   ws[nterms + 2 * T * B * W:space - T * B], ws[space - T * B:space],
                   common["out_first"], common["out_width"], common["temp_width"], B, n, W, C, prog.input_start,
@@ -1106,7 +1101,8 @@ def run_top_down(launches, bufs, prog, regions, element_flows, temp_flows, node_
         idx = tensor(item)
         Cn = la.children.size(0) if idx is None else idx.numel()
         indexed = dict(children_idx = la.children if idx is None else idx, INDEXED = idx is not None)
-        lanes_max = compact.lanes(la.host["child_ivs"]) if compact is not None else B * la.S_max   # a child's most
+        at = 3 * la.number
+        lanes_max = compact.lanes(la.host["child_ivs"]) if compact is not None else B * prog.td_most[at + 2]   # a child's most
         if la.form == "copy":
             c_kind, out_temp = la.kinds
             tile = _tile(max(lanes_max, 1))
@@ -1170,10 +1166,12 @@ def run_top_down(launches, bufs, prog, regions, element_flows, temp_flows, node_
             c_kind, o_kind, out_temp = la.kinds
             side_l = la.side == "L"
 
+            E_max, X_max = prog.td_most[at], prog.td_most[at + 1]
+
             def block_block(cfg, nf, tf, la = la, Cn = Cn, indexed = indexed, c_kind = c_kind, o_kind = o_kind,
-                            out_temp = out_temp, side_l = side_l):
+                            out_temp = out_temp, side_l = side_l, E_max = E_max, X_max = X_max):
                 TM, TN, TK, warps = cfg
-                tiles = host_cdiv(la.E_max, TM) * host_cdiv(la.X_max, TN)
+                tiles = host_cdiv(E_max, TM) * host_cdiv(X_max, TN)
                 split = min(tiles, host_cdiv(BLOCK_BLOCK_PROGRAMS_PER_SM * prog.num_sms, Cn * B))
                 group = host_cdiv(tiles, max(1, split))
                 split = host_cdiv(tiles, group)
@@ -1193,7 +1191,7 @@ def run_top_down(launches, bufs, prog, regions, element_flows, temp_flows, node_
             # a child reached before log-adds to its value, so the launch is not idempotent: the candidates are timed
             # into throwaway copies of the outputs (and not at all when those cannot be allocated)
             key = ("lifted_block_block_top_down", la.kinds, la.side, prune, exact, SKIP_EMPTY_TILES, PRODUCT_PRECISION,
-                   B, host_next_power_of_2(Cn), la.E_max, la.X_max)
+                   B, host_next_power_of_2(Cn), E_max, X_max)
             cfg = BLOCK_BLOCK_TILES[0]
             if autotune.should_tune(key, len(BLOCK_BLOCK_TILES)):
                 nf_s, tf_s = autotune.scratch_like(node_flows), autotune.scratch_like(temp_flows)

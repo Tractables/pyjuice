@@ -68,35 +68,30 @@ class Launch:
     :ivar kinds: its operands' kinds (see :class:`~.program.Program`)
     :ivar steps: its device tables: ``input_block`` and ``block_input``, ``(steps, chunks, groups)``; ``block_block``,
         ``(steps, triple index)``; ``copy``, ``steps`` (int32 rows, see the ``*_FIELDS`` above)
-    :ivar E_max, X_max, S_max: the most entry columns, exit columns and slots of its steps' outputs
     :ivar rows: [S, fields] int64, its steps on the host, in the device tables' order
     :ivar iv: [S] int64, the interval of every step's product, as its number in ``Program.sum_ivs`` (a scratch step
         follows the product it is a fold of)
-    :ivar parts: [parts, 3] int64 (host): the entry columns, exit columns and slots of its steps' outputs' intervals,
-        and ``part_of`` [S], every step's among them (None: one part): :attr:`sizes`
+    :ivar ends: the ends of its steps' outputs' intervals, each once (its ``parts``), and ``part_of`` [S], every step's
+        among them (None: one part)
     :ivar out_ivs: int64 (host): the intervals of its steps' outputs, each once, by ``prog.intervals``' numbers (for
         compact storage, see :mod:`.compact`)
+    :ivar number: its place among its :class:`~..compiled.circuit.Assembly`'s launches
+
+    A launch is the circuit's, one for every automaton of a pattern: what an automaton says of it -- its parts' columns
+    and slots -- is in the program's arrays, by ``number`` (:meth:`~..compiled.program.Program.most_of`).
     """
 
     form: str
     kinds: tuple
     steps: Any
-    E_max: int
-    X_max: int
-    S_max: int
     rows: torch.Tensor
     iv: torch.Tensor
-    parts: np.ndarray
+    ends: list
     part_of: Optional[torch.Tensor] = None
     groups_host: Optional[dict] = None
     out_ivs: Any = None
+    number: int = 0
     _input_boundaries: Any = None
-
-    @property
-    def sizes(self) -> torch.Tensor:
-        """[S, 3] int64: every step's output's entry columns, exit columns and slots."""
-        table = torch.from_numpy(self.parts)
-        return table.expand(self.rows.size(0), 3) if self.part_of is None else table[self.part_of]
 
     @property
     def out_temp(self) -> bool:
@@ -117,14 +112,13 @@ class Cut:
     The steps of a :class:`Launch` a query plan runs: per chunk of the launch (``chunks``: ``(first, end, None, index
     list or None for every step, count)``, see :func:`run_products`; the index list relative to the chunk's first); for
     ``input_block`` steps run in groups, per group size ``(index list or None, count)`` of its groups (a group's steps
-    share their interval); the selected steps' most entry columns, exit columns and slots, and how many there are.
+    share their interval); where the selected steps' most entry columns, exit columns and slots are in the plan's sizes
+    (``at``: three numbers, what an automaton says of them), and how many steps there are.
     """
 
     chunks: list
     groups: Optional[dict]
-    E_max: int
-    X_max: int
-    S_max: int
+    at: int
     count: int
 
 
@@ -1225,12 +1219,13 @@ INPUT_BLOCK_ONE_EXP = (False, True)
 
 def run_products(stages, bufs, prog, regions, element_mars, node_mars, masses, obs_class, live,
                  elem_first: int, elem_width: int, B: int, prior: dict, exact: bool, compact = None,
-                 succ_lists = None, hold = None):
+                 succ_lists = None, hold = None, sizes = ()):
     """
     The steps a query plan runs of one product layer, stage by stage (a stage reads only earlier stages' scratch
     rows). Products are fp32-level whatever the query's precision, which applies to the sum layers: ``block @ block``
     dots in :data:`PRODUCT_PRECISION` (exact fp32 by default), the other contractions exact fp32 log-sum-exps.
 
+    :param sizes: the plan's sizes (:attr:`Cut.at`: of this automaton)
     :param stages: the layer's stages: lists of ``(launch, cut)`` -- a :class:`Launch` and the :class:`Cut` of its
         steps the plan runs. ``block @ block`` steps: ``(steps, triple index)``, the latter indexing ``Program.skip``;
         ``input @ block`` and ``block @ input`` steps: ``(steps, chunks, groups)``, chunks ``(first, end, None)`` step
@@ -1299,7 +1294,8 @@ def run_products(stages, bufs, prog, regions, element_mars, node_mars, masses, o
     for launches in stages:
         for launch, cut in launches:
             form, kinds = launch.form, launch.kinds
-            E_max, X_max, S_max, S = cut.E_max, cut.X_max, cut.S_max, cut.count
+            at = cut.at
+            E_max, X_max, S_max, S = sizes[at], sizes[at + 1], sizes[at + 2], cut.count
             lanes = B * S_max if compact is None else compact.lanes(launch.out_ivs)   # an output's most
             if compact is not None and lanes == 0:                           # no sample has a live pair there
                 continue

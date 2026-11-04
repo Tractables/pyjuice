@@ -336,3 +336,13 @@ def pdl_launch(dev: torch.device) -> bool:
     if hit is None:
         hit = _PDL[key] = torch.cuda.get_device_capability(key)[0] >= 9
     return hit
+
+
+def most_in_runs(values: np.ndarray, ptr: np.ndarray, floor: int = 0) -> np.ndarray:
+    """int64 [len(ptr) - 1]: the largest of every run ``values[ptr[k]:ptr[k + 1]]``, at least ``floor`` (an empty run:
+    ``floor``)."""
+    out = np.full(ptr.size - 1, floor, dtype = np.int64)
+    some = ptr[1:] > ptr[:-1]
+    if some.any():
+        out[some] = np.maximum(np.maximum.reduceat(values, ptr[:-1][some]), floor)
+    return out
