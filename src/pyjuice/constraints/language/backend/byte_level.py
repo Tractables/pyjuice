@@ -312,6 +312,22 @@ def _merged_trie(first_child, node_byte, end_ptr, end_ids, byte_class, read, V):
         ptr[m] = edges
         a, b = first[m], first[m + 1]
         held = False
+        if b == a + 1 and first_child[members[a] + 1] <= first_child[members[a]] + 1:   # (most nodes: a chain)
+            u = members[a]
+            for k in range(end_ptr[u], end_ptr[u + 1]):
+                token_node[end_ids[k]] = m
+                held = True
+            holds[m] = held
+            w = first_child[u]
+            if w < first_child[u + 1] and read[byte_class[node_byte[w]]]:
+                end = first[num]
+                members[end] = w
+                first[num + 1] = end + 1
+                edge_class[edges], edge_node[edges] = byte_class[node_byte[w]], num
+                edges += 1
+                num += 1
+            m += 1
+            continue
         t = 0
         for i in range(a, b):
             u = members[i]
@@ -366,10 +382,11 @@ def _classes_read(table, dead):
 
 
 @njit(cache = True)
-def _walk(table, dead, initial, ptr, edge_class, edge_node, holds, r1, r2, r3, r4):
+def _walk(table, dead, initial, ptr, edge_class, edge_node, holds, r1, r2, r3, r4, budget):
     """The states reached at token boundaries (breadth-first from ``initial``) and, per merged node, two hashes of its
     successors from them: from every reached state a depth-first walk of the merged trie (:func:`_merged_trie`) through
-    live states."""
+    live states -- as far as ``budget`` edges go: ``(h1, h2, states, walked)``, the first ``walked`` of them walked (every
+    state a walk found, if it is all of them)."""
     S = table.shape[0]
     M = ptr.shape[0] - 1
     h1 = np.zeros(M + 2, dtype = np.uint64)
@@ -381,7 +398,8 @@ def _walk(table, dead, initial, ptr, edge_class, edge_node, holds, r1, r2, r3, r
     num, head = 1, 0
     stack_node = np.empty(M + 1, dtype = np.int32)
     stack_q = np.empty(M + 1, dtype = np.int32)
-    while head < num:
+    steps = 0
+    while head < num and steps < budget:
         s = order[head]
         head += 1
         a1, b1, a2, b2 = r1[s], r2[s], r3[s], r4[s]
@@ -392,6 +410,7 @@ def _walk(table, dead, initial, ptr, edge_class, edge_node, holds, r1, r2, r3, r
             top -= 1
             u = stack_node[top]
             q = stack_q[top]
+            steps += ptr[u + 1] - ptr[u]
             for e in range(ptr[u], ptr[u + 1]):
                 q2 = table[q, edge_class[e]]
                 if q2 == dead:
@@ -408,7 +427,7 @@ def _walk(table, dead, initial, ptr, edge_class, edge_node, holds, r1, r2, r3, r
                 stack_node[top] = w
                 stack_q[top] = q2
                 top += 1
-    return h1, h2, order[:num]
+    return h1, h2, order[:num], head
 
 
 @njit(parallel = True, cache = True)
@@ -534,9 +553,10 @@ def _rows_parallel(table, dead, states, reps, kinds, offsets, data, byte_class, 
         _rows(table, dead, states, reps, kinds, offsets, data, byte_class, remap, out, c * R // P, (c + 1) * R // P)
 
 
-#: below this many steps (states times merged nodes, states times classes) a walk stays on one thread: waking a team is
-#: milliseconds on a busy machine
-SERIAL_STEPS = 1 << 22
+#: so many edges of the merged trie, or a table of so many entries, stay on one thread: waking a team is milliseconds on a
+#: busy machine
+SERIAL_STEPS = 1 << 19
+NO_BUDGET = 1 << 62
 
 
 def to_tokens(automaton: ByteAutomaton, vocabulary: Vocabulary, eos_padding: bool) -> DFA:
@@ -557,14 +577,20 @@ def to_tokens(automaton: ByteAutomaton, vocabulary: Vocabulary, eos_padding: boo
                                                                  byte_class, _classes_read(table, dead_byte), V)
     M = ptr.size - 1
     complete = automaton.minimal and start != dead_byte and _byte_complete(trie)
-    parallel = complete and S * M >= SERIAL_STEPS and get_num_threads() > 1
-    if parallel:                    # the states reached at token boundaries: every one a byte text reaches; walked apart
+    threads = get_num_threads()
+    h1, h2, states, walked = _walk(table, dead_byte, start, ptr, edge_class, edge_node, holds, r[0], r[1], r[2], r[3],
+                                   SERIAL_STEPS if complete and threads > 1 else NO_BUDGET)
+    if walked < states.size:        # the states reached at token boundaries: every one a byte text reaches; the rest apart
+        left = np.ones(S, dtype = bool)
+        left[states[:walked]] = False
         states = bfs_order(table, start)
         states = states[states != dead_byte]
-        h1, h2 = _walk_from(table, dead_byte, states, ptr, edge_class, edge_node, holds, r[0], r[1], r[2], r[3],
-                            max(1, min(get_num_threads(), states.size)), M + 2)
-    else:
-        h1, h2, states = _walk(table, dead_byte, start, ptr, edge_class, edge_node, holds, r[0], r[1], r[2], r[3])
+        rest = states[left[states]]
+        a1, a2 = _walk_from(table, dead_byte, rest, ptr, edge_class, edge_node, holds, r[0], r[1], r[2], r[3],
+                            max(1, min(threads, rest.size)), M + 2)
+        with np.errstate(over = "ignore"):
+            h1 += a1
+            h2 += a2
     offsets, has_text = vocabulary._offsets, vocabulary._has_text
     empty = np.nonzero(has_text & (offsets[1:] == offsets[:-1]))[0]
     if empty.size:                                                      # empty text: every state to itself
