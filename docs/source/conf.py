@@ -1,6 +1,5 @@
 # Configuration file for the Sphinx documentation builder.
 
-from sphinx_gallery.sorting import FileNameSortKey
 
 # -- Project information
 
@@ -28,7 +27,7 @@ sphinx_gallery_conf = {
     # other configuration options
     'gallery_dirs': 'getting-started/tutorials',
     # sort key
-    'within_subsection_order': FileNameSortKey
+    'within_subsection_order': 'sphinx_gallery.sorting.FileNameSortKey'
 }
 
 intersphinx_mapping = {

@@ -22,7 +22,7 @@ class ProdNodes(CircuitNodes):
     :param chs: sequence of child nodes
     :type chs: Sequence[CircuitNodes]
 
-    :param edge_ids: a matrix of size [# product node blocks, # children] - the ith product node block is connected to the `edge_ids[i,j]`th node block in the jth child
+    :param edge_ids: a matrix of size [# product node blocks, # children] - the ith product node block is connected to node block `edge_ids[i,j]` of the jth child
     :type edge_ids: Optional[Tensor]
 
     :param block_size: block size
