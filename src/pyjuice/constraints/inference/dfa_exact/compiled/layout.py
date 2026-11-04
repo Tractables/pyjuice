@@ -232,10 +232,21 @@ def _build(dfa: DFA, n: int, device = None, report = None) -> BoundaryLayout:
     dev = torch.device("cpu") if device is None else torch.device(device)
     _, delta, accept = dfa._tables_on(dev)                                  # [K, C], [K]
     delta = delta.long()
+    # the sweeps walk the automaton's transitions but those into a state that never accepts and never leaves itself:
+    # most of its [K, C] table, and nothing can be accepted through them
+    accept = accept.bool()
+    dead = (delta == torch.arange(K, device = dev)[:, None]).all(dim = 1) & ~accept
+    state, cls = torch.nonzero(~dead[delta], as_tuple = True)
+    succ = delta[state, cls]
 
     def forward(row):                                                       # the successors of a set of states
         nxt = torch.zeros(K, dtype = torch.bool, device = dev)
-        nxt[delta[row].reshape(-1)] = True
+        nxt[succ[row[state]]] = True
+        return nxt
+
+    def backward(row):                                                      # the states with a successor in a set
+        nxt = torch.zeros(K, dtype = torch.bool, device = dev)
+        nxt[state[row[succ]]] = True
         return nxt
 
     initial = torch.zeros(K, dtype = torch.bool, device = dev)
@@ -243,7 +254,7 @@ def _build(dfa: DFA, n: int, device = None, report = None) -> BoundaryLayout:
     # reachable from the initial state in exactly t tokens ...
     reach = _sweep(initial, forward, n, report, "layout: reachable states")
     # ... and able to reach acceptance in exactly n - t more tokens
-    accept_in = _sweep(accept.bool(), lambda row: row[delta].any(dim = 1), n, report, "layout: accepting states")
+    accept_in = _sweep(accept, backward, n, report, "layout: accepting states")
     active = reach & accept_in.flip(0)                                      # [n+1, K]
     # the column order: the fewest tokens to acceptance (within n), descending, then the state id
     to_accept = torch.where(accept_in.any(dim = 0), accept_in.to(torch.uint8).argmax(dim = 0), n + 1)

@@ -551,9 +551,13 @@ def _compress_classes(token_class: torch.Tensor, delta: torch.Tensor):
     """Merge classes with identical successor columns, drop classes no token belongs to, and number
     the remaining classes by their smallest token (a canonical form for a given transition table)."""
     used = torch.nonzero(torch.bincount(token_class, minlength = delta.size(1))).flatten()   # O(V), no sort
-    sub = np.ascontiguousarray(delta[:, used].numpy())
+    sub = delta if used.numel() == delta.size(1) else delta[:, used]
+    sub = np.ascontiguousarray(sub.numpy())
     group, first_col = _column_classes(sub)                                  # merge identical columns (one pass)
-    cols, inv = torch.from_numpy(np.ascontiguousarray(sub[:, first_col])), torch.from_numpy(group)
+    # (every column its own group: `first_col` counts up from 0, and the table stays as it is; it is the caller's, so
+    # one copy of it)
+    cols = sub.copy() if first_col.size == sub.shape[1] else np.ascontiguousarray(sub[:, first_col])
+    cols, inv = torch.from_numpy(cols), torch.from_numpy(group)
     old_to_new = torch.full((delta.size(1),), -1, dtype = torch.long)
     old_to_new[used] = inv
     tc = old_to_new[token_class]
@@ -564,4 +568,6 @@ def _compress_classes(token_class: torch.Tensor, delta: torch.Tensor):
     order = torch.argsort(first)
     rank = torch.empty_like(order)
     rank[order] = torch.arange(C)
+    if torch.equal(order, torch.arange(C)):
+        return tc.contiguous(), cols
     return rank[tc].contiguous(), cols[:, order].contiguous()

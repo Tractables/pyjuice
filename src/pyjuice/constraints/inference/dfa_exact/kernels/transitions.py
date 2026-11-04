@@ -150,6 +150,25 @@ BOUNDARY_BATCH = 1 << 26
 BOUNDARY_ENTRIES_KEPT = 1 << 22
 
 
+def _below(keys: torch.Tensor, size: int) -> torch.Tensor:
+    """int64 [size + 1]: how many of the ascending ``keys`` are below each value."""
+    return torch.searchsorted(keys, torch.arange(size + 1, device = keys.device))
+
+
+def _counts(keys: torch.Tensor, size: int) -> torch.Tensor:
+    """int64 [size]: how many of the ascending ``keys`` are each value."""
+    below = _below(keys, size)
+    return below[1:] - below[:-1]
+
+
+def _rows_below(g: torch.Tensor, x: torch.Tensor, groups: int, width: int) -> torch.Tensor:
+    """int64 [groups, width + 1]: per group, how many of its ``x`` are below every value (``g``, ``x`` ascending
+    together)."""
+    below = _below(g * width + x, groups * width)
+    at = torch.arange(groups, device = g.device)[:, None] * width + torch.arange(width + 1, device = g.device)[None, :]
+    return below[at] - below[at[:, :1]]
+
+
 def _boundary_weights(W: int, dev) -> torch.Tensor:
     """int64 [W]: what a hash of a boundary's states multiplies them by."""
     return torch.from_numpy(np.random.default_rng(0).integers(1, 1 << 62, W) | 1).to(dev)
@@ -317,11 +336,6 @@ def transition_tables(tr, grouped: bool, enum: Optional[EnumeratedTokens] = None
     firsts, group, at = groups.firsts, groups.group, groups.at
     G = len(firsts)
 
-    def rows_of(g: torch.Tensor, x: torch.Tensor, Gb: int, width: int) -> torch.Tensor:
-        """int64 [Gb, width + 1]: per group, how many of its ``x`` (ascending within ``g``) are below every value."""
-        counts = torch.bincount(g * width + x, minlength = Gb * width).view(Gb, width)
-        return torch.cat([torch.zeros(Gb, 1, dtype = torch.int64, device = dev), torch.cumsum(counts, dim = 1)], dim = 1)
-
     succs, xs, cols, pxs, ees, epairs, ccols, csuccs, clss, pclss = ([] for _ in range(10))
     entry_rows, pred_rows, enum_rows, cls_rows, orders = ([] for _ in range(5))
     sizes, csizes, esizes, pairs = [], [], [], []
@@ -335,45 +349,46 @@ def transition_tables(tr, grouped: bool, enum: Optional[EnumeratedTokens] = None
             s = torch.where(ends_here[g], torch.zeros_like(s), s)
         by_cls = torch.argsort(g * C + c, stable = True)                     # by group, class, then column
         gc, cc, qc = g[by_cls], c[by_cls], q[by_cls]
-        lengths = torch.bincount(gc * C + cc, minlength = Gb * C).view(Gb, C)
-        cls_rows.append(torch.cat([torch.zeros(Gb, 1, dtype = torch.int64, device = dev), torch.cumsum(lengths, dim = 1)], dim = 1))
+        classes = _rows_below(gc, cc, Gb, C)
+        lengths = classes[:, 1:] - classes[:, :-1]
+        cls_rows.append(classes)
         ccols.append(qc); csuccs.append(s[by_cls])
-        counts = torch.bincount(g, minlength = Gb)
-        csizes += counts.tolist()
+        csizes += _counts(g, Gb).tolist()
         orders.append(torch.argsort(-lengths, dim = 1, stable = True))
         max_cls = max(max_cls, int(lengths.max()))
         if grouped:
             key, inverse = torch.unique((g * (W + 1) + q) * (W + 1) + s, return_inverse = True)   # by group, column, successor
             eg, rest = key // ((W + 1) * (W + 1)), key % ((W + 1) * (W + 1))
             eq, es = rest // (W + 1), rest % (W + 1)
-            found = torch.bincount(eg, minlength = Gb)
+            found = _counts(eg, Gb)
             base = torch.cumsum(found, dim = 0) - found
             ex = torch.arange(key.numel(), device = dev) - base[eg]
             pairs += found.tolist()
             if key.numel():
-                column = torch.bincount(eg * (W + 1) + eq)
+                column = _rows_below(eg, eq, Gb, W + 1)
+                column = column[:, 1:] - column[:, :-1]
                 max_pairs = max(max_pairs, int(column.max()))
-                inner = ~ends_here[eg]                                       # (not at a sequence end: a statistic's)
-                if inner.any():
-                    most = max(most, int(torch.bincount((eg * (W + 1) + eq)[inner]).max()))
+                inner = column[~ends_here]                                   # (not at a sequence end: a statistic's)
+                if inner.numel():
+                    most = max(most, int(inner.max()))
             if code is not None:                                             # the enumerated classes' live entries
                 codes = code[torch.as_tensor(firsts[k:end], device = dev)]
                 en = codes[g, c] < 0
-                enum_rows.append(rows_of(g[en], q[en], Gb, W))
+                enum_rows.append(_rows_below(g[en], q[en], Gb, W))
                 ees.append(-1 - codes[g[en], c[en]]); epairs.append(inverse[en] - base[g[en]])
-                esizes += torch.bincount(g[en], minlength = Gb).tolist()
+                esizes += _counts(g[en], Gb).tolist()
                 if en.any():
-                    max_enum = max(max_enum, int(torch.bincount(g[en] * (W + 1) + q[en]).max()))
+                    max_enum = max(max_enum, int(_counts(g[en] * (W + 1) + q[en], Gb * (W + 1)).max()))
         else:
             eg, eq, es, ex = g, q, s, (c if code is None else code[torch.as_tensor(firsts[k:end], device = dev)][g, c])
             clss.append(c)
-        entry_rows.append(rows_of(eg, eq, Gb, W))
+        entry_rows.append(_rows_below(eg, eq, Gb, W))
         by_succ = torch.argsort((eg * (W + 1) + es) * (W + 1) + eq, stable = True)
-        pred_rows.append(rows_of(eg[by_succ], es[by_succ], Gb, W))
+        pred_rows.append(_rows_below(eg[by_succ], es[by_succ], Gb, W))
         succs.append(es); xs.append(ex); cols.append(eq[by_succ]); pxs.append(ex[by_succ])
         if not grouped:
             pclss.append(c[by_succ])
-        sizes += torch.bincount(eg, minlength = Gb).tolist()
+        sizes += _counts(eg, Gb).tolist()
     if grouped:
         groups.most = most
 
