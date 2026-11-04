@@ -34,7 +34,7 @@ from pyjuice.layer.kernels import autotune
 from pyjuice.utils.kernel_launcher import triton_jit
 from pyjuice.utils.util import host_cdiv, host_next_power_of_2
 
-from .common import (NODE_TILE, SUM, _block_ptr, _child, _exit_width, _next_col, _interval, _logaddexp_tile, _lse_step, _pair,
+from .common import (NODE_TILE, SUM, pack_aligned, _block_ptr, _child, _exit_width, _next_col, _interval, _logaddexp_tile, _lse_step, _pair,
                      _slot, _tf32_operand, _tile_rows, grid_chunks, tensor, pdl_launch)
 from .compact import _lane, _lane_ends
 from .transitions import enumerated_args
@@ -900,28 +900,55 @@ INPUT_BLOCK_CUDA_CODES = 64
 INPUT_BLOCK_CUDA_DEFER_CTAS = 0
 
 
+def _walk_boundaries(prog) -> None:
+    """Into ``host["walk"]`` of every ``input @ block`` launch of ``prog``'s :class:`~..compiled.circuit.Assembly`, what
+    :func:`_input_block_boundaries` says whatever the automaton (a launch's dict, the same for its program of any
+    constraint), in one copy to the device: copies wait for the stream."""
+    template = prog.assembly.top_down
+    kids = [c for kind, _, layers in template.steps if kind == "prod" for info in layers for out, _, _, _ in info
+            for c in out if c.form == "input_block"]
+    n = prog.n
+    ts = [np.unique(c.host["parents"][:, 2]).astype(np.int64) for c in kids]
+    arrays = []
+    for x in ts:
+        t2i = np.full(n, -1, dtype = np.int32)
+        t2i[x] = np.arange(x.size, dtype = np.int32)
+        arrays += [x.astype(np.int32), t2i]
+    buf, starts = pack_aligned(arrays, np.int32)
+    tables, starts = torch.from_numpy(buf).to(prog.dev), starts.tolist()
+    for k, (c, x) in enumerate(zip(kids, ts)):
+        ends = prog.iv_ends_np[np.asarray(c.host["child_ivs"], dtype = np.int64)]
+        c.host["walk"].update(at = k, ts = x, tlist = tables[starts[2 * k]:starts[2 * k] + x.size],
+                              t2i = tables[starts[2 * k + 1]:starts[2 * k + 1] + n], ta = ends[:, 0] - 1, te = ends[:, 1])
+    template.shared["walk_ts"] = ts
+
+
 def _input_block_boundaries(la: TopDownLaunch, prog) -> dict:
     """An ``input @ block`` launch's boundaries for the CUDA kernels, built on first use: ``ts`` (its parents' ``t``,
     ascending; ``tlist`` int32 on the device), ``t2i`` (int32 [n] on the device: every one's place among them),
     ``ecum`` (int64 [T + 1], host and ``ecum_t`` device: the predecessor entries at the boundaries before), and every
-    child's interval as ``(t, t2)`` (``ta``, ``te``)."""
+    child's interval as ``(t, t2)`` (``ta``, ``te``). Of a program's launches together, in a copy each: what its
+    automaton says, the predecessor entries, and what it does not (:func:`_walk_boundaries`)."""
     st = la.host.get("cuda")
     if st is None:
-        n, W = prog.n, prog.W
-        counts = getattr(prog, "pred_counts", None)
-        if counts is None:                                                   # every boundary's predecessor entries
-            pp = prog.ungrouped_tables().pred_ptr.view(n, W + 1).cpu().numpy().astype(np.int64)   # (the CUDA walk
-            counts = prog.pred_counts = pp[:, W] - pp[:, 0]                                        # runs ungrouped)
-        ts = np.unique(la.host["parents"][:, 2]).astype(np.int64)
-        ecum = np.zeros(ts.size + 1, dtype = np.int64)
-        np.cumsum(counts[ts], out = ecum[1:])
-        t2i = np.full(n, -1, dtype = np.int32)
-        t2i[ts] = np.arange(ts.size, dtype = np.int32)
-        ends = prog.iv_ends_np[np.asarray(la.host["child_ivs"], dtype = np.int64)]
-        dev = prog.dev
-        st = la.host["cuda"] = dict(ts = ts, tlist = torch.from_numpy(ts.astype(np.int32)).to(dev),
-                                    t2i = torch.from_numpy(t2i).to(dev), ecum = ecum,
-                                    ecum_t = torch.from_numpy(ecum).to(dev), ta = ends[:, 0] - 1, te = ends[:, 1])
+        walk = la.host["walk"]
+        if not walk:
+            _walk_boundaries(prog)
+        kept = getattr(prog, "walk_entries", None)
+        if kept is None:
+            n, W = prog.n, prog.W
+            pp = prog.ungrouped_tables().pred_ptr.view(n, W + 1).cpu().numpy().astype(np.int64)   # (the CUDA walk runs
+            counts = pp[:, W] - pp[:, 0]                                   # ungrouped: every boundary's predecessors)
+            ecums = []
+            for x in prog.assembly.top_down.shared["walk_ts"]:
+                ecum = np.zeros(x.size + 1, dtype = np.int64)
+                np.cumsum(counts[x], out = ecum[1:])
+                ecums.append(ecum)
+            buf, starts = pack_aligned(ecums, np.int64)
+            kept = prog.walk_entries = (ecums, torch.from_numpy(buf).to(prog.dev), starts.tolist())
+        ecums, tables, starts = kept
+        k = walk["at"]
+        st = la.host["cuda"] = dict(walk, ecum = ecums[k], ecum_t = tables[starts[k]:starts[k] + ecums[k].size])
     return st
 
 

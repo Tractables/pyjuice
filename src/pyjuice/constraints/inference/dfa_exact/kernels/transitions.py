@@ -185,6 +185,7 @@ class BoundaryGroups:
     :ivar batches: ``(first group, end group)`` of the batches they are built in (:data:`BOUNDARY_BATCH`)
     :ivar class_columns: int64 [G, C] on the device: the columns where every class leads somewhere (built when first read)
     :ivar most: :func:`transition_stats`' most, once known
+    :ivar by_class: the transition tables' fields of the entries by class, once known: both forms' (:func:`transition_tables`)
     """
 
     def __init__(self, tr):
@@ -211,6 +212,7 @@ class BoundaryGroups:
         self.firsts, self.group = firsts, group
         self.at = torch.tensor(group, dtype = torch.long, device = dev)
         self.most = None
+        self.by_class = None
         self._class_columns = None
         self._kept = {}
         # the automaton's transitions between states some boundary has, a CSR by state
@@ -341,21 +343,23 @@ def transition_tables(tr, grouped: bool, enum: Optional[EnumeratedTokens] = None
     sizes, csizes, esizes, pairs = [], [], [], []
     max_pairs = max_enum = max_cls = 0
     most = 1
+    by_class = groups.by_class                                       # (the entries by class: the same for both forms)
     for k, end in groups.batches:
         Gb = end - k
         g, q, c, s = groups.entries(k, end)                                  # by group, column, then class
         ends_here = torch.as_tensor(firsts[k:end], device = dev) + 1 == n
         if ends_here.any():                                                  # a sequence end: one column
             s = torch.where(ends_here[g], torch.zeros_like(s), s)
-        by_cls = torch.argsort(g * C + c, stable = True)                     # by group, class, then column
-        gc, cc, qc = g[by_cls], c[by_cls], q[by_cls]
-        classes = _rows_below(gc, cc, Gb, C)
-        lengths = classes[:, 1:] - classes[:, :-1]
-        cls_rows.append(classes)
-        ccols.append(qc); csuccs.append(s[by_cls])
-        csizes += _counts(g, Gb).tolist()
-        orders.append(torch.argsort(-lengths, dim = 1, stable = True))
-        max_cls = max(max_cls, int(lengths.max()))
+        if by_class is None:
+            by_cls = torch.argsort(g * C + c, stable = True)                 # by group, class, then column
+            gc, cc, qc = g[by_cls], c[by_cls], q[by_cls]
+            classes = _rows_below(gc, cc, Gb, C)
+            lengths = classes[:, 1:] - classes[:, :-1]
+            cls_rows.append(classes)
+            ccols.append(qc); csuccs.append(s[by_cls])
+            csizes += _counts(g, Gb).tolist()
+            orders.append(torch.argsort(-lengths, dim = 1, stable = True))
+            max_cls = max(max_cls, int(lengths.max()))
         if grouped:
             key, inverse = torch.unique((g * (W + 1) + q) * (W + 1) + s, return_inverse = True)   # by group, column, successor
             eg, rest = key // ((W + 1) * (W + 1)), key % ((W + 1) * (W + 1))
@@ -399,9 +403,14 @@ def transition_tables(tr, grouped: bool, enum: Optional[EnumeratedTokens] = None
         bases = torch.tensor([0] + list(np.cumsum(counts)[:-1]), dtype = torch.int64, device = dev)
         return i32(torch.cat(rows)[at] + bases[at][:, None])
 
-    base, cbase, ebase = sum(sizes), sum(csizes), sum(esizes)
+    base, ebase = sum(sizes), sum(esizes)
     enumerated = grouped and code is not None
     per_boundary = np.concatenate([[0], np.cumsum([sizes[g] for g in group])]).astype(np.int64)
+    if by_class is None:
+        by_class = groups.by_class = dict(
+            cls_ptr = pointers(cls_rows, csizes) if G else torch.zeros(n, C + 1, dtype = torch.int32, device = dev),
+            cls_col = cat(ccols, sum(csizes)), cls_succ = cat(csuccs, sum(csizes)), max_cls = max_cls,
+            cls_order = i32(torch.cat(orders)[at]) if G else i32(torch.arange(C, device = dev).repeat(n, 1)))
     return TransitionTables(grouped = grouped, entry_ptr = pointers(entry_rows, sizes), entry_succ = cat(succs, base),
                             entry_x = cat(xs, base), pred_ptr = pointers(pred_rows, sizes), pred_col = cat(cols, base),
                             pred_x = cat(pxs, base), num_pairs = [pairs[g] for g in group] if grouped else [],
@@ -409,11 +418,7 @@ def transition_tables(tr, grouped: bool, enum: Optional[EnumeratedTokens] = None
                             enum_ptr = pointers(enum_rows, esizes) if enumerated else (pointers([], []) if grouped else None),
                             enum_e = cat(ees, ebase) if grouped else None,
                             enum_pair = cat(epairs, ebase) if grouped else None, max_enum = max_enum,
-                            cls_ptr = pointers(cls_rows, csizes) if G else
-                            torch.zeros(n, C + 1, dtype = torch.int32, device = dev),
-                            cls_col = cat(ccols, cbase), cls_succ = cat(csuccs, cbase), max_cls = max_cls,
-                            cls_order = i32(torch.cat(orders)[at]) if G else i32(torch.arange(C, device = dev).repeat(n, 1)),
-                            entry_class = None if grouped else cat(clss, base),
+                            **by_class, entry_class = None if grouped else cat(clss, base),
                             pred_class = None if grouped else cat(pclss, base),
                             boundary_base = torch.from_numpy(per_boundary).to(dev), num_entries = int(per_boundary[-1]))
 

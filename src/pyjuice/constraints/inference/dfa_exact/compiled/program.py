@@ -145,11 +145,21 @@ class Program:
         self.succ = transition_tables(tr, grouped = True, enum = self.enum)
         self.transition_stats = transition_stats(tr)
 
-        self.slots = [slots for _, _, slots in backend.sum_regions]
-        self.reg_slots = torch.tensor(self.slots, dtype = torch.long, device = dev)
+        regions = np.asarray(backend.sum_regions)
+        self.slots = regions[:, 2].tolist()
+        self.reg_slots = torch.from_numpy(regions[:, 2].copy()).to(dev)
         # every sum interval's slots, for evidence pruning and query plans (host)
         self.sum_iv_slots = [self.reach.slots(a, b) for a, b in self.sum_ivs]
         self.iv_slots = np.array(self.sum_iv_slots, dtype = np.int64)
+        # every boundary's columns and every interval's slots and whether it keeps every pair (host, by the interval's
+        # number in `all_ivs`): what the launches' sizes read
+        ends = self.iv_ends_np
+        self.entries = np.asarray(self.width, dtype = np.int64)
+        self.exits = self.entries.copy()
+        self.exits[n] = 1
+        self.all_iv_slots = np.fromiter((self.reach.slots(a, b) for a, b in self.all_ivs), dtype = np.int64,
+                                        count = len(self.all_ivs))
+        self.all_iv_full = self.all_iv_slots == self.entries[ends[:, 0]] * self.exits[ends[:, 1]]
         self.live_tables = OrderedDict()                               # (batch size, intervals) -> lane order tables
         self.plans = OrderedDict()                                     # query plans, see :mod:`.plans`
         self.layouts = OrderedDict()                                   # conditionals' class weights, see .conditional
@@ -158,18 +168,19 @@ class Program:
         # (:mod:`..external_params.block_scale`) run every node block fused, each edge with its gate
         assembly = self.assembly = circuit.assembly(self.reach)
         self.score = assembly.score
-        reach, entries, exits = self.reach, self.width, self.width[:n] + [1]
+        reach, entries, exits, all_slots = self.reach, self.entries, self.exits, self.all_iv_slots
+        slots = regions[:, 2]
         self.steps = []
         for kind, prod_index, layers in circuit.steps:
             if kind == "prod":
                 self.steps.append(("prod", prod_index, [
-                    ([[launch_of(t, entries, exits, reach) for t in launches] for launches in stages], num_temps,
-                     max([1] + [reach.slots(a, b) for a, b in temp_ivs]))
+                    ([[launch_of(t, entries, exits, all_slots) for t in launches] for launches in stages], num_temps,
+                     int(all_slots[temp_ivs].max(initial = 1)))
                     for stages, num_temps, temp_ivs in assembly.layers.get(prod_index, ())]))
             else:
                 self.steps.append(("sum", prod_index, [
                     (block_size, [(dense, E, None if fused is None else
-                                   (*fused[:4], max(self.slots[r] for r in fused[4]), *fused[5:]))
+                                   (*fused[:4], int(slots[fused[4]].max()), *fused[5:]))
                                   for dense, E, fused in parts]) for block_size, parts in layers]))
         self.intervals = interval_tables(reach, self.all_ivs, dev, of = circuit.of_t)
         self.elem_slots = np.asarray([slots for _, _, slots in backend.element_regions], dtype = np.int64)

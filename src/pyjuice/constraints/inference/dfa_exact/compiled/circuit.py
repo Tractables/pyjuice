@@ -55,7 +55,8 @@ class CircuitRows:
     :ivar numbered: every node group and its first row, to check against the node group's record of it
     :ivar product_rows: per product layer, ``(out_rows [R], child_rows [R, k], boundaries [R, k + 1])`` int64
     :ivar node_ivs: the intervals of every sum and product node group, each once
-    :ivar sum_groups: per sum node group, in row order, ``(first row, end row, a, b)``, its interval ``[a, b)``
+    :ivar sum_groups: per sum node group, in row order, ``(first row, end row, a, b)``, its interval ``[a, b)``;
+        ``sum_rows`` int64 [groups, 2] their rows, ``sum_iv`` int64 [groups] their intervals' numbers in ``node_ivs``
     :ivar product_groups: per product layer group, ``(first row, end row, intervals of its node groups, each once)``
     :ivar input_range, root_rows: the rows of all input nodes, and of the roots
     """
@@ -100,6 +101,9 @@ class CircuitRows:
                 self.product_rows.append(_concat_padded(parts))
         self.sum_groups = sorted((first_row[ns], first_row[ns] + ns.num_nodes, *interval(ns))
                                  for lg in pc.inner_layer_groups if lg.is_sum() for layer in lg.layers for ns in layer.nodes)
+        number = {iv: k for k, iv in enumerate(self.node_ivs)}
+        self.sum_rows = np.asarray([(first, end) for first, end, _, _ in self.sum_groups], dtype = np.int64).reshape(-1, 2)
+        self.sum_iv = np.asarray([number[(a, b)] for _, _, a, b in self.sum_groups], dtype = np.int64)
         self.product_groups = []
         for lg in pc.inner_layer_groups:
             if lg.is_prod():
@@ -388,7 +392,7 @@ class CircuitTables:
         reg_iv_host = [iv_number[iv] for iv in reg_ivs]
         reg_iv_np = np.asarray(reg_iv_host, dtype = np.int64)
         operands = _operand_table(rows.product_rows, firsts_np, n, input_end, iv_number, len(sum_ivs))
-        iv_children = [np.unique(reg_iv_np[operands[k]]) for k in range(len(sum_ivs))]
+        iv_children = [np.unique(reg_iv_np[regions]) for regions in operands]
         iv_depth = np.zeros(len(sum_ivs), dtype = np.int64)
         for k in np.argsort(iv_bounds[:, 1] - iv_bounds[:, 0], kind = "stable"):     # children first
             if iv_children[k].size:
@@ -439,8 +443,7 @@ class CircuitTables:
                             if gated:
                                 gate = block_scale.edge_tables(gate_cells, layer, rn, rc, elem_first, dev)
                                 gate["dense_run"] = block_scale.dense_run(rn, rc, nb_reg, layer.block_size, elem_first)
-                            fused = (rn.contiguous(), rc.contiguous(), rp.contiguous(), nb_reg,
-                                     np.unique(rest_regs).tolist(), None, gate)
+                            fused = (rn.contiguous(), rc.contiguous(), rp.contiguous(), nb_reg, np.unique(rest_regs), None, gate)
                         parts.append((dense, cids.size(1), fused))
                     layers.append((layer.block_size, parts))
                 self.steps.append(("sum", prod_index, layers))
@@ -523,6 +526,8 @@ class CircuitTables:
             iv_bounds = iv_bounds, iv_inside = (a[None, :] >= a[:, None]) & (b[None, :] <= b[:, None]),   # [k, m]: m in k
             reg_iv_host = reg_iv_host, reg_iv_np = reg_iv_np,
             reg_iv = torch.tensor(reg_iv_host, dtype = torch.long, device = dev), operands = operands,
+            iv_regions = np.split(np.argsort(reg_iv_np, kind = "stable"),
+                                  np.cumsum(np.bincount(reg_iv_np, minlength = len(sum_ivs)))[:-1]),
             iv_children = iv_children, iv_depth = iv_depth,
             no_evidence = torch.full((1, n), -1, dtype = torch.int32, device = dev),   # a sample with nothing observed
             stack_uses = stack_uses, gate_cells = gate_cells, root_region = region_of(root_first),
@@ -549,11 +554,11 @@ class CircuitTables:
         return kept
 
 
-def _operand_table(product_rows, firsts: np.ndarray, n: int, input_end: int, iv_number: dict, num_ivs: int) -> np.ndarray:
-    """bool [sum intervals, sum regions]: whether a product over the interval (``sum_ivs``' numbers: a product's
-    scope is its parent sum's) has a child in the region -- whose per-sample inside values computing the product, or
-    its children's top-down values, reads (see :func:`~..queries.backend.plans.read_regions`)."""
-    out = np.zeros((num_ivs, firsts.size), dtype = bool)
+def _operand_table(product_rows, firsts: np.ndarray, n: int, input_end: int, iv_number: dict, num_ivs: int) -> list:
+    """Per sum interval (``sum_ivs``' numbers: a product's scope is its parent sum's), the sum regions, ascending (int64),
+    where a product over it has a child -- whose per-sample inside values computing the product, or its children's
+    top-down values, reads (see :func:`~..queries.backend.plans.read_regions`)."""
+    found = []
     for _, child_rows, bounds in product_rows:
         child, bnd = child_rows.numpy(), bounds.numpy()
         k = (child >= 0).sum(axis = 1)
@@ -561,8 +566,9 @@ def _operand_table(product_rows, firsts: np.ndarray, n: int, input_end: int, iv_
         iv = np.array([iv_number.get((int(e) // (n + 1), int(e) % (n + 1)), -1) for e in ends],
                       dtype = np.int64)[inverse.reshape(-1)]
         r, c = np.nonzero((child >= input_end) & (iv >= 0)[:, None])        # every sum child of a product
-        out[iv[r], np.searchsorted(firsts, child[r, c], side = "right") - 1] = True
-    return out
+        found.append(iv[r] * firsts.size + np.searchsorted(firsts, child[r, c], side = "right") - 1)
+    keys = np.unique(np.concatenate(found)) if found else np.zeros(0, dtype = np.int64)
+    return np.split(keys % firsts.size, np.searchsorted(keys // firsts.size, np.arange(1, num_ivs)))
 
 
 # -------------------------------------------------------------------------------------------------
@@ -570,8 +576,9 @@ def _operand_table(product_rows, firsts: np.ndarray, n: int, input_end: int, iv_
 # -------------------------------------------------------------------------------------------------
 
 class LaunchTemplate(NamedTuple):
-    """A :class:`~..kernels.prod.Launch` but for what its automaton says: its steps' outputs' intervals, ``parts``,
-    and ``part_of`` [S], every step's among them (None: one part)."""
+    """A :class:`~..kernels.prod.Launch` but for what its automaton says: its steps' outputs' intervals, ``parts``
+    (``part_a``, ``part_b``: their ends; ``part_iv``: their numbers, ``CircuitTables``' ``all_ivs``), and ``part_of``
+    [S], every step's among them (None: one part)."""
 
     form: str
     kinds: tuple
@@ -582,13 +589,17 @@ class LaunchTemplate(NamedTuple):
     part_of: Optional[torch.Tensor]
     groups_host: Optional[dict]
     out_ivs: np.ndarray
+    part_a: np.ndarray
+    part_b: np.ndarray
+    part_iv: np.ndarray
 
 
 class Assembly:
     """
     A circuit's steps grouped into launches, under one pattern of which intervals keep every pair.
 
-    :ivar layers: per product layer group (by number), per layer, ``(stages of LaunchTemplate, num_temps, temp_ivs)``
+    :ivar layers: per product layer group (by number), per layer, ``(stages of LaunchTemplate, num_temps, the intervals
+        of what its scratch rows hold, by their numbers)``
     :ivar triple_of, skip_triples: every ``block @ block`` step's boundary triple, in the order the skip masks are built
     :ivar pos_steps: int64 [n] on the device, the input steps per position
     :ivar steps_host: the same on the host
@@ -644,10 +655,12 @@ class Assembly:
         self.pos_steps = steps_t.to(dev)
         self.trans_job = transition_job(torch.cat(rows), dev) if rows else None
         self.layers = {}
+        number = circuit.attrs["iv_index"]
         for kind, pi, layers in circuit.steps:
             if kind == "prod":
                 self.layers[pi] = [([[self._launch(*launch) for launch in launches_] for launches_ in hosts[(pi, li)]],
-                                    layer.num_temps, layer.temp_ivs) for li, layer in enumerate(layers)]
+                                    layer.num_temps, np.asarray([number[iv] for iv in layer.temp_ivs], dtype = np.int64))
+                                   for li, layer in enumerate(layers)]
         self.score = None
         self.top_down = None
         self.forward_shape = None
@@ -685,8 +698,10 @@ class Assembly:
         else:
             steps = rows.to(dev, torch.int32).contiguous()
         index = circuit.attrs["iv_index"]                               # the outputs' intervals
-        out_ivs = np.unique(np.asarray([index[iv_] for iv_ in ends], dtype = np.int64))
-        return LaunchTemplate(form, kinds, steps, rows, iv, ends, part_of, groups_host, out_ivs)
+        part_iv = np.asarray([index[iv_] for iv_ in ends], dtype = np.int64)
+        return LaunchTemplate(form, kinds, steps, rows, iv, ends, part_of, groups_host, np.unique(part_iv),
+                              np.asarray([a for a, _ in ends], dtype = np.int64),
+                              np.asarray([b for _, b in ends], dtype = np.int64), part_iv)
 
 
 def _cat_fields(parts: List[Emit]) -> torch.Tensor:
@@ -708,15 +723,9 @@ def _step_groups(st: torch.Tensor, sizes):
     return order, {G: torch.cat([torch.nonzero((k - run_first) % G == 0).flatten(), end]) for G in sizes}
 
 
-def launch_of(t: LaunchTemplate, entry_width, exit_width, reach) -> Launch:
+def launch_of(t: LaunchTemplate, entries: np.ndarray, exits: np.ndarray, slots: np.ndarray) -> Launch:
     """The :class:`~..kernels.prod.Launch` of a template under a layout: every output's columns and slots read off the
-    layout (``entry_width``, ``exit_width``: Python lists, by boundary; ``reach``: its pairs)."""
-    parts = [[entry_width[a], exit_width[b], reach.slots(a, b)] for a, b in t.parts]
-    table = torch.tensor(parts, dtype = torch.long)
-    S = t.rows.size(0)
-    sizes = table.expand(S, 3) if t.part_of is None else table[t.part_of]
-    if len(parts) == 1:
-        E_max, X_max, S_max = parts[0]
-    else:
-        E_max, X_max, S_max = (max(p[k] for p in parts) for k in range(3))
-    return Launch(t.form, t.kinds, t.steps, E_max, X_max, S_max, t.rows, t.iv, sizes, t.groups_host, t.out_ivs)
+    layout (``entries``, ``exits``: int64 by boundary; ``slots``: int64, by the number of an interval)."""
+    parts = np.stack([entries[t.part_a], exits[t.part_b], slots[t.part_iv]], axis = 1)
+    E_max, X_max, S_max = parts.max(axis = 0).tolist()
+    return Launch(t.form, t.kinds, t.steps, E_max, X_max, S_max, t.rows, t.iv, parts, t.part_of, t.groups_host, t.out_ivs)

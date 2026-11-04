@@ -72,7 +72,8 @@ class Launch:
     :ivar rows: [S, fields] int64, its steps on the host, in the device tables' order
     :ivar iv: [S] int64, the interval of every step's product, as its number in ``Program.sum_ivs`` (a scratch step
         follows the product it is a fold of)
-    :ivar sizes: [S, 3] int64, every step's output's entry columns, exit columns and slots
+    :ivar parts: [parts, 3] int64 (host): the entry columns, exit columns and slots of its steps' outputs' intervals,
+        and ``part_of`` [S], every step's among them (None: one part): :attr:`sizes`
     :ivar out_ivs: int64 (host): the intervals of its steps' outputs, each once, by ``prog.intervals``' numbers (for
         compact storage, see :mod:`.compact`)
     """
@@ -85,10 +86,17 @@ class Launch:
     S_max: int
     rows: torch.Tensor
     iv: torch.Tensor
-    sizes: torch.Tensor
+    parts: np.ndarray
+    part_of: Optional[torch.Tensor] = None
     groups_host: Optional[dict] = None
     out_ivs: Any = None
     _input_boundaries: Any = None
+
+    @property
+    def sizes(self) -> torch.Tensor:
+        """[S, 3] int64: every step's output's entry columns, exit columns and slots."""
+        table = torch.from_numpy(self.parts)
+        return table.expand(self.rows.size(0), 3) if self.part_of is None else table[self.part_of]
 
     @property
     def out_temp(self) -> bool:
@@ -1113,14 +1121,23 @@ def skip_masks_for(reach: Reachability, specs, tm: int = 16, tn: int = 16, tk: i
     if len(specs) == 0:
         return SkipMasks(torch.zeros(1, dtype = torch.int32, device = device), 0, 0, 1, tm, tn, tk)
 
-    def occ(a, b, transposed):
-        m = reach.device_occupancy(a, b)
-        return m.t() if transposed else m
+    def tiles_of(sides, tr, tc):
+        """The occupancy of every side tiled, a matrix per distinct occupancy (alike intervals keep one, see
+        :class:`Reachability`), and every side's among them."""
+        matrices, numbers, at = [], {}, {}
+        for side in sides:
+            a, b, transposed = side
+            m = reach.device_occupancy(a, b)
+            key = (id(m), transposed)
+            k = numbers.get(key)
+            if k is None:
+                k = numbers[key] = len(matrices)
+                matrices.append(_tile_any(m.t() if transposed else m, tr, tc))
+            at[side] = k
+        return matrices, at
 
-    lefts = sorted({a for a, _ in specs})
-    rights = sorted({b for _, b in specs})
-    L = [_tile_any(occ(*a), tm // T, tk // T) for a in lefts]                   # [output row tiles, chunks]
-    R = [_tile_any(occ(*b), tk // T, tn // T) for b in rights]                  # [chunks, output column tiles]
+    L, lpos = tiles_of({a for a, _ in specs}, tm // T, tk // T)                 # [output row tiles, chunks]
+    R, rpos = tiles_of({b for _, b in specs}, tk // T, tn // T)                 # [chunks, output column tiles]
     I = max(m.size(0) for m in L)
     J = max(m.size(1) for m in R)
     words = max(1, math.ceil(max(max(m.size(1) for m in L), max(m.size(0) for m in R)) / 32))
@@ -1139,8 +1156,6 @@ def skip_masks_for(reach: Reachability, specs, tm: int = 16, tn: int = 16, tk: i
         return torch.where(w >= 2 ** 31, w - 2 ** 32, w).to(torch.int32)
 
     Lw, Rw = packed(L, I, NC, False), packed(R, J, NC, True)          # [lefts, I, words], [rights, J, words]
-    lpos = {a: k for k, a in enumerate(lefts)}
-    rpos = {b: k for k, b in enumerate(rights)}
     li = torch.tensor([lpos[a] for a, _ in specs], dtype = torch.long, device = where)
     ri = torch.tensor([rpos[b] for _, b in specs], dtype = torch.long, device = where)
     chunk = max(1, (1 << 26) // max(I * J * words, 1))

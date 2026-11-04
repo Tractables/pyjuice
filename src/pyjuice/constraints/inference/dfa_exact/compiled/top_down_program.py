@@ -69,14 +69,13 @@ def top_down_program(backend) -> TopDownProgram:
     t = prog.assembly.top_down
     if t is None:
         t = prog.assembly.top_down = top_down_template(backend, prog)
-    reach, slots = prog.reach, prog.slots
+    reach, slots = prog.reach, np.asarray(prog.slots, dtype = np.int64)
+    entries, exits, iv_slots, iv_full = prog.entries, prog.exits, prog.all_iv_slots, prog.all_iv_full
 
     def child(c: _Child) -> TopDownLaunch:
-        kinds = c.kinds if c.c_full_at is None else \
-            (c.kinds[0], c.kinds[1], (all(reach.keeps_every_pair(x, y) for x, y in c.ivs), c.kinds[2]))
-        return TopDownLaunch(c.form, c.side, kinds, c.children, c.ptr, c.parents, max(prog._entry(x) for x, _ in c.ivs),
-                             max(prog._exit(y) for _, y in c.ivs), max(reach.slots(x, y) for x, y in c.ivs), dict(c.host),
-                             c.tiles, c.height)
+        kinds = c.kinds if c.c_full_at is None else (c.kinds[0], c.kinds[1], (bool(iv_full[c.iv_num].all()), c.kinds[2]))
+        return TopDownLaunch(c.form, c.side, kinds, c.children, c.ptr, c.parents, int(entries[c.iv_a].max()),
+                             int(exits[c.iv_b].max()), int(iv_slots[c.iv_num].max()), dict(c.host), c.tiles, c.height)
 
     def weights(cw, boundaries) -> ClassWeightLaunch:
         return ClassWeightLaunch(cw.form, cw.kinds, cw.dests, cw.ptr, cw.parents,
@@ -86,9 +85,8 @@ def top_down_program(backend) -> TopDownProgram:
         dense = tables["dense"]
         if dense is not None:                            # (the forward part, as the Program has it)
             part = dense["part"]
-            dense = dict(dense, part = (*part[:4], max(slots[r] for r in part[4]), *part[5:]))
-        return dict(tables, max_slots = max(slots[r] for r in tables["max_slots"]), host = dict(tables["host"]),
-                    dense = dense)
+            dense = dict(dense, part = (*part[:4], int(slots[part[4]].max()), *part[5:]))
+        return dict(tables, max_slots = int(slots[tables["max_slots"]].max()), host = dict(tables["host"]), dense = dense)
 
     steps = []
     for (kind, prod_index, layers_t), (_, _, layers) in zip(t.steps, reversed(prog.steps)):
@@ -109,9 +107,10 @@ def top_down_program(backend) -> TopDownProgram:
 
 
 class _Child(NamedTuple):
-    """A :class:`TopDownLaunch` but for what its automaton says: its columns and slots (of the distinct intervals
-    ``ivs``), and, where ``c_full_at`` is not None, whether every pair of the children's intervals is kept (``kinds``:
-    ``(child kind, parent kind, whether every pair of the output's is kept)`` then)."""
+    """A :class:`TopDownLaunch` but for what its automaton says: its columns and slots (of the distinct intervals, their
+    ends ``iv_a``, ``iv_b`` and numbers ``iv_num``), and, where ``c_full_at`` is not None, whether every pair of the
+    children's intervals is kept (``kinds``: ``(child kind, parent kind, whether every pair of the output's is kept)``
+    then)."""
 
     form: str
     side: str
@@ -120,7 +119,9 @@ class _Child(NamedTuple):
     children: torch.Tensor
     ptr: torch.Tensor
     parents: torch.Tensor
-    ivs: list
+    iv_a: np.ndarray
+    iv_b: np.ndarray
+    iv_num: np.ndarray
     host: dict
     tiles: Optional[torch.Tensor]
     height: int
@@ -229,7 +230,8 @@ def top_down_template(backend, prog) -> _Template:
         out_a, out_b = {"copy": (3, 4), "input_block": (2, 5), "block_input": (3, None), "block_block": (5, 7)}[form]
         pa = par[:, out_a]
         pb = par[:, 5] + 1 if form == "block_input" else par[:, out_b]    # the product's interval
-        ivs = [(int(v) // (n + 2), int(v) % (n + 2)) for v in np.unique(a * (n + 2) + b).tolist()]
+        ends = np.unique(a * (n + 2) + b)                             # (the children's distinct intervals)
+        iv_a, iv_b = ends // (n + 2), ends % (n + 2)
         c_full_at = None
         if form == "copy":
             okinds = (c_kind, out_temp)
@@ -246,10 +248,12 @@ def top_down_template(backend, prog) -> _Template:
                     parent_ivs = np.unique(parent_iv), child_ivs = np.unique(child_iv))
         tiles, height = None, 1
         if form in ("input_block", "block_input"):                # children walking the same entries, together
+            host["walk"] = {}
             host["group"] = node_groups(a[ptr_np[:-1]], b[ptr_np[:-1]], np.diff(ptr_np), add)
             tiles, height = node_tiles(host["group"])
             tiles = torch.from_numpy(tiles).to(dev)
-        return _Child(form, side, okinds, c_full_at, ch, i32(ptr_np), i32(par), ivs, host, tiles, height)
+        return _Child(form, side, okinds, c_full_at, ch, i32(ptr_np), i32(par), iv_a, iv_b, iv_index(iv_a, iv_b), host,
+                      tiles, height)
 
     steps = []
     for kind, prod_index, layers in reversed(circuit.steps):
@@ -483,7 +487,7 @@ def _fused_tables(prog, parts, block_size, elem_first, firsts, sums, elements, d
         groups[length] = dict(cb_row = t32(cb_row), cb_reg = t32(cb_reg), cb_add = t32(cb_add), cb_ivreg = t32(cb_ivreg),
                               par_ptr = t32(ptr), par_nid = t32(p_nid), par_reg = t32(p_reg),
                               par_pid = torch.from_numpy(p_pid).to(dev, torch.int64),
-                              max_slots = np.unique(cb_ivreg).tolist(),    # (of these regions: the backend's)
+                              max_slots = np.unique(cb_ivreg),             # (of these regions: the backend's)
                               max_parents = int(np.diff(ptr).max()),
                               dense = dense,
                               gate = None if not gated else dict(

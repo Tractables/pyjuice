@@ -39,7 +39,7 @@ from pyjuice.constraints.distributions import find_token
 from pyjuice.utils.kernel_launcher import triton_jit
 from pyjuice.utils.util import host_cdiv, host_next_power_of_2
 
-from .common import (IDENTITY, NODE_TILE, _block_ptr, _exit_width, _interval, _next_col, _logaddexp_tile, _lse_step, _slot,
+from .common import (IDENTITY, NODE_TILE, pack_aligned, _block_ptr, _exit_width, _interval, _next_col, _logaddexp_tile, _lse_step, _slot,
                      _tf32_operand, _tile_rows, grid_chunks, node_groups, node_tiles, tensor, pdl_launch)
 from .prod import _lse_step_one_exp
 from .prod_top_down import _once, _out_flows_ptr, _parent_base, _parent_lane
@@ -170,7 +170,7 @@ def class_weight_launch(launch, alive: np.ndarray, prog, score: ScoreTables):
     tiles, height = node_tiles(group)
     i32 = lambda x: torch.from_numpy(np.ascontiguousarray(x)).to(prog.dev, torch.int32)
     return ClassWeightLaunch(launch.form, launch.kinds, i32(dests), i32(ptr), i32(rows), 0,
-                             dict(dests = dests, ptr = ptr, parents = rows, group = group), i32(tiles), height), boundaries
+                             dict(dests = dests, ptr = ptr, parents = rows, group = group, walk = {}), i32(tiles), height), boundaries
 
 
 def class_weight_exits(form: str, boundaries: list, prog) -> int:
@@ -477,11 +477,34 @@ CLASS_WEIGHT_CUDA_SMEM = 96 * 1024
 
 def _long_walk(la, rows) -> bool:
     """Whether the launch's longest live walk reaches :data:`CLASS_WEIGHT_CUDA_WALK` (host values, no wait)."""
-    bounds = la.host.get("bounds")
+    bounds = la.host["walk"].get("bounds")
     if bounds is None:
-        bounds = la.host["bounds"] = sorted(set(la.host["dests"][:, 0].tolist()))
+        bounds = la.host["walk"]["bounds"] = sorted(set(la.host["dests"][:, 0].tolist()))
     walk = rows.walk
     return max(walk[t] for t in bounds) >= CLASS_WEIGHT_CUDA_WALK
+
+
+def _class_weight_boundaries(prog) -> None:
+    """Into ``host["walk"]`` of every class weight launch of ``prog``'s :class:`~..compiled.circuit.Assembly`, what its
+    CUDA tables say whatever the automaton (a launch's dict, the same for its program of any constraint): ``ts``, its
+    destinations' boundaries, ``tlist`` / ``t2i`` the same on the device, in one copy (copies wait for the stream), and
+    the most steps of a destination."""
+    launches = [cw.host for kind, _, layers in prog.assembly.top_down.steps if kind == "prod" for info in layers
+                for _, _, _, cws in info for cw, _ in cws]
+    n, arrays, ts = prog.n, [], []
+    for h in launches:
+        x = np.unique(h["dests"][:, 0])
+        t2i = np.full(n + 1, -1, dtype = np.int32)
+        t2i[x] = np.arange(x.size, dtype = np.int32)
+        ts.append(x.tolist())
+        arrays += [x.astype(np.int32), t2i]
+    buf, starts = pack_aligned(arrays, np.int32)
+    tables, starts = torch.from_numpy(buf).to(prog.dev), starts.tolist()
+    for k, (h, x) in enumerate(zip(launches, ts)):
+        ptr = np.asarray(h["ptr"])
+        h["walk"].update(ts = x, tlist = tables[starts[2 * k]:starts[2 * k] + len(x)],
+                         t2i = tables[starts[2 * k + 1]:starts[2 * k + 1] + n + 1], T = len(x),
+                         steps = int((ptr[1:] - ptr[:-1]).max(initial = 0)))
 
 
 def _class_weight_cuda(mod, la, tiles, height, cw, rows, prog, bufs, element_flows, temp_flows, node_mars, liveness,
@@ -495,20 +518,16 @@ def _class_weight_cuda(mod, la, tiles, height, cw, rows, prog, bufs, element_flo
     if st is None:
         if torch.cuda.is_current_stream_capturing():
             return False
-        d = h["dests"]
-        ptr = np.asarray(h["ptr"])
-        ts = sorted(set(d[:, 0].tolist()))
+        walk = h["walk"]
+        if "ts" not in walk:
+            _class_weight_boundaries(prog)
+        ts = walk["ts"]
         maxl = getattr(prog, "_cw_max_list", None)
         if maxl is None:                                               # every boundary's longest class list (once)
             cp = prog.trans.cls_ptr.view(-1, prog.C + 1)
             maxl = prog._cw_max_list = (cp[:, 1:] - cp[:, :-1]).amax(1).cpu().numpy()
-        t2i = np.full(prog.n + 1, -1, dtype = np.int32)
-        t2i[ts] = np.arange(len(ts), dtype = np.int32)
-        st = h["cw_cuda"] = dict(
-            steps = int((ptr[1:] - ptr[:-1]).max(initial = 0)),
-            tlist = torch.tensor(ts, dtype = torch.int32, device = prog.dev),
-            t2i = torch.from_numpy(t2i).to(prog.dev), T = len(ts), maxl = max(1, int(max(maxl[t] for t in ts))),
-            wt = max(prog.width[t] for t in ts), wt1 = max(prog.width[t + 1] for t in ts))
+        st = h["cw_cuda"] = dict(walk, maxl = max(1, int(max(maxl[t] for t in ts))), wt = max(prog.width[t] for t in ts),
+                                 wt1 = max(prog.width[t + 1] for t in ts))
     if st["steps"] != 1:
         return False
     lanes = host_cdiv(max(rows.most, 1), 32) * 32

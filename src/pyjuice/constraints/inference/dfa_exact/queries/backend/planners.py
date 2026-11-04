@@ -674,21 +674,22 @@ def _top_down_active(td, index, unit_count, cw_count, foldrow_mode, run_mode, gr
 
 
 def _mode_workspace(t, td):
-    """The work arrays of :func:`_top_down_modes` sized by the program, kept on ``td`` across queries: the ones
-    indexed by every launch child, class weight destination or product row -- a query writes a few of their entries
-    and the next resets those (:func:`_top_down_modes` keeps the runs and launches it touched), so that a query pays
-    for what it computes, not for the program's size."""
-    work = getattr(td, "mode_work", None)
+    """The work arrays of :func:`_top_down_modes` sized by the program, the ones indexed by every launch child, class
+    weight destination or product row -- a query writes a few of their entries and the next resets those
+    (:func:`_top_down_modes` keeps the runs and launches it touched), so that a query pays for what it computes, not for
+    the program's size. Kept with the circuit's tables, taken from there while a plan reads them (the caller gives them
+    back in ``td.shared``: a plan of another thread takes its own)."""
+    work = td.shared.pop("mode_work", None)
     if work is None:
         temps = int(t.layer_temps.max()) if t.layer_temps.size else 1
-        work = td.mode_work = (np.full(int(t.unit_child_ptr[-1]), -1, dtype = np.int8),            # child_mode
-                               np.zeros(t.run_src.size, dtype = np.bool_),                        # run_on
-                               np.zeros(t.dest_pos.size, dtype = np.bool_),                        # dest_sel
-                               np.zeros(t.cw_temp.size, dtype = np.int64),                        # cw_count
-                               np.zeros(int(t.elem_base[-1]), dtype = np.bool_),                   # ereq
-                               np.zeros(int(t.elem_base[-1]) + t.elem_base.size - 1, dtype = np.int64),   # E
-                               np.zeros(t.elem_base.size - 1, dtype = np.bool_),                   # touched
-                               np.zeros(temps, dtype = np.bool_), np.full(temps, -1, dtype = np.int8))   # treq, tin
+        work = (np.full(int(t.unit_child_ptr[-1]), -1, dtype = np.int8),            # child_mode
+                np.zeros(t.run_src.size, dtype = np.bool_),                        # run_on
+                np.zeros(t.dest_pos.size, dtype = np.bool_),                        # dest_sel
+                np.zeros(t.cw_temp.size, dtype = np.int64),                        # cw_count
+                np.zeros(int(t.elem_base[-1]), dtype = np.bool_),                   # ereq
+                np.zeros(int(t.elem_base[-1]) + t.elem_base.size - 1, dtype = np.int64),   # E
+                np.zeros(t.elem_base.size - 1, dtype = np.bool_),                   # touched
+                np.zeros(temps, dtype = np.bool_), np.full(temps, -1, dtype = np.int8))   # treq, tin
     return work
 
 

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from typing import Any, Dict
 
+import numpy as np
 import torch
 
 from .layout import BoundaryLayout
@@ -16,6 +17,29 @@ from .layout import BoundaryLayout
 # -------------------------------------------------------------------------------------------------
 # The PC side
 # -------------------------------------------------------------------------------------------------
+
+class Regions:
+    """The sum regions of a backend, ``(first_row, end_row, slots)`` each, as a read-only sequence of tuples (Python
+    ints), and ``array``: int64 [regions, 3]. A circuit may have tens of thousands of them, and a new constraint new ones."""
+
+    __slots__ = ("array",)
+
+    def __init__(self, array: np.ndarray):
+        self.array = array
+
+    def __len__(self) -> int:
+        return self.array.shape[0]
+
+    def __getitem__(self, r: int) -> tuple:
+        first, end, slots = self.array[r].tolist()
+        return first, end, slots
+
+    def __iter__(self):
+        return map(tuple, self.array.tolist())
+
+    def __array__(self, dtype = None, copy = None):
+        return self.array if dtype is None else self.array.astype(dtype, copy = False)
+
 
 def build_pc_tables(structure, layout: BoundaryLayout, pc) -> Dict[str, Any]:
     """
@@ -48,8 +72,8 @@ def build_pc_tables(structure, layout: BoundaryLayout, pc) -> Dict[str, Any]:
           product kernels read every product from this one table;
         * ``input_range`` -- the ``node_mars`` rows ``(first, last + 1)`` of all input nodes;
         * ``root_rows`` -- the ``node_mars`` rows ``(first, last + 1)`` of the root nodes;
-        * ``sum_regions`` -- one ``(first_row, end_row, slots)`` per sum node group, in row order: its
-          ``node_mars`` rows and the slots its block takes per sample;
+        * ``sum_regions`` -- one ``(first_row, end_row, slots)`` per sum node group, in row order
+          (:class:`Regions`): its ``node_mars`` rows and the slots its block takes per sample;
         * ``element_regions`` -- one ``(first_row, end_row, slots)`` per product layer group, in
           ``pc.inner_layer_groups`` order: its ``element_mars`` rows and the most slots any of its
           products takes per sample.
@@ -59,9 +83,10 @@ def build_pc_tables(structure, layout: BoundaryLayout, pc) -> Dict[str, Any]:
     from .circuit import circuit_rows                # (it imports the kernels, which import this module)
     rows = circuit_rows(structure, pc)
     reach = layout.reachability
-    return dict(columns_per_sample = max([1] + [reach.slots(a, b) for a, b in rows.node_ivs]),
+    slots = np.fromiter((reach.slots(a, b) for a, b in rows.node_ivs), dtype = np.int64, count = len(rows.node_ivs))
+    return dict(columns_per_sample = max(1, int(slots.max(initial = 1))),
                 product_rows = rows.on_device(pc.device), input_range = rows.input_range, root_rows = rows.root_rows,
-                sum_regions = tuple((first, end, reach.slots(a, b)) for first, end, a, b in rows.sum_groups),
+                sum_regions = Regions(np.concatenate([rows.sum_rows, slots[rows.sum_iv][:, None]], axis = 1)),
                 element_regions = tuple((first, end, max(reach.slots(a, b) for a, b in ivs))
                                         for first, end, ivs in rows.product_groups))
 
@@ -98,13 +123,12 @@ def buffer_layout(input_range, sum_regions, element_regions, batch_size: int) ->
     """
     B = int(batch_size)
     input_start, input_end = input_range
-    offset = _align(input_end * B)
-    sum_offsets, sum_widths = [], []
-    for first, end, slots in sum_regions:
-        width = _align(B * slots)
-        sum_offsets.append(offset); sum_widths.append(width)
-        offset += (end - first) * width                                       # stays aligned
+    regions = np.asarray(sum_regions, dtype = np.int64).reshape(-1, 3)
+    widths = (B * regions[:, 2] + ALIGN - 1) // ALIGN * ALIGN
+    ends = _align(input_end * B) + np.cumsum((regions[:, 1] - regions[:, 0]) * widths)   # (stays aligned)
+    node_size = int(ends[-1]) if ends.size else _align(input_end * B)
+    sum_offsets = np.concatenate([[_align(input_end * B)], ends[:-1]]) if ends.size else ends
     element_widths = [_align(B * slots) for _, _, slots in element_regions]
     element_size = max(((end - first) * w for (first, end, _), w in zip(element_regions, element_widths)), default = 0)
-    return dict(input_offset = 0, sum_offsets = sum_offsets, sum_widths = sum_widths,
-                node_size = offset, element_widths = element_widths, element_size = element_size)
+    return dict(input_offset = 0, sum_offsets = sum_offsets.tolist(), sum_widths = widths.tolist(),
+                node_size = node_size, element_widths = element_widths, element_size = element_size)

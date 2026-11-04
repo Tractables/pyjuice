@@ -184,20 +184,20 @@ class TokenClasses:
         stored classes' tokens alone (scoring: an enumerated class's token is scored on its own, no tile of one)."""
         found = self._class_tiles.get((width, stored))
         if found is None:
-            tc = self.token_class.cpu().long()
+            tc = self.token_class.long()
+            dev = tc.device
             order = torch.argsort(tc, stable = True)
             if stored:
-                order = order[self.stored_class.cpu()[order] >= 0]
-            counts = torch.bincount(tc[order], minlength = self.num_classes)
+                order = order[self.stored_class[order] >= 0]
+            cls = tc[order]
+            counts = torch.bincount(cls, minlength = self.num_classes)
             tiles = (counts + width - 1) // width                               # per class
             first_tile = torch.cumsum(tiles, 0) - tiles
             first_token = torch.cumsum(counts, 0) - counts
-            cls = tc[order]
-            tokens = torch.full((int(tiles.sum()) * width,), -1, dtype = torch.long)
-            tokens[first_tile[cls] * width + torch.arange(order.numel()) - first_token[cls]] = order
-            tile_class = torch.repeat_interleave(torch.arange(self.num_classes), tiles)
-            dev = self.token_class.device
-            found = self._class_tiles[(width, stored)] = (tokens.to(dev, torch.int32), tile_class.to(dev, torch.int32))
+            tokens = torch.full((int(tiles.sum()) * width,), -1, dtype = torch.long, device = dev)
+            tokens[first_tile[cls] * width + torch.arange(order.numel(), device = dev) - first_token[cls]] = order
+            tile_class = torch.repeat_interleave(torch.arange(self.num_classes, device = dev), tiles)
+            found = self._class_tiles[(width, stored)] = (tokens.to(torch.int32), tile_class.to(torch.int32))
         return found
 
 

@@ -550,24 +550,23 @@ def _concatenate_pair(a: DFA, b: DFA) -> DFA:
 def _compress_classes(token_class: torch.Tensor, delta: torch.Tensor):
     """Merge classes with identical successor columns, drop classes no token belongs to, and number
     the remaining classes by their smallest token (a canonical form for a given transition table)."""
-    used = torch.nonzero(torch.bincount(token_class, minlength = delta.size(1))).flatten()   # O(V), no sort
-    sub = delta if used.numel() == delta.size(1) else delta[:, used]
-    sub = np.ascontiguousarray(sub.numpy())
+    tokens, table = token_class.numpy(), delta.numpy()
+    used = np.flatnonzero(np.bincount(tokens, minlength = table.shape[1]))   # O(V), no sort
+    sub = np.ascontiguousarray(table if used.size == table.shape[1] else table[:, used])
     group, first_col = _column_classes(sub)                                  # merge identical columns (one pass)
     # (every column its own group: `first_col` counts up from 0, and the table stays as it is; it is the caller's, so
     # one copy of it)
     cols = sub.copy() if first_col.size == sub.shape[1] else np.ascontiguousarray(sub[:, first_col])
-    cols, inv = torch.from_numpy(cols), torch.from_numpy(group)
-    old_to_new = torch.full((delta.size(1),), -1, dtype = torch.long)
-    old_to_new[used] = inv
-    tc = old_to_new[token_class]
-    # number classes by first (smallest) token
-    C = cols.size(1)
-    first = torch.full((C,), token_class.numel(), dtype = torch.long)
-    first.scatter_reduce_(0, tc, torch.arange(tc.numel()), reduce = "amin")
-    order = torch.argsort(first)
-    rank = torch.empty_like(order)
-    rank[order] = torch.arange(C)
-    if torch.equal(order, torch.arange(C)):
-        return tc.contiguous(), cols
-    return rank[tc].contiguous(), cols[:, order].contiguous()
+    old_to_new = np.full(table.shape[1], -1, dtype = np.int64)
+    old_to_new[used] = group
+    tc = old_to_new[tokens]
+    # number classes by first (smallest) token: a repeated index keeps the value assigned last
+    C = cols.shape[1]
+    first = np.full(C, tokens.size, dtype = np.int64)
+    first[tc[::-1]] = np.arange(tokens.size - 1, -1, -1)
+    order = np.argsort(first, kind = "stable")
+    if np.array_equal(order, np.arange(C)):
+        return torch.from_numpy(tc), torch.from_numpy(cols)
+    rank = np.empty(C, dtype = np.int64)
+    rank[order] = np.arange(C)
+    return torch.from_numpy(rank[tc]), torch.from_numpy(np.ascontiguousarray(cols[:, order]))

@@ -451,8 +451,12 @@ class Reachability:
         if (a, b) not in self._occupancy:
             if self._dev is None or not self._every_pair(a, b):
                 self._compute(a, b)
-            else:
-                self._occupancy[a, b] = _tile_any(self._device_pairs(a, b), self.tile, self.tile)
+            else:                                            # (every pair: one matrix per shape)
+                shape = ("every pair", self.width[a], self.exit_width(b))
+                full = self._by_path.get(shape)
+                if full is None:
+                    full = self._by_path[shape] = _tile_any(self._device_pairs(a, b), self.tile, self.tile)
+                self._occupancy[a, b] = full
         return self._occupancy[a, b]
 
 

@@ -211,7 +211,7 @@ def flags(cc, observed, targets, valid, prior):
     K = len(prog.sum_ivs)
     sample = [(targets is None or bool(targets[:a].any() or targets[b:].any())) and not bool(prior[k])
               for k, (a, b) in enumerate(prog.sum_ivs)]
-    children = [set(prog.reg_iv_host[r] for r in np.nonzero(prog.operands[k])[0]) for k in range(K)]
+    children = [set(prog.reg_iv_host[r] for r in prog.operands[k]) for k in range(K)]
     read = set().union(*(children[k] for k in range(K) if sample[k]))
     if targets is None:
         read.add(prog.reg_iv_host[prog.root_region])

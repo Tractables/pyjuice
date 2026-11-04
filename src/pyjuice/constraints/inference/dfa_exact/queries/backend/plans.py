@@ -156,6 +156,8 @@ def _stage_inputs(stages, out: np.ndarray):
             for s0, s1, _, idx, _ in cut.chunks:
                 every = idx is None or idx.host is None
                 out[t[s0:s1] if every else t[s0 + np.asarray(idx.host, dtype = np.int64)]] = True
+            if cut.count == t.size:                                # (every step: no group has another)
+                continue
             for G, (idx, _) in (cut.groups or {}).items():
                 firsts = np.asarray(launch.groups_host[G], dtype = np.int64)
                 every = idx is None or idx.host is None
@@ -193,12 +195,12 @@ def input_reads(n: int, steps: list, top_down: bool = False) -> np.ndarray:
                     col = TRANS_COLS.get(la.form)
                     if col is None:
                         continue
+                    if item is None or item.host is None:           # (every child: every parent)
+                        out[np.asarray(la.host["parents"])[:, col[1]]] = True
+                        continue
                     ptr = np.asarray(la.host["ptr"], dtype = np.int64)
-                    if item is None or item.host is None:
-                        c = np.arange(ptr.size - 1)
-                    else:
-                        c = np.asarray(item.host, dtype = np.int64).ravel()
-                        c = c[c >= 0]                                # (node tiles' padding)
+                    c = np.asarray(item.host, dtype = np.int64).ravel()
+                    c = c[c >= 0]                                    # (node tiles' padding)
                     run = np.zeros(ptr[-1] + 1, dtype = np.int64)    # (the children's parents)
                     np.add.at(run, ptr[c], 1)
                     np.add.at(run, ptr[c + 1], -1)
@@ -308,7 +310,8 @@ def query_plan(prog, observed: np.ndarray, targets: Optional[np.ndarray], valid:
     if td is not None:
         read_ivs[prog.reg_iv_np[td.per_sample | td.once]] = True
     wanted = np.zeros_like(prior)
-    wanted[prog.reg_iv_np[prog.operands[read_ivs].any(axis = 0)]] = True
+    for k in np.nonzero(read_ivs)[0].tolist():           # (the intervals of the regions the products read)
+        wanted[prog.iv_children[k]] = True
     if td is not None:
         wanted |= td.prior
     if targets is None:
@@ -370,7 +373,9 @@ def read_regions(prog, plan: QueryPlan, root: bool = False) -> np.ndarray:
     ivs = plan.sample.copy()
     if plan.top_down is not None:
         ivs[prog.reg_iv_np[plan.top_down.per_sample | plan.top_down.once]] = True
-    out = prog.operands[ivs].any(axis = 0)
+    out = np.zeros(len(prog.slots), dtype = bool)
+    for k in np.nonzero(ivs)[0].tolist():
+        out[prog.operands[k]] = True
     if root:
         out[prog.root_region] = True
     return out
@@ -480,9 +485,11 @@ def top_down_plan(prog, td, targets: Optional[np.ndarray], once: np.ndarray, val
     r_once = once[td.reg_iv]
     req = needed[td.reg_iv] & ~np.where(r_once, valid, False if held is None else held)   # sum regions computed
     t, index = _top_down_tables(prog, td)
-    m = _top_down_modes(req, positions, once, scoring, t.data, t.offsets, *_mode_workspace(t, td))
+    work = _mode_workspace(t, td)
+    m = _top_down_modes(req, positions, once, scoring, t.data, t.offsets, *work)
     lists = IndexLists()                                 # every index list, copied to the device together
     out, busy = _top_down_steps(td, t, index, m, scoring, lists)
+    td.shared["mode_work"] = work                        # (read: for the next plan)
     cw_fill = class_weight_writes(prog, [out[si] for si in busy], positions) if scoring else True
     prior = m[-1]
     root = prog.root_region

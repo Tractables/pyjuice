@@ -33,7 +33,7 @@ import torch
 from pyjuice.utils.fast_inference import bf16_params_allowed, is_active, param_copies_allowed, register_layer
 
 from ...distributions import lookup
-from .compiled.tables import _align, buffer_layout
+from .compiled.tables import ALIGN, _align, buffer_layout
 
 
 @dataclass(eq = False)
@@ -232,12 +232,11 @@ class PriorPool:
             return
         prog, layout = self.state._backend.program(), self.state.batch_layout(1)
         full = layout["node_size"]
-        self.reg_floats = np.asarray([int(_align(r)) for r in prog.reg_rows * np.asarray(layout["sum_widths"],
-                                                                                        dtype = np.int64)])
+        self.reg_floats = (prog.reg_rows * np.asarray(layout["sum_widths"], dtype = np.int64) + ALIGN - 1) // ALIGN * ALIGN
         K = len(prog.sum_ivs)
         self.iv_floats = np.zeros(K, dtype = np.int64)
         np.add.at(self.iv_floats, prog.reg_iv_np, self.reg_floats)
-        self.iv_regions = [np.nonzero(prog.reg_iv_np == k)[0] for k in range(K)]
+        self.iv_regions = prog.iv_regions
         dev = self.state._device
         if self.budget is not None:
             budget = self.budget
@@ -573,8 +572,11 @@ class State:
                 flows[:pf["flows"].numel()] = pf["flows"]
                 pf["flows"] = flows
             pf["flows"][start:pf["size"]] = float("-inf")
-            pf["offset_t"] = torch.tensor([max(o, 0) for o in pf["offset"]], dtype = torch.int64, device = self._device)
-            pf["width_t"] = torch.tensor(pf["width"], dtype = torch.int64, device = self._device)
+            if pf["size"] == 0:                          # (nothing has rows yet: every region's 0)
+                pf["offset_t"] = pf["width_t"] = torch.zeros(len(pf["offset"]), dtype = torch.int64, device = self._device)
+            else:
+                pf["offset_t"] = torch.tensor(np.maximum(pf["offset"], 0), dtype = torch.int64, device = self._device)
+                pf["width_t"] = torch.tensor(pf["width"], dtype = torch.int64, device = self._device)
         return pf
 
     def storage(self, name: str) -> Optional[torch.Tensor]:
