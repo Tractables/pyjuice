@@ -37,6 +37,7 @@ import numpy as np
 import torch
 import triton
 import triton.language as tl
+from triton.language.extra.cuda import gdc_wait
 
 from pyjuice.layer.kernels import autotune
 from pyjuice.utils.kernel_launcher import triton_jit
@@ -44,6 +45,7 @@ from pyjuice.utils.util import host_cdiv, host_next_power_of_2
 
 from ..compiled.layout import Reachability, _tile_any
 from .common import _block_ptr, _child, _exit_width, _interval, _lse_step, _next_col, _pair, _slot, _tf32_operand, grid_chunks
+from .common import pdl_launch
 from .compact import _lane_pairs, _lane_sample, _operand_slot
 from .transitions import enumerated_args
 
@@ -333,7 +335,8 @@ def _input_block_kernel(element_mars, node_mars, temp, obs_class, next_col, delt
                         OUT_TEMP: tl.constexpr, GROUPED: tl.constexpr, PRUNE: tl.constexpr, OUT_FULL: tl.constexpr,
                         R_FULL: tl.constexpr, COMPACT: tl.constexpr, INDEXED: tl.constexpr, SAMPLE: tl.constexpr,
                         ENUM: tl.constexpr, LOGW: tl.constexpr, ENTRIES: tl.constexpr, SUCC_LISTS: tl.constexpr,
-                        SAMPLE_MASSES: tl.constexpr, TILE: tl.constexpr, hold_cum = None, HOLD: tl.constexpr = False):
+                        SAMPLE_MASSES: tl.constexpr, TILE: tl.constexpr, hold_cum = None, HOLD: tl.constexpr = False,
+                        PDL: tl.constexpr = False):
     """One program per step (of the plan's index list ``sel`` if ``INDEXED``) and tile of its whole output, flattened
     (sample, slot): with the samples' blocks contiguous, a step's output is one run of columns, and the lanes stay
     full whatever the widths. ``COMPACT``: the per-sample values compact (:mod:`.compact`), a lane per pair of the
@@ -346,6 +349,8 @@ def _input_block_kernel(element_mars, node_mars, temp, obs_class, next_col, delt
     boundary takes them, ``succ_use``): the lanes walk their column's entries whose successor is live alone
     (:class:`~.live.SuccessorLists`, ``E`` the tables' entries; a term through a dead successor is -inf, a no-op: the
     same bits)."""
+    if PDL:                                             # (the launch before it, done)
+        gdc_wait()
     s = _child(sel, tl.program_id(0), INDEXED)
     tile = pid0 + tl.program_id(1)
     out_row = tl.load(steps + s * 7 + 0)
@@ -396,8 +401,10 @@ def _input_block_kernel(element_mars, node_mars, temp, obs_class, next_col, delt
             acc = tl.zeros([TILE], dtype = tl.float32)
             if GROUPED:                                                      # the step's transition masses: its rank's
                 mt = b.to(tl.int64) * mb_stride + t                          # block of the boundary's pairs, or of the
-                masses = trans + tl.load(mbase + mt) + \
-                    tl.load(steps + s * 7 + 6).to(tl.int64) * tl.load(mcount + mt).to(tl.int64)   # lane's sample's
+                # (masked: a lane past the tile's outputs has no sample, its `b` anywhere -- unmasked, these 8-byte
+                # loads read past the tables and, on an unmapped page, faulted the context)
+                masses = trans + tl.load(mbase + mt, mask = miss, other = 0) + \
+                    tl.load(steps + s * 7 + 6).to(tl.int64) * tl.load(mcount + mt, mask = miss, other = 0).to(tl.int64)
                 bbt = tl.load(bbase + t)                                     # entries there (see Program.mass_args)
                 tk, pr, lz = 0, 0, 0.0                                       # (no class masses read)
             else:                                                            # the input's row of the class masses
@@ -465,7 +472,8 @@ def _input_block_group_kernel(element_mars, node_mars, temp, obs_class, next_col
                               OUT_FULL: tl.constexpr, R_FULL: tl.constexpr, G: tl.constexpr, ONE_EXP: tl.constexpr,
                               COMPACT: tl.constexpr, INDEXED: tl.constexpr, SAMPLE: tl.constexpr, ENUM: tl.constexpr,
                               LOGW: tl.constexpr, ENTRIES: tl.constexpr, SUCC_LISTS: tl.constexpr,
-                              TILE: tl.constexpr, hold_cum = None, HOLD: tl.constexpr = False):
+                              TILE: tl.constexpr, hold_cum = None, HOLD: tl.constexpr = False,
+                              PDL: tl.constexpr = False):
     """:func:`_input_block_kernel` for a group of steps per program, ungrouped transitions (a column's live entries,
     ``ENTRIES``, or every class, in class order), the block a sum's or a scratch row: group ``g`` is steps ``groups[g] .. groups[g +
     1]`` (at most ``G``, a power of 2), which share their position and block interval, so they share their lanes'
@@ -475,6 +483,8 @@ def _input_block_group_kernel(element_mars, node_mars, temp, obs_class, next_col
     ``ONE_EXP``: the log-sum-exp by :func:`_lse_step_one_exp` (bit-identical). ``COMPACT``: as
     :func:`_input_block_kernel`, the group's blocks all kept once or none (their interval is shared). ``INDEXED``: the
     groups of the plan's index list ``sel``. ``SAMPLE``: as :func:`_input_block_kernel`."""
+    if PDL:                                             # (the launch before it, done)
+        gdc_wait()
     g = _child(sel, tl.program_id(0), INDEXED)
     first = tl.load(groups + g)
     gs = first + tl.arange(0, G)
@@ -596,12 +606,14 @@ def _block_input_kernel(element_mars, node_mars, temp, obs_class, next_col, delt
                         L_KIND: tl.constexpr, OUT_TEMP: tl.constexpr, GROUPED: tl.constexpr, PRUNE: tl.constexpr,
                         OUT_FULL: tl.constexpr, L_FULL: tl.constexpr, COMPACT: tl.constexpr, INDEXED: tl.constexpr,
                         SAMPLE: tl.constexpr, ENUM: tl.constexpr, LOGW: tl.constexpr, SAMPLE_MASSES: tl.constexpr,
-                        TILE: tl.constexpr, hold_cum = None, HOLD: tl.constexpr = False):
+                        TILE: tl.constexpr, hold_cum = None, HOLD: tl.constexpr = False, PDL: tl.constexpr = False):
     """One program per step and tile of its whole output, flattened (sample, slot) as in
     :func:`_input_block_kernel`: every lane takes a log-sum over its exit column's predecessor entries (the
     program loops to the longest list among its lanes), each through its mass for a missing token (ungrouped: by
     the class's code, :func:`_lane_mass`), or the observed token's own log-probability when the entry holds its
     class. ``COMPACT``, ``INDEXED``, ``SAMPLE``, ``ENUM``: as :func:`_input_block_kernel`."""
+    if PDL:                                             # (the launch before it, done)
+        gdc_wait()
     s = _child(sel, tl.program_id(0), INDEXED)
     tile = pid0 + tl.program_id(1)
     out_row = tl.load(steps + s * 7 + 0)
@@ -630,9 +642,9 @@ def _block_input_kernel(element_mars, node_mars, temp, obs_class, next_col, delt
             lp = lp + tl.where(l_own, b * LS, 0)
             lbase = 0
         if GROUPED:                                                          # the step's transition masses (as in
-            mt = b.to(tl.int64) * mb_stride + t                              # _input_block_kernel)
-            masses = trans + tl.load(mbase + mt) + \
-                tl.load(steps + s * 7 + 6).to(tl.int64) * tl.load(mcount + mt).to(tl.int64)
+            mt = b.to(tl.int64) * mb_stride + t                              # _input_block_kernel; masked as there)
+            masses = trans + tl.load(mbase + mt, mask = m, other = 0) + \
+                tl.load(steps + s * 7 + 6).to(tl.int64) * tl.load(mcount + mt, mask = m, other = 0).to(tl.int64)
             bbt = tl.load(bbase + t)
         else:                                                                # the input's row of the class masses
             mrow = tl.load(mass_row + (u - input_start)).to(tl.int64) + b * 0
@@ -1159,8 +1171,15 @@ def _flat_tile(lanes: int) -> int:
 
 #: An ``input @ block`` launch runs its steps in groups (see :func:`_input_block_group_kernel`) only when a step's
 #: output has more lanes than this (batch x slots): a step that fits one program shares little, and its launch would
-#: have G times fewer programs (HMM4096 with 67- and 101-state automata at batch 1: 1-3% slower grouped).
-GROUP_MIN_LANES = 128
+#: have G times fewer programs (HMM4096 with 67- and 101-state automata at batch 1: 1-3% slower grouped). A group
+#: shares its steps' lanes' samples (a search over the batch's offsets a lane): Codpula-4096 x JSON hard_0 B64
+#: diffusion (~77 lanes a step) 2129 -> 2002 ms grouped; B1 / B8 / B32 the same either way
+GROUP_MIN_LANES = 64
+
+#: (step, lane) pairs a program of :func:`_input_block_group_kernel` takes: G steps of GROUP_TILE // G lanes (or a step's
+#: lanes, fewer), a pair a thread. Codpula-4096 x JSON hard_0 B64 diffusion (G 16 chosen: 64 lanes a program at 1024,
+#: 168 registers a thread, 0.91 waves) 2036 -> 1949 ms at 128; 512 / 256 / 64 / 32: 1992 / 1982 / 2010 / 1994
+GROUP_TILE = 128
 
 #: The log-sum-exp steps the autotuner times for :func:`_input_block_group_kernel` (with every group size the
 #: Program built): two exps (the default), and :func:`_lse_step_one_exp` -- bit-identical; x1.115 on the kernel with
@@ -1203,6 +1222,7 @@ def run_products(stages, bufs, prog, regions, element_mars, node_mars, masses, o
         values they hold (a fold's scratch rows: every lane)
     """
     temp, temp_width = bufs
+    pdl = pdl_launch(element_mars.device)                # (the walks: dependents of the launch before them)
     common = dict(reg_offset = regions["offset"], reg_width = regions["width"], reg_first = regions["first"],
                   prior_mars = prior["mars"], prior_offset = prior["offset"], prior_width = prior["width"],
                   reg_prior = prior["reg_prior"], out_first = elem_first, out_width = elem_width,
@@ -1263,7 +1283,7 @@ def run_products(stages, bufs, prog, regions, element_mars, node_mars, masses, o
                             firsts = groups[G]
                             gsel, gcnt = cut.groups[G]
                             G = host_next_power_of_2(G)            # lanes per group (a group may be shorter)
-                            tile = min(_flat_tile(lanes), 1024 // G)
+                            tile = min(_flat_tile(lanes), GROUP_TILE // G)
                             for first, size in grid_chunks(host_cdiv(lanes, tile), 1):
                                 _input_block_group_kernel[(gcnt, size)](
                                     element_mars, node_mars, temp, obs_class, prog.next_col_arg, prog.delta, prog.state_id,
@@ -1276,7 +1296,8 @@ def run_products(stages, bufs, prog, regions, element_mars, node_mars, masses, o
                                     OUT_TEMP = out_temp, PRUNE = prune, OUT_FULL = out_full, R_FULL = all(r_full),
                                     G = G, ONE_EXP = one_exp, COMPACT = compact is not None,
                                     INDEXED = gsel is not None, ENTRIES = prog.entry_loop, TILE = tile,
-                                    num_warps = 4, **inputs, **lists, **common, **succ, **held(out_temp))
+                                    PDL = pdl, launch_pdl = pdl, num_warps = 4, **inputs, **lists, **common, **succ,
+                                    **held(out_temp))
 
                         # the group sizes the Program built (its default first), each step form: timed per shape (the
                         # steps rounded up to a power of 2, so that queries running subsets of a launch share choices)
@@ -1292,12 +1313,13 @@ def run_products(stages, bufs, prog, regions, element_mars, node_mars, masses, o
                             _input_block_kernel[(cnt, size)](
                                 element_mars, node_mars, temp, obs_class, prog.next_col_arg, prog.delta, prog.state_id,
                                     prog.col_of_state, **margs, entry_ptr = tt.entry_ptr, entry_succ = tt.entry_succ,
-                                entry_x = tt.entry_x, width = prog.width_t, iv_of = ivs.of, iv_info = ivs.info,
+                                entry_x = prog.mass_x("entry_x"), width = prog.width_t, iv_of = ivs.of, iv_info = ivs.info,
                                 iv_table = ivs.table, live = live, steps = part, B = B, n = n, W = W,
                                 C = C, K = prog.K, input_start = prog.input_start, pid0 = first, HOMOGENEOUS = prog.homogeneous, R_KIND = r_kind,
                                 OUT_TEMP = out_temp, GROUPED = tt.grouped, PRUNE = prune, OUT_FULL = out_full,
                                 R_FULL = all(r_full), COMPACT = compact is not None, ENTRIES = prog.entry_loop,
-                                TILE = tile, num_warps = 4, **idx, **inputs, **lists, **common, **succ,
+                                TILE = tile, PDL = pdl, launch_pdl = pdl, num_warps = 4, **idx, **inputs, **lists,
+                                **common, **succ,
                                 **held(out_temp))
                     else:
                         l_kind, out_temp, (out_full, l_full) = kinds
@@ -1306,11 +1328,12 @@ def run_products(stages, bufs, prog, regions, element_mars, node_mars, masses, o
                             _block_input_kernel[(cnt, size)](
                                 element_mars, node_mars, temp, obs_class, prog.next_col_arg, prog.delta, prog.state_id,
                                     prog.col_of_state, **margs, pred_ptr = tt.pred_ptr, pred_col = tt.pred_col,
-                                pred_x = tt.pred_x, width = prog.width_t, iv_of = ivs.of, iv_info = ivs.info,
+                                pred_x = prog.mass_x("pred_x"), width = prog.width_t, iv_of = ivs.of, iv_info = ivs.info,
                                 iv_table = ivs.table, live = live, steps = part, B = B, n = n, W = W,
                                 C = C, K = prog.K, input_start = prog.input_start, pid0 = first, HOMOGENEOUS = prog.homogeneous, L_KIND = l_kind,
                                 OUT_TEMP = out_temp, GROUPED = tt.grouped, PRUNE = prune, OUT_FULL = out_full,
-                                L_FULL = l_full, COMPACT = compact is not None, TILE = tile, num_warps = 4, **idx,
+                                L_FULL = l_full, COMPACT = compact is not None, TILE = tile, PDL = pdl,
+                                launch_pdl = pdl, num_warps = 4, **idx,
                                 **inputs, **lists, **common, **held(out_temp))
             elif form == "block_block" and compact is not None:     # a sample's rectangle at a time
                 l_kind, r_kind, out_temp = kinds

@@ -38,6 +38,8 @@ would only pin that the two agree, and they share the compiled tables.
 
 import math
 
+import functools
+
 import pytest
 import torch
 
@@ -287,7 +289,14 @@ PARAMETERIZATIONS = ("random", "manual")
 
 @pytest.fixture(scope = "module")
 def _compiled():
-    """Every (parameterization, structure), compiled once for the module."""
+    return _compiled_once()
+
+
+@functools.cache
+def _compiled_once():
+    """Every (parameterization, structure), compiled once a process: the module fixture alone was set up again each
+    time a worker came back to this file, which the suite's duration ordering interleaves with others (MEASURED: 83
+    builds in a full suite at 5 workers, 45 s)."""
     out = {}
     for mode in PARAMETERIZATIONS:
         for name, build in STRUCTURES.items():

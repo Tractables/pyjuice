@@ -31,6 +31,7 @@
 // block_size-strided; the caller verifies both and raises otherwise.
 
 #include <torch/extension.h>
+#include "../../../../layer/kernels/c/param_load.cuh"   // `ParamLoad<TP>`: the parameters in their stored dtype
 #include <cuda_runtime.h>
 #include <c10/cuda/CUDAStream.h>
 #include <c10/cuda/CUDAException.h>
@@ -54,10 +55,10 @@ __device__ __forceinline__ void lse_add(float& m, float& l, float x, float w) {
 // TWO extra dependent global loads per gate standing in front of the parameter address -- the same
 // mistake the note below warns about for `gate[j]`, and measured here at +9.5% on two shapes.
 // Specialized, the dense path keeps the single pair of row bases it always had.
-template <int SPLIT, bool TWOPASS, bool ROW_CONTIG>
+template <int SPLIT, bool TWOPASS, bool ROW_CONTIG, typename TP>
 __global__ void __launch_bounds__(32 * SPLIT) bs_sb_fwd_kernel(
         float* __restrict__ node_mars, const float* __restrict__ element_mars,
-        const float* __restrict__ params, const float* __restrict__ ext,
+        const TP* __restrict__ params, const float* __restrict__ ext,
         const long* __restrict__ nids, const long* __restrict__ cids,
         const long* __restrict__ pids, const long* __restrict__ gate,
         float* __restrict__ log_z_out,
@@ -131,7 +132,7 @@ __global__ void __launch_bounds__(32 * SPLIT) bs_sb_fwd_kernel(
             bp = ep[j] + (long)w * block_size;
             be = ec[j] + w;
         }
-        const float* pe = &params[bp + m_local];
+        const TP* pe = &params[bp + m_local];
         const float* em = &element_mars[be * (long)batch + b];
 
         // The gate's own log-sum-exp first, WITHOUT the gate: `log phi` is constant across these
@@ -147,7 +148,7 @@ __global__ void __launch_bounds__(32 * SPLIT) bs_sb_fwd_kernel(
             // ONLINE: one pass, but `(gm, gl)` carries from edge to edge, so each parameter load waits
             // on the previous edge's arithmetic.
             for (int c = 0; c < gate_cbs; c++) {
-                const float p = *pe;               // 32 consecutive params, coalesced
+                const float p = ParamLoad<TP>::at(pe);   // 32 consecutive params, coalesced
                 lse_add(gm, gl, *em, p);           // element_mars is warp-uniform
                 sig += p;                          // the gate's parameter mass, all Z needs of it
                 pe += block_size;
@@ -179,8 +180,8 @@ __global__ void __launch_bounds__(32 * SPLIT) bs_sb_fwd_kernel(
             int c = 0;
             if (gm != -INFINITY) {
                 for (; c + 3 < gate_cbs; c += 4) {
-                    const float p0 = pe[0], p1 = pe[block_size];
-                    const float p2 = pe[2 * block_size], p3 = pe[3 * block_size];
+                    const float p0 = ParamLoad<TP>::at(pe), p1 = ParamLoad<TP>::at(pe + block_size);
+                    const float p2 = ParamLoad<TP>::at(pe + 2 * block_size), p3 = ParamLoad<TP>::at(pe + 3 * block_size);
                     g0 = fmaf(p0, __expf(em[0] - gm), g0);
                     g1 = fmaf(p1, __expf(em[batch] - gm), g1);
                     g2 = fmaf(p2, __expf(em[2 * batch] - gm), g2);
@@ -190,13 +191,13 @@ __global__ void __launch_bounds__(32 * SPLIT) bs_sb_fwd_kernel(
                     em += 4 * batch;
                 }
                 for (; c < gate_cbs; c++, pe += block_size, em += batch) {
-                    const float p = *pe;
+                    const float p = ParamLoad<TP>::at(pe);
                     g0 = fmaf(p, __expf(*em - gm), g0);
                     s0 += p;
                 }
             } else {
                 // every edge under this gate is -inf; Z still needs the parameter mass
-                for (; c < gate_cbs; c++, pe += block_size) s0 += *pe;
+                for (; c < gate_cbs; c++, pe += block_size) s0 += ParamLoad<TP>::at(pe);
             }
 
             gl = (g0 + g1) + (g2 + g3);
@@ -264,7 +265,7 @@ __global__ void __launch_bounds__(32 * SPLIT) bs_sb_fwd_kernel(
 }
 
 
-template <int SPLIT, bool TWOPASS, bool ROW_CONTIG>
+template <int SPLIT, bool TWOPASS, bool ROW_CONTIG, typename TP>
 static void launch(torch::Tensor node_mars, torch::Tensor element_mars, torch::Tensor params,
                    torch::Tensor ext, torch::Tensor nids, torch::Tensor cids, torch::Tensor pids,
                    torch::Tensor gate, torch::Tensor log_z,
@@ -274,8 +275,8 @@ static void launch(torch::Tensor node_mars, torch::Tensor element_mars, torch::T
     dim3 grid((unsigned)(ng * (block_size / 32)), (unsigned)batch);
     dim3 blk(32, SPLIT);
 
-    bs_sb_fwd_kernel<SPLIT, TWOPASS, ROW_CONTIG><<<grid, blk, 0, c10::cuda::getCurrentCUDAStream()>>>(
-        node_mars.data_ptr<float>(), element_mars.data_ptr<float>(), params.data_ptr<float>(),
+    bs_sb_fwd_kernel<SPLIT, TWOPASS, ROW_CONTIG, TP><<<grid, blk, 0, c10::cuda::getCurrentCUDAStream()>>>(
+        node_mars.data_ptr<float>(), element_mars.data_ptr<float>(), param_ptr<TP>(params),
         ext.data_ptr<float>(), nids.data_ptr<long>(), cids.data_ptr<long>(),
         pids.data_ptr<long>(), gate.data_ptr<long>(),
         log_z.numel() ? log_z.data_ptr<float>() : nullptr,
@@ -320,20 +321,24 @@ void blockscale_sb_forward(torch::Tensor node_mars, torch::Tensor element_mars, 
     // addressing specialization: see the note on `ROW_CONTIG` at the kernel.
 #define BS_SB_DISPATCH(RC)                                                                         \
     switch (cfg) {                                                                                 \
-        case 0: launch<32, false, RC>(BS_SB_ARGS); break;                                          \
-        case 1: launch<16, false, RC>(BS_SB_ARGS); break;                                          \
-        case 2: launch< 8, false, RC>(BS_SB_ARGS); break;                                          \
-        case 3: launch< 4, false, RC>(BS_SB_ARGS); break;                                          \
-        case 4: launch<32, true , RC>(BS_SB_ARGS); break;                                          \
-        case 5: launch<16, true , RC>(BS_SB_ARGS); break;                                          \
-        case 6: launch< 8, true , RC>(BS_SB_ARGS); break;                                          \
-        case 7: launch< 4, true , RC>(BS_SB_ARGS); break;                                          \
+        case 0: launch<32, false, RC, TP>(BS_SB_ARGS); break;                                      \
+        case 1: launch<16, false, RC, TP>(BS_SB_ARGS); break;                                      \
+        case 2: launch< 8, false, RC, TP>(BS_SB_ARGS); break;                                      \
+        case 3: launch< 4, false, RC, TP>(BS_SB_ARGS); break;                                      \
+        case 4: launch<32, true , RC, TP>(BS_SB_ARGS); break;                                      \
+        case 5: launch<16, true , RC, TP>(BS_SB_ARGS); break;                                      \
+        case 6: launch< 8, true , RC, TP>(BS_SB_ARGS); break;                                      \
+        case 7: launch< 4, true , RC, TP>(BS_SB_ARGS); break;                                      \
         /* No silent default: an unknown cfg must not run zero kernels, which against a reused   */ \
         /* output buffer can masquerade as a correct -- and very fast -- result to the autotuner.*/ \
         default: TORCH_CHECK(false, "blockscale small-batch forward: invalid cfg ", cfg);           \
     }
 
-    if (row_contig) { BS_SB_DISPATCH(true); } else { BS_SB_DISPATCH(false); }
+    auto run = [&](auto tag) {
+        using TP = decltype(tag);
+        if (row_contig) { BS_SB_DISPATCH(true); } else { BS_SB_DISPATCH(false); }
+    };
+    if (params.scalar_type() == torch::kBFloat16) run(__nv_bfloat16{}); else run(float{});
 
 #undef BS_SB_DISPATCH
 #undef BS_SB_ARGS

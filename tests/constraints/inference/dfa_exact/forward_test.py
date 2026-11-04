@@ -316,6 +316,9 @@ def test_fast_inference_keeps_the_class_masses(kind, build_pc, reference, monkey
     monkeypatch.setattr(categorical, "class_masses", lambda *a, **k: calls.append(1) or computed(*a, **k))
     builds, built = [], P.transition_masses                              # the transition masses follow them
     monkeypatch.setattr(P, "transition_masses", lambda *a, **k: builds.append(1) or built(*a, **k))
+    from pyjuice.constraints.inference.dfa_exact.kernels import transition_signatures as TS    # (by column, or by
+    built_sig = TS.signature_transition_masses                                                  # signature)
+    monkeypatch.setattr(TS, "signature_transition_masses", lambda *a, **k: builds.append(1) or built_sig(*a, **k))
     per_query = len(pc.input_layer_group)                                # one call per input layer
 
     want = reference.marginal(cc, data, missing)
@@ -560,14 +563,17 @@ def test_live_columns_are_shifted_and_exponentiated(rows, width, num_live):
     assert torch.equal(ex_t.view(torch.int32), one_t.view(torch.int32)) and torch.equal(m, one_m)
 
 
-def test_transition_masses_match_brute_force(build_pc, monkeypatch):
+@pytest.mark.parametrize("signatures", [False, True], ids = ["by_column", "by_signature"])
+def test_transition_masses_match_brute_force(build_pc, monkeypatch, signatures):
     """Every transition mass -- log sum of the class masses that lead from a column to a successor -- against
     float64, on an automaton whose columns have more successors than one pair tile takes and more classes than one
     chunk, with token probabilities down to e^-100 and one emission row below e^-90 altogether (pairs whose class
-    masses are all below the fp32 normal range)."""
+    masses are all below the fp32 normal range); laid out by column, and by column signature
+    (:mod:`~pyjuice.constraints.inference.dfa_exact.kernels.transition_signatures`), read as the kernels read them."""
     import pyjuice.constraints.inference.dfa_exact.compiled.program as P
-    from pyjuice.constraints.inference.dfa_exact.kernels import transitions
+    from pyjuice.constraints.inference.dfa_exact.kernels import transitions, transition_signatures
     monkeypatch.setattr(P, "GROUP_MIN_RATIO", 0)
+    monkeypatch.setattr(transition_signatures, "SIGNATURE_MASSES", signatures)
     rng = random.Random(0)
     V2, K, n = 600, 48, 6
     dfa = jc.DFA.from_dense(V2, [[rng.randrange(K) for _ in range(V2)] for _ in range(K)], 0, rng.sample(range(K), 12))
@@ -594,15 +600,17 @@ def test_transition_masses_match_brute_force(build_pc, monkeypatch):
     mass_row = prog.mass_row.long().cpu()
     assert (cm[torch.isfinite(cm)] < -87.4).any()                       # class masses below the normal range
     assert (cm.max(dim = 1).values < -87.4).any()                       # ... every class of a row
-    pair_off, pairs = prog.pair_off.cpu(), prog.pairs_t.cpu()
+    assert (prog.trans_sig is not None) == signatures                    # (the layout taken: it saves here)
+    margs = prog.mass_args()                                             # the masses as the kernels address them
+    pair_off, pairs, ex = margs["mbase"].cpu(), margs["mcount"].cpu(), prog.mass_x("entry_x").long().cpu()
     for u, t, rk in prog.trans_job[0].long().cpu().tolist():                 # (input row, position, step rank)
-        off = int(pair_off[t]) + rk * int(pairs[t])                          # the step's block of the boundary's pairs
+        off = int(pair_off[t]) + rk * int(pairs[t])                          # the step's block
         for q in range(width[t]):
             to = nc[t, q].long()
             for g in range(int(ptr[t, q]), int(ptr[t, q + 1])):
                 classes = (to >= 0) if t + 1 == n else (to == succ[g])
                 want = torch.logsumexp(cm[mass_row[u - prog.input_start], classes], dim = 0)
-                got = T[off + g - int(ptr[t, 0])]
+                got = T[off + int(ex[g])]
                 assert abs(float(got - want)) < 1e-5, (u, t, q, g, float(got), float(want))
 
 

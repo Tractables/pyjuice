@@ -399,7 +399,7 @@ def test_small_batch_ele_backward_cuda_matches_triton():
         # Confirm the small-batch CUDA ele dispatch was actually reached (an "sb" choice was cached),
         # so this test is not silently validating Triton-vs-Triton.
         reached = any(
-            any(isinstance(k, tuple) and len(k) == 3 and k[2] == "sb"
+            any(isinstance(k, tuple) and len(k) >= 3 and k[2] == "sb"
                 for k in getattr(layer, "_cached_bk_ele_choice", {}))
             for lg in pc.inner_layer_groups for layer in lg
             if type(layer).__name__ == "SumLayer"
@@ -590,6 +590,7 @@ def test_small_batch_par_backward_cuda_matches_triton():
 
 
 def _clear_sum_caches(pc):
+    from pyjuice.utils.launch_plans import LaunchPlans
     _names = ["_cached_fw_pcids", "_cached_fw_cuda", "_cached_fw_cuda_choice", "_cached_fw_sb",
               "_cached_bk_parids", "_cached_bk_ele_cuda", "_cached_bk_ele_choice", "_cached_bk_ele_sb",
               "_cached_bk_par_cuda", "_cached_bk_par_choice", "_cached_bk_par_sparse_choice",
@@ -600,6 +601,7 @@ def _clear_sum_caches(pc):
                 for nm in _names:
                     if hasattr(layer, nm):
                         getattr(layer, nm).clear()
+                LaunchPlans.of(layer).clear()          # (the plans of its backward read the decisions cleared above)
 
 
 def _trim_fires(pc):

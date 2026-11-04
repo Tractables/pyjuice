@@ -23,6 +23,7 @@
 // block_size%128==0, batch%64==0, contiguous edge/param layout, TMA-capable GPU sm_90+). Else Triton.
 
 #include <torch/extension.h>
+#include "param_load.cuh"
 #include <cuda_fp16.h>
 #include <cuda.h>
 #include <c10/cuda/CUDAStream.h>
@@ -67,8 +68,9 @@ __device__ __forceinline__ void mbar_wait(uint64_t* bar, int phase) {
 
 extern __shared__ char smem_raw[];
 
+template <typename TP>
 __global__ void __launch_bounds__(NTH) ele_kernel(
-        float* __restrict__ eflows, const float* __restrict__ emars_g, const float* __restrict__ mp,
+        float* __restrict__ eflows, const float* __restrict__ emars_g, const TP* __restrict__ mp,
         const long* __restrict__ chids, const long* __restrict__ ebase, const long* __restrict__ pbase,
         int batch, int BSK, int BSM, int knt, int pid_m_offset,
         const __grid_constant__ CUtensorMap descNf, const __grid_constant__ CUtensorMap descNm) {
@@ -135,9 +137,10 @@ __global__ void __launch_bounds__(NTH) ele_kernel(
         __syncthreads();   // all reads of sLf/sNm done before sA(=sNm region) is overwritten with epars
         // A[m,e] = epars (e-contiguous, 8/float4 from 8 contiguous mp floats)
         for (int i = tid; i < (BM * BK) / 8; i += NTH) { int m = i / (BK / 8), ee = (i % (BK / 8)) * 8;
-            const float* g = &mp[pc + (long)m * BSK + ee]; float4 a = *(const float4*)g, b2 = *(const float4*)(g + 4);
-            half_t r[8]; r[0] = static_cast<half_t>(a.x); r[1] = static_cast<half_t>(a.y); r[2] = static_cast<half_t>(a.z); r[3] = static_cast<half_t>(a.w);
-            r[4] = static_cast<half_t>(b2.x); r[5] = static_cast<half_t>(b2.y); r[6] = static_cast<half_t>(b2.z); r[7] = static_cast<half_t>(b2.w);
+            float v[8]; ParamLoad<TP>::load8(&mp[pc + (long)m * BSK + ee], v);
+            half_t r[8];
+            CUTE_UNROLL
+            for (int j = 0; j < 8; j++) r[j] = static_cast<half_t>(v[j]);
             *(float4*)&sAt(m, ee) = *(const float4*)r; }
         __syncthreads();
         // fp16 tensor-core dot: partial[m,b] = sum_e epars[m,e] * nfsub[e,b], accumulated in fp32.
@@ -175,10 +178,11 @@ static bool build_desc(CUtensorMap* d, void* base, int n_rows, int batch) {
 }
 
 // element-flow backward (writes element_flows in-place). chids/ebase/pbase are int64 [neb] / [neb,knt].
-void ele_backward_sum(torch::Tensor element_flows, torch::Tensor element_mars, torch::Tensor node_flows,
-                      torch::Tensor node_mars, torch::Tensor params, torch::Tensor chids,
-                      torch::Tensor ebase, torch::Tensor pbase,
-                      int64_t batch, int64_t BSK, int64_t BSM, int64_t knt) {
+template <typename TP>
+static void ele_backward_sum_t(torch::Tensor element_flows, torch::Tensor element_mars, torch::Tensor node_flows,
+                               torch::Tensor node_mars, torch::Tensor params, torch::Tensor chids,
+                               torch::Tensor ebase, torch::Tensor pbase,
+                               int64_t batch, int64_t BSK, int64_t BSM, int64_t knt) {
     TORCH_CHECK(BSM % BM == 0, "block_size must be divisible by ", BM);
     TORCH_CHECK(batch % BN == 0, "batch must be divisible by ", BN);
     int n_nblocks = chids.size(0);
@@ -191,18 +195,29 @@ void ele_backward_sum(torch::Tensor element_flows, torch::Tensor element_mars, t
         g_nf = nf; g_nm = nm; g_rows = n_rows; g_batch = (int)batch;
     }
     int smem = BM * BK * 2 + BN * BK * 2 + BK * BN * 4 + BN * 4 + 1024;   // pA(fp16)+pBs(fp16)+sLf(f32)+sMx+bar
-    cudaFuncSetAttribute(ele_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    cudaFuncSetAttribute(ele_kernel<TP>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
     int total_m = n_nblocks * (BSM / BM);
     const int MAX_Y = 65535;
     for (int off = 0; off < total_m; off += MAX_Y) {
         int chunk = (total_m - off < MAX_Y) ? (total_m - off) : MAX_Y;
         dim3 grid(batch / BN, chunk);
-        ele_kernel<<<grid, NTH, smem, c10::cuda::getCurrentCUDAStream()>>>(
-            element_flows.data_ptr<float>(), element_mars.data_ptr<float>(), params.data_ptr<float>(),
+        ele_kernel<TP><<<grid, NTH, smem, c10::cuda::getCurrentCUDAStream()>>>(
+            element_flows.data_ptr<float>(), element_mars.data_ptr<float>(), param_ptr<TP>(params),
             chids.data_ptr<long>(), ebase.data_ptr<long>(), pbase.data_ptr<long>(),
             (int)batch, (int)BSK, (int)BSM, (int)knt, off, g_descNf, g_descNm);
         C10_CUDA_KERNEL_LAUNCH_CHECK();
     }
+}
+
+// The parameters in the dtype they are stored in (`TensorCircuit.param_dtype`): fp32 or bf16.
+void ele_backward_sum(torch::Tensor element_flows, torch::Tensor element_mars, torch::Tensor node_flows,
+                      torch::Tensor node_mars, torch::Tensor params, torch::Tensor chids,
+                      torch::Tensor ebase, torch::Tensor pbase,
+                      int64_t batch, int64_t BSK, int64_t BSM, int64_t knt) {
+    if (params.scalar_type() == torch::kBFloat16)
+        ele_backward_sum_t<__nv_bfloat16>(element_flows, element_mars, node_flows, node_mars, params, chids, ebase, pbase, batch, BSK, BSM, knt);
+    else
+        ele_backward_sum_t<float>(element_flows, element_mars, node_flows, node_mars, params, chids, ebase, pbase, batch, BSK, BSM, knt);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {

@@ -255,9 +255,12 @@ def test_all_tile_configs_agree():
     layer = [l for g in pc.inner_layer_groups if g.is_sum() for l in g.layers
              if hasattr(l, "_bs_fw_plans")][0]
     mod, fname, calls = next(iter(layer._bs_fw_plans.values()))[0]
-    if fname != "blockscale_forward":
+    if fname not in ("blockscale_forward", "blockscale_forward_prepass"):
         pytest.skip("the launcher chose the small-batch kernel; no tile configs to compare")
-    valid = [int(i) for i in mod.fitting_configs(128, 128, 16)]
+    if fname == "blockscale_forward":
+        valid = [int(i) for i in mod.fitting_configs(128, 128, 16)]
+    else:                                                # the pre-pass copy (its node_cbs is in the launch tuple)
+        valid = [int(i) for i in mod.fitting_configs(128, 128, int(calls[0][7]), 16)]
     assert len(valid) >= 2, f"expected several usable tiles, got {valid}"
 
     saved = list(calls)

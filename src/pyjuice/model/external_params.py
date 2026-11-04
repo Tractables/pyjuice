@@ -40,6 +40,36 @@ def _staging_transpose_fn():
         return None
 
 
+def _staged_transposes_batched(fn, fast: list) -> bool:
+    """
+    Every `fast` pair's transpose in ONE launch of the CUDA extension's batched sibling, where `fn` is the
+    extension's own transpose (a test forcing another tier keeps it) and every pair is contiguous float32 of equal
+    sizes on one device; False (nothing launched) otherwise. One call per pair was most of a forward's staging
+    host time: MEASURED 83 us at a tied gated HMM-2048 x4 (15 nodes). The pairs' addresses and sizes go to the
+    launch by value -- nothing on the device to upload or to keep by address, so a caller handing fresh tensors
+    every call (a head's output, new gradient buffers) costs no more than one with stable ones, and what the
+    backward launches never depends on where the allocator put them.
+    """
+    from pyjuice.nodes.external_params.kernels.c import get_module
+    mod = get_module()
+    batched = getattr(mod, "staging_transpose_batched", None) if mod is not None else None
+    if batched is None or fn is not mod.staging_transpose:
+        return False
+    device = fast[0][0].device
+    rows, max_b, max_n = [], 0, 0
+    for dst, src in fast:
+        if not (dst.device == device and src.device == device and dst.dtype == torch.float32
+                and src.dtype == torch.float32 and dst.is_contiguous() and src.is_contiguous()
+                and dst.numel() == src.numel()):
+            return False
+        batch = src.size(0)
+        n = src.numel() // max(batch, 1)
+        rows += (src.data_ptr(), dst.data_ptr(), batch, n)
+        max_b, max_n = max(max_b, batch), max(max_n, n)
+    batched(rows, max_b, max_n)
+    return True
+
+
 def _staged_copy(plain_d: list, plain_s: list, fast: list) -> None:
     """
     Issue the staging copies: a tiled transpose for the pairs that are one, a batched `copy_` for the
@@ -56,6 +86,8 @@ def _staged_copy(plain_d: list, plain_s: list, fast: list) -> None:
     """
     if fast:
         fn = _staging_transpose_fn()
+        if len(fast) > 1 and _staged_transposes_batched(fn, fast):
+            fast = []
         for dst, src in fast:
             batch = src.size(0)
             n = src.numel() // max(batch, 1)
@@ -93,15 +125,45 @@ class _ExternalParamsMixin:
         if not dsts:
             return None
 
-        d, s = [], []
+        d, s, fast = [], [], []
+        # A node's views of the gradient buffer are the same objects every call at a batch size
+        # (`_external_params_views` caches them), and `from_storage` is a layout mapping of them: kept per node
+        # against those views' identity (~3 us a node, every backward). Where the storage layout rotates the batch
+        # axis to the end (`_ext_ns_static`) and the caller's tensor is contiguous fp32, the copy is the staging
+        # transpose the other way round -- `[N, B] -> [B, N]`, the same kernel with the sides swapped -- and every
+        # such pair goes in ONE launch: `_foreach_copy_` on the transposed views issued one copy kernel per tensor
+        # (MEASURED, a tied gated HMM-2048 x4, 15 nodes: 15 launches a backward, ~10 us of host each).
+        src_cache = self.__dict__.setdefault("_external_grad_src_cache", {})
         for ns, tensors in dsts.items():
-            src = ns.external_params.from_storage(ns, self._staged_external_params_grad[ns])
+            views = self._staged_external_params_grad[ns]
+            hit = src_cache.get(ns)
+            if hit is not None and hit[0] is views:
+                src, flat = hit[1], hit[2]
+            else:
+                src = ns.external_params.from_storage(ns, views)
+                rotates, _ = self._ext_ns_static(ns)
+                # the storage views as `[N, B]`, the transpose's source (None where the layout is not that rotation)
+                flat = tuple(v.view(-1, v.size(-1)) for v in views) if rotates else None
+                src_cache[ns] = (views, src, flat)
             if torch.is_tensor(tensors):
                 tensors = (tensors,)
-            for dst, one in zip(tensors, src):
-                d.append(dst)
-                s.append(one)
+            for i, (dst, one) in enumerate(zip(tensors, src)):
+                if flat is not None and dst.is_contiguous() and dst.dtype == torch.float32 and dst.dim() >= 2:
+                    fast.append((dst, flat[i]))
+                else:
+                    d.append(dst)
+                    s.append(one)
 
+        if fast:
+            fn = _staging_transpose_fn()
+            if len(fast) > 1 and _staged_transposes_batched(fn, fast):
+                fast = []
+            for dst, src in fast:
+                if fn is not None:
+                    fn(dst, src, src.size(0), src.size(1))   # dst[b, n] = src[n, b]: the transpose, sides swapped
+                else:
+                    d.append(dst)
+                    s.append(src.permute(1, 0).view(dst.shape))
         if d:
             torch._foreach_copy_(d, s)
 
@@ -526,12 +588,9 @@ class _ExternalParamsMixin:
             # whichever it is, so the caller never has to know about it.
             #
             # When that layout change is exactly "rotate the batch axis to the end", the copy is a
-            # transpose and gets the tiled kernel. Recognized from the DECLARED permutation -- a tuple
-            # comparison -- rather than from the tensors, so the test costs nothing per forward.
-            perm = ns.external_params.storage_perm()
-            rotates_batch = (perm is not None
-                             and type(ns.external_params).to_storage is ExternalSumParams.to_storage
-                             and tuple(perm) == tuple(range(1, len(perm))) + (0,))
+            # transpose and gets the tiled kernel. Recognized from the DECLARED permutation rather than from
+            # the tensors, and kept per node (`_ext_ns_static`).
+            rotates_batch, _ = self._ext_ns_static(ns)
 
             if rotates_batch:
                 for dst, tensor in zip(views[ns], tensors):
@@ -557,16 +616,29 @@ class _ExternalParamsMixin:
         # is staged. Comparing node-by-node would keep only the one that was named and silently turn the
         # rest into plain sum layers -- correct-looking output with the correction applied to one
         # timestep out of many.
-        supplied_groups = {ns.external_params.storage_owner(ns)
-                           for ns in (set(ns2tensors) | group_done)}
+        supplied_groups = {self._ext_ns_static(ns)[1] for ns in (set(ns2tensors) | group_done)}
         for ns in list(views.keys()):
-            if ns.external_params.storage_owner(ns) not in supplied_groups:
+            if self._ext_ns_static(ns)[1] not in supplied_groups:
                 del views[ns]
 
         kwargs[EXTERNAL_PARAMS_KWARG] = views
         kwargs[EXTERNAL_PARAMS_BUFFER_KWARG] = self.__dict__[name]
         if owns_forward_state:
             self._staged_external_params = views
+
+    def _ext_ns_static(self, ns) -> tuple:
+        """`(rotates_batch, storage owner)` of an external-parameter node, both fixed by its parameterization: whether
+        its storage layout is the default `to_storage` moving the batch to the end (the staging copy's fast form) and
+        whose slots it uses. Kept per node (two method calls and a tuple comparison a node, every forward)."""
+        memo = self.__dict__.setdefault("_ext_ns_static_memo", {})
+        hit = memo.get(ns)
+        if hit is None:
+            ep = ns.external_params
+            perm = ep.storage_perm()
+            rotates = (perm is not None and type(ep).to_storage is ExternalSumParams.to_storage
+                       and tuple(perm) == tuple(range(1, len(perm))) + (0,))
+            hit = memo[ns] = (rotates, ep.storage_owner(ns))
+        return hit
 
     def _resolve_backward_external_params(self, kwargs: dict) -> None:
         """

@@ -1,12 +1,18 @@
 from __future__ import annotations
 
+import contextlib
+
 import torch
 import torch.nn as nn
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from pyjuice.nodes import ExternalParamsSumNodes
+from pyjuice.utils import launch_plans
+from pyjuice.utils.launch_plans import LaunchPlans
 from pyjuice.utils.parameter_list import FastParamList
+from . import deferred_par
 from .sum_layer import SumLayer
+from .fused_children import form_elements, scatter_flows
 
 
 # Forward kwarg carrying the per-sample external tensors, keyed by `ns` instance:
@@ -108,7 +114,17 @@ def validate_external_tensors(ns, external_params, tensors: Any, batch_size: int
                                strides -- so the caller may hand over slices of whatever their own
                                head produced without paying for a `.contiguous()` per node.
     """
-    shapes = external_params.tensor_shapes(ns, batch_size)
+    # The declared shapes are a function of the node and the batch size: computed once per pair (~1-2 us a call, and
+    # every forward and backward validates each node's tensors), cached on the parameterization next to the node.
+    shape_cache = external_params.__dict__.setdefault("_tensor_shapes_cache", {})
+    hit = shape_cache.get((id(ns), batch_size))
+    if hit is not None and hit[0] is ns:
+        shapes = hit[1]
+    else:
+        shapes = external_params.tensor_shapes(ns, batch_size)
+        if len(shape_cache) >= 256:
+            shape_cache.clear()
+        shape_cache[(id(ns), batch_size)] = (ns, shapes)
 
     if torch.is_tensor(tensors):
         tensors = (tensors,)
@@ -203,6 +219,14 @@ class ExternalParamsSumLayer(SumLayer):
 
     def restore_cuda_graph_state(self, state) -> None:
         self.external_params.restore_cuda_graph_state(self, state)
+
+    def _drop_device_caches(self) -> None:
+        """The sum layer's own, and every parameterization's of the layer's node groups."""
+        super()._drop_device_caches()
+        for name in ("_bk_stream_parts_g", "_bk_par_deferred_g", "_bk_fusion_ready_g"):
+            self.__dict__.pop(name, None)
+        for params in {id(ns.external_params): ns.external_params for ns in self.nodes}.values():
+            params.drop_device_caches(self)
 
     def assign_denom_flow_offsets(self, base: int) -> int:
         """
@@ -565,27 +589,47 @@ class ExternalParamsSumLayer(SumLayer):
                 "External sum parameters are not supported with `negate_pflows = True`."
 
     def forward(self, node_mars: torch.Tensor, element_mars: torch.Tensor, params: torch.Tensor,
-                propagation_alg: str = "LL", **kwargs) -> None:
+                propagation_alg: str = "LL", op_params: Optional[torch.Tensor] = None, **kwargs) -> None:
         """
         Forward pass. The shared-parameter term is the standard sum-layer forward, run unchanged; the
-        descriptor then turns the values it wrote into the effective ones.
+        descriptor then turns the values it wrote into the effective ones. Whole partitions only (no
+        `partition_runs`): the descriptors' passes cover every node of the layer. `op_params`: the circuit's bf16
+        copy of shared fp32 parameters (`SumLayer.forward`), for the standard forward and for a descriptor that takes
+        it (`ExternalSumParams.reads_param_operands`).
         """
 
+        if kwargs.get("partition_runs") is not None:
+            raise ValueError("An external-parameter sum layer computes whole partitions: no `partition_runs`.")
         ns_tensors = self._resolve_external_tensors(kwargs, node_mars.size(1), node_mars.device)
+
+        # The product layer group below whose forward the caller did not run (`SumLayer.forward`'s `stream_children`):
+        # to the plain forward where nothing was supplied for this layer, to a parameterization that forms the node
+        # values itself and takes them (`fuses_stream_children`), else its values formed here for what reads them
+        sc = kwargs.pop("stream_children", None)
+        gated = len(ns_tensors) > 0
+        takes = gated and self.external_params.replaces_shared_forward and \
+            getattr(self.external_params, "fuses_stream_children", False)
+        if sc is not None and gated and not takes:
+            form_elements(element_mars, node_mars, sc)
 
         # Some parameterizations compute the node values themselves, in which case the standard forward
         # would be redundant work whose result is thrown away. It still has to run when nothing was
         # supplied for this layer, since then the layer IS a plain sum layer.
-        if len(ns_tensors) == 0 or not self.external_params.replaces_shared_forward:
+        if not gated or not self.external_params.replaces_shared_forward:
             super(ExternalParamsSumLayer, self).forward(
-                node_mars, element_mars, params, propagation_alg = propagation_alg, **kwargs
+                node_mars, element_mars, params, propagation_alg = propagation_alg, op_params = op_params,
+                **(dict(kwargs, stream_children = sc) if sc is not None and not gated else kwargs)
             )
 
-        if len(ns_tensors) == 0:
+        if not gated:
             return None
 
         self._assert_supported(propagation_alg, is_backward = False, **kwargs)
 
+        if op_params is not None and self.external_params.reads_param_operands:
+            kwargs = dict(kwargs, op_params = op_params)
+        if takes and sc is not None:
+            kwargs = dict(kwargs, stream_children = sc)
         self.external_params.forward_layer(
             self, ns_tensors, node_mars, element_mars, params,
             propagation_alg = propagation_alg, **kwargs
@@ -593,25 +637,62 @@ class ExternalParamsSumLayer(SumLayer):
 
         return None
 
+    def _stream_fusion(self, fast_key: tuple, children: Tuple[torch.Tensor, int]) -> Optional[tuple]:
+        """The fused stream forward a call of ``fast_key``'s shape can take over the product group below (``children``):
+        the parameterization's, where it forms the node values with the product fused (`stream_fusion_plan`, a gated
+        call), else the plain layer's (a call supplying nothing for this layer) -- None where neither applies. What the
+        circuit's decision asks (`TensorCircuit._stream_fusion_groups`); a call without one forms the values itself."""
+        fn = getattr(self.external_params, "stream_fusion_plan", None)
+        plan = None if fn is None else fn(self, fast_key, children)
+        return plan if plan is not None else SumLayer._stream_fusion(self, fast_key, children)
+
     def backward(self, node_flows: torch.Tensor, element_flows: torch.Tensor,
                  node_mars: torch.Tensor, element_mars: torch.Tensor,
                  params: torch.Tensor, param_flows: Optional[torch.Tensor] = None,
                  denom_param_flows: Optional[torch.Tensor] = None,
-                 propagation_alg: str = "LL", **kwargs) -> None:
+                 propagation_alg: str = "LL", op_params: Optional[torch.Tensor] = None, **kwargs) -> None:
         """
         Backward pass. The descriptor is given a chance to prepare the buffers so that the *standard*
         sum-layer backward computes the shared component's element and parameter flows, and then to
-        add the external contribution to the child flows and write the per-sample gradients.
+        add the external contribution to the child flows and write the per-sample gradients. Whole
+        partitions only, as the forward. `op_params`: as `SumLayer.backward`'s -- the element kernels whose products
+        are bf16 read it, the descriptor's among them (`SumLayer._bk_copy`), for a descriptor that takes it
+        (`ExternalSumParams.reads_param_operands`).
         """
 
+        if kwargs.get("partition_runs") is not None:
+            raise ValueError("An external-parameter sum layer computes whole partitions: no `partition_runs`.")
         ns_tensors = self._resolve_external_tensors(kwargs, node_mars.size(1), node_mars.device)
+        # (the product layer group below handed to this call, its passes not run: `SumLayer.backward`'s)
+        sc = kwargs.pop("stream_children", None)
+        self.__dict__["_bk_gated_call"] = len(ns_tensors) > 0
 
         if len(ns_tensors) == 0:
             # Nothing supplied for this layer -> it is a plain sum layer
             return super(ExternalParamsSumLayer, self).backward(
                 node_flows, element_flows, node_mars, element_mars, params,
-                param_flows = param_flows, propagation_alg = propagation_alg, **kwargs
+                param_flows = param_flows, propagation_alg = propagation_alg, op_params = op_params,
+                **(dict(kwargs, stream_children = sc) if sc is not None else kwargs)
             )
+
+        # The product layer below fused into the parameterization's element and parameter-flow kernels where every
+        # partition settled on them (`_bk_fusion_ready`); else its values formed for the kernels that read them, the
+        # backward as without the tables, and the element flows written as the children's node flows after. Set
+        # before this layer's plan is looked up: its launchers read it (`_bk_stream_children`)
+        fallback = None
+        if sc is not None and not (getattr(self.external_params, "fuses_stream_children", False) and self._bk_fusion_ready(
+                node_flows.size(1), params.dtype, op_params is not None and self.external_params.reads_param_operands
+                and self.__dict__.get("_reads_param_operands", False), param_flows is not None)):
+            form_elements(element_mars, node_mars, sc)
+            fallback, sc = sc, None
+        self.__dict__["_bk_stream_children"] = sc
+
+        # The copy this call's element flows may read, set before this layer's plan is looked up: its element
+        # launchers read it (`SumLayer._bk_copy`), replayed with `params`
+        if not self.external_params.reads_param_operands:
+            op_params = None
+        op = op_params if op_params is not None and self.__dict__.get("_reads_param_operands", False) else None
+        self.__dict__["_bk_op_params"] = op
 
         self._assert_supported(propagation_alg, is_backward = True, **kwargs)
 
@@ -623,38 +704,125 @@ class ExternalParamsSumLayer(SumLayer):
             for ns_info, _ in ns_tensors
         ]
 
-        try:
-            self.external_params.pre_backward_layer(
-                self, ns_tensors, node_flows, element_flows, node_mars, element_mars, params,
-                param_flows = param_flows, propagation_alg = propagation_alg, **kwargs
-            )
+        # `pre_backward_layer` may change this layer's node values in place (BlockScale and LowRank shift them by log Z,
+        # undone in `post_backward_layer`), which a capture the deferral left on its side stream may still read -- a
+        # tied layer's above, its products' children's values: it finishes first (`deferred_par.join_side`)
+        deferred_par.join_side(node_mars.device)
 
-            # Shared-parameter flows -- the standard kernels, untouched. Skipped entirely when the
-            # parameterization owns the flows: its effective parameters vary per edge block, and the
-            # standard kernels would sum the parents together before any correction could separate them.
-            if not self.external_params.replaces_shared_backward:
-                super(ExternalParamsSumLayer, self).backward(
-                    node_flows, element_flows, node_mars, element_mars, params,
+        # A launch plan of the rest (`pyjuice.utils.launch_plans`) where the parameterization keeps one
+        # (`ExternalSumParams.backward_plan`): the two hooks and the standard backward between them are host work
+        # around a few launches -- MEASURED (a tied gated HMM-2048 x4, B 64, bf16) 52 us a layer. The checks above
+        # run every call. Recorded under the parameterization's tag, its sites reached from the standard backward's
+        # converted ones -- which records itself as usual, inside, and fails this recording if it comes out short.
+        pkey, expected = self._backward_plan_key(ns_tensors, ns_grad_tensors, node_flows, node_mars, params,
+                                                 param_flows, denom_param_flows, propagation_alg, kwargs)
+        if pkey is not None:
+            pkey = pkey + (op is not None, sc is not None)
+        if pkey is not None:
+            plan = LaunchPlans.of(self).lookup(pkey)
+            if plan is not None:
+                for launch in plan:
+                    launch(node_flows, element_flows, node_mars, element_mars, params, param_flows, denom_param_flows,
+                           kwargs)
+                if fallback is not None:
+                    scatter_flows(node_flows, element_flows, fallback, self._element_rows())
+                return None
+        elif LaunchPlans.nested():
+            LaunchPlans.fail()                     # (a recording around this call cannot capture what it launches)
+
+        with (LaunchPlans.record(self.external_params.BACKWARD_PLAN_TAG) if pkey is not None
+              else contextlib.nullcontext()) as rec:
+            try:
+                self.external_params.pre_backward_layer(
+                    self, ns_tensors, node_flows, element_flows, node_mars, element_mars, params,
                     param_flows = param_flows, propagation_alg = propagation_alg, **kwargs
                 )
 
-            self.external_params.post_backward_layer(
-                self, ns_tensors, ns_grad_tensors,
-                node_flows, element_flows, node_mars, element_mars, params,
-                param_flows = param_flows, denom_param_flows = denom_param_flows,
-                propagation_alg = propagation_alg, **kwargs
-            )
-        finally:
-            # A parameterization may redirect the standard backward's CUDA kernels at its own for the
-            # duration of this call (see `SumLayer._ext_bw_ele_hook`). Left installed after a raise
-            # they would make the NEXT backward -- possibly an ungated one -- fail or, worse, run a
-            # gated kernel against a stale plan.
-            self._ext_bw_ele_hook = None
-            self._ext_bw_par_hook = None
-            self._ext_bw_par_sb_hook = None
-            self._ext_bw_par_triton_hook = None
+                # Shared-parameter flows -- the standard kernels, untouched. Skipped entirely when the
+                # parameterization owns the flows: its effective parameters vary per edge block, and the
+                # standard kernels would sum the parents together before any correction could separate them.
+                if not self.external_params.replaces_shared_backward:
+                    super(ExternalParamsSumLayer, self).backward(
+                        node_flows, element_flows, node_mars, element_mars, params,
+                        param_flows = param_flows, propagation_alg = propagation_alg, op_params = op,
+                        **(dict(kwargs, stream_children = sc) if sc is not None else kwargs)
+                    )
 
+                self.external_params.post_backward_layer(
+                    self, ns_tensors, ns_grad_tensors,
+                    node_flows, element_flows, node_mars, element_mars, params,
+                    param_flows = param_flows, denom_param_flows = denom_param_flows,
+                    propagation_alg = propagation_alg, **kwargs
+                )
+            finally:
+                # A parameterization may redirect the standard backward's CUDA kernels at its own for the
+                # duration of this call (see `SumLayer._ext_bw_ele_hook`). Left installed after a raise
+                # they would make the NEXT backward -- possibly an ungated one -- fail or, worse, run a
+                # gated kernel against a stale plan.
+                # (Plain attributes, written past `nn.Module.__setattr__`: its registration checks, ~1.5 us a write, on
+                # every gated layer's every backward.)
+                self.__dict__.update(_ext_bw_ele_hook = None, _ext_bw_par_hook = None, _ext_bw_par_sb_hook = None,
+                                     _ext_bw_par_triton_hook = None)
+
+        if pkey is not None:
+            LaunchPlans.of(self).store(pkey, rec, expected)
+        if fallback is not None:
+            scatter_flows(node_flows, element_flows, fallback, self._element_rows())
         return None
+
+    def _bk_fusion_ready(self, batch_size: int, dtype: torch.dtype, op: bool, param_flows: bool) -> bool:
+        """`SumLayer._bk_fusion_ready`, a gated call's by the parameterization's records (`_stream_fusion_bk`)."""
+        if not self.__dict__.get("_bk_gated_call", False):
+            return super()._bk_fusion_ready(batch_size, dtype, op, param_flows)
+        memo = self.__dict__.setdefault("_bk_fusion_ready_g", {})
+        key = (batch_size, dtype, op, param_flows)
+        hit = memo.get(key)
+        if hit is None:
+            hit = memo[key] = self._stream_fusion_bk(batch_size, dtype, op, param_flows)
+        return hit
+
+    def _stream_fusion_bk(self, batch_size: int, dtype: torch.dtype, op: bool, param_flows: bool) -> bool:
+        """`SumLayer._stream_fusion_bk` for this layer's last kind of call: a gated one's by the records its
+        parameterization's backward keeps (`_bk_stream_parts_g`: its element flows on the split kernel; with parameter
+        flows `_bk_par_deferred_g`, deferred), the plain one's by the standard backward's."""
+        if not self.__dict__.get("_bk_gated_call", False):
+            return super()._stream_fusion_bk(batch_size, dtype, op, param_flows)
+        if not getattr(self.external_params, "fuses_stream_children", False):
+            return False
+        parts = self.__dict__.get("_bk_stream_parts_g", {}).get((batch_size, dtype, op))
+        if not parts or not all(parts.get(pid) for pid in range(self.num_bk_partitions)):
+            return False
+        if param_flows:
+            deferred = self.__dict__.get("_bk_par_deferred_g", {})
+            if not all(deferred.get((batch_size, pid)) for pid in range(self.num_fw_partitions)):
+                return False
+            import pyjuice.layer.kernels.c as cuda_kernels
+            if cuda_kernels.get_par_deferred_fused_module() is None:
+                return False
+        return True
+
+    def _backward_plan_key(self, ns_tensors, ns_grad_tensors, node_flows, node_mars, params, param_flows,
+                           denom_param_flows, propagation_alg, kwargs):
+        """
+        `(key, launchers expected)` of this call's backward plan, or `(None, 0)`: not planned. The layer's part of the
+        key -- what the standard backward decides from, as its own plans take it (`SumLayer.backward`: the batch,
+        device, dtypes and flags by value, the other arguments by name), in the regime they plan -- and the
+        parameterization's (`ExternalSumParams.backward_plan`), where it plans this call.
+        """
+        if (not launch_plans.ENABLED or kwargs.get("compute_children") is not None
+                or kwargs.get("allow_modify_flows", False) or kwargs.get("pflow_temperature", 1.0) != 1.0
+                or kwargs.get("temper_eflow", False) or "force_use_bf16" in kwargs or "force_use_fp32" in kwargs):
+            return None, 0
+        own = self.external_params.backward_plan(self, ns_tensors, ns_grad_tensors, node_mars, param_flows,
+                                                 denom_param_flows, kwargs)
+        if own is None:
+            return None, 0
+        key = ("external_backward", own[0], node_flows.size(1), node_flows.device, node_flows.dtype, params.dtype,
+               None if param_flows is None else param_flows.dtype, denom_param_flows is not None, propagation_alg,
+               kwargs.get("logspace_flows", False), kwargs.get("negate_pflows", False),
+               kwargs.get("accumulate_ch_flows", False), kwargs.get("allow_neg_flows", False),
+               kwargs.get("precision", "auto"), tuple(kwargs))
+        return key, own[1]
 
     def _check_staged_batch(self, ns_tensors, num_samples: int) -> None:
         """

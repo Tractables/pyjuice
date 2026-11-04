@@ -72,7 +72,7 @@ def _bk_triton_sparse_ele_kernel(node_flows, element_flows, node_mars, element_m
 
     # Inner loop
     for i in range(0, BLOCK_M):
-        epars = tl.load(epars_ptr) # [num_edges]
+        epars = tl.load(epars_ptr).to(tl.float32) # [num_edges]
         emars = tl.load(emars_ptr, mask = mask_batch) # [BLOCK_B]
 
         if propagation_alg_id == 1:
@@ -157,7 +157,7 @@ def _bk_triton_large_sparse_ele_kernel(node_flows, element_flows, node_mars, ele
     offs_edge_gid = offs_edge // BLOCK_SIZE_K
     offs_edge_nid = (offs_edge % BLOCK_SIZE_K)
     par_start = tl.load(parpids + eleblock_ids[:,None] * n_edge_blocks + offs_edge_gid[None,:])
-    epars = tl.load(mparams + par_start + offs_edge_nid[None,:], mask = mask_m[:,None]) # [TILE_SIZE_M, num_edges]
+    epars = tl.load(mparams + par_start + offs_edge_nid[None,:], mask = mask_m[:,None]).to(tl.float32) # [TILE_SIZE_M, num_edges]
 
     # Batch offsets and mask
     offs_batch = tl.arange(0, BLOCK_B) + pid_b * BLOCK_B
@@ -274,7 +274,7 @@ def _bk_triton_sparse_tempered_ele_kernel(node_flows, element_flows, node_mars_t
 
     # Inner loop
     for i in range(0, BLOCK_M):
-        epars = tl.load(epars_ptr) # [num_edges]
+        epars = tl.load(epars_ptr).to(tl.float32) # [num_edges]
         emars = tl.load(emars_ptr, mask = mask_batch) # [BLOCK_B]
 
         lpars = tl.log(epars)
@@ -324,7 +324,7 @@ def _bk_triton_large_sparse_tempered_ele_kernel(node_flows, element_flows, node_
     offs_edge_gid = offs_edge // BLOCK_SIZE_K
     offs_edge_nid = (offs_edge % BLOCK_SIZE_K)
     par_start = tl.load(parpids + eleblock_ids[:,None] * n_edge_blocks + offs_edge_gid[None,:])
-    epars = tl.load(mparams + par_start + offs_edge_nid[None,:], mask = mask_m[:,None]) # [TILE_SIZE_M, num_edges]
+    epars = tl.load(mparams + par_start + offs_edge_nid[None,:], mask = mask_m[:,None]).to(tl.float32) # [TILE_SIZE_M, num_edges]
 
     # Batch offsets and mask
     offs_batch = tl.arange(0, BLOCK_B) + pid_b * BLOCK_B

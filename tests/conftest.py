@@ -71,9 +71,15 @@ def _pin_gpu():
     os.environ["CUDA_VISIBLE_DEVICES"] = gpus[worker_id % len(gpus)]
     os.environ["PYJUICE_TEST_WORKER_ID"] = str(worker_id)
 
-    # CPU limits — env vars before torch import
-    os.environ["OMP_NUM_THREADS"] = "8"
-    os.environ["MKL_NUM_THREADS"] = "8"
+    # CPU limits -- env vars before torch / numba import. One torch thread and four numba threads a worker: the workers
+    # share the machine's cores, and with 8 OpenMP threads each plus numba's default of one thread per core (the
+    # byte-level token lift's parallel loops) the suite oversubscribed them by itself -- MEASURED on toast (128 cores),
+    # 5 workers: load median 155, max 320; the tests doing many small CPU tensor ops (the circuits' `init_parameters`,
+    # `gather_parameters`, `torch.unique`, HCLT's mutual information) ran 10-25x slower than alone (hclt_correctness's
+    # 75-100 s each against 3-5), the suite 12:54 against 4:38 at these limits, load median 8.
+    os.environ["OMP_NUM_THREADS"] = "1"
+    os.environ["MKL_NUM_THREADS"] = "1"
+    os.environ["NUMBA_NUM_THREADS"] = "4"
 
 
 _pin_gpu()
@@ -82,7 +88,7 @@ _pin_gpu()
 def pytest_configure(config):
     # Only now is it safe to import torch
     import torch
-    torch.set_num_threads(8)
+    torch.set_num_threads(1)                    # (see `_pin_gpu`'s CPU limits)
 
     # Kernel launch-config autotuning is deliberately left at the library default (on), so the suite
     # runs the same code path users do. MEASURED with a warm Triton cache: the full suite takes 340s

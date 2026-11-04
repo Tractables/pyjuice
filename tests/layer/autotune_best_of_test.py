@@ -46,3 +46,19 @@ def test_candidates_that_cannot_run_are_skipped():
     calls = {}
     assert autotune.best_of([("ref", broken), _candidate(2_000_000, calls, "ok")]) == "ok"
     assert autotune.best_of([("ref", broken)]) is None
+
+
+def test_a_margin_of_one_takes_the_faster():
+    # 5% faster: short of MARGIN, past a margin of 1.0 (candidates computing the same bits: the faster is taken)
+    calls = {}
+    cands = [_candidate(2_000_000, calls, "ref"), _candidate(1_900_000, calls, "better")]
+    assert autotune.best_of(cands, warmup = 3, reps = 7) == "ref"
+    assert autotune.best_of(cands, warmup = 3, reps = 7, margin = 1.0) == "better"
+
+
+def test_pick_hands_its_margin_to_best_of(monkeypatch):
+    monkeypatch.setattr(autotune, "_CACHE", {})
+    cycles = {"ref": 2_000_000, "better": 1_900_000}
+    bench = lambda c: torch.cuda._sleep(cycles[c])
+    assert autotune.pick(("margin_test", 0), ["ref", "better"], bench) == "ref"
+    assert autotune.pick(("margin_test", 1), ["ref", "better"], bench, margin = 1.0) == "better"

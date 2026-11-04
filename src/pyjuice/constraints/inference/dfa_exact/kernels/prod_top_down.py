@@ -28,13 +28,14 @@ import numpy as np
 import torch
 import triton
 import triton.language as tl
+from triton.language.extra.cuda import gdc_wait
 
 from pyjuice.layer.kernels import autotune
 from pyjuice.utils.kernel_launcher import triton_jit
 from pyjuice.utils.util import host_cdiv, host_next_power_of_2
 
 from .common import (NODE_TILE, SUM, _block_ptr, _child, _exit_width, _next_col, _interval, _logaddexp_tile, _lse_step, _pair,
-                     _slot, _tf32_operand, _tile_rows, grid_chunks, tensor)
+                     _slot, _tf32_operand, _tile_rows, grid_chunks, tensor, pdl_launch)
 from .compact import _lane, _lane_ends
 from .transitions import enumerated_args
 from .prod import (BLOCK_BLOCK_PROGRAMS_PER_SM, BLOCK_BLOCK_TILES, EXACT_BELOW, PRODUCT_PRECISION, SKIP_EMPTY_TILES,
@@ -240,7 +241,7 @@ def _input_block_top_down_kernel(element_flows, temp_flows, node_flows, node_mar
                                 PRUNE: tl.constexpr, ORDERED: tl.constexpr, COMPACT: tl.constexpr,
                                 C_FULL: tl.constexpr, OUT_FULL: tl.constexpr, SAMPLE: tl.constexpr, ENUM: tl.constexpr,
                                 LOGW: tl.constexpr, SAMPLE_MASSES: tl.constexpr, TN: tl.constexpr, SUBS: tl.constexpr,
-                                TILE: tl.constexpr):
+                                TILE: tl.constexpr, PDL: tl.constexpr = False):
     """The right operand ``R`` over ``[t + 1, t2)`` of ``input @ block`` steps: ``O_R[q, j] = log sum over the
     parents, and over the entries ``(i, class)`` leading to ``q`` at boundary ``t``, of mass + O_out[i, j]``. One
     program per ``TN`` children of a node tile (:func:`~.common.node_tiles`: children of one interval with as many
@@ -253,6 +254,8 @@ def _input_block_top_down_kernel(element_flows, temp_flows, node_flows, node_mar
     :meth:`~..compiled.program.Program.mass_args` lays them out, ``SAMPLE_MASSES`` each sample's own over its
     entries). Ungrouped, an entry's mass is read by its class's code (``ENUM``: an enumerated
     class's from its token, see :func:`_entry_mass`; ``Cs`` the stored classes, the table's width)."""
+    if PDL:                                             # (the launch before it, done)
+        gdc_wait()
     c, real, c0 = _tile_rows(tiles, tl.program_id(0), TN, SUBS)
     tile = pid0 + tl.program_id(1)
     row = tl.load(children + c * 4 + 0)
@@ -310,8 +313,10 @@ def _input_block_top_down_kernel(element_flows, temp_flows, node_flows, node_mar
                                 temp_width, OUT_TEMP)[:, None] + _parent_base(b, ostride, COMPACT)[None, :]
             if GROUPED:                                                      # the parents' transition masses: each
                 mt = b.to(tl.int64) * mb_stride + t                          # step's rank's block of the boundary's
-                masses = trans + tl.load(mbase + mt)[None, :] + \
-                    tl.load(parents + p * 7 + 6).to(tl.int64)[:, None] * tl.load(mcount + mt).to(tl.int64)[None, :]
+                # (masked: a lane past the tile's outputs has no sample, its `b` anywhere -- see _input_block_kernel)
+                masses = trans + tl.load(mbase + mt, mask = m, other = 0)[None, :] + \
+                    tl.load(parents + p * 7 + 6).to(tl.int64)[:, None] * \
+                    tl.load(mcount + mt, mask = m, other = 0).to(tl.int64)[None, :]
                 bbt = tl.load(bbase + t)                                     # pairs, or of the lane's sample's entries
             else:
                 mrow = tl.load(mass_row + (u - input_start)).to(tl.int64)[:, None]
@@ -370,11 +375,13 @@ def _block_input_top_down_kernel(element_flows, temp_flows, node_flows, node_mar
                                 PRUNE: tl.constexpr, ORDERED: tl.constexpr, COMPACT: tl.constexpr,
                                 C_FULL: tl.constexpr, OUT_FULL: tl.constexpr, SAMPLE: tl.constexpr, ENUM: tl.constexpr,
                                 LOGW: tl.constexpr, SAMPLE_MASSES: tl.constexpr, TN: tl.constexpr, SUBS: tl.constexpr,
-                                TILE: tl.constexpr):
+                                TILE: tl.constexpr, PDL: tl.constexpr = False):
     """The left operand ``L`` over ``[t0, t)`` of ``block @ input`` steps (output over ``[t0, t + 1)``): ``O_L[i, q] =
     log sum over the parents and over the entries ``(successor, class)`` of ``q`` at boundary ``t`` of mass +
     O_out[i, successor]``. Node tiles, ``ORDERED``, ``COMPACT``, ``SAMPLE``, codes (``ENUM``): as
     :func:`_input_block_top_down_kernel`."""
+    if PDL:                                             # (the launch before it, done)
+        gdc_wait()
     c, real, c0 = _tile_rows(tiles, tl.program_id(0), TN, SUBS)
     tile = pid0 + tl.program_id(1)
     row = tl.load(children + c * 4 + 0)
@@ -443,9 +450,10 @@ def _block_input_top_down_kernel(element_flows, temp_flows, node_flows, node_mar
             mx, acc = _lse_step_one_exp(mx, acc, tl.where(obs[None, :], own + ov, float("-inf")))
             if any_miss:
                 if GROUPED:                                                  # the parents' transition masses (as in
-                    mt = b.to(tl.int64) * mb_stride + t                      # _input_block_top_down_kernel)
-                    masses = trans + tl.load(mbase + mt)[None, :] + \
-                        tl.load(parents + p * 7 + 6).to(tl.int64)[:, None] * tl.load(mcount + mt).to(tl.int64)[None, :]
+                    mt = b.to(tl.int64) * mb_stride + t                      # _input_block_top_down_kernel; masked)
+                    masses = trans + tl.load(mbase + mt, mask = m, other = 0)[None, :] + \
+                        tl.load(parents + p * 7 + 6).to(tl.int64)[:, None] * \
+                        tl.load(mcount + mt, mask = m, other = 0).to(tl.int64)[None, :]
                     bbt = tl.load(bbase + t)
                 else:
                     mrow = tl.load(mass_row + (u - input_start)).to(tl.int64)[:, None]
@@ -881,6 +889,14 @@ INPUT_BLOCK_CUDA_WARP_ITEMS = 64
 #: the most int32 of work space a launch takes (every sample's copy of its boundaries' predecessor lists): past it, the
 #: Triton kernel
 INPUT_BLOCK_CUDA_SPACE = 1 << 26
+#: the codes of a unit's class masses (a sample's, at a CTA's children) the CUDA kernel's CTAs stage -- its terms' alone,
+#: by rank --: a unit reading more (or a kept-once parent's every entry) is summed by the deferred kernel, every code
+#: staged (`c/walk.cu`). Codpula-4096 x JSON hard_0 B64 diffusion (1224 codes, a unit's terms 43 at most): every code
+#: staged took 39.5 KB a CTA, 2 CTAs an SM, the launches of a call 91-104 ms; 32 / 64 / 128 / 256 / 512 codes 26-29 /
+#: 26-29 / 33-36 / 33-37 / 45-51 ms (8 samples a CTA, a warp each, up to 128)
+INPUT_BLOCK_CUDA_CODES = 64
+#: the deferred kernel's CTAs (0: as many as the device holds at once, at most one a deferred unit)
+INPUT_BLOCK_CUDA_DEFER_CTAS = 0
 
 
 def _input_block_boundaries(la: TopDownLaunch, prog) -> dict:
@@ -918,6 +934,15 @@ def _work_space(prog, size: int, counters: int):
     if done is None or done.numel() < counters:
         done = prog.walk_done = torch.zeros(max(counters, 1 << 10), dtype = torch.int32, device = prog.dev)
     return ws, done
+
+
+def _defer_space(prog, size: int) -> torch.Tensor:
+    """The CUDA walk's list of deferred units: int32 of at least ``size`` on ``prog``'s device, zeros where it counts
+    them (each launch leaves them zero), kept for the next launch."""
+    d = getattr(prog, "walk_defer", None)
+    if d is None or d.numel() < size:
+        d = prog.walk_defer = torch.zeros(max(size, 1 << 12), dtype = torch.int32, device = prog.dev)
+    return d
 
 
 def _ibtd_smem_max(mod) -> int:
@@ -961,20 +986,23 @@ def _input_block_cuda(la: TopDownLaunch, tiles: torch.Tensor, height: int, prog,
     mc = compact.max_count
     cq = int(mc[st["ts"] + 1].max())                                         # a sample's most live columns at t + 1
     lp = max(int((mc[st["ta"]] * mc[st["te"]]).max()), 1)                   # ... lanes of a parent's row
-    nw = (mw + 31) // 32                                                    # a sample's shared memory (bytes:
-    team = lambda tn: (4 * tn * (lp + mw + 1) + 4 * (2 * nw + 1) + 15) // 16 * 16   # c/walk.cu's `ibtd_smem`)
+    team = lambda tn: (4 * tn * (lp + mw + 1) + 15) // 16 * 16             # a sample's shared memory (bytes:
+    ms = min(mw, INPUT_BLOCK_CUDA_CODES)                                    # c/walk.cu's `ibtd_smem`), and its
+    staged = lambda tn: (4 * tn * (lp + ms + 1) + 15) // 16 * 16           # CTAs' (`ibtd_smem_compact`)
     tn = min(height, INPUT_BLOCK_CUDA_NODES)
     while tn > 1 and team(tn) > INPUT_BLOCK_CUDA_SMEM:
         tn //= 2
     if team(tn) > INPUT_BLOCK_CUDA_SMEM and team(tn) > _ibtd_smem_max(mod):  # (one child: the device's most)
         return None
     items = cq * int(mc[st["te"]].max()) * max(tn // 4, 1)                  # a sample's most (lane, 4 children)
-    warps = items <= INPUT_BLOCK_CUDA_WARP_ITEMS and 8 * team(tn) <= INPUT_BLOCK_CUDA_SMEM
+    warps = items <= INPUT_BLOCK_CUDA_WARP_ITEMS and 8 * staged(tn) <= INPUT_BLOCK_CUDA_SMEM
     threads = 256 if warps or items >= INPUT_BLOCK_CUDA_WIDE else 128
     T, nterms = st["ts"].size, B * int(st["ecum"][-1])
-    if nterms + 2 * T * B * W > INPUT_BLOCK_CUDA_SPACE:
+    space = nterms + 2 * T * B * W + T * B * (mw + 1)                       # (terms, cnt, perm, codes, ncodes)
+    if space > INPUT_BLOCK_CUDA_SPACE or 4 * (2 * ((mw + 31) // 32) + 1) > 48 * 1024:
         return None
-    ws, done = _work_space(prog, nterms + 2 * T * B * W, T * B)
+    ws, done = _work_space(prog, space, T * B)
+    defer = _defer_space(prog, 2 + 2 * (tiles.numel() // NODE_TILE) * (height // tn) * B)
     tt, ivs = prog.trans_top_down, prog.intervals
     c_kind, out_temp, (c_full, out_full) = la.kinds
     sample = masses.batch > 1
@@ -986,12 +1014,14 @@ def _input_block_cuda(la: TopDownLaunch, tiles: torch.Tensor, height: int, prog,
                   compact.rank, la.children, tiles, la.ptr, la.parents, common["reg_offset"], common["reg_width"],
                   common["reg_first"], st["tlist"], st["t2i"], st["ecum_t"], ws[:nterms],
                   ws[nterms:nterms + T * B * W], ws[nterms + T * B * W:nterms + 2 * T * B * W], done,
+                  ws[nterms + 2 * T * B * W:space - T * B], ws[space - T * B:space],
                   common["out_first"], common["out_width"], common["temp_width"], B, n, W, C, prog.input_start,
                   height // tn, tn, threads, warps, not warps, lp, cq, sample, c_kind, out_temp, c_full, out_full,
                   ea["code"], ea["tok_ptr"], ea["eidx"], ea["eprobs"], ea["prow"], ea["lognorm"], ea["enum_logw"],
                   ea["Cs"], mw, ea["num_enum"], ea["logw_stride"], ea["LOGW"],
-                  tt.pred_class if classes else tt.pred_x, allowed if classes else obs_class, a_stride, classes)
-    return dict(tn = tn, threads = threads, warps = warps, smem = team(tn) * (8 if warps else 1))
+                  tt.pred_class if classes else tt.pred_x, allowed if classes else obs_class, a_stride, classes,
+                  ms, defer, INPUT_BLOCK_CUDA_DEFER_CTAS)
+    return dict(tn = tn, threads = threads, warps = warps, smem = staged(tn) * (8 if warps else 1), codes = ms)
 
 
 def run_top_down(launches, bufs, prog, regions, element_flows, temp_flows, node_flows, node_mars, masses, obs_class,
@@ -1068,8 +1098,9 @@ def run_top_down(launches, bufs, prog, regions, element_flows, temp_flows, node_
             tn = min(height, TOP_DOWN_NODES)
             tile = max(16, min(_flat_tile(max(lanes_max, 1)), TOP_DOWN_TILE_LANES // tn))
             kernel = _input_block_top_down_kernel if la.form == "input_block" else _block_input_top_down_kernel
-            tables = (tt.pred_ptr, tt.pred_col, tt.pred_x) if la.form == "input_block" else \
-                (tt.entry_ptr, tt.entry_succ, tt.entry_x)
+            pdl = pdl_launch(element_flows.device)
+            tables = (tt.pred_ptr, tt.pred_col, prog.mass_x("pred_x")) if la.form == "input_block" else \
+                (tt.entry_ptr, tt.entry_succ, prog.mass_x("entry_x"))
             for first, size in grid_chunks(host_cdiv(lanes_max, tile), 1):
                 kernel[(tiles.numel() // NODE_TILE * (height // tn), size)](
                     element_flows, temp_flows, node_flows, node_mars, obs_class, prog.next_col_arg, prog.delta,
@@ -1082,7 +1113,7 @@ def run_top_down(launches, bufs, prog, regions, element_flows, temp_flows, node_
                     OUT_TEMP = out_temp, HOMOGENEOUS = prog.homogeneous,
                     GROUPED = grouped, PRUNE = prune, ORDERED = ordered, COMPACT = compact is not None,
                     C_FULL = c_full, OUT_FULL = out_full, SAMPLE = sample, SAMPLE_MASSES = margs["SAMPLE_MASSES"],
-                    TN = tn, SUBS = height // tn, TILE = tile,
+                    TN = tn, SUBS = height // tn, TILE = tile, PDL = pdl, launch_pdl = pdl,
                     num_warps = TOP_DOWN_WARPS, **common, **lists, **enumerated_args(prog, masses))
         elif compact is not None:                    # block @ block on compact values, a sample's rectangle at a time
             c_kind, o_kind, out_temp = la.kinds

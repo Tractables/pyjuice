@@ -84,6 +84,98 @@ def out_temp(launch):
     return launch.kinds[2] if launch.form == "block_block" else launch.kinds[1]
 
 
+@pytest.mark.parametrize("seed", range(8))
+def test_input_reads_count_every_step_a_plan_runs(seed):
+    """`input_reads` marks the inputs of every step a plan's launches run, and no other: the input @ block and
+    block @ input steps of every stage's cut -- every step of a chunk, or those of its index list; every group's steps
+    where the grouped kernel runs them --, forward or kept once (and the top-down pass's folds), and the parents of
+    every child a top-down launch of those forms walks (all of them, or its node tiles' children, padding aside);
+    launches of other forms read none."""
+    from types import SimpleNamespace as NS
+    from pyjuice.constraints.inference.dfa_exact.compiled.program import TRANS_COLS
+    from pyjuice.constraints.inference.dfa_exact.kernels.common import IndexList
+    from pyjuice.constraints.inference.dfa_exact.kernels.prod import Cut
+    from pyjuice.constraints.inference.dfa_exact.queries.backend.plans import input_reads
+    rng = np.random.default_rng(seed)
+    n = int(rng.integers(4, 40))
+    want_fw, want_td = np.zeros(n, dtype = bool), np.zeros(n, dtype = bool)
+
+    def stage(want):
+        out = []
+        for _ in range(int(rng.integers(0, 4))):
+            form = str(rng.choice(["input_block", "block_input", "block_block", "copy"]))
+            S = int(rng.integers(1, 30))
+            rows = rng.integers(0, n, (S, 9))
+            col = TRANS_COLS.get(form, (None, None))[1]
+            edges = np.unique(np.concatenate([[0, S], rng.integers(0, S, 3)]))
+            chunks = []
+            for s0, s1 in zip(edges[:-1], edges[1:]):
+                if rng.random() < 0.3:
+                    continue
+                sel = None if rng.random() < 0.4 else np.sort(rng.choice(s1 - s0, int(rng.integers(1, s1 - s0 + 1)),
+                                                                          replace = False))
+                chunks.append((int(s0), int(s1), None, None if sel is None else IndexList(sel.astype(np.int32)),
+                               int(s1 - s0 if sel is None else sel.size)))
+                if col is not None:
+                    want[rows[s0:s1, col] if sel is None else rows[s0 + sel, col]] = True
+            groups, groups_host = None, None
+            if form == "input_block" and rng.random() < 0.6:
+                firsts = np.unique(np.concatenate([[0, S], rng.integers(0, S, 4)]))
+                groups_host = {4: firsts}
+                g = None if rng.random() < 0.4 else np.sort(rng.choice(firsts.size - 1, int(rng.integers(
+                    1, firsts.size)), replace = False))
+                groups = {4: (None if g is None else IndexList(g.astype(np.int32)), 0)}
+                for k in (range(firsts.size - 1) if g is None else g):
+                    want[rows[firsts[k]:firsts[k + 1], col]] = True
+            launch = NS(form = form, rows = torch.from_numpy(rows), groups_host = groups_host)
+            out.append([(launch, Cut(chunks, groups, 1, 1, 1, 1))])
+        return out
+
+    def walks(want):
+        out = []
+        for _ in range(int(rng.integers(0, 4))):
+            form = str(rng.choice(["input_block", "block_input", "block_block", "copy"]))
+            C = int(rng.integers(1, 12))
+            ptr = np.concatenate([[0], np.cumsum(rng.integers(1, 4, C))])
+            parents = rng.integers(0, n, (int(ptr[-1]), 9))
+            col = TRANS_COLS.get(form, (None, None))[1]
+            item = None
+            if rng.random() < 0.6:
+                c = rng.choice(C, int(rng.integers(1, C + 1)), replace = False)
+                tiles = np.full(-(-c.size // 16) * 16, -1, dtype = np.int32)
+                tiles[:c.size] = c
+                item = IndexList(tiles)
+            else:
+                c = np.arange(C)
+            if col is not None:
+                for k in c:
+                    want[parents[ptr[k]:ptr[k + 1], col]] = True
+            out.append((NS(form = form, host = dict(ptr = ptr, parents = parents)), item))
+        return out
+
+    forward = [("prod", 0, [(stage(want_fw), stage(want_fw), 0, 0)]), ("sum", 1, [])]
+    assert np.array_equal(input_reads(n, forward), want_fw)
+    top_down = [("prod", 0, [((stage(want_td), stage(want_td)), [(walks(want_td), walks(want_td), walks(np.zeros(n,
+               dtype = bool)))], 0, 0)]), None, ("sum", 1, [])]
+    assert np.array_equal(input_reads(n, top_down, top_down = True), want_td)
+
+
+@pytest.mark.parametrize("seed", range(6))
+def test_the_unobserved_intervals_are_numpys(seed):
+    """`_unobserved` (numba) is numpy's prefix formulas: per interval ``[a, b)``, no observed position inside it (the
+    input-independent inside values, `free_regions`) or, ``outside``, none outside it (the input-independent top-down
+    values, `top_down_free`) -- empty intervals, the whole sequence, nothing or everything observed."""
+    from pyjuice.constraints.inference.dfa_exact.queries.backend.plans import _unobserved
+    rng = np.random.default_rng(seed)
+    n = int(rng.integers(1, 40))
+    bounds = np.sort(rng.integers(0, n + 1, (int(rng.integers(1, 60)), 2)), axis = 1).astype(np.int64)
+    bounds = np.concatenate([bounds, [[0, n], [0, 0], [n, n]]]).astype(np.int64)
+    for observed in (rng.random(n) < 0.3, np.zeros(n, bool), np.ones(n, bool)):
+        P = np.concatenate([[0], np.cumsum(observed)])
+        assert np.array_equal(_unobserved(observed, bounds, False), P[bounds[:, 1]] == P[bounds[:, 0]])
+        assert np.array_equal(_unobserved(observed, bounds, True), (P[bounds[:, 0]] == 0) & (P[-1] == P[bounds[:, 1]]))
+
+
 @pytest.mark.parametrize("kind", list(KINDS))
 def test_every_step_carries_its_products_interval(kind, build_pc):
     """A step writing the layer's element row is its product: its interval is its output's. A step writing scratch

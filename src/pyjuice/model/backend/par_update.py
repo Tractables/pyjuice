@@ -10,6 +10,7 @@ from typing import Sequence
 
 from pyjuice.nodes import CircuitNodes
 from pyjuice.utils.kernel_launcher import FastJITFunction
+from pyjuice.utils.util import device_scalars
 
 
 @njit
@@ -198,12 +199,12 @@ def cum_pflow_kernel(cum_pflows, mparams, param_flows, nchs, par_start_ids, pflo
     if keep_zero_params:
         par_start = tl.load(par_start_ids + offs_m, mask = mask_m, other = 0)
         offs_par = par_start[:,None] + offs_blk[None,:] * blk_interval[:,None]
-        old_params = tl.load(mparams + offs_par, mask = mask_pflow, other = 0)
+        old_params = tl.load(mparams + offs_par, mask = mask_pflow, other = 0).to(tl.float32)
 
         nch = tl.load(nchs + offs_m, mask = mask_m, other = 1)
         pflows += (pseudocount / nch[:,None])
 
-        nflows = tl.sum(tl.where(old_params < 1e-12, 0.0, pflows), axis = 1)
+        nflows = tl.sum(tl.where(old_params == 0.0, 0.0, pflows), axis = 1)
     else:
         nflows = tl.sum(pflows, axis = 1)
 
@@ -246,14 +247,14 @@ def em_par_update_kernel(mparams, param_flows, cum_pflows, nchs, par_start_ids, 
         new_param = (pflows + pseudocount / nch[:,None]) / (nflows[:,None] + pseudocount)
 
     offs_par = par_start[:,None] + offs_blk[None,:] * blk_interval[:,None]
-    old_param = tl.load(mparams + offs_par, mask = mask_pflow, other = 0)
+    old_param = tl.load(mparams + offs_par, mask = mask_pflow, other = 0).to(tl.float32)
 
     if keep_zero_params:
-        updated_params = tl.where(old_param < 1e-12, 0.0, (1.0 - step_size) * old_param + step_size * new_param)
+        updated_params = tl.where(old_param == 0.0, 0.0, (1.0 - step_size) * old_param + step_size * new_param)
     else:
         updated_params = (1.0 - step_size) * old_param + step_size * new_param
 
-    tl.store(mparams + offs_par, updated_params, mask = mask_pflow)
+    tl.store(mparams + offs_par, updated_params.to(mparams.dtype.element_ty), mask = mask_pflow)
 
 
 @triton.jit
@@ -283,14 +284,14 @@ def sgd_par_update_kernel(mparams, param_grads, par_start_ids, pgrad_start_ids, 
     pgrads = tl.load(param_grads + offs_pgrad, mask = mask_pgrad, other = 0)
 
     offs_par = par_start[:,None] + offs_blk[None,:] * blk_interval[:,None]
-    old_param = tl.load(mparams + offs_par, mask = mask_pgrad, other = 0)
+    old_param = tl.load(mparams + offs_par, mask = mask_pgrad, other = 0).to(tl.float32)
 
     if keep_zero_params:
-        updated_params = tl.where(old_param < 1e-12, 0.0, tl.exp(tl.log(old_param) + lr * pgrads))
+        updated_params = tl.where(old_param == 0.0, 0.0, tl.exp(tl.log(old_param) + lr * pgrads))
     else:
         updated_params = tl.exp(tl.log(old_param) + lr * pgrads)
 
-    tl.store(mparams + offs_par, updated_params, mask = mask_pgrad)
+    tl.store(mparams + offs_par, updated_params.to(mparams.dtype.element_ty), mask = mask_pgrad)
 
 
 def em_par_update(params: torch.Tensor, param_flows: torch.Tensor, par_update_kwargs: Sequence, 
@@ -311,7 +312,7 @@ def em_par_update(params: torch.Tensor, param_flows: torch.Tensor, par_update_kw
 
     grid = (triton.cdiv(num_blocks, BLOCK_ID),)
 
-    constexprs = torch.tensor([step_size, pseudocount, num_blocks]).to(params.device)
+    constexprs = device_scalars([step_size, pseudocount, num_blocks], params.device)
 
     cum_pflow_kernel[grid](
         cum_pflows, params, param_flows, nchs, par_start_ids, pflow_start_ids, blk_sizes, blk_intervals, 
@@ -340,7 +341,7 @@ def sgd_par_update(params: torch.Tensor, param_grads: torch.Tensor, par_update_k
     :param lr: learning rate
     :type lr: float
 
-    :param keep_zero_params: whether to freeze zero parameters
+    :param keep_zero_params: whether to freeze exactly zero parameters (no magnitude threshold)
     :type keep_zero_params: bool
     """
 
@@ -354,7 +355,7 @@ def sgd_par_update(params: torch.Tensor, param_grads: torch.Tensor, par_update_k
 
     grid = (triton.cdiv(num_blocks, BLOCK_ID),)
 
-    constexprs = torch.tensor([lr, num_blocks]).to(params.device)
+    constexprs = device_scalars([lr, num_blocks], params.device)
 
     sgd_par_update_kernel[grid](
         params, param_grads, par_start_ids, pgrad_start_ids, blk_sizes, blk_intervals,

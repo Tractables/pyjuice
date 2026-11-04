@@ -155,16 +155,74 @@ SMALL = [(K, K, g, b)
 @needs_cute
 @pytest.mark.parametrize("num_latents,block_size,gate_cbs,batch", LARGE)
 def test_sweep_large_batch(num_latents, block_size, gate_cbs, batch):
-    """The CuTe/TMA forks, over tile sizes, gate widths and parent-block counts."""
-    _check(num_latents, block_size, gate_cbs, batch, tol_val = 2e-3, tol_ef = 3e-3, tol_pf = 5e-3)
+    """The CuTe/TMA forks, over tile sizes, gate widths and parent-block counts.
+
+    Their operands are bf16 -- the parameters, the exponentials and the normalizer's gate exponentials, each within
+    2^-9 -- and a node value is the ratio of two such sums: off by 2.18e-3 at (256, 128, 32), every CuTe and pre-pass
+    config alike (a float64 emulation of those roundings gives the same number). Where an fp32 fork (small-batch) is
+    faster the tuner takes it and the error is ~1e-6; the bar is the bf16 forks'."""
+    _check(num_latents, block_size, gate_cbs, batch, tol_val = 3e-3, tol_ef = 3e-3, tol_pf = 5e-3)
 
 
 @cuda_only
 @needs_cute
 @pytest.mark.parametrize("num_latents,block_size,gate_cbs,batch", SMALL)
-def test_sweep_small_batch(num_latents, block_size, gate_cbs, batch):
-    """The plain-CUDA forks. These are fp32 throughout, so the bar is far tighter."""
+def test_sweep_small_batch(num_latents, block_size, gate_cbs, batch, monkeypatch):
+    """The plain-CUDA forks. These are fp32 throughout, so the bar is far tighter -- the tensor-core small-batch twins
+    (`test_sweep_small_batch_tensor_cores`, `test_sweep_small_batch_high_precision`) taken out, as if their extensions
+    had not built."""
+    import pyjuice.nodes.external_params.kernels.c as bs_c
+    monkeypatch.setattr(bs_c, "get_sb_mma_module", lambda: None)
+    monkeypatch.setattr(bs_c, "get_sb_ele_mma_module", lambda: None)
     _check(num_latents, block_size, gate_cbs, batch, tol_val = 1e-5, tol_ef = 1e-5, tol_pf = 1e-4)
+
+
+SMALL_TC = [(K, K, g, b) for K in (128, 512) for g in (8, 64) for b in (16, 33, 63)]   # (one bf16 an operand from 16)
+SMALL_HP = [(K, K, g, b) for K in (128, 512) for g in (8, 64) for b in (1, 3, 8, 15)]  # (hi + lo operands below 16)
+
+
+def _force_twins(monkeypatch, hp):
+    """An autotune that takes the tensor-core small-batch forward and element backward wherever offered (asserting both
+    were, in the form `hp` says), the real one for every other choice."""
+    import pyjuice.layer.kernels.c as ck
+    real = ck.autotune
+    taken = set()
+
+    def forced(cands, *args, **kwargs):
+        keys = [k for k, _ in cands]
+        # (the forward's pick: among the batch-tiled kernel's arms; the element plan's: beside the plain "triton")
+        for kind, mark in (("sbmma", lambda k: isinstance(k, tuple) and k[0] == "sbbt"), ("sbm", lambda k: k == "triton")):
+            twin = [k for k in keys if isinstance(k, tuple) and k[0] == kind]
+            if any(mark(k) for k in keys):
+                assert twin, f"the tensor-core small-batch {kind} was not offered"
+                assert all(bool(k[1] & 128) == hp for k in twin), f"{kind}: {twin}"
+                taken.add(kind)
+                return twin[0]
+        return real(cands, *args, **kwargs)
+    monkeypatch.setattr(ck, "autotune", forced)
+    return taken
+
+
+@cuda_only
+@needs_cute
+@pytest.mark.parametrize("num_latents,block_size,gate_cbs,batch", SMALL_TC)
+def test_sweep_small_batch_tensor_cores(num_latents, block_size, gate_cbs, batch, monkeypatch):
+    """The tensor-core small-batch forward and element backward (blockscale_smallbatch_forward_mma.cu,
+    blockscale_smallbatch_ele_mma.cu) forced: bf16 operands, so the large batch's bar."""
+    taken = _force_twins(monkeypatch, hp = False)
+    _check(num_latents, block_size, gate_cbs, batch, tol_val = 3e-3, tol_ef = 3e-3, tol_pf = 5e-3)
+    assert taken == {"sbmma", "sbm"}, taken
+
+
+@cuda_only
+@needs_cute
+@pytest.mark.parametrize("num_latents,block_size,gate_cbs,batch", SMALL_HP)
+def test_sweep_small_batch_high_precision(num_latents, block_size, gate_cbs, batch, monkeypatch):
+    """Below batch 16 the same twins in their high-precision form (every operand a bf16 hi + lo pair, ~2^-16 a term):
+    near the fp32 forks' bar."""
+    taken = _force_twins(monkeypatch, hp = True)
+    _check(num_latents, block_size, gate_cbs, batch, tol_val = 1e-4, tol_ef = 1e-4, tol_pf = 1e-3)
+    assert taken == {"sbmma", "sbm"}, taken
 
 
 def _check(num_latents, block_size, gate_cbs, batch, tol_val, tol_ef, tol_pf, seed = 0):

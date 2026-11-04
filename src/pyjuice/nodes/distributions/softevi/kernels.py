@@ -1,7 +1,7 @@
 """
 The Triton kernels of :class:`~pyjuice.nodes.distributions.softevi_categorical.SoftEvidenceCategorical`
 (:class:`_KernelsMixin`, one of its bases): the forward with and without a value mask, the parameter and soft-evidence
-backward, the dense backward's prologue and expected-category flow, and the sampler.
+backward, the dense backward's expected-category flow (its prologue: `prologue.py`), and the sampler.
 """
 
 from __future__ import annotations
@@ -712,133 +712,6 @@ class _KernelsMixin:
                         expars_grad = tl.sum(nflow_sub_logz_sub[:,None,:] * inpars[None,:,:], axis = 2).log() + nflow_sub_logz_max + expars
 
                     tl.atomic_add(expars_grad_ptr + i * TILE_SIZE_K, -tl.exp(expars_grad), mask = (mask_b[:,None] & mask_c[None,:]))
-
-    @staticmethod
-    @triton_jit
-    def bk_dense_prologue_kernel(params_ptr, param_flows_ptr, node_flows_ptr, node_mars_ptr, data_ptr, vids_ptr, s_pids_ptr, s_pfids_ptr,
-                                 metadata_ptr, s_mids_ptr, nids_ptr, layer_num_nodes, batch_size,
-                                 num_vars_per_node: tl.constexpr, num_vars: tl.constexpr, nv_block_size: tl.constexpr,
-                                 node_offset, logspace_flows: tl.constexpr,
-                                 BLOCK_SIZE_B: tl.constexpr, BLOCK_SIZE_N: tl.constexpr,
-                                 TILE_SIZE_K: tl.constexpr, K_NUM_TILES: tl.constexpr,
-                                 categorical_evidence_logp_ptr, soft_evidence_cat_ids_ptr,
-                                 categorical_evidence_logp_grad_ptr, var_idmapping_ptr, ratio_ptr,
-                                 num_cats: tl.constexpr, ext_num_vars: tl.constexpr, num_latents: tl.constexpr,
-                                 update_extflows: tl.constexpr, missing_mask_ptr,
-                                 missing_mask_mode: tl.constexpr, missing_mask_num_vars: tl.constexpr,
-                                 update_pflows: tl.constexpr = True):
-        """First half of the dense top-k backward: everything except the expected-category flow phase.
-
-        Accumulates the observed-category flow, adds the observed-token term of the external evidence
-        gradient, and stores `ratio[slot, latent] = node_flow / Z` for the second kernel to consume.
-        Identical to `bk_softevi_kernel` up to and including the local normalizer `logZ`; it just stores
-        that ratio instead of running the scattered expected-flow loop."""
-
-        pid_b = tl.program_id(axis = 0)
-        pid_n = tl.program_id(axis = 1)
-
-        offsets_b = pid_b * BLOCK_SIZE_B + tl.arange(0, BLOCK_SIZE_B)
-        offsets_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-
-        mask_b = offsets_b < batch_size
-        mask_n = offsets_n < layer_num_nodes
-        mask_bn = mask_b[:,None] & mask_n[None,:]
-
-        offset_n = pid_n * BLOCK_SIZE_N
-
-        vid = tl.load(vids_ptr + offset_n)
-        lvid = tl.load(var_idmapping_ptr + vid)
-
-        # A marginalized leaf contributes nothing through the evidence: its soft evidence was never
-        # applied (the forward overwrote `node_mars` with 0), so `logZ` below is meaningless there. Drop
-        # those batch elements from every accumulation, and store a zero ratio so the expected-flow
-        # kernel skips them too. `bk_dual_flow_mask_fn` writes the statistic they should get instead.
-        if missing_mask_mode > 0:
-            miss_b = _missing_slot_mask(missing_mask_ptr, vid, offsets_b, batch_size,
-                                        missing_mask_num_vars, missing_mask_mode)
-            mask_b_ev = mask_b & (miss_b == False)
-            mask_bn_ev = mask_b_ev[:,None] & mask_n[None,:]
-        else:
-            mask_b_ev = mask_b
-            mask_bn_ev = mask_bn
-
-        nids = tl.load(nids_ptr + offsets_n, mask = mask_n, other = 0)
-        s_pids = tl.load(s_pids_ptr + offsets_n, mask = mask_n, other = 0)
-        s_pfids = tl.load(s_pfids_ptr + offsets_n, mask = mask_n, other = 0)
-
-        # `node_mars` / `node_flows` are laid out [node, batch], so load them with the BATCH axis
-        # innermost and transpose in registers. Loading them directly as [batch, node] -- which is the
-        # orientation the rest of this kernel wants -- puts a stride of `batch_size` floats between
-        # adjacent lanes, so each lane pulls its own 32-byte sector for 4 useful bytes. That alone was
-        # 0.50 of the prologue's 0.63 ms.
-        mask_nb = mask_n[:,None] & mask_b[None,:]
-        nmars = tl.trans(tl.load(
-            node_mars_ptr + (offsets_n + node_offset)[:,None] * batch_size + offsets_b[None,:],
-            mask = mask_nb, other = 0.0))
-        nflows = tl.trans(tl.load(
-            node_flows_ptr + (offsets_n + node_offset)[:,None] * batch_size + offsets_b[None,:],
-            mask = mask_nb, other = 0.0))
-
-        # Keep the log form for the ratio and the linear form for the observed-category flow, rather
-        # than the exp -> log round trip the scattered kernel does.
-        if logspace_flows:
-            log_nflows = nflows
-            nflows = nflows.exp()
-        else:
-            log_nflows = nflows.log()
-
-        data = tl.load(data_ptr + vid * batch_size + offsets_b, mask = mask_b, other = 0)
-
-        # Observed-category flow (phase 0)
-        if update_pflows:
-            tl.atomic_add(param_flows_ptr + s_pfids[None,:] + data[:,None], nflows, mask = mask_bn_ev)
-
-        catids_ptr = soft_evidence_cat_ids_ptr + \
-            offsets_b[:,None] * (ext_num_vars * num_cats) + lvid * num_cats + tl.arange(0, TILE_SIZE_K)[None,:]
-        expar_ptr = categorical_evidence_logp_ptr + offsets_b * (ext_num_vars * num_cats) + lvid * num_cats
-        if update_extflows:
-            expar_grad_ptr = categorical_evidence_logp_grad_ptr + offsets_b * (ext_num_vars * num_cats) + lvid * num_cats
-
-        # Locate the observed token among the candidates, and accumulate the numerator half of the
-        # external gradient onto its slot
-        log_ex_p = tl.zeros([BLOCK_SIZE_B], dtype = tl.float32) - float("inf")
-        for i in range(K_NUM_TILES):
-            mask_c = (i * TILE_SIZE_K + tl.arange(0, TILE_SIZE_K) < num_cats)
-            catids = tl.load(catids_ptr + i * TILE_SIZE_K, mask = (mask_b[:,None] & mask_c[None,:]), other = 0)
-
-            is_match = ((catids == data[:,None]) & mask_c[None,:]).to(tl.int64)
-            # CLAMPED. This is a SUM over matching slots, so it is the intended slot only when the
-            # tile holds `data` at most once -- the documented precondition. Two matches at slots
-            # i and j yield i + j, which for i + j >= TILE_SIZE_K addresses PAST the tile: an
-            # out-of-bounds read (confirmed under compute-sanitizer), and the value it lands on
-            # varies with allocator layout, so the log-likelihood is nondeterministic run to run.
-            # The clamp cannot restore the right answer for a duplicated id -- nothing can, the
-            # information is already gone -- but it keeps the read in bounds and the result
-            # deterministic. Branchless on purpose: a `tl.where`/early-out here costs real
-            # throughput on the dominant no-duplicate path (cf. the LowRank padded-slot clamp).
-            match_ids = tl.sum(is_match * tl.arange(0, TILE_SIZE_K), axis = 1)
-            match_ids = tl.minimum(match_ids, TILE_SIZE_K - 1)
-            has_match = (tl.sum(is_match, axis = 1) > 0)
-
-            expar = tl.load(expar_ptr + i * TILE_SIZE_K + match_ids, mask = (mask_b & has_match), other = 0.0)
-            log_ex_p = tl.where(has_match, expar, log_ex_p)
-
-            if update_extflows:
-                tl.atomic_add(expar_grad_ptr + i * TILE_SIZE_K + match_ids, tl.sum(nflows, axis = 1),
-                              mask = (mask_b_ev & has_match))
-
-        log_in_p = tl.load(params_ptr + s_pids[None,:] + data[:,None], mask = mask_bn, other = 0.0).log()
-        logZ = log_in_p + log_ex_p[:,None] - nmars
-
-        # ratio[slot, latent], slot = lvid * batch_size + b; `nids` is the latent index, so the store is
-        # contiguous along the innermost axis
-        ratio = tl.exp(log_nflows - logZ)
-        if missing_mask_mode > 0:
-            # Store, do not skip: `ratio_ptr` is scratch that is reused across steps, so a skipped slot
-            # would keep whatever the previous step left there.
-            ratio = tl.where(mask_bn_ev, ratio, 0.0)
-        tl.store(ratio_ptr + (lvid * batch_size + offsets_b)[:,None] * num_latents + nids[None,:],
-                 ratio, mask = mask_bn)
 
     @staticmethod
     @triton_jit

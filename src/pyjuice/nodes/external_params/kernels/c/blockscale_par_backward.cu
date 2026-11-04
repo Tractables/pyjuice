@@ -23,6 +23,7 @@
 // rather than per (child, batch).
 
 #include <torch/extension.h>
+#include "../../../../layer/kernels/c/param_load.cuh"   // `ParamLoad<TP>`: the parameters in their stored dtype
 #include <cuda_fp16.h>
 #include <cuda.h>
 #include <c10/cuda/CUDAStream.h>
@@ -70,8 +71,9 @@ __device__ __forceinline__ void mbar_wait(uint64_t* bar, int phase) {
 
 extern __shared__ char smem_raw[];
 
+template <typename TP>
 __global__ void __launch_bounds__(NTH) bs_par_kernel(
-        float* __restrict__ pflows, const float* __restrict__ mp,
+        float* __restrict__ pflows, const TP* __restrict__ mp,
         const long* __restrict__ nbase, const long* __restrict__ cbase,
         const long* __restrict__ pbase, const long* __restrict__ fbase,
         int batch, int block_size, int num_edges, int bnt, int use_atomic, int pid_my_offset,
@@ -219,8 +221,8 @@ __global__ void __launch_bounds__(NTH) bs_par_kernel(
         for (int idx = tid; idx < (BN * BM) / 4; idx += NTH) { int e = idx/(BM/4), m4 = (idx%(BM/4))*4;
             long off = (long)e * (long)block_size + m4;
             float4 ps = *(const float4*)&partialS[e * BM + m4];
-            float4 ep = *(const float4*)&mp[par0 + off];
-            float4 v = {ps.x*ep.x, ps.y*ep.y, ps.z*ep.z, ps.w*ep.w};   // pflow = epars * partial
+            float ep[4]; ParamLoad<TP>::load4(&mp[par0 + off], ep);
+            float4 v = {ps.x*ep[0], ps.y*ep[1], ps.z*ep[2], ps.w*ep[3]};   // pflow = epars * partial
             // Write mode (set by the Python gate): 0 = read-modify-write (RMW; the safe default,
             // accumulates across minibatches, requires collision-free pfids); 1 = atomicAdd (for tied
             // params where edge-blocks collide); 2 = store-only (fastest, but ONLY valid when param_flows
@@ -273,20 +275,24 @@ void blockscale_par_backward(torch::Tensor param_flows, torch::Tensor node_flows
         g_nf=nf; g_nm=nm; g_em=em; g_nr=n_node_rows; g_er=n_ele_rows; g_b=(int)batch; }
     int smem = (BM * BK + BM * BK + BN * BK) * 4 + BK * 4 + BK * 4 + BK * 4 + 64
                + (BN >> gate_sh) * BK * 4;          // + the staged gates
-    cudaFuncSetAttribute(bs_par_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
-    int bnt = (int)batch / BK;
-    int total_y = n_nblocks * ((int)block_size / BM);
-    int gx = (int)num_edges / (EE * BN);
-    const int MAX_Y = 65535;
-    for (int off = 0; off < total_y; off += MAX_Y) {
-        int chunk = (total_y - off < MAX_Y) ? (total_y - off) : MAX_Y;
-        dim3 grid(gx, chunk);
-        bs_par_kernel<<<grid, NTH, smem, c10::cuda::getCurrentCUDAStream()>>>(param_flows.data_ptr<float>(), params.data_ptr<float>(),
-            nbase.data_ptr<long>(), cbase.data_ptr<long>(), pbase.data_ptr<long>(), fbase.data_ptr<long>(),
-            (int)batch, (int)block_size, (int)num_edges, bnt, (int)use_atomic, off, g_dNf, g_dNm,
-            ext.data_ptr<float>(), gate.data_ptr<long>(),
-            (int)node_cbs, node_sh, gate_sh, (int)gate.size(1), (long)ext_base, g_dEm);
-        C10_CUDA_KERNEL_LAUNCH_CHECK(); }
+    auto run = [&](auto tag) {
+        using TP = decltype(tag);
+        cudaFuncSetAttribute(bs_par_kernel<TP>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+        int bnt = (int)batch / BK;
+        int total_y = n_nblocks * ((int)block_size / BM);
+        int gx = (int)num_edges / (EE * BN);
+        const int MAX_Y = 65535;
+        for (int off = 0; off < total_y; off += MAX_Y) {
+            int chunk = (total_y - off < MAX_Y) ? (total_y - off) : MAX_Y;
+            dim3 grid(gx, chunk);
+            bs_par_kernel<TP><<<grid, NTH, smem, c10::cuda::getCurrentCUDAStream()>>>(param_flows.data_ptr<float>(), param_ptr<TP>(params),
+                nbase.data_ptr<long>(), cbase.data_ptr<long>(), pbase.data_ptr<long>(), fbase.data_ptr<long>(),
+                (int)batch, (int)block_size, (int)num_edges, bnt, (int)use_atomic, off, g_dNf, g_dNm,
+                ext.data_ptr<float>(), gate.data_ptr<long>(),
+                (int)node_cbs, node_sh, gate_sh, (int)gate.size(1), (long)ext_base, g_dEm);
+            C10_CUDA_KERNEL_LAUNCH_CHECK(); }
+    };
+    if (params.scalar_type() == torch::kBFloat16) run(__nv_bfloat16{}); else run(float{});
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {

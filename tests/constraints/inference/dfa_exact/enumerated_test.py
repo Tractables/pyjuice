@@ -311,12 +311,17 @@ def test_sample_inputs_stored_columns_and_log_z_match_a_float64_brute_force(evid
 # The readers
 # -------------------------------------------------------------------------------------------------
 
-def test_transition_masses_with_enumerated_classes_match_a_float64_brute_force(build_pc, monkeypatch):
+@pytest.mark.parametrize("signatures", [False, True], ids = ["by_column", "by_signature"])
+def test_transition_masses_with_enumerated_classes_match_a_float64_brute_force(build_pc, monkeypatch, signatures):
     """Grouped transitions kept whole: every (step, column, successor)'s mass is the log-sum over the tokens leading
     there of ``p(v)`` -- and under dense evidence of a session, per sample, of ``q(v) = p(v) w(v) / Z``, over the
     sample's entries alone (:class:`~pyjuice.constraints.inference.dfa_exact.kernels.transitions.SampleMasses`): an
-    entry no allowed class leads along has no mass (its log-sum would be -inf)."""
+    entry no allowed class leads along has no mass (its log-sum would be -inf). One set of masses laid out by column
+    or by column signature (:mod:`~pyjuice.constraints.inference.dfa_exact.kernels.transition_signatures`), read as the
+    kernels read them."""
+    from pyjuice.constraints.inference.dfa_exact.kernels import transition_signatures
     monkeypatch.setattr(P, "GROUP_MIN_RATIO", 0)
+    monkeypatch.setattr(transition_signatures, "SIGNATURE_MASSES", signatures)
     n, B = 6, 3
     dfa = singleton_automaton()
     for ev in ("none", "dense"):
@@ -330,10 +335,11 @@ def test_transition_masses_with_enumerated_classes_match_a_float64_brute_force(b
             masses = cc.backend.state._session[2] if ev == "dense" else cc.backend.state.masses()
             T = prog.transition_buffer().double().cpu()
             layout = prog.trans_layout
+            margs, ex = prog.mass_args(), prog.mass_x("entry_x").long().cpu()   # (one set: as the kernels read it)
         assert prog.trans.grouped and prog.trans_persistent and (layout is not None) == (ev == "dense")
         tt, width, nc = prog.trans, prog.width, cc.backend.layout.next_col_table()
         ptr, succ = tt.entry_ptr.long().cpu(), tt.entry_succ.long().cpu()
-        pair_off, pairs, bbase = prog.pair_off.cpu(), prog.pairs_t.cpu(), tt.boundary_base.cpu()
+        pair_off, pairs, bbase = margs["mbase"].cpu(), margs["mcount"].cpu(), tt.boundary_base.cpu()
         if layout is not None:
             base, count, rank = layout.base.cpu(), layout.count.long().cpu(), layout.rank.long().cpu()
             assert layout.Be == B and T.numel() >= layout.size and layout.size < B * prog.trans_size
@@ -360,7 +366,7 @@ def test_transition_masses_with_enumerated_classes_match_a_float64_brute_force(b
                         want = q_tok[classes[tc]].sum().log()
                         x = g - int(ptr[t, 0])                              # the pair's number within the boundary
                         if layout is None:
-                            got = T[int(pair_off[t]) + rk * int(pairs[t]) + x]
+                            got = T[int(pair_off[t]) + rk * int(pairs[t]) + int(ex[g])]
                         else:
                             k = int(rank[b, int(bbase[t]) + x])             # the sample's entry, or none
                             if k < 0:

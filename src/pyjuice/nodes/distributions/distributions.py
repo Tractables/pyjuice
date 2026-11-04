@@ -129,6 +129,15 @@ class Distribution():
         """
         return self.em_fn if hasattr(self, "em_fn") else None
 
+    def get_em_layer_fn(self):
+        """
+        Return an optional kernel of its own for a whole layer's mini-batch EM update, or None to run `em_fn` in the
+        layer's template. Called as `fn(layer, constexprs, keep_zero_params)` with `constexprs` the step size and
+        pseudocount on the device; it should run the update and return True, or return False (nothing launched) to
+        leave it to the template. Only the distributions with such a kernel override this.
+        """
+        return self.em_layer_fn if hasattr(self, "em_layer_fn") else None
+
     def set_custom_kernel_kwargs(self, kwargs):
         pass
 

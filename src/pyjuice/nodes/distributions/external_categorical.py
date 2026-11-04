@@ -1640,12 +1640,13 @@ class ExternProductCategorical(Distribution):
 
             if keep_zero_params:
                 param = tl.load(params_ptr + s_pids + cat_id, mask = cat_mask, other = 0)
-                cum_flow += tl.where(param < 1e-12, 0.0, flow + numerate_pseudocount)
+                cum_flow += tl.where(param == 0.0, 0.0, flow + numerate_pseudocount)
             else:
                 cum_flow += flow
 
         # Parameter update
-        cum_flow += pseudocount
+        if not keep_zero_params:
+            cum_flow += pseudocount
         for cat_id in range(max_num_cats):
             cat_mask = mask & (cat_id < num_cats)
 
@@ -1653,8 +1654,8 @@ class ExternProductCategorical(Distribution):
             flow = tl.load(param_flows_ptr + s_pfids + cat_id, mask = cat_mask, other = 0)
 
             if keep_zero_params:
-                new_param = (1.0 - step_size) * param + step_size * (flow + numerate_pseudocount) / (cum_flow - pseudocount)
-                new_param = tl.where(param < 1e-12, 0.0, new_param)
+                new_param = (1.0 - step_size) * param + step_size * (flow + numerate_pseudocount) / cum_flow
+                new_param = tl.where(param == 0.0, 0.0, new_param)
             else:
                 new_param = (1.0 - step_size) * param + step_size * (flow + numerate_pseudocount) / cum_flow
 
@@ -1680,14 +1681,15 @@ class ExternProductCategorical(Distribution):
 
             if keep_zero_params:
                 param = tl.load(params_ptr + s_pids[:,None] + cat_ids[None,:], mask = cat_mask, other = 0)
-                cum_flow += tl.sum(tl.where(param < 1e-12, 0.0, flow + numerate_pseudocount[:,None]))
+                cum_flow += tl.sum(tl.where(param == 0.0, 0.0, flow + numerate_pseudocount[:,None]), axis = 1)
             else:
                 cum_flow += tl.sum(flow, axis = 1)
 
             cat_ids += 128
 
         # Parameter update
-        cum_flow += pseudocount
+        if not keep_zero_params:
+            cum_flow += pseudocount
         cat_ids = tl.arange(0, 128)
         for cat_sid in range(0, max_num_cats, 128):
             cat_mask = mask[:,None] & (cat_ids[None,:] < num_cats[:,None])
@@ -1696,8 +1698,8 @@ class ExternProductCategorical(Distribution):
             flow = tl.load(param_flows_ptr + s_pfids[:,None] + cat_ids[None,:], mask = cat_mask, other = 0)
 
             if keep_zero_params:
-                new_param = (1.0 - step_size) * param + step_size * (flow + numerate_pseudocount[:,None]) / (cum_flow[:,None] - pseudocount)
-                new_param = tl.where(param < 1e-12, 0.0, new_param)
+                new_param = (1.0 - step_size) * param + step_size * (flow + numerate_pseudocount[:,None]) / cum_flow[:,None]
+                new_param = tl.where(param == 0.0, 0.0, new_param)
             else:
                 new_param = (1.0 - step_size) * param + step_size * (flow + numerate_pseudocount[:,None]) / cum_flow[:,None]
             tl.store(params_ptr + s_pids[:,None] + cat_ids[None,:], new_param, mask = cat_mask)
