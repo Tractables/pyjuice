@@ -35,8 +35,6 @@ only with names no schema there declares. Numbers are exact decimals, as JSON Sc
 digits that a binary floating-point reading would round to an integer is still no integer.
 
 Two constraints are equal when their languages are: the same canonical texts over the same vocabulary and padding.
-
-Needs ``interegular`` (``pip install pyjuice[constraints]``): patterns and the ``whitespace`` pattern.
 """
 
 from __future__ import annotations
@@ -45,8 +43,12 @@ import copy
 import json
 from typing import Any, Dict, Optional, Union
 
+import numpy as np
+
+from .backend.automata import regex as _regex
+from .backend.byte_level import ByteAutomaton, utf8_sequences
 from .base import Constraint
-from .regex import _Text, _char_automaton, _checked, _interegular, _unsupported
+from .regex import _Text, _checked, _unsupported
 
 #: the keywords with a meaning in JSON Schema validation (every draft); any other keyword is an annotation
 VALIDATION = frozenset({
@@ -90,24 +92,19 @@ def _json_types(value) -> set:
 JSON_UNSAFE = ((0x00, 0x1F), (0x22, 0x22), (0x5C, 0x5C), (0x7F, 0x9F))
 
 
-def _matches_any(fsm, ranges, chars) -> bool:
-    """Whether some string the character automaton accepts holds a character of ``chars`` (code point ranges): a
-    transition on such a character from a reachable state into one that still reaches acceptance."""
-    reach, stack = {fsm.initial}, [fsm.initial]
-    while stack:
-        for nxt in fsm.map.get(stack.pop(), {}).values():
-            if nxt not in reach:
-                reach.add(nxt)
-                stack.append(nxt)
-    live = set(fsm.finals)
-    while True:
-        more = {q for q in reach if q not in live and any(n in live for n in fsm.map.get(q, {}).values())}
-        if not more:
-            break
-        live |= more
-    hits = lambda rs: any(a <= d and c <= b for a, b in rs for c, d in chars)
-    return any(n in live and hits(ranges.get(sym, ()))
-               for q in reach for sym, n in fsm.map.get(q, {}).items())
+def _matches_any(a: ByteAutomaton, chars) -> bool:
+    """Whether some text a minimal automaton accepts holds a character of ``chars`` (code point ranges): such a
+    character's bytes lead from a live state to a live state (all its states are reachable, all but the dead one live)."""
+    table, byte_class = a.table, a.byte_class
+    for lo, hi in chars:
+        for seq in utf8_sequences(lo, hi):
+            states = np.flatnonzero(np.arange(table.shape[0]) != a.dead)
+            for first, last in seq:
+                states = np.unique(table[states][:, np.unique(byte_class[first:last + 1])])
+                states = states[states != a.dead]
+            if states.size:
+                return True
+    return False
 
 
 def _pattern(pattern: str, where: str) -> str:
@@ -117,19 +114,22 @@ def _pattern(pattern: str, where: str) -> str:
     if q.endswith("$") and not q.endswith("\\$"):
         q = q[:-1]
     try:
-        why = _unsupported(q)
-    except Exception as e:                      # (not a pattern Python's `re` reads)
-        why = f"{type(e).__name__}: {e}"
-    if why is not None:
-        raise _Refused(f"{where}: pattern {pattern!r}: {why}")
-    interegular, _ = _interegular()
-    try:
-        fsm, ranges = _char_automaton(interegular.parse_pattern(q))
-    except Exception as e:
-        raise _Refused(f"{where}: pattern {pattern!r}: {type(e).__name__}: {e}") from None
-    if _matches_any(fsm, ranges, JSON_UNSAFE):
+        a = _regex(q)
+    except Exception as e:                      # (not a pattern Python's `re` reads, or what Regex does not)
+        why = _unsupported_reason(q, e)
+        raise _Refused(f"{where}: pattern {pattern!r}: {why}") from None
+    if _matches_any(a, JSON_UNSAFE):
         raise _Refused(f"{where}: pattern {pattern!r} can match a quote, a backslash or a control character")
     return f"(?:{q})"
+
+
+def _unsupported_reason(pattern: str, err: Exception) -> str:
+    """What :func:`_pattern` says of a pattern :func:`.backend.automata.regex` refuses."""
+    try:
+        why = _unsupported(pattern)
+    except Exception as e:
+        return f"{type(e).__name__}: {e}"
+    return why if why is not None else f"{type(err).__name__}: {err}"
 
 
 def _prepare(schema: Dict[str, Any]) -> Dict[str, Any]:

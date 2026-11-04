@@ -142,7 +142,6 @@ def test_text_constraints_widen_to_the_pcs_vocabulary():
     """A Regex over fewer ids than the PC's inputs range over (a model's embedding rows beyond its tokenizer's)
     compiles over the PC's vocabulary, the extra ids without text: the constraint over the larger vocabulary, the
     same marginals as compiling that one, probability 0 for the extra id; composites widen too; a DFA does not."""
-    pytest.importorskip("interegular")
     vocab = jc.Vocabulary([b"a", b"b", b"ab", None], eos = [3])           # 4 ids; the PC's inputs range over V = 5
     pc = hmm(4).to("cuda")
     regex = jc.Regex("a+b?", vocab)

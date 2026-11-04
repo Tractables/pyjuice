@@ -20,7 +20,6 @@ import torch
 
 import pyjuice.constraints as jc
 
-pytest.importorskip("interegular")
 
 #: every byte a token, a few longer ones, an id without text, an end of sequence
 TOKENS = [bytes([b]) for b in range(256)] + [b'{"', b'":', b'","', b"null", b"true", b'"ab"', "é".encode(), None,
@@ -228,9 +227,13 @@ def test_the_token_lift_of_a_minimal_automaton_over_every_byte_is_minimal(monkey
                 numba.set_num_threads(min(n, threads))
                 try:
                     fast = byte_level.to_tokens(a, VOCAB, eos)
+                    with monkeypatch.context() as m:
+                        m.setattr(byte_level, "SERIAL_STEPS", 0)        # (every walk in threads)
+                        walked = byte_level.to_tokens(a, VOCAB, eos)
                 finally:
                     numba.set_num_threads(threads)
                 assert fast == slow and fast.num_states == slow.num_states, (a.num_states, eos, n)
+                assert walked == slow and walked.num_states == slow.num_states, (a.num_states, eos, n)
 
 
 def test_numbers_below_a_combinator_are_written_one_way():

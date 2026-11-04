@@ -6,7 +6,7 @@ several DFAs over their joint classes (:func:`product_bfs`), and the columns of 
 """
 
 import numpy as np
-from numba import njit
+from numba import get_num_threads, njit, prange
 
 
 @njit(cache = True)
@@ -29,6 +29,38 @@ def bfs_order(delta, initial):
                 order[num] = t
                 num += 1
     return order[:num]
+
+
+@njit(cache = True)
+def _renumbered_rows(delta, order, remap, out, lo, hi):
+    C = delta.shape[1]
+    for i in range(lo, hi):
+        q = order[i]
+        for c in range(C):
+            out[i, c] = remap[delta[q, c]]
+
+
+@njit(parallel = True, cache = True)
+def _renumbered_parallel(delta, order, remap, out, P):
+    R = order.shape[0]
+    for p in prange(P):
+        _renumbered_rows(delta, order, remap, out, p * R // P, (p + 1) * R // P)
+
+
+#: a table of at least this many entries is renumbered in threads (waking a team is milliseconds on a busy machine)
+PARALLEL_ENTRIES = 1 << 24
+
+
+def renumbered(delta: np.ndarray, order: np.ndarray) -> np.ndarray:
+    """The table of the states ``order`` (every successor among them), numbered by their place there."""
+    remap = np.empty(delta.shape[0], dtype = np.int64)
+    remap[order] = np.arange(order.size)
+    out = np.empty((order.size, delta.shape[1]), dtype = np.int64)
+    if out.size >= PARALLEL_ENTRIES and get_num_threads() > 1:
+        _renumbered_parallel(delta, order, remap, out, get_num_threads())
+    else:
+        _renumbered_rows(delta, order, remap, out, 0, order.size)
+    return out
 
 
 @njit(cache = True)

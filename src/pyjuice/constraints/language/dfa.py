@@ -29,7 +29,7 @@ from typing import Dict, Iterable, List, Mapping, Optional, Sequence
 import numpy as np
 import torch
 
-from .backend.dfa import _column_classes, bfs_order, hopcroft, product_bfs
+from .backend.dfa import _column_classes, bfs_order, hopcroft, product_bfs, renumbered
 from .base import Constraint, Matcher, Tokens
 
 
@@ -87,6 +87,17 @@ class DFA(Constraint):
         self._live = None              # [K] bool: an accepting state is reachable
         self._accept_in = None         # list: _accept_in[r][q] = acceptance reachable in exactly r steps
         self._device_tables = {}
+
+    @classmethod
+    def _of_classes(cls, vocab_size: int, token_class: torch.Tensor, delta: torch.Tensor, initial: int,
+                    accept: torch.Tensor) -> "DFA":
+        """A DFA of tables the constructor would keep as they are: complete, its classes numbered by their smallest token,
+        no two columns the same; the tables are its own."""
+        out = cls.__new__(cls)
+        Constraint.__init__(out, vocab_size)
+        out._token_class, out._delta, out._initial, out._accept = token_class, delta, initial, accept
+        out._live, out._accept_in, out._device_tables = None, None, {}
+        return out
 
     # ---------------------------------------------------------------------------------------------
     # Tables
@@ -267,11 +278,12 @@ class DFA(Constraint):
         return self.minimize() == other.minimize()
 
     def _renumbered(self) -> "DFA":
-        """Canonical numbering: states in BFS order (classes visited in increasing order)."""
-        order = torch.from_numpy(bfs_order(self._delta.numpy(), self._initial))
-        remap = torch.full((self.num_states,), -1, dtype = torch.long)
-        remap[order] = torch.arange(order.numel())
-        return DFA(self.vocab_size, self._token_class, remap[self._delta[order]], 0, self._accept[order])
+        """Canonical numbering: states in BFS order (classes visited in increasing order); the states left out, if any,
+        tell no two columns apart that the others do not."""
+        delta = self._delta.numpy()
+        order = bfs_order(delta, self._initial)
+        return DFA._of_classes(self.vocab_size, self._token_class, torch.from_numpy(renumbered(delta, order)), 0,
+                               torch.from_numpy(self._accept.numpy()[order]))
 
     # ---------------------------------------------------------------------------------------------
     # Builders

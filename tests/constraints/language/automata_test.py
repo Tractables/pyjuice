@@ -14,8 +14,6 @@ import re
 import numpy as np
 import pytest
 
-pytest.importorskip("interegular")
-
 from pyjuice.constraints.language.backend import automata as A   # noqa: E402
 
 ALPHABET = [b"a", b"b", b"\xc3", b"\xa9"]
