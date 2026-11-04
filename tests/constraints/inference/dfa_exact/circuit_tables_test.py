@@ -240,6 +240,52 @@ def test_reachability_on_the_device_is_the_hosts(seed, tile):
             assert torch.equal(got.table[at:ap + S], want.table[at2:ap2 + S2])
 
 
+@pytest.mark.parametrize("seed", range(4))
+@pytest.mark.parametrize("tile", [1, 2, 16])
+@pytest.mark.parametrize("budget", [None, 1])
+def test_intervals_prepared_together_are_those_swept_alone(seed, tile, budget, monkeypatch):
+    """`Reachability.prepare`, blocks of every width padded in one stack (or, with no budget for it, a stack each),
+    against asking the intervals one at a time: slots, occupancy, positions and the slots' pairs; the skip masks and
+    interval tables read from them too."""
+    g = torch.Generator().manual_seed(seed)
+    K, C, n = 40, 5, 9
+    dfa = jc.DFA(C, torch.arange(C), torch.randint(0, K, (K, C), generator = g), 0, list(range(0, K, 2)))
+    layout = build_layout(dfa, n, device = torch.device("cuda"))
+    alone, together = Reachability(layout, tile = tile), Reachability(layout, tile = tile)
+    pairs = [(a, b) for a in range(n + 1) for b in range(a, n + 1)]
+    if budget is not None:
+        monkeypatch.setattr(Reachability, "PREPARE_PAIRS", budget)
+    together.prepare(pairs)
+    assert len({id(together.device_occupancy(a, b)) for a, b in pairs}) > 1
+    for a, b in pairs:
+        assert together.slots(a, b) == alone.slots(a, b), (a, b)
+        assert torch.equal(together.device_occupancy(a, b), alone.device_occupancy(a, b)), (a, b)
+        p, q = together.device_positions(a, b), alone.device_positions(a, b)
+        assert (p is None) == (q is None), (a, b)
+        if p is not None:
+            assert torch.equal(p, q), (a, b)
+            assert torch.equal(together.slot_pairs(p), alone.slot_pairs(q)), (a, b)
+            assert torch.equal(together.flat_positions(p), q.flatten()), (a, b)
+    specs = [(a, b, c) for a in range(n - 1) for b in range(a + 1, n) for c in range(b + 1, n + 1)]
+    if 16 % tile == 0:
+        got, want = (skip_masks(r, specs, device = torch.device("cuda")) for r in (together, alone))
+        assert (got.tiles_i, got.tiles_j, got.words) == (want.tiles_i, want.tiles_j, want.words)
+        assert torch.equal(got.bits, want.bits)
+    if tile == 16:                                       # (what `skip_masks_for` packs a stack at a time: both ways round)
+        from pyjuice.constraints.inference.dfa_exact.kernels.prod import skip_masks_for
+        specs = [((a, b, flip), (b, c, not flip)) for flip in (False, True) for a, b, c in specs[:40]]
+        got, want = (skip_masks_for(r, specs, device = torch.device("cuda")) for r in (together, alone))
+        assert (got.tiles_i, got.tiles_j, got.words) == (want.tiles_i, want.tiles_j, want.words)
+        assert torch.equal(got.bits, want.bits)
+    intervals = [(a, b) for a, b in pairs if b > a]
+    got, want = (interval_tables(r, intervals, torch.device("cuda")) for r in (together, alone))
+    assert torch.equal(got.of, want.of)
+    for (S, at, ap), (S2, at2, ap2) in zip(got.info.tolist(), want.info.tolist()):
+        assert S == S2 and (at < 0) == (at2 < 0)
+        if at >= 0:
+            assert torch.equal(got.table[at:ap + S], want.table[at2:ap2 + S2])
+
+
 def test_alike_intervals_share_their_positions():
     """Past the shortest accepted string most boundaries are alike: an interval through them keeps one table, whatever
     its entry -- what makes an automaton of thousands of columns on a tree fit."""

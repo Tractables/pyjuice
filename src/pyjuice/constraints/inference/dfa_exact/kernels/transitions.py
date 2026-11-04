@@ -216,6 +216,7 @@ class BoundaryGroups:
         self.by_class = None
         self._class_columns = None
         self._kept = {}
+        self.holding = False                                                 # (see `release`)
         # the automaton's transitions between states some boundary has, a CSR by state
         active = (tr.col_of_state >= 0).any(dim = 0)
         keep = active[tr.delta]
@@ -256,10 +257,17 @@ class BoundaryGroups:
         g, q = torch.repeat_interleave(g, counts), torch.repeat_interleave(q, counts)
         s = tr.col_of_state[firsts[g] + 1, self.succ[at]]
         live = s >= 0
-        out = g[live], q[live], self.cls[at][live], s[live]
-        if out[0].numel() <= BOUNDARY_ENTRIES_KEPT:
+        at = at[live]
+        out = g[live], q[live], self.cls[at], s[live]
+        if out[0].numel() <= BOUNDARY_ENTRIES_KEPT or self.holding:
             self._kept[(k, end)] = out
         return out
+
+    def release(self) -> None:
+        """A program holds every batch's entries while it builds its tables, each reading them (``holding``, set by it):
+        what :data:`BOUNDARY_ENTRIES_KEPT` would not keep goes now."""
+        self.holding = False
+        self._kept = {key: out for key, out in self._kept.items() if out[0].numel() <= BOUNDARY_ENTRIES_KEPT}
 
     @property
     def class_columns(self) -> torch.Tensor:

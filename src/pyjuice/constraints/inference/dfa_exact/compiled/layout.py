@@ -376,14 +376,17 @@ class Reachability:
         path_of, at = torch.nonzero(flat, as_tuple = True)   # the slots' pairs, `i * X + j` of each path's own X
         numbers = ((at // max(exits, 1)) * torch.from_numpy(widths[:, 1]).to(self._dev)[path_of] + at % max(exits, 1)).to(torch.int32)
         numbers = numbers.split(slots)
-        # the positions of the paths that do not join every pair, flat, one after the other
-        dev = self._dev
-        rows = torch.arange(entries, device = dev)[None, :] < torch.from_numpy(widths[:, 0]).to(dev)[:, None]
-        columns = torch.arange(exits, device = dev)[None, :] < torch.from_numpy(widths[:, 1]).to(dev)[:, None]
-        sizes = widths[:, 0] * widths[:, 1]
-        full = np.asarray(slots, dtype = np.int64) == sizes
-        kept_flat = positions[rows[:, :, None] & columns[:, None, :] & torch.from_numpy(~full).to(dev)[:, None, None]]
-        flat_of = iter(kept_flat.split(sizes[~full].tolist()))
+        # padded: the positions of the paths that do not join every pair, flat, one after the other, in one call (a table
+        # of them, :func:`interval_tables`, takes them once)
+        flat_of = None
+        if (widths != np.asarray([entries, exits])).any():
+            dev = self._dev
+            rows = torch.arange(entries, device = dev)[None, :] < torch.from_numpy(widths[:, 0]).to(dev)[:, None]
+            columns = torch.arange(exits, device = dev)[None, :] < torch.from_numpy(widths[:, 1]).to(dev)[:, None]
+            sizes = widths[:, 0] * widths[:, 1]
+            full = np.asarray(slots, dtype = np.int64) == sizes
+            flat = positions[rows[:, :, None] & columns[:, None, :] & torch.from_numpy(~full).to(dev)[:, None, None]]
+            flat_of = iter(flat.split(sizes[~full].tolist()))
         tiles = lambda columns: (columns + self.tile - 1) // self.tile
         for i, (path, (Wa, X, _, ivs)) in enumerate(items):
             every = slots[i] == Wa * X
@@ -391,7 +394,8 @@ class Reachability:
             self._places[id(kept[1])] = (occupancy, i)
             if not every:
                 self._numbers[id(kept[2])] = numbers[i]
-                self._flat[id(kept[2])] = next(flat_of)
+                if flat_of is not None:
+                    self._flat[id(kept[2])] = next(flat_of)
             for a, b in ivs:
                 self._slots[a, b], self._occupancy[a, b], self._positions[a, b] = kept
 
@@ -520,8 +524,8 @@ class Reachability:
         return kept if kept is not None else torch.nonzero(positions.flatten() >= 0).flatten().to(torch.int32)
 
     def flat_positions(self, positions: torch.Tensor) -> torch.Tensor:
-        """A table of :meth:`device_positions`, flat."""
-        kept = self._flat.get(id(positions))
+        """A table of :meth:`device_positions`, flat (what :meth:`prepare` left of it goes: read once)."""
+        kept = self._flat.pop(id(positions), None)
         return kept if kept is not None else positions.flatten()
 
     def occupancy_place(self, occupancy: torch.Tensor) -> Optional[tuple]:
