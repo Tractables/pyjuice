@@ -134,4 +134,5 @@ class BitSet(object):
             return "BitSet(num_elements={})".format(self.length)
 
     def __hash__(self):
-        return hash(bytes(self.values))
+        # (as `__eq__`, blind to trailing zero bytes: equal sets of other byte lengths must hash alike)
+        return hash(bytes(self.values).rstrip(b"\x00"))
