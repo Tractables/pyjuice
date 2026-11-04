@@ -584,31 +584,44 @@ static int num_sms() {
     return sms[dev % 64];
 }
 
-// The most dynamic shared memory a CTA of kernel `f` may take (the device's opt-in less the kernel's static), the
-// attribute set once per instantiation
+// The most dynamic shared memory a CTA of kernel `f` may take on the current device (its opt-in less the kernel's
+// static), the attribute set once per device and kernel (`most`, zeros at first). Every launch asks this, however little
+// it takes: the default limit, 48 KB, counts the STATIC with the dynamic, so `IbShared<true>`'s 3776 B leave a warp team
+// 45376 B, under the 45 KB `_input_block_cuda` allows it
 template <typename F>
-static int64_t kernel_allowed(F f) {
-    int dev = 0, optin = 0;
-    cudaFuncAttributes fa;
+static int64_t kernel_allowed(int64_t* most, F f) {
+    int dev = 0;
     C10_CUDA_CHECK(cudaGetDevice(&dev));
-    C10_CUDA_CHECK(cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev));
-    C10_CUDA_CHECK(cudaFuncGetAttributes(&fa, (const void*)f));
-    const int dyn = optin - (int)fa.sharedSizeBytes;
-    C10_CUDA_CHECK(cudaFuncSetAttribute((const void*)f, cudaFuncAttributeMaxDynamicSharedMemorySize, dyn));
-    return (int64_t)dyn;
+    int64_t& kept = most[dev % 64];
+    if (kept == 0) {
+        int optin = 0;
+        cudaFuncAttributes fa;
+        C10_CUDA_CHECK(cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev));
+        C10_CUDA_CHECK(cudaFuncGetAttributes(&fa, (const void*)f));
+        const int dyn = optin - (int)fa.sharedSizeBytes;
+        C10_CUDA_CHECK(cudaFuncSetAttribute((const void*)f, cudaFuncAttributeMaxDynamicSharedMemorySize, dyn));
+        kept = (int64_t)dyn;
+    }
+    return kept;
 }
 
 template <int G>
 static int64_t ibtd_deferred_allowed() {
-    static const int64_t most = kernel_allowed(ibtd_deferred_kernel<G>);
-    return most;
+    static int64_t most[64] = {0};
+    return kernel_allowed(most, ibtd_deferred_kernel<G>);
 }
 
 // ... of `ibtd_kernel<G, WARPS>`
 template <int G, bool WARPS>
 static int64_t ibtd_allowed() {
-    static const int64_t most = kernel_allowed(ibtd_kernel<G, WARPS>);
-    return most;
+    static int64_t most[64] = {0};
+    return kernel_allowed(most, ibtd_kernel<G, WARPS>);
+}
+
+// ... of `ibtd_terms_kernel`
+static int64_t ibtd_terms_allowed() {
+    static int64_t most[64] = {0};
+    return kernel_allowed(most, ibtd_terms_kernel);
 }
 
 // The most dynamic shared memory of a CTA of one child with every code staged (a deferred unit's):
@@ -672,7 +685,7 @@ void ibtd_cuda(torch::Tensor element_flows, torch::Tensor temp_flows, torch::Ten
                 classes ? (const signed char*)allowed.data_ptr<int8_t>() : nullptr, (long long)a_stride,
                 classes ? 1 : 0};
     const size_t tsmem = 4 * (2 * ((mw + 31) / 32) + 1);                 // (its last CTAs' marked codes)
-    TORCH_CHECK(tsmem <= 48 * 1024, "ibtd_cuda: ", mw, " codes, more than the term lists' CTAs mark");
+    TORCH_CHECK((int64_t)tsmem <= ibtd_terms_allowed(), "ibtd_cuda: ", mw, " codes, more than the term lists' CTAs mark");
     ibtd_terms_kernel<<<dim3((unsigned)cq_max, (unsigned)B, (unsigned)T), TW, tsmem, stream>>>(ta);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     IbArgs a;
@@ -749,13 +762,13 @@ void ibtd_cuda(torch::Tensor element_flows, torch::Tensor temp_flows, torch::Ten
     // the units, then the ones they deferred (CTAs as many as the device holds at once, at most one a unit)
 #define IBTD_LAUNCH(GG, WW) \
     do { \
-        TORCH_CHECK(smem <= 45 * 1024 || smem <= (ibtd_allowed<GG, WW>()), "ibtd_cuda: ", smem, \
+        TORCH_CHECK(smem <= (ibtd_allowed<GG, WW>()), "ibtd_cuda: ", smem, \
                     " bytes of dynamic shared memory, more than the device takes"); \
         ibtd_kernel<GG, WW><<<grid, (unsigned)threads, (size_t)smem, stream>>>(a); \
     } while (0)
 #define IBTD_DEFERRED(GG) \
     do { \
-        TORCH_CHECK(smem_full <= 45 * 1024 || smem_full <= ibtd_deferred_allowed<GG>(), "ibtd_cuda: ", smem_full, \
+        TORCH_CHECK(smem_full <= ibtd_deferred_allowed<GG>(), "ibtd_cuda: ", smem_full, \
                     " bytes of dynamic shared memory, more than the device takes"); \
         int per_sm = 0; \
         C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, ibtd_deferred_kernel<GG>, (int)threads, \

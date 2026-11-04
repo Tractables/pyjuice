@@ -232,17 +232,22 @@ __global__ void __launch_bounds__(NT) cw_stage_kernel(StageArgs a) {
     }
 }
 
-// The dynamic shared memory a kernel may take beyond the default 48 KB: the device's opt-in limit less its static
-// shared memory
+// The dynamic shared memory a kernel may take on the current device: its opt-in limit less the kernel's static shared
+// memory, the attribute set once per device and instantiation. Every launch asks this, however little it takes: the
+// default limit, 48 KB, counts the static with the dynamic
 template <int TN, int NT>
 size_t stage_smem_limit() {
-    static size_t limit = 0;                                            // (per instantiation, once a process)
+    static size_t most[64] = {0};
+    int dev = 0;
+    C10_CUDA_CHECK(cudaGetDevice(&dev));
+    size_t& limit = most[dev % 64];
     if (limit == 0) {
-        int dev = 0, optin = 0;
-        C10_CUDA_CHECK(cudaGetDevice(&dev));
+        int optin = 0;
         C10_CUDA_CHECK(cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev));
         cudaFuncAttributes fa;
         C10_CUDA_CHECK(cudaFuncGetAttributes(&fa, cw_stage_kernel<TN, NT>));
+        C10_CUDA_CHECK(cudaFuncSetAttribute(cw_stage_kernel<TN, NT>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                            optin - (int)fa.sharedSizeBytes));
         limit = (size_t)optin - fa.sharedSizeBytes;
     }
     return limit;
@@ -250,14 +255,7 @@ size_t stage_smem_limit() {
 
 template <int TN, int NT>
 void launch_stage(const StageArgs& a, dim3 grid, size_t smem, cudaStream_t stream) {
-    static size_t raised = 48 * 1024;                                   // (per instantiation: the limit set so far)
-    const size_t limit = stage_smem_limit<TN, NT>();
-    TORCH_CHECK(smem <= limit, "cw_class_cuda: the rows do not fit in shared memory");
-    if (smem > raised) {
-        C10_CUDA_CHECK(cudaFuncSetAttribute(cw_stage_kernel<TN, NT>, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                            (int)smem));
-        raised = smem;
-    }
+    TORCH_CHECK(smem <= (stage_smem_limit<TN, NT>()), "cw_class_cuda: the rows do not fit in shared memory");
     cw_stage_kernel<TN, NT><<<grid, NT, smem, stream>>>(a);
 }
 

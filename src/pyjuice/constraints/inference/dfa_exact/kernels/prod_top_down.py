@@ -877,8 +877,9 @@ TOP_DOWN_WARPS = 4
 #: (:func:`_input_block_cuda`); False: the Triton kernel always
 INPUT_BLOCK_CUDA = True
 #: the most children of a node tile a CTA of the CUDA kernel takes (a node tile's at most), and the most dynamic
-#: shared memory (a sample's lanes of its children's parents, their class masses; 48 KB less the kernel's own): past
-#: it, CTAs of fewer -- and past it for one child, CTAs of one child with as much as the device takes
+#: shared memory (a sample's lanes of its children's parents, their class masses): past it, CTAs of fewer -- and past
+#: it for one child, CTAs of one child with as much as the device takes. A choice, not the device's limit: the kernels
+#: raise that themselves for whatever a launch takes (``c/walk.cu``, ``kernel_allowed``)
 INPUT_BLOCK_CUDA_NODES = NODE_TILE
 INPUT_BLOCK_CUDA_SMEM = 45 * 1024
 #: (lane, 4 children) items of a sample from which its CTA has 256 threads, not 128; up to which a CTA takes 8 samples

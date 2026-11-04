@@ -66,6 +66,34 @@ def test_sessions_match_the_reference_and_the_triton_kernel_to_the_bit(kind, mod
 
 
 @needs_kernel
+def test_rows_of_exactly_the_default_limit_of_shared_memory(monkeypatch):
+    """A CTA of 4 destinations whose rows take 48 KB (boundaries of 1536 columns): with the kernel's static shared
+    memory, past what a kernel has unless it asks for more, though the rows alone are within it. Bit for bit against
+    the Triton kernel."""
+    K, C, n, B = 1536, 40, 6, 2
+    V = 2 * C
+    dfa = jc.DFA(V, torch.arange(V) % C, (torch.arange(K)[:, None] * C + torch.arange(C)[None, :]) % K, 0,
+                 torch.ones(K, dtype = torch.bool))                       # (every state from the initial in two tokens)
+    pc = strong.hmm_pc(n, strong.SMALL["hmm"]["latents"], V, 0)
+    cc = jc.compile(dfa, pc)
+    data = torch.randint(0, V, (B, n), generator = torch.Generator().manual_seed(0))
+    masks = schedule("l2r", B, n)
+    calls = _calls(monkeypatch)
+    monkeypatch.setattr(score, "CLASS_WEIGHT_CUDA", True)
+    monkeypatch.setattr(score, "CLASS_WEIGHT_CUDA_WALK", 0)
+    monkeypatch.setattr(score, "CLASS_WEIGHT_CUDA_DESTS", 4)
+    monkeypatch.setattr(score, "CLASS_WEIGHT_CUDA_THREADS", 256)
+    cuda = run_session(cc, data, masks, None, "compact", "fp32")
+    mod = dfa_c.get_class_weights_module()
+    assert any(mod.cw_stage_smem(a[-8], a[-11], a[-10]) == 48 * 1024 for a in calls), "no CTA of exactly 48 KB"
+    monkeypatch.setattr(score, "CLASS_WEIGHT_CUDA", False)
+    triton = run_session(cc, data, masks, None, "compact", "fp32")
+    for i in cuda:
+        for u, v in zip(cuda[i], triton[i]):
+            assert torch.equal(u, v), f"call {i}: the CUDA and Triton class weights differ"
+
+
+@needs_kernel
 def test_it_declines_dense_storage(monkeypatch):
     pc, dfa, data, inputs = small_case("hmm")
     cc = jc.compile(dfa, pc)
