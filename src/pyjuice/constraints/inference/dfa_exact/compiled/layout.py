@@ -24,6 +24,7 @@ from dataclasses import dataclass
 from functools import cached_property
 from typing import Dict, Optional, Tuple
 
+import numpy as np
 import torch
 
 from ....language.dfa import DFA
@@ -306,7 +307,7 @@ class Reachability:
 
     #: the words of the sweeps kept to go on from (on the device), the last used kept
     SWEEP_WORDS = 1 << 28
-    #: the pairs :meth:`prepare` takes in a device call at most
+    #: the pairs :meth:`prepare` takes in a device call at most (padding included)
     PREPARE_PAIRS = 1 << 28
 
     def __init__(self, layout: BoundaryLayout, tile: int = 16):
@@ -321,6 +322,8 @@ class Reachability:
         self._sweeps = None
         self._by_path: Dict[tuple, tuple] = {}             # the boundaries' groups an interval passes -> what it keeps
         self._numbers: Dict[int, torch.Tensor] = {}        # (of a positions table, by its id: its slots' pairs)
+        self._flat: Dict[int, torch.Tensor] = {}           # (... and itself, flat)
+        self._places: Dict[int, tuple] = {}                # (of an occupancy, by its id: its stack and place there)
         self._bits: "OrderedDict[tuple, torch.Tensor]" = OrderedDict()   # ... -> where a sweep along them is
         self._bits_words = 0
 
@@ -332,8 +335,8 @@ class Reachability:
 
     def prepare(self, intervals) -> None:
         """Keep the slots, positions and occupancy of ``intervals`` (``(a, b)`` pairs): those whose pairs are to be swept,
-        by shape, in a few device calls a shape (one at a time, they take some twenty each, and a circuit may ask
-        thousands). On a layout on the host, nothing: each is swept when first asked."""
+        all of them in a few device calls (one at a time, they take some twenty each, a wait for the device among them,
+        and a circuit may ask thousands). On a layout on the host, nothing: each is swept when first asked."""
         if self._dev is None:
             return
         todo = {}
@@ -345,30 +348,52 @@ class Reachability:
             if kept is not None:
                 self._slots[a, b], self._occupancy[a, b], self._positions[a, b] = kept
             elif path in todo:
-                todo[path][1].append((a, b))
+                todo[path][3].append((a, b))
             else:
-                todo[path] = ((a, b), [(a, b)])
-        by_shape = {}
-        for path, (first, ivs) in todo.items():
-            by_shape.setdefault((self.width[first[0]], self.width[first[1]]), []).append((path, ivs, self._device_bits(*first)))
-        from ..kernels.reachability import pairs_of_bits
-        for (entries, exits), items in by_shape.items():
-            step = max(1, self.PREPARE_PAIRS // max(entries * exits, 1))
-            for k in range(0, len(items), step):
-                part = items[k:k + step]
-                pairs = pairs_of_bits(torch.stack([bits for _, _, bits in part]), entries)
-                occupancy = _tile_any_stacked(pairs, self.tile, self.tile)
-                flat = pairs.flatten(1)
-                slots = flat.sum(dim = 1).tolist()
-                positions = torch.where(pairs, torch.cumsum(flat, dim = 1).view_as(pairs) - 1, -1).to(torch.int32)
-                numbers = torch.nonzero(flat, as_tuple = True)[1].to(torch.int32).split(slots)
-                for i, (path, ivs, _) in enumerate(part):
-                    every = slots[i] == entries * exits
-                    kept = self._by_path[path] = (slots[i], occupancy[i], None if every else positions[i])
-                    if not every:                        # (the slots' pairs: what the interval tables read)
-                        self._numbers[id(kept[2])] = numbers[i]
-                    for a, b in ivs:
-                        self._slots[a, b], self._occupancy[a, b], self._positions[a, b] = kept
+                todo[path] = (self.width[a], self.width[b], self._device_bits(a, b), [(a, b)])
+        items = sorted(todo.items(), key = lambda item: item[1][0] * item[1][1])     # (blocks of a size together)
+        k = 0
+        while k < len(items):                                # as many as a device call takes, padded to the largest
+            end, entries, exits = k, 0, 0
+            while end < len(items):
+                wider, longer = max(entries, items[end][1][0]), max(exits, items[end][1][1])
+                if end > k and (end - k + 1) * wider * longer > self.PREPARE_PAIRS:
+                    break
+                entries, exits, end = wider, longer, end + 1
+            self._keep_stacked(items[k:end], entries, exits)
+            k = end
+
+    def _keep_stacked(self, items: list, entries: int, exits: int) -> None:
+        """Keep what the paths ``items`` (``(path, (width at a, width at b, bits, their intervals))``) join, every block
+        padded to ``entries`` x ``exits`` pairs that no column joins, which count for nothing in row-major order."""
+        from ..kernels.reachability import pairs_of_bits, stack_bits
+        widths = np.asarray([(Wa, X) for _, (Wa, X, _, _) in items], dtype = np.int64)
+        pairs = pairs_of_bits(stack_bits([bits for _, (_, _, bits, _) in items], widths[:, 1], exits, entries), entries)
+        occupancy = _tile_any_stacked(pairs, self.tile, self.tile)
+        flat = pairs.flatten(1)
+        slots = flat.sum(dim = 1).tolist()                   # (the one wait)
+        positions = torch.where(pairs, torch.cumsum(flat, dim = 1).view_as(pairs) - 1, -1).to(torch.int32)
+        path_of, at = torch.nonzero(flat, as_tuple = True)   # the slots' pairs, `i * X + j` of each path's own X
+        numbers = ((at // max(exits, 1)) * torch.from_numpy(widths[:, 1]).to(self._dev)[path_of] + at % max(exits, 1)).to(torch.int32)
+        numbers = numbers.split(slots)
+        # the positions of the paths that do not join every pair, flat, one after the other
+        dev = self._dev
+        rows = torch.arange(entries, device = dev)[None, :] < torch.from_numpy(widths[:, 0]).to(dev)[:, None]
+        columns = torch.arange(exits, device = dev)[None, :] < torch.from_numpy(widths[:, 1]).to(dev)[:, None]
+        sizes = widths[:, 0] * widths[:, 1]
+        full = np.asarray(slots, dtype = np.int64) == sizes
+        kept_flat = positions[rows[:, :, None] & columns[:, None, :] & torch.from_numpy(~full).to(dev)[:, None, None]]
+        flat_of = iter(kept_flat.split(sizes[~full].tolist()))
+        tiles = lambda columns: (columns + self.tile - 1) // self.tile
+        for i, (path, (Wa, X, _, ivs)) in enumerate(items):
+            every = slots[i] == Wa * X
+            kept = self._by_path[path] = (slots[i], occupancy[i, :tiles(Wa), :tiles(X)], None if every else positions[i, :Wa, :X])
+            self._places[id(kept[1])] = (occupancy, i)
+            if not every:
+                self._numbers[id(kept[2])] = numbers[i]
+                self._flat[id(kept[2])] = next(flat_of)
+            for a, b in ivs:
+                self._slots[a, b], self._occupancy[a, b], self._positions[a, b] = kept
 
     def _compute(self, a: int, b: int):
         """Keep the interval's slots, positions and occupancy."""
@@ -494,6 +519,16 @@ class Reachability:
         kept = self._numbers.get(id(positions))
         return kept if kept is not None else torch.nonzero(positions.flatten() >= 0).flatten().to(torch.int32)
 
+    def flat_positions(self, positions: torch.Tensor) -> torch.Tensor:
+        """A table of :meth:`device_positions`, flat."""
+        kept = self._flat.get(id(positions))
+        return kept if kept is not None else positions.flatten()
+
+    def occupancy_place(self, occupancy: torch.Tensor) -> Optional[tuple]:
+        """``(stack, i)`` where an occupancy of :meth:`device_occupancy` is ``stack[i]`` but for tiles no column reaches,
+        or None if it stands alone."""
+        return self._places.get(id(occupancy))
+
     def pairs(self, a: int, b: int) -> torch.Tensor:
         """bool [width[a], exit width at b] (host; computed afresh, not cached)."""
         if self._dev is not None:
@@ -579,7 +614,7 @@ def interval_tables(reach: Reachability, intervals, device, of: Optional[torch.T
         if at is None:
             pairs = reach.slot_pairs(positions)
             at = seen[id(positions)] = (pairs.numel(), size, size + positions.numel())
-            parts += [positions.flatten(), pairs]
+            parts += [reach.flat_positions(positions), pairs]
             size += positions.numel() + pairs.numel()
         info.append(at)
     table = torch.cat([t.to(device) for t in parts]) if parts else torch.zeros(1, dtype = torch.int32)

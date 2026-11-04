@@ -8,6 +8,7 @@ distinct (column, successor) pairs of the automaton's alike boundaries
 
 from __future__ import annotations
 
+import numpy as np
 import torch
 import triton.language as tl
 
@@ -82,6 +83,23 @@ def advance(bits: torch.Tensor, t: int, next_width: int, tables: SweepTables) ->
         with current_device(bits.device):
             _or_predecessors_kernel[(next_width, host_cdiv(words, WORD_TILE))](
                 out, bits, tables.ptr, tables.cols, tables.group[t] * (tables.W + 1), words, TILE = WORD_TILE, num_warps = 1)
+    return out
+
+
+def stack_bits(bits: list, columns: np.ndarray, most_columns: int, entries: int) -> torch.Tensor:
+    """int32 [sweeps, ``most_columns``, words of ``entries``]: the sweeps' bits (int32 [``columns[k]``, their words]) one
+    above the other, zeros past their columns and words, in a few device calls."""
+    dev = bits[0].device
+    words = max(host_cdiv(entries, 32), 1)
+    own = np.asarray([b.size(1) for b in bits], dtype = np.int64)
+    if (columns == most_columns).all() and (own == words).all():
+        return torch.stack(bits)
+    out = torch.zeros(len(bits), most_columns, words, dtype = torch.int32, device = dev)
+    sizes = columns * own
+    sweep = np.repeat(np.arange(len(bits)), sizes)                   # every word's sweep, and its place in the sweep's
+    place = np.arange(sweep.size) - np.repeat(np.cumsum(sizes) - sizes, sizes)
+    at = sweep * (most_columns * words) + (place // own[sweep]) * words + place % own[sweep]
+    out.view(-1)[torch.from_numpy(at).to(dev)] = torch.cat([b.view(-1) for b in bits])
     return out
 
 
