@@ -70,7 +70,7 @@ def top_down_program(backend) -> TopDownProgram:
 
     def child(c: _Child) -> TopDownLaunch:
         kinds = c.kinds if c.c_full_at is None else \
-            (c.kinds[0], c.kinds[1], (all(reach.positions(x, y) is None for x, y in c.ivs), c.kinds[2]))
+            (c.kinds[0], c.kinds[1], (all(reach.keeps_every_pair(x, y) for x, y in c.ivs), c.kinds[2]))
         return TopDownLaunch(c.form, c.side, kinds, c.children, c.ptr, c.parents, max(prog._entry(x) for x, _ in c.ivs),
                              max(prog._exit(y) for _, y in c.ivs), max(reach.slots(x, y) for x, y in c.ivs), dict(c.host),
                              c.tiles, c.height)

@@ -7,6 +7,7 @@ the batches they are built in.
 """
 import gc
 import os
+import random
 import subprocess
 import sys
 import weakref
@@ -16,7 +17,8 @@ import torch
 
 import pyjuice.constraints as jc
 from pyjuice.constraints.inference.dfa_exact.compiled import program as P
-from pyjuice.constraints.inference.dfa_exact.compiled.layout import build_layout
+from pyjuice.constraints.inference.dfa_exact.compiled.layout import Reachability, build_layout, interval_tables
+from pyjuice.constraints.inference.dfa_exact.kernels.prod import skip_masks
 from pyjuice.constraints.inference.dfa_exact.kernels import sum as lifted_sum
 from pyjuice.constraints.inference.dfa_exact.kernels import transitions as TR
 
@@ -186,6 +188,7 @@ def test_the_batches_do_not_change_the_automatons_tables(seed, grouped, monkeypa
     monkeypatch.setattr(TR, "BOUNDARY_BATCH", 1)
     monkeypatch.setattr(TR, "BOUNDARY_ENTRIES_KEPT", -1)
     tr = layout.transitions(torch.device("cuda"))
+    del tr.__dict__["_boundary_groups"]                               # (kept with the transitions: built again)
     assert len(TR.boundary_groups(tr).batches) == len(TR.boundary_groups(tr).firsts) > 1
     apart = TR.transition_tables(tr, grouped)
     for k in together.__dataclass_fields__:
@@ -196,7 +199,56 @@ def test_the_batches_do_not_change_the_automatons_tables(seed, grouped, monkeypa
 def test_boundaries_alike_are_found_exactly_whatever_their_hash(monkeypatch):
     """The hash only proposes: boundaries that merely hash alike are told apart."""
     layout = build_layout(jc.DFA.contains([[1, 2]], 3), 12)
-    want = TR.boundary_groups(layout.transitions(torch.device("cuda")))
+    tr = layout.transitions(torch.device("cuda"))
+    want = TR.BoundaryGroups(tr)
     monkeypatch.setattr(TR, "_boundary_weights", lambda W, dev: torch.zeros(W, dtype = torch.int64, device = dev))
-    got = TR.boundary_groups(layout.transitions(torch.device("cuda")))
+    got = TR.BoundaryGroups(tr)
     assert got.firsts == want.firsts and got.group == want.group and len(got.firsts) > 1
+
+
+@pytest.mark.parametrize("seed", range(4))
+@pytest.mark.parametrize("tile", [1, 2, 16])
+def test_reachability_on_the_device_is_the_hosts(seed, tile):
+    """Bitset sweeps on the device against the dense ones on the host: every interval's slots, positions, occupancy
+    and pairs, whatever order they are asked in; the skip masks and interval tables read from them too."""
+    g = torch.Generator().manual_seed(seed)
+    K, C, n = 40, 5, 9
+    dfa = jc.DFA(C, torch.arange(C), torch.randint(0, K, (K, C), generator = g), 0, list(range(0, K, 2)))
+    host = Reachability(build_layout(dfa, n), tile = tile)
+    dfa_d = jc.DFA(C, torch.arange(C), dfa.delta, 0, dfa.accept)
+    device = Reachability(build_layout(dfa_d, n, device = torch.device("cuda")), tile = tile)
+    pairs = [(a, b) for a in range(n + 1) for b in range(a, n + 1)]
+    random.Random(seed).shuffle(pairs)
+    for a, b in pairs:
+        assert device.slots(a, b) == host.slots(a, b), (a, b)
+        assert device.keeps_every_pair(a, b) == (host.positions(a, b) is None), (a, b)
+        p, q = device.positions(a, b), host.positions(a, b)
+        assert (p is None) == (q is None) and (p is None or torch.equal(p, q)), (a, b)
+        assert torch.equal(device.occupancy(a, b), host.occupancy(a, b)), (a, b)
+        assert torch.equal(device.pairs(a, b), host.pairs(a, b)), (a, b)
+    intervals = [(a, b) for a, b in pairs if b > a]
+    specs = [(a, b, c) for a in range(n - 1) for b in range(a + 1, n) for c in range(b + 1, n + 1)]
+    if tile <= 16 and 16 % tile == 0:
+        got, want = skip_masks(device, specs, device = torch.device("cuda")), skip_masks(host, specs, device = torch.device("cuda"))
+        assert (got.tiles_i, got.tiles_j, got.words) == (want.tiles_i, want.tiles_j, want.words)
+        assert torch.equal(got.bits, want.bits)
+    got, want = (interval_tables(r, intervals, torch.device("cuda")) for r in (device, host))
+    assert torch.equal(got.of, want.of)
+    for (S, at, ap), (S2, at2, ap2) in zip(got.info.tolist(), want.info.tolist()):
+        assert S == S2 and (at < 0) == (at2 < 0)
+        if at >= 0:
+            assert torch.equal(got.table[at:ap + S], want.table[at2:ap2 + S2])
+
+
+def test_alike_intervals_share_their_positions():
+    """Past the shortest accepted string most boundaries are alike: an interval through them keeps one table, whatever
+    its entry -- what makes an automaton of thousands of columns on a tree fit."""
+    K, C, n = 60, 4, 24
+    g = torch.Generator().manual_seed(0)
+    dfa = jc.DFA(C, torch.arange(C), torch.randint(0, K, (K, C), generator = g), 0, list(range(K)))
+    layout = build_layout(dfa, n, device = torch.device("cuda"))
+    reach = layout.reachability
+    intervals = [(a, a + 2) for a in range(1, n - 2)]
+    tables = interval_tables(reach, intervals, torch.device("cuda"))
+    separately = sum(reach.width[a] * reach.width[b] + reach.slots(a, b) for a, b in intervals if not reach.keeps_every_pair(a, b))
+    assert separately > 0 and tables.table.numel() < separately / 2

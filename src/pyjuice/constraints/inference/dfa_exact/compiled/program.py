@@ -18,7 +18,7 @@ from ..kernels.live import live_successors
 from ..kernels.sample_transitions import sample_transition_masses
 from ..kernels.transitions import (SampleMasses, enumerated_tokens, next_col_table, sample_classes, sample_masses,
                                    transition_masses, transition_stats, transition_tables)
-from .circuit import OUT_ENDS, TRANS_COLS, circuit_tables, launch_of
+from .circuit import TRANS_COLS, circuit_tables, launch_of
 from .layout import interval_tables
 
 

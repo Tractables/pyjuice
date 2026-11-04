@@ -21,6 +21,7 @@ from __future__ import annotations
 import hashlib
 import weakref
 from dataclasses import dataclass
+from functools import cached_property
 from typing import Dict, Tuple, Union
 
 from pyjuice.nodes import CircuitNodes
@@ -62,11 +63,14 @@ class PCStructure:
     """
 
     num_vars: int
-    signature: str
     nodes: Tuple[NodeInfo, ...]
     right_linear: bool
     contiguous: bool
     max_runs: int
+
+    @cached_property
+    def signature(self) -> str:
+        return _signature([info.ns for info in self.nodes])
 
     @property
     def shape_counts(self) -> Dict[str, int]:
@@ -109,18 +113,23 @@ def analyze_structure(pc) -> PCStructure:
 
 def _analyze(root_ns: CircuitNodes) -> PCStructure:
     order = list(root_ns)                                       # children before parents
-    num_vars = max(max(ns.scope.to_list()) for ns in order) + 1 if order else 0
+    scopes = {}                                                 # a scope's runs (many node groups share a scope)
+    for ns in order:
+        key = bytes(ns.scope.values)
+        if key not in scopes:
+            scopes[key] = _runs(ns.scope.to_list())
+    num_vars = max(runs[-1][1] for runs in scopes.values()) + 1 if order else 0
+    shapes = {key: _shape(runs, num_vars) for key, runs in scopes.items()}
 
     nodes = []
     for ns in order:
         kind = "input" if ns.is_input() else ("sum" if ns.is_sum() else "prod")
-        runs = _runs(ns.scope.to_list())
-        nodes.append(NodeInfo(ns = ns, kind = kind, scope_runs = runs, shape = _shape(runs, num_vars)))
+        key = bytes(ns.scope.values)
+        nodes.append(NodeInfo(ns = ns, kind = kind, scope_runs = scopes[key], shape = shapes[key]))
 
     inner = [info for info in nodes if info.kind != "input"]
     return PCStructure(
         num_vars = num_vars,
-        signature = _signature(order),
         nodes = tuple(nodes),
         right_linear = all(info.shape in ("suffix", "whole") for info in inner),
         contiguous = all(info.num_runs == 1 for info in nodes),
@@ -161,7 +170,7 @@ def _signature(order) -> str:
     h = hashlib.sha256()
     for ns in order:
         kind = "input" if ns.is_input() else ("sum" if ns.is_sum() else "prod")
-        item = [kind, ns.num_node_blocks, ns.block_size, sorted(ns.scope.to_list())]
+        item = [kind, ns.num_node_blocks, ns.block_size, bytes(ns.scope.values).rstrip(b"\0")]
         if kind == "input":
             item += [ns.dist.get_signature(), ns.dist.get_metadata()]
         else:

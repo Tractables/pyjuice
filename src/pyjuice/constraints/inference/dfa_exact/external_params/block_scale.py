@@ -179,6 +179,9 @@ def uniform_chunks(idx: np.ndarray, valid: np.ndarray) -> dict:
     cells, ``valid`` the real ones) reads one gate cell: the forward then reads one gate per chunk and column."""
     out = {}
     E = idx.shape[1]
+    if valid.all():                                  # (a chunk is uniform where no block's cell changes inside it)
+        change = np.nonzero((idx[:, 1:] != idx[:, :-1]).any(axis = 0))[0] + 1
+        return {T: not (change % T).any() for T in GATE_CHUNKS}
     for T in GATE_CHUNKS:
         out[T] = bool(np.all(~valid | (idx == idx[:, (np.arange(E) // T) * T])))
     return out

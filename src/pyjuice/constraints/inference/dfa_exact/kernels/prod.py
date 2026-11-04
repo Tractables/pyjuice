@@ -1114,7 +1114,7 @@ def skip_masks_for(reach: Reachability, specs, tm: int = 16, tn: int = 16, tk: i
         return SkipMasks(torch.zeros(1, dtype = torch.int32, device = device), 0, 0, 1, tm, tn, tk)
 
     def occ(a, b, transposed):
-        m = reach.occupancy(a, b)
+        m = reach.device_occupancy(a, b)
         return m.t() if transposed else m
 
     lefts = sorted({a for a, _ in specs})
@@ -1126,24 +1126,27 @@ def skip_masks_for(reach: Reachability, specs, tm: int = 16, tn: int = 16, tk: i
     words = max(1, math.ceil(max(max(m.size(1) for m in L), max(m.size(0) for m in R)) / 32))
     NC = 32 * words
 
-    def stack(ms, shape):
-        out = torch.zeros(len(ms), *shape, dtype = torch.bool)
-        for k, m in enumerate(ms):
-            out[k, :m.size(0), :m.size(1)] = m
-        return out
+    where = L[0].device
+    shifts = torch.arange(32, dtype = torch.int64, device = where)
 
-    Ls, Rs = stack(L, (I, NC)), stack(R, (NC, J))
+    def packed(ms, rows, columns, transposed):
+        """int32 [len(ms), rows, words]: the shared chunks' flags of every matrix, a word per 32 chunks (bit by chunk)."""
+        out = torch.zeros(len(ms), rows, NC, dtype = torch.bool, device = where)
+        for k, m in enumerate(ms):
+            m = m.t() if transposed else m
+            out[k, :m.size(0), :m.size(1)] = m
+        w = (out.view(len(ms), rows, words, 32).to(torch.int64) << shifts).sum(dim = -1)
+        return torch.where(w >= 2 ** 31, w - 2 ** 32, w).to(torch.int32)
+
+    Lw, Rw = packed(L, I, NC, False), packed(R, J, NC, True)          # [lefts, I, words], [rights, J, words]
     lpos = {a: k for k, a in enumerate(lefts)}
     rpos = {b: k for k, b in enumerate(rights)}
-    li = torch.tensor([lpos[a] for a, _ in specs], dtype = torch.long)
-    ri = torch.tensor([rpos[b] for _, b in specs], dtype = torch.long)
-    shifts = torch.arange(32, dtype = torch.int64)
-    chunk = max(1, (1 << 26) // max(I * J * NC, 1))
+    li = torch.tensor([lpos[a] for a, _ in specs], dtype = torch.long, device = where)
+    ri = torch.tensor([rpos[b] for _, b in specs], dtype = torch.long, device = where)
+    chunk = max(1, (1 << 26) // max(I * J * words, 1))
     parts = []
     for g0 in range(0, len(specs), chunk):
-        need = Ls[li[g0:g0 + chunk], :, None, :] & Rs[ri[g0:g0 + chunk]].transpose(1, 2)[:, None, :, :]
-        w = (need.view(need.size(0), I, J, words, 32).to(torch.int64) << shifts).sum(dim = -1)
-        parts.append(torch.where(w >= 2 ** 31, w - 2 ** 32, w).to(torch.int32).flatten())
+        parts.append((Lw[li[g0:g0 + chunk], :, None, :] & Rw[ri[g0:g0 + chunk], None, :, :]).flatten())
     return SkipMasks(torch.cat(parts).to(device), I, J, words, tm, tn, tk)
 
 

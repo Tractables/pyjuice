@@ -107,28 +107,17 @@ class DFAExactBackend(Backend):
             reasons.append(f"the constraint ({type(constraint).__name__}) has no `automaton` capability, which "
                            f"exact lifting needs; it supports: {', '.join(sorted(caps))}")
 
-        by_reason = defaultdict(list)
-        for info in structure.nodes:
-            why = _unsupported_reason(info.ns, info.kind)
-            if why is not None:
-                by_reason[why].append(info.ns)
+        by_reason, vars_by_values, fragmented = _structure_refusals(structure)
         for why, group in by_reason.items():
             reasons.append(f"{_count(len(group), 'node group')} {'is' if len(group) == 1 else 'are'} not supported: "
                            f"{why}; e.g. over variables {_format_vars(group[0].scope.to_list())}")
 
-        vars_by_values = defaultdict(list)                              # (distribution, values) -> variables
-        for info in structure.nodes:
-            module = distributions.lookup(info.ns.dist) if info.kind == "input" else None
-            if module is not None:
-                key = (type(info.ns.dist).__name__, module.num_values(info.ns.dist))
-                vars_by_values[key].extend(info.ns.scope.to_list())
         for (name, num_values), vs in sorted(vars_by_values.items()):
             if num_values != constraint.vocab_size:
                 reasons.append(f"vocabulary mismatch: the constraint reads tokens 0..{constraint.vocab_size - 1} "
                                f"(vocab_size {constraint.vocab_size}), but the {name} input nodes over variables "
                                f"{_format_vars(vs)} range over {num_values} values")
 
-        fragmented = [info for info in structure.nodes if info.shape == "fragmented"]
         if fragmented:
             worst = max(fragmented, key = lambda info: info.num_runs)   # the first one with the most runs
             r = worst.num_runs
@@ -344,6 +333,26 @@ class DFAExactBackend(Backend):
         not change it (:class:`~.queries.decoder.DFAExactDecoder`)."""
         from .queries.decoder import DFAExactDecoder
         return DFAExactDecoder(cc, **{**self.decoder_defaults, **options})
+
+
+def _structure_refusals(structure: PCStructure):
+    """What :meth:`DFAExactBackend.refusals` reads of a circuit, kept with its structure: ``(by_reason, vars_by_values,
+    fragmented)``, the node groups by the reason this backend cannot serve them, the input nodes' variables by
+    ``(distribution, values)``, and the fragmented node groups."""
+    kept = structure.__dict__.get("_dfa_exact_refusals")
+    if kept is None:
+        by_reason, vars_by_values = defaultdict(list), defaultdict(list)
+        for info in structure.nodes:
+            why = _unsupported_reason(info.ns, info.kind)
+            if why is not None:
+                by_reason[why].append(info.ns)
+            module = distributions.lookup(info.ns.dist) if info.kind == "input" else None
+            if module is not None:
+                key = (type(info.ns.dist).__name__, module.num_values(info.ns.dist))
+                vars_by_values[key].extend(info.ns.scope.to_list())
+        fragmented = [info for info in structure.nodes if info.shape == "fragmented"]
+        kept = structure.__dict__["_dfa_exact_refusals"] = (by_reason, vars_by_values, fragmented)
+    return kept
 
 
 def _unsupported_reason(ns, kind: str) -> Optional[str]:

@@ -54,14 +54,21 @@ class BoundaryLayout:
     n: int
     token_class: torch.Tensor
     width: torch.Tensor
-    state_id: torch.Tensor
-    col_of_state: torch.Tensor
     delta: torch.Tensor
     satisfiable: bool
+    on_device: tuple                                  # (device, delta, state_id, col_of_state), as they were built
+
+    @cached_property
+    def state_id(self) -> torch.Tensor:
+        return self.on_device[2].cpu()
+
+    @cached_property
+    def col_of_state(self) -> torch.Tensor:
+        return self.on_device[3].cpu()
 
     @property
     def max_width(self) -> int:
-        return self.state_id.size(1)
+        return self.on_device[2].size(1)
 
     @cached_property
     def reachability(self) -> "Reachability":
@@ -92,11 +99,18 @@ class BoundaryLayout:
 
     def transitions(self, device) -> "Transitions":
         """The layout's transitions on ``device`` (:class:`Transitions`)."""
-        widths = [int(w) for w in self.width.tolist()]
-        dev, delta, state_id, col_of_state = self.__dict__.get("_on_device", (None, None, None, None))
-        if dev == torch.device(device):
-            return Transitions(delta, state_id, col_of_state, widths)
-        return Transitions(self.delta.to(device), self.state_id.to(device), self.col_of_state.to(device), widths)
+        device = torch.device(device)
+        kept = self.__dict__.setdefault("_transitions", {})
+        tr = kept.get(device)
+        if tr is None:
+            widths = [int(w) for w in self.width.tolist()]
+            dev, delta, state_id, col_of_state = self.on_device
+            if dev == device:
+                tr = Transitions(delta, state_id, col_of_state, widths)
+            else:
+                tr = Transitions(delta.to(device), state_id.to(device), col_of_state.to(device), widths)
+            kept[device] = tr
+        return tr
 
     @cached_property
     def successors(self):
@@ -246,10 +260,9 @@ def _build(dfa: DFA, n: int, device = None, report = None) -> BoundaryLayout:
     state_id[rows, cols[rows, at]] = order[at]
     col_of_state = torch.full((n + 1, K), -1, dtype = torch.long, device = dev)
     col_of_state[rows, order[at]] = cols[rows, at]
-    # (the automaton's tables are not copied: nothing writes them; on the device they are kept for the transitions)
-    layout = BoundaryLayout(n = n, token_class = dfa._token_class, width = width.cpu(), state_id = state_id.cpu(),
-                            col_of_state = col_of_state.cpu(), delta = dfa._delta, satisfiable = bool(width[0] > 0))
-    layout.__dict__["_on_device"] = (dev, delta, state_id, col_of_state)
+    # (the automaton's tables are not copied: nothing writes them)
+    layout = BoundaryLayout(n = n, token_class = dfa._token_class, width = width.cpu(), delta = dfa._delta,
+                            satisfiable = bool(width[0] > 0), on_device = (dev, delta, state_id, col_of_state))
     if report is not None:
         report.advance()
     return layout
@@ -260,8 +273,9 @@ class Reachability:
     Which (column at boundary ``a``, column at boundary ``b``) pairs the automaton joins in exactly ``b - a``
     tokens -- the entries of a block over ``[a, b)`` that are not structurally ``-inf``, and the only ones a block
     keeps: its SLOTS, the joined pairs in row-major order. A sequence end (``b == n``) is one column, joined from
-    every column that can still accept. Per interval, computed on demand by one forward sweep per entry boundary
-    (the pair matrices dropped as the sweep moves on):
+    every column that can still accept. Per interval, computed when first asked, by a forward sweep from its entry
+    boundary as far as it asks: on the device its layout was built on (bitsets, :mod:`~..kernels.reachability`), on the
+    host for one built there:
 
     * :meth:`slots`: how many pairs are joined. A prefix (``a == 0``) or a suffix (``b == n``) joins every pair --
       every column is reachable from the initial state and can still accept -- so neither is swept;
@@ -273,14 +287,22 @@ class Reachability:
     :param tile: the side of an occupancy tile, in columns
     """
 
+    #: the words of the sweeps kept to go on from (on the device), the last used kept
+    SWEEP_WORDS = 1 << 28
+
     def __init__(self, layout: BoundaryLayout, tile: int = 16):
         self.n = layout.n
         self.width = [int(w) for w in layout.width.tolist()]
         self.tile = tile
         self._layout = layout
+        self._dev = layout.on_device[0] if layout.on_device[0].type == "cuda" else None
         self._occupancy: Dict[Tuple[int, int], torch.Tensor] = {}
         self._slots: Dict[Tuple[int, int], int] = {}
         self._positions: Dict[Tuple[int, int], Optional[torch.Tensor]] = {}
+        self._sweeps = None
+        self._by_path: Dict[tuple, tuple] = {}             # the boundaries' groups an interval passes -> what it keeps
+        self._bits: "OrderedDict[tuple, torch.Tensor]" = OrderedDict()   # ... -> where a sweep along them is
+        self._bits_words = 0
 
     def exit_width(self, b: int) -> int:
         return 1 if b == self.n else self.width[b]
@@ -288,21 +310,46 @@ class Reachability:
     def _every_pair(self, a: int, b: int) -> bool:
         return a == 0 or b == self.n
 
+    def _compute(self, a: int, b: int):
+        """Keep the interval's slots, positions and occupancy."""
+        if self._dev is None:
+            self._sweep(a)
+            return
+        # intervals through the same alike boundaries join the same pairs: what they keep is one, and tables of them
+        # are too (past the shortest accepted string, most intervals of a length are alike)
+        path = self._path(a, b)
+        kept = self._by_path.get(path)
+        if kept is None:
+            pairs = self._device_pairs(a, b)
+            self._keep(a, b, pairs)
+            self._by_path[path] = (self._slots[a, b], self._occupancy[a, b], self._positions[a, b])
+        else:
+            self._slots[a, b], self._occupancy[a, b], self._positions[a, b] = kept
+
     def slots(self, a: int, b: int) -> int:
         """The joined pairs of the interval ``[a, b)``: the slots of its blocks."""
         if self._every_pair(a, b):
             return self.width[a] * self.exit_width(b)
         if (a, b) not in self._slots:
-            self._sweep(a)
+            self._compute(a, b)
         return self._slots[a, b]
 
+    def keeps_every_pair(self, a: int, b: int) -> bool:
+        """Whether the automaton joins every pair of the interval: :meth:`positions` is None."""
+        return self._every_pair(a, b) or self.slots(a, b) == self.width[a] * self.exit_width(b)
+
     def positions(self, a: int, b: int) -> Optional[torch.Tensor]:
-        """int32 [width[a], exit width at b]: the slot of every pair, -1 where not joined; None if every pair is
+        """int32 [width[a], exit width at b] (host): the slot of every pair, -1 where not joined; None if every pair is
         joined."""
+        out = self.device_positions(a, b)
+        return None if out is None else out.cpu()
+
+    def device_positions(self, a: int, b: int) -> Optional[torch.Tensor]:
+        """:meth:`positions`, where they are kept."""
         if self._every_pair(a, b):
             return None
         if (a, b) not in self._positions:
-            self._sweep(a)
+            self._compute(a, b)
         return self._positions[a, b]
 
     def _advance(self, cur: torch.Tensor, t: int) -> torch.Tensor:
@@ -320,39 +367,91 @@ class Reachability:
         nxt.index_add_(1, cols[keep], cur[:, k[keep]])
         return (nxt > 0).to(cur.dtype)
 
+    def _keep(self, a: int, b: int, pairs: torch.Tensor):
+        self._occupancy[a, b] = _tile_any(pairs, self.tile, self.tile)
+        count = int(pairs.sum())
+        self._slots[a, b] = count
+        self._positions[a, b] = None if count == pairs.numel() else \
+            torch.where(pairs, torch.cumsum(pairs.flatten(), 0).view_as(pairs) - 1, -1).to(torch.int32)
+
     def _sweep(self, a: int):
         """Every interval starting at ``a``: pairs (a, b) for b = a, ..., n, kept as occupancy, slots and
-        positions."""
+        positions (on the host)."""
         cur = torch.eye(self.width[a])
         for b in range(a, self.n + 1):
             if b > a:
                 cur = self._advance(cur, b - 1)
-            pairs = (cur.sum(dim = 1, keepdim = True) if b == self.n else cur) > 0
-            self._occupancy[a, b] = _tile_any(pairs, self.tile, self.tile)
-            count = int(pairs.sum())
-            self._slots[a, b] = count
-            self._positions[a, b] = None if count == pairs.numel() else \
-                torch.where(pairs, torch.cumsum(pairs.flatten(), 0).view_as(pairs) - 1, -1).to(torch.int32)
+            self._keep(a, b, (cur.sum(dim = 1, keepdim = True) if b == self.n else cur) > 0)
+
+    def _tables(self):
+        from ..kernels.reachability import sweep_tables
+        if self._sweeps is None:
+            self._sweeps = sweep_tables(self._layout.transitions(self._dev))
+        return self._sweeps
+
+    def _path(self, a: int, b: int) -> tuple:
+        """What the pairs of ``[a, b)`` depend on: the boundaries' groups it passes (a group fixes a boundary's states and
+        the next's), or for no boundary, its width."""
+        return tuple(self._tables().group[a:b]) if b > a else ("identity", self.width[a])
+
+    def _device_pairs(self, a: int, b: int) -> torch.Tensor:
+        """bool [width[a], exit width at b] on the device: a prefix's and a suffix's every pair, else by a sweep along
+        the interval's boundaries, going on from the longest part of them swept already."""
+        from ..kernels.reachability import advance, column_bits, pairs_of_bits
+        Wa, X = self.width[a], self.exit_width(b)
+        if self._every_pair(a, b):
+            return torch.ones(Wa, X, dtype = torch.bool, device = self._dev)
+        tables = self._tables()
+        t, bits = b, None
+        while t > a:
+            bits = self._bits.get(tuple(tables.group[a:t]))
+            if bits is not None:
+                break
+            t -= 1
+        if bits is None:
+            t, bits = a, column_bits(Wa, self._dev)
+        for t in range(t, b):
+            bits = advance(bits, t, self.width[t + 1], tables)
+            key = tuple(tables.group[a:t + 1])
+            if key not in self._bits:
+                self._bits[key] = bits
+                self._bits_words += bits.numel()
+            self._bits.move_to_end(key)
+        while self._bits_words > self.SWEEP_WORDS and len(self._bits) > 1:
+            _, old = self._bits.popitem(last = False)
+            self._bits_words -= old.numel()
+        return pairs_of_bits(bits, Wa)
 
     def pairs(self, a: int, b: int) -> torch.Tensor:
-        """bool [width[a], exit width at b]: the joined pairs (computed afresh, not cached)."""
+        """bool [width[a], exit width at b] (host; computed afresh, not cached)."""
+        if self._dev is not None:
+            return self._device_pairs(a, b).cpu()
         cur = torch.eye(self.width[a])
         for t in range(a, b):
             cur = self._advance(cur, t)
         return (cur.sum(dim = 1, keepdim = True) if b == self.n else cur) > 0
 
     def occupancy(self, a: int, b: int) -> torch.Tensor:
-        """bool [ceil(width[a] / tile), ceil(exit width at b / tile)]."""
+        """bool [ceil(width[a] / tile), ceil(exit width at b / tile)] (host)."""
+        return self.device_occupancy(a, b).cpu()
+
+    def device_occupancy(self, a: int, b: int) -> torch.Tensor:
+        """:meth:`occupancy`, where it is kept."""
         if (a, b) not in self._occupancy:
-            self._sweep(a)
+            if self._dev is None or not self._every_pair(a, b):
+                self._compute(a, b)
+            else:
+                self._occupancy[a, b] = _tile_any(self._device_pairs(a, b), self.tile, self.tile)
         return self._occupancy[a, b]
 
 
 def _tile_any(m: torch.Tensor, tr: int, tc: int) -> torch.Tensor:
     """[ceil(R / tr), ceil(C / tc)]: whether each tr x tc tile of the bool matrix ``m`` holds a True."""
+    if tr == 1 and tc == 1:
+        return m
     R, C = m.shape
     I, J = math.ceil(R / tr), math.ceil(C / tc)
-    p = torch.zeros(I * tr, J * tc, dtype = torch.bool)
+    p = torch.zeros(I * tr, J * tc, dtype = torch.bool, device = m.device)
     p[:R, :C] = m
     return p.view(I, tr, J, tc).any(dim = 3).any(dim = 1)
 
@@ -383,16 +482,19 @@ def interval_tables(reach: Reachability, intervals, device, of: Optional[torch.T
         of = torch.full(((n + 1) * (n + 1),), -1, dtype = torch.int32)
         for k, (a, b) in enumerate(intervals):
             of[a * (n + 1) + b] = k
-    info, parts, size = [], [], 0
+    info, parts, size, seen = [], [], 0, {}
     for a, b in intervals:
-        positions = reach.positions(a, b)
+        positions = reach.device_positions(a, b)
         if positions is None:
             info.append((reach.slots(a, b), -1, -1))
-        else:
+            continue
+        at = seen.get(id(positions))                            # (alike intervals keep one table of positions)
+        if at is None:
             pairs = torch.nonzero(positions.flatten() >= 0).flatten().to(torch.int32)
-            info.append((pairs.numel(), size, size + positions.numel()))
+            at = seen[id(positions)] = (pairs.numel(), size, size + positions.numel())
             parts += [positions.flatten(), pairs]
             size += positions.numel() + pairs.numel()
-    table = torch.cat(parts) if parts else torch.zeros(1, dtype = torch.int32)
+        info.append(at)
+    table = torch.cat([t.to(device) for t in parts]) if parts else torch.zeros(1, dtype = torch.int32)
     return IntervalTables(of.to(device), torch.tensor(info, dtype = torch.int64).reshape(-1, 3).to(device),
                           table.to(device))
