@@ -13,6 +13,7 @@ weight (``enum_logw``, see :class:`~..state.ClassMasses`) over the row's ``Z``.
 """
 
 import math
+import weakref
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
@@ -190,7 +191,7 @@ class BoundaryGroups:
 
     def __init__(self, tr):
         n, dev = tr.n, tr.device
-        self.tr = tr
+        self.tr = weakref.proxy(tr)                                          # (it keeps them: no cycle)
         sid = tr.state_id
         hashed = ((sid + 2) * _boundary_weights(sid.size(1), dev)).sum(dim = 1)   # (a sum of products, wrapping)
         _, boundary = torch.unique(hashed, return_inverse = True)            # boundaries of the same states, ...

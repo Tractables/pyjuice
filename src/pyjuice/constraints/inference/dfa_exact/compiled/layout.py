@@ -74,7 +74,7 @@ class BoundaryLayout:
     def reachability(self) -> "Reachability":
         """The pairs of columns the automaton joins, per interval (:class:`Reachability`, built on first use and kept
         with the layout)."""
-        return Reachability(self)
+        return Reachability(weakref.proxy(self))     # (it keeps it: no cycle to wait for a collection)
 
     @property
     def num_classes(self) -> int:
@@ -200,7 +200,13 @@ def build_layout(automaton: DFA, n: int, device = None, report = None) -> Bounda
         _CACHE.move_to_end(key)
         return kept[1]
     layout = _build(automaton, int(n), device, report)
-    _CACHE[key] = (weakref.ref(automaton), layout)
+
+    def forget(ref):                                                      # (a dead automaton's layout: freed with it)
+        kept = _CACHE.get(key)
+        if kept is not None and kept[0] is ref:
+            del _CACHE[key]
+
+    _CACHE[key] = (weakref.ref(automaton, forget), layout)
     _CACHE.move_to_end(key)
     if len(_CACHE) > _CACHE_SIZE:
         _CACHE.popitem(last = False)

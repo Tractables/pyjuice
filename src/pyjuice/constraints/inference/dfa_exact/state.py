@@ -24,6 +24,7 @@ session's scope exits (:meth:`State.masses`).
 
 from __future__ import annotations
 
+import weakref
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
@@ -203,7 +204,7 @@ class PriorPool:
     """
 
     def __init__(self, state: "State", budget: Optional[int] = None):
-        self.state = state
+        self.state = weakref.proxy(state)             # (it owns the pool: no cycle to wait for a collection)
         self.budget = budget
         self.buffer: Optional[torch.Tensor] = None
         self.extents: Dict[int, tuple] = {}           # region -> (offset, floats)
@@ -435,8 +436,8 @@ class State:
     """
 
     def __init__(self, backend):
-        self._backend = backend
-        self._device = backend.device
+        self._backend = weakref.proxy(backend)      # (it owns the state: dropped, it frees the buffers at once, with no
+        self._device = backend.device               # collection to wait for)
         self._storage = {}                          # buffer name -> backing storage (see `storage_view`)
         self._layouts = {}                          # batch size -> `buffer_layout` and its device tensors
         self._class_rows = None                     # where the input nodes' class masses are (see `class_mass_rows`)
@@ -886,7 +887,7 @@ class State:
         if poison and self._storage.get("prior_mars") is not None:
             self._storage["prior_mars"].fill_(float("nan"))
         if poison and self._prior_flows_state is not None:      # rows given again (filled with -inf) on next use
-            R = len(self._backend.sum_regions)
+            R = len(self._prior_flows_state["offset"])      # (a scope may outlive the backend)
             self._prior_flows_state["flows"].fill_(float("nan"))
             self._prior_flows_state = dict(self._prior_flows_state, offset = [-1] * R, width = [0] * R, size = 0)
             self._prior_flows_state.pop("offset_t")

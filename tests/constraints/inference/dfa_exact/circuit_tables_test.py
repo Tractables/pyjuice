@@ -252,3 +252,55 @@ def test_alike_intervals_share_their_positions():
     tables = interval_tables(reach, intervals, torch.device("cuda"))
     separately = sum(reach.width[a] * reach.width[b] + reach.slots(a, b) for a, b in intervals if not reach.keeps_every_pair(a, b))
     assert separately > 0 and tables.table.numel() < separately / 2
+
+
+@pytest.mark.parametrize("kind", ["hmm", "pd"])
+@pytest.mark.parametrize("session", ["queries", "decoder", "fast_inference"])
+def test_a_dropped_constraint_is_freed_at_once(kind, session, build_pc):
+    # constraint after constraint on a live circuit: nothing of the last waits for a collection of the whole heap
+    n = KINDS[kind]
+    pc = build_pc(kind, n, V)
+    x = torch.zeros(2, n, dtype = torch.long, device = "cuda")
+    m = torch.zeros(2, n, dtype = torch.bool, device = "cuda")
+    m[:, n // 2:] = True
+
+    def use(cc):
+        if session == "queries":
+            cc.conditional(x, m), cc.marginal(x, m)
+        elif session == "decoder":
+            with cc.decoder() as d:
+                d.conditional(x, m), d.marginal(x, m)
+        else:
+            import pyjuice as juice
+            with juice.fast_inference():
+                cc.conditional(x, m), cc.marginal(x, m)
+
+    def one():
+        cc = jc.compile(jc.DFA.contains([[1, 2]], V), pc)
+        use(cc)
+        return [weakref.ref(o) for o in (cc, cc.backend, cc.backend.state, cc.backend.program(), cc.backend.layout,
+                                         cc.backend.layout.reachability, cc.backend.automaton)]
+
+    one()                                                # (what the circuit keeps, and a kernel's first run)
+    gc.collect()
+    before = torch.cuda.memory_allocated()
+    gc.disable()
+    try:
+        refs = one()
+        assert [r() for r in refs] == [None] * len(refs)
+        assert torch.cuda.memory_allocated() <= before
+    finally:
+        gc.enable()
+
+
+def test_a_layout_stays_for_a_live_automaton_and_goes_with_it():
+    dfa = jc.DFA.contains([[1, 2]], V)
+    first = build_layout(dfa, 5)
+    assert build_layout(dfa, 5) is first
+    from pyjuice.constraints.inference.dfa_exact.compiled import layout as L
+    keys = [k for k in L._CACHE if k[0] == id(dfa)]
+    assert keys
+    held = len(L._CACHE)
+    del dfa
+    assert len(L._CACHE) == held - len(keys)
+    assert first.reachability.slots(0, 5) >= 1           # (what is at hand still works)
