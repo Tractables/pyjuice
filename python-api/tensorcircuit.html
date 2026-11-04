@@ -136,7 +136,7 @@ homogeneous HMM (seq 32, 1024 latents, 126464 cats, top-k 1024 soft evidence), g
 4 accumulator blocks to 1: <cite>param_flows</cite> 4.14 -&gt; 1.04 GB, backward 16.8 -&gt; 13.4 ms and
 <cite>init_param_flows</cite> 5.7 -&gt; 1.4 ms (1.41x on the step), with parameters after an EM step
 agreeing to ~2e-5 relative – flow-accumulation reassociation only. For scale, on the same
-GPU 268M <a href="#id1"><span class="problematic" id="id2">`</span></a>atomic_add`s all targeting ONE address cost 3.7 ms, versus 44 ms for the same
+GPU 268M <cite>atomic_add</cite> calls all targeting ONE address cost 3.7 ms, versus 44 ms for the same
 count scattered over a 4 GB table: contention is the cheap side of the trade. Lower it
 only for a model where atomic stalls are demonstrably the bottleneck.</p>
 </dd>

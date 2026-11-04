@@ -35,8 +35,8 @@ Helpers that build structured (block-diagonal or block-sparse) edge patterns, pa
     :toctree: generated
     :nosignatures:
 
-    edge_constructors.block_diagonal_edge_constructor
-    edge_constructors.block_sparse_rnd_blk_edge_constructor
+    methods.edge_constructors.block_diagonal_edge_constructor
+    methods.edge_constructors.block_sparse_rnd_blk_edge_constructor
 
 Input Distributions
 -------------------

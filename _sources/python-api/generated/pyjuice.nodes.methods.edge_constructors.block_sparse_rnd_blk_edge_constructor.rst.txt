@@ -1,0 +1,6 @@
+﻿pyjuice.nodes.methods.edge\_constructors.block\_sparse\_rnd\_blk\_edge\_constructor
+===================================================================================
+
+.. currentmodule:: pyjuice.nodes.methods.edge_constructors
+
+.. autofunction:: block_sparse_rnd_blk_edge_constructor

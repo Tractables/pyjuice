@@ -69,8 +69,8 @@
 </ul>
 </li>
 <li class="toctree-l2"><a class="reference internal" href="#edge-constructors">Edge Constructors</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="generated/pyjuice.nodes.edge_constructors.block_diagonal_edge_constructor.html">pyjuice.nodes.edge_constructors.block_diagonal_edge_constructor</a></li>
-<li class="toctree-l3"><a class="reference internal" href="generated/pyjuice.nodes.edge_constructors.block_sparse_rnd_blk_edge_constructor.html">pyjuice.nodes.edge_constructors.block_sparse_rnd_blk_edge_constructor</a></li>
+<li class="toctree-l3"><a class="reference internal" href="generated/pyjuice.nodes.methods.edge_constructors.block_diagonal_edge_constructor.html">pyjuice.nodes.methods.edge_constructors.block_diagonal_edge_constructor</a></li>
+<li class="toctree-l3"><a class="reference internal" href="generated/pyjuice.nodes.methods.edge_constructors.block_sparse_rnd_blk_edge_constructor.html">pyjuice.nodes.methods.edge_constructors.block_sparse_rnd_blk_edge_constructor</a></li>
 </ul>
 </li>
 <li class="toctree-l2"><a class="reference internal" href="#input-distributions">Input Distributions</a><ul>
@@ -159,10 +159,10 @@
 <code class="docutils literal notranslate"><span class="pre">edge_ids</span></code> argument of <a class="reference internal" href="generated/pyjuice.summate.html#pyjuice.summate" title="pyjuice.summate"><code class="xref py py-func docutils literal notranslate"><span class="pre">summate()</span></code></a>.</p>
 <table class="autosummary longtable docutils align-default">
 <tbody>
-<tr class="row-odd"><td><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">edge_constructors.block_diagonal_edge_constructor</span></code></p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="generated/pyjuice.nodes.methods.edge_constructors.block_diagonal_edge_constructor.html#pyjuice.nodes.methods.edge_constructors.block_diagonal_edge_constructor" title="pyjuice.nodes.methods.edge_constructors.block_diagonal_edge_constructor"><code class="xref py py-obj docutils literal notranslate"><span class="pre">methods.edge_constructors.block_diagonal_edge_constructor</span></code></a></p></td>
 <td><p>An edge constructor that connects sum and child node blocks in a one-to-one (block-diagonal) pattern: the i-th sum node block is connected only to the i-th child node block.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">edge_constructors.block_sparse_rnd_blk_edge_constructor</span></code></p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="generated/pyjuice.nodes.methods.edge_constructors.block_sparse_rnd_blk_edge_constructor.html#pyjuice.nodes.methods.edge_constructors.block_sparse_rnd_blk_edge_constructor" title="pyjuice.nodes.methods.edge_constructors.block_sparse_rnd_blk_edge_constructor"><code class="xref py py-obj docutils literal notranslate"><span class="pre">methods.edge_constructors.block_sparse_rnd_blk_edge_constructor</span></code></a></p></td>
 <td><p>An edge constructor that connects every sum node block to <cite>num_chs_per_block</cite> randomly chosen, distinct child node blocks (all of them, if there are fewer), yielding a block-sparse (rather than fully-connected) sum layer.</p></td>
 </tr>
 </tbody>

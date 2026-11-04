@@ -6,7 +6,7 @@
   <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
 
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>pyjuice.nodes.edge_constructors.block_sparse_rnd_blk_edge_constructor &mdash; PyJuice 2.7.0 documentation</title>
+  <title>pyjuice.nodes.methods.edge_constructors.block_diagonal_edge_constructor &mdash; PyJuice 2.7.0 documentation</title>
       <link rel="stylesheet" type="text/css" href="../../_static/pygments.css?v=b86133f3" />
       <link rel="stylesheet" type="text/css" href="../../_static/css/theme.css?v=9edc463e" />
       <link rel="stylesheet" type="text/css" href="../../_static/sg_gallery.css?v=c83e6b79" />
@@ -24,8 +24,8 @@
     <script src="../../_static/js/theme.js"></script>
     <link rel="index" title="Index" href="../../genindex.html" />
     <link rel="search" title="Search" href="../../search.html" />
-    <link rel="next" title="pyjuice.nodes.distributions.Bernoulli" href="pyjuice.nodes.distributions.Bernoulli.html" />
-    <link rel="prev" title="pyjuice.nodes.edge_constructors.block_diagonal_edge_constructor" href="pyjuice.nodes.edge_constructors.block_diagonal_edge_constructor.html" /> 
+    <link rel="next" title="pyjuice.nodes.methods.edge_constructors.block_sparse_rnd_blk_edge_constructor" href="pyjuice.nodes.methods.edge_constructors.block_sparse_rnd_blk_edge_constructor.html" />
+    <link rel="prev" title="pyjuice.nodes.foldup_aggregate" href="pyjuice.nodes.foldup_aggregate.html" /> 
 </head>
 
 <body class="wy-body-for-nav"> 
@@ -59,8 +59,11 @@
 <li class="toctree-l2"><a class="reference internal" href="../nodes.html#nodes">Nodes</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../nodes.html#methods">Methods</a></li>
 <li class="toctree-l2 current"><a class="reference internal" href="../nodes.html#edge-constructors">Edge Constructors</a><ul class="current">
-<li class="toctree-l3"><a class="reference internal" href="pyjuice.nodes.edge_constructors.block_diagonal_edge_constructor.html">pyjuice.nodes.edge_constructors.block_diagonal_edge_constructor</a></li>
-<li class="toctree-l3 current"><a class="current reference internal" href="#">pyjuice.nodes.edge_constructors.block_sparse_rnd_blk_edge_constructor</a></li>
+<li class="toctree-l3 current"><a class="current reference internal" href="#">pyjuice.nodes.methods.edge_constructors.block_diagonal_edge_constructor</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="#pyjuice.nodes.methods.edge_constructors.block_diagonal_edge_constructor"><code class="docutils literal notranslate"><span class="pre">block_diagonal_edge_constructor()</span></code></a></li>
+</ul>
+</li>
+<li class="toctree-l3"><a class="reference internal" href="pyjuice.nodes.methods.edge_constructors.block_sparse_rnd_blk_edge_constructor.html">pyjuice.nodes.methods.edge_constructors.block_sparse_rnd_blk_edge_constructor</a></li>
 </ul>
 </li>
 <li class="toctree-l2"><a class="reference internal" href="../nodes.html#input-distributions">Input Distributions</a></li>
@@ -87,9 +90,9 @@
   <ul class="wy-breadcrumbs">
       <li><a href="../../index.html" class="icon icon-home" aria-label="Home"></a></li>
           <li class="breadcrumb-item"><a href="../nodes.html">pyjuice.nodes</a></li>
-      <li class="breadcrumb-item active">pyjuice.nodes.edge_constructors.block_sparse_rnd_blk_edge_constructor</li>
+      <li class="breadcrumb-item active">pyjuice.nodes.methods.edge_constructors.block_diagonal_edge_constructor</li>
       <li class="wy-breadcrumbs-aside">
-            <a href="../../_sources/python-api/generated/pyjuice.nodes.edge_constructors.block_sparse_rnd_blk_edge_constructor.rst.txt" rel="nofollow"> View page source</a>
+            <a href="../../_sources/python-api/generated/pyjuice.nodes.methods.edge_constructors.block_diagonal_edge_constructor.rst.txt" rel="nofollow"> View page source</a>
       </li>
   </ul>
   <hr/>
@@ -97,16 +100,33 @@
           <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
            <div itemprop="articleBody">
              
-  <section id="pyjuice-nodes-edge-constructors-block-sparse-rnd-blk-edge-constructor">
-<h1>pyjuice.nodes.edge_constructors.block_sparse_rnd_blk_edge_constructor<a class="headerlink" href="#pyjuice-nodes-edge-constructors-block-sparse-rnd-blk-edge-constructor" title="Link to this heading"></a></h1>
+  <section id="pyjuice-nodes-methods-edge-constructors-block-diagonal-edge-constructor">
+<h1>pyjuice.nodes.methods.edge_constructors.block_diagonal_edge_constructor<a class="headerlink" href="#pyjuice-nodes-methods-edge-constructors-block-diagonal-edge-constructor" title="Link to this heading"></a></h1>
+<dl class="py function">
+<dt class="sig sig-object py" id="pyjuice.nodes.methods.edge_constructors.block_diagonal_edge_constructor">
+<span class="sig-prename descclassname"><span class="pre">pyjuice.nodes.methods.edge_constructors.</span></span><span class="sig-name descname"><span class="pre">block_diagonal_edge_constructor</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">ns0</span></span></em>, <em class="sig-param"><span class="o"><span class="pre">*</span></span><span class="n"><span class="pre">args</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">num_node_blocks</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3/builtins/functions.html#int" title="(in Python v3.15)"><span class="pre">int</span></a></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">block_size</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3/builtins/functions.html#int" title="(in Python v3.15)"><span class="pre">int</span></a></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">0</span></span></em>, <em class="sig-param"><span class="o"><span class="pre">**</span></span><span class="n"><span class="pre">kwargs</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#pyjuice.nodes.methods.edge_constructors.block_diagonal_edge_constructor" title="Link to this definition"></a></dt>
+<dd><p>An edge constructor that connects sum and child node blocks in a one-to-one (block-diagonal)
+pattern: the i-th sum node block is connected only to the i-th child node block. It is meant to be
+passed as the <cite>edge_ids</cite> argument of <a class="reference internal" href="pyjuice.summate.html#pyjuice.summate" title="pyjuice.summate"><code class="xref py py-func docutils literal notranslate"><span class="pre">summate()</span></code></a>, and requires the number of sum node
+blocks to equal the total number of child node blocks.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>ns0</strong> (<a class="reference internal" href="pyjuice.nodes.CircuitNodes.html#pyjuice.nodes.CircuitNodes" title="pyjuice.nodes.CircuitNodes"><em>CircuitNodes</em></a>) – the first child node group; additional child node groups are passed as positional arguments</p>
+</dd>
+<dt class="field-even">Returns<span class="colon">:</span></dt>
+<dd class="field-even"><p>an edge-id tensor of size [2, num_node_blocks], or <cite>None</cite> when <cite>block_size == 1</cite></p>
+</dd>
+</dl>
+</dd></dl>
+
 </section>
 
 
            </div>
           </div>
           <footer><div class="rst-footer-buttons" role="navigation" aria-label="Footer">
-        <a href="pyjuice.nodes.edge_constructors.block_diagonal_edge_constructor.html" class="btn btn-neutral float-left" title="pyjuice.nodes.edge_constructors.block_diagonal_edge_constructor" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> Previous</a>
-        <a href="pyjuice.nodes.distributions.Bernoulli.html" class="btn btn-neutral float-right" title="pyjuice.nodes.distributions.Bernoulli" accesskey="n" rel="next">Next <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+        <a href="pyjuice.nodes.foldup_aggregate.html" class="btn btn-neutral float-left" title="pyjuice.nodes.foldup_aggregate" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> Previous</a>
+        <a href="pyjuice.nodes.methods.edge_constructors.block_sparse_rnd_blk_edge_constructor.html" class="btn btn-neutral float-right" title="pyjuice.nodes.methods.edge_constructors.block_sparse_rnd_blk_edge_constructor" accesskey="n" rel="next">Next <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
     </div>
 
   <hr/>

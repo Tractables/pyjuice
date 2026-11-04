@@ -106,7 +106,7 @@ For example, :code:`edge_ids[1,0] = 1` means that the 1th product node block con
 
 We require the node vectors fed to :code:`pyjuice.multiply` have the same :code:`block_size`. And the block size of the output product node vector is also the same with that of the inputs.
 We do not need to specify the number of node blocks (e.g., using :code:`num_node_blocks`) since it is equal to :code:`edge_ids.size(0)`.
-For :code:`pyjuice.multiply`, if two node blocks are connected (as defined by :code:`edge_ids`), we assume the :math:`i`th node in the (parent) product node block is connected to the :math:`i`th node in the child node block.
+For :code:`pyjuice.multiply`, if two node blocks are connected (as defined by :code:`edge_ids`), we assume the :math:`i` th node in the (parent) product node block is connected to the :math:`i` th node in the child node block.
 
 When we do not provide the :code:`edge_ids`, PyJuice assumes it to be the following (we can only use this shortcut when the child node vectors have the same :code:`num_node_blocks` and :code:`block_size`):
 
