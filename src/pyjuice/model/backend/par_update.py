@@ -13,7 +13,7 @@ from pyjuice.utils.kernel_launcher import FastJITFunction
 from pyjuice.utils.util import device_scalars
 
 
-@njit
+@njit(cache = True)
 def _record_par_blks(par_start_ids, pflow_start_ids, blk_sizes, blk_intervals, global_nids, nchs,
                      num_edges_per_ng, ns_num_node_blocks, ns_block_size, cs_block_size, pid, 
                      global_nid, par_start, pflow_start, BLOCK_SIZE):
