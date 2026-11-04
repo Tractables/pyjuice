@@ -10,7 +10,7 @@ from typing import Any, Dict, Optional
 import torch
 
 from .inference.base import Backend
-from .evidence import candidate_tensor, evidence, target_mask
+from .evidence import candidate_tensor, current_device, evidence, target_mask
 from .language.base import Constraint
 from .structure import PCStructure, analyze_structure
 
@@ -138,7 +138,8 @@ class ConstrainedCircuit:
         """
         self._check_pc_unchanged()
         data, missing = evidence(data, missing_mask, mask_id, self.n)
-        return self.backend.marginal(data, missing, **options)
+        with current_device(self._device):
+            return self.backend.marginal(data, missing, **options)
 
     def conditional(self, data: torch.Tensor, missing_mask: Optional[torch.Tensor] = None,
                     targets: Optional[torch.Tensor] = None, return_log_marginal: bool = False, *, mask_id: int = -1,
@@ -179,14 +180,16 @@ class ConstrainedCircuit:
         self._check_pc_unchanged()
         data, missing = evidence(data, missing_mask, mask_id, self.n)
         B = data.size(0)
-        return self.backend.conditional(data, missing, target_mask(targets, B, self.n),
-                                        return_log_marginal = return_log_marginal,
-                                        candidates = candidate_tensor(candidates, B, self.n), **options)
+        with current_device(self._device):
+            return self.backend.conditional(data, missing, target_mask(targets, B, self.n),
+                                            return_log_marginal = return_log_marginal,
+                                            candidates = candidate_tensor(candidates, B, self.n), **options)
 
     def sample(self, *args, **kwargs):
         """Samples from the PC conditioned on the constraint (and evidence)."""
         self._check_pc_unchanged()
-        return self.backend.sample(*args, **kwargs)
+        with current_device(self._device):
+            return self.backend.sample(*args, **kwargs)
 
     def decoder(self, **options):
         """

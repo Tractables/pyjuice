@@ -24,7 +24,7 @@ from numba import njit
 
 from pyjuice.utils.fast_inference import fast_inference
 
-from .evidence import candidate_tensor, evidence, target_mask
+from .evidence import candidate_tensor, current_device, evidence, target_mask
 
 #: the options of the :func:`pyjuice.fast_inference` scope a decoder opens; every other option is a query default
 FAST_INFERENCE_OPTIONS = ("allow_param_copy", "allow_bf16_params", "allow_cudagraph")
@@ -157,7 +157,8 @@ class Decoder:
         decoder's default, -1 unless it was made with another)."""
         options = self._options(options)
         data, missing = self._evidence(data, missing_mask, mask_id)
-        out = self._marginal(data, missing, **options)
+        with current_device(self.cc._device):
+            out = self._marginal(data, missing, **options)
         self._remember(data, missing)
         return out
 
@@ -169,14 +170,16 @@ class Decoder:
         options = self._options(options)
         data, missing = self._evidence(data, missing_mask, mask_id)
         B, n = data.size(0), self.cc.n
-        out = self._conditional(data, missing, target_mask(targets, B, n), return_log_marginal,
-                                candidate_tensor(candidates, B, n), **options)
+        with current_device(self.cc._device):
+            out = self._conditional(data, missing, target_mask(targets, B, n), return_log_marginal,
+                                    candidate_tensor(candidates, B, n), **options)
         self._remember(data, missing)
         return out
 
     def sample(self, *args, **kwargs):
         """Samples under the constraint, as :meth:`ConstrainedCircuit.sample`."""
-        return self.cc.backend.sample(*args, **self._options(kwargs))
+        with current_device(self.cc._device):
+            return self.cc.backend.sample(*args, **self._options(kwargs))
 
     # ---------------------------------------------------------------------------------------------
     # What a backend's decoder overrides

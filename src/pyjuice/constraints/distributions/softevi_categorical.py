@@ -383,6 +383,10 @@ def _num_vars(layer) -> int:
 
 def _cached(layer, key, build):
     entry = _STRUCTURES.setdefault(layer, {})
+    device = layer.params.device
+    if entry.get("device") != device:                       # (a layer moved: what is kept is on the other device)
+        entry.clear()
+        entry["device"] = device
     if key not in entry:
         entry[key] = build()
     return entry[key]

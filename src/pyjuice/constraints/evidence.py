@@ -10,11 +10,19 @@ A constrained query's inputs, from the forms users give them to the one form eve
   sample ([B, n, k]) -- become [B, n, k], a view when they are shared (:func:`candidate_tensor`).
 """
 
+import contextlib
 from typing import Optional
 
 import numpy as np
 import torch
 from numba import njit
+
+
+def current_device(device):
+    """A query's context on ``device``: Triton launches kernels on the CURRENT device, whatever device their tensors
+    are on, and :meth:`TensorCircuit.to` does not change it -- a kernel launched there faults on the tensors of another
+    GPU ("an illegal memory access", at a later launch, as the launches are asynchronous)."""
+    return torch.cuda.device(device) if device.type == "cuda" else contextlib.nullcontext()
 
 
 def evidence(data, missing_mask, mask_id: int, n: int):
