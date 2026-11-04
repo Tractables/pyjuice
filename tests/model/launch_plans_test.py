@@ -105,14 +105,21 @@ def test_recordings_are_per_thread():
 
 
 @cuda_only
-def test_the_store_is_bounded():
+def test_the_store_is_bounded_and_gives_up_its_oldest_plan_alone():
     o = _Owner()
     plans = LaunchPlans.of(o)
-    for i in range(LaunchPlans.MAX_PLANS + 5):
+
+    def store(key):
         with LaunchPlans.record() as rec:
             LaunchPlans.add(lambda: None)
-        plans.store(i, rec, 1)
-    assert len(plans.plans) <= LaunchPlans.MAX_PLANS
+        plans.store(key, rec, 1)
+
+    n = LaunchPlans.MAX_PLANS
+    for i in range(n + 5):
+        store(i)
+    assert list(plans.plans) == list(range(5, n + 5)), "past the cap only the oldest plans go"
+    store(n + 4)                                        # (a key it holds: stored anew, nothing given up)
+    assert list(plans.plans) == list(range(5, n + 5))
 
 
 @cuda_only

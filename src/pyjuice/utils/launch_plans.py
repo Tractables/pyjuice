@@ -58,7 +58,9 @@ class LaunchPlans:
     open now are the class's, shared by every owner -- a launch site adds to whichever call is being recorded without
     knowing whose it is -- and per thread: a thread running another circuit's pass meanwhile never adds to them.
     """
-    MAX_PLANS = 32              # a few batch sizes x a few flag sets; a sweep over many must not grow it unbounded
+    # A few plans a batch size (MEASURED, a joint CoDD2.0 training: a layer's 4, its 23 batch sizes in 45 steps; 64 at most
+    # at its GPU batch), 54 objects for the garbage collector to track a plan. A sweep over many must not grow it unbounded
+    MAX_PLANS = 256
 
     _local = threading.local()  # `.open`: this thread's recordings open now, innermost last
 
@@ -93,8 +95,10 @@ class LaunchPlans:
             LaunchPlans.fail()
         if not ENABLED or key is None or not complete or _capturing():
             return
-        if len(self.plans) >= self.MAX_PLANS:
-            self.plans.clear()
+        # The oldest alone. MEASURED, the same training at a cap of 32 with all of them cleared when full: most of its gated
+        # backwards took the full path, whose allocations brought a full garbage collection every second step
+        if key not in self.plans and len(self.plans) >= self.MAX_PLANS:
+            del self.plans[next(iter(self.plans))]
         self.plans[key] = tuple(rec.launchers)
 
     def clear(self) -> None:
