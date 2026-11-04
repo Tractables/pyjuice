@@ -14,7 +14,7 @@ from typing import Optional, Tuple
 import numpy as np
 import torch
 
-from ..kernels.common import IDENTITY, SUM, TEMP
+from ..kernels.common import IDENTITY, SUM, TEMP, packed
 from ..kernels.prod import Launch, skip_masks
 from ..kernels.sum import dense_groups
 from ..kernels.live import live_successors
@@ -158,6 +158,7 @@ class Program:
         self.transition_stats = transition_stats(tr)
 
         firsts = [first for first, _, _ in backend.sum_regions]
+        firsts_np = np.asarray(firsts, dtype = np.int64)
         self.firsts = firsts
         self.slots = [slots for _, _, slots in backend.sum_regions]
         self.reg_rows = np.asarray([end - first for first, end, _ in backend.sum_regions], dtype = np.int64)
@@ -215,7 +216,7 @@ class Program:
                     parts = []
                     gated = any(gl is layer for gl in self.gate_cells.layers)
                     for nids, cids, pids in zip(layer.partitioned_nids, layer.partitioned_cids, layer.partitioned_pids):
-                        regs = [region_of(int(r)) for r in nids.tolist()]
+                        regs = (np.searchsorted(firsts_np, nids.cpu().numpy(), side = "right") - 1).tolist()
                         if not gated:
                             groups, rest = dense_groups(nids, cids, pids, layer.block_size, elem_first)
                         else:
@@ -263,8 +264,11 @@ class Program:
             if kind != "prod" or self.steps[k + 1][:2] != ("sum", prod_index):
                 continue
             first, end, _ = backend.element_regions[prod_index]
-            dense_rows = {c0 + e for _, parts in self.steps[k + 1][2] for dense, E, _ in parts
-                          for (_, c0) in dense for e in range(E)}
+            dense_rows = np.zeros(end, dtype = bool)
+            for _, parts in self.steps[k + 1][2]:
+                for dense, E, _ in parts:
+                    for (_, c0) in dense:
+                        dense_rows[c0:c0 + E] = True
             alias_row = torch.full((end - first,), -1, dtype = torch.int32)
             alias_reg = torch.zeros(end - first, dtype = torch.int32)
             for stages, _, _ in layers:
@@ -272,7 +276,7 @@ class Program:
                     for li, (form, kinds, st, iv, sizes) in enumerate(launches):
                         if form != "copy" or kinds != (SUM, False):
                             continue
-                        keep = torch.tensor([int(o) in dense_rows for o in st[:, 0].tolist()], dtype = torch.bool)
+                        keep = torch.from_numpy(dense_rows[st[:, 0].numpy()])
                         regs = st[~keep, 2]
                         alias_row[st[~keep, 0] - first] = (st[~keep, 1] - torch.tensor(firsts)[regs]).to(torch.int32)
                         alias_reg[st[~keep, 0] - first] = regs.to(torch.int32)
@@ -288,7 +292,7 @@ class Program:
         # where every interval a product reads or writes keeps its slots; the intervals themselves (host, and their
         # ends on the device), and per product layer group the intervals of its products, for compact storage (see
         # :mod:`..kernels.compact`)
-        self.all_ivs = sorted(_intervals(self.steps) | set(self.sum_ivs))
+        self.all_ivs = sorted(_intervals(self.steps, n) | set(self.sum_ivs))
         self.intervals = interval_tables(self.reach, self.all_ivs, dev)
         self.iv_index = {iv: k for k, iv in enumerate(self.all_ivs)}
         self.iv_ends_np = np.asarray(self.all_ivs, dtype = np.int64).reshape(-1, 2)
@@ -297,7 +301,7 @@ class Program:
         self.elem_ivs = {}
         for kind, prod_index, layers in self.steps:
             if kind == "prod":
-                ivs = {int(k) for stages, _, _ in layers for launches in stages for *_, iv, _ in launches
+                ivs = {k for stages, _, _ in layers for launches in stages for *_, iv, _ in launches
                        for k in iv.unique().tolist()}
                 self.elem_ivs[prod_index] = np.asarray(sorted(self.iv_index[self.sum_ivs[k]] for k in ivs),
                                                        dtype = np.int64)
@@ -319,7 +323,9 @@ class Program:
                                      for li, launch in enumerate(launches) if launch[0] in forms]
         triples = {}
         for launches, li in launches_of(("block_block",)):
-            for tri in launches[li][2][:, 5:8].tolist():
+            st = launches[li][2][:, 5:8]
+            _, first = np.unique(packed(st.numpy(), n + 2), return_index = True)
+            for tri in st[np.sort(first)].tolist():
                 triples.setdefault(tuple(tri), len(triples))
         self.triple_of = triples
         self.skip_triples = list(triples)
@@ -376,8 +382,11 @@ class Program:
         dev, S = self.dev, rows.size(0)
         groups_host = None
         if form == "block_block":
-            idx = torch.tensor([self.triple_of[tuple(t)] for t in rows[:, 5:8].tolist()], dtype = torch.int32,
-                               device = dev)
+            _, first, inverse = np.unique(packed(rows[:, 5:8].numpy(), self.n + 2), return_index = True,
+                                          return_inverse = True)
+            distinct = rows[first, 5:8].tolist()
+            idx = torch.from_numpy(np.asarray([self.triple_of[tuple(t)] for t in distinct], dtype = np.int32)[inverse])
+            idx = idx.to(dev)
             steps = (rows.to(dev, torch.int32).contiguous(), idx)
         elif form in TRANS_COLS:
             groups = None                                               # input @ block steps, several to a program
@@ -395,8 +404,9 @@ class Program:
             steps = rows.to(dev, torch.int32).contiguous()
         E_max, X_max, S_max = (int(sizes[:, k].max()) for k in range(3))
         a, e, past = OUT_ENDS[form]                                     # the outputs' intervals [a, e + past)
-        ends = set(zip(rows[:, a].tolist(), (rows[:, e] + past).tolist()))
-        out_ivs = np.unique(np.asarray([self.iv_index[iv] for iv in ends], dtype = np.int64))
+        ends = np.unique(packed(torch.stack([rows[:, a], rows[:, e] + past], dim = 1).numpy(), self.n + 2))
+        out_ivs = np.unique(np.asarray([self.iv_index[(int(v) // (self.n + 2), int(v) % (self.n + 2))] for v in ends],
+                                       dtype = np.int64))
         return Launch(form, kinds, steps, E_max, X_max, S_max, rows, iv, sizes, groups_host, out_ivs)
 
     def transition_buffer(self) -> torch.Tensor:
@@ -538,11 +548,7 @@ class Program:
         """
         out_rows, child_rows, bounds = (t.cpu().long() for t in rows)
         firsts = torch.tensor(self.firsts, dtype = torch.long)
-        groups = OrderedDict()
-        for r in range(out_rows.numel()):
-            k = int((child_rows[r] >= 0).sum())
-            kids = child_rows[r, :k].tolist()
-            groups.setdefault((tuple(c < self.input_end for c in kids), tuple(bounds[r, :k + 1].tolist())), []).append(r)
+        groups = _fold_groups(child_rows.numpy(), bounds.numpy(), self.input_end)
 
         stages = defaultdict(lambda: defaultdict(list))              # stage -> (form, kinds) -> [(rows, iv, sizes)]
         temps = [0, 1]                                               # scratch rows so far, most slots per row
@@ -565,11 +571,15 @@ class Program:
             sizes = torch.tensor([[self._entry(entry), self._exit(exit), self.reach.slots(entry, exit)]]).expand(R, 3)
             stages[stage][(form, kinds)].append((torch.stack(fields, dim = 1), torch.full((R,), product), sizes))
 
-        for (is_input, bd), members in groups.items():
-            idx = torch.tensor(members)
-            R, k = idx.numel(), len(is_input)
+        for (is_input, bd), runs in groups.items():
+            k = len(is_input)
             product = self.iv_number[(bd[0], bd[k])]                 # the products' interval (their sums')
-            kids, outs = child_rows[idx], out_rows[idx]
+            if len(runs) == 1:                                       # (a node group: one run of rows)
+                kids, outs = child_rows[runs[0][0]:runs[0][1]], out_rows[runs[0][0]:runs[0][1]]
+            else:
+                kids = torch.cat([child_rows[s:e] for s, e in runs])
+                outs = torch.cat([out_rows[s:e] for s, e in runs])
+            R = outs.numel()
             zeros = torch.zeros(R, dtype = torch.long)
             full = lambda v: torch.full((R,), v, dtype = torch.long)
             if k == 1:
@@ -613,9 +623,27 @@ class Program:
         return out, temps[0], temps[1]
 
 
-def _intervals(steps) -> set:
-    """Every interval ``(a, b)`` whose blocks the product steps read or write (the Program's host launches)."""
+def _fold_groups(child: np.ndarray, bounds: np.ndarray, input_end: int) -> dict:
+    """The rows of a product layer's table (``child`` [R, k], ``bounds`` [R, k + 1], -1 padded) that fold alike, in the
+    order they first occur: ``{(whether each child is an input, the boundaries): [(first row, end row)]}`` -- the rows of
+    a node group are a run, so the runs are few, whatever the rows."""
+    real = child >= 0
+    kinds = real.astype(np.int8) + (real & (child < input_end))              # 0 padding, 1 a sum, 2 an input
+    change = np.ones(child.shape[0], dtype = bool)
+    change[1:] = (kinds[1:] != kinds[:-1]).any(axis = 1) | (bounds[1:] != bounds[:-1]).any(axis = 1)
+    starts = np.nonzero(change)[0].tolist()
+    groups = {}
+    for s, e in zip(starts, starts[1:] + [child.shape[0]]):
+        k = int(real[s].sum())
+        groups.setdefault((tuple((kinds[s, :k] == 2).tolist()), tuple(bounds[s, :k + 1].tolist())), []).append((s, e))
+    return groups
+
+
+def _intervals(steps, n: int) -> set:
+    """Every interval ``(a, b)`` whose blocks the product steps read or write (the Program's host launches over ``n``
+    positions)."""
     out = set()
+    radix = n + 2
     for kind, _, layers in steps:
         if kind != "prod":
             continue
@@ -634,7 +662,8 @@ def _intervals(steps) -> set:
                     else:                                            # a copy of [t0, t2)
                         ivs = [(st[:, 3], st[:, 4])]
                     for a, b in ivs:
-                        out.update(zip(a.tolist(), b.tolist()))
+                        keys = torch.unique(a * radix + b).tolist()
+                        out.update((k // radix, k % radix) for k in keys)
     return out
 
 

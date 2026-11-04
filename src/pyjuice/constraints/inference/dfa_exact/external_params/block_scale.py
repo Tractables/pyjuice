@@ -85,22 +85,24 @@ def edge_tables(layout: Cells, layer, nids: torch.Tensor, cids: torch.Tensor, el
     ck = np.zeros(K, dtype = np.int64)
     node_gates = {ns.external_params.gate_sizes(ns)[0] for ns in nodes}
     assert len(node_gates) == 1, node_gates          # a layer's nodes share their block size and gate signature
-    for k, at in enumerate(np.searchsorted(starts, nid_h, side = "right") - 1):
+    groups = np.searchsorted(starts, nid_h, side = "right") - 1
+    for at in np.unique(groups).tolist():            # (every node group's node blocks together)
+        ks = np.nonzero(groups == at)[0]
         ns = nodes[at]
         owner = ns.external_params.storage_owner(ns)
         gate_bs, gate_cbs = ns.external_params.gate_sizes(ns)
-        ck[k] = layout.shape[owner][1]
-        row[k] = layout.base[owner] + (nid_h[k] - starts[at]) // gate_bs * ck[k]
-        cbs[k] = gate_cbs
+        ck[ks] = layout.shape[owner][1]
+        row[ks] = layout.base[owner] + (nid_h[ks] - starts[at]) // gate_bs * ck[ks]
+        cbs[ks] = gate_cbs
         first = np.asarray([cs._output_ind_range[0] for cs in ns.chs], dtype = np.int64)
         if np.unique(first).size != first.size:
             raise NotImplementedError("A gated sum node group whose children list a node group twice is not "
                                       "supported under a constraint.")
         cum = np.cumsum([0] + [cs.num_nodes for cs in ns.chs])[:-1]
         order = np.argsort(first)
-        c = cid_h[k]
+        c = cid_h[ks]
         j = order[np.clip(np.searchsorted(first[order], c, side = "right") - 1, 0, None)]
-        lc[k] = np.where(c >= elem_first, cum[j] + c - first[j], 0)
+        lc[ks] = np.where(c >= elem_first, cum[j] + c - first[j], 0)
     idx = np.where(cid_h >= elem_first, row[:, None] + lc // cbs[:, None], 0)
     i32 = lambda a: torch.from_numpy(np.ascontiguousarray(a)).to(dev, torch.int32)
     return dict(idx = i32(idx), ck = i32(ck), ck_host = ck, node_gate = node_gates.pop(), row = row, cbs = cbs, lc = lc,
@@ -176,12 +178,9 @@ def uniform_chunks(idx: np.ndarray, valid: np.ndarray) -> dict:
     """Chunk size -> whether every aligned chunk of that many edges of every node block (``idx`` [K, E], the edges'
     cells, ``valid`` the real ones) reads one gate cell: the forward then reads one gate per chunk and column."""
     out = {}
-    K, E = idx.shape
+    E = idx.shape[1]
     for T in GATE_CHUNKS:
-        pad = (-E) % T
-        i = np.pad(idx, ((0, 0), (0, pad))).reshape(K, -1, T)
-        v = np.pad(valid, ((0, 0), (0, pad))).reshape(K, -1, T)
-        out[T] = bool(np.all(~v | (i == i[:, :, :1])))
+        out[T] = bool(np.all(~valid | (idx == idx[:, (np.arange(E) // T) * T])))
     return out
 
 
@@ -190,6 +189,9 @@ def uniform_tiles(lc: np.ndarray, cbs: np.ndarray, length: int) -> dict:
     one child gate for every parent block (``lc`` its first child's place among its node group's children, ``cbs`` its
     child gate size): the top-down pass then reads one gate per parent block and column."""
     out = {}
+    size = int(cbs.max()) + 1                        # (what counts of a parent's place: its remainder by its gate size)
+    distinct = np.unique((lc % cbs) * size + cbs)
+    lc, cbs = distinct // size, distinct % size
     for T in GATE_CHUNKS:
         s = lc[:, None] + np.arange(0, length, T)[None, :]
         e = lc[:, None] + np.minimum(np.arange(0, length, T) + T, length)[None, :] - 1

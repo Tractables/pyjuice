@@ -11,8 +11,6 @@ nothing reads it, and its sum rows are filled with -inf.
 
 from __future__ import annotations
 
-from bisect import bisect_left
-from collections import defaultdict
 from dataclasses import dataclass
 from typing import Any
 
@@ -20,7 +18,7 @@ import numpy as np
 import torch
 
 from ..external_params import block_scale
-from ..kernels.common import IDENTITY, SUM, TEMP, node_groups, node_tiles
+from ..kernels.common import IDENTITY, SUM, TEMP, first_occurrence_groups, node_groups, node_tiles, packed
 from ..kernels.prod import skip_masks_for
 from ..kernels.prod_top_down import TopDownLaunch
 from ..kernels.score import class_weight_launch, score_tables
@@ -69,9 +67,16 @@ def top_down_program(backend) -> TopDownProgram:
     score = score_tables(prog)
     of = prog.intervals.of.cpu().numpy()
     iv_index = lambda a, b: of[np.asarray(a) * (n + 1) + np.asarray(b)].astype(np.int64)
-    # what already has its top-down value: ("S", row, region) sum rows, ("E", group, row) element rows and ("T", layer,
-    # row) scratch rows; what is never written has none (a node no chain of edges reaches) and is not read either
-    written = {("S", row, prog.root_region) for row in range(*prog.root_rows)}
+    width = np.asarray(prog.width, dtype = np.int64)
+    exits = width.copy()
+    exits[n] = 1                                                      # a sequence end: one column
+    # what already has its top-down value: sum rows, every product layer group's element rows and every product layer's
+    # scratch rows; what is never written has none (a node no chain of edges reaches) and is not read either
+    sums = np.zeros(max(end for _, end, _ in backend.sum_regions), dtype = bool)
+    sums[slice(*prog.root_rows)] = True
+    elem_firsts = [first for first, _, _ in backend.element_regions]
+    elements = [np.zeros(end - first, dtype = bool) for first, end, _ in backend.element_regions]
+    temps = {}
     specs, spec_of = [], {}
 
     def spec_index(spec):
@@ -80,16 +85,24 @@ def top_down_program(backend) -> TopDownProgram:
             specs.append(spec)
         return spec_of[spec]
 
+    def out_temp_of(launch):
+        return launch.kinds[2] if launch.form == "block_block" else launch.kinds[1]
+
+    def outputs_written(launch, rows, prod_index, layer):
+        """bool [steps]: whether every step's output (``rows`` the launch's, numpy) has a top-down value."""
+        if out_temp_of(launch):
+            return temps[layer][rows[:, 0]]
+        return elements[prod_index][rows[:, 0] - elem_firsts[prod_index]]
+
     def child_launch(launch, side, prod_index, layer):
         """The :class:`TopDownLaunch` of one side of a forward launch, or None when that operand is an input or no
         product of the launch has a top-down value."""
-        form, kinds, rows = launch.form, launch.kinds, launch.rows
-        out_temp = out_temp_of(launch)
-        live = torch.tensor([(("T", layer, r) if out_temp else ("E", prod_index, r)) in written
-                             for r in rows[:, 0].tolist()], dtype = torch.bool)
+        form, kinds = launch.form, launch.kinds
+        rows = launch.rows.numpy()
+        live = outputs_written(launch, rows, prod_index, layer)
         if not live.any():
             return None
-        rows, iv = rows[live], launch.iv[live]
+        rows = rows[live]
         if form == "copy":
             c_kind, out_temp = kinds
             crow, creg = rows[:, 1], rows[:, 2]
@@ -116,77 +129,77 @@ def top_down_program(backend) -> TopDownProgram:
             else:
                 c_kind, crow, creg, a, b = r_kind, rows[:, 3], rows[:, 4], t1, t2
                 spec = lambda r: ((int(r[5]), int(r[6]), True), (int(r[5]), int(r[7]), False))
-        key_reg = creg if c_kind == SUM else torch.zeros_like(creg)
-        keys = list(zip(crow.tolist(), key_reg.tolist()))
-        order = sorted(range(len(keys)), key = lambda k: keys[k])
-        children, ptr, add = [], [0], []
-        for k in order:
-            if not children or children[-1] != keys[k]:
-                children.append(keys[k])
-                ptr.append(ptr[-1])
-                wk = ("S", keys[k][0], keys[k][1]) if c_kind == SUM else ("T", layer, keys[k][0])
-                add.append(int(wk in written))
-                written.add(wk)
-            ptr[-1] += 1
+        key_reg = creg if c_kind == SUM else np.zeros_like(creg)
+        order = np.lexsort((key_reg, crow))                           # by child, the parents of one in launch order
+        crow, key_reg = crow[order], key_reg[order]
+        first = np.ones(crow.size, dtype = bool)
+        first[1:] = (crow[1:] != crow[:-1]) | (key_reg[1:] != key_reg[:-1])
+        starts = np.nonzero(first)[0]
+        child_row, child_reg = crow[starts], key_reg[starts]
+        ptr_np = np.append(starts, crow.size).astype(np.int64)
+        kept = sums if c_kind == SUM else temps[layer]
+        add = kept[child_row].astype(np.int64)                        # written by an earlier launch: log-added to
+        kept[child_row] = True
         par = rows[order]
         if spec is not None:
-            tri = torch.tensor([spec_index(spec(r)) for r in par.tolist()], dtype = torch.long)
-            par = torch.cat([par, tri[:, None]], dim = 1)
+            _, at, inverse = np.unique(packed(par[:, 5:8], n + 2), return_index = True, return_inverse = True)
+            index = np.empty(at.size, dtype = np.int64)
+            for u in np.argsort(at).tolist():                          # (numbered as they first occur)
+                index[u] = spec_index(spec(par[at[u]]))
+            par = np.concatenate([par, index[inverse][:, None]], axis = 1)
         a, b = a[order], b[order]
         out_a, out_b = {"copy": (3, 4), "input_block": (2, 5), "block_input": (3, None), "block_block": (5, 7)}[form]
-        pa = par[:, out_a].numpy()
-        pb = (par[:, 5] + 1).numpy() if form == "block_input" else par[:, out_b].numpy()   # the product's interval
-        ptr_np = np.asarray(ptr, dtype = np.int64)
-        entry = torch.tensor([prog._entry(int(x)) for x in a])
-        exit_ = torch.tensor([prog._exit(int(x)) for x in b])
-        slots = torch.tensor([reach.slots(int(x), int(y)) for x, y in zip(a, b)])
+        pa = par[:, out_a]
+        pb = par[:, 5] + 1 if form == "block_input" else par[:, out_b]    # the product's interval
+        ivs = [(int(v) // (n + 2), int(v) % (n + 2)) for v in np.unique(a * (n + 2) + b).tolist()]
+        S_max = max(reach.slots(x, y) for x, y in ivs)
         if form == "copy":
             okinds = (c_kind, out_temp)
         elif form in ("input_block", "block_input"):
-            c_full = all(reach.positions(int(x), int(y)) is None for x, y in zip(a, b))
+            c_full = all(reach.positions(x, y) is None for x, y in ivs)
             out_full = kinds[2][0]
             okinds = (c_kind, out_temp, (c_full, out_full))
         else:
             okinds = (c_kind, r_kind if side == "L" else l_kind, out_temp)
-        ch = torch.tensor([[r, g, ad, 0] for (r, g), ad in zip(children, add)], dtype = torch.int32, device = dev)
-        child_iv, parent_iv = iv_index(a.numpy()[ptr_np[:-1]], b.numpy()[ptr_np[:-1]]), iv_index(pa, pb)
-        host = dict(children = np.asarray([[r, g, ad] for (r, g), ad in zip(children, add)], dtype = np.int64),
-                    ptr = ptr_np, parents = par.numpy(), parent_iv = parent_iv, child_iv = child_iv,
+        i32 = lambda x: torch.from_numpy(np.ascontiguousarray(x)).to(dev, torch.int32)
+        ch = i32(np.stack([child_row, child_reg, add, np.zeros_like(add)], axis = 1))
+        child_iv, parent_iv = iv_index(a[ptr_np[:-1]], b[ptr_np[:-1]]), iv_index(pa, pb)
+        host = dict(children = np.stack([child_row, child_reg, add], axis = 1).astype(np.int64),
+                    ptr = ptr_np, parents = par, parent_iv = parent_iv, child_iv = child_iv,
                     parent_ivs = np.unique(parent_iv), child_ivs = np.unique(child_iv))
         tiles, height = None, 1
         if form in ("input_block", "block_input"):                # children walking the same entries, together
-            host["group"] = node_groups(a.numpy()[ptr_np[:-1]], b.numpy()[ptr_np[:-1]], np.diff(ptr_np), add)
+            host["group"] = node_groups(a[ptr_np[:-1]], b[ptr_np[:-1]], np.diff(ptr_np), add)
             tiles, height = node_tiles(host["group"])
             tiles = torch.from_numpy(tiles).to(dev)
-        return TopDownLaunch(form, side, okinds, ch, torch.tensor(ptr, dtype = torch.int32, device = dev),
-                             par.to(dev, torch.int32).contiguous(), int(entry.max()), int(exit_.max()),
-                             int(slots.max()), host, tiles, height)
-
-    def out_temp_of(launch):
-        return launch.kinds[2] if launch.form == "block_block" else launch.kinds[1]
+        return TopDownLaunch(form, side, okinds, ch, i32(ptr_np), i32(par), int(width[a].max()), int(exits[b].max()),
+                             S_max, host, tiles, height)
 
     steps = []
     for kind, prod_index, layers in reversed(prog.steps):
         if kind == "sum":
             layers_out = []
+            elem_first = backend.element_regions[prod_index][0]
             for block_size, parts in layers:                # in the order run_backward launches: dense, then fused
                 dense_runs = []
                 for dense, E, _ in parts:
                     for (r, c0), (blocks, key) in dense.items():
-                        if not any(("S", nid + i, r) in written for _, nid, _ in blocks for i in range(block_size)):
+                        nid = np.asarray([block[1] for block in blocks], dtype = np.int64)
+                        if not sums[nid[:, None] + np.arange(block_size)].any():
                             continue                             # no node of the run has a top-down value
-                        wk = [("E", prod_index, c0 + e) for e in range(E)]
-                        hit = [k in written for k in wk]
-                        written.update(wk)
+                        children = elements[prod_index][c0 - elem_first:c0 - elem_first + E]
+                        hit = children.copy()
+                        children[:] = True
                         for lo, hi, add in _segments(hit):       # written by an earlier launch: log-added to
                             dense_runs.append((r, c0, E, (lo, hi), blocks, key, add))
                 fused_groups = _fused_tables(prog, [fused for _, _, fused in parts if fused is not None], block_size,
-                                             prod_index, backend.element_regions[prod_index][0], firsts, written, dev)
+                                             elem_first, firsts, sums, elements[prod_index], dev)
                 layers_out.append((block_size, dense_runs, fused_groups))
             steps.append(("sum", prod_index, layers_out))
         else:
             layers_out = []
             for li, (stages, num_temps, temp_slots) in enumerate(layers):
+                temps[(prod_index, li)] = np.zeros(num_temps, dtype = bool)
                 fold_stages = [[l for l in launches if out_temp_of(l)] for launches in stages]
                 fold_stages = [s for s in fold_stages if s]
                 info = []
@@ -197,25 +210,29 @@ def top_down_program(backend) -> TopDownProgram:
                             la = child_launch(launch, side, prod_index, (prod_index, li))
                             if la is not None:
                                 out.append(la)
-                        alive = np.asarray([(("T", (prod_index, li), r) if out_temp_of(launch) else
-                                             ("E", prod_index, r)) in written for r in launch.rows[:, 0].tolist()])
+                        alive = outputs_written(launch, launch.rows.numpy(), prod_index, (prod_index, li))
                         cw = class_weight_launch(launch, alive, prog, score)
                         if cw is not None:
                             cws.append(cw)
                     info.append((out, _inputs(launches), _folds([l for l in launches if out_temp_of(l)]), cws))
                 layers_out.append((fold_stages, info[::-1], num_temps, temp_slots))
             steps.append(("prod", prod_index, layers_out))
-    dead = [(row, r) for r, (first, end, _) in enumerate(backend.sum_regions) for row in range(first, end)
-            if ("S", row, r) not in written]
+    region_first = np.asarray([first for first, _, _ in backend.sum_regions], dtype = np.int64)
+    region_end = np.asarray([end for _, end, _ in backend.sum_regions], dtype = np.int64)
+    rows = np.nonzero(~sums)[0]
+    regs = np.searchsorted(region_first, rows, side = "right") - 1
+    inside = regs >= 0
+    inside[inside] = rows[inside] < region_end[regs[inside]]
+    dead = np.stack([rows[inside], regs[inside]], axis = 1).astype(np.int64)
+    keys = np.nonzero(of >= 0)[0]
     iv_bounds = np.zeros((int(of.max()) + 1, 2), dtype = np.int64)
-    for k in np.nonzero(of >= 0)[0]:
-        iv_bounds[of[k]] = (k // (n + 1), k % (n + 1))
-    dead = np.asarray(dead, dtype = np.int64).reshape(-1, 2)
+    iv_bounds[of[keys]] = np.stack([keys // (n + 1), keys % (n + 1)], axis = 1)
     dead_region = np.zeros(len(backend.sum_regions), dtype = bool)
     dead_region[dead[:, 1]] = True
+    region_iv = prog.iv_bounds[prog.reg_iv_np]
     return TopDownProgram(steps = steps, skip = skip_masks_for(reach, specs, device = dev),
                           dead = dead, dead_region = dead_region, iv_bounds = iv_bounds,
-                          reg_iv = iv_index(*np.asarray([prog.sum_ivs[k] for k in prog.reg_iv_host]).T),
+                          reg_iv = iv_index(region_iv[:, 0], region_iv[:, 1]),
                           elem_regions = [(first, end) for first, end, _ in backend.element_regions])
 
 
@@ -253,12 +270,29 @@ def _folds(launches) -> list:
     return out
 
 
-def _fused_tables(prog, parts, block_size, prod_index, elem_first, firsts, written, dev) -> dict:
+def _fused_runs(cols: np.ndarray, pids: np.ndarray, valid: np.ndarray, BS: int, group = None, lc = None):
+    """Per row of ``cols`` [K, E], its maximal runs of valid consecutive children with weights ``BS`` apart (and, given
+    ``group``, in one group: the sum region of aliased children; given ``lc``, consecutive places), row by row: ``(row,
+    first child, length, pid base, group, first place)``, arrays of a value per run."""
+    cont = valid[:, 1:] & valid[:, :-1] & (cols[:, 1:] == cols[:, :-1] + 1) & (pids[:, 1:] == pids[:, :-1] + BS)
+    if group is not None:
+        cont &= group[:, 1:] == group[:, :-1]
+    if lc is not None:
+        cont &= lc[:, 1:] == lc[:, :-1] + 1
+    none = np.zeros((valid.shape[0], 1), dtype = bool)
+    k, a = np.nonzero(valid & ~np.concatenate([none, cont], axis = 1))
+    _, b = np.nonzero(valid & ~np.concatenate([cont, none], axis = 1))
+    return (k, cols[k, a], b - a + 1, pids[k, a], np.full(k.size, -1, dtype = np.int64) if group is None else group[k, a],
+            np.zeros(k.size, dtype = np.int64) if lc is None else lc[k, a])
+
+
+def _fused_tables(prog, parts, block_size, elem_first, firsts, sums, elements, dev) -> dict:
     """Child-block-major tables of a sum layer's fused parts (see :func:`~.sum.fused_sum_top_down`), by child
     block size. A node block reads runs of consecutive children whose weights are ``BS`` apart; the runs of every node
     block of the layer are cut where any of them starts or ends, so two child blocks are equal or disjoint (one
     launch's programs never write the same row), and where an earlier launch's children end, so a child block is
-    written or log-added to as a whole. Node blocks with no top-down value (no row written) add nothing: left out.
+    written or log-added to as a whole. Node blocks with no top-down value (no row written, ``sums``) add nothing: left
+    out. ``elements``: which of the product layer group's rows (from ``elem_first``) have a top-down value.
     A gated layer's runs are also cut where their children's places among their node group's children stop being
     consecutive: every parent of a child block has its gate row, child gate size, grid row length and its first child's
     place (``gate``, see ``block_scale.edge_tables`` in :mod:`..external_params`), and the layer its node gate size.
@@ -266,93 +300,132 @@ def _fused_tables(prog, parts, block_size, prod_index, elem_first, firsts, writt
     children, none of them written by an earlier launch, has in its one group's ``dense`` the run and its forward
     part -- what its products by sample need (see :func:`~..kernels.sum.per_sample_dense_sum_top_down`); else None."""
     BS = block_size
-
-    def runs(cols, pid_row, valid, group = None, lc = None):
-        """Maximal runs of valid consecutive children with weights ``BS`` apart (and, given ``group``, in one group:
-        the sum region of aliased children; given ``lc``, consecutive places): [(first, length, pid base, group, first
-        place)]."""
-        cont = valid[1:] & valid[:-1] & (cols[1:] == cols[:-1] + 1) & (pid_row[1:] == pid_row[:-1] + BS)
-        if group is not None:
-            cont &= group[1:] == group[:-1]
-        if lc is not None:
-            cont &= lc[1:] == lc[:-1] + 1
-        starts = np.nonzero(valid & ~np.concatenate([[False], cont]))[0]
-        ends = np.nonzero(valid & ~np.concatenate([cont, [False]]))[0]
-        return [(int(cols[a]), int(b - a + 1), int(pid_row[a]), -1 if group is None else int(group[a]),
-                 0 if lc is None else int(lc[a])) for a, b in zip(starts, ends)]
-
-    found = {"E": [], "S": []}           # kind -> [(first row, length, pid base, region, nid, reg, place, gate)]
-    firsts_np = np.asarray(firsts)
+    found = {"E": [], "S": []}           # kind -> per part, a value per run: first row, length, pid base, region, nid,
+    firsts_np = np.asarray(firsts)       # reg, place, gate row, gate size, grid row length
     gated = False
     for nids, cids, pids, nb_reg, _, aliased, gate in parts:
-        nids_h, regs_h = nids.cpu().long().tolist(), nb_reg.cpu().long().tolist()
-        cids_h, pids_h = cids.cpu().long().numpy(), pids.cpu().long().numpy()
-        if aliased is not None:
-            a_rows, a_regs, a_pids = (t.cpu().long().numpy() for t in aliased)
         gated = gate is not None
-        for k, (nid, reg) in enumerate(zip(nids_h, regs_h)):
-            if not any(("S", nid + i, reg) in written for i in range(BS)):
-                continue
-            g = (int(gate["row"][k]), int(gate["cbs"][k]), int(gate["ck_host"][k])) if gated else (0, 1, 0)
-            for c0, length, p0, _, lc0 in runs(cids_h[k], pids_h[k], cids_h[k] >= elem_first,   # padding: below
-                                               lc = gate["lc"][k] if gated else None):        # the region
-                found["E"].append((c0, length, p0, -1, nid, reg, lc0, g))
-            if aliased is not None:
-                valid = a_rows[k] >= 0
-                rows = np.where(valid, a_rows[k] + firsts_np[a_regs[k]], -1)
-                for r0, length, p0, creg, lc0 in runs(rows, a_pids[k], valid, a_regs[k],
-                                                      lc = gate["a_lc"][k] if gated else None):
-                    found["S"].append((r0, length, p0, creg, nid, reg, lc0, g))
-    blocks = defaultdict(list)           # (kind, first row, region, size) -> [(nid, reg, pid base, place, gate)]
-    for kind, rs in found.items():
-        cuts = sorted({x for c0, length, *_ in rs for x in (c0, c0 + length)})
-        for c0, length, p0, creg, nid, reg, lc0, g in rs:
-            lo, hi = bisect_left(cuts, c0), bisect_left(cuts, c0 + length)
-            for a, b in zip(cuts[lo:hi], cuts[lo + 1:hi + 1]):
-                blocks[(kind, a, creg, b - a)].append((nid, reg, p0 + (a - c0) * BS, lc0 + a - c0, g))
-    by_size = defaultdict(list)                          # child block size -> [(kind, first row, region, add, parents)]
-    for (kind, row, creg, length), parents in blocks.items():
-        keys = [(("E", prod_index, row + c) if kind == "E" else ("S", row + c, creg)) for c in range(length)]
-        hit = [k in written for k in keys]
-        written.update(keys)
-        for lo, hi, add in _segments(hit):               # written by an earlier launch: log-added to
-            by_size[hi - lo].append((kind, row + lo, creg, add, [(nid, reg, p0 + lo * BS, lc0 + lo, g)
-                                                                  for nid, reg, p0, lc0, g in parents]))
+        nids_h = nids.cpu().long().numpy()
+        at = np.nonzero(sums[nids_h[:, None] + np.arange(BS)].any(axis = 1))[0]
+        if at.size == 0:
+            continue
+        nids_h, regs_h = nids_h[at], nb_reg.cpu().long().numpy()[at]
+        cids_h, pids_h = cids.cpu().long().numpy()[at], pids.cpu().long().numpy()[at]
+        if gated:
+            g_row, g_cbs, g_ck = gate["row"][at], gate["cbs"][at], gate["ck_host"][at]
+        else:
+            g_row, g_cbs, g_ck = (np.full(at.size, v, dtype = np.int64) for v in (0, 1, 0))
+
+        def collect(kind, run):
+            k, c0, length, p0, creg, lc0 = run
+            found[kind].append((c0, length, p0, creg, nids_h[k], regs_h[k], lc0, g_row[k], g_cbs[k], g_ck[k]))
+
+        collect("E", _fused_runs(cids_h, pids_h, cids_h >= elem_first, BS,        # padding: below the region
+                                 lc = gate["lc"][at] if gated else None))
+        if aliased is not None:
+            a_rows, a_regs, a_pids = (t.cpu().long().numpy()[at] for t in aliased)
+            valid = a_rows >= 0
+            collect("S", _fused_runs(np.where(valid, a_rows + firsts_np[a_regs], -1), a_pids, valid, BS, a_regs,
+                                     lc = gate["a_lc"][at] if gated else None))
+    # the child blocks: per kind, as they first occur; a block's parents, in their runs' order
+    tables = []
+    for kind, runs in found.items():
+        if not runs:
+            continue
+        c0, length, p0, creg, nid, reg, lc0, g_row, g_cbs, g_ck = (np.concatenate(col) for col in zip(*runs))
+        if c0.size == 0:
+            continue
+        cuts = np.unique(np.concatenate([c0, c0 + length]))
+        lo, hi = np.searchsorted(cuts, c0), np.searchsorted(cuts, c0 + length)
+        count = hi - lo
+        run = np.repeat(np.arange(c0.size), count)
+        cut = lo[run] + np.arange(run.size) - np.repeat(np.cumsum(count) - count, count)
+        a, size = cuts[cut], cuts[cut + 1] - cuts[cut]
+        block, first = first_occurrence_groups(a, creg[run], size)
+        order = np.argsort(block, kind = "stable")
+        p_count = np.bincount(block, minlength = first.size)
+        p_first = np.cumsum(p_count) - p_count
+        r = run[order]
+        shift = a[order] - c0[r]
+        tables.append(dict(kind = kind, row = a[first], reg = creg[run[first]], size = size[first], p_first = p_first,
+                           p_count = p_count, nid = nid[r], par_reg = reg[r], pid = p0[r] + shift * BS, lc = lc0[r] + shift,
+                           grow = g_row[r], gcbs = g_cbs[r], gck = g_ck[r]))
+    # ... cut where an earlier launch's children end; by their size, as the sizes first occur
+    segments = []
+    for t in tables:
+        size = t["size"]
+        block = np.repeat(np.arange(size.size), size)
+        c = np.arange(block.size) - np.repeat(np.cumsum(size) - size, size)
+        rows = t["row"][block] + c
+        kept, rows = (elements, rows - elem_first) if t["kind"] == "E" else (sums, rows)
+        hit = kept[rows].copy()
+        kept[rows] = True
+        new = np.ones(block.size, dtype = bool)
+        new[1:] = (hit[1:] != hit[:-1]) | (block[1:] != block[:-1])
+        starts = np.nonzero(new)[0]
+        ends = np.append(starts[1:], block.size)
+        segments.append((t, block[starts], c[starts], ends - starts, hit[starts].astype(np.int64)))
     groups = {}
-    for length, items in by_size.items():
-        cb_row, cb_reg, cb_add, cb_ivreg, ptr = [], [], [], [], [0]
-        p_nid, p_reg, p_pid, p_lc, p_g = [], [], [], [], []
-        for kind, row, creg, add, parents in items:
-            cb_row.append(row); cb_reg.append(creg); cb_add.append(add); cb_ivreg.append(parents[0][1])
-            for nid, reg, p0, lc0, g in parents:
-                p_nid.append(nid); p_reg.append(reg); p_pid.append(p0); p_lc.append(lc0); p_g.append(g)
-            ptr.append(len(p_nid))
-        p_grow, p_gcbs, p_gck = (list(col) for col in zip(*p_g))
-        t = lambda xs, dt = torch.int32: torch.tensor(xs, dtype = dt, device = dev)
+    if not segments:
+        return groups
+    sizes = np.concatenate([seg[3] for seg in segments])
+    distinct = pd_unique(sizes)
+    for length in distinct.tolist():
+        cb_row, cb_reg, cb_add, cb_ivreg, counts = [], [], [], [], []
+        p_nid, p_reg, p_pid, p_lc, p_grow, p_gcbs, p_gck = [], [], [], [], [], [], []
+        for t, block, lo, seg_len, add in segments:
+            at = np.nonzero(seg_len == length)[0]
+            if at.size == 0:
+                continue
+            b, l = block[at], lo[at]
+            cb_row.append(t["row"][b] + l)
+            cb_reg.append(t["reg"][b])
+            cb_add.append(add[at])
+            cb_ivreg.append(t["par_reg"][t["p_first"][b]])
+            count = t["p_count"][b]
+            counts.append(count)
+            idx = np.repeat(t["p_first"][b], count) + np.arange(int(count.sum())) - np.repeat(np.cumsum(count) - count, count)
+            shift = np.repeat(l, count)
+            p_nid.append(t["nid"][idx])
+            p_reg.append(t["par_reg"][idx])
+            p_pid.append(t["pid"][idx] + shift * BS)
+            p_lc.append(t["lc"][idx] + shift)
+            p_grow.append(t["grow"][idx])
+            p_gcbs.append(t["gcbs"][idx])
+            p_gck.append(t["gck"][idx])
+        cb_row, cb_reg, cb_add, cb_ivreg, counts = (np.concatenate(x) for x in (cb_row, cb_reg, cb_add, cb_ivreg, counts))
+        p_nid, p_reg, p_pid, p_lc, p_grow, p_gcbs, p_gck = (np.concatenate(x) for x in (p_nid, p_reg, p_pid, p_lc, p_grow,
+                                                                                         p_gcbs, p_gck))
+        ptr = np.concatenate([[0], np.cumsum(counts)])
+        t32 = lambda x: torch.from_numpy(np.ascontiguousarray(x)).to(dev, torch.int32)
         dense = None              # one dense run under external parameters: its children these child blocks, unwritten
-        run = parts[0][6].get("dense_run") if gated and len(parts) == 1 and len(by_size) == 1 else None
-        if run is not None and run["E"] % length == 0 and not any(cb_add) and (np.asarray(cb_reg) < 0).all() and \
+        run = parts[0][6].get("dense_run") if gated and len(parts) == 1 and distinct.size == 1 else None
+        if run is not None and run["E"] % length == 0 and not cb_add.any() and (cb_reg < 0).all() and \
                 np.array_equal(np.sort(cb_row), run["c0"] + length * np.arange(run["E"] // length)):
             dense = dict(run = run, part = parts[0])
-        groups[length] = dict(cb_row = t(cb_row), cb_reg = t(cb_reg), cb_add = t(cb_add), cb_ivreg = t(cb_ivreg),
-                              par_ptr = t(ptr), par_nid = t(p_nid), par_reg = t(p_reg), par_pid = t(p_pid, torch.int64),
-                              max_slots = max(prog.slots[r] for r in cb_ivreg), max_parents = int(np.diff(ptr).max()),
+        groups[length] = dict(cb_row = t32(cb_row), cb_reg = t32(cb_reg), cb_add = t32(cb_add), cb_ivreg = t32(cb_ivreg),
+                              par_ptr = t32(ptr), par_nid = t32(p_nid), par_reg = t32(p_reg),
+                              par_pid = torch.from_numpy(p_pid).to(dev, torch.int64),
+                              max_slots = max(prog.slots[r] for r in np.unique(cb_ivreg).tolist()),
+                              max_parents = int(np.diff(ptr).max()),
                               dense = dense,
                               gate = None if not gated else dict(
-                                  layer = parts[0][6]["layer"], lc = t(p_lc), row = t(p_grow), cbs = t(p_gcbs),
-                                  ck = t(p_gck), node_gate = parts[0][6]["node_gate"],
-                                  uniform = block_scale.uniform_tiles(np.asarray(p_lc), np.asarray(p_gcbs), length)),
-                              host = dict(cb_row = np.asarray(cb_row), cb_reg = np.asarray(cb_reg),
-                                          cb_ivreg = np.asarray(cb_ivreg),
-                                          ivs = np.unique(prog.reg_iv_all[np.asarray(cb_ivreg)])))
+                                  layer = parts[0][6]["layer"], lc = t32(p_lc), row = t32(p_grow), cbs = t32(p_gcbs),
+                                  ck = t32(p_gck), node_gate = parts[0][6]["node_gate"],
+                                  uniform = block_scale.uniform_tiles(p_lc, p_gcbs, length)),
+                              host = dict(cb_row = cb_row, cb_reg = cb_reg, cb_ivreg = cb_ivreg,
+                                          ivs = np.unique(prog.reg_iv_all[cb_ivreg])))
     return groups
 
 
-def _segments(flags) -> list:
+def pd_unique(values: np.ndarray) -> np.ndarray:
+    """The distinct ``values``, as they first occur."""
+    u, at = np.unique(values, return_index = True)
+    return u[np.argsort(at)]
+
+
+def _segments(flags: np.ndarray) -> list:
     """The maximal runs of equal values in ``flags``: ``[(start, end, value)]``."""
-    out, k = [], 0
-    for j in range(1, len(flags) + 1):
-        if j == len(flags) or flags[j] != flags[k]:
-            out.append((k, j, int(flags[k])))
-            k = j
-    return out
+    flags = np.asarray(flags)
+    cuts = (np.nonzero(flags[1:] != flags[:-1])[0] + 1).tolist()
+    return [(s, e, int(flags[s])) for s, e in zip([0] + cuts, cuts + [flags.size])]

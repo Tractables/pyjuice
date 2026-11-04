@@ -64,11 +64,54 @@ NODE_TILE = 16
 _NODE_TILE = tl.constexpr(NODE_TILE)
 
 
+def packed(columns: np.ndarray, radix: int) -> np.ndarray:
+    """int64 [rows]: every row of the non-negative ``columns`` [rows, k] (each below ``radix``) as one number, in the
+    rows' lexicographic order."""
+    out = columns[:, 0].astype(np.int64)
+    for c in range(1, columns.shape[1]):
+        out = out * radix + columns[:, c]
+    return out
+
+
+def _row_keys(keys) -> Tuple[Optional[np.ndarray], np.ndarray]:
+    """``(numbers, cols)``: the rows of ``keys`` (int arrays, a value per row each, or [rows, k]) as [rows, k] ``cols``,
+    and as one int64 each in their lexicographic order, where those fit (else None)."""
+    cols = np.concatenate([np.asarray(k, dtype = np.int64).reshape(len(keys[0]), -1) for k in keys], axis = 1)
+    if cols.shape[0] == 0:
+        return None, cols
+    low, span = cols.min(axis = 0), cols.max(axis = 0) - cols.min(axis = 0) + 1
+    room = 1
+    for s in span.tolist():
+        room *= s
+    if room >= 1 << 62:
+        return None, cols
+    out = cols[:, 0] - low[0]
+    for c in range(1, cols.shape[1]):
+        out = out * span[c] + (cols[:, c] - low[c])
+    return out, cols
+
+
 def node_groups(*keys: np.ndarray) -> np.ndarray:
     """Every row's group (int64 [rows]): the rows with equal ``keys`` (int arrays, a value per row each, or [rows, k])
-    share one."""
-    cols = np.concatenate([np.asarray(k, dtype = np.int64).reshape(len(keys[0]), -1) for k in keys], axis = 1)
-    return np.unique(cols, axis = 0, return_inverse = True)[1].reshape(-1)
+    share one, numbered in the rows' lexicographic order."""
+    numbers, cols = _row_keys(keys)
+    if numbers is None:
+        return np.unique(cols, axis = 0, return_inverse = True)[1].reshape(-1)
+    return np.unique(numbers, return_inverse = True)[1].reshape(-1)
+
+
+def first_occurrence_groups(*keys: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """``(group, first)``: :func:`node_groups`' rows with equal ``keys``, numbered as they first occur, and every group's
+    first row."""
+    numbers, cols = _row_keys(keys)
+    if numbers is None:
+        _, at, inverse = np.unique(cols, axis = 0, return_index = True, return_inverse = True)
+    else:
+        _, at, inverse = np.unique(numbers, return_index = True, return_inverse = True)
+    order = np.argsort(at)
+    rank = np.empty(at.size, dtype = np.int64)
+    rank[order] = np.arange(at.size)
+    return rank[inverse.reshape(-1)], at[order]
 
 
 @njit(cache = True)

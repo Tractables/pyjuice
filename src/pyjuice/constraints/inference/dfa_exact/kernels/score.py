@@ -94,8 +94,11 @@ def score_tables(prog) -> ScoreTables:
     group_of = np.full(prog.n, -1, dtype = np.int64)
     col_of = np.full(prog.input_end - prog.input_start, -1, dtype = np.int64)
     groups, rows, nodes = {}, [], []
+    order = np.argsort(t, kind = "stable")
+    u, t = u[order], t[order]
+    bounds = np.searchsorted(t, np.arange(prog.n + 1))
     for pos in range(prog.n):
-        at = u[t == pos]
+        at = u[bounds[pos]:bounds[pos + 1]]
         if at.size == 0:
             continue
         r = np.unique(mass_row[at])
