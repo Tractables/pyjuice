@@ -1,6 +1,8 @@
 import pytest
 import torch
 
+from triton.runtime.errors import OutOfResources
+
 from pyjuice.layer.kernels import autotune
 
 
@@ -42,10 +44,19 @@ def test_a_close_win_still_needs_the_margin():
 
 def test_candidates_that_cannot_run_are_skipped():
     def broken():
-        raise RuntimeError("cannot launch")
+        raise OutOfResources(1 << 20, 1 << 16, "shared memory")
     calls = {}
     assert autotune.best_of([("ref", broken), _candidate(2_000_000, calls, "ok")]) == "ok"
     assert autotune.best_of([("ref", broken)]) is None
+
+
+def test_a_candidate_failing_for_another_reason_is_said_so():
+    """A kernel that does not compile, say: dropped as well, but a bug to fix (this suite makes the warning an error)."""
+    def broken():
+        raise RuntimeError("PassManager::run failed")
+    calls = {}
+    with pytest.warns(autotune.KernelCandidateWarning, match = "PassManager"):
+        assert autotune.best_of([("ref", broken), _candidate(2_000_000, calls, "ok")]) == "ok"
 
 
 def test_a_margin_of_one_takes_the_faster():

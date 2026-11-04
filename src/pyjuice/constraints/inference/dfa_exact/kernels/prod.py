@@ -259,16 +259,19 @@ def _ib_term(mx, acc, ee, pm, entry_succ, entry_x, rp, iv_table, rpos, j, X, r_o
 
 
 @triton.jit
-def _ibg_term(mx, acc, ee, pm, gm, entry_succ, entry_x, rp, iv_table, rpos, j, X, own, crank, b, t, rbase, ce, n, W,
+def _ibg_term(mx, acc, ee, pm, lm, gm, entry_succ, entry_x, rp, iv_table, rpos, j, X, own, crank, b, t, rbase, ce, n, W,
               masses, eprobs, tk, pr, lz, enum_logw, eidx, num_enum, logw_stride, R_FULL: tl.constexpr,
               COMPACT: tl.constexpr, ENUM: tl.constexpr, LOGW: tl.constexpr, ONE_EXP: tl.constexpr):
     """:func:`_input_block_group_kernel`'s term of entry ``ee`` (lanes ``pm``) for the ``[G, TILE]`` lanes (``gm`` the
-    group's steps): the successor's slot once, the steps' block values and masses (:func:`_group_mass`)."""
+    group's steps, ``lm`` both): the successor's slot once, the steps' block values and masses (:func:`_group_mass`).
+    The caller makes ``lm`` ahead of every load masked by ``pm``: Triton's layout pass may move such a load to the
+    ``[G, TILE]`` layout, reading ``pm`` as ``lm`` has it, and some variants (``ENUM``) fail to compile if ``lm`` comes
+    after the load ("operand #1 does not dominate this use")."""
     q = tl.load(entry_succ + ee, mask = pm, other = -1)
     x = tl.load(entry_x + ee, mask = pm, other = 0)
     sl = _operand_slot(iv_table, rpos, q, j, X, pm, own, crank, b, t + 1, q, rbase, ce, n, W, R_FULL, COMPACT)
     rv = tl.load(rp + sl[None, :], mask = gm[:, None] & (pm & (sl >= 0))[None, :], other = float("-inf"))
-    mass = _group_mass(masses, x, gm, pm, tk, pr, lz, eidx, eprobs, enum_logw, b, logw_stride,
+    mass = _group_mass(masses, x, lm, pm, tk, pr, lz, eidx, eprobs, enum_logw, b, logw_stride,
                        num_enum, ENUM, LOGW)
     if ONE_EXP:
         return _lse_step_one_exp(mx, acc, mass + rv)
@@ -297,12 +300,11 @@ def _lane_mass(masses, x, pm, eprobs, tk, pr, lz, enum_logw, eidx, b, num_enum, 
 
 
 @triton.jit
-def _group_mass(masses, x, gm, pm, tk, pr, lz, eidx, eprobs, enum_logw, b, logw_stride, num_enum, ENUM: tl.constexpr,
+def _group_mass(masses, x, lm, pm, tk, pr, lz, eidx, eprobs, enum_logw, b, logw_stride, num_enum, ENUM: tl.constexpr,
                 LOGW: tl.constexpr):
     """:func:`_lane_mass` for a group of steps: [G, TILE], the mass of class code ``x`` ([TILE]) at the lanes' rows
-    (``masses`` [G, TILE] pointers), the lanes on ``gm`` [G] (the group's steps) x ``pm`` [TILE]; ``ENUM``: ``tk`` the
-    boundary's first enumerated token, ``pr`` the rows' parameter rows, ``lz`` (``LOGW``) their log Z."""
-    lm = gm[:, None] & pm[None, :]
+    (``masses`` [G, TILE] pointers), the lanes on ``lm`` [G, TILE] (the group's steps by ``pm`` [TILE]); ``ENUM``: ``tk``
+    the boundary's first enumerated token, ``pr`` the rows' parameter rows, ``lz`` (``LOGW``) their log Z."""
     if ENUM:
         enum = (x < 0)[None, :]
         stored = tl.load(masses + tl.maximum(x, 0)[None, :], mask = lm & ~enum, other = float("-inf"))
@@ -559,8 +561,9 @@ def _input_block_group_kernel(element_mars, node_mars, temp, obs_class, next_col
                     l0, l1 = _list_range(succ_start, succ_count, b, t, i, miss, n, W, E)
                     for kk in range(0, tl.max(l1 - l0, axis = 0)):                  # (kk: not the int32 k below)
                         pm = miss & (l0 + kk < l1)
+                        lm = gm[:, None] & pm[None, :]
                         ee = tl.load(succ_entries + l0 + kk, mask = pm, other = 0)
-                        mx, acc = _ibg_term(mx, acc, ee, pm, gm, entry_succ, entry_x, rp, iv_table, rpos, j, X, own,
+                        mx, acc = _ibg_term(mx, acc, ee, pm, lm, gm, entry_succ, entry_x, rp, iv_table, rpos, j, X, own,
                                             crank, b, t, rbase, ce, n, W, masses, eprobs, tk, pr, lz, enum_logw, eidx,
                                             num_enum, logw_stride, R_FULL, COMPACT, ENUM, LOGW, ONE_EXP)
                 else:
@@ -568,7 +571,8 @@ def _input_block_group_kernel(element_mars, node_mars, temp, obs_class, next_col
                     p1 = tl.load(entry_ptr + t * (W + 1) + i + 1, mask = miss, other = 0)
                     for k in range(0, tl.max(p1 - p0, axis = 0)):
                         pm = miss & (p0 + k < p1)
-                        mx, acc = _ibg_term(mx, acc, p0 + k, pm, gm, entry_succ, entry_x, rp, iv_table, rpos, j, X, own,
+                        lm = gm[:, None] & pm[None, :]
+                        mx, acc = _ibg_term(mx, acc, p0 + k, pm, lm, gm, entry_succ, entry_x, rp, iv_table, rpos, j, X, own,
                                             crank, b, t, rbase, ce, n, W, masses, eprobs, tk, pr, lz, enum_logw, eidx,
                                             num_enum, logw_stride, R_FULL, COMPACT, ENUM, LOGW, ONE_EXP)
             else:                                                            # every class in class order, the dead
@@ -584,7 +588,7 @@ def _input_block_group_kernel(element_mars, node_mars, temp, obs_class, next_col
                                        COMPACT)
                     rv = tl.load(rp + sl[None, :], mask = gm[:, None] & (pm & (sl >= 0))[None, :],
                                  other = float("-inf"))
-                    mass = _group_mass(masses, x, gm, pm, tk, pr, lz, eidx, eprobs, enum_logw, b,
+                    mass = _group_mass(masses, x, gm[:, None] & pm[None, :], pm, tk, pr, lz, eidx, eprobs, enum_logw, b,
                                        logw_stride, num_enum, ENUM, LOGW)
                     if ONE_EXP:
                         mx, acc = _lse_step_one_exp(mx, acc, mass + rv)

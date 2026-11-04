@@ -28,7 +28,9 @@ disk by Triton across processes), i.e. it lands in the first iteration's warmup.
 """
 
 import os
+import warnings
 import torch
+from triton.runtime.errors import OutOfResources
 from typing import Optional
 
 
@@ -88,9 +90,15 @@ def _capturing() -> bool:
         return False
 
 
+class KernelCandidateWarning(UserWarning):
+    """A candidate dropped for something other than this device's limits: a kernel that does not compile, say. The
+    query still runs on the others, but that is a bug to fix; the test suite turns this into an error."""
+
+
 def _median_time(run, warmup: int, reps: int):
-    """Median wall time of `run` in ms, or None if it cannot be launched (e.g. a tile config that
-    exceeds this GPU's shared memory raises `OutOfResources` at COMPILE time, before any write)."""
+    """Median wall time of `run` in ms, or None if it cannot be launched: a tile config that exceeds this GPU's shared
+    memory raises `OutOfResources` at COMPILE time, before any write, and one that takes too much of its memory
+    `OutOfMemoryError`. Anything else also returns None, with a :class:`KernelCandidateWarning`."""
     ev0, ev1 = torch.cuda.Event(enable_timing = True), torch.cuda.Event(enable_timing = True)
     try:
         for _ in range(warmup):
@@ -100,7 +108,11 @@ def _median_time(run, warmup: int, reps: int):
         for _ in range(reps):
             ev0.record(); run(); ev1.record(); torch.cuda.synchronize()
             ts.append(ev0.elapsed_time(ev1))
-    except Exception:
+    except (OutOfResources, torch.cuda.OutOfMemoryError):
+        return None
+    except Exception as e:
+        warnings.warn(f"A kernel candidate failed and is dropped: {type(e).__name__}: {str(e)[:200]}",
+                      KernelCandidateWarning)
         return None
     ts.sort()
     return ts[len(ts) // 2]
