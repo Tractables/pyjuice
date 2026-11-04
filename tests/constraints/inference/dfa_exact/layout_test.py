@@ -1,5 +1,6 @@
 import itertools
 import random
+import weakref
 
 import pytest
 import torch
@@ -8,6 +9,7 @@ import pyjuice as juice
 import pyjuice.constraints as jc
 from pyjuice.constraints.inference.dfa_exact.kernels.prod import skip_masks
 from pyjuice.constraints.inference.dfa_exact.kernels.transitions import transition_stats, transition_tables
+from pyjuice.constraints.inference.dfa_exact.compiled import layout as layout_module
 from pyjuice.constraints.inference.dfa_exact.compiled.layout import (Reachability, _tile_any, build_layout,
                                                                     interval_tables)
 
@@ -345,11 +347,21 @@ def test_unsatisfiable_constraint_has_empty_boundaries():
     assert not L.satisfiable and (L.width == 0).all() and all(L.next_col_at(t).numel() == 0 for t in range(2))
 
 
-def test_layouts_are_cached_by_fingerprint():
-    a = build_layout(jc.DFA.contains([[1, 2]], 6), 4)
-    b = build_layout(jc.DFA.contains([[1, 2]], 6), 4)               # separately built, equal automaton
-    assert a is b
-    assert build_layout(jc.DFA.contains([[1, 2]], 6), 5) is not a
+def test_layouts_are_kept_with_the_automaton():
+    dfa = jc.DFA.contains([[1, 2]], 6)
+    a = build_layout(dfa, 4)
+    assert build_layout(dfa, 4) is a
+    assert build_layout(dfa, 5) is not a
+    twin = build_layout(jc.DFA.contains([[1, 2]], 6), 4)            # separately built, equal automaton: equal tables
+    assert twin is not a and torch.equal(twin.state_id, a.state_id) and torch.equal(twin.col_of_state, a.col_of_state)
+
+
+def test_a_layout_is_never_taken_for_a_dead_automatons():
+    """An id is only unique among live objects: an entry whose automaton died under the same id is not this one's."""
+    dead, alive = jc.DFA.contains([[1, 2]], 6), jc.DFA.contains([[2, 1]], 6)
+    stale = build_layout(dead, 4)
+    layout_module._CACHE[(id(alive), 4)] = (weakref.ref(dead), stale)
+    assert build_layout(alive, 4) is not stale
 
 
 def test_pruning_on_a_word_count_constraint(word_count):

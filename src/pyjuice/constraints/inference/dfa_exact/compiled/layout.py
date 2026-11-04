@@ -12,12 +12,13 @@ is valid, and this one gathers the (column, column) pairs the automaton cannot j
 product kernels skip (:class:`Reachability`).
 
 The layout depends only on the automaton and ``n`` -- never on the PC, its parameters or evidence -- so it
-is built once and cached by the automaton's fingerprint.
+is built once and kept with the automaton object (hashing the automaton's tables would take longer than building it).
 """
 
 from __future__ import annotations
 
 import math
+import weakref
 from collections import OrderedDict
 from dataclasses import dataclass
 from functools import cached_property
@@ -91,8 +92,11 @@ class BoundaryLayout:
 
     def transitions(self, device) -> "Transitions":
         """The layout's transitions on ``device`` (:class:`Transitions`)."""
-        return Transitions(self.delta.to(device), self.state_id.to(device), self.col_of_state.to(device),
-                           [int(w) for w in self.width.tolist()])
+        widths = [int(w) for w in self.width.tolist()]
+        dev, delta, state_id, col_of_state = self.__dict__.get("_on_device", (None, None, None, None))
+        if dev == torch.device(device):
+            return Transitions(delta, state_id, col_of_state, widths)
+        return Transitions(self.delta.to(device), self.state_id.to(device), self.col_of_state.to(device), widths)
 
     @cached_property
     def successors(self):
@@ -154,13 +158,14 @@ class Transitions:
         return next_columns(self.delta, self.state_id, self.col_of_state, t, self.width[t])
 
 
-_CACHE: "OrderedDict[tuple, BoundaryLayout]" = OrderedDict()
+_CACHE: "OrderedDict[tuple, Tuple[weakref.ref, BoundaryLayout]]" = OrderedDict()
 _CACHE_SIZE = 64
 
 
 def build_layout(automaton: DFA, n: int, device = None, report = None) -> BoundaryLayout:
     """
-    The :class:`BoundaryLayout` of ``automaton`` over ``n`` positions (cached by fingerprint and ``n``; on the host).
+    The :class:`BoundaryLayout` of ``automaton`` over ``n`` positions (kept for the automaton object and ``n``; on the
+    host).
 
     :param automaton: a complete DFA (what the ``automaton`` capability returns)
     :type automaton: DFA
@@ -175,13 +180,14 @@ def build_layout(automaton: DFA, n: int, device = None, report = None) -> Bounda
         raise TypeError(f"Expected a DFA, got {type(automaton).__name__}.")
     if n < 0:
         raise ValueError(f"`n` must be non-negative, got {n}.")
-    key = (automaton.fingerprint(), int(n))
-    layout = _CACHE.get(key)
-    if layout is not None:
+    key = (id(automaton), int(n))
+    kept = _CACHE.get(key)
+    if kept is not None and kept[0]() is automaton:                       # (an id is only unique among live objects)
         _CACHE.move_to_end(key)
-        return layout
+        return kept[1]
     layout = _build(automaton, int(n), device, report)
-    _CACHE[key] = layout
+    _CACHE[key] = (weakref.ref(automaton), layout)
+    _CACHE.move_to_end(key)
     if len(_CACHE) > _CACHE_SIZE:
         _CACHE.popitem(last = False)
     return layout
@@ -224,30 +230,29 @@ def _build(dfa: DFA, n: int, device = None, report = None) -> BoundaryLayout:
     reach = _sweep(initial, forward, n, report, "layout: reachable states")
     # ... and able to reach acceptance in exactly n - t more tokens
     accept_in = _sweep(accept.bool(), lambda row: row[delta].any(dim = 1), n, report, "layout: accepting states")
-    active = (reach & accept_in.flip(0)).cpu()                              # [n+1, K]
+    active = reach & accept_in.flip(0)                                      # [n+1, K]
     # the column order: the fewest tokens to acceptance (within n), descending, then the state id
-    to_accept = torch.where(accept_in.any(dim = 0), accept_in.to(torch.uint8).argmax(dim = 0), n + 1).cpu()
+    to_accept = torch.where(accept_in.any(dim = 0), accept_in.to(torch.uint8).argmax(dim = 0), n + 1)
+    order = torch.argsort((n + 1 - to_accept) * K + torch.arange(K, device = dev))     # the states in that order
 
+    if report is not None:
+        report.stage("layout: columns", 1)
     width = active.sum(dim = 1)
     W = max(int(width.max()), 1)
-    state_id = torch.full((n + 1, W), -1, dtype = torch.long)
-    col_of_state = torch.full((n + 1, K), -1, dtype = torch.long)
+    in_order = active[:, order]
+    cols = torch.cumsum(in_order, dim = 1) - 1                              # a state's column, were it active
+    rows, at = torch.nonzero(in_order, as_tuple = True)
+    state_id = torch.full((n + 1, W), -1, dtype = torch.long, device = dev)
+    state_id[rows, cols[rows, at]] = order[at]
+    col_of_state = torch.full((n + 1, K), -1, dtype = torch.long, device = dev)
+    col_of_state[rows, order[at]] = cols[rows, at]
+    # (the automaton's tables are not copied: nothing writes them; on the device they are kept for the transitions)
+    layout = BoundaryLayout(n = n, token_class = dfa._token_class, width = width.cpu(), state_id = state_id.cpu(),
+                            col_of_state = col_of_state.cpu(), delta = dfa._delta, satisfiable = bool(width[0] > 0))
+    layout.__dict__["_on_device"] = (dev, delta, state_id, col_of_state)
     if report is not None:
-        report.stage("layout: columns", n + 1)
-    for t in range(n + 1):
-        if t > 0 and torch.equal(active[t], active[t - 1]):                 # (the same states: the same columns)
-            state_id[t], col_of_state[t] = state_id[t - 1], col_of_state[t - 1]
-        else:
-            ids = torch.nonzero(active[t]).flatten()
-            ids = ids[torch.argsort((n + 1 - to_accept[ids]) * K + ids)]
-            state_id[t, :ids.numel()] = ids
-            col_of_state[t, ids] = torch.arange(ids.numel())
-        if report is not None:
-            report.advance()
-
-    return BoundaryLayout(n = n, token_class = dfa.token_class, width = width, state_id = state_id,
-                          col_of_state = col_of_state, delta = dfa.delta.to(torch.long).contiguous(),
-                          satisfiable = bool(width[0] > 0))
+        report.advance()
+    return layout
 
 
 class Reachability:
@@ -370,13 +375,16 @@ class IntervalTables:
     table: torch.Tensor
 
 
-def interval_tables(reach: Reachability, intervals, device) -> IntervalTables:
-    """The :class:`IntervalTables` of ``intervals`` (``(a, b)`` boundary pairs), on ``device``."""
+def interval_tables(reach: Reachability, intervals, device, of: Optional[torch.Tensor] = None) -> IntervalTables:
+    """The :class:`IntervalTables` of ``intervals`` (``(a, b)`` boundary pairs), on ``device``; ``of``: their numbers if
+    the caller has them (as :attr:`IntervalTables.of`, on the device)."""
     n = reach.n
-    of = torch.full(((n + 1) * (n + 1),), -1, dtype = torch.int32)
+    if of is None:
+        of = torch.full(((n + 1) * (n + 1),), -1, dtype = torch.int32)
+        for k, (a, b) in enumerate(intervals):
+            of[a * (n + 1) + b] = k
     info, parts, size = [], [], 0
-    for k, (a, b) in enumerate(intervals):
-        of[a * (n + 1) + b] = k
+    for a, b in intervals:
         positions = reach.positions(a, b)
         if positions is None:
             info.append((reach.slots(a, b), -1, -1))
