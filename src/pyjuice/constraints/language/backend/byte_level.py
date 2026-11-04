@@ -97,43 +97,6 @@ class ByteAutomaton:
         return bool(self.accept[q])
 
 
-@njit(cache = True)
-def _coreachable(delta, accept):
-    """bool [K]: the states some accepting state is reachable from (a breadth-first search over reversed edges)."""
-    K, C = delta.shape
-    ptr = np.zeros(K + 1, dtype = np.int64)
-    for q in range(K):
-        for c in range(C):
-            ptr[delta[q, c] + 1] += 1
-    for i in range(K):
-        ptr[i + 1] += ptr[i]
-    src = np.empty(K * C, dtype = np.int64)
-    fill = ptr[:-1].copy()
-    for q in range(K):
-        for c in range(C):
-            t = delta[q, c]
-            src[fill[t]] = q
-            fill[t] += 1
-    live = accept.copy()
-    queue = np.empty(K, dtype = np.int64)
-    num = 0
-    for q in range(K):
-        if live[q]:
-            queue[num] = q
-            num += 1
-    head = 0
-    while head < num:
-        t = queue[head]
-        head += 1
-        for k in range(ptr[t], ptr[t + 1]):
-            q = src[k]
-            if not live[q]:
-                live[q] = True
-                queue[num] = q
-                num += 1
-    return live
-
-
 def _encode(cp: int) -> bytes:
     return chr(cp).encode("utf-8")
 
@@ -386,7 +349,8 @@ def _walk(table, dead, initial, ptr, edge_class, edge_node, holds, r1, r2, r3, r
     """The states reached at token boundaries (breadth-first from ``initial``) and, per merged node, two hashes of its
     successors from them: from every reached state a depth-first walk of the merged trie (:func:`_merged_trie`) through
     live states -- as far as ``budget`` edges go: ``(h1, h2, states, walked)``, the first ``walked`` of them walked (every
-    state a walk found, if it is all of them)."""
+    state a walk found, if it is all of them). The hashes tell apart the nodes these states tell apart, by the state they
+    lead to, whether tokens end at them or not."""
     S = table.shape[0]
     M = ptr.shape[0] - 1
     h1 = np.zeros(M + 2, dtype = np.uint64)
@@ -416,25 +380,57 @@ def _walk(table, dead, initial, ptr, edge_class, edge_node, holds, r1, r2, r3, r
                 if q2 == dead:
                     continue
                 w = edge_node[e]
-                if holds[w]:                                           # a token ends here: a boundary state
-                    x = np.uint64(q2 + 1)
-                    h1[w] += a1 * x + b1
-                    h2[w] += a2 * x + b2
-                    if not seen[q2]:
-                        seen[q2] = True
-                        order[num] = q2
-                        num += 1
+                x = np.uint64(q2 + 1)
+                h1[w] += a1 * x + b1
+                h2[w] += a2 * x + b2
+                if holds[w] and not seen[q2]:                          # a token ends here: a boundary state
+                    seen[q2] = True
+                    order[num] = q2
+                    num += 1
                 stack_node[top] = w
                 stack_q[top] = q2
                 top += 1
     return h1, h2, order[:num], head
 
 
+@njit(cache = True)
+def _walks(table, dead, states, ptr, edge_class, edge_node, r1, r2, r3, r4, h1, h2, budget):
+    """:func:`_walk`'s hashes, added to ``h1`` and ``h2``, from ``states`` in turn, as far as ``budget`` edges go: how many
+    were walked, one at least."""
+    M = ptr.shape[0] - 1
+    stack_node = np.empty(M + 1, dtype = np.int32)
+    stack_q = np.empty(M + 1, dtype = np.int32)
+    steps, i = 0, 0
+    while i < states.shape[0] and (i == 0 or steps < budget):
+        s = states[i]
+        i += 1
+        a1, b1, a2, b2 = r1[s], r2[s], r3[s], r4[s]
+        stack_node[0] = 0
+        stack_q[0] = s
+        top = 1
+        while top > 0:
+            top -= 1
+            u = stack_node[top]
+            q = stack_q[top]
+            steps += ptr[u + 1] - ptr[u]
+            for e in range(ptr[u], ptr[u + 1]):
+                q2 = table[q, edge_class[e]]
+                if q2 == dead:
+                    continue
+                w = edge_node[e]
+                x = np.uint64(q2 + 1)
+                h1[w] += a1 * x + b1
+                h2[w] += a2 * x + b2
+                stack_node[top] = w
+                stack_q[top] = q2
+                top += 1
+    return i
+
+
 @njit(parallel = True, cache = True)
-def _walk_from(table, dead, states, ptr, edge_class, edge_node, holds, r1, r2, r3, r4, P, slots):
-    """:func:`_walk`'s hashes from the given ``states`` (every state reached at a token boundary), in parallel: ``P``
-    walkers take every ``P``-th state, each summing into its own hashes -- ``slots`` of them, the merged nodes and two
-    more --, then summed."""
+def _walks_parallel(table, dead, states, ptr, edge_class, edge_node, r1, r2, r3, r4, P, slots):
+    """:func:`_walks` of all ``states``, no budget, in parallel: ``P`` walkers take every ``P``-th state, each summing into
+    its own hashes -- ``slots`` of them, the merged nodes and two more --, then summed."""
     S = states.shape[0]
     h1 = np.zeros((P, slots), dtype = np.uint64)
     h2 = np.zeros((P, slots), dtype = np.uint64)
@@ -456,10 +452,9 @@ def _walk_from(table, dead, states, ptr, edge_class, edge_node, holds, r1, r2, r
                     if q2 == dead:
                         continue
                     w = edge_node[e]
-                    if holds[w]:
-                        x = np.uint64(q2 + 1)
-                        h1[c, w] += a1 * x + b1
-                        h2[c, w] += a2 * x + b2
+                    x = np.uint64(q2 + 1)
+                    h1[c, w] += a1 * x + b1
+                    h2[c, w] += a2 * x + b2
                     stack_node[top] = w
                     stack_q[top] = q2
                     top += 1
@@ -470,6 +465,177 @@ def _walk_from(table, dead, states, ptr, edge_class, edge_node, holds, r1, r2, r
             o1[t] += h1[c, t]
             o2[t] += h2[c, t]
     return o1, o2
+
+
+@njit(cache = True)
+def _quotient(h1, h2, ptr, edge_class, edge_node):
+    """
+    The merged trie with the nodes of the same hashes as one (no state walked tells them apart; the root stays alone):
+    ``(gptr, gclass, gnode, into, zero)``: its edges, one per (node, class), as CSR, the edges into every node, and the
+    node of those no walk reached (-1: none). What the walks have told apart a child of it keeps: the nodes of a node's
+    children on a class are one, as the same states lead to the same states.
+    """
+    M = ptr.shape[0] - 1
+    E = edge_node.shape[0]
+    cap = 16
+    while cap < 2 * M:
+        cap *= 2
+    slots = np.full(cap, -1, dtype = np.int32)
+    of = np.empty(M, dtype = np.int32)
+    rep = np.empty(M, dtype = np.int32)
+    of[0], rep[0] = 0, 0
+    G = 1
+    zero = -1
+    for u in range(1, M):
+        at = np.int64((h1[u] ^ (h2[u] >> np.uint64(17))) & np.uint64(cap - 1))
+        while True:
+            g = slots[at]
+            if g < 0:
+                g = G
+                G += 1
+                slots[at] = g
+                rep[g] = u
+                if h1[u] == 0 and h2[u] == 0:
+                    zero = g
+                break
+            if h1[rep[g]] == h1[u] and h2[rep[g]] == h2[u]:
+                break
+            at = (at + 1) & (cap - 1)
+        of[u] = g
+    cap = 16
+    while cap < 2 * E:
+        cap *= 2
+    keys = np.full(cap, np.int64(-1))
+    src = np.empty(E, dtype = np.int32)
+    gclass = np.empty(E, dtype = np.int32)
+    gnode = np.empty(E, dtype = np.int32)
+    C = 0
+    for e in range(E):
+        C = max(C, edge_class[e] + 1)
+    num = 0
+    gptr = np.zeros(G + 1, dtype = np.int64)
+    for u in range(M):
+        g = of[u]
+        for e in range(ptr[u], ptr[u + 1]):
+            key = np.int64(g) * C + edge_class[e]
+            at = (key * np.int64(0x9E3779B97F4A7C1)) & (cap - 1)
+            while keys[at] >= 0 and keys[at] != key:
+                at = (at + 1) & (cap - 1)
+            if keys[at] < 0:
+                keys[at] = key
+                src[num], gclass[num], gnode[num] = g, edge_class[e], of[edge_node[e]]
+                gptr[g + 1] += 1
+                num += 1
+    for g in range(G):
+        gptr[g + 1] += gptr[g]
+    fill = gptr[:G].copy()
+    out_class = np.empty(num, dtype = np.int32)
+    out_node = np.empty(num, dtype = np.int32)
+    into = np.zeros(G, dtype = np.int32)
+    for i in range(num):
+        g = src[i]
+        out_class[fill[g]], out_node[fill[g]] = gclass[i], gnode[i]
+        fill[g] += 1
+        into[gnode[i]] += 1
+    return gptr, out_class, out_node, into, zero
+
+
+@njit(cache = True)
+def _check_part(table, dead, states, first, step, gptr, gclass, gnode, into, zero, bad):
+    """``bad[i]``, every ``step``-th of ``states`` from ``first``, unless the state leads every trie node of a node of the
+    quotient (:func:`_quotient`) to one state, or nowhere: it then tells no two of them apart. A walk of the quotient from
+    the root gives every node it reaches a state: another edge into that node must say the same, and every edge into it
+    must be walked: from a node reached, on a class that does not die. Then by induction over a trie node's depth it leads
+    to its quotient node's state. Through a node no walk reached (``zero``) it fails: that says nowhere for the tokens."""
+    G = gptr.shape[0] - 1
+    value = np.empty(G, dtype = np.int32)
+    stamp = np.full(G, -1, dtype = np.int64)
+    queue = np.empty(G, dtype = np.int32)
+    for i in range(first, states.shape[0], step):
+        stamp[0] = i
+        value[0] = states[i]
+        queue[0] = 0
+        num, head = 1, 0
+        edges, needed = 0, 0
+        ok = True
+        while head < num and ok:
+            g = queue[head]
+            head += 1
+            q = value[g]
+            for e in range(gptr[g], gptr[g + 1]):
+                q2 = table[q, gclass[e]]
+                if q2 == dead:
+                    continue
+                w = gnode[e]
+                edges += 1
+                if stamp[w] != i:
+                    stamp[w] = i
+                    value[w] = q2
+                    queue[num] = w
+                    num += 1
+                    needed += into[w]
+                    if w == zero:
+                        ok = False
+                        break
+                elif value[w] != q2:
+                    ok = False
+                    break
+        bad[i] = not ok or edges != needed
+
+
+@njit(parallel = True, cache = True)
+def _check_parallel(table, dead, states, gptr, gclass, gnode, into, zero, bad, P):
+    """:func:`_check_part` of all ``states``: ``P`` parts."""
+    for c in prange(P):
+        _check_part(table, dead, states, c, P, gptr, gclass, gnode, into, zero, bad)
+
+
+def _not_told_apart(table: np.ndarray, dead: int, states: np.ndarray, quotient) -> np.ndarray:
+    """Those of ``states`` that tell apart two trie nodes of a node of the quotient (:func:`_check_part`)."""
+    bad = np.empty(states.size, dtype = bool)
+    threads = get_num_threads()
+    if states.size >= SERIAL_CHECKS and threads > 1:
+        _check_parallel(table, dead, states, *quotient, bad, min(threads, states.size))
+    else:
+        _check_part(table, dead, states, 0, 1, *quotient, bad)
+    return states[bad]
+
+
+def _walk_the_rest(table: np.ndarray, dead: int, rest: np.ndarray, ptr: np.ndarray, edge_class: np.ndarray, edge_node: np.ndarray,
+                   r: Sequence[np.ndarray], h1: np.ndarray, h2: np.ndarray) -> None:
+    """
+    The token classes as if walks from ``rest`` were added to the hashes ``h1`` and ``h2``, with next to no walks: of two
+    hundred thousand states a few hundred tell apart all a walk from every one would (a state in a long string reads its
+    tokens like the next). The nodes the hashes so far tell apart are a far smaller graph (:func:`_quotient`). Every state
+    is checked on it (:func:`_check_part`), and walks only if it tells apart what the hashes do not; from then on the graph
+    is that much larger. The states that have passed tell nothing apart whatever the graph comes to be: what they cannot
+    tell apart stays together or is told apart by others.
+    """
+    M = ptr.size - 1
+    quotient = _quotient(h1, h2, ptr, edge_class, edge_node)
+    budget, at, batch = M, 0, FIRST_CHECKS
+    while at < rest.size:
+        left = rest[at:at + batch]
+        at += left.size
+        batch *= 2
+        while True:
+            left = _not_told_apart(table, dead, left, quotient)
+            if left.size == 0:
+                break
+            if budget < WALKS_IN_THREADS or get_num_threads() == 1:
+                walked = _walks(table, dead, left, ptr, edge_class, edge_node, r[0], r[1], r[2], r[3], h1, h2, budget)
+                left = left[walked:]
+                budget *= 2
+            else:                                                       # (states that do tell much apart: all at once)
+                a1, a2 = _walks_parallel(table, dead, left, ptr, edge_class, edge_node, r[0], r[1], r[2], r[3],
+                                         min(get_num_threads(), left.size), M + 2)
+                with np.errstate(over = "ignore"):
+                    h1 += a1
+                    h2 += a2
+                left = left[:0]
+            quotient = _quotient(h1, h2, ptr, edge_class, edge_node)
+            if left.size == 0:
+                break
 
 
 @njit(cache = True)
@@ -553,10 +719,15 @@ def _rows_parallel(table, dead, states, reps, kinds, offsets, data, byte_class, 
         _rows(table, dead, states, reps, kinds, offsets, data, byte_class, remap, out, c * R // P, (c + 1) * R // P)
 
 
-#: so many edges of the merged trie, or a table of so many entries, stay on one thread: waking a team is milliseconds on a
-#: busy machine
+#: so many edges of the merged trie are walked first, or a table of so many entries stays on one thread: waking a team is
+#: milliseconds on a busy machine
 SERIAL_STEPS = 1 << 19
 NO_BUDGET = 1 << 62
+#: states checked on the quotient of the merged trie (:func:`_walk_the_rest`): at first so many, then twice as many a time,
+#: on one thread below :data:`SERIAL_CHECKS`; states failing are walked, so many edges in threads at the most at a time
+FIRST_CHECKS = 256
+SERIAL_CHECKS = 1 << 12
+WALKS_IN_THREADS = 1 << 24
 
 
 def to_tokens(automaton: ByteAutomaton, vocabulary: Vocabulary, eos_padding: bool) -> DFA:
@@ -577,20 +748,14 @@ def to_tokens(automaton: ByteAutomaton, vocabulary: Vocabulary, eos_padding: boo
                                                                  byte_class, _classes_read(table, dead_byte), V)
     M = ptr.size - 1
     complete = automaton.minimal and start != dead_byte and _byte_complete(trie)
-    threads = get_num_threads()
     h1, h2, states, walked = _walk(table, dead_byte, start, ptr, edge_class, edge_node, holds, r[0], r[1], r[2], r[3],
-                                   SERIAL_STEPS if complete and threads > 1 else NO_BUDGET)
-    if walked < states.size:        # the states reached at token boundaries: every one a byte text reaches; the rest apart
+                                   SERIAL_STEPS if complete else NO_BUDGET)
+    if walked < states.size:        # the states reached at token boundaries: every one a byte text reaches
         left = np.ones(S, dtype = bool)
         left[states[:walked]] = False
         states = bfs_order(table, start)
         states = states[states != dead_byte]
-        rest = states[left[states]]
-        a1, a2 = _walk_from(table, dead_byte, rest, ptr, edge_class, edge_node, holds, r[0], r[1], r[2], r[3],
-                            max(1, min(threads, rest.size)), M + 2)
-        with np.errstate(over = "ignore"):
-            h1 += a1
-            h2 += a2
+        _walk_the_rest(table, dead_byte, states[left[states]], ptr, edge_class, edge_node, r, h1, h2)
     offsets, has_text = vocabulary._offsets, vocabulary._has_text
     empty = np.nonzero(has_text & (offsets[1:] == offsets[:-1]))[0]
     if empty.size:                                                      # empty text: every state to itself

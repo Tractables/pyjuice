@@ -224,3 +224,74 @@ def test_a_long_chain_stays_linear():
     assert a.num_states == sum(len(f'"k{i}":') for i in range(3000)) + 2
     text = b"".join(f'"k{i}":'.encode() for i in range(3000))
     assert a.accepts(text) and not a.accepts(text[:-1])
+
+
+def moore(table, accept):
+    """The coarsest partition of the states, the textbook way: refined until nothing changes."""
+    block = np.asarray(accept, dtype = np.int64)
+    while True:
+        rows = np.concatenate([block[:, None], block[table]], axis = 1)
+        _, new = np.unique(rows, axis = 0, return_inverse = True)
+        new = new.reshape(-1)
+        if new.max() == block.max() and len(np.unique(new)) == len(np.unique(block)):
+            return new
+        block = new
+
+
+def random_table(rng, K, C, density):
+    """A complete table of ``K`` states over ``C`` classes, state ``K - 1`` a sink, a move there unless ``density`` says."""
+    table = np.full((K, C), K - 1, dtype = np.int32)
+    moves = rng.random((K, C)) < density
+    table[moves] = rng.integers(0, K, moves.sum())
+    table[K - 1] = K - 1
+    accept = rng.random(K) < rng.choice([0.0, 0.1, 0.5, 1.0])
+    accept[K - 1] = False
+    return table, accept
+
+
+def test_the_partition_over_moves_is_the_coarsest():
+    """:func:`~pyjuice.constraints.language.backend.dfa.hopcroft` against refining until nothing changes: random tables
+    sparse and dense, with sinks, without an accepting state, with nothing else."""
+    from pyjuice.constraints.language.backend.dfa import hopcroft
+    rng = np.random.default_rng(0)
+    for case in range(400):
+        K, C = int(rng.integers(1, 40)), int(rng.integers(1, 8))
+        table, accept = random_table(rng, K, C, rng.choice([0.05, 0.2, 0.6, 1.0]))
+        if case % 7 == 0:                                       # another state like the sink: no accepting one reached
+            table[K // 2] = K // 2
+            accept[K // 2] = False
+        block, num = hopcroft(table.astype(np.int64), accept)
+        reference = moore(table, accept)
+        assert num == len(np.unique(reference)) == len(np.unique(block)), case
+        assert block.min() >= 0 and block.max() < num, case
+        pairs = np.unique(np.stack([block, reference]), axis = 1)
+        assert pairs.shape[1] == num, case                      # (the same partition: one to one)
+
+
+def test_the_minimal_automaton_over_moves_is_the_table_minimized():
+    """:func:`~pyjuice.constraints.language.backend.automata._from_classes` on random tables: a state per block of the
+    reachable states from which something is accepted, breadth-first by class, the one dead state last, and the same
+    answers on every string."""
+    rng = np.random.default_rng(1)
+    for case in range(300):
+        K, C = int(rng.integers(1, 30)), int(rng.integers(1, 6))
+        table, accept = random_table(rng, K, C, rng.choice([0.1, 0.3, 0.8]))
+        initial = int(rng.integers(0, K))
+        byte_class = np.arange(256) % C
+        byte_class[:C] = np.arange(C)
+        a = A._from_classes(table, initial, accept, byte_class)
+        assert a.minimal and a.initial == 0 and a.dead == a.num_states - 1, case
+        assert not a.accept[a.dead] and (a.table[a.dead] == a.dead).all(), case
+        again = A._from_classes(a.table[:, a.byte_class[np.arange(C)]], 0, a.accept, np.arange(256) % C * 0 + byte_class)
+        assert np.array_equal(again.table, a.table) and np.array_equal(again.accept, a.accept), case
+        seen = [0]                                              # numbered breadth-first, by class
+        for q in seen:
+            for t in a.table[q].tolist():
+                if t != a.dead and t not in seen:
+                    seen.append(t)
+        assert seen == list(range(a.num_states - 1)) or a.num_states == 1, case
+        for text in itertools.product(range(C), repeat = 4):
+            q, r = initial, 0
+            for c in text:
+                q, r = int(table[q, c]), int(a.table[r, a.byte_class[c]])
+                assert bool(accept[q]) == bool(a.accept[r]), case

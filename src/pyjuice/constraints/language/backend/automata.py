@@ -22,8 +22,8 @@ from typing import List, Optional, Sequence, Tuple
 import numpy as np
 from numba import njit
 
-from .byte_level import ByteAutomaton, _coreachable
-from .dfa import _column_classes, bfs_order, hopcroft, product_bfs
+from .byte_level import ByteAutomaton
+from .dfa import _column_classes, minimal_moves, moves_of_table, product_bfs
 
 
 # -------------------------------------------------------------------------------------------------
@@ -40,74 +40,21 @@ def _joint(parts: Sequence[ByteAutomaton]) -> Tuple[np.ndarray, List[np.ndarray]
     return byte_class, list(classes[:, first])
 
 
-@njit(cache = True)
-def _canonical_table(table, initial, accept):
-    """The minimal automaton of a complete table: reachable states, Hopcroft's partition, breadth-first numbering, every
-    state from which no accepting state is reachable one dead state, the last: ``(out, accepting, start, dead)``."""
-    K, C = table.shape
-    reach = bfs_order(table, initial)
-    R = reach.shape[0]
-    remap = np.empty(K, dtype = np.int32)
-    for i in range(R):
-        remap[reach[i]] = i
-    d = np.empty((R, C), dtype = np.int32)
-    acc = np.empty(R, dtype = np.bool_)
-    for i in range(R):
-        q = reach[i]
-        acc[i] = accept[q]
-        for c in range(C):
-            d[i, c] = remap[table[q, c]]
-    block, num_blocks = hopcroft(d, acc)
-    rep = np.empty(num_blocks, dtype = np.int32)
-    for i in range(R):                                          # any member represents its block
-        rep[block[i]] = i
-    merged = np.empty((num_blocks, C), dtype = np.int32)
-    for b in range(num_blocks):
-        r = rep[b]
-        for c in range(C):
-            merged[b, c] = block[d[r, c]]
-    order = bfs_order(merged, block[0])
-    place = np.empty(num_blocks, dtype = np.int32)
-    for i in range(num_blocks):
-        place[order[i]] = i
-    numbered = np.empty((num_blocks, C), dtype = np.int32)
-    good = np.empty(num_blocks, dtype = np.bool_)
-    for i in range(num_blocks):
-        b = order[i]
-        good[i] = acc[rep[b]]
-        for c in range(C):
-            numbered[i, c] = place[merged[b, c]]
-    live = _coreachable(numbered, good)                         # (the one dead state last)
-    alive = 0
-    final = np.empty(num_blocks, dtype = np.int32)
-    for i in range(num_blocks):
-        if live[i]:
-            final[i] = alive
-            alive += 1
-    for i in range(num_blocks):
-        if not live[i]:
-            final[i] = alive
-    out = np.empty((alive + 1, C), dtype = np.int32)
-    accepting = np.zeros(alive + 1, dtype = np.bool_)
-    for c in range(C):
-        out[alive, c] = alive
-    for i in range(num_blocks):
-        if live[i]:
-            f = final[i]
-            accepting[f] = good[i]
-            for c in range(C):
-                out[f, c] = final[numbered[i, c]]
-    return out, accepting, final[0], alive
+def _from_moves(ptr: np.ndarray, cls: np.ndarray, dst: np.ndarray, initial: int, accept: np.ndarray, C: int,
+                byte_class: np.ndarray) -> ByteAutomaton:
+    """The canonical minimal automaton of moves as CSR per state over byte classes (:func:`~.dfa.minimal_moves`; the
+    classes numbered by their smallest byte: its breadth-first numbering, the same over any classes numbered so, reads
+    bytes in order), and the classes it tells apart."""
+    out, accepting = minimal_moves(ptr, cls, dst, accept, initial, C)
+    column_class, first = _column_classes(out)
+    return ByteAutomaton(None, 0, accepting, accepting.size - 1, table = out if first.size == out.shape[1] else out[:, first],
+                         byte_class = column_class[byte_class], minimal = True)
 
 
 def _from_classes(table: np.ndarray, initial: int, accept: np.ndarray, byte_class: np.ndarray) -> ByteAutomaton:
-    """The canonical minimal automaton of a complete int32 table over byte classes ([K, classes], the classes numbered
-    by their smallest byte): reachable states, Hopcroft's partition, breadth-first numbering (the same over any classes
-    numbered so: bytes in order), the dead state last, and the classes the minimal table tells apart."""
-    out, accepting, start, dead = _canonical_table(table, initial, accept)
-    column_class, first = _column_classes(out)                  # (the classes the minimal automaton tells apart)
-    return ByteAutomaton(None, int(start), accepting, int(dead), table = out if first.size == out.shape[1] else out[:, first],
-                         byte_class = column_class[byte_class], minimal = True)
+    """:func:`_from_moves` of a complete int32 table [K, classes]."""
+    ptr, cls, dst = moves_of_table(table, accept)
+    return _from_moves(ptr, cls, dst, initial, accept, table.shape[1], byte_class)
 
 
 def force(a) -> ByteAutomaton:
@@ -225,9 +172,9 @@ def _subsets(edge_ptr, edge_class, edge_dst, eps_ptr, eps_dst, accept, start, C)
     """
     The subset construction of an automaton with empty moves: its moves as CSR per state (``edge_ptr`` [N + 1], the class
     ``edge_class`` of every move and its successor ``edge_dst``), its empty moves too (``eps_ptr`` [N + 1], ``eps_dst``),
-    ``accept`` bool [N], the initial state ``start``, over ``C`` classes. Returns ``(table, accepting)``: int32 [M, C]
-    over the reachable sets of states (set 0 the empty one, set 1 the initial one) and bool [M]. Classes in a row whose
-    moves are the same lead to the same set.
+    ``accept`` bool [N], the initial state ``start``, over ``C`` classes. Returns ``(ptr, cls, dst, accepting)``: over the
+    reachable sets of states (set 0 the empty one, without moves, set 1 the initial one), their moves to sets but the
+    empty one as CSR, classes ascending, and bool [M]. Classes in a row whose moves are the same lead to the same set.
     """
     N = edge_ptr.shape[0] - 1
     stamp = np.full(N, -1, dtype = np.int64)
@@ -236,7 +183,10 @@ def _subsets(edge_ptr, edge_class, edge_dst, eps_ptr, eps_dst, accept, start, C)
     pool = np.empty(max(4 * cap, 2 * N), dtype = np.int32)      # the sets' sorted states back to back
     ptr = np.zeros(cap + 1, dtype = np.int64)
     hashes = np.empty(cap, dtype = np.int64)
-    table = np.zeros((cap, C), dtype = np.int32)
+    move_ptr = np.zeros(cap + 1, dtype = np.int64)
+    move_class = np.empty(8 * cap, dtype = np.int32)
+    move_dst = np.empty(8 * cap, dtype = np.int32)
+    moves = 0
     acc = np.zeros(cap, dtype = np.bool_)
     slots_size = 4 * cap
     slots = np.full(slots_size, -1, dtype = np.int32)           # open addressing: the set of a hash
@@ -285,15 +235,24 @@ def _subsets(edge_ptr, edge_class, edge_dst, eps_ptr, eps_dst, accept, start, C)
                 continue
             count[c] = 0
             at = where[c] - n
-            if n == last_n:
-                same = True
+            same = n == last_n
+            if same:
                 for i in range(n):
                     if moved[at + i] != moved[last_at + i]:
                         same = False
                         break
-                if same:
-                    table[head, c] = last_j
-                    continue
+            if moves == move_class.shape[0]:
+                more_class = np.empty(2 * moves, dtype = np.int32)
+                more_class[:moves] = move_class
+                move_class = more_class
+                more_dst = np.empty(2 * moves, dtype = np.int32)
+                more_dst[:moves] = move_dst
+                move_dst = more_dst
+            move_class[moves] = c
+            if same:
+                move_dst[moves] = last_j
+                moves += 1
+                continue
             mark += 1
             k = 0
             for i in range(at, at + n):
@@ -324,9 +283,9 @@ def _subsets(edge_ptr, edge_class, edge_dst, eps_ptr, eps_dst, accept, start, C)
             if j < 0:                                           # a new set
                 if num == cap:
                     cap *= 2
-                    bigger = np.zeros((cap, C), dtype = np.int32)
-                    bigger[:num] = table[:num]
-                    table = bigger
+                    more_ptr = np.zeros(cap + 1, dtype = np.int64)
+                    more_ptr[:num + 1] = move_ptr[:num + 1]
+                    move_ptr = more_ptr
                     more = np.zeros(cap, dtype = np.bool_)
                     more[:num] = acc[:num]
                     acc = more
@@ -361,10 +320,12 @@ def _subsets(edge_ptr, edge_class, edge_dst, eps_ptr, eps_dst, accept, start, C)
                 hashes[j] = h
                 slots[slot] = j
                 num += 1
-            table[head, c] = j
+            move_dst[moves] = j
+            moves += 1
             last_at, last_n, last_j = at, n, j
         head += 1
-    return table[:num], acc[:num]
+        move_ptr[head] = moves
+    return move_ptr[:num + 1], move_class[:moves], move_dst[:moves], acc[:num]
 
 
 @njit(cache = True)
@@ -417,8 +378,9 @@ def determinized(num: int, start: int, end: int, src, lo, hi, dst, eps_src, eps_
     accept = np.zeros(num, dtype = np.bool_)
     accept[end] = True
     eps_ptr, eps = _csr(eps_src, eps_dst, num)
-    table, acc = _subsets(edge_ptr, edge_class, edge_dst, eps_ptr, eps, accept, start, int(byte_class[-1]) + 1)
-    return _from_classes(table, 1, acc, byte_class)
+    C = int(byte_class[-1]) + 1
+    ptr, cls, moved, acc = _subsets(edge_ptr, edge_class, edge_dst, eps_ptr, eps, accept, start, C)
+    return _from_moves(ptr, cls, moved, 1, acc, C, byte_class)
 
 
 @njit(cache = True)
@@ -480,6 +442,13 @@ class _Joined:
                 self.eps += [(q, e) for q in prev]
                 prev = acc
             return entry, prev
+        if x.kind == "list":                                    # one copy of the item, the separator back to it
+            entry, accepting = self.wire(x.parts[0])
+            e, acc = self.wire(x.parts[1])
+            self.eps += [(q, e) for q in accepting] + [(q, entry) for q in acc]
+            return entry, accepting
+        if x.kind == "members":
+            return self._wire_members(*x.parts)
         start = self.fresh()
         if x.kind == "alt":
             accepting = []
@@ -503,6 +472,29 @@ class _Joined:
                 self.eps += [(p, e) for p in acc]
         return start, accepting
 
+    def _wire_members(self, opening, closing, items, empty: bool) -> Tuple[int, List[int]]:
+        """Two tracks of states between the members -- nothing written yet, or something (the next member then follows
+        its ``later`` part, else its ``first``) -- through one copy of every value (see :func:`members`)."""
+        k = len(items)
+        none, some = [self.fresh() for _ in range(k + 1)], [self.fresh() for _ in range(k + 1)]
+
+        def enter(x, sources, targets):
+            entry, accepting = self.wire(x)
+            self.eps.extend((u, entry) for u in sources)
+            self.eps.extend((q, t) for q in accepting for t in targets)
+            return entry, accepting
+
+        start, _ = enter(opening, [], [none[0]])
+        for i, (first, later, value, required) in enumerate(items):
+            v, done = self.wire(value)
+            enter(first, [none[i]], [v])
+            enter(later, [some[i]], [v])
+            self.eps.extend((q, some[i + 1]) for q in done)
+            if not required:
+                self.eps += [(none[i], none[i + 1]), (some[i], some[i + 1])]
+        _, accepting = enter(closing, [some[k]] + ([none[k]] if empty else []), [])
+        return start, accepting
+
     def build(self, start: int) -> ByteAutomaton:
         total = self.size + self.extra
         num = lambda q: q if q >= 0 else self.size - 1 - q    # placeholders after the parts
@@ -519,16 +511,18 @@ class _Joined:
         src = np.array([num(u) for u, _ in self.eps], dtype = np.int64)
         dst = np.array([num(v) for _, v in self.eps], dtype = np.int32)
         eps_ptr, eps = _csr(src, dst, total)
-        table, acc = _subsets(edge_ptr, edge_class, edge_dst, eps_ptr, eps, accept, num(start), int(byte_class.max()) + 1)
-        return _from_classes(table, 1, acc, byte_class)
+        C = int(byte_class.max()) + 1
+        ptr, cls, moved, acc = _subsets(edge_ptr, edge_class, edge_dst, eps_ptr, eps, accept, num(start), C)
+        return _from_moves(ptr, cls, moved, 1, acc, C, byte_class)
 
 
 class Expr:
     """
-    A concatenation (``kind`` "seq"), union ("alt") or repetition ("rep", ``lo`` to ``hi`` times; ``hi`` None: no
-    bound) of automata or other expressions, not carried out yet: evaluated on first use -- read as an automaton (its
-    attributes are its automaton's) or forced (:func:`force`) -- all at once, the whole expression one automaton with
-    empty moves, determinized and minimized once. What is reused is best forced once, else every use wires it again.
+    A concatenation (``kind`` "seq"), union ("alt"), repetition ("rep", ``lo`` to ``hi`` times; ``hi`` None: no bound),
+    list ("list", :func:`list_of`) or object's members ("members", :func:`members`) of automata or other expressions, not
+    carried out yet: evaluated on first use -- read as an automaton (its attributes are its automaton's) or forced
+    (:func:`force`) -- all at once, the whole expression one automaton with empty moves, determinized and minimized once.
+    What is reused is best forced once, else every use wires it again.
     """
 
     __slots__ = ("kind", "parts", "lo", "hi", "_forced")
@@ -570,6 +564,18 @@ def optional(a):
 def star(a):
     """Concatenations of any number of ``a``'s texts (the empty text among them)."""
     return repeat(a, 0, None)
+
+
+def list_of(item, separator):
+    """``item`` or more, ``separator`` between them: ``item (separator item)*`` through one copy of ``item``."""
+    return Expr("list", (item, separator))
+
+
+def members(opening, closing, items, empty: bool):
+    """``opening``, then the members ``items`` -- ``(first, later, value, required)``: a member's name read first, or after
+    another member, and its value -- in order, the ones not required may be left out, then ``closing``; every one left
+    out only if ``empty``. Through one copy of every value."""
+    return Expr("members", (opening, closing, tuple(items), empty))
 
 
 def repeat(a, lo: int, hi: Optional[int]):
