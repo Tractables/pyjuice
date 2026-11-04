@@ -838,7 +838,8 @@ def forced_fill(real):
                 continue
             for _, stages, _, _ in step[2]:
                 for _, _, cws in stages:
-                    cws[:] = [(la, item, False) for la, item, _ in cws]
+                    for i, (la, item, _) in enumerate(cws):
+                        cws[i] = (la, item, False)
         return True
     return writes
 

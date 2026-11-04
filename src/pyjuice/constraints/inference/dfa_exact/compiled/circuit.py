@@ -32,7 +32,7 @@ from pyjuice.nodes.nodes import compilations
 
 from ....errors import ConstraintCompileError
 from ..external_params import block_scale
-from ..kernels.common import IDENTITY, SUM, TEMP
+from ..kernels.common import IDENTITY, SUM, TEMP, OneCopy, settled
 from ..kernels.prod import Launch
 from ..kernels.sum import dense_groups
 from ..kernels.transitions import transition_job
@@ -208,14 +208,14 @@ def dense_groups_switch() -> int:
 
 class Emit(NamedTuple):
     """The steps of one contraction of the products of a node group: ``fields`` [R, step fields] int64 (see
-    :class:`~..kernels.prod.Launch`), the products' interval (``product``, its number in ``CircuitTables.sum_ivs``), the
+    :class:`~..kernels.prod.Launch`; NumPy), the products' interval (``product``, its number in ``CircuitTables.sum_ivs``), the
     outputs' interval ``[entry, exit)``, the operands' whose keeping every pair the kernels must know, and every interval
     its steps read or write (``reads``, the first its output; a ``block @ block`` step's, its boundary triple's)."""
 
     stage: int
     form: str
     kinds: tuple
-    fields: torch.Tensor
+    fields: np.ndarray
     product: int
     entry: int
     exit: int
@@ -249,31 +249,31 @@ def fold_groups(child: np.ndarray, bounds: np.ndarray, input_end: int) -> dict:
     return groups
 
 
-def fold_layer(rows, firsts: torch.Tensor, input_end: int, iv_number: dict) -> FoldLayer:
+def fold_layer(rows, firsts: np.ndarray, input_end: int, iv_number: dict) -> FoldLayer:
     """
     One product layer's table, compiled into steps. Rows that share their children's kinds and boundaries fold the same
     way, right to left: ``c_0 @ (c_1 @ (... @ c_{k-1}))``, every intermediate block in a scratch row, the last step
     writing the layer's ``element_mars`` row. Each step is one contraction of :mod:`..kernels.prod`, chosen by its
-    operands; a stage holds the steps that read only earlier stages.
+    operands; a stage holds the steps that read only earlier stages. (In NumPy: thousands of small array operations a
+    circuit, which on the host a thread team of torch's would run many times slower on a busy machine.)
     """
-    out_rows, child_rows, bounds = rows
-    groups = fold_groups(child_rows.numpy(), bounds.numpy(), input_end)
+    out_rows, child_rows, bounds = (t.numpy() for t in rows)
+    groups = fold_groups(child_rows, bounds, input_end)
     emits = []
     num_temps, temp_ivs = 0, {}
 
     def block(rows_m):
-        rows_m = rows_m.contiguous()
-        return ("block", SUM, rows_m, torch.bucketize(rows_m, firsts, right = True) - 1)
+        return ("block", SUM, rows_m, np.searchsorted(firsts, rows_m, side = "right") - 1)
 
     def scratch(R, entry, exit):
         nonlocal num_temps
         first = num_temps
         num_temps += R
         temp_ivs[(entry, exit)] = True
-        return ("block", TEMP, torch.arange(first, first + R), torch.zeros(R, dtype = torch.long))
+        return ("block", TEMP, np.arange(first, first + R, dtype = np.int64), np.zeros(R, dtype = np.int64))
 
     def emit(stage, form, kinds, fields, entry, exit, operands = (), reads = ()):
-        emits.append(Emit(stage, form, kinds, torch.stack(fields, dim = 1), product, entry, exit, tuple(operands),
+        emits.append(Emit(stage, form, kinds, np.stack(fields, axis = 1), product, entry, exit, tuple(operands),
                           ((entry, exit), *reads)))
 
     for (is_input, bd), runs in groups.items():
@@ -282,11 +282,11 @@ def fold_layer(rows, firsts: torch.Tensor, input_end: int, iv_number: dict) -> F
         if len(runs) == 1:                                           # (a node group: one run of rows)
             kids, outs = child_rows[runs[0][0]:runs[0][1]], out_rows[runs[0][0]:runs[0][1]]
         else:
-            kids = torch.cat([child_rows[s:e] for s, e in runs])
-            outs = torch.cat([out_rows[s:e] for s, e in runs])
-        R = outs.numel()
-        zeros = torch.zeros(R, dtype = torch.long)
-        full = lambda v: torch.full((R,), v, dtype = torch.long)
+            kids = np.concatenate([child_rows[s:e] for s, e in runs])
+            outs = np.concatenate([out_rows[s:e] for s, e in runs])
+        R = outs.size
+        zeros = np.zeros(R, dtype = np.int64)
+        full = lambda v: np.full(R, v, dtype = np.int64)
         if k == 1:
             if is_input[0]:                                          # the input's own block
                 emit(0, "input_block", (IDENTITY, False), [outs, kids[:, 0], full(bd[0]), zeros, zeros,
@@ -409,7 +409,6 @@ class CircuitTables:
         reg_rows = np.asarray([end - first for first, end, _, _ in groups], dtype = np.int64)
 
         # the layers: the products' folds, and the sums' dense runs and fused parts
-        firsts_t = torch.tensor(firsts, dtype = torch.long)
         self.steps, stack_uses = [], {}
         gate_cells = block_scale.cells(pc)
         prod_index = -1
@@ -417,7 +416,7 @@ class CircuitTables:
         for lg in pc.inner_layer_groups:
             if lg.is_prod():
                 prod_index += 1
-                layers = [fold_layer(next(prod_layers), firsts_t, input_end, iv_number) for _ in lg.layers]
+                layers = [fold_layer(next(prod_layers), firsts_np, input_end, iv_number) for _ in lg.layers]
                 self.steps.append(("prod", prod_index, layers))
             else:
                 elem_first = rows.product_groups[prod_index][0]
@@ -473,8 +472,8 @@ class CircuitTables:
                 for dense, E, _ in parts:
                     for (_, c0) in dense:
                         dense_rows[c0:c0 + E] = True
-            alias_row = torch.full((end - first,), -1, dtype = torch.int32)
-            alias_reg = torch.zeros(end - first, dtype = torch.int32)
+            alias_row = np.full(end - first, -1, dtype = np.int32)
+            alias_reg = np.zeros(end - first, dtype = np.int32)
             for li, layer in enumerate(layers):
                 emits = []
                 for e in layer.emits:
@@ -482,14 +481,15 @@ class CircuitTables:
                         emits.append(e)
                         continue
                     st = e.fields
-                    keep = torch.from_numpy(dense_rows[st[:, 0].numpy()])
+                    keep = dense_rows[st[:, 0]]
                     regs = st[~keep, 2]
-                    alias_row[st[~keep, 0] - first] = (st[~keep, 1] - firsts_t[regs]).to(torch.int32)
-                    alias_reg[st[~keep, 0] - first] = regs.to(torch.int32)
+                    alias_row[st[~keep, 0] - first] = st[~keep, 1] - firsts_np[regs]
+                    alias_reg[st[~keep, 0] - first] = regs
                     if keep.any():
                         emits.append(e._replace(fields = st[keep]))
                 layers[li] = layer._replace(emits = emits)
             if (alias_row >= 0).any():
+                alias_row, alias_reg = torch.from_numpy(alias_row), torch.from_numpy(alias_reg)
                 alias[prod_index] = (alias_row, alias_reg)
                 for _, parts in self.steps[k + 1][2]:
                     for pi, (dense, E, fused) in enumerate(parts):
@@ -646,28 +646,34 @@ class Assembly:
         # are its own (field 6, set here once)
         ins = [launch for launch in launches if launch[0] in TRANS_COLS]
         positions = [launch[2][:, TRANS_COLS[launch[0]][1]] for launch in ins]
-        tcat = torch.cat(positions) if positions else torch.zeros(0, dtype = torch.long)
-        steps_t = torch.bincount(tcat, minlength = n)                    # input steps per position
-        order = torch.argsort(tcat, stable = True)
-        rank = torch.empty_like(tcat)
-        rank[order] = torch.arange(tcat.numel()) - (torch.cumsum(steps_t, 0) - steps_t)[tcat[order]]
+        tcat = np.concatenate(positions) if positions else np.zeros(0, dtype = np.int64)
+        steps_t = np.bincount(tcat, minlength = n).astype(np.int64)      # input steps per position
+        order = np.argsort(tcat, kind = "stable")
+        rank = np.empty_like(tcat)
+        rank[order] = np.arange(tcat.size) - (np.cumsum(steps_t) - steps_t)[tcat[order]]
         rows, k = [], 0
         for launch, pos in zip(ins, positions):
-            st = launch[2].clone()
-            st[:, 6] = rank[k:k + pos.numel()]
-            k += pos.numel()
+            st = launch[2].copy()
+            st[:, 6] = rank[k:k + pos.size]
+            k += pos.size
             rows.append(st[:, [*TRANS_COLS[launch[0]], 6]])
             launch[2] = st
-        self.steps_host = steps_t
-        self.pos_steps = steps_t.to(dev)
-        self.trans_job = transition_job(torch.cat(rows), dev) if rows else None
+        self.steps_host = torch.from_numpy(steps_t)
+        self.pos_steps = self.steps_host.to(dev)
+        self.trans_job = transition_job(torch.from_numpy(np.concatenate(rows)), dev) if rows else None
         self.layers = {}
         number = circuit.attrs["iv_index"]
+        tables = OneCopy()
         for kind, pi, layers in circuit.steps:
             if kind == "prod":
-                self.layers[pi] = [([[self._launch(*launch) for launch in launches_] for launches_ in hosts[(pi, li)]],
+                self.layers[pi] = [([[self._launch(tables, *launch) for launch in launches_] for launches_ in hosts[(pi, li)]],
                                     layer.num_temps, np.asarray([number[iv] for iv in layer.temp_ivs], dtype = np.int64))
                                    for li, layer in enumerate(layers)]
+        tables.upload(dev)
+        for layers in self.layers.values():
+            for stages, _, _ in layers:
+                for launches_ in stages:
+                    launches_[:] = [t._replace(steps = settled(t.steps)) for t in launches_]
         ends = [iv for layers in self.layers.values() for stages, _, _ in layers for launches_ in stages
                 for t in launches_ for iv in t.parts]
         counts = [len(t.parts) for layers in self.layers.values() for stages, _, _ in layers for launches_ in stages
@@ -682,22 +688,23 @@ class Assembly:
         self.forward_shape = None
         self.position_classes = None
 
-    def _launch(self, form: str, kinds: tuple, rows: torch.Tensor, parts: list) -> LaunchTemplate:
+    def _launch(self, tables: OneCopy, form: str, kinds: tuple, rows: np.ndarray, parts: list) -> LaunchTemplate:
         """The :class:`LaunchTemplate` of a stage's steps (``rows`` [S, fields] int64, of the emits ``parts``); a query
         plan runs a subset of them through index lists (:class:`~..kernels.prod.Cut`)."""
         circuit = self.circuit
-        dev, S = circuit.dev, rows.size(0)
-        counts = torch.tensor([e.fields.size(0) for e in parts])
-        iv = torch.repeat_interleave(torch.tensor([e.product for e in parts], dtype = torch.long), counts)
+        S = rows.shape[0]
+        to_device = lambda a: tables.add(a.astype(np.int32))
+        counts = [e.fields.shape[0] for e in parts]
+        iv = np.repeat(np.asarray([e.product for e in parts], dtype = np.int64), counts)
         ends = list({(e.entry, e.exit): True for e in parts})
         part_of = None
         if len(ends) > 1:
             number = {end: k for k, end in enumerate(ends)}
-            part_of = torch.repeat_interleave(torch.tensor([number[(e.entry, e.exit)] for e in parts]), counts)
+            part_of = np.repeat(np.asarray([number[(e.entry, e.exit)] for e in parts], dtype = np.int64), counts)
         groups_host = None
         if form == "block_block":
-            triples = torch.tensor([self.triple_of[(e.entry, e.reads[1][1], e.exit)] for e in parts], dtype = torch.int32)
-            steps = (rows.to(dev, torch.int32).contiguous(), torch.repeat_interleave(triples, counts).to(dev))
+            triples = np.asarray([self.triple_of[(e.entry, e.reads[1][1], e.exit)] for e in parts], dtype = np.int32)
+            steps = (to_device(rows), to_device(np.repeat(triples, counts)))
         elif form in TRANS_COLS:
             groups = None                                               # input @ block steps, several to a program
             chunks = [(0, S, None)]                                     # (every step's masses at hand: one chunk)
@@ -708,33 +715,34 @@ class Assembly:
                 order, firsts = _step_groups(rows, [G for G in sizes_g if G > 1])
                 rows, iv = rows[order], iv[order]
                 part_of = None if part_of is None else part_of[order]
-                groups = {G: f.to(dev, torch.int32) for G, f in firsts.items()}
-                groups_host = {G: f.numpy() for G, f in firsts.items()}
-            steps = (rows.to(dev, torch.int32).contiguous(), chunks, groups)
+                groups = {G: to_device(f) for G, f in firsts.items()}
+                groups_host = firsts
+            steps = (to_device(rows), chunks, groups)
         else:
-            steps = rows.to(dev, torch.int32).contiguous()
+            steps = to_device(rows)
         index = circuit.attrs["iv_index"]                               # the outputs' intervals
         out_ivs = np.unique(np.asarray([index[iv_] for iv_ in ends], dtype = np.int64))
-        return LaunchTemplate(form, kinds, steps, rows, iv, ends, part_of, groups_host, out_ivs)
+        return LaunchTemplate(form, kinds, steps, torch.from_numpy(rows), torch.from_numpy(iv), ends,
+                              None if part_of is None else torch.from_numpy(part_of), groups_host, out_ivs)
 
 
-def _cat_fields(parts: List[Emit]) -> torch.Tensor:
-    return parts[0].fields if len(parts) == 1 else torch.cat([e.fields for e in parts])
+def _cat_fields(parts: List[Emit]) -> np.ndarray:
+    return parts[0].fields if len(parts) == 1 else np.concatenate([e.fields for e in parts])
 
 
-def _step_groups(st: torch.Tensor, sizes):
+def _step_groups(st: np.ndarray, sizes):
     """An ``input @ block`` launch's steps (host rows, see :data:`~.prod.INPUT_BLOCK_FIELDS`): ``order``, which
     sorts them by their position and block end, and per group size ``G`` of ``sizes``, ``firsts`` [groups + 1]: the
     first (sorted) step of every group of at most ``G`` consecutive steps that share both, then the end."""
     key = st[:, 2] * (int(st[:, 5].max()) + 1) + st[:, 5]
-    order = torch.sort(key, stable = True).indices
+    order = np.argsort(key, kind = "stable")
     key = key[order]
-    k = torch.arange(st.size(0))
-    change = torch.ones(st.size(0), dtype = torch.bool)
+    k = np.arange(st.shape[0], dtype = np.int64)
+    change = np.ones(st.shape[0], dtype = bool)
     change[1:] = key[1:] != key[:-1]
-    run_first = torch.cummax(torch.where(change, k, 0), 0).values           # the first step of each step's run
-    end = torch.tensor([st.size(0)])
-    return order, {G: torch.cat([torch.nonzero((k - run_first) % G == 0).flatten(), end]) for G in sizes}
+    run_first = np.maximum.accumulate(np.where(change, k, 0))               # the first step of each step's run
+    end = np.asarray([st.shape[0]], dtype = np.int64)
+    return order, {G: np.concatenate([np.flatnonzero((k - run_first) % G == 0), end]) for G in sizes}
 
 
 def launch_of(t: LaunchTemplate, parts: np.ndarray, most: list) -> Launch:

@@ -18,7 +18,7 @@ import numpy as np
 import torch
 
 from ..external_params import block_scale
-from ..kernels.common import IDENTITY, SUM, TEMP, first_occurrence_groups, node_groups, node_tiles, packed
+from ..kernels.common import IDENTITY, SUM, TEMP, OneCopy, first_occurrence_groups, node_groups, node_tiles, packed, settled
 from ..kernels.prod import skip_masks_for
 from ..kernels.prod_top_down import TopDownLaunch
 from ..kernels.score import ClassWeightLaunch, class_weight_exits, class_weight_launch, score_tables
@@ -82,11 +82,11 @@ def top_down_program(backend) -> TopDownProgram:
         k = c.number
         kinds = c.kinds if c.c_full_at is None else (c.kinds[0], c.kinds[1], (all_full[k], c.kinds[2]))
         return TopDownLaunch(c.form, c.side, kinds, c.children, c.ptr, c.parents, most_entries[k], most_exits[k],
-                             most_slots[k], dict(c.host), c.tiles, c.height)
+                             most_slots[k], c.host, c.tiles, c.height)
 
     def weights(cw, boundaries) -> ClassWeightLaunch:
         return ClassWeightLaunch(cw.form, cw.kinds, cw.dests, cw.ptr, cw.parents,
-                                 class_weight_exits(cw.form, boundaries, prog), dict(cw.host), cw.tiles, cw.tile_height)
+                                 class_weight_exits(cw.form, boundaries, prog), cw.host, cw.tiles, cw.tile_height)
 
     def group(tables: dict) -> dict:
         dense = tables["dense"]
@@ -172,6 +172,7 @@ def top_down_template(backend, prog) -> _Template:
     temps = {}
     specs, spec_of = [], {}
     child_ends = []
+    tables = OneCopy()                                    # (the launches' tables on the device: in one copy)
 
     def spec_index(spec):
         if spec not in spec_of:
@@ -252,7 +253,7 @@ def top_down_template(backend, prog) -> _Template:
             okinds = (c_kind, out_temp, kinds[2][0])
         else:
             okinds = (c_kind, r_kind if side == "L" else l_kind, out_temp)
-        i32 = lambda x: torch.from_numpy(np.ascontiguousarray(x)).to(dev, torch.int32)
+        i32 = lambda x: tables.add(np.asarray(x, dtype = np.int32))
         ch = i32(np.stack([child_row, child_reg, add, np.zeros_like(add)], axis = 1))
         child_iv, parent_iv = iv_index(a[ptr_np[:-1]], b[ptr_np[:-1]]), iv_index(pa, pb)
         host = dict(children = np.stack([child_row, child_reg, add], axis = 1).astype(np.int64),
@@ -263,7 +264,7 @@ def top_down_template(backend, prog) -> _Template:
             host["walk"] = {}
             host["group"] = node_groups(a[ptr_np[:-1]], b[ptr_np[:-1]], np.diff(ptr_np), add)
             tiles, height = node_tiles(host["group"])
-            tiles = torch.from_numpy(tiles).to(dev)
+            tiles = tables.add(tiles)
         child_ends.append((iv_a, iv_b, iv_index(iv_a, iv_b)))
         return _Child(form, side, okinds, c_full_at, ch, i32(ptr_np), i32(par), len(child_ends) - 1, host, tiles, height)
 
@@ -301,12 +302,22 @@ def top_down_template(backend, prog) -> _Template:
                             if la is not None:
                                 out.append(la)
                         alive = outputs_written(launch, launch.rows.numpy(), prod_index, (prod_index, li))
-                        cw = class_weight_launch(launch, alive, prog, score)
+                        cw = class_weight_launch(launch, alive, prog, score, tables)
                         if cw is not None:
                             cws.append(cw)
                     info.append((out, _inputs(launches), _folds([l for l in launches if _out_temp(l)]), cws))
                 layers_out.append(info[::-1])
             steps.append(("prod", prod_index, layers_out))
+    tables.upload(dev)
+    for kind, _, layers_out in steps:
+        if kind != "prod":
+            continue
+        for info in layers_out:
+            for out, _, _, cws in info:
+                out[:] = [c._replace(children = c.children.tensor, ptr = c.ptr.tensor, parents = c.parents.tensor,
+                                     tiles = settled(c.tiles)) for c in out]
+                for cw, _ in cws:
+                    cw.dests, cw.ptr, cw.parents, cw.tiles = cw.dests.tensor, cw.ptr.tensor, cw.parents.tensor, cw.tiles.tensor
     region_first = np.asarray([first for first, _, _ in backend.sum_regions], dtype = np.int64)
     region_end = np.asarray([end for _, end, _ in backend.sum_regions], dtype = np.int64)
     rows = np.nonzero(~sums)[0]

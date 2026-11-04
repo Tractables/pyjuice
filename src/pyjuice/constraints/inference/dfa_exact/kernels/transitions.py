@@ -448,6 +448,7 @@ def transition_job(rows: torch.Tensor, dev):
     (fewer when there are few rows, so that there are enough programs).
     """
     TS = job_tile(rows.size(0))
+    rows = rows.to(dev)
     rows = rows[torch.argsort(rows[:, 1], stable = True)]
     pos, counts = torch.unique_consecutive(rows[:, 1], return_counts = True)
     i32 = lambda x: x.to(dev, torch.int32).contiguous()

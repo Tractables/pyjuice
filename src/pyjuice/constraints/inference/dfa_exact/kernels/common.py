@@ -42,6 +42,44 @@ def pack_aligned(arrays: Sequence[np.ndarray], dtype) -> Tuple[np.ndarray, np.nd
     return buf, starts
 
 
+class OneCopy:
+    """Int32 tables of a circuit's launches on their way to the device, in one copy (thousands of them; every copy from
+    the host waits for the stream): :meth:`add` gives a place for a table, :meth:`upload` copies them all, and
+    :func:`settled` reads the tables at their places in what was built with them."""
+
+    class Place:
+        __slots__ = ("host", "tensor")
+
+    def __init__(self):
+        self.places = []
+
+    def add(self, array: np.ndarray) -> "OneCopy.Place":
+        place = OneCopy.Place()
+        place.host, place.tensor = np.asarray(array), None
+        self.places.append(place)
+        return place
+
+    def upload(self, dev) -> None:
+        buf, starts = pack_aligned([p.host.reshape(-1) for p in self.places], np.int32)
+        tables = torch.from_numpy(buf).to(dev)
+        for p, s in zip(self.places, starts.tolist()):
+            p.tensor, shape = tables[s:s + p.host.size], p.host.shape
+            if len(shape) != 1:
+                p.tensor = p.tensor.view(shape)
+            p.host = None
+
+
+def settled(x):
+    """``x``, a tuple or dict of them or anything else, with the tables of :class:`OneCopy` at their places."""
+    if isinstance(x, OneCopy.Place):
+        return x.tensor
+    if isinstance(x, tuple):
+        return tuple(settled(v) for v in x)
+    if isinstance(x, dict):
+        return {k: settled(v) for k, v in x.items()}
+    return x
+
+
 class IndexList:
     """An int32 index list of a query plan: ``host`` (numpy) until :meth:`IndexLists.upload` copies it to the device
     (``tensor``) and drops it -- a cached plan holds the device copy alone (the host one may view a planner's whole

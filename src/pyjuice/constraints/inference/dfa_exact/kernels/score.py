@@ -143,12 +143,14 @@ class ClassWeightLaunch:
     host: Any
     tiles: torch.Tensor
     tile_height: int
+    walk_tables: Any = None
 
 
-def class_weight_launch(launch, alive: np.ndarray, prog, score: ScoreTables):
+def class_weight_launch(launch, alive: np.ndarray, prog, score: ScoreTables, tables):
     """``(launch, boundaries)``, the :class:`ClassWeightLaunch` of a forward launch's input operands but for ``J_max``
     (:func:`class_weight_exits`, of the outputs' ``boundaries``), ``alive`` marking the steps whose output has a top-down
-    value (the others add nothing); None when there is no such step or no input operand."""
+    value (the others add nothing); None when there is no such step or no input operand. Its tables are places of
+    ``tables`` (a :class:`~.common.OneCopy`) until they are uploaded."""
     if launch.form not in ("input_block", "block_input") or not alive.any():
         return None
     rows = launch.rows.numpy()[alive]
@@ -168,7 +170,7 @@ def class_weight_launch(launch, alive: np.ndarray, prog, score: ScoreTables):
         rows[:, 5 if launch.form == "input_block" else 3]
     group = node_groups(dests[:, 0], other)
     tiles, height = node_tiles(group)
-    i32 = lambda x: torch.from_numpy(np.ascontiguousarray(x)).to(prog.dev, torch.int32)
+    i32 = lambda x: tables.add(np.asarray(x, dtype = np.int32))
     return ClassWeightLaunch(launch.form, launch.kinds, i32(dests), i32(ptr), i32(rows), 0,
                              dict(dests = dests, ptr = ptr, parents = rows, group = group, walk = {}), i32(tiles), height), boundaries
 
@@ -514,7 +516,7 @@ def _class_weight_cuda(mod, la, tiles, height, cw, rows, prog, bufs, element_flo
     a destination, rows too wide for shared memory, entry tables past :data:`CLASS_WEIGHT_CUDA_TABLE_MAX`, a CUDA graph
     being captured before the launch's tables exist): the caller runs the Triton kernel then."""
     h = la.host
-    st = h.get("cw_cuda")
+    st = la.walk_tables
     if st is None:
         if torch.cuda.is_current_stream_capturing():
             return False
@@ -526,7 +528,7 @@ def _class_weight_cuda(mod, la, tiles, height, cw, rows, prog, bufs, element_flo
         if maxl is None:                                               # every boundary's longest class list (once)
             cp = prog.trans.cls_ptr.view(-1, prog.C + 1)
             maxl = prog._cw_max_list = (cp[:, 1:] - cp[:, :-1]).amax(1).cpu().numpy()
-        st = h["cw_cuda"] = dict(walk, maxl = max(1, int(max(maxl[t] for t in ts))), wt = max(prog.width[t] for t in ts),
+        st = la.walk_tables = dict(walk, maxl = max(1, int(max(maxl[t] for t in ts))), wt = max(prog.width[t] for t in ts),
                                  wt1 = max(prog.width[t + 1] for t in ts))
     if st["steps"] != 1:
         return False

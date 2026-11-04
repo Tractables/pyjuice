@@ -370,7 +370,7 @@ def _forward_steps(prog, todo: np.ndarray, sample: np.ndarray, lists: IndexLists
                     for m in (0, 1):
                         if st_out[m]:
                             out[m].append(st_out[m])
-                layers_out.append((out[0], out[1], num_temps, temp_slots))
+                layers_out.append((out[0] or (), out[1] or (), num_temps, temp_slots))
         else:
             for block_size, parts in layers:
                 out = ([], [])
@@ -385,9 +385,9 @@ def _forward_steps(prog, todo: np.ndarray, sample: np.ndarray, lists: IndexLists
                             f = (fused, None if every else lists.add(buf[ps[P, m]:ps[P, m] + n]), int(n),
                                  int(pslots[P, m]), ivs_of[P])
                         if dense or f is not None:
-                            out[m].append((dense, num_edges, f))
+                            out[m].append((dense or (), num_edges, f))
                     P += 1
-                layers_out.append((block_size, out[0], out[1]))
+                layers_out.append((block_size, out[0] or (), out[1] or ()))
         steps[si] = (kind, prod_index, layers_out)
     return steps, busy
 
@@ -899,7 +899,7 @@ def _top_down_steps(td, t, index, m, scoring: bool, lists: IndexLists) -> tuple:
                         if cw_count[w]:
                             sel = dest_sel[dest_ptr[w]:dest_ptr[w + 1]]
                             cw_l.append((cw, tiled(cw, sel, 1, cw_count[w])))
-                    stages_out.append((once_l, sample_l, cw_l))
+                    stages_out.append((once_l or (), sample_l or (), cw_l or ()))
                 folds_out = ([], [])
                 for launches, ids in zip(fold_stages, fold_ids):
                     cut = ([], [])
@@ -911,7 +911,7 @@ def _top_down_steps(td, t, index, m, scoring: bool, lists: IndexLists) -> tuple:
                     for mode in (0, 1):
                         if cut[mode]:
                             folds_out[mode].append(cut[mode])
-                layers_out.append((folds_out, stages_out, num_temps, temp_slots))
+                layers_out.append(((folds_out[0] or (), folds_out[1] or ()), stages_out, num_temps, temp_slots))
         else:
             for (block_size, dense_runs, fused_groups), (r0, groups) in zip(layers, index[si]):
                 dense = ([], [])
@@ -923,7 +923,7 @@ def _top_down_steps(td, t, index, m, scoring: bool, lists: IndexLists) -> tuple:
                     for mode, lst in ((1, fused[0]), (0, fused[1])):
                         if group_count[g][mode]:
                             lst.append((cbs, tables, selection(block_mode[b0:b1], mode, group_count[g][mode])))
-                layers_out.append((block_size, dense, fused))
+                layers_out.append((block_size, (dense[0] or (), dense[1] or ()), (fused[0] or (), fused[1] or ())))
         out[si] = (kind, pi, layers_out)
     return out, busy
 

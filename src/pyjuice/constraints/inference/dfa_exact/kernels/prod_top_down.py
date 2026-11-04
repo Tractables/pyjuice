@@ -85,6 +85,7 @@ class TopDownLaunch:
     host: Any
     tiles: Optional[torch.Tensor] = None
     tile_height: int = 1
+    walk_tables: Any = None
 
 
 @triton.jit
@@ -929,7 +930,7 @@ def _input_block_boundaries(la: TopDownLaunch, prog) -> dict:
     ``ecum`` (int64 [T + 1], host and ``ecum_t`` device: the predecessor entries at the boundaries before), and every
     child's interval as ``(t, t2)`` (``ta``, ``te``). Of a program's launches together, in a copy each: what its
     automaton says, the predecessor entries, and what it does not (:func:`_walk_boundaries`)."""
-    st = la.host.get("cuda")
+    st = la.walk_tables
     if st is None:
         walk = la.host["walk"]
         if not walk:
@@ -948,7 +949,7 @@ def _input_block_boundaries(la: TopDownLaunch, prog) -> dict:
             kept = prog.walk_entries = (ecums, torch.from_numpy(buf).to(prog.dev), starts.tolist())
         ecums, tables, starts = kept
         k = walk["at"]
-        st = la.host["cuda"] = dict(walk, ecum = ecums[k], ecum_t = tables[starts[k]:starts[k] + ecums[k].size])
+        st = la.walk_tables = dict(walk, ecum = ecums[k], ecum_t = tables[starts[k]:starts[k] + ecums[k].size])
     return st
 
 
