@@ -44,7 +44,7 @@ def _backtrace_fn(partitions, backtrace, target_n_partition, num_nodes):
     i = num_nodes - 1
     for n in range(target_n_partition, 0, -1):
         partitions[n-1] = i
-        i = backtrace[i,target_n_partition]
+        i = backtrace[i,n]
 
 
 def _partition_nodes_dp_simple(node_n_edges: np.ndarray, max_num_partitions: int, target_overhead: Optional[int]):
