@@ -97,10 +97,11 @@ def test_token_classes_are_the_same_read_on_the_host(seed, enumerate_max):
     assert host.num_stored == device.num_stored and host.num_enumerated == device.num_enumerated
 
 
-def test_an_automaton_with_many_entries_stays_on_the_device(monkeypatch):
+@pytest.mark.parametrize("limit", ["HOST_ENTRIES", "HOST_MOVES"])
+def test_an_automaton_with_many_entries_stays_on_the_device(limit, monkeypatch):
     dfa = random_automaton(3)
     tr = build_layout(dfa, 16, device = DEV).transitions(DEV)
-    monkeypatch.setattr(H, "HOST_ENTRIES", 1)
+    monkeypatch.setattr(H, limit, 1)
     assert isinstance(TR.boundary_groups(tr), TR.BoundaryGroups)
     assert TR.transition_tables(tr, True) is not None
 

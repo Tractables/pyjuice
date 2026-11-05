@@ -18,9 +18,12 @@ from .host_kernels import (_below, _boundaries, _by_class_tables, _by_second, _c
 
 
 #: the tables of a layout are built on the device past so many live entries of its distinct boundaries and rows of its per-boundary
-#: tables (entries + n x (W + C)). MEASURED, the one-time cost of a new automaton at HMM-128/4096, host against device: 4,000 of them
-#: 2.8 against 6.4 ms, 56,000 4.5 against 7.8, about 80,000 even or a little past it, 400,000 48.7 against 9.6
-HOST_ENTRIES = 1 << 16
+#: tables (entries + n x (W + C)). MEASURED, the one-time cost of a new automaton, host against device: HMM-128/4096, 4,000 of them 2.5
+#: against 6.4 ms, 56,000 4.2 against 7.8, 69,000 5.7 against 8.9, 84,000 7.2 against 7.8; HMM-512/1024, 150,000 to 200,000 6.6-8.2 against
+#: 8.8-11.6; on no shape slower past the noise
+HOST_ENTRIES = 1 << 18
+#: ... or past so many (state, class) pairs, where finding its entries alone costs as much as the rest (4 ms at 194,000)
+HOST_MOVES = 1 << 16
 #: a table over every boundary of at most so many entries is laid out on the host; a larger one, from its distinct rows, on the device
 HOST_TABLE_ENTRIES = 1 << 20
 
@@ -223,7 +226,7 @@ def host_tables(tr) -> Optional[HostTables]:
 
 
 def _build(tr) -> Optional[HostTables]:
-    if tr.host is None or tr.n == 0 or tr.n * (tr.W + tr.C) > HOST_ENTRIES or tr.K * tr.C > 2 * HOST_ENTRIES:
+    if tr.host is None or tr.n == 0 or tr.n * (tr.W + tr.C) > HOST_ENTRIES or tr.K * tr.C > HOST_MOVES:
         return None
     delta, state_id, col_of_state = tr.host
     firsts, group = _boundaries(state_id, tr.n)
