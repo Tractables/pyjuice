@@ -481,6 +481,55 @@ def test_token_classes_from_the_hashes():
         assert hashed.tolist() == [key != (0, 0) for key in first], distinct
 
 
+def test_the_quotient_of_the_trie_from_the_hashes():
+    """Nodes are one exactly if both hashes are the same (the root alone); edges one per (node, class), from every member's children,
+    on classes in every word of the bits; more nodes than the table of slots starts with; nothing goes on from a node no walk reached."""
+    from pyjuice.constraints.language.backend import token_lift as T
+    rng = np.random.default_rng(4)
+    for distinct, per in ((2, 3), (30, 3), (5000, 2)):
+        tokens = {bytes(rng.integers(0, 256, int(rng.integers(1, 5))).tolist()) for _ in range(30000)}
+        trie = T._trie(jc.Vocabulary(sorted(tokens)))
+        first_child, node_byte = trie.first_child, trie.node_byte
+        M = first_child.size - 1
+        byte_class = (np.arange(256) * 7 % 200).astype(np.int64)
+        values = rng.integers(1, 2 ** 62, size = (distinct, 2), dtype = np.uint64)
+        values[distinct // 2] = values[0, 0], values[0, 1] ^ np.uint64(1)          # (one hash the same, the other nearly: in one slot)
+        pick = rng.integers(-1, distinct, M + 2)
+        pick[1:3] = 0, distinct // 2                            # (neighbours)
+        h1, h2 = values[pick, 0], values[pick, 1]
+        h1[pick < 0], h2[pick < 0] = 0, 0
+        h1[0], h2[0] = 0, 0
+        gptr, gclass, gnode, into, zero = T._quotient(h1, h2, first_child, node_byte, byte_class)
+        group = {}
+        of = [0] * M
+        for u in range(1, M):
+            of[u] = group.setdefault((int(h1[u]), int(h2[u])), len(group) + 1)
+        assert gptr.size - 1 == len(group) + 1
+        assert (zero == group[(0, 0)]) if (0, 0) in group else zero == -1
+        want = {}
+        for u in range(M):
+            if of[u] != zero:
+                for w in range(first_child[u], first_child[u + 1]):
+                    want.setdefault((of[u], int(byte_class[node_byte[w]])), set()).add(of[w])
+        got = {}
+        for g in range(gptr.size - 1):
+            for e in range(gptr[g], gptr[g + 1]):
+                assert (g, int(gclass[e])) not in got
+                got[g, int(gclass[e])] = int(gnode[e])
+        assert set(got) == set(want), distinct
+        assert all(got[key] in want[key] for key in got), distinct
+        assert into.tolist() == np.bincount(np.asarray(list(got.values())), minlength = into.size).tolist()
+
+
+def test_the_random_words():
+    from pyjuice.constraints.language.backend import token_lift as T
+    for S in (1, 100, T._KEPT_WORDS, T._KEPT_WORDS + 1):
+        words = T._random_words(S)
+        assert len(words) == 4 and all(w.size == S and w.dtype == np.uint64 for w in words)
+        assert (words[0] & np.uint64(1)).all() and (words[2] & np.uint64(1)).all()      # (odd: they multiply, nothing lost)
+        assert all(np.array_equal(a, b) for a, b in zip(words, T._random_words(S)))
+
+
 @pytest.mark.parametrize("few", [0, 300])
 def test_ids_a_vocabulary_grew_after_its_trie(few, monkeypatch):
     """The trie made for a vocabulary serves it with more ids, and those lead nowhere, on either trie."""

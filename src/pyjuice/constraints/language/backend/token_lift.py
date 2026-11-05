@@ -485,6 +485,19 @@ def _walks_parallel(table, dead, states, byte_class, first_child, node_byte, r1,
 
 
 @njit(cache = True)
+def _more_slots(h1, h2, rep, first, num, cap):
+    """The places of nodes ``rep[first:num]``, each with hashes of its own, in a table of ``cap`` slots."""
+    slots = np.full(cap, -1, dtype = np.int32)
+    for k in range(first, num):
+        n = rep[k]
+        at = np.int64((h1[n] ^ (h2[n] >> np.uint64(17))) & np.uint64(cap - 1))
+        while slots[at] >= 0:
+            at = (at + 1) & (cap - 1)
+        slots[at] = k
+    return slots
+
+
+@njit(cache = True)
 def _quotient(h1, h2, first_child, node_byte, byte_class):
     """
     The trie with the nodes of the same hashes as one (no state walked tells them apart; the root stays alone):
@@ -493,17 +506,20 @@ def _quotient(h1, h2, first_child, node_byte, byte_class):
     nodes of a node's children on a class are one, as the same states lead to the same states.
     """
     M = first_child.shape[0] - 1
-    cap = 16
-    while cap < 2 * M:
-        cap *= 2
+    cap = 4096
     slots = np.full(cap, -1, dtype = np.int32)
     of = np.empty(M, dtype = np.int32)
-    rep = np.empty(M, dtype = np.int32)
+    rep = np.empty(cap // 2, dtype = np.int32)
     of[0], rep[0] = 0, 0
     G = 1
     zero = -1
+    p1, p2, pg = np.uint64(0), np.uint64(0), -1
     for u in range(1, M):
-        at = np.int64((h1[u] ^ (h2[u] >> np.uint64(17))) & np.uint64(cap - 1))
+        x1, x2 = h1[u], h2[u]
+        if x1 == p1 and x2 == p2 and pg >= 0:                   # (nodes side by side are mostly alike)
+            of[u] = pg
+            continue
+        at = np.int64((x1 ^ (x2 >> np.uint64(17))) & np.uint64(cap - 1))
         while True:
             g = slots[at]
             if g < 0:
@@ -511,25 +527,28 @@ def _quotient(h1, h2, first_child, node_byte, byte_class):
                 G += 1
                 slots[at] = g
                 rep[g] = u
-                if h1[u] == 0 and h2[u] == 0:
+                if x1 == 0 and x2 == 0:
                     zero = g
+                if 2 * G >= cap:
+                    cap *= 2
+                    slots = _more_slots(h1, h2, rep, 1, G, cap)
+                    more = np.empty(cap // 2, dtype = np.int32)
+                    more[:G] = rep[:G]
+                    rep = more
                 break
-            if h1[rep[g]] == h1[u] and h2[rep[g]] == h2[u]:
+            if h1[rep[g]] == x1 and h2[rep[g]] == x2:
                 break
             at = (at + 1) & (cap - 1)
+        p1, p2, pg = x1, x2, g
         of[u] = g
     E = 0
     for u in range(M):
         if of[u] != zero:
             E += first_child[u + 1] - first_child[u]
-    cap = 16
-    while cap < 2 * E:
-        cap *= 2
-    keys = np.full(cap, np.int64(-1))
+    have = np.zeros((G, 4), dtype = np.uint64)                  # (every class is below 256: a byte's)
     src = np.empty(E, dtype = np.int32)
     gclass = np.empty(E, dtype = np.int32)
     gnode = np.empty(E, dtype = np.int32)
-    C = np.max(byte_class) + 1
     num = 0
     gptr = np.zeros(G + 1, dtype = np.int64)
     for u in range(M):
@@ -538,12 +557,9 @@ def _quotient(h1, h2, first_child, node_byte, byte_class):
             continue
         for w in range(first_child[u], first_child[u + 1]):
             c = byte_class[node_byte[w]]
-            key = np.int64(g) * C + c
-            at = (key * np.int64(0x9E3779B97F4A7C1)) & (cap - 1)
-            while keys[at] >= 0 and keys[at] != key:
-                at = (at + 1) & (cap - 1)
-            if keys[at] < 0:
-                keys[at] = key
+            bit = np.uint64(1) << np.uint64(c & 63)
+            if have[g, c >> 6] & bit == 0:
+                have[g, c >> 6] |= bit
                 src[num], gclass[num], gnode[num] = g, c, of[w]
                 gptr[g + 1] += 1
                 num += 1
@@ -656,22 +672,11 @@ def _walk_the_rest(table: np.ndarray, dead: int, rest: np.ndarray, byte_class: n
                     h1 += a1
                     h2 += a2
                 left = left[:0]
+            if left.size == 0 and at >= rest.size:
+                return
             quotient = _quotient(h1, h2, first_child, node_byte, byte_class)
             if left.size == 0:
                 break
-
-
-@njit(cache = True)
-def _more_class_slots(h1, h2, rep_node, num, cap):
-    """The classes' places in a table of ``cap`` slots, the first ``num`` of ``rep_node`` the classes' nodes."""
-    slots = np.full(cap, -1, dtype = np.int32)
-    for k in range(num):
-        n = rep_node[k]
-        at = np.int64((h1[n] ^ (h2[n] >> np.uint64(17))) & np.uint64(cap - 1))
-        while slots[at] >= 0:
-            at = (at + 1) & (cap - 1)
-        slots[at] = k
-    return slots
 
 
 @njit(cache = True)
@@ -703,7 +708,7 @@ def _token_classes(h1, h2, end_nodes, token_end):
                 num += 1
                 if 2 * num >= cap:
                     cap *= 2
-                    slots = _more_class_slots(h1, h2, rep_node, num, cap)
+                    slots = _more_slots(h1, h2, rep_node, 0, num, cap)
                     more = np.empty(cap // 2, dtype = np.int32)
                     more[:num] = rep_node[:num]
                     rep_node = more
@@ -885,9 +890,10 @@ def _sparse_rows_parallel(table, dead, states, remap, gptr, gclass, gnode, class
 
 
 @njit(cache = True)
-def _sparse_order(moves, row_at, row_len, K, C, pad):
+def _sparse_order(moves, row_at, row_len, first_at, first_moves, K, C, pad):
     """:func:`~.dfa.bfs_order` of the rows of :func:`_sparse_rows` from state 0 (the dead state ``K`` where a row has its first
-    gap, the padding's state ``K + 1`` being ``pad``): ``(order, place)``, the states and every state's place, -1 for the rest."""
+    gap, the padding's state ``K + 1`` being ``pad``): ``(order, place)``, the states and every state's place, -1 for the rest. Of a
+    row only those of its moves are read that ``first_moves[first_at[state]]`` counts and lists, if any: the first to each state."""
     T = K + 2
     order = np.empty(T, dtype = np.int64)
     place = np.full(T, -1, dtype = np.int64)
@@ -918,6 +924,15 @@ def _sparse_order(moves, row_at, row_len, K, C, pad):
                 place[K] = num
                 order[num] = K
                 num += 1
+        elif first_at[q] >= 0:
+            f = first_at[q]
+            for j in range(f + 1, f + 1 + first_moves[f]):
+                t = moves[at + first_moves[j]] & mask
+                t = pad if t == K + 1 else t
+                if place[t] < 0:
+                    place[t] = num
+                    order[num] = t
+                    num += 1
         else:
             for k in range(at, at + n):
                 t = moves[k] & mask
@@ -952,6 +967,9 @@ def _sparse_table_parallel(moves, row_at, row_len, order, place, K, pad, out, P)
         _sparse_table(moves, row_at, row_len, order, place, K, pad, out, p * R // P, (p + 1) * R // P)
 
 
+_NO_FIRST_MOVES = (np.empty(0, dtype = np.int32), np.zeros(1, dtype = np.int32))
+
+
 def _canonical_token_table(automaton: ByteAutomaton, states: np.ndarray, remap: np.ndarray, trie, letters: np.ndarray, reps: np.ndarray, kinds: np.ndarray, accept: np.ndarray,
                            end_class: int, K_full: int) -> tuple:
     """
@@ -973,8 +991,9 @@ def _canonical_token_table(automaton: ByteAutomaton, states: np.ndarray, remap: 
         _sparse_rows_parallel(*args, K, min(threads, K))
     else:
         _sparse_rows(*args, 0, K)
+    first_at, first_moves = _NO_FIRST_MOVES
     if automaton.counted:
-        moves = expanded_moves(automaton.counted, remap, K, K_full, moves, row_at, row_len, accept, threads)
+        moves, first_at, first_moves = expanded_moves(automaton.counted, remap, K, K_full, moves, row_at, row_len, accept, threads)
     pad = K_full + 1
     if end_class >= 0:                                          # a state accepting the empty text alone is the padding's
         alone = np.nonzero(accept[:K_full] & (row_len[:K_full] == 1))[0]
@@ -983,7 +1002,9 @@ def _canonical_token_table(automaton: ByteAutomaton, states: np.ndarray, remap: 
         moves[-1] = (end_class << 32) | (K_full + 1)
         row_at[K_full + 1], row_len[K_full + 1] = moves.size - 1, 1
         accept[pad] = True
-    order, place = _sparse_order(moves, row_at, row_len, K_full, C, pad)
+    if first_at is _NO_FIRST_MOVES[0]:
+        first_at = np.full(K_full + 2, -1, dtype = np.int32)
+    order, place = _sparse_order(moves, row_at, row_len, first_at, first_moves, K_full, C, pad)
     out = np.empty((order.size, C), dtype = np.int64)
     if K_full * C >= THREADS_ENTRIES and threads > 1:
         _sparse_table_parallel(moves, row_at, row_len, order, place, K_full, pad, out, min(threads, K_full))
@@ -1003,9 +1024,26 @@ SPARSE_ENTRIES = 1 << 19
 THREADS_ENTRIES = 1 << 18
 #: states checked on the quotient of the trie (:func:`_walk_the_rest`): at first so many, then twice as many a time,
 #: on one thread below :data:`SERIAL_CHECKS`; states failing are walked, so many edges in threads at the most at a time
-FIRST_CHECKS = 256
+FIRST_CHECKS = 1 << 12
 SERIAL_CHECKS = 1 << 8
 WALKS_IN_THREADS = 1 << 24
+
+
+def _random_words(S: int) -> list:
+    """Four arrays of ``S`` random words for the hashes, the first and third odd; those of few states kept (a generator takes time)."""
+    global _WORDS
+    if S > _WORDS.shape[1]:
+        words = np.random.default_rng(0).integers(1, 2 ** 63, size = (4, max(S, _KEPT_WORDS)), dtype = np.uint64)
+        words[0] |= np.uint64(1)
+        words[2] |= np.uint64(1)
+        if S > _KEPT_WORDS:
+            return list(words)
+        _WORDS = words
+    return list(_WORDS[:, :S])
+
+
+_KEPT_WORDS = 1 << 12
+_WORDS = np.empty((4, 0), dtype = np.uint64)
 
 
 @few_threads
@@ -1019,10 +1057,7 @@ def to_tokens(automaton: ByteAutomaton, vocabulary: Vocabulary, eos_padding: boo
     trie = _trie(vocabulary)
     table, byte_class = automaton._kept_table, automaton.byte_class
     dead_byte, start = automaton.dead, automaton.initial
-    rng = np.random.default_rng(0)
-    r = [rng.integers(1, 2 ** 63, size = S, dtype = np.uint64) for _ in range(4)]
-    r[0] |= np.uint64(1)
-    r[2] |= np.uint64(1)
+    r = _random_words(S)
     complete = automaton.minimal and start != dead_byte and _byte_complete(trie)
     if automaton.counted and not complete:
         raise NotCounted

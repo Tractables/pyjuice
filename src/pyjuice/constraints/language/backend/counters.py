@@ -40,8 +40,12 @@ class Reach:
     def __init__(self, vocabulary, data: np.ndarray):
         self.offsets = vocabulary._offsets
         self.data = data
-        self.longest = int((self.offsets[1:] - self.offsets[:-1]).max())
         self.spans: Dict[int, Tuple[object, int]] = {}
+
+    @property
+    def longest(self) -> int:
+        """The bytes of the longest token."""
+        return int((self.offsets[1:] - self.offsets[:-1]).max())
 
 
 COUNTING: ContextVar[Optional[Reach]] = ContextVar("counting", default = None)
@@ -131,24 +135,28 @@ def _shortest(table, initial, accept, dead):
 @njit(cache = True)
 def _most_passes(table, byte_class, initial, accept, dead, data, offsets):
     """The most times the text of one token, from some byte of it on, goes all the way through an automaton whose accepting
-    states lead nowhere, starting again at each end."""
+    states lead nowhere, starting again at each end (from the end of a token back: from a byte on, once and as many as from where
+    that ends)."""
     most = 0
+    passes = np.zeros(1024, dtype = np.int32)
     for v in range(offsets.shape[0] - 1):
-        end = offsets[v + 1]
-        for p in range(offsets[v], end):
-            if table[initial, byte_class[data[p]]] == dead:
-                continue
+        start, end = offsets[v], offsets[v + 1]
+        if end - start >= passes.shape[0]:
+            passes = np.zeros(2 * (end - start), dtype = np.int32)
+        passes[end - start] = 0
+        for p in range(end - 1, start - 1, -1):
             q = initial
-            passes = 0
+            n = 0
             for k in range(p, end):
                 q = table[q, byte_class[data[k]]]
                 if q == dead:
                     break
                 if accept[q]:
-                    passes += 1
-                    q = initial
-            if passes > most:
-                most = passes
+                    n = 1 + passes[k + 1 - start]
+                    break
+            passes[p - start] = n
+            if n > most:
+                most = n
     return most
 
 
@@ -436,8 +444,37 @@ def _forward_moves(moves, row_at, row_len, window, where_g, where_l, where_r, ru
 
 
 @njit(cache = True)
-def _copied_rows(moves, row_at, row_len, forward, template, window, where_g, where_l, where_r, first_new_of, u_of, extra, first_new, u, moves_from, moves_of_copy,
-                 row_start, k0, k1):
+def _first_moves(moves, row_at, row_len, forward, template, seen_on, seen_out, mark, first_moves, at, copy_first):
+    """
+    What the breadth-first order reads of a row of a copy of ``template``: the first of its moves to every target, on through the chain
+    or not -- two of them alike lead to one state from every copy. Rows have some ten targets, on far more classes. Written to
+    ``first_moves`` from ``at`` on: how many, and which of the row; where in ``copy_first``. Returns ``(at, mark)``.
+    """
+    for l in range(template.shape[0]):
+        s = template[l]
+        a = row_at[s]
+        copy_first[l] = at
+        count_at = at
+        at += 1
+        mark += 1
+        for i in range(row_len[s]):
+            y = moves[a + i] & _LOW
+            if forward[a + i]:
+                if seen_on[y] != mark:
+                    seen_on[y] = mark
+                    first_moves[at] = i
+                    at += 1
+            elif seen_out[y] != mark:
+                seen_out[y] = mark
+                first_moves[at] = i
+                at += 1
+        first_moves[count_at] = at - count_at - 1
+    return at, mark
+
+
+@njit(cache = True)
+def _copied_rows(moves, row_at, row_len, first_at, copy_first, forward, template, window, where_g, where_l, where_r, first_new_of, u_of, extra, first_new, u, moves_from,
+                 moves_of_copy, row_start, k0, k1):
     """The rows of copies ``k0`` to ``k1 - 1`` (from 1) put after the template, its moves where it stands: a move on through the chain,
     ``g`` copies, leads ``g`` copies on from here, past the last copy put back into the next ones of the window; a move that left it leads
     where it does from the template, its copies past the template now among those put back."""
@@ -451,6 +488,7 @@ def _copied_rows(moves, row_at, row_len, forward, template, window, where_g, whe
             b = base + row_start[l]
             row_at[new + l] = b
             row_len[new + l] = n
+            first_at[new + l] = copy_first[l]
             for i in range(n):
                 m = moves[a + i]
                 y = m & _LOW
@@ -468,11 +506,11 @@ def _copied_rows(moves, row_at, row_len, forward, template, window, where_g, whe
 
 
 @njit(parallel = True, cache = True)
-def _copied_rows_parallel(moves, row_at, row_len, forward, template, window, where_g, where_l, where_r, first_new_of, u_of, extra, first_new, u, moves_from,
-                          moves_of_copy, row_start, P):
+def _copied_rows_parallel(moves, row_at, row_len, first_at, copy_first, forward, template, window, where_g, where_l, where_r, first_new_of, u_of, extra, first_new, u,
+                          moves_from, moves_of_copy, row_start, P):
     for p in prange(P):
-        _copied_rows(moves, row_at, row_len, forward, template, window, where_g, where_l, where_r, first_new_of, u_of, extra, first_new, u, moves_from,
-                     moves_of_copy, row_start, 1 + p * extra // P, 1 + (p + 1) * extra // P)
+        _copied_rows(moves, row_at, row_len, first_at, copy_first, forward, template, window, where_g, where_l, where_r, first_new_of, u_of, extra, first_new, u,
+                     moves_from, moves_of_copy, row_start, 1 + p * extra // P, 1 + (p + 1) * extra // P)
 
 
 @njit(cache = True)
@@ -555,7 +593,8 @@ def expanded_moves(roots: List[Run], remap: np.ndarray, K: int, K_full: int, mov
     The moves of the whole token automaton from the short one's, ``K`` of its ``K_full`` states: ``moves0``, ``row_at`` and ``row_len`` as
     :func:`~.token_lift._sparse_rows` leaves them for the first ``K``, ``remap`` its states of the byte automaton's. The inner runs first;
     a window copy's states are then its own and those put back inside it. Fills ``row_at``, ``row_len`` and ``accept`` for all of them and
-    returns the moves, with room for one row more.
+    returns the moves, with room for one row more, and what the breadth-first order reads of the rows: ``(moves, first_at, first_moves)``
+    (:func:`_first_moves`; ``first_at`` -1: all of the row).
     """
     runs = sorted(_all_runs(roots), key = lambda r: r.level)
     for r in runs:
@@ -569,6 +608,13 @@ def expanded_moves(roots: List[Run], remap: np.ndarray, K: int, K_full: int, mov
     moves = np.empty(total + 1, dtype = np.int64)
     at = _compacted(moves0, row_at, row_len, K, moves)
     forward = np.zeros(total + 1, dtype = np.bool_)
+    first_at = np.empty(K_full + 2, dtype = np.int32)
+    first_at[:K] = -1
+    first_at[K_full:] = -1
+    first_moves = np.empty(sum(r.moves + r.states for r in runs) + 1, dtype = np.int32)
+    first_end, mark = 0, 0
+    seen_on = np.zeros(K_full + 2, dtype = np.int32)
+    seen_out = np.zeros(K_full + 2, dtype = np.int32)
     where_g = np.full(K_full + 2, -1, dtype = np.int32)
     where_l = np.empty(K_full + 2, dtype = np.int32)
     where_r = np.full(K_full + 2, -1, dtype = np.int32)
@@ -608,7 +654,10 @@ def expanded_moves(roots: List[Run], remap: np.ndarray, K: int, K_full: int, mov
             template = r.window[0]
             row_start = np.zeros(r.states, dtype = np.int64)
             row_start[1:] = np.cumsum(row_len[template])[:-1]
-            tail = (moves, row_at, row_len, forward, template, r.window, where_g, where_l, where_r, first_new_of, u_of, r.extra, r.first_new, r.states, at, r.moves, row_start)
+            copy_first = np.empty(r.states, dtype = np.int32)
+            first_end, mark = _first_moves(moves, row_at, row_len, forward, template, seen_on, seen_out, mark, first_moves, first_end, copy_first)
+            tail = (moves, row_at, row_len, first_at, copy_first, forward, template, r.window, where_g, where_l, where_r, first_new_of, u_of, r.extra, r.first_new, r.states, at,
+                    r.moves, row_start)
             if r.moves * r.extra >= PARALLEL_MOVES and threads > 1:
                 _copied_rows_parallel(*tail, min(threads, r.extra))
             else:
@@ -621,6 +670,8 @@ def expanded_moves(roots: List[Run], remap: np.ndarray, K: int, K_full: int, mov
                 _led_on_parallel(*reading, past, before, min(threads, before))
             else:
                 _led_on(*reading, past, 0, before)
+        for r in runs[i:j]:                                     # (two moves of a state past the template, alike so far, may no longer be)
+            first_at[r.window[1:]] = -1
         for r in runs[i:j]:
             for g in range(r.window.shape[0]):
                 where_g[r.window[g]] = -1
@@ -628,7 +679,7 @@ def expanded_moves(roots: List[Run], remap: np.ndarray, K: int, K_full: int, mov
         i = j
     if next_id != K_full or at != total:
         raise NotCounted
-    return moves
+    return moves, first_at, first_moves
 
 
 #: so many moves to write are worth a team

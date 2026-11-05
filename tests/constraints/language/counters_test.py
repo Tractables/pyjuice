@@ -366,6 +366,36 @@ def test_how_far_a_token_goes():
         counters.COUNTING.reset(counting)
 
 
+def test_a_token_longer_than_a_kilobyte():
+    a = A.literal(b"a")
+    many = jc.Vocabulary([bytes([b]) for b in range(256)] + [b"a" * 3000, None], eos = [257])
+    assert counters._span(a, counters.Reach(many, np.frombuffer(many._buffer, dtype = np.uint8))) == 3001
+
+
+@pytest.mark.parametrize("first", [True, False])
+def test_two_moves_to_one_state_from_the_template_and_not_from_a_copy(first):
+    """From the template one token walks on two copies, and another closes the string, opens the next and writes as far: one state.
+    From a copy further on they lead apart, and the order of the states has to see both, whichever class comes first."""
+    schema = {"type": "array", "items": SHORT}
+    pair = [b'","aaa', b"aa"] if first else [b"aa", b'","aaa']
+    tokens = [bytes([b]) for b in range(256)]
+    tokens = pair + [t for t in tokens if t != b"a"] + [b"a"]           # (these classes before those of the bytes)
+    vocabulary = jc.Vocabulary(tokens + [None], eos = [len(tokens)])
+    assert check(schema, vocabulary)
+
+
+def test_two_moves_of_a_copy_in_a_copy_that_lead_apart_only_at_the_end():
+    """A chain in a chain in a loop. From a string's copy put back, in an item past the outer template, one token goes on to the next
+    item and another out of the array and in again as far: one state until the outer copies are put back, and two after. A long
+    token gets to such a copy first of its item, and so it is that the order of the states has to see both from."""
+    schema = {"type": "array", "items": {"type": "array", "items": {"type": "string", "maxLength": 70}, "maxItems": 60}}
+    for empties in (3, 4, 5, 6):
+        out_and_in = b'"],["' + b'","' * empties + b'aaa'
+        tokens = [out_and_in, b'","aaa', b"a" * 20] + [bytes([b]) for b in range(256)]
+        vocabulary = jc.Vocabulary(tokens + [None], eos = [len(tokens)])
+        assert check(schema, vocabulary), empties
+
+
 class Chain:
     """
     What :func:`counters._window` reads of a chain, as moves that can be spoiled one at a time: ``copies`` copies of an entry ``e(c)``,
