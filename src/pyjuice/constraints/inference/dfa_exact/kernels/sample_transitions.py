@@ -137,7 +137,7 @@ def sample_transition_masses(trans, job, masses, prog, layout: SampleMasses):
     class masses ``masses``: see :func:`_sample_transition_kernel`."""
     rows, tiles, TS = job
     cfg = SAMPLE_TRANSITION_TILES
-    enum = prog.enum.num > 0
+    enum = prog.enum.on
     logw = enum and masses.enum_logw is not None
     eprobs = masses.enum_probs if enum else masses.table
     TR = min(cfg["TR"], TS)

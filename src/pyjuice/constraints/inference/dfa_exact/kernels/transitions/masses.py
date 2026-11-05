@@ -149,7 +149,7 @@ def enumerated_args(prog, masses) -> dict:
     probabilities by parameter row (``num_enum`` columns); unread placeholders where nothing is enumerated (``ENUM``
     False) or the masses are no sample's own (``LOGW`` False)."""
     en = prog.enum
-    enum = en.num > 0
+    enum = en.on
     logw = enum and masses.enum_logw is not None
     eprobs = masses.enum_probs if enum else masses.table
     return dict(code = en.code, tok_ptr = en.ptr, eidx = en.index, eprobs = eprobs, prow = masses.prow,
@@ -187,7 +187,7 @@ def transition_masses(trans, job, masses, prog):
         TP = TRANSITION_PAIR_TILE
     sample = masses.batch > 1
     stride = masses.stride if sample else masses.row
-    enum = en.num > 0
+    enum = en.on
     logw = enum and masses.enum_logw is not None
     eprobs = masses.enum_probs if enum else masses.table
     for first, size in grid_chunks(tiles.size(0) * num_qtiles, 0):
@@ -263,11 +263,11 @@ def _pair_tables(prog):
         g = torch.repeat_interleave(torch.arange(E, device = dev), first[1:] - first[:-1])    # every pair's entry
         tb = torch.searchsorted(prog.succ.boundary_base[1:n + 1], g, right = True)        # ... its boundary
         c = key - tb * C                                                                  # ... its class
-        x = en.code.view(-1)[key].long() if en.num > 0 else c                             # ... its code there
+        x = en.code.view(-1)[key].long() if en.on else c                                  # ... its code there
         e = (-1 - x).clamp(min = 0)
-        at = en.ptr.long()[tb] + e if en.num > 0 else e
+        at = en.ptr.long()[tb] + e if en.on else e
         enum = x < 0
-        xcode = torch.where(enum, -1 - en.index.long()[at.clamp(max = en.index.numel() - 1)], x) if en.num > 0 else x
+        xcode = torch.where(enum, -1 - en.index.long()[at.clamp(max = en.index.numel() - 1)], x) if en.on else x
         wsel = torch.where(enum, at, -1)
         kept = prog.entry_class_tables = (xcode.to(torch.int32), wsel.to(torch.int32))
     return kept

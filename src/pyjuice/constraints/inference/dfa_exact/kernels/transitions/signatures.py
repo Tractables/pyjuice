@@ -196,7 +196,7 @@ def signature_masses(prog, masses, trans_size: int) -> Optional[SignatureMasses]
     entry_ptr = long(tt.entry_ptr).view(n, W + 1)
     entry_succ, entry_x = long(tt.entry_succ), long(tt.entry_x)
     pred_ptr, pred_x = long(tt.pred_ptr).view(n, W + 1), long(tt.pred_x)
-    enum = en.num > 0
+    enum = en.on
 
     # every column (t, q) and its pairs (entries: by column, then successor)
     T, Q = _spread(width[:n])
@@ -444,7 +444,7 @@ def signature_transition_masses(trans, sig: SignatureMasses, masses, prog):
         TP = min(64, max(8, host_next_power_of_2(max(1, math.ceil(mean_pairs)))))
     else:
         TP = TRANSITION_PAIR_TILE
-    enum = en.num > 0
+    enum = en.on
     eprobs = masses.enum_probs if enum else masses.table
     for first, size in grid_chunks(tiles.size(0) * num_qtiles, 0):
         _signature_transition_kernel[(size,)](

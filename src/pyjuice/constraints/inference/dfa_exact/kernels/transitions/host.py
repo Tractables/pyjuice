@@ -125,7 +125,8 @@ class HostTables:
         self.enum_lists = index, ptr
         code = code_rows[group]
         ptr_t, tok_t, index_t, code_t = one_copy([ptr.astype(np.int32), tok, index, code], self.dev)
-        return EnumeratedTokens(ptr = ptr_t, tok = tok_t, index = index_t, code = code_t, num = int(ptr[-1]), ptr_host = ptr)
+        return EnumeratedTokens(ptr = ptr_t, tok = tok_t, index = index_t, code = code_t, num = int(ptr[-1]), ptr_host = ptr,
+                                on = classes.num_enumerated > 0)
 
     def _pointers(self, rows: np.ndarray, counts: np.ndarray) -> np.ndarray:
         """int32 [n, width]: every boundary's pointer row, its segment's relative row past the segments before."""
@@ -137,7 +138,7 @@ class HostTables:
         n, W, C, G = self.n, self.W, self.C, self.G
         g, q, c, s = self.g, self.q, self.c, self.s_end
         codes = None
-        if enum is not None and enum.num > 0:
+        if enum is not None and enum.on:
             codes = self._enum_codes if self._enum_codes is not None else enum.code.cpu().numpy()[self.firsts_host]
         arrays = []
         if self.by_class is None:

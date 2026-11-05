@@ -22,7 +22,9 @@ class EnumeratedTokens:
         (``TokenClasses.enumerated_tokens``, in class order) -- its column of the enumerated tokens' probabilities
         (:meth:`~..state.State.enumerated_probs`) --, then a 0
     :ivar code: [n, C] int32
-    :ivar num: the tokens over all boundaries (0: nothing enumerated; every code a stored column, the class itself)
+    :ivar num: the tokens over all boundaries (0: none is live at this length, or nothing is enumerated)
+    :ivar on: whether any class is enumerated, which is what the codes depend on: without, every code is the class itself;
+        with, a stored class's is its stored column, past the classes enumerated before it, even if ``num`` is 0
     """
 
     ptr: torch.Tensor
@@ -31,6 +33,7 @@ class EnumeratedTokens:
     code: torch.Tensor
     num: int
     ptr_host: np.ndarray
+    on: bool
 
 
 @dataclass(frozen = True)

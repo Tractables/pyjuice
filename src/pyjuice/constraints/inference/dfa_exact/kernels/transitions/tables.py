@@ -41,7 +41,7 @@ def enumerated_tokens(tr, classes) -> EnumeratedTokens:
         index = torch.cat([place[c[ids]], zero])
     i32 = lambda x: x.to(dev, torch.int32).contiguous()
     return EnumeratedTokens(ptr = i32(ptr), tok = i32(tok), index = i32(index), code = i32(code), num = int(ptr[-1]),
-                            ptr_host = ptr.numpy())
+                            ptr_host = ptr.numpy(), on = classes.num_enumerated > 0)
 
 
 #: Distinct boundaries' transitions are built in batches of at most this many of the automaton's transitions
@@ -247,7 +247,7 @@ def transition_tables(tr, grouped: bool, enum: Optional[EnumeratedTokens] = None
     if isinstance(boundary_groups(tr), HostTables):
         return boundary_groups(tr).transition_tables(grouped, enum)
     n, W, C, dev = tr.n, tr.W, tr.C, tr.device
-    code = enum.code.long() if enum is not None and enum.num > 0 else None
+    code = enum.code.long() if enum is not None and enum.on else None
     i32 = lambda x: x.to(dev, torch.int32).contiguous()
     cat = lambda xs, total: i32(torch.cat(xs)) if total > 0 else torch.zeros(1, dtype = torch.int32, device = dev)
     groups = boundary_groups(tr)
