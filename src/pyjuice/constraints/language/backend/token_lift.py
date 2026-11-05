@@ -144,6 +144,17 @@ def _ends(end_ptr, end_ids, V, empty):
     return end_nodes, token_end
 
 
+@njit(cache = True)
+def _parents(first_child):
+    """Every node's parent (the root's: itself)."""
+    M = first_child.shape[0] - 1
+    parent = np.zeros(M, dtype = np.int32)
+    for u in range(M):
+        for w in range(first_child[u], first_child[u + 1]):
+            parent[w] = u
+    return parent
+
+
 class _Trie:
     """The byte trie of a vocabulary's tokens with nonempty text, breadth-first (:func:`_trie_tables`), and what walks of it read
     whatever the automaton: the bytes below every node (:func:`_bytes_below`), where tokens end (:func:`_ends`)."""
@@ -155,8 +166,21 @@ class _Trie:
         self.first_child, self.node_byte, self.end_ptr, self.end_ids = _trie_tables(self.data, offsets, tokens)
         self.below = _bytes_below(self.first_child, self.node_byte)
         self.ends_before = self.end_ptr
-        empty = np.nonzero(has_text & (offsets[1:] == offsets[:-1]))[0]
-        self.end_nodes, self.token_end = _ends(self.end_ptr, self.end_ids, vocabulary.size, empty)
+        self.empty = np.nonzero(has_text & (offsets[1:] == offsets[:-1]))[0]
+        self.end_nodes, self.token_end = _ends(self.end_ptr, self.end_ids, vocabulary.size, self.empty)
+        self.parent = _parents(self.first_child)
+        self._places = {}
+
+    def token_ends(self, V: int, eos: tuple) -> np.ndarray:
+        """Every token's place among :attr:`end_nodes`, of ``V`` ids (more than the trie was made for: they have no text), the ids ``eos``
+        at the last place."""
+        places = self._places.get((V, eos))
+        if places is None:
+            places = np.zeros(V, dtype = np.int32)
+            places[:self.token_end.size] = self.token_end
+            places[list(eos)] = self.end_nodes.size - 1
+            self._places[V, eos] = places
+        return places
 
 
 @njit(cache = True)
@@ -263,8 +287,13 @@ class _TrieOfClasses:
         self.first_child, self.node_byte, self.ends_before, self.end_nodes, self.token_end = _trie_of_classes(trie.first_child, trie.node_byte, trie.end_ptr, trie.end_ids,
                                                                                                               byte_class, read, vocabulary.size)
         self.below = _bytes_below(self.first_child, self.node_byte)
-        offsets, has_text = vocabulary._offsets, vocabulary._has_text
-        self.token_end[has_text & (offsets[1:] == offsets[:-1])] = self.end_nodes.size - 2
+        self.token_end[trie.empty] = self.end_nodes.size - 2
+        self.parent = _parents(self.first_child)
+
+    def token_ends(self, V: int, eos: tuple) -> np.ndarray:
+        """As :meth:`_Trie.token_ends`: its own, of this automaton."""
+        self.token_end[list(eos)] = self.end_nodes.size - 1
+        return self.token_end
 
 
 def _trie(vocabulary: Vocabulary) -> _Trie:
@@ -828,49 +857,46 @@ def _rows_parallel(table, dead, states, reps, kinds, offsets, data, byte_class, 
 
 
 @njit(cache = True)
-def _rep_trie(first_child, node_byte, byte_class, rep_node):
+def _rep_trie(first_child, node_byte, byte_class, parent, rep_node):
     """The trie as far as the representative tokens go, ``rep_node`` the node of every class's (-1: none): ``(gptr, gclass,
-    gnode, class_at)``, its edges as CSR, on classes, and the class ending at every node (-1: none). The root is node 0."""
+    gnode, class_at)``, its edges as CSR, on classes, and the class ending at every node (-1: none). The root is node 0, the others
+    numbered as they are found."""
     M = first_child.shape[0] - 1
-    parent = np.zeros(M, dtype = np.int32)
-    for u in range(M):
-        for w in range(first_child[u], first_child[u + 1]):
-            parent[w] = u
     keep = np.zeros(M, dtype = np.bool_)
     keep[0] = True
-    at = np.full(M, -1, dtype = np.int32)
+    kept = np.empty(M, dtype = np.int32)
+    kept[0] = 0
+    G = 1
+    for c in range(rep_node.shape[0]):
+        m = rep_node[c]
+        if m >= 0:
+            while not keep[m]:
+                keep[m] = True
+                kept[G] = m
+                G += 1
+                m = parent[m]
+    number = np.empty(M, dtype = np.int32)
+    edges = 0
+    for g in range(G):
+        m = kept[g]
+        number[m] = g
+        for w in range(first_child[m], first_child[m + 1]):
+            edges += keep[w]
+    class_at = np.full(G, -1, dtype = np.int32)
     for c in range(rep_node.shape[0]):
         if rep_node[c] >= 0:
-            at[rep_node[c]] = c
-            keep[rep_node[c]] = True
-    for m in range(M - 1, 0, -1):                               # (breadth-first: a parent before its children)
-        if keep[m]:
-            keep[parent[m]] = True
-    number = np.empty(M, dtype = np.int32)
-    G = 0
-    for m in range(M):
-        if keep[m]:
-            number[m] = G
-            G += 1
+            class_at[number[rep_node[c]]] = c
     gptr = np.zeros(G + 1, dtype = np.int32)
-    class_at = np.empty(G, dtype = np.int32)
-    edges = 0
-    for m in range(M):
-        if keep[m]:
-            class_at[number[m]] = at[m]
-            for w in range(first_child[m], first_child[m + 1]):
-                if keep[w]:
-                    edges += 1
-            gptr[number[m] + 1] = edges
     gclass = np.empty(edges, dtype = np.int32)
     gnode = np.empty(edges, dtype = np.int32)
     edges = 0
-    for m in range(M):
-        if keep[m]:
-            for w in range(first_child[m], first_child[m + 1]):
-                if keep[w]:
-                    gclass[edges], gnode[edges] = byte_class[node_byte[w]], number[w]
-                    edges += 1
+    for g in range(G):
+        m = kept[g]
+        for w in range(first_child[m], first_child[m + 1]):
+            if keep[w]:
+                gclass[edges], gnode[edges] = byte_class[node_byte[w]], number[w]
+                edges += 1
+        gptr[g + 1] = edges
     return gptr, gclass, gnode, class_at
 
 
@@ -1030,7 +1056,7 @@ def _canonical_token_table(automaton: ByteAutomaton, states: np.ndarray, remap: 
     K, C = states.size, reps.size
     threads = get_num_threads()
     rep_node = np.where(kinds == 0, trie.end_nodes[trie.token_end[np.minimum(reps, trie.token_end.size - 1)]], -1).astype(np.int64)
-    gptr, gclass, gnode, class_at = _rep_trie(trie.first_child, trie.node_byte, letters, rep_node)
+    gptr, gclass, gnode, class_at = _rep_trie(trie.first_child, trie.node_byte, letters, trie.parent, rep_node)
     itself = np.nonzero(kinds == 1)[0].astype(np.int64)
     moves = np.empty(K * C + 1, dtype = np.int64)               # (room for all, where a part starts; only what is written is touched)
     row_at, row_len = np.zeros(K_full + 2, dtype = np.int64), np.zeros(K_full + 2, dtype = np.int64)
@@ -1068,7 +1094,7 @@ SERIAL_STEPS = 1 << 18
 NO_BUDGET = 1 << 62
 #: the table of a token automaton of at least so many entries, minimal already, is made from its moves (:func:`_canonical_token_table`,
 #: the dense table of its rows costing no more below it), in threads from :data:`THREADS_ENTRIES` on
-SPARSE_ENTRIES = 1 << 19
+SPARSE_ENTRIES = 1 << 13
 THREADS_ENTRIES = 1 << 18
 #: states checked on the quotient of the trie (:func:`_walk_the_rest`): at first so many, then twice as many a time,
 #: on one thread below :data:`SERIAL_CHECKS`; states failing are walked, so many edges in threads at the most at a time
@@ -1124,19 +1150,15 @@ def to_tokens(automaton: ByteAutomaton, vocabulary: Vocabulary, eos_padding: boo
         states = states[states != dead_byte]
         _walk_the_rest(table, dead_byte, states[left[states]], letters, through, r, walking, h1, h2)
     offsets, has_text = vocabulary._offsets, vocabulary._has_text
-    if ((offsets[1:] == offsets[:-1]) & has_text).any():                # empty text: every state to itself
+    if trie.empty.size:                                                 # empty text: every state to itself
         with np.errstate(over = "ignore"):
             x = (states + 1).astype(np.uint64)
             h1[M] = np.sum(r[0][states] * x + r[1][states], dtype = np.uint64)
             h2[M] = np.sum(r[2][states] * x + r[3][states], dtype = np.uint64)
     eos = np.asarray(vocabulary.eos, dtype = np.int64)
-    token_end = through.token_end
     if eos_padding and eos.size:                                        # a class of their own
         h1[M + 1] = h2[M + 1] = np.uint64(2 ** 64 - 1)
-    if token_end.size < V or (eos_padding and eos.size):                # (ids past the ones the trie was made for have no text)
-        token_end = np.concatenate([token_end, np.zeros(V - token_end.size, dtype = np.int32)])
-        if eos_padding and eos.size:
-            token_end[eos] = through.end_nodes.size - 1
+    token_end = through.token_ends(V, vocabulary.eos if eos_padding else ())
     token_class, reps, hashed = _token_classes(h1, h2, through.end_nodes, token_end)
     kinds = np.where(hashed & has_text[reps], np.where(offsets[reps + 1] == offsets[reps], 1, 0), 2).astype(np.int64)
     K, C = states.size, reps.size

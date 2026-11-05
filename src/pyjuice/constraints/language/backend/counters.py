@@ -565,6 +565,38 @@ def _compacted(moves0, row_at, row_len, K, moves):
     return at
 
 
+@njit(cache = True)
+def _mark_window(window, number, where_g, where_l, where_r, template_of):
+    """Where every state of a run's window stands. False if one stands in two runs already."""
+    for g in range(window.shape[0]):
+        for l in range(window.shape[1]):
+            s = window[g, l]
+            if where_g[s] >= 0:
+                return False
+            where_g[s], where_l[s], where_r[s] = g, l, number
+            template_of[s] = window[0, l]
+    return True
+
+
+@njit(cache = True)
+def _unmark_window(window, where_g, where_r, first_at):
+    """The states of a run's window no longer stand in it, and two moves of one past the template, alike so far, may no longer be."""
+    for g in range(window.shape[0]):
+        for l in range(window.shape[1]):
+            s = window[g, l]
+            where_g[s], where_r[s] = -1, -1
+            if g >= 1:
+                first_at[s] = -1
+
+
+@njit(cache = True)
+def _accepting_copies(accept, template, first_new, extra):
+    u = template.shape[0]
+    for k in range(extra):
+        for l in range(u):
+            accept[first_new + k * u + l] = accept[template[l]]
+
+
 def _all_runs(roots: List[Run]) -> List[Run]:
     out, stack = [], list(roots)
     while stack:
@@ -638,13 +670,8 @@ def expanded_moves(roots: List[Run], remap: np.ndarray, K: int, K_full: int, mov
             r.window = window
             r.first_new = next_id
             next_id += r.states * r.extra
-            for g in range(window.shape[0]):
-                if (where_g[window[g]] >= 0).any():
-                    raise NotCounted                            # (a state in two chains)
-                where_g[window[g]] = g
-                where_l[window[g]] = np.arange(r.states, dtype = np.int32)
-                where_r[window[g]] = number
-                template_of[window[g]] = window[0]
+            if not _mark_window(window, number, where_g, where_l, where_r, template_of):
+                raise NotCounted                                # (a state in two chains)
             first_new_of[number] = r.first_new
             u_of[number] = r.states
         for number, r in enumerate(runs[i:j]):
@@ -663,19 +690,15 @@ def expanded_moves(roots: List[Run], remap: np.ndarray, K: int, K_full: int, mov
             else:
                 _copied_rows(*tail, 1, r.extra + 1)
             at += r.moves * r.extra
-            accept[r.first_new:r.first_new + r.states * r.extra] = np.tile(accept[template], r.extra)
+            _accepting_copies(accept, template, r.first_new, r.extra)
         reading = (moves, row_at, row_len, forward, template_of, where_g, where_l, where_r, first_new_of, u_of)
         for past in (True, False):                              # (in this order: see `_led_on`)
             if at >= PARALLEL_MOVES and threads > 1:
                 _led_on_parallel(*reading, past, before, min(threads, before))
             else:
                 _led_on(*reading, past, 0, before)
-        for r in runs[i:j]:                                     # (two moves of a state past the template, alike so far, may no longer be)
-            first_at[r.window[1:]] = -1
         for r in runs[i:j]:
-            for g in range(r.window.shape[0]):
-                where_g[r.window[g]] = -1
-                where_r[r.window[g]] = -1
+            _unmark_window(r.window, where_g, where_r, first_at)
         i = j
     if next_id != K_full or at != total:
         raise NotCounted
