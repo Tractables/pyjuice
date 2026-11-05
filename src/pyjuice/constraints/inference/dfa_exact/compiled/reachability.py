@@ -84,10 +84,13 @@ class Reachability:
         if self._path_no is None:
             self._path_no = np.full(side * side, -1, dtype = np.int32)
         last, numbers, no, todo = self.n, self._numbers, self._path_no, {}
+        group = None
         for a, b in intervals:
             if a == 0 or b == last or no[a * side + b] >= 0:
                 continue
-            path = self._path(a, b)
+            if group is None:
+                group = self._tables().group
+            path = tuple(group[a:b]) if b > a else ("identity", self.width[a])    # (:meth:`_path`, thousands of times)
             known = numbers.get(path)
             if known is not None:
                 no[a * side + b] = known
@@ -112,8 +115,9 @@ class Reachability:
     def _sweep_together(self, todo: dict) -> dict:
         """What each of the paths ``todo`` (:meth:`prepare`'s, by an interval of it) joins: ``(columns' bits of several
         sweeps, where its are, its words)``. A boundary at a time, every sweep there side by side: a launch a boundary,
-        where one sweep at a time takes a launch a boundary and sweep."""
-        from ..kernels.reachability import advance, column_bits              # (they import this module's)
+        where one sweep at a time takes a launch a boundary and sweep. Every table of them stays as it is written: a path
+        reads the one at its end, and a sweep starts from a part of one table of a column per bit."""
+        from ..kernels.reachability import advance, column_bits, words_of    # (they import this module's)
         starts, ends, last = set(), {}, {}
         for path, (_, _, _, ivs) in todo.items():
             a, b = ivs[0]
@@ -124,22 +128,15 @@ class Reachability:
         if not starts:
             return out
         tables = self._tables()
+        every_column = column_bits(max(self.width[a] for a in starts), self._dev)
         cur, live = None, {}                                 # [columns here, words], a sweep's start -> (first word, words)
         for t in range(min(starts), max(last.values()) + 1):
             if t in starts:
-                bits = column_bits(self.width[t], self._dev)
+                bits = every_column[:self.width[t], :words_of(self.width[t])]
                 live[t] = (0 if cur is None else cur.size(1), bits.size(1))
-                cur = bits if cur is None else torch.cat([cur, bits], dim = 1)
-            if t in ends:                                    # the words of the paths ending here, in a call
-                at, read = 0, []
-                for a, path in ends[t]:
-                    first, words = live[a]
-                    out[path] = (at, words)
-                    read.append(np.arange(first, first + words))
-                    at += words
-                here = cur[:, torch.from_numpy(np.concatenate(read)).to(self._dev)]
-                for a, path in ends[t]:
-                    out[path] = (here, *out[path])
+                cur = bits.contiguous() if cur is None else torch.cat([cur, bits], dim = 1)     # (a kernel reads rows of its words)
+            for a, path in ends.get(t, ()):                  # (the paths ending here: their words, read when stacked)
+                out[path] = (cur, *live[a])
             done = [a for a in live if last[a] <= t]         # (what no path reads any more goes)
             if done:
                 for a in done:

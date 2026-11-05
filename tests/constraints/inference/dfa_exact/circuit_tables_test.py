@@ -12,6 +12,7 @@ import subprocess
 import sys
 import weakref
 
+import numpy as np
 import pytest
 import torch
 
@@ -197,6 +198,16 @@ def test_the_batches_do_not_change_the_automatons_tables(seed, grouped, monkeypa
     for k in together.__dataclass_fields__:
         a, b = getattr(together, k), getattr(apart, k)
         assert torch.equal(a, b) if isinstance(a, torch.Tensor) else a == b, k
+
+
+@pytest.mark.parametrize("count, size", [(2000, 64), (2000, 2000), (8, 1 << 20), (0, 64)])
+def test_distinct_operands_are_those_of_a_sort(count, size):
+    """Many keys for their range, by a table; few, by a sort: the same distinct keys and every key's place among them."""
+    from pyjuice.constraints.inference.dfa_exact.kernels.prod.skip_masks import _distinct
+    keys = np.random.default_rng(size).integers(0, size, count, dtype = np.int64)
+    got, want = _distinct(keys, size), np.unique(keys, return_inverse = True)
+    assert np.array_equal(got[0], want[0]) and np.array_equal(got[1], want[1])
+    assert got[0].dtype == want[0].dtype and got[1].dtype == want[1].dtype
 
 
 def test_boundaries_alike_are_found_exactly_whatever_their_hash(monkeypatch):

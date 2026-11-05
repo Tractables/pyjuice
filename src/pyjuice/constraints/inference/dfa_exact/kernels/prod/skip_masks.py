@@ -42,6 +42,16 @@ def skip_masks(reach: Reachability, triples: Sequence[Tuple[int, int, int]], tm:
     return skip_masks_for(reach, [((a, b, False), (b, c, False)) for a, b, c in triples], tm, tn, tk, device)
 
 
+def _distinct(keys: np.ndarray, size: int) -> Tuple[np.ndarray, np.ndarray]:
+    """``np.unique(keys, return_inverse = True)`` of keys below ``size``, without sorting them where they are many (a tree's
+    products are some 40,000 for a few hundred operands)."""
+    if size > 8 * keys.size:
+        return np.unique(keys, return_inverse = True)
+    seen = np.zeros(size, dtype = np.bool_)
+    seen[keys] = True
+    return np.flatnonzero(seen), (np.cumsum(seen) - 1)[keys]
+
+
 def skip_masks_for(reach: Reachability, specs, tm: int = 16, tn: int = 16, tk: int = 16, device = None) -> SkipMasks:
     """
     The :class:`SkipMasks` of log-space products ``A @ B`` whose operands are blocks or transposed blocks: spec ``k``
@@ -61,7 +71,7 @@ def skip_masks_for(reach: Reachability, specs, tm: int = 16, tn: int = 16, tk: i
     def sides_of(side):
         """The distinct operands of a side of the specs, ``(a, b, transposed)`` int64, and every spec's among them."""
         key = (side[:, 0] * (reach.n + 1) + side[:, 1]) * 2 + side[:, 2]
-        distinct, inverse = np.unique(key, return_inverse = True)
+        distinct, inverse = _distinct(key, 2 * (reach.n + 1) * (reach.n + 1))
         return distinct // 2 // (reach.n + 1), distinct // 2 % (reach.n + 1), distinct % 2, inverse
 
     def packed(a, b, transposed, rows, chunks_along_rows):
@@ -80,7 +90,15 @@ def skip_masks_for(reach: Reachability, specs, tm: int = 16, tn: int = 16, tk: i
                     part = part.transpose(1, 2)
                 part = part[:, :rows, :NC]                               # (what is cut: no column reaches it)
                 out[torch.from_numpy(own).to(where), :part.size(1), :part.size(2)] = part
-        for k in np.flatnonzero(stack < 0).tolist():                     # (not swept together: every pair, or alone)
+        every = (stack < 0) & ((a == 0) | (b == reach.n))                # (every pair: all set, over its columns, in a call)
+        own = np.flatnonzero(every)
+        if own.size:
+            first, second = tiles(widths[a[own]]), tiles(exits(b[own]))
+            flip = (transposed[own] == 1) != chunks_along_rows
+            along, across = np.where(flip, second, first), np.where(flip, first, second)
+            all_set = (np.arange(rows) < along[:, None])[:, :, None] & (np.arange(NC) < across[:, None])[:, None, :]
+            out[torch.from_numpy(own).to(where)] = torch.from_numpy(all_set).to(where)
+        for k in np.flatnonzero((stack < 0) & ~every).tolist():          # (not swept together: alone)
             m = reach.device_occupancy(int(a[k]), int(b[k]))
             m = m.t() if bool(transposed[k]) != chunks_along_rows else m
             out[k, :m.size(0), :m.size(1)] = m

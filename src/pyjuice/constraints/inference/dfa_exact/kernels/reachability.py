@@ -16,6 +16,7 @@ from pyjuice.utils.kernel_launcher import triton_jit
 from pyjuice.utils.util import host_cdiv
 
 from ....evidence import current_device
+from .common import one_copy
 from .transitions import HostTables, boundary_groups
 
 #: the words of a program
@@ -69,10 +70,14 @@ def sweep_tables(tr) -> SweepTables:
     return SweepTables(tr)
 
 
+def words_of(width: int) -> int:
+    """The words of a bit per column."""
+    return max(host_cdiv(width, 32), 1)
+
+
 def column_bits(width: int, dev) -> torch.Tensor:
     """int32 [width, words]: every column reached from itself alone."""
-    words = max(host_cdiv(width, 32), 1)
-    out = torch.zeros(width, words, dtype = torch.int64, device = dev)
+    out = torch.zeros(width, words_of(width), dtype = torch.int64, device = dev)
     at = torch.arange(width, device = dev)
     out[at, at // 32] = 1 << (at % 32)
     return out.to(torch.int32)
@@ -92,18 +97,24 @@ def advance(bits: torch.Tensor, t: int, next_width: int, tables: SweepTables) ->
 def stack_bits(swept: list, most_columns: int, entries: int) -> torch.Tensor:
     """int32 [sweeps, ``most_columns``, words of ``entries``]: the bits of ``swept``, ``(table, first word, words)``: of
     every sweep the ``words`` of ``table`` [its columns, ...] from its first, one above the other, zeros past their columns
-    and words -- a few device calls a table."""
+    and words -- two device calls a table, and one copy of where they read."""
     dev = swept[0][0].device
-    words = max(host_cdiv(entries, 32), 1)
-    out = torch.zeros(len(swept), most_columns, words, dtype = torch.int32, device = dev)
+    out = torch.zeros(len(swept), most_columns, words_of(entries), dtype = torch.int32, device = dev)
     tables = {}
     for k, (table, first, own) in enumerate(swept):
         tables.setdefault((id(table), own), (table, own, [], []))
         tables[id(table), own][2].append(k)
         tables[id(table), own][3].append(first)
-    for table, own, ks, firsts in tables.values():
-        at = np.asarray(firsts, dtype = np.int64)[:, None] + np.arange(own, dtype = np.int64)[None, :]
-        out[torch.tensor(ks, device = dev), :table.size(0), :own] = table[:, torch.from_numpy(at).to(dev)].transpose(0, 1)
+    ks_of = np.concatenate([np.asarray(ks, dtype = np.int64) for _, _, ks, _ in tables.values()])
+    at_of = np.concatenate([(np.asarray(firsts, dtype = np.int64)[:, None] + np.arange(own, dtype = np.int64)[None, :]).ravel()
+                            for _, own, _, firsts in tables.values()])
+    ks_of, at_of = one_copy([ks_of, at_of], dev, np.int64)
+    i = j = 0
+    for table, own, ks, _ in tables.values():
+        count = len(ks)
+        at = at_of[j:j + count * own].view(count, own)
+        out[ks_of[i:i + count], :table.size(0), :own] = table[:, at].transpose(0, 1)
+        i, j = i + count, j + count * own
     return out
 
 
