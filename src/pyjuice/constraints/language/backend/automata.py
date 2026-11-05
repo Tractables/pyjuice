@@ -563,16 +563,9 @@ class _Joined:
         self.offsets: List[int] = []
         self.size = 0
         self.extra = 0                                          # fresh states, numbered after the parts'
-        self.eps: List[Tuple[int, int]] = []
+        self.eps: List[int] = []                                # the empty moves: from, to, from, to...
         self.accepting: List[int] = []
         self.wired: List[Wired] = []                            # (the repetitions wired short: see :mod:`.counters`)
-
-    def add(self, a: ByteAutomaton) -> int:
-        """A copy of ``a``: the number of its first state (its states follow in order)."""
-        self.parts.append(a)
-        self.offsets.append(self.size)
-        self.size += a.num_states
-        return self.size - a.num_states
 
     def fresh(self) -> int:
         """A fresh state without byte transitions (numbered once every part is in: a negative placeholder)."""
@@ -582,22 +575,33 @@ class _Joined:
     def wire(self, x) -> Tuple[int, List[int]]:
         """``x`` -- an automaton, or an expression not evaluated yet, its parts wired in turn -- added: ``(entry,
         accepting states)``. A repeated part is evaluated first (its copies then the minimal automaton's)."""
-        if isinstance(x, Expr) and x._forced is not None:
+        if type(x) is Expr:
+            if x._forced is None:
+                return self._wire_expression(x)
             x = x._forced
-        if not isinstance(x, Expr):
-            off = self.add(x)
-            return off + x.initial, [off + int(q) for q in np.nonzero(x.accept)[0]]
+        off = self.size
+        self.parts.append(x)
+        self.offsets.append(off)
+        self.size = off + x.num_states
+        return off + x.initial, [off + q for q in x.accepting_states]
+
+    def _wire_expression(self, x: "Expr") -> Tuple[int, List[int]]:
+        eps = self.eps
         if x.kind == "seq":
             entry, prev = self.wire(x.parts[0])
             for part in x.parts[1:]:                            # every accepting state enters the next part
                 e, acc = self.wire(part)
-                self.eps += [(q, e) for q in prev]
+                for q in prev:
+                    eps += (q, e)
                 prev = acc
             return entry, prev
         if x.kind == "list":                                    # one copy of the item, the separator back to it
             entry, accepting = self.wire(x.parts[0])
             e, acc = self.wire(x.parts[1])
-            self.eps += [(q, e) for q in accepting] + [(q, entry) for q in acc]
+            for q in accepting:
+                eps += (q, e)
+            for q in acc:
+                eps += (q, entry)
             return entry, accepting
         if x.kind == "members":
             return self._wire_members(*x.parts)
@@ -606,7 +610,7 @@ class _Joined:
             accepting = []
             for part in x.parts:
                 e, acc = self.wire(part)
-                self.eps.append((start, e))
+                eps += (start, e)
                 accepting += acc
             return start, accepting
         lo, hi = x.lo, x.hi                                     # "rep"
@@ -623,42 +627,50 @@ class _Joined:
             if short is not None:
                 wired.offsets.append(e - part.initial)
                 wired.parts.append(len(self.parts) - 1)
-            self.eps += [(p, e) for p in prev]
+            for p in prev:
+                eps += (p, e)
             prev = acc
             if i + 1 >= lo:
                 accepting += acc
             if hi is None and i == copies - 1:                  # the last copy loops
-                self.eps += [(p, e) for p in acc]
+                for p in acc:
+                    eps += (p, e)
         return start, accepting
+
+    def enter(self, x, sources, targets) -> Tuple[int, List[int]]:
+        """:meth:`wire` of ``x``, entered from ``sources``, its accepting states on into ``targets``."""
+        entry, accepting = self.wire(x)
+        eps = self.eps
+        for u in sources:
+            eps += (u, entry)
+        for q in accepting:
+            for t in targets:
+                eps += (q, t)
+        return entry, accepting
 
     def _wire_members(self, opening, closing, items, empty: bool) -> Tuple[int, List[int]]:
         """Two tracks of states between the members -- nothing written yet, or something (the next member then follows
         its ``later`` part, else its ``first``) -- through one copy of every value (see :func:`members`)."""
         k = len(items)
         none, some = [self.fresh() for _ in range(k + 1)], [self.fresh() for _ in range(k + 1)]
-
-        def enter(x, sources, targets):
-            entry, accepting = self.wire(x)
-            self.eps.extend((u, entry) for u in sources)
-            self.eps.extend((q, t) for q in accepting for t in targets)
-            return entry, accepting
-
+        eps, enter = self.eps, self.enter
         start, _ = enter(opening, [], [none[0]])
         for i, (first, later, value, required) in enumerate(items):
             v, done = self.wire(value)
             enter(first, [none[i]], [v])
             enter(later, [some[i]], [v])
-            self.eps.extend((q, some[i + 1]) for q in done)
+            for q in done:
+                eps += (q, some[i + 1])
             if not required:
-                self.eps += [(none[i], none[i + 1]), (some[i], some[i + 1])]
+                eps += (none[i], none[i + 1], some[i], some[i + 1])
         _, accepting = enter(closing, [some[k]] + ([none[k]] if empty else []), [])
         return start, accepting
 
     def build(self, start: int) -> ByteAutomaton:
         total = self.size + self.extra
-        distinct = {}                                           # (an automaton's copies: read once)
-        part = np.fromiter((distinct.setdefault(id(a), len(distinct)) for a in self.parts), dtype = np.int64, count = len(self.parts))
-        own = list({id(a): a for a in self.parts}.values())
+        ids = np.fromiter(map(id, self.parts), dtype = np.int64, count = len(self.parts))
+        _, first, part = np.unique(ids, return_index = True, return_inverse = True)         # (an automaton's copies: read once)
+        own = [self.parts[i] for i in first.tolist()]
         byte_class, cols = _joint(own)
         tables = np.concatenate([a._kept_table.ravel() for a in own])
         table_at = np.zeros(len(own) + 1, dtype = np.int64)
@@ -669,7 +681,7 @@ class _Joined:
         accept = np.zeros(total, dtype = np.bool_)
         accepting = np.asarray(self.accepting, dtype = np.int64)
         accept[np.where(accepting >= 0, accepting, self.size - 1 - accepting)] = True
-        pairs = np.asarray(self.eps, dtype = np.int64).reshape(-1, 2)
+        pairs = np.array(self.eps, dtype = np.int64).reshape(-1, 2)
         pairs = np.where(pairs >= 0, pairs, self.size - 1 - pairs)             # (placeholders after the parts)
         eps_ptr, eps = _csr(pairs[:, 0], pairs[:, 1].astype(np.int32), total)
         C = int(byte_class.max()) + 1

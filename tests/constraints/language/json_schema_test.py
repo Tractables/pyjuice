@@ -521,6 +521,25 @@ def test_the_quotient_of_the_trie_from_the_hashes():
         assert into.tolist() == np.bincount(np.asarray(list(got.values())), minlength = into.size).tolist()
 
 
+def test_a_schema_is_copied_as_deepcopy_copies_it():
+    """What is written twice stays one object, a cycle a cycle, anything not JSON copied; nothing of the copy is the schema's but what cannot be written to."""
+    import copy
+    import decimal
+    from pyjuice.constraints.language.json_schema import _copied
+    shared = {"type": "string", "enum": ["a", None, 1, 1.5, True]}
+    other = decimal.Decimal("1.5")
+    schema = {"a": shared, "b": [shared, {"c": shared}], "d": other, "e": (1, [2]), "f": [[]]}
+    schema["g"] = schema
+    got, want = _copied(schema, {}), copy.deepcopy(schema)
+    assert got["a"] is got["b"][0] is got["b"][1]["c"] and got["g"] is got
+    assert got["a"] is not shared and got["b"] is not schema["b"] and got["f"][0] is not schema["f"][0]
+    assert got["e"] == want["e"] and got["e"][1] is not schema["e"][1]
+    del got["g"], want["g"]
+    assert got == want
+    got["a"]["enum"].append(2)
+    assert shared["enum"] == ["a", None, 1, 1.5, True]
+
+
 def test_the_random_words():
     from pyjuice.constraints.language.backend import token_lift as T
     for S in (1, 100, T._KEPT_WORDS, T._KEPT_WORDS + 1):

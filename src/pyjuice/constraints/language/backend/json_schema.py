@@ -560,12 +560,7 @@ class _Compiler:
         n = len(entries)
         none, some, tail = [j.fresh() for _ in range(n + 1)], [j.fresh() for _ in range(n + 1)], j.fresh()
 
-        def enter(x, sources, targets):
-            entry, accepting = j.wire(x)
-            j.eps.extend((u, entry) for u in sources)
-            j.eps.extend((q, t) for q in accepting for t in targets)
-            return entry, accepting
-
+        enter = j.enter
         start, _ = enter(self.lit("{"), [], [none[0]])
         for i, (name, value) in enumerate(entries):
             first = A.concat(ws, self.lit(json.dumps(name, ensure_ascii = False)), self.sep(":", ws))
@@ -573,9 +568,10 @@ class _Compiler:
             v, done = j.wire(value)
             enter(first, [none[i]], [v])
             enter(later, [some[i]], [v])
-            j.eps.extend((q, some[i + 1]) for q in done)
+            for q in done:
+                j.eps += (q, some[i + 1])
             if name not in required:
-                j.eps += [(none[i], none[i + 1]), (some[i], some[i + 1])]
+                j.eps += (none[i], none[i + 1], some[i], some[i + 1])
         if extra is not None:                                   # members of the other names, after them
             member = A.force(A.concat(canon.other(self, "B"), self.sep(":", ws), extra))
             enter(A.concat(ws, member), [none[n]], [tail])

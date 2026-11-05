@@ -52,6 +52,7 @@ class ByteAutomaton:
         self.accept = np.asarray(accept, dtype = bool)
         self.minimal = bool(minimal)
         self.counted = None
+        self._accepting = None
 
     @property
     def delta(self) -> np.ndarray:
@@ -85,6 +86,13 @@ class ByteAutomaton:
         if self._table is None:
             self._classes()
         return self._byte_class
+
+    @property
+    def accepting_states(self) -> list:
+        """The accepting states, a list made on first use and not to be written to."""
+        if self._accepting is None:
+            self._accepting = np.nonzero(self.accept)[0].tolist()
+        return self._accepting
 
     @property
     def num_states(self) -> int:

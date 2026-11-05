@@ -132,10 +132,31 @@ def _unsupported_reason(pattern: str, err: Exception) -> str:
     return why if why is not None else f"{type(err).__name__}: {err}"
 
 
+def _copied(x: Any, memo: Dict[int, Any]) -> Any:
+    """What ``copy.deepcopy`` makes of JSON (what is written twice in it, once), and at a third of its cost; of anything else, the same."""
+    kind = type(x)
+    if kind is str or kind is int or kind is bool or kind is float or x is None:
+        return x
+    if kind is dict:
+        out = memo.get(id(x))
+        if out is None:
+            out = memo[id(x)] = {}
+            for k, v in x.items():
+                out[k] = _copied(v, memo)
+        return out
+    if kind is list:
+        out = memo.get(id(x))
+        if out is None:
+            out = memo[id(x)] = []
+            out += [_copied(v, memo) for v in x]
+        return out
+    return copy.deepcopy(x)
+
+
 def _prepare(schema: Dict[str, Any]) -> Dict[str, Any]:
     """The schema as the converter is to get it (a copy: patterns rewritten, objects of annotations only emptied), or
     :class:`ValueError` with where and why it is refused (see the module docstring)."""
-    root = copy.deepcopy(schema)
+    root = _copied(schema, {})
     rewritten, sound = set(), set()
 
     def resolve(ref: str, where: str):
@@ -285,7 +306,7 @@ class JSONSchema(_Text):
         super().__init__(vocabulary, eos_padding)
         self._prepared = _prepare(schema)
         _checked(whitespace)
-        self._schema = copy.deepcopy(schema)
+        self._schema = _copied(schema, {})
         self._whitespace = whitespace
         self._bytes = None
 
