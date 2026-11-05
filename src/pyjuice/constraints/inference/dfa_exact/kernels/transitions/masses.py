@@ -6,11 +6,13 @@ per sample.
 import math
 from dataclasses import dataclass
 from typing import Optional
+
 import torch
 import triton.language as tl
 
 from pyjuice.utils.kernel_launcher import triton_jit
 from pyjuice.utils.util import host_cdiv, host_next_power_of_2
+
 from .....distributions.categorical import _exact_dot
 from ..common import _next_col_of, grid_chunks
 

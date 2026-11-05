@@ -7,11 +7,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any, Optional
+
 import torch
 import triton
 import triton.language as tl
 
 from pyjuice.utils.kernel_launcher import triton_jit
+
 from ..common import _child, _interval, _logaddexp_tile, _lse_step
 from ..compact import _lane
 from ..prod.launches import _lse_value

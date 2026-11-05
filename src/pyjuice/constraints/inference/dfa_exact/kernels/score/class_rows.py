@@ -6,12 +6,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any, Optional
+
 import torch
 import triton
 import triton.language as tl
 
 from pyjuice.utils.kernel_launcher import triton_jit
 from pyjuice.utils.util import host_cdiv, host_next_power_of_2
+
 from ..common import _next_col
 from ..sum.tile_rules import _num_sms
 

@@ -3,11 +3,13 @@ The dense sum's top-down pass, for a batch at once or a sample at a time; the ro
 """
 
 from typing import Optional
+
 import torch
 import triton.language as tl
 
 from pyjuice.utils.kernel_launcher import triton_jit
 from pyjuice.utils.util import host_cdiv
+
 from ...external_params.block_scale import sample_weights
 from .dense_common import (_EW_TILE, _bf16_products, _bf16_weights, _live_shifted_exp, _log_accumulate_kernel,
                            _log_add_kernel, _log_scatter_accumulate_kernel, _log_scatter_kernel, _matmul_precision,

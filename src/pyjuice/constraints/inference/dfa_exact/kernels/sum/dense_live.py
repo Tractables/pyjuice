@@ -6,6 +6,7 @@ kernel fused (``c/dense_live_mma.cu``), the tuner's choice.
 import torch
 
 from pyjuice.utils.util import host_cdiv, host_next_power_of_2
+
 from .dense_common import (_EW_TILE, _bf16_weights, _live_shifted_exp, _log_scatter_accumulate_kernel,
                            _log_scatter_kernel, _matmul_precision, _products)
 

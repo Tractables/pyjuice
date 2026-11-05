@@ -8,6 +8,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 import os
+
 import numpy as np
 import torch
 import triton
@@ -16,6 +17,7 @@ from triton.language.extra.cuda import gdc_wait
 
 from pyjuice.utils.kernel_launcher import triton_jit
 from pyjuice.utils.util import host_cdiv
+
 from ..common import (pack_aligned, _block_ptr, _exit_width, _interval, _next_col, _logaddexp_tile, _slot, _tile_rows,
                       node_groups, node_tiles)
 from ..prod.launches import _lse_step_one_exp

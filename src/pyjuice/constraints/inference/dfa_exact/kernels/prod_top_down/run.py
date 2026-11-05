@@ -5,10 +5,12 @@ The launches of a query's top-down product steps: their tiles, the tuner's choic
 from __future__ import annotations
 
 from typing import Optional
+
 import torch
 
 from pyjuice.layer.kernels import autotune
 from pyjuice.utils.util import host_cdiv, host_next_power_of_2
+
 from ..common import NODE_TILE, SUM, grid_chunks, tensor, pdl_launch
 from ..transitions import enumerated_args
 from ..prod import compact_tiles

@@ -4,9 +4,11 @@ The CUDA forms of the fused sum, both directions (``c/fused_sum.cu``): when they
 
 import hashlib
 from typing import Optional
+
 import torch
 
 from pyjuice.utils.util import host_cdiv
+
 from . import tile_rules
 from .tile_rules import _num_sms, pre_buffer, split_buffer
 

@@ -5,6 +5,7 @@ A class's weight to its tokens' scores: the kernels of a next-token distribution
 from __future__ import annotations
 
 from typing import Optional
+
 import torch
 import triton
 import triton.language as tl
@@ -12,6 +13,7 @@ import triton.language as tl
 from pyjuice.constraints.distributions import find_token
 from pyjuice.utils.kernel_launcher import triton_jit
 from pyjuice.utils.util import host_cdiv, host_next_power_of_2
+
 from ..common import _lse_step, _tf32_operand
 from ..sum.tile_rules import _num_sms
 

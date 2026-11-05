@@ -7,6 +7,7 @@ import triton.language as tl
 from triton.language.extra.cuda import gdc_wait
 
 from pyjuice.utils.kernel_launcher import triton_jit
+
 from ..common import _block_ptr, _child, _exit_width, _interval, _lse_step, _next_col
 from ..compact import _operand_slot
 from .launches import _fresh_tile, _lane_rows, _lse_step_one_exp, _lse_value, _out_count, _out_lanes, _out_ptr

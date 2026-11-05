@@ -5,11 +5,13 @@ scattered, the weights a query reads and their products.
 
 import contextlib
 from typing import Optional
+
 import torch
 import triton.language as tl
 
 from pyjuice.utils.kernel_launcher import triton_jit
 from pyjuice.utils.util import host_cdiv
+
 from ..common import _logaddexp_tile
 
 

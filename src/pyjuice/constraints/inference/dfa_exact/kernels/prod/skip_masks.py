@@ -5,6 +5,7 @@ Which (output tile, shared chunk) pairs a ``block @ block`` step can skip, from 
 import math
 from dataclasses import dataclass
 from typing import Sequence, Tuple
+
 import numpy as np
 import torch
 

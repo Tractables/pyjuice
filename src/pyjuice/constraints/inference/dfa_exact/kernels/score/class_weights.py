@@ -5,9 +5,11 @@ The class weights of a query's boundaries: the walks and rows they take, and the
 from __future__ import annotations
 
 from typing import Optional
+
 import torch
 
 from pyjuice.utils.util import host_cdiv, host_next_power_of_2
+
 from ..common import IDENTITY, NODE_TILE, grid_chunks, tensor, pdl_launch
 from ..c import get_class_weights_module
 from .class_rows import ClassWeightRows

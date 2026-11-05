@@ -8,6 +8,7 @@ import triton
 import triton.language as tl
 
 from pyjuice.utils.kernel_launcher import triton_jit
+
 from ..common import _block_ptr, _child, _exit_width, _interval, _logaddexp_tile, _lse_step, _slot, _tf32_operand
 from ..prod.block_block import _chunk_needed, _rect_product, _rect_product_exact, _tile_load
 from ..prod.launches import _lse_value

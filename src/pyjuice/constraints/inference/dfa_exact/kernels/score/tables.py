@@ -5,6 +5,7 @@ What every scoring kernel reads: a program's tables by class (:class:`ScoreTable
 from __future__ import annotations
 
 from dataclasses import dataclass
+
 import numpy as np
 import torch
 

@@ -211,7 +211,7 @@ def test_the_token_lift_of_a_minimal_automaton_over_every_byte_is_minimal(monkey
     """Every byte a token and the byte automaton minimal: the lift walks its states apart and needs no minimization
     -- the same DFA as the walk from the initial state minimized, with the padding (merged into the state accepting
     the empty text alone, where there is one) and without."""
-    from pyjuice.constraints.language.backend import automata as A, byte_level
+    from pyjuice.constraints.language.backend import automata as A, token_lift
     from pyjuice.constraints.language.backend.json_schema import compile_schema
     from pyjuice.constraints.language.json_schema import _prepare
     automata = [compile_schema(_prepare(s), r"[ ]?") for s in (PERSON, POINTS, KIND, {"type": "string"})]
@@ -222,20 +222,20 @@ def test_the_token_lift_of_a_minimal_automaton_over_every_byte_is_minimal(monkey
         assert a.minimal
         for eos in (True, False):
             with monkeypatch.context() as m:
-                m.setattr(byte_level, "_byte_complete", lambda trie: False)
-                slow = byte_level.to_tokens(a, VOCAB, eos)
+                m.setattr(token_lift, "_byte_complete", lambda trie: False)
+                slow = token_lift.to_tokens(a, VOCAB, eos)
             for n in sorted({1, 2, 3, threads}):                # (walkers fewer than states: each takes several)
                 numba.set_num_threads(min(n, threads))
                 try:
-                    fast = byte_level.to_tokens(a, VOCAB, eos)
+                    fast = token_lift.to_tokens(a, VOCAB, eos)
                     assert fast == slow and fast.num_states == slow.num_states, (a.num_states, eos, n)
                     for first, serial, in_threads in ((256, 1 << 12, 1 << 24), (1, 1 << 12, 1 << 24), (1, 0, 1 << 24), (2, 0, 0)):
                         with monkeypatch.context() as m:               # (no walk first: all by the checks)
-                            m.setattr(byte_level, "SERIAL_STEPS", 0)
-                            m.setattr(byte_level, "FIRST_CHECKS", first)
-                            m.setattr(byte_level, "SERIAL_CHECKS", serial)
-                            m.setattr(byte_level, "WALKS_IN_THREADS", in_threads)
-                            walked = byte_level.to_tokens(a, VOCAB, eos)
+                            m.setattr(token_lift, "SERIAL_STEPS", 0)
+                            m.setattr(token_lift, "FIRST_CHECKS", first)
+                            m.setattr(token_lift, "SERIAL_CHECKS", serial)
+                            m.setattr(token_lift, "WALKS_IN_THREADS", in_threads)
+                            walked = token_lift.to_tokens(a, VOCAB, eos)
                         assert walked == slow and walked.num_states == slow.num_states, (a.num_states, eos, n, first)
                 finally:
                     numba.set_num_threads(threads)
@@ -245,7 +245,7 @@ def test_the_checks_on_a_quotient_of_the_trie_tell_tokens_apart_as_every_walk_do
     """Random minimal byte automata, random tokens over all 256 bytes: tokens are one class exactly if they lead every
     state to one state, however few states have walked and with threads or without -- every token walked from every state
     here -- and the DFA is the one every walk gives."""
-    from pyjuice.constraints.language.backend import automata as A, byte_level
+    from pyjuice.constraints.language.backend import automata as A, token_lift
     rng = np.random.default_rng(0)
     for case in range(60):
         C = int(rng.integers(2, 8))
@@ -269,16 +269,16 @@ def test_the_checks_on_a_quotient_of_the_trie_tell_tokens_apart_as_every_walk_do
                 column.append(q)
             classes.append(first.setdefault(tuple(column), len(first)))
         with monkeypatch.context() as m:
-            m.setattr(byte_level, "_byte_complete", lambda trie: False)
-            slow = byte_level.to_tokens(a, vocabulary, False)
+            m.setattr(token_lift, "_byte_complete", lambda trie: False)
+            slow = token_lift.to_tokens(a, vocabulary, False)
         for steps, first_checks, serial, in_threads in ((1 << 19, 256, 1 << 12, 1 << 24), (0, 1, 1 << 12, 1 << 24), (1, 3, 0, 1 << 24),
                                                         (0, 2, 0, 0), (40, 1, 1 << 12, 1)):
             with monkeypatch.context() as m:
-                m.setattr(byte_level, "SERIAL_STEPS", steps)
-                m.setattr(byte_level, "FIRST_CHECKS", first_checks)
-                m.setattr(byte_level, "SERIAL_CHECKS", serial)
-                m.setattr(byte_level, "WALKS_IN_THREADS", in_threads)
-                dfa = byte_level.to_tokens(a, vocabulary, False)
+                m.setattr(token_lift, "SERIAL_STEPS", steps)
+                m.setattr(token_lift, "FIRST_CHECKS", first_checks)
+                m.setattr(token_lift, "SERIAL_CHECKS", serial)
+                m.setattr(token_lift, "WALKS_IN_THREADS", in_threads)
+                dfa = token_lift.to_tokens(a, vocabulary, False)
             assert dfa == slow and dfa.num_states == slow.num_states, (case, steps, first_checks)
             if a.num_states > 1:                                # (else no state but the dead one: no walk)
                 got = dfa.token_class.tolist()

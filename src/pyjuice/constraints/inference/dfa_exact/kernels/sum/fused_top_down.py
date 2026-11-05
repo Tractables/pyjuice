@@ -3,12 +3,14 @@ The fused sum's top-down pass: a parent's value and its gates, an edge's weight 
 """
 
 from typing import Optional
+
 import torch
 import triton
 import triton.language as tl
 
 from pyjuice.utils.kernel_launcher import triton_jit
 from pyjuice.utils.util import host_cdiv, host_next_power_of_2
+
 from ...external_params.block_scale import _add_gated_parent, _node_log_z, _row_gates, _tile_gates
 from ..common import _logaddexp_tile, _tf32_operand, grid_chunks
 from . import tile_rules

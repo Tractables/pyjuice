@@ -4,11 +4,13 @@ log-sum-exp, a sample's columns, a launch's gates.
 """
 
 from typing import Optional
+
 import torch
 import triton
 import triton.language as tl
 
 from pyjuice.utils.util import host_next_power_of_2
+
 from ...external_params.block_scale import _row_gates, _segment_cell
 from ..common import _tf32_operand
 from ..compact import _lane_sample

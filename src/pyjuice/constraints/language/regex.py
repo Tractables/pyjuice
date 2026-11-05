@@ -26,7 +26,8 @@ from typing import Optional
 import torch
 
 from .base import Constraint, Matcher, Tokens
-from .backend.byte_level import ByteAutomaton, to_tokens, widened
+from .backend.byte_level import ByteAutomaton
+from .backend.token_lift import to_tokens, widened
 from .backend.patterns import byte_automaton, parse
 from .dfa import DFA
 from .vocabulary import Vocabulary

@@ -137,8 +137,8 @@ class DFAExactDecoder(Decoder):
 
     ``memory_budget``: the bytes the inside values the session keeps once -- those of scopes no sample observes,
     computed once and read by every call: decoding left to right, the suffixes after the prefix -- may take
-    (:class:`~pyjuice.constraints.inference.dfa_exact.state.PriorPool`). None: all of them when their total fits the
-    free device memory, else :data:`~pyjuice.constraints.inference.dfa_exact.state.PRIOR_MEMORY_SHARE` of that
+    (:class:`~pyjuice.constraints.inference.dfa_exact.prior_pool.PriorPool`). None: all of them when their total fits the
+    free device memory, else :data:`~pyjuice.constraints.inference.dfa_exact.prior_pool.PRIOR_MEMORY_SHARE` of that
     memory. Below their total, the values a call reads are kept and the others evicted and
     computed again when read: left to right, every segment of the suffixes is computed once as decoding enters it
     (about one forward pass more a session) -- the answers the same, bit for bit.

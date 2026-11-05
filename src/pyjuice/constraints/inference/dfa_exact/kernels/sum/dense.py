@@ -4,9 +4,11 @@ a matrix product and the log taken back (see :mod:`pyjuice.constraints.inference
 """
 
 from typing import Optional
+
 import torch
 
 from pyjuice.utils.util import host_cdiv
+
 from .dense_common import _EW_TILE, _bf16_products, _log_add_kernel, _matmul_precision, _products, _shifted_exp_kernel
 from .dense_live import _dense_sum_live
 

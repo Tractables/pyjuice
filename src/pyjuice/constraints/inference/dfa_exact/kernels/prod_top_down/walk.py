@@ -5,6 +5,7 @@ The top-down ``input @ block`` kernel in CUDA (``c/walk.cu``): when it is taken,
 from __future__ import annotations
 
 from typing import Optional
+
 import numpy as np
 import torch
 

@@ -4,12 +4,14 @@ The fused forward sum: an online log-sum-exp over chunks of children, the produc
 """
 
 from typing import Optional
+
 import torch
 import triton
 import triton.language as tl
 
 from pyjuice.utils.kernel_launcher import triton_jit
 from pyjuice.utils.util import host_cdiv, host_next_power_of_2
+
 from ...external_params.block_scale import _chunk_gates, _edge_gates, _node_log_z
 from ..common import _child, _tf32_operand, grid_chunks
 from . import tile_rules

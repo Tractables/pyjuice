@@ -289,7 +289,7 @@ def test_random_patterns_as_python_reads_them():
 def test_the_trie_of_a_vocabulary():
     """The tables of a vocabulary's byte trie are those of a trie built by hand: every node's children by increasing
     byte, numbered breadth-first, the tokens ending at it ascending; only tokens with nonempty text."""
-    from pyjuice.constraints.language.backend.byte_level import _trie
+    from pyjuice.constraints.language.backend.token_lift import _trie
     rng = random.Random(0)
     tokens = [bytes(rng.randrange(256) if rng.random() < 0.1 else rng.choice(b"abc") for _ in range(rng.randint(0, 5)))
               for _ in range(300)] + [None, b"", b"abc", b"abc"]

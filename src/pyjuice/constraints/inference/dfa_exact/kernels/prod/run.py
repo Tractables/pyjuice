@@ -4,8 +4,8 @@ The launches of a query's product steps: their tiles, the tuner's choices among 
 
 from pyjuice.layer.kernels import autotune
 from pyjuice.utils.util import host_cdiv, host_next_power_of_2
-from ..common import grid_chunks
-from ..common import pdl_launch
+
+from ..common import grid_chunks, pdl_launch
 from ..transitions import enumerated_args
 from .block_block import EXACT_BELOW, _block_block_compact_kernel, _block_block_kernel, _copy_kernel, compact_tiles
 from .input_block import _block_input_kernel, _input_block_group_kernel, _input_block_kernel

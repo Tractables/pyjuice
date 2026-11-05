@@ -6,6 +6,7 @@ or by class, the enumerated tokens.
 import weakref
 from dataclasses import dataclass
 from typing import Optional, Tuple
+
 import numpy as np
 import torch
 

@@ -57,8 +57,9 @@ import torch
 from numba import njit
 
 from ...compiled.program import TRANS_COLS
-from .planners import IndexLists, _forward_steps, _mode_workspace, _top_down_modes, _top_down_steps, _top_down_tables, \
-    class_weight_writes, cut_parts, cut_sizes, forward_sizes
+from .planners.cuts import IndexLists, cut_parts, cut_sizes
+from .planners.forward import _forward_steps, forward_sizes
+from .planners.top_down import _mode_workspace, _top_down_modes, _top_down_steps, _top_down_tables, class_weight_writes
 
 
 #: query plans a Program keeps (the most recently used): at least this many, and at least ``PLANS_PER_POSITION`` per
