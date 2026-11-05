@@ -31,8 +31,8 @@ from .dfa import _column_classes, minimal_moves, moves_of_table, product_bfs
 # -------------------------------------------------------------------------------------------------
 
 def _joint(parts: Sequence[ByteAutomaton]) -> Tuple[np.ndarray, List[np.ndarray]]:
-    """``(byte_class, columns)``: the bytes none of ``parts`` tells apart -- the coarsest common refinement of their
-    classes, numbered by their smallest byte -- and the class every part has for each of them."""
+    """``(byte_class, columns)``: the bytes none of ``parts`` (one each, whatever their copies) tells apart -- the coarsest
+    common refinement of their classes, numbered by their smallest byte -- and the class every part has for each of them."""
     if len(parts) == 1:
         return parts[0].byte_class, [np.arange(parts[0].table.shape[1], dtype = np.int64)]
     classes = np.ascontiguousarray(np.stack([a.byte_class for a in parts]))
@@ -97,15 +97,17 @@ def epsilon() -> ByteAutomaton:
     return literal(b"")
 
 
+@lru_cache(maxsize = 4096)
 def literal(data: bytes) -> ByteAutomaton:
-    """The text ``data`` alone (any bytes)."""
+    """The text ``data`` alone (any bytes); the texts read last are kept (an automaton is not written to)."""
     n = len(data)
     delta = np.full((n + 2, 256), n + 1, dtype = np.int32)
     for i, b in enumerate(data):
         delta[i, b] = i + 1
     accept = np.zeros(n + 2, dtype = bool)
     accept[n] = True
-    return ByteAutomaton(delta, 0, accept, n + 1)
+    byte_class, first = _column_classes(delta)                  # (kept: the classes alone, not a row of 256 per byte)
+    return ByteAutomaton(None, 0, accept, n + 1, table = delta[:, first], byte_class = byte_class)
 
 
 def byte_ranges(ranges: Sequence[Tuple[int, int]]) -> ByteAutomaton:
@@ -329,34 +331,61 @@ def _subsets(edge_ptr, edge_class, edge_dst, eps_ptr, eps_dst, accept, start, C)
 
 
 @njit(cache = True)
-def _count_moves(table, dead, cols):
-    """int64 [states]: the moves of every state (its dead state's none, nor those into it), over the joint classes
-    ``cols`` reads."""
-    K = table.shape[0]
-    C = cols.shape[0]
-    out = np.zeros(K, dtype = np.int64)
-    for q in range(K):
-        n = 0
-        for j in range(C):
-            if table[q, cols[j]] != dead:
-                n += 1
-        out[q] = n
-    return out
-
-
-@njit(cache = True)
-def _fill_moves(table, dead, cols, first, edge_ptr, edge_class, edge_dst):
-    """:func:`_count_moves`' moves in their places (``first``: the number of the table's first state)."""
-    K = table.shape[0]
-    C = cols.shape[0]
-    for q in range(K):
-        at = edge_ptr[first + q]
-        for j in range(C):
-            t = table[q, cols[j]]
-            if t != dead:
-                edge_class[at] = j
-                edge_dst[at] = t + first
-                at += 1
+def _moves_of_parts(tables, table_at, states, dead, cols, part, first, N):
+    """
+    The moves of automata side by side, as CSR over ``N`` states: ``(edge_ptr, edge_class, edge_dst)``. Distinct automata
+    ``u``: a table of ``states[u]`` rows at ``tables[table_at[u]:table_at[u + 1]]``, its ``dead`` state without moves and no
+    move into it, the class ``cols[u, j]`` it has for joint class ``j``. Its copies ``i``: ``part[i]`` the automaton, ``first[i]``
+    the number of its first state. Every automaton's moves are read once.
+    """
+    U = states.shape[0]
+    J = cols.shape[1]
+    state_at = np.zeros(U + 1, dtype = np.int64)                # (one automaton's states after another's)
+    for u in range(U):
+        state_at[u + 1] = state_at[u] + states[u]
+    ptr = np.zeros(state_at[U] + 1, dtype = np.int64)
+    for u in range(U):
+        at, K, C = table_at[u], states[u], (table_at[u + 1] - table_at[u]) // max(states[u], 1)
+        for q in range(K):
+            n = 0
+            for j in range(J):
+                if tables[at + q * C + cols[u, j]] != dead[u]:
+                    n += 1
+            ptr[state_at[u] + q + 1] = n
+    for x in range(state_at[U]):
+        ptr[x + 1] += ptr[x]
+    own_class = np.empty(ptr[state_at[U]], dtype = np.int32)
+    own_dst = np.empty(ptr[state_at[U]], dtype = np.int32)
+    fill = 0
+    for u in range(U):
+        at, K, C = table_at[u], states[u], (table_at[u + 1] - table_at[u]) // max(states[u], 1)
+        for q in range(K):
+            for j in range(J):
+                t = tables[at + q * C + cols[u, j]]
+                if t != dead[u]:
+                    own_class[fill], own_dst[fill] = j, t
+                    fill += 1
+    edge_ptr = np.zeros(N + 1, dtype = np.int64)
+    total = 0
+    for i in range(part.shape[0]):
+        u = part[i]
+        base = state_at[u]
+        for q in range(states[u]):
+            edge_ptr[first[i] + q + 1] = ptr[base + q + 1] - ptr[base + q]
+            total += ptr[base + q + 1] - ptr[base + q]
+    for x in range(N):
+        edge_ptr[x + 1] += edge_ptr[x]
+    edge_class = np.empty(total, dtype = np.int32)
+    edge_dst = np.empty(total, dtype = np.int32)
+    for i in range(part.shape[0]):
+        u = part[i]
+        base = state_at[u]
+        at = edge_ptr[first[i]]
+        for k in range(ptr[base], ptr[base + states[u]]):
+            edge_class[at] = own_class[k]
+            edge_dst[at] = own_dst[k] + first[i]
+            at += 1
+    return edge_ptr, edge_class, edge_dst
 
 
 def _csr(src: np.ndarray, dst: np.ndarray, total: int) -> Tuple[np.ndarray, np.ndarray]:
@@ -497,22 +526,24 @@ class _Joined:
 
     def build(self, start: int) -> ByteAutomaton:
         total = self.size + self.extra
-        num = lambda q: q if q >= 0 else self.size - 1 - q    # placeholders after the parts
-        byte_class, cols = _joint(self.parts)
-        edge_ptr = np.zeros(total + 1, dtype = np.int64)
-        edge_ptr[1:self.size + 1] = np.concatenate([_count_moves(a.table, a.dead, c) for a, c in zip(self.parts, cols)])
-        np.cumsum(edge_ptr, out = edge_ptr)
-        edge_class = np.empty(int(edge_ptr[-1]), dtype = np.int32)
-        edge_dst = np.empty(int(edge_ptr[-1]), dtype = np.int32)
-        for a, c, first in zip(self.parts, cols, self.offsets):
-            _fill_moves(a.table, a.dead, c, first, edge_ptr, edge_class, edge_dst)
+        distinct = {}                                           # (an automaton's copies: read once)
+        part = np.fromiter((distinct.setdefault(id(a), len(distinct)) for a in self.parts), dtype = np.int64, count = len(self.parts))
+        own = list({id(a): a for a in self.parts}.values())
+        byte_class, cols = _joint(own)
+        tables = np.concatenate([a.table.ravel() for a in own])
+        table_at = np.zeros(len(own) + 1, dtype = np.int64)
+        np.cumsum([a.table.size for a in own], out = table_at[1:])
+        edge_ptr, edge_class, edge_dst = _moves_of_parts(tables, table_at, np.asarray([a.num_states for a in own], dtype = np.int64),
+                                                         np.asarray([a.dead for a in own], dtype = np.int64), np.stack(cols).astype(np.int64),
+                                                         part, np.asarray(self.offsets, dtype = np.int64), total)
         accept = np.zeros(total, dtype = np.bool_)
-        accept[[num(q) for q in self.accepting]] = True
-        src = np.array([num(u) for u, _ in self.eps], dtype = np.int64)
-        dst = np.array([num(v) for _, v in self.eps], dtype = np.int32)
-        eps_ptr, eps = _csr(src, dst, total)
+        accepting = np.asarray(self.accepting, dtype = np.int64)
+        accept[np.where(accepting >= 0, accepting, self.size - 1 - accepting)] = True
+        pairs = np.asarray(self.eps, dtype = np.int64).reshape(-1, 2)
+        pairs = np.where(pairs >= 0, pairs, self.size - 1 - pairs)             # (placeholders after the parts)
+        eps_ptr, eps = _csr(pairs[:, 0], pairs[:, 1].astype(np.int32), total)
         C = int(byte_class.max()) + 1
-        ptr, cls, moved, acc = _subsets(edge_ptr, edge_class, edge_dst, eps_ptr, eps, accept, num(start), C)
+        ptr, cls, moved, acc = _subsets(edge_ptr, edge_class, edge_dst, eps_ptr, eps, accept, start if start >= 0 else self.size - 1 - start, C)
         return _from_moves(ptr, cls, moved, 1, acc, C, byte_class)
 
 

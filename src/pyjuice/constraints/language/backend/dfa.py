@@ -19,7 +19,7 @@ def bfs_order(delta, initial):
     order[0] = initial
     seen[initial] = True
     num, head = 1, 0
-    while head < num:
+    while head < num and num < K:                               # (every state found: the order is known)
         q = order[head]
         head += 1
         for c in range(C):

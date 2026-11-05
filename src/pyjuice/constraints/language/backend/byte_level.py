@@ -71,18 +71,19 @@ class ByteAutomaton:
         return self._delta
 
     def _classes(self):
-        if self._table is None:
-            self._byte_class, first = _column_classes(self._delta)
-            self._table = np.ascontiguousarray(self._delta[:, first])
+        self._byte_class, first = _column_classes(self._delta)
+        self._table = np.ascontiguousarray(self._delta[:, first])
 
     @property
     def table(self) -> np.ndarray:
-        self._classes()
+        if self._table is None:
+            self._classes()
         return self._table
 
     @property
     def byte_class(self) -> np.ndarray:
-        self._classes()
+        if self._table is None:
+            self._classes()
         return self._byte_class
 
     @property
