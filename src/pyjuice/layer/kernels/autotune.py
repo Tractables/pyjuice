@@ -24,12 +24,18 @@ Contract at every call site:
     be redirected to a scratch buffer (see `scratch_like`).
 
 Cost: the benchmark runs once per key and pays one Triton compile per candidate config (cached on
-disk by Triton across processes), i.e. it lands in the first iteration's warmup.
+disk by Triton across processes), i.e. it lands in the first iteration's warmup. The winners are kept
+on disk too, per GPU model and version of the code (`_Store`): the next process of a machine starts
+from them, so it neither measures them again nor can come to another answer.
 """
 
+import ast
+import hashlib
+import json
 import os
 import warnings
 import torch
+import triton
 from triton.runtime.errors import OutOfResources
 from typing import Optional
 
@@ -160,6 +166,166 @@ def best_of(candidates: list, warmup: int = 3, reps: int = 7, margin: Optional[f
 # Process-wide cache of tuned configs, keyed by SHAPE -- see `pick`.
 _CACHE = dict()
 
+# Whether winners are kept on disk (`_Store`), and where; settable with PYJUICE_AUTOTUNE_PERSIST=0 and
+# PYJUICE_AUTOTUNE_DIR. Read when first needed.
+PERSIST_ENV, DIR_ENV = "PYJUICE_AUTOTUNE_PERSIST", "PYJUICE_AUTOTUNE_DIR"
+
+# The files of other versions of the code kept beside a new one, the newest (every edit makes a version).
+KEPT_VERSIONS = 16
+
+
+def _source_digest() -> str:
+    """A digest of the package's sources: what candidates a key offers, and what they run, follows from them."""
+    root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    digest = hashlib.blake2b(digest_size = 16)
+    for folder, subfolders, files in os.walk(root):
+        subfolders[:] = sorted(d for d in subfolders if d != "__pycache__")
+        for name in sorted(files):
+            if name.endswith((".py", ".cu", ".cuh", ".h", ".cpp")):
+                path = os.path.join(folder, name)
+                digest.update(os.path.relpath(path, root).encode())
+                with open(path, "rb") as f:
+                    digest.update(f.read())
+    return digest.hexdigest()
+
+
+def _key_text(key) -> Optional[str]:
+    """`key` as text that reads the same in any process, or None if it holds something that has no such text: a tuple
+    of plain values, dtypes, and kernels and functions by their names."""
+    if isinstance(key, tuple):
+        parts = [_key_text(k) for k in key]
+        return None if None in parts else "(" + ",".join(parts) + ")"
+    if key is None or isinstance(key, (bool, int, float, str, torch.dtype)):
+        return repr(key)
+    fn = getattr(key, "fn", getattr(getattr(key, "jit_fn", None), "fn", key))    # (a Triton kernel's, or a plain function)
+    module, name = getattr(fn, "__module__", None), getattr(fn, "__qualname__", None)
+    return None if module is None or name is None else f"{module}.{name}"
+
+
+def _is_literal(value) -> bool:
+    """Whether `value` reads back from its `repr` as itself."""
+    if isinstance(value, (tuple, list)):
+        return all(_is_literal(v) for v in value)
+    return value is None or isinstance(value, (bool, int, float, str))
+
+
+class _Store:
+    """
+    The winners of earlier processes for one GPU model and version of the code: a file of one JSON line per winner,
+    ``[key text, repr of the choice]``, only ever appended to (one short write, so that processes side by side can share
+    it: a line cut short by a crash is passed over, the last line of a key counts). Nothing in it is run: choices are read
+    as Python literals. What a choice depends on but its key's shape names the file: the sources (:func:`_source_digest`:
+    a candidate of another version may not exist any more), the GPU, torch and Triton. A file that cannot be read or
+    written is no error: its winners are measured again.
+    """
+
+    def __init__(self, directory: str, device: int):
+        name = "|".join((_source_digest(), torch.cuda.get_device_name(device), torch.__version__, triton.__version__))
+        self.directory = directory
+        self.path = os.path.join(directory, hashlib.blake2b(name.encode(), digest_size = 16).hexdigest() + ".jsonl")
+        self.choices = dict()
+        try:
+            with open(self.path) as f:
+                for line in f:
+                    try:
+                        text, choice = json.loads(line)
+                    except ValueError:
+                        continue
+                    self.choices[text] = choice
+        except OSError:
+            pass
+
+    def get(self, key):
+        """The choice kept for `key` (without the device), or None."""
+        text = _key_text(key)
+        choice = None if text is None else self.choices.get(text)
+        if choice is None:
+            return None
+        try:
+            return ast.literal_eval(choice)
+        except (ValueError, SyntaxError):
+            return None
+
+    def add(self, key, choice) -> None:
+        text = _key_text(key)
+        if text is None or not _is_literal(choice):
+            return
+        self.choices[text] = repr(choice)
+        try:
+            fresh = not os.path.exists(self.path)
+            if fresh:
+                os.makedirs(self.directory, exist_ok = True)
+            with open(self.path, "a") as f:
+                f.write(json.dumps([text, repr(choice)]) + "\n")
+            if fresh:
+                self._prune()
+        except OSError:
+            pass
+
+    def _prune(self) -> None:
+        """Only the newest files of other versions stay."""
+        paths = [os.path.join(self.directory, name) for name in os.listdir(self.directory) if name.endswith(".jsonl")]
+        for path in sorted(paths, key = os.path.getmtime)[:-KEPT_VERSIONS]:
+            os.remove(path)
+
+    def forget(self) -> None:
+        self.choices.clear()
+        try:
+            os.remove(self.path)
+        except OSError:
+            pass
+
+
+# Per device number; the keys of this process already looked up in them; whether a store opened from now on is to forget
+# what it has (`set_autotune`).
+_STORES = dict()
+_LOOKED_UP = set()
+_FORGET = False
+
+
+def _store(device: int) -> Optional[_Store]:
+    """The :class:`_Store` of a device, or None if keeping winners is off."""
+    if os.environ.get(PERSIST_ENV, "1") == "0":
+        return None
+    store = _STORES.get(device)
+    if store is None:
+        cache = os.environ.get("XDG_CACHE_HOME") or os.path.join(os.path.expanduser("~"), ".cache")
+        store = _STORES[device] = _Store(os.environ.get(DIR_ENV) or os.path.join(cache, "pyjuice", "autotune"), device)
+        if _FORGET:
+            store.forget()
+    return store
+
+
+def _known(key):
+    """The choice for `key` (with its device) of this process or, from now on this process's too, of an earlier one. The
+    file is looked at once a key, however often a launch that never tunes asks."""
+    choice = _CACHE.get(key)
+    if choice is None and key not in _LOOKED_UP:
+        _LOOKED_UP.add(key)
+        store = _store(key[0])
+        if store is not None:
+            choice = store.get(key[1])
+            if choice is not None:
+                _CACHE[key] = choice
+    return choice
+
+
+def _from_store(key, offered: list):
+    """:func:`_known` for a key not in this process's choices, if the choice kept is one of those `offered`."""
+    choice = _known(key)
+    if choice is not None and choice not in offered:
+        del _CACHE[key]
+        return None
+    return choice
+
+
+def _keep(key, choice) -> None:
+    """`choice`, just measured for `key`, for this process and the next."""
+    _CACHE[key] = choice
+    store = _store(key[0])
+    if store is not None:
+        store.add(key[1], choice)
+
 
 def _full_key(key):
     return (torch.cuda.current_device(), key)
@@ -168,12 +334,18 @@ def _full_key(key):
 def set_autotune(enabled: bool = True, clear_cache: bool = False):
     """Enable or disable launch-config autotuning process-wide; returns the previous setting.
 
-    Choices already measured stay cached (and keep being used) unless `clear_cache` is set.
+    Choices already measured stay cached (and keep being used) unless `clear_cache` is set, which also forgets what is
+    kept on disk for this process's devices: they are measured again. Off, a choice kept on disk is not read either, but
+    for the gates of `choose`, which always measure.
     """
-    global ENABLED
+    global ENABLED, _FORGET
     was, ENABLED = ENABLED, bool(enabled)
     if clear_cache:
         _CACHE.clear()
+        _LOOKED_UP.clear()
+        _FORGET = True
+        for store in _STORES.values():
+            store.forget()
     return was
 
 
@@ -181,7 +353,8 @@ def cached(key):
     """The config already chosen for `key`, or None if this key still has to go through `pick`.
     Lets a call site skip setting up for a benchmark (allocating a scratch output) on the steady
     state path, where the answer is already known."""
-    return _CACHE.get(_full_key(key))
+    key = _full_key(key)
+    return _known(key) if ENABLED else _CACHE.get(key)
 
 
 def should_tune(key, num_candidates: int = 2) -> bool:
@@ -200,7 +373,8 @@ def should_tune(key, num_candidates: int = 2) -> bool:
     227x the peak for buffers that were never benchmarked into. Wall time was unchanged (21.4 vs
     21.3 ms -- the caching allocator just reuses the block), so this never showed up in a profile.
     """
-    if _full_key(key) in _CACHE:
+    key = _full_key(key)
+    if key in _CACHE or (ENABLED and _known(key) is not None):
         return False
     return ENABLED and num_candidates >= 2 and not _capturing()
 
@@ -221,13 +395,16 @@ def pick(key, candidates: list, bench, warmup: int = 3, reps: int = 7, margin: O
         that tuned independently would disagree in the last ulp -- and with the winner decided by
         measurement, they sometimes would. Keying on shape makes them share one answer instead.
 
-    Across processes the choice can still differ, exactly as the existing atomic-add
+    A later process on the machine shares the answer too (`_Store`). On another machine, or
+    after an edit, the choice can still differ, exactly as the existing atomic-add
     nondeterminism in these kernels already does, and at the same ~1e-7 magnitude.
     """
     key = _full_key(key)
     cfg = _CACHE.get(key)
     if cfg is not None:
         return cfg
+    if ENABLED and _from_store(key, candidates) is not None:
+        return _CACHE[key]
 
     if not ENABLED or len(candidates) < 2 or _capturing():
         # Not cached on purpose: capture is transient, so a later ordinary call still tunes.
@@ -235,7 +412,10 @@ def pick(key, candidates: list, bench, warmup: int = 3, reps: int = 7, margin: O
 
     best = best_of([(c, (lambda c = c: bench(c))) for c in candidates], warmup, reps, margin)
     cfg = candidates[0] if best is None else best
-    _CACHE[key] = cfg
+    if best is None:
+        _CACHE[key] = cfg                                # (nothing ran: nothing for another process to go by)
+    else:
+        _keep(key, cfg)
     return cfg
 
 
@@ -254,12 +434,15 @@ def choose(key, candidates: list):
     choice = _CACHE.get(key)
     if choice is not None:
         return choice
+    if _from_store(key, [c for c, _ in candidates]) is not None:
+        return _CACHE[key]
     if _capturing():
         return candidates[0][0]
     choice = best_of(candidates)
     if choice is None:
-        choice = candidates[0][0]
-    _CACHE[key] = choice
+        _CACHE[key] = candidates[0][0]
+        return candidates[0][0]
+    _keep(key, choice)
     return choice
 
 

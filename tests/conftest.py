@@ -23,6 +23,11 @@ workers. Run the suite once to seed the cache; every run after that is balanced.
 _DURATIONS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".test_durations")
 _durations_seen = {}   # nodeid -> seconds (this run; accumulates setup+call+teardown)
 
+# Tests force a tuner's answers, and their measurements are of the moment: none of them is for what this machine's later
+# processes start from, nor do tests go by what earlier ones measured (`autotune._Store`; its own test turns it on).
+os.environ["PYJUICE_AUTOTUNE_PERSIST"] = "0"
+
+
 def _pin_gpu():
     """Pin this process (the xdist controller, or one worker) to one GPU of the pool.
 
