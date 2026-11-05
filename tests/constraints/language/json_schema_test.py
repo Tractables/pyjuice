@@ -285,6 +285,58 @@ def test_the_checks_on_a_quotient_of_the_trie_tell_tokens_apart_as_every_walk_do
                 assert got == classes, (case, steps, first_checks)
 
 
+def same_tables(a, b, where):
+    assert a.num_states == b.num_states and a.initial == b.initial, where
+    assert torch.equal(a.delta, b.delta) and torch.equal(a.accept, b.accept) and torch.equal(a.token_class, b.token_class), where
+
+
+def test_the_table_of_a_token_automaton_from_its_moves_is_the_dense_one(monkeypatch):
+    """Minimal already: the table from every state's moves, numbered as it is made, against the dense table of every state's
+    every class numbered afterwards, entry for entry: the dead state wherever a row first has a gap, the padding merged or a
+    state of its own, tokens of empty text, on one thread and in parts -- schemas, and random automata over all 256 bytes."""
+    from pyjuice.constraints.language.backend import automata as A, token_lift
+    from pyjuice.constraints.language.backend.json_schema import compile_schema
+    from pyjuice.constraints.language.json_schema import _prepare
+    numba = pytest.importorskip("numba")
+    threads = numba.get_num_threads()
+    rng = np.random.default_rng(0)
+    cases = [(compile_schema(_prepare(s), r"[ ]?"), VOCAB) for s in (PERSON, POINTS, KIND, {"type": "string"})]
+    cases += [(A.regex(p), VOCAB) for p in ("a*", "(ab|é)+c?", "", "(a|b|c)*")]
+    for case in range(40):
+        C = int(rng.integers(1, 8))
+        K = int(rng.integers(2, 60))
+        table = np.full((K, C), K - 1, dtype = np.int32)
+        moves = rng.random((K, C)) < rng.choice([0.2, 0.5, 1.0])
+        table[moves] = rng.integers(0, K, moves.sum())
+        table[K - 1] = K - 1
+        accept = rng.random(K) < 0.5
+        accept[K - 1] = False
+        tokens = [bytes([b]) for b in range(256)] + [bytes(rng.integers(0, 6, int(rng.integers(2, 7))).tolist()) for _ in range(200)]
+        tokens += [b""] if case % 2 else []
+        cases.append((A._from_classes(table, 0, accept, np.arange(256) % C), jc.Vocabulary(tokens + [None], eos = [len(tokens)])))
+    made, real = [], token_lift._canonical_token_table
+    monkeypatch.setattr(token_lift, "_canonical_token_table", lambda *args: made.append(1) or real(*args))
+    from_moves = 0
+    for a, vocabulary in cases:
+        for eos in (True, False):
+            with monkeypatch.context() as m:
+                m.setattr(token_lift, "SPARSE_ENTRIES", 1 << 62)
+                dense = token_lift.to_tokens(a, vocabulary, eos)
+            assert not made
+            for n, parts in ((threads, 0), (1, 0), (min(3, threads), 0), (threads, 1 << 62)):
+                numba.set_num_threads(n)
+                try:
+                    with monkeypatch.context() as m:
+                        m.setattr(token_lift, "SPARSE_ENTRIES", 0)
+                        m.setattr(token_lift, "THREADS_ENTRIES", parts)
+                        same_tables(token_lift.to_tokens(a, vocabulary, eos), dense, (a.num_states, eos, n, parts))
+                finally:
+                    numba.set_num_threads(threads)
+                from_moves += bool(made)                        # (the others: an automaton accepting nothing, no walk)
+                made.clear()
+    assert from_moves > 0.9 * 8 * len(cases)
+
+
 def test_numbers_below_a_combinator_are_written_one_way():
     from pyjuice.constraints.language.backend.json_schema import canonical_number
     for x, text in [(1, "1"), (1.0, "1"), (-0.0, "0"), (0, "0"), (1.5, "1.5"), (1e-7, "0.0000001"),

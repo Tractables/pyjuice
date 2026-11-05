@@ -199,17 +199,13 @@ def _merged_trie(first_child, node_byte, end_ptr, end_ids, byte_class, read, V):
 
 @njit(cache = True)
 def _classes_read(table, dead):
-    """bool [classes]: the classes on which some live state moves to a live state."""
+    """bool [classes]: the classes on which some live state moves to a live state (a column at a time: most say so soon)."""
     S, C = table.shape
     read = np.zeros(C, dtype = np.bool_)
-    left = C
-    for q in range(S):
-        if q != dead:
-            for c in range(C):
-                if not read[c] and table[q, c] != dead:
-                    read[c] = True
-                    left -= 1
-            if left == 0:
+    for c in range(C):
+        for q in range(S):
+            if q != dead and table[q, c] != dead:
+                read[c] = True
                 break
     return read
 
@@ -589,10 +585,228 @@ def _rows_parallel(table, dead, states, reps, kinds, offsets, data, byte_class, 
         _rows(table, dead, states, reps, kinds, offsets, data, byte_class, remap, out, c * R // P, (c + 1) * R // P)
 
 
+@njit(cache = True)
+def _rep_trie(ptr, edge_class, edge_node, rep_node):
+    """The merged trie as far as the representative tokens go, ``rep_node`` the merged node of every class's (-1: none):
+    ``(gptr, gclass, gnode, class_at)``, its edges as CSR and the class ending at every node (-1: none). The root is node 0."""
+    M = ptr.shape[0] - 1
+    parent = np.zeros(M, dtype = np.int32)
+    for u in range(M):
+        for e in range(ptr[u], ptr[u + 1]):
+            parent[edge_node[e]] = u
+    keep = np.zeros(M, dtype = np.bool_)
+    keep[0] = True
+    at = np.full(M, -1, dtype = np.int32)
+    for c in range(rep_node.shape[0]):
+        if rep_node[c] >= 0:
+            at[rep_node[c]] = c
+            keep[rep_node[c]] = True
+    for m in range(M - 1, 0, -1):                               # (breadth-first: a parent before its children)
+        if keep[m]:
+            keep[parent[m]] = True
+    number = np.empty(M, dtype = np.int32)
+    G = 0
+    for m in range(M):
+        if keep[m]:
+            number[m] = G
+            G += 1
+    gptr = np.zeros(G + 1, dtype = np.int32)
+    class_at = np.empty(G, dtype = np.int32)
+    edges = 0
+    for m in range(M):
+        if keep[m]:
+            class_at[number[m]] = at[m]
+            for e in range(ptr[m], ptr[m + 1]):
+                if keep[edge_node[e]]:
+                    edges += 1
+            gptr[number[m] + 1] = edges
+    gclass = np.empty(edges, dtype = np.int32)
+    gnode = np.empty(edges, dtype = np.int32)
+    edges = 0
+    for m in range(M):
+        if keep[m]:
+            for e in range(ptr[m], ptr[m + 1]):
+                if keep[edge_node[e]]:
+                    gclass[edges], gnode[edges] = edge_class[e], number[edge_node[e]]
+                    edges += 1
+    return gptr, gclass, gnode, class_at
+
+
+@njit(cache = True)
+def _sparse_rows(table, dead, states, remap, gptr, gclass, gnode, class_at, itself, accepting, end_class, K, C, moves, row_at, row_len, lo, hi):
+    """
+    Rows ``lo`` to ``hi`` of the token automaton as moves but those to the dead state, classes ascending: ``moves[row_at[i]:
+    row_at[i] + row_len[i]]``, ``(class << 32) | state``, from place ``lo * C`` on, room for all. From every state a walk of
+    :func:`_rep_trie` through live states; classes of empty text lead to the state itself (``itself``), and with
+    ``end_class`` >= 0, of an accepting state to the state ``K + 1`` for now, the padding's.
+    """
+    G = gptr.shape[0] - 1
+    stack_node = np.empty(G + 1, dtype = np.int32)
+    stack_q = np.empty(G + 1, dtype = np.int32)
+    at = lo * C
+    for i in range(lo, hi):
+        row_at[i] = at
+        n = 0
+        stack_node[0] = 0
+        stack_q[0] = states[i]
+        top = 1
+        while top > 0:
+            top -= 1
+            u = stack_node[top]
+            q = stack_q[top]
+            for e in range(gptr[u], gptr[u + 1]):
+                q2 = table[q, gclass[e]]
+                if q2 == dead:
+                    continue
+                w = gnode[e]
+                c = class_at[w]
+                if c >= 0 and remap[q2] != K:
+                    moves[at + n] = (np.int64(c) << 32) | remap[q2]
+                    n += 1
+                if gptr[w + 1] > gptr[w]:
+                    stack_node[top] = w
+                    stack_q[top] = q2
+                    top += 1
+        for j in range(itself.shape[0]):
+            moves[at + n] = (itself[j] << 32) | i
+            n += 1
+        if end_class >= 0 and accepting[i]:
+            moves[at + n] = (end_class << 32) | (K + 1)
+            n += 1
+        if n > 32:
+            moves[at:at + n] = np.sort(moves[at:at + n])
+        else:
+            for a in range(at + 1, at + n):
+                x = moves[a]
+                b = a
+                while b > at and moves[b - 1] > x:
+                    moves[b] = moves[b - 1]
+                    b -= 1
+                moves[b] = x
+        row_len[i] = n
+        at += n
+
+
+@njit(parallel = True, cache = True)
+def _sparse_rows_parallel(table, dead, states, remap, gptr, gclass, gnode, class_at, itself, accepting, end_class, K, C, moves, row_at, row_len, P):
+    """:func:`_sparse_rows` of all rows in ``P`` parts."""
+    for p in prange(P):
+        _sparse_rows(table, dead, states, remap, gptr, gclass, gnode, class_at, itself, accepting, end_class, K, C, moves, row_at, row_len,
+                     p * K // P, (p + 1) * K // P)
+
+
+@njit(cache = True)
+def _sparse_order(moves, row_at, row_len, K, C, pad):
+    """:func:`~.dfa.bfs_order` of the rows of :func:`_sparse_rows` from state 0 (the dead state ``K`` where a row has its first
+    gap, the padding's state ``K + 1`` being ``pad``): ``(order, place)``, the states and every state's place, -1 for the rest."""
+    T = K + 2
+    order = np.empty(T, dtype = np.int64)
+    place = np.full(T, -1, dtype = np.int64)
+    order[0] = 0
+    place[0] = 0
+    num, head = 1, 0
+    mask = (np.int64(1) << 32) - 1
+    while head < num:
+        q = order[head]
+        head += 1
+        at, n = row_at[q], row_len[q]
+        if place[K] < 0:                                        # (the dead state's place: until it has one)
+            expected = 0
+            for k in range(at, at + n):
+                c = moves[k] >> 32
+                if c > expected and place[K] < 0:
+                    place[K] = num
+                    order[num] = K
+                    num += 1
+                expected = c + 1
+                t = moves[k] & mask
+                t = pad if t == K + 1 else t
+                if place[t] < 0:
+                    place[t] = num
+                    order[num] = t
+                    num += 1
+            if expected < C and place[K] < 0:
+                place[K] = num
+                order[num] = K
+                num += 1
+        else:
+            for k in range(at, at + n):
+                t = moves[k] & mask
+                t = pad if t == K + 1 else t
+                if place[t] < 0:
+                    place[t] = num
+                    order[num] = t
+                    num += 1
+    return order[:num], place
+
+
+@njit(cache = True)
+def _sparse_table(moves, row_at, row_len, order, place, K, pad, out, lo, hi):
+    """Rows ``lo`` to ``hi`` of the table of the states ``order``, numbered by their ``place``."""
+    C = out.shape[1]
+    gone = place[K]
+    mask = (np.int64(1) << 32) - 1
+    for i in range(lo, hi):
+        q = order[i]
+        for c in range(C):
+            out[i, c] = gone
+        for k in range(row_at[q], row_at[q] + row_len[q]):
+            t = moves[k] & mask
+            out[i, moves[k] >> 32] = place[pad if t == K + 1 else t]
+
+
+@njit(parallel = True, cache = True)
+def _sparse_table_parallel(moves, row_at, row_len, order, place, K, pad, out, P):
+    """:func:`_sparse_table` in ``P`` parts."""
+    R = order.shape[0]
+    for p in prange(P):
+        _sparse_table(moves, row_at, row_len, order, place, K, pad, out, p * R // P, (p + 1) * R // P)
+
+
+def _canonical_token_table(automaton: ByteAutomaton, states: np.ndarray, remap: np.ndarray, merged, token_node: np.ndarray, reps: np.ndarray, kinds: np.ndarray,
+                           accept: np.ndarray, end_class: int) -> tuple:
+    """
+    The table in canonical numbering of a token automaton minimal already, and its accepting states: what
+    ``DFA._of_classes(...)._renumbered()`` makes of the dense table of every state's every class, without it: nearly all of
+    that table is the dead state. Moves from a walk of the representatives' trie, the breadth-first order over them, then
+    the table once, as it will stand.
+    """
+    K, C = states.size, reps.size
+    P = min(get_num_threads(), K) if K * C >= THREADS_ENTRIES else 1
+    gptr, gclass, gnode, class_at = _rep_trie(*merged, np.where(kinds == 0, token_node[reps], -1).astype(np.int64))
+    itself = np.nonzero(kinds == 1)[0].astype(np.int64)
+    moves = np.empty(K * C + 1, dtype = np.int64)               # (room for all, where a part starts; only what is written is touched)
+    row_at, row_len = np.zeros(K + 2, dtype = np.int64), np.zeros(K + 2, dtype = np.int64)
+    args = (automaton.table, automaton.dead, states, remap, gptr, gclass, gnode, class_at, itself, accept, end_class, K, C, moves, row_at, row_len)
+    if P > 1:
+        _sparse_rows_parallel(*args, P)
+    else:
+        _sparse_rows(*args, 0, K)
+    pad = K + 1
+    if end_class >= 0:                                          # a state accepting the empty text alone is the padding's
+        alone = np.nonzero(accept[:K] & (row_len[:K] == 1))[0]
+        if alone.size:
+            pad = int(alone[0])
+        moves[K * C] = (end_class << 32) | (K + 1)
+        row_at[K + 1], row_len[K + 1] = K * C, 1
+        accept[pad] = True
+    order, place = _sparse_order(moves, row_at, row_len, K, C, pad)
+    out = np.empty((order.size, C), dtype = np.int64)
+    if P > 1:
+        _sparse_table_parallel(moves, row_at, row_len, order, place, K, pad, out, P)
+    else:
+        _sparse_table(moves, row_at, row_len, order, place, K, pad, out, 0, order.size)
+    return out, accept[order]
+
+
 #: so many edges of the merged trie are walked first, or a table of so many entries stays on one thread: waking a team is
 #: milliseconds on a busy machine
 SERIAL_STEPS = 1 << 19
 NO_BUDGET = 1 << 62
+#: the table of a token automaton of at least so many entries, minimal already, is made from its moves (:func:`_canonical_token_table`,
+#: the dense table of its rows costing no more below it), in threads from :data:`THREADS_ENTRIES` on (below that, waking a team is the cost)
+SPARSE_ENTRIES = 1 << 19
+THREADS_ENTRIES = 1 << 24
 #: states checked on the quotient of the merged trie (:func:`_walk_the_rest`): at first so many, then twice as many a time,
 #: on one thread below :data:`SERIAL_CHECKS`; states failing are walked, so many edges in threads at the most at a time
 FIRST_CHECKS = 256
@@ -643,6 +857,12 @@ def to_tokens(automaton: ByteAutomaton, vocabulary: Vocabulary, eos_padding: boo
     K, C = states.size, reps.size
     remap = np.full(S, K, dtype = np.int64)                             # unreached (the byte dead state among them)
     remap[states] = np.arange(K)
+    if complete and K * C >= SPARSE_ENTRIES:
+        accept = np.zeros(K + 2, dtype = bool)
+        accept[:K] = automaton.accept[states]
+        end_class = int(token_class[eos[0]]) if eos_padding and eos.size else -1
+        out, kept = _canonical_token_table(automaton, states, remap, (ptr, edge_class, edge_node), token_node, reps, kinds, accept, end_class)
+        return DFA._of_classes(V, torch.from_numpy(token_class), torch.from_numpy(out), 0, torch.from_numpy(kept))
     dead, pad = K, K + 1
     out = np.empty((K + 2, C), dtype = np.int64)
     out[K:] = dead
