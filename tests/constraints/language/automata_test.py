@@ -295,3 +295,155 @@ def test_the_minimal_automaton_over_moves_is_the_table_minimized():
             for c in text:
                 q, r = int(table[q, c]), int(a.table[r, a.byte_class[c]])
                 assert bool(accept[q]) == bool(a.accept[r]), case
+
+
+# -------------------------------------------------------------------------------------------------
+# The subset construction and the minimization, against plain ones
+# -------------------------------------------------------------------------------------------------
+
+def plain_minimal(table, accept, initial):
+    """The canonical minimal automaton of a complete table, by the book: the reachable states, those from which something
+    is accepted, Moore's refinement, then breadth-first numbers by class, the one dead state last: ``(table, accept)``."""
+    K, C = len(table), len(table[0]) if table else 0
+    reach, stack = {initial}, [initial]
+    while stack:
+        for t in table[stack.pop()]:
+            if t not in reach:
+                reach.add(t)
+                stack.append(t)
+    live = {q for q in reach if accept[q]}
+    grew = True
+    while grew:
+        grew = False
+        for q in reach - live:
+            if any(t in live for t in table[q]):
+                live.add(q)
+                grew = True
+    if initial not in live:
+        return [[0] * C], [False]
+    block = {q: int(accept[q]) for q in live}
+    while True:
+        seen = {}
+        new = {q: seen.setdefault((block[q], tuple(block.get(t, -1) for t in table[q])), len(seen)) for q in sorted(live)}
+        if len(seen) == len(set(block.values())):
+            break
+        block = new
+    rep = {}
+    for q in sorted(live):
+        rep.setdefault(block[q], q)
+    number = {block[initial]: 0}
+    order = [block[initial]]
+    for b in order:
+        for t in table[rep[b]]:
+            if t in live and block[t] not in number:
+                number[block[t]] = len(order)
+                order.append(block[t])
+    m = len(order)
+    out = [[number[block[t]] if t in live else m for t in table[rep[b]]] for b in order] + [[m] * C]
+    return out, [bool(accept[rep[b]]) for b in order] + [False]
+
+
+def plain_subsets(N, moves, eps, accept, start, C):
+    """The subset construction, by the book, of ``moves`` (``(state, class, successor)``) and empty moves: a complete table
+    over sets of states, the empty one among them: ``(table, accepting)``, set 0 the initial one."""
+    def closed(states):
+        out, stack = set(states), list(states)
+        while stack:
+            u = stack.pop()
+            for a, b in eps:
+                if a == u and b not in out:
+                    out.add(b)
+                    stack.append(b)
+        return frozenset(out)
+    first = closed([start])
+    number, order, table = {first: 0}, [first], []
+    for s in order:
+        row = []
+        for c in range(C):
+            t = closed([d for u, k, d in moves if u in s and k == c])
+            if t not in number:
+                number[t] = len(order)
+                order.append(t)
+            row.append(number[t])
+        table.append(row)
+    return table, [any(accept[q] for q in s) for s in order]
+
+
+def random_moves(rng, N, C, density, one_a_class):
+    """Moves of a random automaton: as parts' states have them (one on a class at the most, classes ascending), or any."""
+    moves = []
+    for u in range(N):
+        classes = rng.sample(range(C), rng.randint(0, C)) if rng.random() < density else []
+        for c in (sorted(classes) if one_a_class else classes):
+            moves.append((u, c, rng.randrange(N)))
+            if not one_a_class and rng.random() < 0.3:
+                moves.append((u, rng.randrange(C), rng.randrange(N)))
+    return moves
+
+
+@pytest.mark.parametrize("one_a_class", [True, False])
+@pytest.mark.parametrize("eps_share", [0.0, 0.1, 0.5])
+def test_the_subset_construction_is_the_plain_one(one_a_class, eps_share):
+    """Random automata, states moving on their own and in sets, found ahead of the sweep and behind it, however numbered:
+    the minimal automaton of the sets is the one of the plain construction, table for table."""
+    rng = random.Random(int(eps_share * 10) + one_a_class)
+    for case in range(300):
+        N, C = rng.randint(1, 14), rng.randint(1, 4)
+        moves = random_moves(rng, N, C, rng.choice([0.5, 0.9, 1.0]), one_a_class)
+        eps = [(u, rng.randrange(N)) for u in range(N) if rng.random() < eps_share]
+        eps += [(rng.randrange(N), rng.randrange(N)) for _ in range(rng.randint(0, 2) if eps_share else 0)]
+        accept = [rng.random() < 0.3 for _ in range(N)]
+        start = rng.randrange(N)
+        by_state = sorted(range(len(moves)), key = lambda i: moves[i][0])              # (stably: a state's moves as they came)
+        edge_ptr = np.zeros(N + 1, dtype = np.int64)
+        for u, _, _ in moves:
+            edge_ptr[u + 1] += 1
+        edge_ptr = np.cumsum(edge_ptr)
+        edge_class = np.array([moves[i][1] for i in by_state], dtype = np.int32)
+        edge_dst = np.array([moves[i][2] for i in by_state], dtype = np.int32)
+        eps_ptr = np.zeros(N + 1, dtype = np.int64)
+        for u, _ in eps:
+            eps_ptr[u + 1] += 1
+        eps_ptr = np.cumsum(eps_ptr)
+        eps_dst = np.array([v for _, v in sorted(eps, key = lambda p: p[0])], dtype = np.int32)
+        ptr, cls, dst, acc, initial = A._subsets(edge_ptr, edge_class, edge_dst, eps_ptr, eps_dst, np.array(accept, dtype = np.bool_), start, C)
+        assert ptr.size - 1 == acc.size and ptr[-1] == dst.size == cls.size
+        got = A._from_moves(ptr, cls, dst, initial, acc, C, np.arange(256) % C)
+        table, accepting = plain_subsets(N, moves, eps, accept, start, C)
+        want, want_accept = plain_minimal(table, accepting, 0)
+        table_got = got.table[:, got.byte_class[np.arange(C)]]
+        assert table_got.tolist() == want and got.accept.tolist() == want_accept, (case, N, C, moves, eps, accept, start)
+
+
+def test_a_state_found_behind_the_sweep_through_a_set_is_read():
+    """Moves of a set of two states, alone on a class once they are one: the state they both lead to stands behind the
+    sweep, and what it moves to is not a set on its own -- unless it is read, its row leads to a state without its empty moves."""
+    # 5 -a-> 4 (empty: 3); 4 and 3 -a-> 1; 1 -b-> 2 (empty: 0); 0 accepts
+    moves = [(1, 1, 2), (3, 0, 1), (4, 0, 1), (5, 0, 4)]
+    eps = [(2, 0), (4, 3)]
+    N, C, start = 6, 2, 5
+    accept = [True, False, False, False, False, False]
+    edge_ptr = np.cumsum([0] + [sum(m[0] == u for m in moves) for u in range(N)]).astype(np.int64)
+    edge_class = np.array([m[1] for m in moves], dtype = np.int32)
+    edge_dst = np.array([m[2] for m in moves], dtype = np.int32)
+    eps_ptr = np.cumsum([0] + [sum(e[0] == u for e in eps) for u in range(N)]).astype(np.int64)
+    eps_dst = np.array([e[1] for e in eps], dtype = np.int32)
+    ptr, cls, dst, acc, initial = A._subsets(edge_ptr, edge_class, edge_dst, eps_ptr, eps_dst, np.array(accept, dtype = np.bool_), start, C)
+    got = A._from_moves(ptr, cls, dst, initial, acc, C, np.arange(256) % C)
+    want, want_accept = plain_minimal(*plain_subsets(N, moves, eps, accept, start, C), 0)
+    assert got.table[:, got.byte_class[np.arange(C)]].tolist() == want and got.accept.tolist() == want_accept
+    assert any(want_accept)
+
+
+@pytest.mark.parametrize("dead_share", [0.0, 0.3, 0.8])
+def test_the_minimal_table_is_the_plain_one(dead_share):
+    """Random tables, states out of reach and states from which nothing is accepted among them: Hopcroft's algorithm from the
+    distances to acceptance gives the partition Moore's does from accepting or not, in the same numbers."""
+    rng = random.Random(int(dead_share * 10))
+    for case in range(300):
+        K, C = rng.randint(1, 30), rng.randint(1, 5)
+        table = [[rng.randrange(K) if rng.random() >= dead_share else q for _ in range(C)] for q in range(K)]
+        accept = [rng.random() < 0.25 for _ in range(K)]
+        got = A._from_classes(np.array(table, dtype = np.int32), 0, np.array(accept, dtype = np.bool_), np.arange(256) % C)
+        want, want_accept = plain_minimal(table, accept, 0)
+        assert got.table[:, got.byte_class[np.arange(C)]].tolist() == want and got.accept.tolist() == want_accept, (case, table, accept)

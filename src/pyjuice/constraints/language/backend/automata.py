@@ -170,164 +170,281 @@ def _sorted_states(buf, k):
 
 
 @njit(cache = True)
+def _kept_set(buf, k, i, at, pool, acc, accept, slot_set, slot_hash, one):
+    """
+    The number among the sets kept of the set of states ``buf[:k]``, closed under empty moves: the one found, or ``i``, a new
+    one, then kept (the states of set ``j`` are ``pool[at[j]:at[j + 1]]``). A set of one state is found by ``one[state]``, a
+    larger one by its hash, in the open addressing of ``slot_set`` and ``slot_hash``. The caller has made room.
+    """
+    if k == 1:
+        j = one[buf[0]]
+        if j >= 0:
+            return j
+        one[buf[0]] = i
+    else:
+        _sorted_states(buf, k)
+        h = np.int64(1469598103934665603)
+        for x in range(k):
+            h = (h ^ buf[x]) * np.int64(1099511628211)
+        mask = slot_set.shape[0] - 1
+        slot = h & mask
+        while True:
+            j = slot_set[slot]
+            if j < 0:
+                break
+            if slot_hash[slot] == h and at[j + 1] - at[j] == k:
+                found = True
+                for x in range(k):
+                    if pool[at[j] + x] != buf[x]:
+                        found = False
+                        break
+                if found:
+                    return j
+            slot = (slot + 1) & mask
+        slot_set[slot] = i
+        slot_hash[slot] = h
+    end = at[i]
+    for x in range(k):
+        pool[end + x] = buf[x]
+        if accept[buf[x]]:
+            acc[i] = True
+    at[i + 1] = end + k
+    return i
+
+
+@njit(cache = True)
+def _grown_slots(slot_set, slot_hash):
+    """The open addressing of :func:`_kept_set`, twice as large."""
+    size = 2 * slot_set.shape[0]
+    more_set = np.full(size, -1, dtype = np.int32)
+    more_hash = np.empty(size, dtype = np.int64)
+    for s in range(slot_set.shape[0]):
+        j = slot_set[s]
+        if j >= 0:
+            at = slot_hash[s] & (size - 1)
+            while more_set[at] >= 0:
+                at = (at + 1) & (size - 1)
+            more_set[at], more_hash[at] = j, slot_hash[s]
+    return more_set, more_hash
+
+
+@njit(cache = True)
+def _longer(a, size):
+    """A copy of ``a`` of ``size`` entries, those past its own not set."""
+    out = np.empty(size, dtype = a.dtype)
+    out[:a.shape[0]] = a
+    return out
+
+
+#: of a state in the subset construction: on its own a set not reached yet, one to be read, one read, or not a set on its own
+_NOT_REACHED, _TO_READ, _READ, _IN_SETS = 0, 1, 2, 3
+
+
+@njit(cache = True)
 def _subsets(edge_ptr, edge_class, edge_dst, eps_ptr, eps_dst, accept, start, C):
     """
     The subset construction of an automaton with empty moves: its moves as CSR per state (``edge_ptr`` [N + 1], the class
     ``edge_class`` of every move and its successor ``edge_dst``), its empty moves too (``eps_ptr`` [N + 1], ``eps_dst``),
-    ``accept`` bool [N], the initial state ``start``, over ``C`` classes. Returns ``(ptr, cls, dst, accepting)``: over the
-    reachable sets of states (set 0 the empty one, without moves, set 1 the initial one), their moves to sets but the
-    empty one as CSR, classes ascending, and bool [M]. Classes in a row whose moves are the same lead to the same set.
+    ``accept`` bool [N], the initial state ``start``, over ``C`` classes. Returns ``(ptr, cls, dst, accepting, initial)``: the
+    moves of the sets reachable from the initial one, to sets but the empty one, as CSR, classes ascending, and bool for every
+    number (those of no reachable set: their rows lead nowhere that is read).
+
+    Nearly all states of automata joined by empty moves are sets of their own: without empty moves, with one move on a
+    class at the most, classes ascending, they move as they are. Such a state IS a set, numbered as the state, its row its
+    moves, read where it stands, in the order of their numbers but for those found behind (rows in order, far fewer misses than
+    breadth-first through the columns of an automaton's parts; a move to another of them is only a mark). The other sets are
+    numbered past the states, as they are found: a set that one state and its empty moves make is remembered by that state
+    (``one``), and is hashed only when first found. The numbers mean nothing: :func:`~.dfa.minimal_moves` makes them canonical.
     """
     N = edge_ptr.shape[0] - 1
+    E = edge_ptr[N]
+    state = np.zeros(N, dtype = np.uint8)
+    for u in range(N):
+        if eps_ptr[u + 1] > eps_ptr[u]:
+            state[u] = _IN_SETS
+        else:
+            for e in range(edge_ptr[u] + 1, edge_ptr[u + 1]):
+                if edge_class[e] <= edge_class[e - 1]:
+                    state[u] = _IN_SETS
+                    break
+    cls = np.empty(E + 1024, dtype = np.int32)                  # the states' rows, then the other sets', as they are read
+    dst = np.empty(E + 1024, dtype = np.int32)
+    cls[:E] = edge_class
+    dst[:E] = edge_dst
+    moves = E
+    ptr = np.empty(N + 1025, dtype = np.int64)
+    ptr[:N + 1] = edge_ptr
     stamp = np.full(N, -1, dtype = np.int64)
     buf = np.empty(N, dtype = np.int32)
-    cap = 1024
-    pool = np.empty(max(4 * cap, 2 * N), dtype = np.int32)      # the sets' sorted states back to back
-    ptr = np.zeros(cap + 1, dtype = np.int64)
-    hashes = np.empty(cap, dtype = np.int64)
-    move_ptr = np.zeros(cap + 1, dtype = np.int64)
-    move_class = np.empty(8 * cap, dtype = np.int32)
-    move_dst = np.empty(8 * cap, dtype = np.int32)
-    moves = 0
-    acc = np.zeros(cap, dtype = np.bool_)
-    slots_size = 4 * cap
-    slots = np.full(slots_size, -1, dtype = np.int32)           # open addressing: the set of a hash
+    one = np.full(N, -1, dtype = np.int32)                      # the kept set of a state and all empty moves reach from it
+    pool = np.empty(max(1024, 2 * N), dtype = np.int32)         # the kept sets' sorted states back to back
+    at = np.zeros(1025, dtype = np.int64)
+    acc = np.zeros(1024, dtype = np.bool_)
+    slot_set = np.full(4096, -1, dtype = np.int32)              # open addressing: the kept set of a hash
+    slot_hash = np.empty(4096, dtype = np.int64)
+    kept, hashed, head = 0, 0, 0
     count = np.zeros(C, dtype = np.int32)
     where = np.empty(C, dtype = np.int32)
     moved = np.empty(1024, dtype = np.int32)                    # a set's successors per class
-    num, mark = 2, 0                                            # set 0: empty (ptr[1] == ptr[0])
-    buf[0] = start
-    stamp[start] = mark
-    m = _closure(buf, 1, eps_ptr, eps_dst, stamp, mark)
-    _sorted_states(buf, m)
-    pool[:m] = buf[:m]
-    ptr[2] = m
-    h = np.int64(1469598103934665603)
-    for i in range(m):
-        x = buf[i]
-        h = (h ^ x) * np.int64(1099511628211)
-        acc[1] = acc[1] or accept[x]
-    hashes[1] = h
-    slots[h & (slots_size - 1)] = 1
-    head = 1
-    while head < num:
-        a0, a1 = ptr[head], ptr[head + 1]
-        total = 0
-        for i in range(a0, a1):
-            u = pool[i]
-            for e in range(edge_ptr[u], edge_ptr[u + 1]):
-                count[edge_class[e]] += 1
-            total += edge_ptr[u + 1] - edge_ptr[u]
-        if total > moved.shape[0]:
-            moved = np.empty(2 * total, dtype = np.int32)
-        place = 0
-        for c in range(C):
-            where[c] = place
-            place += count[c]
-        for i in range(a0, a1):
-            u = pool[i]
-            for e in range(edge_ptr[u], edge_ptr[u + 1]):
-                c = edge_class[e]
-                moved[where[c]] = edge_dst[e]
-                where[c] += 1
-        last_at, last_n, last_j = 0, 0, 0
-        for c in range(C):
-            n = count[c]
-            if n == 0:
-                continue
-            count[c] = 0
-            at = where[c] - n
-            same = n == last_n
-            if same:
-                for i in range(n):
-                    if moved[at + i] != moved[last_at + i]:
-                        same = False
-                        break
-            if moves == move_class.shape[0]:
-                more_class = np.empty(2 * moves, dtype = np.int32)
-                more_class[:moves] = move_class
-                move_class = more_class
-                more_dst = np.empty(2 * moves, dtype = np.int32)
-                more_dst[:moves] = move_dst
-                move_dst = more_dst
-            move_class[moves] = c
-            if same:
-                move_dst[moves] = last_j
-                moves += 1
-                continue
-            mark += 1
-            k = 0
-            for i in range(at, at + n):
-                t = moved[i]
-                if stamp[t] != mark:
-                    stamp[t] = mark
-                    buf[k] = t
-                    k += 1
-            k = _closure(buf, k, eps_ptr, eps_dst, stamp, mark)
-            _sorted_states(buf, k)
-            h = np.int64(1469598103934665603)
-            for i in range(k):
-                h = (h ^ buf[i]) * np.int64(1099511628211)
-            slot = h & (slots_size - 1)
-            while True:
-                j = slots[slot]
+    stack = np.empty(N + 1, dtype = np.int32)                   # the states found behind the sweep
+    top, sweep, mark = 0, 0, 0
+    if state[start] == _NOT_REACHED:
+        state[start] = _TO_READ
+        initial = start
+    else:
+        buf[0] = start
+        stamp[start] = mark
+        k = _closure(buf, 1, eps_ptr, eps_dst, stamp, mark)
+        if k > pool.shape[0]:
+            pool = np.empty(2 * k, dtype = np.int32)
+        one[start] = _kept_set(buf, k, 0, at, pool, acc, accept, slot_set, slot_hash, one)
+        kept, hashed = 1, 1
+        initial = N
+    while True:
+        if head < kept:                                         # a kept set: its moves by class
+            a0, a1 = at[head], at[head + 1]
+            total = 0
+            for i in range(a0, a1):
+                u = pool[i]
+                for e in range(edge_ptr[u], edge_ptr[u + 1]):
+                    count[edge_class[e]] += 1
+                total += edge_ptr[u + 1] - edge_ptr[u]
+            if total > moved.shape[0]:
+                moved = np.empty(2 * total, dtype = np.int32)
+            place = 0
+            for c in range(C):
+                where[c] = place
+                place += count[c]
+            for i in range(a0, a1):
+                u = pool[i]
+                for e in range(edge_ptr[u], edge_ptr[u + 1]):
+                    c = edge_class[e]
+                    moved[where[c]] = edge_dst[e]
+                    where[c] += 1
+            if moves + total > cls.shape[0]:
+                cls = _longer(cls, 2 * (moves + total))
+                dst = _longer(dst, 2 * (moves + total))
+            if kept + total + 1 > at.shape[0]:                  # (a new set a move, at the most)
+                at = _longer(at, 2 * (kept + total + 1))
+                more = np.zeros(at.shape[0], dtype = np.bool_)
+                more[:kept] = acc[:kept]
+                acc = more
+            if N + kept + total + 1 > ptr.shape[0]:
+                ptr = _longer(ptr, 2 * (N + kept + total + 1))
+            while 4 * (hashed + total) > slot_set.shape[0]:
+                slot_set, slot_hash = _grown_slots(slot_set, slot_hash)
+            last_at, last_n, last_j = 0, 0, 0
+            for c in range(C):
+                n = count[c]
+                if n == 0:
+                    continue
+                count[c] = 0
+                b = where[c] - n
+                cls[moves] = c
+                j = -1
+                t = moved[b]
+                if n == 1:                                      # alone: its target says it
+                    r = state[t]
+                    if r != _IN_SETS:
+                        if r == _NOT_REACHED:
+                            state[t] = _TO_READ
+                            if t < sweep:
+                                stack[top] = t
+                                top += 1
+                        j = t
+                    else:
+                        i = one[t]
+                        if i >= 0:
+                            j = N + i
                 if j < 0:
-                    break
-                if hashes[j] == h and ptr[j + 1] - ptr[j] == k:
-                    found = True
-                    for i in range(k):
-                        if pool[ptr[j] + i] != buf[i]:
-                            found = False
-                            break
-                    if found:
-                        break
-                slot = (slot + 1) & (slots_size - 1)
-            if j < 0:                                           # a new set
-                if num == cap:
-                    cap *= 2
-                    more_ptr = np.zeros(cap + 1, dtype = np.int64)
-                    more_ptr[:num + 1] = move_ptr[:num + 1]
-                    move_ptr = more_ptr
-                    more = np.zeros(cap, dtype = np.bool_)
-                    more[:num] = acc[:num]
-                    acc = more
-                    more_hashes = np.empty(cap, dtype = np.int64)
-                    more_hashes[:num] = hashes[:num]
-                    hashes = more_hashes
-                    p = np.zeros(cap + 1, dtype = np.int64)
-                    p[:num + 1] = ptr[:num + 1]
-                    ptr = p
-                    slots_size = 4 * cap
-                    slots = np.full(slots_size, -1, dtype = np.int32)
-                    for q in range(1, num):
-                        s = hashes[q] & (slots_size - 1)
-                        while slots[s] >= 0:
-                            s = (s + 1) & (slots_size - 1)
-                        slots[s] = q
-                    slot = h & (slots_size - 1)
-                    while slots[slot] >= 0:
-                        slot = (slot + 1) & (slots_size - 1)
-                end = ptr[num]
-                if end + k > pool.shape[0]:
-                    more_pool = np.empty(2 * (end + k), dtype = np.int32)
-                    more_pool[:end] = pool[:end]
-                    pool = more_pool
-                pool[end:end + k] = buf[:k]
-                ptr[num + 1] = end + k
-                for i in range(k):
-                    if accept[buf[i]]:
-                        acc[num] = True
-                        break
-                j = num
-                hashes[j] = h
-                slots[slot] = j
-                num += 1
-            move_dst[moves] = j
-            moves += 1
-            last_at, last_n, last_j = at, n, j
-        head += 1
-        move_ptr[head] = moves
-    return move_ptr[:num + 1], move_class[:moves], move_dst[:moves], acc[:num]
+                    same = n == last_n
+                    if same:
+                        for i in range(n):
+                            if moved[b + i] != moved[last_at + i]:
+                                same = False
+                                break
+                    if same:
+                        j = last_j
+                    else:
+                        mark += 1
+                        k = 0
+                        for i in range(b, b + n):
+                            x = moved[i]
+                            if stamp[x] != mark:
+                                stamp[x] = mark
+                                buf[k] = x
+                                k += 1
+                        k = _closure(buf, k, eps_ptr, eps_dst, stamp, mark)
+                        if k == 1 and state[buf[0]] != _IN_SETS:
+                            j = buf[0]
+                            if state[j] == _NOT_REACHED:
+                                state[j] = _TO_READ
+                                if j < sweep:
+                                    stack[top] = j
+                                    top += 1
+                        else:
+                            if at[kept] + k > pool.shape[0]:
+                                pool = _longer(pool, 2 * (at[kept] + k))
+                            i = _kept_set(buf, k, kept, at, pool, acc, accept, slot_set, slot_hash, one)
+                            if i == kept:
+                                kept += 1
+                                hashed += 1
+                            if n == 1:
+                                one[t] = i
+                            j = N + i
+                dst[moves] = j
+                moves += 1
+                last_at, last_n, last_j = b, n, j
+            head += 1
+            ptr[N + head] = moves
+            continue
+        if top > 0:                                             # a state behind the sweep
+            top -= 1
+            u = stack[top]
+        else:
+            while sweep < N and state[sweep] != _TO_READ:
+                sweep += 1
+            if sweep == N:
+                break
+            u = sweep
+            sweep += 1
+        state[u] = _READ
+        for e in range(edge_ptr[u], edge_ptr[u + 1]):           # a state's row: as it is but for what is not on its own
+            t = edge_dst[e]
+            r = state[t]
+            if r == _NOT_REACHED:
+                state[t] = _TO_READ
+                if t < sweep:
+                    stack[top] = t
+                    top += 1
+            elif r == _IN_SETS:
+                i = one[t]
+                if i < 0:
+                    if kept + 2 > at.shape[0]:
+                        at = _longer(at, 2 * (kept + 2))
+                        more = np.zeros(at.shape[0], dtype = np.bool_)
+                        more[:kept] = acc[:kept]
+                        acc = more
+                    if N + kept + 2 > ptr.shape[0]:
+                        ptr = _longer(ptr, 2 * (N + kept + 2))
+                    if 4 * (hashed + 1) > slot_set.shape[0]:
+                        slot_set, slot_hash = _grown_slots(slot_set, slot_hash)
+                    mark += 1
+                    buf[0] = t
+                    stamp[t] = mark
+                    k = _closure(buf, 1, eps_ptr, eps_dst, stamp, mark)
+                    if at[kept] + k > pool.shape[0]:
+                        pool = _longer(pool, 2 * (at[kept] + k))
+                    i = _kept_set(buf, k, kept, at, pool, acc, accept, slot_set, slot_hash, one)
+                    if i == kept:
+                        kept += 1
+                        hashed += 1
+                    one[t] = i
+                dst[e] = N + i
+    accepting = np.empty(N + kept, dtype = np.bool_)
+    accepting[:N] = accept
+    accepting[N:] = acc[:kept]
+    return ptr[:N + kept + 1], cls[:moves], dst[:moves], accepting, initial
 
 
 @njit(cache = True)
@@ -408,8 +525,8 @@ def determinized(num: int, start: int, end: int, src, lo, hi, dst, eps_src, eps_
     accept[end] = True
     eps_ptr, eps = _csr(eps_src, eps_dst, num)
     C = int(byte_class[-1]) + 1
-    ptr, cls, moved, acc = _subsets(edge_ptr, edge_class, edge_dst, eps_ptr, eps, accept, start, C)
-    return _from_moves(ptr, cls, moved, 1, acc, C, byte_class)
+    ptr, cls, moved, acc, initial = _subsets(edge_ptr, edge_class, edge_dst, eps_ptr, eps, accept, start, C)
+    return _from_moves(ptr, cls, moved, initial, acc, C, byte_class)
 
 
 @njit(cache = True)
@@ -543,8 +660,8 @@ class _Joined:
         pairs = np.where(pairs >= 0, pairs, self.size - 1 - pairs)             # (placeholders after the parts)
         eps_ptr, eps = _csr(pairs[:, 0], pairs[:, 1].astype(np.int32), total)
         C = int(byte_class.max()) + 1
-        ptr, cls, moved, acc = _subsets(edge_ptr, edge_class, edge_dst, eps_ptr, eps, accept, start if start >= 0 else self.size - 1 - start, C)
-        return _from_moves(ptr, cls, moved, 1, acc, C, byte_class)
+        ptr, cls, moved, acc, initial = _subsets(edge_ptr, edge_class, edge_dst, eps_ptr, eps, accept, start if start >= 0 else self.size - 1 - start, C)
+        return _from_moves(ptr, cls, moved, initial, acc, C, byte_class)
 
 
 class Expr:
