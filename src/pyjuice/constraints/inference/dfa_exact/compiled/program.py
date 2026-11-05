@@ -21,7 +21,7 @@ from ..kernels.transitions import (SampleMasses, boundary_groups, enumerated_tok
                                    sample_masses, transition_masses, transition_stats, transition_tables)
 from ..kernels.common import available_memory, most_in_runs
 from .circuit import TRANS_COLS, circuit_tables
-from .layout import interval_tables
+from .reachability import interval_tables
 
 
 #: Read a one-child product over a sum straight from the sum's row instead of copying its block (see Program)
@@ -282,9 +282,9 @@ class Program:
         return getattr(self.trans, kind)
 
     def signature_layout(self, masses):
-        """The :class:`~..kernels.transition_signatures.SignatureMasses` of ``masses``' row map (one set), or None
+        """The :class:`~..kernels.transitions.signatures.SignatureMasses` of ``masses``' row map (one set), or None
         (no saving, or per-sample masses): built once a row map (the state's, which a query's one set reads)."""
-        from ..kernels import transition_signatures as TS
+        from ..kernels.transitions import signatures as TS
         if not TS.SIGNATURE_MASSES or masses.batch != 1 or masses.enum_logw is not None:
             return None
         if self._sig is None or self._sig[0] is not masses.row:
@@ -322,7 +322,7 @@ class Program:
             self._trans, self._trans_version = None, None               # (the masses go with the grouped tables)
         if grouped and self.trans_job is not None and self._trans_version != masses.version:
             if layout is None and self.trans_sig is not None:
-                from ..kernels.transition_signatures import signature_transition_masses
+                from ..kernels.transitions.signatures import signature_transition_masses
                 signature_transition_masses(self.transition_buffer(), self.trans_sig, masses, self)
             elif layout is None:
                 transition_masses(self.transition_buffer(), self.trans_job, masses, self)

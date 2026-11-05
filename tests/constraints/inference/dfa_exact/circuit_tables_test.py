@@ -17,7 +17,8 @@ import torch
 
 import pyjuice.constraints as jc
 from pyjuice.constraints.inference.dfa_exact.compiled import program as P
-from pyjuice.constraints.inference.dfa_exact.compiled.layout import Reachability, build_layout, interval_tables
+from pyjuice.constraints.inference.dfa_exact.compiled.layout import build_layout
+from pyjuice.constraints.inference.dfa_exact.compiled.reachability import Reachability, interval_tables
 from pyjuice.constraints.inference.dfa_exact.kernels.prod import skip_masks
 from pyjuice.constraints.inference.dfa_exact.kernels import sum as lifted_sum
 from pyjuice.constraints.inference.dfa_exact.kernels import transitions as TR
@@ -184,13 +185,13 @@ def test_the_batches_do_not_change_the_automatons_tables(seed, grouped, monkeypa
     K, C, n = 12, 5, 7
     delta = torch.randint(0, K, (K, C), generator = g)
     layout = build_layout(jc.DFA(C, torch.arange(C), delta, 0, list(range(0, K, 3))), n)
-    together = TR.transition_tables(layout.transitions(torch.device("cuda")), grouped)
-    monkeypatch.setattr(TR, "BOUNDARY_BATCH", 1)
-    monkeypatch.setattr(TR, "BOUNDARY_ENTRIES_KEPT", -1)
+    together = TR.tables.transition_tables(layout.transitions(torch.device("cuda")), grouped)
+    monkeypatch.setattr(TR.tables, "BOUNDARY_BATCH", 1)
+    monkeypatch.setattr(TR.tables, "BOUNDARY_ENTRIES_KEPT", -1)
     tr = layout.transitions(torch.device("cuda"))
     del tr.__dict__["_boundary_groups"]                               # (kept with the transitions: built again)
-    assert len(TR.boundary_groups(tr).batches) == len(TR.boundary_groups(tr).firsts) > 1
-    apart = TR.transition_tables(tr, grouped)
+    assert len(TR.tables.boundary_groups(tr).batches) == len(TR.tables.boundary_groups(tr).firsts) > 1
+    apart = TR.tables.transition_tables(tr, grouped)
     for k in together.__dataclass_fields__:
         a, b = getattr(together, k), getattr(apart, k)
         assert torch.equal(a, b) if isinstance(a, torch.Tensor) else a == b, k
@@ -200,9 +201,9 @@ def test_boundaries_alike_are_found_exactly_whatever_their_hash(monkeypatch):
     """The hash only proposes: boundaries that merely hash alike are told apart."""
     layout = build_layout(jc.DFA.contains([[1, 2]], 3), 12)
     tr = layout.transitions(torch.device("cuda"))
-    want = TR.BoundaryGroups(tr)
-    monkeypatch.setattr(TR, "_boundary_weights", lambda W, dev: torch.zeros(W, dtype = torch.int64, device = dev))
-    got = TR.BoundaryGroups(tr)
+    want = TR.tables.BoundaryGroups(tr)
+    monkeypatch.setattr(TR.tables, "_boundary_weights", lambda W, dev: torch.zeros(W, dtype = torch.int64, device = dev))
+    got = TR.tables.BoundaryGroups(tr)
     assert got.firsts == want.firsts and got.group == want.group and len(got.firsts) > 1
 
 

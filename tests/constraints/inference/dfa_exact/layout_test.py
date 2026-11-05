@@ -10,8 +10,8 @@ import pyjuice.constraints as jc
 from pyjuice.constraints.inference.dfa_exact.kernels.prod import skip_masks
 from pyjuice.constraints.inference.dfa_exact.kernels.transitions import transition_stats, transition_tables
 from pyjuice.constraints.inference.dfa_exact.compiled import layout as layout_module
-from pyjuice.constraints.inference.dfa_exact.compiled.layout import (Reachability, _tile_any, build_layout,
-                                                                    interval_tables)
+from pyjuice.constraints.inference.dfa_exact.compiled.layout import build_layout
+from pyjuice.constraints.inference.dfa_exact.compiled.reachability import Reachability, _tile_any, interval_tables
 
 
 def random_dfa(K, V, seed):

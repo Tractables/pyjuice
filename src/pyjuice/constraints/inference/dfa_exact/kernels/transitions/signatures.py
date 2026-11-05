@@ -32,9 +32,9 @@ import triton.language as tl
 from pyjuice.utils.kernel_launcher import triton_jit
 from pyjuice.utils.util import host_cdiv, host_next_power_of_2
 
-from ....distributions.categorical import _exact_dot
-from .common import _next_col_of, grid_chunks
-from .transitions import TRANSITION_PAIR_TILE, TRANSITION_TILES, job_tile, job_tiles
+from .....distributions.categorical import _exact_dot
+from ..common import _next_col_of, grid_chunks
+from .masses import TRANSITION_PAIR_TILE, TRANSITION_TILES, job_tile, job_tiles
 
 #: Whether a query's one set of transition masses is laid out by column signature where that saves at least
 #: ``SIGNATURE_MIN_SAVING`` times the floats (see the module docstring)

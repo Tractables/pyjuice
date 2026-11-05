@@ -1,5 +1,5 @@
 """
-Transition masses by column signature (kernels/transition_signatures.py, ``Program.signature_layout``): a query's one
+Transition masses by column signature (kernels/transitions/signatures.py, ``Program.signature_layout``): a query's one
 set of transition masses built once per distinct column instead of once per boundary column. On an HMM long enough
 that boundaries repeat their columns: the layout is taken; a decoder session (l2r and diffusion, dense and compact
 values) gives the per-column layout's results to the bit and the float64 reference's to strong_check's bars; a
@@ -13,7 +13,7 @@ import pytest
 import torch
 
 import pyjuice.constraints as jc
-from pyjuice.constraints.inference.dfa_exact.kernels import transition_signatures as TS
+from pyjuice.constraints.inference.dfa_exact.kernels.transitions import signatures as TS
 
 _spec = importlib.util.spec_from_file_location("strong_check_test", os.path.join(os.path.dirname(__file__), "strong_check_test.py"))
 strong = importlib.util.module_from_spec(_spec)

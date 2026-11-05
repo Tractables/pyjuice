@@ -261,7 +261,7 @@ def test_skipping_empty_tiles_changes_nothing(build_pc, monkeypatch):
     """A wide automaton, so that blocks span several tiles and some (output tile, shared chunk) pairs cannot be
     joined: skipping them gives what computing them gives."""
     from pyjuice.constraints.inference.dfa_exact.kernels import prod
-    from pyjuice.constraints.inference.dfa_exact.compiled.layout import Reachability
+    from pyjuice.constraints.inference.dfa_exact.compiled.reachability import Reachability
     rng = random.Random(0)
     K, n = 48, 8
     dfa = jc.DFA.from_dense(V, [[rng.randrange(K) for _ in range(V)] for _ in range(K)], 0, rng.sample(range(K), 12))
@@ -316,7 +316,7 @@ def test_fast_inference_keeps_the_class_masses(kind, build_pc, reference, monkey
     monkeypatch.setattr(categorical, "class_masses", lambda *a, **k: calls.append(1) or computed(*a, **k))
     builds, built = [], P.transition_masses                              # the transition masses follow them
     monkeypatch.setattr(P, "transition_masses", lambda *a, **k: builds.append(1) or built(*a, **k))
-    from pyjuice.constraints.inference.dfa_exact.kernels import transition_signatures as TS    # (by column, or by
+    from pyjuice.constraints.inference.dfa_exact.kernels.transitions import signatures as TS    # (by column, or by
     built_sig = TS.signature_transition_masses                                                  # signature)
     monkeypatch.setattr(TS, "signature_transition_masses", lambda *a, **k: builds.append(1) or built_sig(*a, **k))
     per_query = len(pc.input_layer_group)                                # one call per input layer
@@ -570,9 +570,10 @@ def test_transition_masses_match_brute_force(build_pc, monkeypatch, signatures):
     float64, on an automaton whose columns have more successors than one pair tile takes and more classes than one
     chunk, with token probabilities down to e^-100 and one emission row below e^-90 altogether (pairs whose class
     masses are all below the fp32 normal range); laid out by column, and by column signature
-    (:mod:`~pyjuice.constraints.inference.dfa_exact.kernels.transition_signatures`), read as the kernels read them."""
+    (:mod:`~pyjuice.constraints.inference.dfa_exact.kernels.transitions.signatures`), read as the kernels read them."""
     import pyjuice.constraints.inference.dfa_exact.compiled.program as P
-    from pyjuice.constraints.inference.dfa_exact.kernels import transitions, transition_signatures
+    from pyjuice.constraints.inference.dfa_exact.kernels import transitions
+    from pyjuice.constraints.inference.dfa_exact.kernels.transitions import signatures as transition_signatures
     monkeypatch.setattr(P, "GROUP_MIN_RATIO", 0)
     monkeypatch.setattr(transition_signatures, "SIGNATURE_MASSES", signatures)
     rng = random.Random(0)
@@ -591,7 +592,7 @@ def test_transition_masses_match_brute_force(build_pc, monkeypatch, signatures):
     tt, width, nc = prog.trans, prog.width, cc.backend.layout.next_col_table()
     ptr, succ = tt.entry_ptr.long().cpu(), tt.entry_succ.long().cpu()
     assert tt.grouped and prog.trans_persistent and tt.max_pairs > 16    # several pair tiles at the narrowest
-    assert nc.size(2) > transitions.TRANSITION_TILES["TC"]
+    assert nc.size(2) > transitions.masses.TRANSITION_TILES["TC"]
     assert cc.backend.token_classes.num_enumerated > 0                   # (most classes one token: enumerated)
     T = prog.transition_buffer().double().cpu()
     layer = next(iter(pc.input_layer_group))                             # the class masses, in float64 from the

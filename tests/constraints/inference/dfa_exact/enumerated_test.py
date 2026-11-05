@@ -317,9 +317,9 @@ def test_transition_masses_with_enumerated_classes_match_a_float64_brute_force(b
     there of ``p(v)`` -- and under dense evidence of a session, per sample, of ``q(v) = p(v) w(v) / Z``, over the
     sample's entries alone (:class:`~pyjuice.constraints.inference.dfa_exact.kernels.transitions.SampleMasses`): an
     entry no allowed class leads along has no mass (its log-sum would be -inf). One set of masses laid out by column
-    or by column signature (:mod:`~pyjuice.constraints.inference.dfa_exact.kernels.transition_signatures`), read as the
+    or by column signature (:mod:`~pyjuice.constraints.inference.dfa_exact.kernels.transitions.signatures`), read as the
     kernels read them."""
-    from pyjuice.constraints.inference.dfa_exact.kernels import transition_signatures
+    from pyjuice.constraints.inference.dfa_exact.kernels.transitions import signatures as transition_signatures
     monkeypatch.setattr(P, "GROUP_MIN_RATIO", 0)
     monkeypatch.setattr(transition_signatures, "SIGNATURE_MASSES", signatures)
     n, B = 6, 3

@@ -8,7 +8,7 @@ from typing import Sequence, Tuple
 import numpy as np
 import torch
 
-from ...compiled.layout import Reachability, _tile_any
+from ...compiled.reachability import Reachability, _tile_any
 
 
 @dataclass(frozen = True)
