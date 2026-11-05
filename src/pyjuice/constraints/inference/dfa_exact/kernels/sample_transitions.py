@@ -8,7 +8,7 @@ MEASURED (ncu, Codpula-4096 x JSON hard_0 B8, l2r call 0: 854 M masses, 2.56 G c
 with 31 G instructions on 255 registers (17% occupancy) -- a [128 rows, 32 entries] tile a program on 128 threads,
 every term computing the log of its token's probability and both a stored class's and an enumerated class's mass,
 each step a two-exp log-sum. Here a program takes ``TR`` of the tile's rows and ``TQ`` entries a step (registers for
-more programs), the steps are :func:`~.prod._lse_step_one_exp` (the two-exp step's floats with one exp), and the
+more programs), the steps are :func:`~.kernels.prod.launches._lse_step_one_exp` (the two-exp step's floats with one exp), and the
 tokens' log-probabilities come from a table of them built once a call (:func:`_log_table_kernel`: the same ``tl.log``
 of the same floats). Every class's code at its boundary comes resolved (``SampleMasses.xcode`` / ``wsel``, from
 :func:`~.transitions.sample_classes`): one load before a class's mass, not three. And a step's entries are taken in

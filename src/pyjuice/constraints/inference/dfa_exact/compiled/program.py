@@ -41,8 +41,8 @@ ALIAS_COPIES = True
 GROUP_MIN_RATIO = 8
 
 #: ``input @ block`` steps at the same position and block interval run this many to a program on the class-by-class
-#: path, when the block is not the identity (see :func:`~.prod._input_block_group_kernel`; launches wider than
-#: :data:`~.prod.GROUP_MIN_LANES`): every class's successors and slots are read once for all of them, not once
+#: path, when the block is not the identity (see :func:`~.kernels.prod.input_block._input_block_group_kernel`; launches wider than
+#: :data:`~.kernels.prod.run.GROUP_MIN_LANES`): every class's successors and slots are read once for all of them, not once
 #: per step. HMM4096 sweep over 1, 2, 4, 8, 16: 8 best or within 5% of it on every workload; against one step per
 #: program, bit-identical: 13.8k- / 49k-state automata x1.09-1.15 with a prefix, x1.16-1.31 on the 49k one without;
 #: batch 16 x1.02-1.18. 1: one step per program.
@@ -166,7 +166,7 @@ class Program:
         self.all_iv_full = self.all_iv_slots == self.entries[ends[:, 0]] * self.exits[ends[:, 1]]
         self.live_tables = OrderedDict()                               # (batch size, intervals) -> lane order tables
         self.plans = OrderedDict()                                     # query plans, see :mod:`.plans`
-        self.cw_walks = {}                                             # (see :func:`~..kernels.score._class_weight_cuda`)
+        self.cw_walks = {}                                             # (see :func:`~.kernels.score.class_weight_kernels._class_weight_cuda`)
         self.layouts = OrderedDict()                                   # conditionals' class weights, see .conditional
 
         # every product layer's launches, what the layout says of them; gated sum layers

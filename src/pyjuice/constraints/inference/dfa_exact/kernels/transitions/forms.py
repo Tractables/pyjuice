@@ -60,7 +60,7 @@ class TransitionTables:
     :ivar cls_ptr, cls_col, cls_succ: the same (column, class) entries BY CLASS: the columns where class ``c`` leads
         somewhere at ``t``, ascending, ``cls_col[cls_ptr[t, c] .. cls_ptr[t, c + 1]]`` (``cls_ptr`` [n, C + 1] int32,
         global numbers), and their successors (a sequence end's: its one column) -- the class weights' walk over a
-        class's columns (:func:`~.score._class_weight_kernel`); ``max_cls`` the most of any (boundary, class);
+        class's columns (:func:`~.kernels.score.class_weight_kernels._class_weight_kernel`); ``max_cls`` the most of any (boundary, class);
         ``cls_order`` [n, C] int32, every boundary's classes by their columns, most first (the walk's lanes take
         classes in this order, so that a program's classes have lists of a length)
     :ivar entry_class, pred_class: ungrouped only, [entries] int32: every entry's class, in the entry and the

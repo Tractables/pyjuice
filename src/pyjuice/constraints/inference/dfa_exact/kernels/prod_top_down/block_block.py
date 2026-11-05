@@ -29,7 +29,7 @@ def _top_down_tile(ap, bp, iv_table, apos, bpos, mb, live_k, r, c, tr, tc, Rn, K
                   TM: tl.constexpr, TN: tl.constexpr, TK: tl.constexpr, SUB_I: tl.constexpr, SUB_J: tl.constexpr,
                   TRANS_A: tl.constexpr, TRANS_B: tl.constexpr, SKIP: tl.constexpr, PRUNE: tl.constexpr,
                   PRECISION: tl.constexpr):
-    """``log(sum_k exp(A[r, k] + B[k, c]))`` for one output tile, as :func:`~.prod._block_block_tile`: ``A`` is
+    """``log(sum_k exp(A[r, k] + B[k, c]))`` for one output tile, as :func:`~.kernels.prod.block_block._block_block_tile`: ``A`` is
     ``[Rn, K]`` (stored ``[K, Rn]`` when ``TRANS_A``), ``B`` is ``[K, Cn]`` (stored ``[Cn, K]`` when ``TRANS_B``);
     ``live_k``: the shared boundary's liveness (pruned). Returns the tile and its shifted sums."""
     rm, cm = r < Rn, c < Cn
@@ -74,7 +74,7 @@ def _top_down_tile_exact(ap, bp, iv_table, apos, bpos, mb, live_k, r, c, tr, tc,
                         TM: tl.constexpr, TN: tl.constexpr, TK: tl.constexpr, SUB_I: tl.constexpr, SUB_J: tl.constexpr,
                         TRANS_A: tl.constexpr, TRANS_B: tl.constexpr, SKIP: tl.constexpr, PRUNE: tl.constexpr):
     """:func:`_top_down_tile` by an online log-sum-exp per entry over the shared columns one at a time (see
-    :func:`~.prod._block_block_tile_exact`)."""
+    :func:`~.kernels.prod.block_block._block_block_tile_exact`)."""
     rm, cm = r < Rn, c < Cn
     m = tl.full([TM, TN], float("-inf"), dtype = tl.float32)
     acc = tl.zeros([TM, TN], dtype = tl.float32)
@@ -172,7 +172,7 @@ def _block_block_top_down_kernel(element_flows, temp_flows, node_flows, node_mar
     operand ``R`` over ``[t1, t2)``, the shared columns the exit ``j``) or ``L^T @ O_out`` (the child is ``R`` over
     ``[t1, t2)``, the shared columns the entry ``i``), each parent on its own triple (:func:`_parent_tile`). ``O_KIND``:
     the other operand's kind (a sum's block in ``node_mars`` or ``prior_mars``, or a fold's scratch row). ``EXACT``: as
-    :func:`~.prod._block_block_kernel`, per (parent, tile)."""
+    :func:`~.kernels.prod.block_block._block_block_kernel`, per (parent, tile)."""
     pid = pid0 + tl.program_id(0)
     g = pid % SPLIT
     c = _child(children_idx, pid // SPLIT // B, INDEXED)
@@ -272,7 +272,7 @@ def _bb_compact_parent(p, parents, element_flows, temp_flows, node_mars, prior_m
     """Parent ``p``'s contribution to a compact child's output tile (rows ``rid``, columns ``cid``; ``pr``, ``pc``:
     their places among the sample's live columns), a log-space matrix product over the sample's live columns at the
     shared boundary -- the exit ``t2`` (``SIDE_L``: ``O_out @ R^T``) or the entry ``t0`` (``L^T @ O_out``) -- of
-    :func:`~.prod._rect_product`, computed again exactly (one shared column at a time) where its shifts flush a
+    :func:`~.kernels.prod.block_block._rect_product`, computed again exactly (one shared column at a time) where its shifts flush a
     ``valid`` entry. The parent's values are compact, or kept once (by slot); the other operand's inside values
     compact too (``MARS``), or the sample's dense block, or kept once (by slot)."""
     t0 = tl.load(parents + p * 9 + 5)

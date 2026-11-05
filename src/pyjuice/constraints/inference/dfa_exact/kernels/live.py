@@ -23,7 +23,7 @@ A block kept once for every sample (``prior_mars``, see :mod:`.plans`) is comput
 slots hold finite values. The arguments above still make every such slot a term of a dead product -- it is only ever
 added to -inf -- so the values stay exact. They do enter the maxima ``block @ block`` shifts its exponentials by, which
 can flush a live entry's terms: the tiles where that happens are computed again exactly (see
-:func:`~.prod._block_block_tile`).
+:func:`~.kernels.prod.block_block._block_block_tile`).
 """
 
 from dataclasses import dataclass

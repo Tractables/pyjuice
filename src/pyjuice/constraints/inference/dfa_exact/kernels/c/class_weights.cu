@@ -1,5 +1,5 @@
 // The class weights of `input @ block` steps with one exit column and one step a destination, on compact values
-// under evidence pruning (`kernels/score.py`, `_class_weight_kernel`'s class walk), as CUDA kernels: destination
+// under evidence pruning (`kernels/score/class_weight_kernels.py`, `_class_weight_kernel`'s class walk), as CUDA kernels: destination
 // (position t, column k) of sample b and class x gets, stored to (or log-added into) its row of `dfa_class_flow`,
 //     log sum over the columns i at t where x leads to q, i live for the sample, of  exp(O_out[i, 0] + R[q, 0])
 // -- the Triton kernel's terms in its order (the class's columns ascending) with its arithmetic
@@ -267,7 +267,7 @@ int64_t cw_stage_smem(int64_t tn, int64_t wt, int64_t wt1) {
     return tn * (wt + wt1) * 4;
 }
 
-// One class-weight launch (`kernels/score.py`, `_class_weight_cuda`): `tiles` (int32, 16 a node tile) in `subs` CTAs
+// One class-weight launch (`kernels/score/class_weight_kernels.py`, `_class_weight_cuda`): `tiles` (int32, 16 a node tile) in `subs` CTAs
 // of `tn` (1, 2 or 4) destinations each, every sample, `threads` a CTA (128 or 256); `tlist` / `t2i` the launch's
 // positions; `tab` / `cnt` the entry tables' work space ([T, B, lanes / 32, maxl, 32] / [T, B, lanes] int32; `lanes`
 // a multiple of 32, at least any column's live classes, `maxl` at least any class list at the positions); `wt_max` /

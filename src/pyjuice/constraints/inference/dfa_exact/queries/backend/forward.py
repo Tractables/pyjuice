@@ -221,8 +221,8 @@ def run_forward(backend, bufs: dict, plan, x: torch.Tensor, missing: torch.Tenso
 def kept_values(backend, plan, replan, forward, valid: torch.Tensor):
     """
     The values kept once a query reads (:attr:`~.plans.QueryPlan.prior_read`) must be held together while it runs.
-    When they do not fit their pool (:class:`~...state.PriorPool`) beside its checkpoints, the ones it computes are
-    computed first in pieces, the lowest depths first (:meth:`~...state.PriorPool.piece`), each by a plan of its own
+    When they do not fit their pool (:class:`~.inference.dfa_exact.prior_pool.PriorPool`) beside its checkpoints, the ones it computes are
+    computed first in pieces, the lowest depths first (:meth:`~.dfa_exact.prior_pool.PriorPool.piece`), each by a plan of its own
     (:func:`~.plans.kept_plan`) that ``forward(plan)`` runs (:func:`run_forward` with the query's arguments), the pool
     evicting between them all but the values the query reads -- ``valid`` (the state's, see
     :meth:`~...state.State.prior_validity`) marked as they are computed; the query's plan is then made again

@@ -10,7 +10,7 @@ signatures across boundaries (HMM-4096 x JSON hard_0, n 128: 85,034 columns, 3,1
 under tied inputs every position's steps read the same class-mass rows (an HMM: 4096 rows for 128 x 4096 steps). The
 masses are then laid out per (class of positions reading the same rows, rank, signature pair) -- a position's steps
 in rank order, the class's rows -- and built once a signature and class, from a representative column: the same
-arithmetic as :func:`~.transitions._transition_kernel` over the same operands (the column's classes in the same
+arithmetic as :func:`~.kernels.transitions.masses._transition_kernel` over the same operands (the column's classes in the same
 order, its pairs and enumerated tokens chunked alike), so every mass is the per-column kernel's own, bit for bit.
 
 The readers (the ``input @ block`` / ``block @ input`` kernels and their top-down twins) address a step's masses as
@@ -374,7 +374,7 @@ def _signature_transition_kernel(class_mars, mass_row, trans, rows, tiles, delta
                                  rep_ptr, rep_col, rep_shift, width, W, C, K, n, Cs, num_enum, input_start, num_qtiles,
                                  pair_off, pairs, pid0, TS: tl.constexpr, QT: tl.constexpr, TP: tl.constexpr,
                                  TC: tl.constexpr, TE: tl.constexpr, ENUM: tl.constexpr):
-    """:func:`~.transitions._transition_kernel` (one set of masses, no per-sample weights) over every position's
+    """:func:`~.kernels.transitions.masses._transition_kernel` (one set of masses, no per-sample weights) over every position's
     representative columns (``rep_ptr`` / ``rep_col``) alone, a column's masses stored at its signature's slots
     (``rep_shift``: the first's slot less the column's first pair's number) -- the same operations on the same
     operands, so the same values."""

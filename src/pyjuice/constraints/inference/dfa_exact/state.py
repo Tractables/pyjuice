@@ -554,7 +554,7 @@ class State:
         key -> :func:`~.sum.stacked_weights`, see :class:`~.program.Program`), and whether they outlive the
         query. Inside a :func:`pyjuice.fast_inference` scope that allows parameter copies, the scope's: kept until it
         exits, so the query stacks every run it can (see ``STACK_MAX_COLUMNS`` there) -- and the CUDA fused sums keep
-        their weights in fragment order there too (:func:`~.kernels.sum._cuda_fragments`); else an empty dict of the
+        their weights in fragment order there too (:func:`~.kernels.sum.fused_cuda._cuda_fragments`); else an empty dict of the
         query's own, which stacks only reused weights (and, a ``precision = "bf16"`` query, holds its bf16 weights).
         """
         if self._kept_stacks is not None:

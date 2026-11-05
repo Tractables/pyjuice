@@ -24,7 +24,7 @@ input-independent ones not kept once per sample as well. Of the values kept once
 -- the children of the products it computes per sample, of the top-down values it computes, the root's for a
 marginal -- that ``prior_mars`` does not hold, and, so that each can be computed, their children kept once that it
 does not hold either, down to the ones it holds or the inputs (:attr:`QueryPlan.prior_read`: the values read, held
-or computed, which the storage keeps while the query runs, see :class:`~...state.PriorPool`; when they do not all fit
+or computed, which the storage keeps while the query runs, see :class:`~.inference.dfa_exact.prior_pool.PriorPool`; when they do not all fit
 it, the lower ones are computed first, by plans of their own, :func:`kept_plan`). A product follows its
 sum regions (they share their scope), and a product's intermediate folds follow the product. The :class:`QueryPlan`
 is the subsets of the Program's launches, dense runs and fused parts that do so, cached on the Program by what they
@@ -89,7 +89,7 @@ class QueryPlan:
     :ivar input_reads: None (every position), or int32 [n] (device): 1 at the positions whose input values its
         launches read (:func:`input_reads`), the only ones a query computes, and ``input_positions`` those (bool,
         host)
-    :ivar sizes, part_slots: what this program's automaton says of them (:func:`~.planners.forward_sizes`)
+    :ivar sizes, part_slots: what this program's automaton says of them (:func:`~.backend.planners.forward.forward_sizes`)
     """
 
     steps: list
@@ -131,11 +131,11 @@ class TopDownPlan:
     :ivar dead: None, or int32 [D, 2] (device): the rows of the regions it computes per sample that no launch writes
         (see :class:`~.top_down_program.TopDownProgram`), and ``dead_regions``, their regions
     :ivar cw_fill: a scoring plan's: whether ``dfa_class_flow`` must hold -inf before its class weight launches run
-        (:func:`~.planners.class_weight_writes`; their entries ``(launch, index list, store)``)
+        (:func:`~.backend.planners.top_down.class_weight_writes`; their entries ``(launch, index list, store)``)
     :ivar busy: the indices of the steps with anything to run, ascending (the others' parts are all empty)
     :ivar input_reads: bool [n] (host): the positions whose input values its launches read (:func:`input_reads`)
     :ivar fold_part, fold_ptr: int64 (host): what the sizes of its fold launches' cuts are the most of
-        (:func:`~.planners.cut_parts`), and ``fold_sizes`` those, of this program's automaton
+        (:func:`~.backend.planners.cuts.cut_parts`), and ``fold_sizes`` those, of this program's automaton
     """
 
     steps: list

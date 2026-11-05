@@ -851,7 +851,7 @@ _SPLIT_DEFAULTS = (_lifted_sum.tile_rules.SPLIT_PROGRAMS_PER_SM, _lifted_sum.til
 
 
 def set_split(monkeypatch, mode: str):
-    """The fused sum kernels' split reductions (``kernels/sum.py``): ``"default"`` the library's rule, ``"max"``
+    """The fused sum kernels' split reductions (``kernels/sum/fused_cuda.py``): ``"default"`` the library's rule, ``"max"``
     every launch split as far as its reductions allow (shares of one chunk, whatever the launch's size), ``"off"``
     none; any mode after any other."""
     per_sm, min_share, most = _SPLIT_DEFAULTS
@@ -875,7 +875,7 @@ def set_split_fixture(monkeypatch):
 
 @pytest.fixture(params = ["default", "always"])
 def pre(request, monkeypatch):
-    """The fused top-down kernel's pre-pass (``kernels/sum.py``): the library's rule, or every launch that may take
+    """The fused top-down kernel's pre-pass (``kernels/sum/fused_top_down.py``): the library's rule, or every launch that may take
     it (any number of tiles of children)."""
     if request.param == "always":
         monkeypatch.setattr(_lifted_sum.tile_rules, "PRE_MIN_TILES", 1)

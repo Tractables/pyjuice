@@ -1,6 +1,6 @@
 """
 Which columns of a boundary are reached from which columns of an earlier one, on the device
-(:class:`~..compiled.layout.Reachability`), as bitsets: for every column of the boundary a sweep has reached, a bit per
+(:class:`~.dfa_exact.compiled.reachability.Reachability`), as bitsets: for every column of the boundary a sweep has reached, a bit per
 column of the boundary it started from. A step is an OR over every column's predecessors, a word at a time, through the
 distinct (column, successor) pairs of the automaton's alike boundaries
 (:class:`~.transitions.BoundaryGroups`).

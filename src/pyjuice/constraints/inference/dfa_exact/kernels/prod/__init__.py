@@ -21,7 +21,7 @@ block per sample, sample-major: sample ``b``'s block in columns ``[b * slots, (b
 scope no sample observes may keep one block for every sample instead, in ``prior_mars`` (the query plan says which,
 see :mod:`.plans`). A block keeps
 only the (entry column ``i``, exit column ``j``) pairs the automaton joins, in row-major order: slot ``i * X +
-j`` when it joins them all, else through its interval's tables (:class:`~.layout.IntervalTables`). An input child
+j`` when it joins them all, else through its interval's tables (:class:`~.dfa_exact.compiled.reachability.IntervalTables`). An input child
 is read only as the log-probability of its observed token (pyjuice's own input layers wrote it) or, when the
 token is missing, through its transition masses (:func:`transition_masses`): for a column and one of its
 successors, the log-mass of the token classes that lead there -- so a missing token costs a gather per

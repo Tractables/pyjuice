@@ -201,7 +201,7 @@ def circuit_tables(pc, structure, dev, **switches) -> "CircuitTables":
 
 
 def dense_groups_switch() -> int:
-    """The dense path's smallest node block (:data:`~..kernels.sum.DENSE_MIN_BLOCK`): which sum parts are dense."""
+    """The dense path's smallest node block (:data:`~.kernels.sum.dense.DENSE_MIN_BLOCK`): which sum parts are dense."""
     from ..kernels import sum as lifted_sum
     return lifted_sum.dense.DENSE_MIN_BLOCK
 
@@ -525,9 +525,8 @@ class CircuitTables:
             if kind == "prod":
                 products = {e.product for layer in layers for e in layer.emits}
                 elem_ivs[prod_index] = np.asarray(sorted(iv_index[sum_ivs[k]] for k in products), dtype = np.int64)
-        # ... as one table, a row per group padded with one past the last interval (one without lanes, see
-        # :func:`~..kernels.compact._group_widths`), and every group's rows and slots: a query's widths of every
-        # group's rows in a few array operations
+        # ... as one table, a row per group padded with one past the last interval (one without lanes), and every
+        # group's rows and slots: a query's widths of every group's rows in a few array operations
         groups_p = rows.product_groups
         elem_iv_pad = np.full((len(groups_p), max([1, *map(len, elem_ivs.values())])), len(all_ivs), dtype = np.int64)
         for pi, values in elem_ivs.items():
@@ -607,7 +606,7 @@ class Assembly:
     :ivar trans_job: the steps :func:`~..kernels.transitions.transition_masses` builds for, or None
     :ivar score, top_down, forward_shape, position_classes: built for the first program that asks
         (:func:`~..kernels.score.score_tables`, :func:`~.top_down_program.top_down_template`,
-        :func:`~..queries.backend.planners._forward_shape`, :func:`~..kernels.transition_signatures.position_classes`)
+        :func:`~.backend.planners.forward._forward_shape`, :func:`~.kernels.transitions.signatures.position_classes`)
     """
 
     def __init__(self, circuit: CircuitTables, full: Dict[Tuple[int, int], bool]):
@@ -738,7 +737,7 @@ def _cat_fields(parts: List[Emit]) -> np.ndarray:
 
 
 def _step_groups(st: np.ndarray, sizes):
-    """An ``input @ block`` launch's steps (host rows, see :data:`~.prod.INPUT_BLOCK_FIELDS`): ``order``, which
+    """An ``input @ block`` launch's steps (host rows, see :data:`~.kernels.prod.launches.INPUT_BLOCK_FIELDS`): ``order``, which
     sorts them by their position and block end, and per group size ``G`` of ``sizes``, ``firsts`` [groups + 1]: the
     first (sorted) step of every group of at most ``G`` consecutive steps that share both, then the end."""
     key = st[:, 2] * (int(st[:, 5].max()) + 1) + st[:, 5]

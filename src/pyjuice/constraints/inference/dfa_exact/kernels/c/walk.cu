@@ -1,4 +1,4 @@
-// The `input @ block` top-down step on compact values (`kernels/prod_top_down.py`, `_input_block_top_down_kernel`):
+// The `input @ block` top-down step on compact values (`kernels/prod_top_down/input_block.py`, `_input_block_top_down_kernel`):
 // the right operand R over [t + 1, t2) of a launch's children,
 //     O_R[q, j] = log sum over the parents, and over the entries (i, class) leading to q at boundary t, of
 //                 mass + O_out[i, j],
@@ -45,7 +45,7 @@ namespace {
 
 using namespace tri;
 
-// A class's CODE at a boundary (`kernels/transitions.py`, EnumeratedTokens): a stored class's column of the class-mass
+// A class's CODE at a boundary (`kernels/transitions/forms.py`, EnumeratedTokens): a stored class's column of the class-mass
 // table, or -1 - e for the e-th enumerated token live at the boundary (its mass its token's own probability). The
 // staged masses of a child run over the Cs stored columns, then the boundary's enumerated tokens: code x sits at
 // `x >= 0 ? x : Cs + (-1 - x)`, which is what a packed term carries.

@@ -210,7 +210,7 @@ def _class_weight_kernel(dfa_class_flow, cw_col, cw_K, cw_count, cw_cls, cw_off,
     :class:`ClassWeightRows`; rows of ``cw_K`` floats per position) -- or stored there (``STORE``: the launch writes
     each of its destinations first in its query, see :mod:`..queries.backend.plans`). A node tile's destinations (see
     :func:`~.common.node_tiles`) are at one position, with steps to the same other boundaries: they walk the same
-    columns, once for all of them; one exp a term (:func:`~.prod._lse_step_one_exp`).
+    columns, once for all of them; one exp a term (:func:`~.kernels.prod.launches._lse_step_one_exp`).
 
     Two walks, the program choosing per its lanes (``WALK`` 0; 1 and 2 force one): over the CLASS's columns -- those
     where it leads somewhere, ``cls_ptr`` / ``cls_col`` / ``cls_succ`` (:class:`~.transitions.TransitionTables`),

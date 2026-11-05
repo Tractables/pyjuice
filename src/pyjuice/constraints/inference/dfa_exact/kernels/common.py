@@ -272,7 +272,7 @@ def _exit_width(width, t2, n):
 @triton.jit
 def _interval(iv_of, iv_info, a, b, n):
     """``(slots, positions, pairs)`` of the interval ``[a, b)``: its blocks' slots per sample, and where its
-    position and pair tables start (-1 when it keeps every pair; see :class:`~.layout.IntervalTables`)."""
+    position and pair tables start (-1 when it keeps every pair; see :class:`~.dfa_exact.compiled.reachability.IntervalTables`)."""
     k = tl.load(iv_of + a * (n + 1) + b).to(tl.int64) * 3
     return tl.load(iv_info + k).to(tl.int32), tl.load(iv_info + k + 1), tl.load(iv_info + k + 2)  # 32-bit index math
 
