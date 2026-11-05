@@ -853,14 +853,14 @@ def test_a_copy_nothing_leads_to():
     that is reached; what the others would write is not in the table's last row, the dead state's."""
     copies = counters.Copies(np.asarray([3, 6], dtype = np.int64), np.asarray([1], dtype = np.int64), np.asarray([3], dtype = np.int64), np.asarray([0], dtype = np.int64),
                              np.asarray([0, 1], dtype = np.int64), np.asarray([0], dtype = np.int32), np.asarray([-1], dtype = np.int32), np.asarray([3], dtype = np.int32),
-                             np.asarray([0], dtype = np.int32), np.asarray([0], dtype = np.int64), np.asarray([0], dtype = np.int32))
+                             np.asarray([0], dtype = np.int32), np.asarray([0, 0], dtype = np.int64), np.zeros(0, dtype = np.int32), np.asarray([0], dtype = np.int64),
+                             np.asarray([0], dtype = np.int32))
     moves = np.asarray([(0 << 32) | 3, 0], dtype = np.int64)
     row_at = np.asarray([0, 1, 1], dtype = np.int64)
     row_len = np.asarray([1, 0, 0], dtype = np.int64)
-    order = np.asarray([0, 3, 1], dtype = np.int64)
-    place = np.asarray([0, 2, -1, 1, -1, -1], dtype = np.int64)
+    order = np.asarray([0, 3, 1], dtype = np.int32)
     for device in on_devices():
-        table = token_lift.TableToCome(moves, row_at, row_len, copies, order, place, 1, 2, 2)
+        table = token_lift.TableToCome(moves, row_at, row_len, copies, order, 1, 2, 6, 2)
         on = table.on_device(device)
         assert on.size() == (3, 2)
         assert on.cpu().tolist() == [[1, 2], [1, 2], [2, 2]] == table.dense().tolist()

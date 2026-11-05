@@ -34,12 +34,22 @@ from numba import njit, prange
 #: first's, read through this. The states from ``first[r]`` to ``first[r + 1]`` are ``extra[r]`` copies of ``u[r]`` each, and the row of the ``l``-th of
 #: a copy runs from ``row_at[row_of[r] + l]`` to the next: the classes ``cls``, and where they lead: to the state ``v`` (``g`` -1), or ``g`` copies on,
 #: to its ``v``-th state (:func:`~.token_lift.copy_target`). The window's copies past the last are ``window`` from ``window_at[r]`` on. What the breadth-first order
-#: reads of a row is ``first_moves[firsts_at[row_of[r] + l]]``, as in :func:`_first_moves`.
-Copies = namedtuple("Copies", "first u extra row_of row_at cls g v firsts_at window_at window")
+#: reads of a row is ``first_moves[firsts_at[row_of[r] + l]]``, as in :func:`_first_moves`; of a row of a copy but the first it comes to, only those of them
+#: on through the chain (the others lead to one state from every copy, which has its place by then), as how far from the start of the copy
+#: they lead: ``later`` from ``later_at[row_of[r] + l]`` to the next.
+Copies = namedtuple("Copies", "first u extra row_of row_at cls g v firsts_at later_at later window_at window")
 
 NO_COPIES = Copies(np.zeros(1, dtype = np.int64), np.zeros(0, dtype = np.int64), np.zeros(0, dtype = np.int64), np.zeros(0, dtype = np.int64), np.zeros(1, dtype = np.int64),
-                   np.zeros(0, dtype = np.int32), np.zeros(0, dtype = np.int32), np.zeros(0, dtype = np.int32), np.zeros(0, dtype = np.int32), np.zeros(0, dtype = np.int64),
-                   np.zeros(0, dtype = np.int32))
+                   np.zeros(0, dtype = np.int32), np.zeros(0, dtype = np.int32), np.zeros(0, dtype = np.int32), np.zeros(0, dtype = np.int32), np.zeros(1, dtype = np.int64),
+                   np.zeros(0, dtype = np.int32), np.zeros(0, dtype = np.int64), np.zeros(0, dtype = np.int32))
+
+
+@njit(cache = True)
+def room_for(n):
+    """``n`` words not yet touched. numpy asks the kernel for huge pages for an array of 4 MB or more; when memory is fragmented, the first touch of every 2 MB of
+    it then waits on a compaction that mostly fails (MEASURED in one state of the memory, numpy's request off and on: 186 schemas' sum 761 and 1,634 ms, the largest 49 and 190).
+    Allocated by numba, no such request. (A table is another matter: writing all of it, huge pages are worth it when they are to be had.)"""
+    return np.empty(n, dtype = np.int64)
 
 
 class NotCounted(Exception):
@@ -483,6 +493,32 @@ def _rows_of_first_copies(moves, row_at, row_len, forward, template, where_g, wh
 
 
 @njit(cache = True)
+def _first_moves_on(firsts_at, first_moves, row_at, row_of, u, g, v):
+    """:attr:`Copies.later_at` and :attr:`Copies.later`: of the first moves of every row of the runs of ``u`` states, those on through the chain."""
+    later_at = np.zeros(firsts_at.size + 1, dtype = np.int64)
+    total = 0
+    for r in range(u.size):
+        for local in range(row_of[r], row_of[r] + u[r]):
+            later_at[local] = total
+            f, at = firsts_at[local], row_at[local]
+            for j in range(f + 1, f + 1 + first_moves[f]):
+                if g[at + first_moves[j]] >= 0:
+                    total += 1
+        later_at[row_of[r] + u[r]] = total
+    later = np.empty(total, dtype = np.int32)
+    total = 0
+    for r in range(u.size):
+        for local in range(row_of[r], row_of[r] + u[r]):
+            f, at = firsts_at[local], row_at[local]
+            for j in range(f + 1, f + 1 + first_moves[f]):
+                e = at + first_moves[j]
+                if g[e] >= 0:
+                    later[total] = g[e] * u[r] + v[e]
+                    total += 1
+    return later_at, later
+
+
+@njit(cache = True)
 def _first_moves(moves, row_at, row_len, forward, template, seen_on, seen_out, mark, first_moves, at, copy_first):
     """
     What the breadth-first order reads of a row of a copy of ``template``: the first of its moves to every target, on through the chain
@@ -688,7 +724,7 @@ def expanded_moves(roots: List[Run], remap: np.ndarray, K: int, K_kept: int, K_f
         r.moves = int(row_len[r.table[0]].sum()) + sum(c.moves * c.extra for c in r.children[0])
     used = int(row_len[:K].sum())
     total = used + sum(r.moves * r.extra for r in runs)
-    moves = np.empty(total + 1, dtype = np.int64)
+    moves = room_for(total + 1)
     at = _compacted(moves0, row_at, row_len, K, moves)
     forward = np.zeros(total + 1, dtype = np.bool_)
     first_at = np.empty(K_kept + 2, dtype = np.int32)
@@ -790,7 +826,8 @@ def expanded_moves(roots: List[Run], remap: np.ndarray, K: int, K_kept: int, K_f
     for r in roots:
         _unmark_window(r.window, where_g, where_r, first_at)
     window = np.concatenate([r.window.ravel() for r in roots]) if R else NO_COPIES.window
-    return moves, first_at, first_moves, Copies(first, u, extra, row_of, copy_row_at, cls, g, v, firsts_at, window_at, window)
+    later_at, later = _first_moves_on(firsts_at, first_moves, copy_row_at, row_of, u, g, v)
+    return moves, first_at, first_moves, Copies(first, u, extra, row_of, copy_row_at, cls, g, v, firsts_at, later_at, later, window_at, window)
 
 
 #: so many moves to write are worth a team

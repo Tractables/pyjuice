@@ -22,7 +22,7 @@ from numba import get_num_threads, njit, prange
 from ..dfa import DFA
 from ..vocabulary import Vocabulary
 from .behaviours import behaviours_of, classes_of_behaviours, rows_of_behaviours
-from .counters import NO_COPIES, NotCounted, expanded_moves, states_put_back
+from .counters import NO_COPIES, NotCounted, expanded_moves, states_put_back, room_for
 from .dfa import bfs_order
 from .byte_level import ByteAutomaton
 from .threads import few_threads
@@ -851,75 +851,98 @@ def _sparse_rows_parallel(table, dead, states, remap, gptr, gclass, gnode, class
 
 
 @njit(cache = True)
+def _reached(t, seen, order, num):
+    """``t`` in the order, if it is not yet: how many are."""
+    if seen[t]:
+        return num
+    seen[t] = True
+    order[num] = t
+    return num + 1
+
+
+@njit(cache = True)
 def _sparse_order(moves, row_at, row_len, first_at, first_moves, copies, K, T, C, pad):
-    """:func:`~.dfa.bfs_order` of the rows of :func:`_sparse_rows` from state 0, ``T`` states and places: the dead state ``K`` where a row has its
-    first gap, the padding's state ``K + 1`` being ``pad``. ``(order, place)``, the states and every state's place, -1 for the rest. Of a row only those
-    of its moves are read that ``first_moves[first_at[state]]`` counts and lists, if any: the first to each state. Past ``K + 1`` a state's row is
-    its run's first copy's (:class:`~.counters.Copies`)."""
-    order = np.empty(T, dtype = np.int64)
-    place = np.full(T, -1, dtype = np.int64)
-    order[0] = 0
-    place[0] = 0
+    """:func:`~.dfa.bfs_order` of the rows of :func:`_sparse_rows` from state 0, of ``T`` states: the states in that order, the dead state ``K`` where a row has
+    its first gap, the padding's state ``K + 1`` being ``pad``. Of a row only those of its moves are read that ``first_moves[first_at[state]]`` counts and lists, if
+    any: the first to each state. Past ``K + 1`` a state's row is its run's first copy's (:class:`~.counters.Copies`), of which but the first time only the moves
+    on through the chain. A mark a state: nearly all reads find one, and the marks' memory is an eighth of the places' the order does not need (:func:`_places`)."""
+    order = np.empty(T, dtype = np.int32)
+    seen = np.zeros(T, dtype = np.bool_)
+    read = np.zeros(copies.firsts_at.size, dtype = np.bool_)
+    order[0], seen[0] = 0, True
     num, head = 1, 0
     mask = (np.int64(1) << 32) - 1
-    r = 0
+    r, u, end, copy_at = 0, np.int64(0), np.int64(0), np.int64(1) << 62
     while head < num:
-        q = order[head]
+        q = np.int64(order[head])
         head += 1
         if q > K + 1:
-            if not copies.first[r] <= q < copies.first[r + 1]:
-                r = np.searchsorted(copies.first, q, side = "right") - 1
-            u = copies.u[r]
-            k = (q - copies.first[r]) // u
-            local = copies.row_of[r] + q - copies.first[r] - k * u
-            f = copies.firsts_at[local]
-            at = copies.row_at[local]
+            l = q - copy_at
+            if l < 0 or l >= u:                                 # (in another copy than the state before; mostly it is not, no division then)
+                if not copies.first[r] <= q < copies.first[r + 1]:
+                    r = np.searchsorted(copies.first, q, side = "right") - 1
+                u, end = copies.u[r], copies.first[r + 1]
+                l = (q - copies.first[r]) % u
+                copy_at = q - l
+            local = copies.row_of[r] + l
+            if read[local]:
+                for j in range(copies.later_at[local], copies.later_at[local + 1]):
+                    t = copy_at + copies.later[j]
+                    if t >= end:
+                        t = np.int64(copies.window[copies.window_at[r] + u + t - end])
+                    num = _reached(t, seen, order, num)
+                continue
+            read[local] = True
+            f, at = copies.firsts_at[local], copies.row_at[local]
             for j in range(f + 1, f + 1 + first_moves[f]):
-                t = copy_target(copies, r, k + 1, at + first_moves[j])
-                t = pad if t == K + 1 else t
-                if place[t] < 0:
-                    place[t] = num
-                    order[num] = t
-                    num += 1
+                e = at + first_moves[j]
+                t = np.int64(copies.v[e])
+                if copies.g[e] >= 0:
+                    t += copy_at + copies.g[e] * u
+                    if t >= end:
+                        t = np.int64(copies.window[copies.window_at[r] + u + t - end])
+                num = _reached(pad if t == K + 1 else t, seen, order, num)
             continue
         at, n = row_at[q], row_len[q]
-        if place[K] < 0:                                        # (the dead state's place: until it has one)
+        if not seen[K]:                                         # (the dead state's place: until it has one)
             expected = 0
             for k in range(at, at + n):
                 c = moves[k] >> 32
-                if c > expected and place[K] < 0:
-                    place[K] = num
-                    order[num] = K
-                    num += 1
+                if c > expected:
+                    num = _reached(K, seen, order, num)
                 expected = c + 1
                 t = moves[k] & mask
-                t = pad if t == K + 1 else t
-                if place[t] < 0:
-                    place[t] = num
-                    order[num] = t
-                    num += 1
-            if expected < C and place[K] < 0:
-                place[K] = num
-                order[num] = K
-                num += 1
+                num = _reached(pad if t == K + 1 else t, seen, order, num)
+            if expected < C:
+                num = _reached(K, seen, order, num)
         elif first_at[q] >= 0:
             f = first_at[q]
             for j in range(f + 1, f + 1 + first_moves[f]):
                 t = moves[at + first_moves[j]] & mask
-                t = pad if t == K + 1 else t
-                if place[t] < 0:
-                    place[t] = num
-                    order[num] = t
-                    num += 1
+                num = _reached(pad if t == K + 1 else t, seen, order, num)
         else:
             for k in range(at, at + n):
                 t = moves[k] & mask
-                t = pad if t == K + 1 else t
-                if place[t] < 0:
-                    place[t] = num
-                    order[num] = t
-                    num += 1
-    return order[:num], place
+                num = _reached(pad if t == K + 1 else t, seen, order, num)
+    return order[:num]
+
+
+@njit(cache = True)
+def _places(order, T):
+    """Every state's place in ``order``, -1 for the rest of the ``T``."""
+    place = np.full(T, -1, dtype = np.int64)
+    for i in range(order.size):
+        place[order[i]] = i
+    return place
+
+
+@njit(cache = True)
+def _in_order(accept, order):
+    """``accept[order]``, without an index array of 8 bytes an entry on the way."""
+    out = np.empty(order.size, dtype = np.bool_)
+    for i in range(order.size):
+        out[i] = accept[order[i]]
+    return out
 
 
 @njit(cache = True)
@@ -943,7 +966,7 @@ def _sparse_table(moves, row_at, row_len, copies, order, place, K, pad, out, lo,
     mask = (np.int64(1) << 32) - 1
     r = 0
     for i in range(lo, hi):
-        q = order[i]
+        q = np.int64(order[i])
         for c in range(C):
             out[i, c] = gone
         if q > K + 1:
@@ -991,15 +1014,16 @@ class TableToCome:
     """The dense table of a token automaton, as :func:`_table_of_rows` leaves it, written when first asked for: most of a large automaton's
     cost and memory, and not everything reads it. :meth:`dense` once on the host; :meth:`on_device` makes it where it is wanted, none of it on the host."""
 
-    def __init__(self, moves, row_at, row_len, copies, order, place, K, pad, C):
-        self.parts = (moves, row_at, row_len, copies, order, place, K, pad)
+    def __init__(self, moves, row_at, row_len, copies, order, K, pad, T, C):
+        self.parts = (moves, row_at, row_len, copies, order, K, pad, T)
         self.rows, self.classes = order.size, C
         self.made = None
 
     @few_threads
     def dense(self) -> torch.Tensor:
         if self.made is None:
-            moves, row_at, row_len, copies, order, place, K, pad = self.parts
+            moves, row_at, row_len, copies, order, K, pad, T = self.parts
+            place = _places(order, T)
             out = np.empty((self.rows, self.classes), dtype = np.int64)
             threads = get_num_threads()
             if out.size >= THREADS_ENTRIES and threads > 1:
@@ -1014,11 +1038,11 @@ class TableToCome:
         scatter, and not at the mercy of how fast the kernel supplies the host's memory. It has a row past the last, which a state of no place (-1) writes."""
         if self.made is not None:
             return self.made.to(device)
-        moves, row_at, row_len, copies, order, place, K, pad = self.parts
-        places = place.copy()
-        places[K + 1] = place[pad]
-        places = torch.from_numpy(places).to(device)
-        out = torch.full((self.rows + 1, self.classes), int(place[K]), dtype = torch.int64, device = device)
+        moves, row_at, row_len, copies, order, K, pad, T = self.parts
+        places = torch.full((T,), -1, dtype = torch.int64, device = device)
+        places[torch.from_numpy(order).to(device).long()] = torch.arange(self.rows, device = device)
+        places[K + 1] = places[pad]
+        out = torch.full((self.rows + 1, self.classes), int(places[K]), dtype = torch.int64, device = device)
         states, classes, targets = (torch.from_numpy(x).to(device) for x in _written_moves(moves, row_at, row_len, K + 2))
         out[places[states], classes] = places[targets]
         window = torch.from_numpy(copies.window).to(device).long()
@@ -1050,7 +1074,7 @@ def _rows_by_walks(automaton: ByteAutomaton, states: np.ndarray, remap: np.ndarr
     rep_node = np.where(kinds == 0, trie.end_nodes[trie.token_end[np.minimum(reps, trie.token_end.size - 1)]], -1).astype(np.int64)
     gptr, gclass, gnode, class_at = _rep_trie(trie.first_child, trie.node_byte, automaton.byte_class, trie.parent, rep_node)
     itself = np.nonzero(kinds == 1)[0].astype(np.int64)
-    moves = np.empty(K * C + 1, dtype = np.int64)               # (room for all, where a part starts; only what is written is touched)
+    moves = room_for(K * C + 1)                                 # (room for all, where a part starts; only what is written is touched)
     row_at, row_len = np.zeros(K_kept + 2, dtype = np.int64), np.zeros(K_kept + 2, dtype = np.int64)
     args = (automaton._kept_table, automaton.dead, states, remap, gptr, gclass, gnode, class_at, itself, accept, end_class, K_kept, C, moves, row_at, row_len)
     threads = get_num_threads()
@@ -1085,9 +1109,9 @@ def _table_of_rows(automaton: ByteAutomaton, remap: np.ndarray, K: int, K_kept: 
         accept[pad] = True
     if first_at is None:
         first_at = np.full(K_kept + 2, -1, dtype = np.int32)
-    order, place = _sparse_order(moves, row_at, row_len, first_at, first_moves, copies, K_kept, K_full + 2, C, pad)
-    table = TableToCome(moves, row_at, row_len, copies, order, place, K_kept, pad, C)
-    return table if order.size * C >= TABLE_TO_COME else table.dense(), accept[order]
+    order = _sparse_order(moves, row_at, row_len, first_at, first_moves, copies, K_kept, K_full + 2, C, pad)
+    table = TableToCome(moves, row_at, row_len, copies, order, K_kept, pad, K_full + 2, C)
+    return table if order.size * C >= TABLE_TO_COME else table.dense(), _in_order(accept, order)
 
 
 #: an automaton of at most so many entries has its tokens' classes and rows from the behaviours of the trie's nodes, reading at most so many
