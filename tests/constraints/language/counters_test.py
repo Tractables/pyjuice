@@ -10,10 +10,11 @@ import numpy as np
 import pytest
 import torch
 
+import pyjuice as juice
 import pyjuice.constraints as jc
+from pyjuice.constraints.inference.dfa_exact.compiled import layout
 from pyjuice.constraints.language.backend import automata as A, counters, token_lift
 from pyjuice.constraints.language.backend.json_schema import compile_schema
-from pyjuice.constraints.language.json_schema import _prepare
 
 
 @pytest.fixture(autouse = True, params = ["behaviours", "walks"])
@@ -683,10 +684,11 @@ def test_a_state_in_two_chains_is_not_put_back_twice():
     table = np.asarray([[0], [1], [2]], dtype = np.int32)
     other = np.asarray([[5], [1], [6]], dtype = np.int32)
     roots = [counters.Run(table, 2, [[], [], []]), counters.Run(other, 2, [[], [], []])]
-    K_full = 7 + counters.states_put_back(roots)
-    row_len = np.zeros(K_full + 2, dtype = np.int64)
+    inner, outer = counters.states_put_back(roots)
+    K_kept, K_full = 7 + inner, 7 + inner + outer
+    row_len = np.zeros(K_kept + 2, dtype = np.int64)
     with pytest.raises(counters.NotCounted):
-        counters.expanded_moves(roots, np.arange(K_full + 1, dtype = np.int64), 7, K_full, np.zeros(8, dtype = np.int64), np.zeros(K_full + 2, dtype = np.int64), row_len,
+        counters.expanded_moves(roots, np.arange(K_full + 1, dtype = np.int64), 7, K_kept, K_full, np.zeros(8, dtype = np.int64), np.zeros(K_kept + 2, dtype = np.int64), row_len,
                                 np.zeros(K_full + 2, dtype = bool), 1)
 
 
@@ -723,13 +725,14 @@ def test_moves_of_a_copy_past_the_template():
 def test_moves_neither_on_nor_out_are_not_put_back():
     """A token going further than the span counted: the copies are not made from its moves."""
     roots = [counters.Run(np.asarray([[0], [1], [2]], dtype = np.int32), 2, [[], [], []])]
-    K_full = 3 + counters.states_put_back(roots)
+    inner, outer = counters.states_put_back(roots)
+    K_kept, K_full = 3 + inner, 3 + inner + outer
     moves = np.asarray([(0 << 32) | 1, (0 << 32) | 0, (0 << 32) | 2, 0], dtype = np.int64)
-    row_at = np.zeros(K_full + 2, dtype = np.int64)
-    row_len = np.zeros(K_full + 2, dtype = np.int64)
+    row_at = np.zeros(K_kept + 2, dtype = np.int64)
+    row_len = np.zeros(K_kept + 2, dtype = np.int64)
     row_at[:3], row_len[:3] = [0, 1, 2], 1
     with pytest.raises(counters.NotCounted):
-        counters.expanded_moves(roots, np.arange(K_full + 1, dtype = np.int64), 3, K_full, moves, row_at, row_len, np.zeros(K_full + 2, dtype = bool), 1)
+        counters.expanded_moves(roots, np.arange(K_full + 1, dtype = np.int64), 3, K_kept, K_full, moves, row_at, row_len, np.zeros(K_full + 2, dtype = bool), 1)
 
 
 def test_a_counted_automaton_on_a_vocabulary_without_every_byte():
@@ -779,3 +782,157 @@ def test_a_chain_no_closer_follows_goes_the_long_way():
             A.force(A.repeat(A.literal(b"ab"), 0, 90))
     finally:
         counters.COUNTING.reset(counting)
+
+
+# ---------------------------------------------------------------------------------------------
+# A large automaton's table: written when first read, or made where it is wanted
+# ---------------------------------------------------------------------------------------------
+
+TO_COME = [
+    STRING,                                                                             # (a run of copies not written out)
+    {"type": "string", "minLength": 60, "maxLength": 130},                              # (two)
+    {"type": "array", "items": STRING, "maxItems": 40},                                 # (one in another: the inner written out)
+    {"type": "array", "items": STRING},                                                 # (in a loop: moves out of the copies)
+    {"type": "object", "properties": {"a": STRING, "b": STRING}, "required": ["a"], "additionalProperties": False},
+    {"anyOf": [STRING, {"type": "array", "items": STRING, "maxItems": 40}]},
+    {"type": "array", "items": {"type": "boolean"}, "maxItems": 90},
+    {"type": "string", "maxLength": 5},                                                 # (no copies)
+    {"type": "number"},                                                                 # (no state accepts the empty text alone: the padding's own)
+]
+
+
+def to_come(schema, vocabulary, eos, monkeypatch):
+    """The automaton, its table left to come, and as it is without that."""
+    want = jc.JSONSchema(schema, vocabulary, eos_padding = eos).automaton()
+    assert torch.is_tensor(want._table)
+    with monkeypatch.context() as m:
+        m.setattr(token_lift, "TABLE_TO_COME", 0)
+        m.setattr(token_lift, "SPARSE_ENTRIES", 0)
+        got = jc.JSONSchema(schema, vocabulary, eos_padding = eos).automaton()
+    assert isinstance(got._table, token_lift.TableToCome)
+    return got, want
+
+
+def on_devices():
+    return ["cpu"] + (["cuda"] if torch.cuda.is_available() else [])
+
+
+@pytest.mark.parametrize("eos", [True, False])
+@pytest.mark.parametrize("threads", [0, 1 << 62])
+@pytest.mark.parametrize("schema", TO_COME)
+def test_a_table_written_when_first_read(schema, threads, eos, monkeypatch):
+    """Nothing but a read of the table writes it, once, in threads or not."""
+    monkeypatch.setattr(token_lift, "THREADS_ENTRIES", threads)
+    got, want = to_come(schema, vocabulary_of(random.Random(0), pieces = LONG_TOKENS), eos, monkeypatch)
+    table = got._table
+    assert (got.num_states, got.num_classes, got.initial) == (want.num_states, want.num_classes, want.initial)
+    assert torch.equal(got.accept, want.accept) and torch.equal(got.token_class, want.token_class)
+    assert got._table is table and table.made is None
+    same(got, want, schema)
+    assert got._table is table.made and table.dense() is table.made and table.parts is None
+
+
+@pytest.mark.parametrize("eos", [True, False])
+@pytest.mark.parametrize("at_a_time", [1, 1 << 24])
+@pytest.mark.parametrize("device", on_devices())
+@pytest.mark.parametrize("schema", TO_COME)
+def test_a_table_made_on_a_device_is_the_hosts(schema, device, at_a_time, eos, monkeypatch):
+    """Copies a few at a time, or one by one: entry for entry, and none of it on the host."""
+    monkeypatch.setattr(token_lift, "TABLE_ON_DEVICE_MOVES", at_a_time)
+    got, want = to_come(schema, vocabulary_of(random.Random(0), pieces = LONG_TOKENS), eos, monkeypatch)
+    on = got._table.on_device(device)
+    assert got._table.made is None and on.dtype == torch.int64 and on.device.type == device
+    assert torch.equal(on.cpu(), want._delta), schema
+    same(got, want, schema)                                             # (the host's, after it)
+    assert torch.equal(got._table.to(device), on)
+    assert torch.equal(got._table, on.cpu())
+
+
+def test_a_copy_nothing_leads_to():
+    """A state of no place has no row, on the host or on the device. By hand: three copies of a state, all leading to the first, which is all
+    that is reached; what the others would write is not in the table's last row, the dead state's."""
+    copies = counters.Copies(np.asarray([3, 6], dtype = np.int64), np.asarray([1], dtype = np.int64), np.asarray([3], dtype = np.int64), np.asarray([0], dtype = np.int64),
+                             np.asarray([0, 1], dtype = np.int64), np.asarray([0], dtype = np.int32), np.asarray([-1], dtype = np.int32), np.asarray([3], dtype = np.int32),
+                             np.asarray([0], dtype = np.int32), np.asarray([0], dtype = np.int64), np.asarray([0], dtype = np.int32))
+    moves = np.asarray([(0 << 32) | 3, 0], dtype = np.int64)
+    row_at = np.asarray([0, 1, 1], dtype = np.int64)
+    row_len = np.asarray([1, 0, 0], dtype = np.int64)
+    order = np.asarray([0, 3, 1], dtype = np.int64)
+    place = np.asarray([0, 2, -1, 1, -1, -1], dtype = np.int64)
+    for device in on_devices():
+        table = token_lift.TableToCome(moves, row_at, row_len, copies, order, place, 1, 2, 2)
+        on = table.on_device(device)
+        assert on.size() == (3, 2)
+        assert on.cpu().tolist() == [[1, 2], [1, 2], [2, 2]] == table.dense().tolist()
+
+
+def test_tables_on_a_device_leave_the_hosts_to_come(monkeypatch):
+    """Where the table goes: the device's made there, the host's written for the host; either way the one read after is the same."""
+    vocabulary = vocabulary_of(random.Random(0), pieces = LONG_TOKENS)
+    got, want = to_come(STRING, vocabulary, True, monkeypatch)
+    table = got._table
+    for device in on_devices()[1:]:
+        on = got._tables_on(device)[1]
+        assert got._table is table and table.made is None and torch.equal(on.cpu(), want._delta)
+        assert got._tables_on(device)[1] is on
+    assert torch.equal(got._tables_on("cpu")[1], want._delta) and got._table is table.made
+    for device in on_devices()[1:]:
+        got, want = to_come(STRING, vocabulary, True, monkeypatch)      # the host's first, then the device's: that one
+        assert torch.equal(got.delta, want.delta) and torch.equal(got._tables_on(device)[1].cpu(), want._delta)
+
+
+def test_a_table_written_goes_to_a_device_as_it_is(monkeypatch):
+    """A layout keeps the table to come, and may write it, the automaton still holding it to come."""
+    got, want = to_come(STRING, vocabulary_of(random.Random(0), pieces = LONG_TOKENS), True, monkeypatch)
+    table = got._table
+    host = table.dense()
+    assert got._table is table
+    for device in on_devices():
+        assert torch.equal(table.on_device(device).cpu(), want._delta)
+        assert torch.equal(got._tables_on(device)[1].cpu(), host)
+
+
+@pytest.mark.parametrize("eos", [True, False])
+def test_a_compile_and_its_queries_leave_the_table_unwritten(eos, monkeypatch):
+    """On a device, the layout and every query read the device's: no host table for the largest automata. The answers are the eager table's."""
+    if not torch.cuda.is_available():
+        pytest.skip("needs a device")
+    vocabulary = vocabulary_of(random.Random(0), pieces = LONG_TOKENS)
+    schema = {"type": "array", "items": {"type": "string", "maxLength": 30}, "maxItems": 12}
+    n = 6
+    torch.manual_seed(0)
+    ns = juice.structures.HMM(seq_length = n, num_latents = 8, num_emits = vocabulary.size)
+    ns.init_parameters(perturbation = 2.0)
+    pc = juice.compile(ns, verbose = False).to("cuda")
+    monkeypatch.setattr(layout, "LAYOUT_HOST_ENTRIES", 0)
+    eager = jc.compile(jc.JSONSchema(schema, vocabulary, eos_padding = eos), pc)
+
+    def answers(cc, data, missing):
+        with cc.decoder() as decoder:
+            session = decoder.marginal(data, missing), decoder.conditional(data, missing)
+        return cc.marginal(data, missing), cc.conditional(data, missing), *session
+
+    dfa = eager.backend.automaton
+    g = torch.Generator(device = "cuda").manual_seed(0)
+    data = dfa.sample(torch.zeros(1, n, vocabulary.size, device = "cuda"), 4, generator = g)[0]
+    missing = torch.zeros(4, n, dtype = torch.bool, device = "cuda")
+    missing[:, n // 2:] = True
+    want = answers(eager, data, missing)
+    monkeypatch.setattr(token_lift, "TABLE_TO_COME", 0)
+    monkeypatch.setattr(token_lift, "SPARSE_ENTRIES", 0)
+
+    def not_written(self):
+        raise AssertionError("the host's table was written")
+    real = token_lift.TableToCome.dense
+    monkeypatch.setattr(token_lift.TableToCome, "dense", not_written)
+    constraint = jc.JSONSchema(schema, vocabulary, eos_padding = eos)
+    late = jc.compile(constraint, pc)
+    table = late.backend.automaton._table
+    assert isinstance(table, token_lift.TableToCome)
+    for a, b in zip(answers(late, data, missing), want):
+        assert torch.allclose(a, b, atol = 1e-4, rtol = 1e-4)
+    built = late.backend.layout
+    assert (built.num_states, built.num_classes) == (dfa.num_states, dfa.num_classes)
+    monkeypatch.setattr(token_lift.TableToCome, "dense", real)
+    assert torch.equal(built.delta, dfa._delta)                         # (asked for: as the eager one, kept where the layout keeps it)
+    assert built.delta is table.made and late.backend.automaton._table is table

@@ -81,7 +81,7 @@ class DFA(Constraint):
             mask[ids] = True
             accept = mask
 
-        self._token_class, self._delta = _compress_classes(token_class, delta)
+        self._token_class, self._table = _compress_classes(token_class, delta)
         self._initial = int(initial)
         self._accept = accept.clone()
         self._live = None              # [K] bool: an accepting state is reachable
@@ -92,10 +92,11 @@ class DFA(Constraint):
     def _of_classes(cls, vocab_size: int, token_class: torch.Tensor, delta: torch.Tensor, initial: int,
                     accept: torch.Tensor) -> "DFA":
         """A DFA of tables the constructor would keep as they are: complete, its classes numbered by their smallest token,
-        no two columns the same; the tables are its own."""
+        no two columns the same; the tables are its own. ``delta`` may be one to come (``dense`` makes it, first read; it knows its ``rows`` and
+        ``classes``), a large token automaton's."""
         out = cls.__new__(cls)
         Constraint.__init__(out, vocab_size)
-        out._token_class, out._delta, out._initial, out._accept = token_class, delta, initial, accept
+        out._token_class, out._table, out._initial, out._accept = token_class, delta, initial, accept
         out._live, out._accept_in, out._device_tables = None, None, {}
         return out
 
@@ -117,11 +118,13 @@ class DFA(Constraint):
 
     @property
     def num_states(self) -> int:
-        return self._delta.size(0)
+        table = self._table
+        return table.size(0) if isinstance(table, torch.Tensor) else table.rows
 
     @property
     def num_classes(self) -> int:
-        return self._delta.size(1)
+        table = self._table
+        return table.size(1) if isinstance(table, torch.Tensor) else table.classes
 
     @property
     def initial(self) -> int:
@@ -134,6 +137,14 @@ class DFA(Constraint):
     @property
     def token_class(self) -> torch.Tensor:
         return self._token_class.clone()
+
+    @property
+    def _delta(self) -> torch.Tensor:
+        """The table, written now if it is still to come."""
+        table = self._table
+        if not isinstance(table, torch.Tensor):
+            table = self._table = table.dense()
+        return table
 
     @property
     def delta(self) -> torch.Tensor:
@@ -170,8 +181,12 @@ class DFA(Constraint):
     def _tables_on(self, device):
         device = torch.device(device)
         if device not in self._device_tables:
-            self._device_tables[device] = (self._token_class.to(device), self._delta.to(device),
-                                           self._accept.to(device))
+            table = self._table
+            if isinstance(table, torch.Tensor) or device.type == "cpu":
+                table = self._delta.to(device)
+            else:
+                table = table.on_device(device)                 # (made there: the host's is written if something asks for it)
+            self._device_tables[device] = (self._token_class.to(device), table, self._accept.to(device))
         return self._device_tables[device]
 
     # ---------------------------------------------------------------------------------------------

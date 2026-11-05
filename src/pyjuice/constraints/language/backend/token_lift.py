@@ -22,7 +22,7 @@ from numba import get_num_threads, njit, prange
 from ..dfa import DFA
 from ..vocabulary import Vocabulary
 from .behaviours import behaviours_of, classes_of_behaviours, rows_of_behaviours
-from .counters import NotCounted, expanded_moves, states_put_back
+from .counters import NO_COPIES, NotCounted, expanded_moves, states_put_back
 from .dfa import bfs_order
 from .byte_level import ByteAutomaton
 from .threads import few_threads
@@ -851,20 +851,37 @@ def _sparse_rows_parallel(table, dead, states, remap, gptr, gclass, gnode, class
 
 
 @njit(cache = True)
-def _sparse_order(moves, row_at, row_len, first_at, first_moves, K, C, pad):
-    """:func:`~.dfa.bfs_order` of the rows of :func:`_sparse_rows` from state 0 (the dead state ``K`` where a row has its first
-    gap, the padding's state ``K + 1`` being ``pad``): ``(order, place)``, the states and every state's place, -1 for the rest. Of a
-    row only those of its moves are read that ``first_moves[first_at[state]]`` counts and lists, if any: the first to each state."""
-    T = K + 2
+def _sparse_order(moves, row_at, row_len, first_at, first_moves, copies, K, T, C, pad):
+    """:func:`~.dfa.bfs_order` of the rows of :func:`_sparse_rows` from state 0, ``T`` states and places: the dead state ``K`` where a row has its
+    first gap, the padding's state ``K + 1`` being ``pad``. ``(order, place)``, the states and every state's place, -1 for the rest. Of a row only those
+    of its moves are read that ``first_moves[first_at[state]]`` counts and lists, if any: the first to each state. Past ``K + 1`` a state's row is
+    its run's first copy's (:class:`~.counters.Copies`)."""
     order = np.empty(T, dtype = np.int64)
     place = np.full(T, -1, dtype = np.int64)
     order[0] = 0
     place[0] = 0
     num, head = 1, 0
     mask = (np.int64(1) << 32) - 1
+    r = 0
     while head < num:
         q = order[head]
         head += 1
+        if q > K + 1:
+            if not copies.first[r] <= q < copies.first[r + 1]:
+                r = np.searchsorted(copies.first, q, side = "right") - 1
+            u = copies.u[r]
+            k = (q - copies.first[r]) // u
+            local = copies.row_of[r] + q - copies.first[r] - k * u
+            f = copies.firsts_at[local]
+            at = copies.row_at[local]
+            for j in range(f + 1, f + 1 + first_moves[f]):
+                t = copy_target(copies, r, k + 1, at + first_moves[j])
+                t = pad if t == K + 1 else t
+                if place[t] < 0:
+                    place[t] = num
+                    order[num] = t
+                    num += 1
+            continue
         at, n = row_at[q], row_len[q]
         if place[K] < 0:                                        # (the dead state's place: until it has one)
             expected = 0
@@ -906,41 +923,136 @@ def _sparse_order(moves, row_at, row_len, first_at, first_moves, K, C, pad):
 
 
 @njit(cache = True)
-def _sparse_table(moves, row_at, row_len, order, place, K, pad, out, lo, hi):
+def copy_target(copies, r, k, e):
+    """Where the move ``e`` of a row of the copy ``k`` (from 1) of the run ``r`` leads (:class:`~.counters.Copies`). (In this file: numba's cache of a caller does
+    not see a function of another file change.)"""
+    g = copies.g[e]
+    if g < 0:
+        return np.int64(copies.v[e])
+    q = k + g
+    if q <= copies.extra[r]:
+        return copies.first[r] + (q - 1) * copies.u[r] + copies.v[e]
+    return np.int64(copies.window[copies.window_at[r] + (q - copies.extra[r]) * copies.u[r] + copies.v[e]])
+
+
+@njit(cache = True)
+def _sparse_table(moves, row_at, row_len, copies, order, place, K, pad, out, lo, hi):
     """Rows ``lo`` to ``hi`` of the table of the states ``order``, numbered by their ``place``."""
     C = out.shape[1]
     gone = place[K]
     mask = (np.int64(1) << 32) - 1
+    r = 0
     for i in range(lo, hi):
         q = order[i]
         for c in range(C):
             out[i, c] = gone
-        for k in range(row_at[q], row_at[q] + row_len[q]):
-            t = moves[k] & mask
-            out[i, moves[k] >> 32] = place[pad if t == K + 1 else t]
+        if q > K + 1:
+            if not copies.first[r] <= q < copies.first[r + 1]:
+                r = np.searchsorted(copies.first, q, side = "right") - 1
+            u = copies.u[r]
+            k = (q - copies.first[r]) // u
+            local = copies.row_of[r] + q - copies.first[r] - k * u
+            for e in range(copies.row_at[local], copies.row_at[local + 1]):
+                t = copy_target(copies, r, k + 1, e)
+                out[i, copies.cls[e]] = place[pad if t == K + 1 else t]
+            continue
+        for e in range(row_at[q], row_at[q] + row_len[q]):
+            t = moves[e] & mask
+            out[i, moves[e] >> 32] = place[pad if t == K + 1 else t]
 
 
 @njit(parallel = True, cache = True)
-def _sparse_table_parallel(moves, row_at, row_len, order, place, K, pad, out, P):
+def _sparse_table_parallel(moves, row_at, row_len, copies, order, place, K, pad, out, P):
     """:func:`_sparse_table` in ``P`` parts."""
     R = order.shape[0]
     for p in prange(P):
-        _sparse_table(moves, row_at, row_len, order, place, K, pad, out, p * R // P, (p + 1) * R // P)
+        _sparse_table(moves, row_at, row_len, copies, order, place, K, pad, out, p * R // P, (p + 1) * R // P)
 
 
-_NO_FIRST_MOVES = (np.empty(0, dtype = np.int32), np.zeros(1, dtype = np.int32))
+@njit(cache = True)
+def _written_moves(moves, row_at, row_len, K):
+    """The moves of the first ``K`` states: from which state, of which class, to which, in three arrays."""
+    total = 0
+    for q in range(K):
+        total += row_len[q]
+    states = np.empty(total, dtype = np.int64)
+    cls = np.empty(total, dtype = np.int64)
+    targets = np.empty(total, dtype = np.int64)
+    mask = (np.int64(1) << 32) - 1
+    at = 0
+    for q in range(K):
+        for e in range(row_at[q], row_at[q] + row_len[q]):
+            states[at], cls[at], targets[at] = q, moves[e] >> 32, moves[e] & mask
+            at += 1
+    return states, cls, targets
+
+
+class TableToCome:
+    """The dense table of a token automaton, as :func:`_table_of_rows` leaves it, written when first asked for: most of a large automaton's
+    cost and memory, and not everything reads it. :meth:`dense` once on the host; :meth:`on_device` makes it where it is wanted, none of it on the host."""
+
+    def __init__(self, moves, row_at, row_len, copies, order, place, K, pad, C):
+        self.parts = (moves, row_at, row_len, copies, order, place, K, pad)
+        self.rows, self.classes = order.size, C
+        self.made = None
+
+    @few_threads
+    def dense(self) -> torch.Tensor:
+        if self.made is None:
+            moves, row_at, row_len, copies, order, place, K, pad = self.parts
+            out = np.empty((self.rows, self.classes), dtype = np.int64)
+            threads = get_num_threads()
+            if out.size >= THREADS_ENTRIES and threads > 1:
+                _sparse_table_parallel(moves, row_at, row_len, copies, order, place, K, pad, out, min(threads, self.rows))
+            else:
+                _sparse_table(moves, row_at, row_len, copies, order, place, K, pad, out, 0, self.rows)
+            self.made, self.parts = torch.from_numpy(out), None
+        return self.made
+
+    def on_device(self, device) -> torch.Tensor:
+        """The same table on ``device``, none of it written on the host (unless it is already): a tenth of the time, the moves being few and the rest a
+        scatter, and not at the mercy of how fast the kernel supplies the host's memory. It has a row past the last, which a state of no place (-1) writes."""
+        if self.made is not None:
+            return self.made.to(device)
+        moves, row_at, row_len, copies, order, place, K, pad = self.parts
+        places = place.copy()
+        places[K + 1] = place[pad]
+        places = torch.from_numpy(places).to(device)
+        out = torch.full((self.rows + 1, self.classes), int(place[K]), dtype = torch.int64, device = device)
+        states, classes, targets = (torch.from_numpy(x).to(device) for x in _written_moves(moves, row_at, row_len, K + 2))
+        out[places[states], classes] = places[targets]
+        window = torch.from_numpy(copies.window).to(device).long()
+        cls, g, v = (torch.from_numpy(x).to(device).long() for x in (copies.cls, copies.g, copies.v))
+        for r in range(copies.u.size):
+            u, extra = int(copies.u[r]), int(copies.extra[r])
+            at = int(copies.row_of[r])
+            local = torch.from_numpy(np.repeat(np.arange(u, dtype = np.int64), np.diff(copies.row_at[at:at + u + 1]))).to(device)
+            lo, hi = int(copies.row_at[at]), int(copies.row_at[at + u])
+            r_cls, r_g, r_v = cls[lo:hi], g[lo:hi], v[lo:hi]
+            past = window[int(copies.window_at[r]):]
+            first = int(copies.first[r])
+            step = max(1, TABLE_ON_DEVICE_MOVES // max(hi - lo, 1))
+            for k0 in range(1, extra + 1, step):                # (as :func:`~.counters.copy_target`, for these copies' moves together)
+                k = torch.arange(k0, min(k0 + step, extra + 1), device = device)[:, None]
+                q = k + r_g
+                on = torch.where(q <= extra, first + (q - 1) * u + r_v, past[((q - extra).clamp(min = 0) * u + r_v).clamp(max = past.numel() - 1)])
+                out[places[first + (k - 1) * u + local], r_cls.expand_as(q)] = places[torch.where(r_g < 0, r_v, on)]
+        return out[:self.rows]
+
+
+_NO_FIRST_MOVES = np.zeros(1, dtype = np.int32)
 
 
 def _rows_by_walks(automaton: ByteAutomaton, states: np.ndarray, remap: np.ndarray, trie: "_Trie", reps: np.ndarray, kinds: np.ndarray, accept: np.ndarray,
-                   end_class: int, K_full: int) -> tuple:
+                   end_class: int, K_kept: int) -> tuple:
     """The moves of the first ``states.size`` states of a token automaton minimal already, by a walk of the representatives' trie from every state."""
     K, C = states.size, reps.size
     rep_node = np.where(kinds == 0, trie.end_nodes[trie.token_end[np.minimum(reps, trie.token_end.size - 1)]], -1).astype(np.int64)
     gptr, gclass, gnode, class_at = _rep_trie(trie.first_child, trie.node_byte, automaton.byte_class, trie.parent, rep_node)
     itself = np.nonzero(kinds == 1)[0].astype(np.int64)
     moves = np.empty(K * C + 1, dtype = np.int64)               # (room for all, where a part starts; only what is written is touched)
-    row_at, row_len = np.zeros(K_full + 2, dtype = np.int64), np.zeros(K_full + 2, dtype = np.int64)
-    args = (automaton._kept_table, automaton.dead, states, remap, gptr, gclass, gnode, class_at, itself, accept, end_class, K_full, C, moves, row_at, row_len)
+    row_at, row_len = np.zeros(K_kept + 2, dtype = np.int64), np.zeros(K_kept + 2, dtype = np.int64)
+    args = (automaton._kept_table, automaton.dead, states, remap, gptr, gclass, gnode, class_at, itself, accept, end_class, K_kept, C, moves, row_at, row_len)
     threads = get_num_threads()
     if K * C >= THREADS_ENTRIES and threads > 1:
         _sparse_rows_parallel(*args, K, min(threads, K))
@@ -949,36 +1061,33 @@ def _rows_by_walks(automaton: ByteAutomaton, states: np.ndarray, remap: np.ndarr
     return moves, row_at, row_len
 
 
-def _table_of_rows(automaton: ByteAutomaton, remap: np.ndarray, K: int, K_full: int, C: int, moves: np.ndarray, row_at: np.ndarray, row_len: np.ndarray, accept: np.ndarray,
-                   end_class: int) -> tuple:
+def _table_of_rows(automaton: ByteAutomaton, remap: np.ndarray, K: int, K_kept: int, K_full: int, C: int, moves: np.ndarray, row_at: np.ndarray, row_len: np.ndarray,
+                   accept: np.ndarray, end_class: int) -> tuple:
     """
     The table in canonical numbering of a token automaton minimal already, and its accepting states: what
     ``DFA._of_classes(...)._renumbered()`` makes of the dense table of every state's every class, without it: nearly all of
-    that table is the dead state. From the moves of the first ``K`` of its ``K_full`` states (the others: the copies an automaton has left
-    out, its :attr:`~.byte_level.ByteAutomaton.counted`, put back here), the breadth-first order over them, then the table once, as it
-    will stand.
+    that table is the dead state. From the moves of the first ``K`` states (those the short automaton does not have, of its
+    :attr:`~.byte_level.ByteAutomaton.counted`, are put back here: ``K_kept`` of them written out, ``K_full`` in all), the breadth-first
+    order over them, then the table once, as it will stand -- if it is small: a large one is left to be written when first read
+    (:class:`TableToCome`).
     """
     threads = get_num_threads()
-    first_at, first_moves = _NO_FIRST_MOVES
+    first_at, first_moves, copies = None, _NO_FIRST_MOVES, NO_COPIES
     if automaton.counted:
-        moves, first_at, first_moves = expanded_moves(automaton.counted, remap, K, K_full, moves, row_at, row_len, accept, threads)
-    pad = K_full + 1
-    if end_class >= 0:                                          # a state accepting the empty text alone is the padding's
-        alone = np.nonzero(accept[:K_full] & (row_len[:K_full] == 1))[0]
+        moves, first_at, first_moves, copies = expanded_moves(automaton.counted, remap, K, K_kept, K_full, moves, row_at, row_len, accept, threads)
+    pad = K_kept + 1
+    if end_class >= 0:                                          # a state accepting the empty text alone is the padding's (a copy of one: not before it)
+        alone = np.nonzero(accept[:K_kept] & (row_len[:K_kept] == 1))[0]
         if alone.size:
             pad = int(alone[0])
-        moves[-1] = (end_class << 32) | (K_full + 1)
-        row_at[K_full + 1], row_len[K_full + 1] = moves.size - 1, 1
+        moves[-1] = (end_class << 32) | (K_kept + 1)
+        row_at[K_kept + 1], row_len[K_kept + 1] = moves.size - 1, 1
         accept[pad] = True
-    if first_at is _NO_FIRST_MOVES[0]:
-        first_at = np.full(K_full + 2, -1, dtype = np.int32)
-    order, place = _sparse_order(moves, row_at, row_len, first_at, first_moves, K_full, C, pad)
-    out = np.empty((order.size, C), dtype = np.int64)
-    if K_full * C >= THREADS_ENTRIES and threads > 1:
-        _sparse_table_parallel(moves, row_at, row_len, order, place, K_full, pad, out, min(threads, K_full))
-    else:
-        _sparse_table(moves, row_at, row_len, order, place, K_full, pad, out, 0, order.size)
-    return out, accept[order]
+    if first_at is None:
+        first_at = np.full(K_kept + 2, -1, dtype = np.int32)
+    order, place = _sparse_order(moves, row_at, row_len, first_at, first_moves, copies, K_kept, K_full + 2, C, pad)
+    table = TableToCome(moves, row_at, row_len, copies, order, place, K_kept, pad, C)
+    return table if order.size * C >= TABLE_TO_COME else table.dense(), accept[order]
 
 
 #: an automaton of at most so many entries has its tokens' classes and rows from the behaviours of the trie's nodes, reading at most so many
@@ -991,6 +1100,10 @@ NO_BUDGET = 1 << 62
 #: the table of a token automaton of at least so many entries, minimal already, is made from its moves (:func:`_table_of_rows`,
 #: the dense table of its rows costing no more below it), in threads from :data:`THREADS_ENTRIES` on
 SPARSE_ENTRIES = 1 << 13
+#: a token automaton's table of at least so many entries is written when first read
+TABLE_TO_COME = 1 << 22
+#: so many moves a time, making such a table on a device
+TABLE_ON_DEVICE_MOVES = 1 << 24
 THREADS_ENTRIES = 1 << 18
 #: states checked on the quotient of the trie (:func:`_walk_the_rest`): at first so many, then twice as many a time,
 #: on one thread below :data:`SERIAL_CHECKS`; states failing are walked, so many edges in threads at the most at a time
@@ -1014,6 +1127,14 @@ def _random_words(S: int) -> list:
 
 _KEPT_WORDS = 1 << 12
 _WORDS = np.empty((4, 0), dtype = np.uint64)
+
+
+def _how_many(automaton: ByteAutomaton, K: int) -> tuple:
+    """Of the states of a token automaton of the ``K`` of a byte automaton: how many have their moves written out, and how many there are."""
+    if not automaton.counted:
+        return K, K
+    inner, outer = states_put_back(automaton.counted)
+    return K + inner, K + inner + outer
 
 
 @few_threads
@@ -1041,15 +1162,15 @@ def to_tokens(automaton: ByteAutomaton, vocabulary: Vocabulary, eos_padding: boo
             states[start], states[0] = 0, start
             states = states[states != dead_byte]
             K, C = states.size, reps.size
-            K_full = K + states_put_back(automaton.counted) if automaton.counted else K
-            remap = np.full(S, K_full, dtype = np.int64)
+            K_kept, K_full = _how_many(automaton, K)
+            remap = np.full(S, K_kept, dtype = np.int64)
             remap[states] = np.arange(K)
             accept = np.zeros(K_full + 2, dtype = bool)
             accept[:K] = automaton.accept[states]
             end_class = int(token_class[eos[0]]) if padded else -1
-            rows = rows_of_behaviours(behaviour, T, at, source, target, remap, accept, end_class, K, K_full)
-            out, kept = _table_of_rows(automaton, remap, K, K_full, C, *rows, accept, end_class)
-            return DFA._of_classes(V, torch.from_numpy(token_class), torch.from_numpy(out), 0, torch.from_numpy(kept))
+            rows = rows_of_behaviours(behaviour, T, at, source, target, remap, accept, end_class, K, K_kept)
+            table, kept = _table_of_rows(automaton, remap, K, K_kept, K_full, C, *rows, accept, end_class)
+            return DFA._of_classes(V, torch.from_numpy(token_class), table, 0, torch.from_numpy(kept))
     r = _random_words(S)
     M = trie.first_child.size - 1
     walking = (_bytes_of_classes(byte_class, table.shape[1]), np.full(S, -1, dtype = np.int32), np.zeros((S, 4), dtype = np.uint64), np.zeros(S, dtype = np.int32))
@@ -1072,16 +1193,16 @@ def to_tokens(automaton: ByteAutomaton, vocabulary: Vocabulary, eos_padding: boo
     token_class, reps, hashed = _token_classes(h1, h2, trie.end_nodes, token_end)
     kinds = np.where(hashed & has_text[reps], np.where(offsets[reps + 1] == offsets[reps], 1, 0), 2).astype(np.int64)
     K, C = states.size, reps.size
-    K_full = K + states_put_back(automaton.counted) if automaton.counted else K
-    remap = np.full(S, K_full, dtype = np.int64)                        # unreached (the byte dead state among them)
+    K_kept, K_full = _how_many(automaton, K)
+    remap = np.full(S, K_kept, dtype = np.int64)                        # unreached (the byte dead state among them)
     remap[states] = np.arange(K)
     if complete and (automaton.counted or K * C >= SPARSE_ENTRIES):
         accept = np.zeros(K_full + 2, dtype = bool)
         accept[:K] = automaton.accept[states]
         end_class = int(token_class[eos[0]]) if padded else -1
-        rows = _rows_by_walks(automaton, states, remap, trie, reps, kinds, accept, end_class, K_full)
-        out, kept = _table_of_rows(automaton, remap, K, K_full, C, *rows, accept, end_class)
-        return DFA._of_classes(V, torch.from_numpy(token_class), torch.from_numpy(out), 0, torch.from_numpy(kept))
+        rows = _rows_by_walks(automaton, states, remap, trie, reps, kinds, accept, end_class, K_kept)
+        table, kept = _table_of_rows(automaton, remap, K, K_kept, K_full, C, *rows, accept, end_class)
+        return DFA._of_classes(V, torch.from_numpy(token_class), table, 0, torch.from_numpy(kept))
     dead, pad = K, K + 1
     out = np.empty((K + 2, C), dtype = np.int64)
     out[K:] = dead

@@ -42,7 +42,7 @@ class BoundaryLayout:
     :ivar state_id: [n+1, W] automaton state of every column, ``-1`` for padding (``W`` = max width); a
         boundary's columns run from the state farthest from acceptance to the nearest, ties by state id
     :ivar col_of_state: [n+1, K] column of every automaton state, ``-1`` if inactive
-    :ivar delta: [K, C] the automaton's transitions: the successor state of every (state, class)
+    :ivar delta: [K, C] the automaton's transitions: the successor state of every (state, class), on the host, made if it is to come
     :ivar satisfiable: whether any string of length ``n`` is accepted. If not, every boundary is empty.
 
     Boundary 0 holds only the initial state (column 0), and every active state at boundary ``n`` is
@@ -55,9 +55,13 @@ class BoundaryLayout:
     n: int
     token_class: torch.Tensor
     width: torch.Tensor
-    delta: torch.Tensor
+    table: object                                     # the automaton's: a tensor, or one to come (it holds the automaton's moves, not the automaton)
     satisfiable: bool
     on_device: tuple                                  # (device, delta, state_id, col_of_state), as they were built
+
+    @cached_property
+    def delta(self) -> torch.Tensor:
+        return self.table if isinstance(self.table, torch.Tensor) else self.table.dense()
 
     @cached_property
     def state_id(self) -> torch.Tensor:
@@ -79,11 +83,11 @@ class BoundaryLayout:
 
     @property
     def num_classes(self) -> int:
-        return self.delta.size(1)
+        return self.on_device[1].size(1)
 
     @property
     def num_states(self) -> int:
-        return self.delta.size(0)
+        return self.on_device[1].size(0)
 
     def next_col_at(self, t: int) -> torch.Tensor:
         """[width[t], C]: the column at boundary ``t + 1`` reached from every column at ``t`` by a token of each class,
@@ -376,7 +380,7 @@ def _build(dfa: DFA, n: int, device = None, report = None) -> BoundaryLayout:
     host = torch.from_numpy(state_id), torch.from_numpy(col_of_state)
     # (the automaton's tables are not copied: nothing writes them)
     layout = BoundaryLayout(n = n, token_class = dfa._token_class, width = torch.from_numpy(width),
-                            delta = dfa._delta, satisfiable = bool(width[0] > 0),
+                            table = dfa._table, satisfiable = bool(width[0] > 0),
                             on_device = (dev, delta, host[0].to(dev), host[1].to(dev)))
     layout.__dict__.update(state_id = host[0], col_of_state = host[1])        # (the host's, as they were built)
     if report is not None:
@@ -449,7 +453,7 @@ def _build_on_device(dfa: DFA, n: int, dev: torch.device, report = None) -> Boun
     col_of_state = torch.full((n + 1, K), -1, dtype = torch.long, device = dev)
     col_of_state[rows, order[at]] = cols[rows, at]
     # (the automaton's tables are not copied: nothing writes them)
-    layout = BoundaryLayout(n = n, token_class = dfa._token_class, width = width.cpu(), delta = dfa._delta,
+    layout = BoundaryLayout(n = n, token_class = dfa._token_class, width = width.cpu(), table = dfa._table,
                             satisfiable = bool(width[0] > 0), on_device = (dev, delta, state_id, col_of_state))
     if report is not None:
         report.advance()

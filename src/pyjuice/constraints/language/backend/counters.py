@@ -22,11 +22,24 @@ Where anything does not hold, :class:`NotCounted` is raised and the schema goes 
 whole automaton (products, a test of a text) raises too: the short automaton is for :func:`~.token_lift.to_tokens` alone.
 """
 
+from collections import namedtuple
 from contextvars import ContextVar
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
-from numba import get_num_threads, njit, prange
+from numba import njit, prange
+
+
+#: The copies of the outermost runs, which are nearly all the states of the largest automata, are not written out: every one's row is its
+#: first's, read through this. The states from ``first[r]`` to ``first[r + 1]`` are ``extra[r]`` copies of ``u[r]`` each, and the row of the ``l``-th of
+#: a copy runs from ``row_at[row_of[r] + l]`` to the next: the classes ``cls``, and where they lead: to the state ``v`` (``g`` -1), or ``g`` copies on,
+#: to its ``v``-th state (:func:`~.token_lift.copy_target`). The window's copies past the last are ``window`` from ``window_at[r]`` on. What the breadth-first order
+#: reads of a row is ``first_moves[firsts_at[row_of[r] + l]]``, as in :func:`_first_moves`.
+Copies = namedtuple("Copies", "first u extra row_of row_at cls g v firsts_at window_at window")
+
+NO_COPIES = Copies(np.zeros(1, dtype = np.int64), np.zeros(0, dtype = np.int64), np.zeros(0, dtype = np.int64), np.zeros(0, dtype = np.int64), np.zeros(1, dtype = np.int64),
+                   np.zeros(0, dtype = np.int32), np.zeros(0, dtype = np.int32), np.zeros(0, dtype = np.int32), np.zeros(0, dtype = np.int32), np.zeros(0, dtype = np.int64),
+                   np.zeros(0, dtype = np.int32))
 
 
 class NotCounted(Exception):
@@ -444,6 +457,32 @@ def _forward_moves(moves, row_at, row_len, window, where_g, where_l, where_r, ru
 
 
 @njit(cache = True)
+def _rows_of_first_copies(moves, row_at, row_len, forward, template, where_g, where_l, where_r, first_new_of, u_of, out_row_at, local, e, out_cls, out_g, out_v):
+    """Rows of the template of an outermost run as :class:`Copies` reads them, from the move ``e`` on: returns where they end. A move on through
+    the chain leads as far on from a copy; one that left it leads where it does from the template, past the template now among those put back."""
+    u = template.shape[0]
+    for l in range(u):
+        s = template[l]
+        a = row_at[s]
+        out_row_at[local + l] = e
+        for i in range(row_len[s]):
+            m = moves[a + i]
+            y = m & _LOW
+            g = where_g[y]
+            out_cls[e] = m >> 32
+            if forward[a + i]:
+                out_g[e], out_v[e] = g, where_l[y]
+            elif g >= 1:
+                r = where_r[y]
+                out_g[e], out_v[e] = -1, first_new_of[r] + (g - 1) * u_of[r] + where_l[y]
+            else:
+                out_g[e], out_v[e] = -1, y
+            e += 1
+    out_row_at[local + u] = e
+    return e
+
+
+@njit(cache = True)
 def _first_moves(moves, row_at, row_len, forward, template, seen_on, seen_out, mark, first_moves, at, copy_first):
     """
     What the breadth-first order reads of a row of a copy of ``template``: the first of its moves to every target, on through the chain
@@ -607,54 +646,65 @@ def _all_runs(roots: List[Run]) -> List[Run]:
     return out
 
 
-def states_put_back(roots: List[Run]) -> int:
-    """How many states the copies left out are."""
-    total = 0
+def states_put_back(roots: List[Run]) -> Tuple[int, int]:
+    """How many states the copies left out are: those of the runs inside others, written out, and those of the outermost runs, read through :class:`Copies`."""
+    inner = 0
     for r in sorted(_all_runs(roots), key = lambda r: r.level):
         sizes = {sum(c.states * c.extra for c in row) for row in r.children}
         if len(sizes) != 1:
             raise NotCounted
         r.states = r.table.shape[1] + sizes.pop()
-        total += r.states * r.extra
-    return total
+        inner += r.states * r.extra
+    outer = sum(r.states * r.extra for r in roots)
+    return inner - outer, outer
 
 
-def expanded_moves(roots: List[Run], remap: np.ndarray, K: int, K_full: int, moves0: np.ndarray, row_at: np.ndarray, row_len: np.ndarray, accept: np.ndarray,
-                   threads: int) -> np.ndarray:
+def _window_of(r: Run) -> np.ndarray:
+    """A run's window copies, every one its own states and those put back inside it."""
+    window = np.empty((r.table.shape[0], r.states), dtype = np.int32)
+    for g in range(r.table.shape[0]):
+        parts = [r.table[g]] + [np.arange(c.first_new, c.first_new + c.states * c.extra, dtype = np.int32) for c in r.children[g]]
+        window[g] = np.concatenate(parts) if len(parts) > 1 else parts[0]
+    return window
+
+
+def expanded_moves(roots: List[Run], remap: np.ndarray, K: int, K_kept: int, K_full: int, moves0: np.ndarray, row_at: np.ndarray, row_len: np.ndarray, accept: np.ndarray,
+                   threads: int) -> tuple:
     """
-    The moves of the whole token automaton from the short one's, ``K`` of its ``K_full`` states: ``moves0``, ``row_at`` and ``row_len`` as
-    :func:`~.token_lift._sparse_rows` leaves them for the first ``K``, ``remap`` its states of the byte automaton's. The inner runs first;
-    a window copy's states are then its own and those put back inside it. Fills ``row_at``, ``row_len`` and ``accept`` for all of them and
-    returns the moves, with room for one row more, and what the breadth-first order reads of the rows: ``(moves, first_at, first_moves)``
-    (:func:`_first_moves`; ``first_at`` -1: all of the row).
+    The whole token automaton from the short one's ``K`` states: ``moves0``, ``row_at`` and ``row_len`` as :func:`~.token_lift._sparse_rows`
+    leaves them for those, ``remap`` its states of the byte automaton's. The runs inside others come first, inner ones before outer, and their copies
+    are written out, to the state ``K_kept``: a window copy's states are then its own and those put back inside it. ``K_kept`` itself stands for the dead state,
+    the next for the padding's; from there on stand the copies of the outermost runs, to ``K_full + 2``, not written out (:class:`Copies`). Fills
+    ``row_at`` and ``row_len``, ``K_kept + 2`` of them, and ``accept`` for all, and returns ``(moves, first_at, first_moves, copies)``: the moves, with room
+    for one row more, what the breadth-first order reads of the rows (:func:`_first_moves`; ``first_at`` -1: all of the row), the copies.
     """
-    runs = sorted(_all_runs(roots), key = lambda r: r.level)
-    for r in runs:
+    every = sorted(_all_runs(roots), key = lambda r: r.level)
+    outermost = {id(r) for r in roots}
+    runs = [r for r in every if id(r) not in outermost]
+    for r in every:
         r.table = remap[r.table].astype(np.int32)
         if (r.table >= K).any():
             raise NotCounted
-        of_copy = int(row_len[r.table[0]].sum()) + sum(c.moves * c.extra for c in r.children[0])
-        r.moves = of_copy
+        r.moves = int(row_len[r.table[0]].sum()) + sum(c.moves * c.extra for c in r.children[0])
     used = int(row_len[:K].sum())
     total = used + sum(r.moves * r.extra for r in runs)
     moves = np.empty(total + 1, dtype = np.int64)
     at = _compacted(moves0, row_at, row_len, K, moves)
     forward = np.zeros(total + 1, dtype = np.bool_)
-    first_at = np.empty(K_full + 2, dtype = np.int32)
+    first_at = np.empty(K_kept + 2, dtype = np.int32)
     first_at[:K] = -1
-    first_at[K_full:] = -1
-    first_moves = np.empty(sum(r.moves + r.states for r in runs) + 1, dtype = np.int32)
+    first_at[K_kept:] = -1
+    first_moves = np.empty(sum(r.moves + r.states for r in every) + 1, dtype = np.int32)
     first_end, mark = 0, 0
-    seen_on = np.zeros(K_full + 2, dtype = np.int32)
-    seen_out = np.zeros(K_full + 2, dtype = np.int32)
-    where_g = np.full(K_full + 2, -1, dtype = np.int32)
-    where_l = np.empty(K_full + 2, dtype = np.int32)
-    where_r = np.full(K_full + 2, -1, dtype = np.int32)
-    template_of = np.empty(K_full + 2, dtype = np.int32)
-    first_new_of = np.zeros(len(runs), dtype = np.int64)
-    u_of = np.zeros(len(runs), dtype = np.int64)
+    seen_on = np.zeros(K_kept + 2, dtype = np.int32)
+    seen_out = np.zeros(K_kept + 2, dtype = np.int32)
+    where_g = np.full(K_kept + 2, -1, dtype = np.int32)
+    where_l = np.empty(K_kept + 2, dtype = np.int32)
+    where_r = np.full(K_kept + 2, -1, dtype = np.int32)
+    template_of = np.empty(K_kept + 2, dtype = np.int32)
+    first_new_of = np.zeros(len(every), dtype = np.int64)
+    u_of = np.zeros(len(every), dtype = np.int64)
     next_id = K
-    level = 0
     i = 0
     while i < len(runs):
         level = runs[i].level
@@ -663,14 +713,10 @@ def expanded_moves(roots: List[Run], remap: np.ndarray, K: int, K_full: int, mov
             j += 1
         before = next_id
         for number, r in enumerate(runs[i:j]):
-            window = np.empty((r.table.shape[0], r.states), dtype = np.int32)
-            for g in range(r.table.shape[0]):
-                parts = [r.table[g]] + [np.arange(c.first_new, c.first_new + c.states * c.extra, dtype = np.int32) for c in r.children[g]]
-                window[g] = np.concatenate(parts) if len(parts) > 1 else parts[0]
-            r.window = window
+            r.window = _window_of(r)
             r.first_new = next_id
             next_id += r.states * r.extra
-            if not _mark_window(window, number, where_g, where_l, where_r, template_of):
+            if not _mark_window(r.window, number, where_g, where_l, where_r, template_of):
                 raise NotCounted                                # (a state in two chains)
             first_new_of[number] = r.first_new
             u_of[number] = r.states
@@ -700,9 +746,51 @@ def expanded_moves(roots: List[Run], remap: np.ndarray, K: int, K_full: int, mov
         for r in runs[i:j]:
             _unmark_window(r.window, where_g, where_r, first_at)
         i = j
-    if next_id != K_full or at != total:
+    if next_id != K_kept or at != total:
         raise NotCounted
-    return moves, first_at, first_moves
+    # the outermost runs: their rows once, as their copies read them; those of the states kept led on into the copies
+    R = len(roots)
+    first = np.empty(R + 1, dtype = np.int64)
+    first[0] = K_kept + 2
+    for number, r in enumerate(roots):
+        r.window = _window_of(r)
+        r.first_new = int(first[number])
+        first[number + 1] = r.first_new + r.states * r.extra
+        if not _mark_window(r.window, number, where_g, where_l, where_r, template_of):
+            raise NotCounted                                    # (a state in two chains)
+        first_new_of[number] = r.first_new
+        u_of[number] = r.states
+    if first[R] != K_full + 2:
+        raise NotCounted
+    u = np.asarray([r.states for r in roots], dtype = np.int64)
+    extra = np.asarray([r.extra for r in roots], dtype = np.int64)
+    row_of = np.zeros(R, dtype = np.int64)
+    row_of[1:] = np.cumsum(u[:-1])
+    copy_row_at = np.empty(int(u.sum()) + 1, dtype = np.int64)
+    firsts_at = np.empty(copy_row_at.size, dtype = np.int32)
+    E = sum(r.moves for r in roots)
+    cls, g, v = np.empty(E, dtype = np.int32), np.empty(E, dtype = np.int32), np.empty(E, dtype = np.int32)
+    window_at = np.zeros(R, dtype = np.int64)
+    window_at[1:] = np.cumsum([r.window.size for r in roots[:-1]])
+    e = 0
+    for number, r in enumerate(roots):
+        if not _forward_moves(moves, row_at, row_len, r.window, where_g, where_l, where_r, number, forward):
+            raise NotCounted
+    for number, r in enumerate(roots):
+        template = r.window[0]
+        first_end, mark = _first_moves(moves, row_at, row_len, forward, template, seen_on, seen_out, mark, first_moves, first_end, firsts_at[row_of[number]:row_of[number] + r.states])
+        e = _rows_of_first_copies(moves, row_at, row_len, forward, template, where_g, where_l, where_r, first_new_of, u_of, copy_row_at, row_of[number], e, cls, g, v)
+        _accepting_copies(accept, template, r.first_new, r.extra)
+    reading = (moves, row_at, row_len, forward, template_of, where_g, where_l, where_r, first_new_of, u_of)
+    for past in (True, False):                                  # (in this order: see `_led_on`)
+        if at >= PARALLEL_MOVES and threads > 1:
+            _led_on_parallel(*reading, past, K_kept, min(threads, K_kept))
+        else:
+            _led_on(*reading, past, 0, K_kept)
+    for r in roots:
+        _unmark_window(r.window, where_g, where_r, first_at)
+    window = np.concatenate([r.window.ravel() for r in roots]) if R else NO_COPIES.window
+    return moves, first_at, first_moves, Copies(first, u, extra, row_of, copy_row_at, cls, g, v, firsts_at, window_at, window)
 
 
 #: so many moves to write are worth a team
