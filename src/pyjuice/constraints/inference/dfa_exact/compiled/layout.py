@@ -21,6 +21,7 @@ import weakref
 from collections import OrderedDict
 from dataclasses import dataclass
 from functools import cached_property
+from typing import Optional
 
 import numpy as np
 import torch
@@ -105,10 +106,13 @@ class BoundaryLayout:
         if tr is None:
             widths = [int(w) for w in self.width.tolist()]
             dev, delta, state_id, col_of_state = self.on_device
+            host = None                                       # (built on the host: at hand)
+            if "state_id" in self.__dict__ and self.num_states * self.num_classes <= LAYOUT_HOST_ENTRIES:
+                host = (self.delta.numpy(), self.state_id.numpy(), self.col_of_state.numpy())
             if dev == device:
-                tr = Transitions(delta, state_id, col_of_state, widths)
+                tr = Transitions(delta, state_id, col_of_state, widths, host)
             else:
-                tr = Transitions(delta.to(device), state_id.to(device), col_of_state.to(device), widths)
+                tr = Transitions(delta.to(device), state_id.to(device), col_of_state.to(device), widths, host)
             kept[device] = tr
         return tr
 
@@ -140,12 +144,15 @@ class Transitions:
 
     :ivar delta, state_id, col_of_state: the layout's, on the device
     :ivar width: the boundaries' columns (Python ints)
+    :ivar host: ``(delta, state_id, col_of_state)`` as arrays, for a small automaton (its tables are then built on the host,
+        :mod:`~..kernels.transitions.host`), else None
     """
 
     delta: torch.Tensor
     state_id: torch.Tensor
     col_of_state: torch.Tensor
     width: list
+    host: Optional[tuple] = None
 
     @property
     def n(self) -> int:

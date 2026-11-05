@@ -138,12 +138,21 @@ class TokenClasses:
     """
 
     def __init__(self, token_class: torch.Tensor, num_classes: int, enumerate_max: int = 0,
-                 host: Optional[np.ndarray] = None):
-        self.token_class = token_class.to(torch.int32).contiguous()
+                 host: Optional[np.ndarray] = None, device = None):
         self.num_classes = int(num_classes)
         self.enumerate_max = int(enumerate_max)
         if self.enumerate_max > 1:
             raise NotImplementedError("Only classes of one token can be enumerated (`enumerate_max` is 0 or 1).")
+        if host is not None:
+            self._build_on_host(host.astype(np.int32), token_class.device if device is None else device)
+        else:
+            self._build_on_device(token_class.to(torch.int32).contiguous())
+        self._by_class = {}
+        self._host = None if host is None else host.astype(np.int32)    # (``host``: at hand, a wait for the device spared)
+        self._class_tiles = {}
+
+    def _build_on_device(self, token_class: torch.Tensor) -> None:
+        self.token_class = token_class
         dev = self.token_class.device
         sizes = torch.bincount(self.token_class.long(), minlength = self.num_classes)
         enumerated = (sizes > 0) & (sizes <= self.enumerate_max)
@@ -157,9 +166,26 @@ class TokenClasses:
         single = torch.nonzero(self.stored_class < 0).view(-1)                 # (one token per enumerated class)
         self.enumerated_token[self.token_class[single].long()] = single.to(torch.int32)
         self.enumerated_tokens = self.enumerated_token[self.enumerated_token >= 0].contiguous()   # in class order
-        self._by_class = {}
-        self._host = None if host is None else host.astype(np.int32)    # (``host``: at hand, a wait for the device spared)
-        self._class_tiles = {}
+
+    def _build_on_host(self, token_class: np.ndarray, device) -> None:
+        """:meth:`_build_on_device`, the token classes at hand: the same tables, in two copies."""
+        from ..inference.dfa_exact.kernels.common import one_copy
+        sizes = np.bincount(token_class, minlength = self.num_classes)
+        enumerated = (sizes > 0) & (sizes <= self.enumerate_max)
+        stored_of_class = np.where(enumerated, -1, np.cumsum(~enumerated) - 1).astype(np.int32)
+        self.num_stored = int((~enumerated).sum())
+        self.num_enumerated = self.num_classes - self.num_stored
+        class_of_stored = np.nonzero(~enumerated)[0]
+        stored_class = stored_of_class[token_class]
+        enumerated_token = np.full(self.num_classes, -1, dtype = np.int32)
+        single = np.nonzero(stored_class < 0)[0]
+        enumerated_token[token_class[single]] = single
+        enumerated_tokens = enumerated_token[enumerated_token >= 0]
+        self.stored_host, self.enumerated_host = stored_of_class, enumerated_token
+        (self.token_class, self.stored_of_class, self.class_of_stored32, self.stored_class, self.enumerated_token,
+         self.enumerated_tokens) = one_copy([token_class, stored_of_class, class_of_stored.astype(np.int32), stored_class, enumerated_token,
+                                             enumerated_tokens], device)
+        self.class_of_stored = one_copy([class_of_stored.astype(np.int64)], device, np.int64)[0]
 
     def to(self, device) -> "TokenClasses":
         """The same classes on ``device`` (a new object: nothing derived is carried over)."""

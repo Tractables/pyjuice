@@ -42,6 +42,14 @@ def pack_aligned(arrays: Sequence[np.ndarray], dtype) -> Tuple[np.ndarray, np.nd
     return buf, starts
 
 
+def one_copy(arrays: Sequence[np.ndarray], device, dtype = np.int32) -> list:
+    """``arrays`` on ``device`` in one copy (every copy from the host waits for the stream), of their shapes, each as
+    :func:`pack_aligned` places it."""
+    buf, starts = pack_aligned([a.reshape(-1) for a in arrays], dtype)
+    table = torch.from_numpy(buf).to(device)
+    return [table[at:at + a.size].view(a.shape) for a, at in zip(arrays, starts.tolist())]
+
+
 class OneCopy:
     """Int32 tables of a circuit's launches on their way to the device, in one copy (thousands of them; every copy from
     the host waits for the stream): :meth:`add` gives a place for a table, :meth:`upload` copies them all, and

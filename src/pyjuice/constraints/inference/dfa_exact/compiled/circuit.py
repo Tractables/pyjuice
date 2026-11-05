@@ -657,6 +657,7 @@ class Assembly:
         self.steps_host = torch.from_numpy(steps_t)
         self.pos_steps = self.steps_host.to(dev)
         self.trans_job = transition_job(torch.from_numpy(np.concatenate(rows)), dev) if rows else None
+        self.trans_rows_host = None if self.trans_job is None else self.trans_job[0].cpu().numpy()
         self.layers = {}
         number = circuit.attrs["iv_index"]
         tables = OneCopy()

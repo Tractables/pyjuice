@@ -180,7 +180,9 @@ def test_the_tables_follow_the_circuit_to_another_device():
 @pytest.mark.parametrize("grouped", [False, True])
 @pytest.mark.parametrize("seed", range(3))
 def test_the_batches_do_not_change_the_automatons_tables(seed, grouped, monkeypatch):
-    """One boundary a batch, none kept, against all of them together."""
+    """One boundary a batch, none kept, against all of them together (batches are the device's: few transitions build
+    on the host, past them)."""
+    monkeypatch.setattr(TR.host, "HOST_ENTRIES", 0)
     g = torch.Generator().manual_seed(seed)
     K, C, n = 12, 5, 7
     delta = torch.randint(0, K, (K, C), generator = g)

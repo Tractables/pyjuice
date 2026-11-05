@@ -12,8 +12,10 @@ parameter row: a step's lanes read along one row, see :meth:`~..state.State.enum
 weight (``enum_logw``, see :class:`~..state.ClassMasses`) over the row's ``Z``.
 """
 
-from . import tables, masses, signatures
-from .tables import (EnumeratedTokens, TransitionTables, BoundaryGroups, boundary_groups, enumerated_tokens,
-                     next_col_table, transition_stats, transition_tables)
+from . import forms, host_kernels, host, tables, masses, signatures
+from .host import HostTables, host_tables
+from .tables import (BoundaryGroups, boundary_groups, enumerated_tokens, next_col_table, transition_stats,
+                     transition_tables)
+from .forms import EnumeratedTokens, TransitionTables
 from .masses import (transition_job, job_tile, job_tiles, enumerated_args, enum_logw_stride, transition_masses,
                      SampleMasses, sample_masses, sample_classes, TRANSITION_TILES, TRANSITION_PAIR_TILE)

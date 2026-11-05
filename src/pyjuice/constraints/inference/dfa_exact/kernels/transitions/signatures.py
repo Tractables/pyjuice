@@ -33,7 +33,9 @@ from pyjuice.utils.kernel_launcher import triton_jit
 from pyjuice.utils.util import host_cdiv, host_next_power_of_2
 
 from .....distributions.categorical import _exact_dot
-from ..common import _next_col_of, grid_chunks
+from ..common import _next_col_of, grid_chunks, one_copy
+from .host import host_tables
+from .host_kernels import _column_signatures, _signature_representatives, _signature_slots
 from .masses import TRANSITION_PAIR_TILE, TRANSITION_TILES, job_tile, job_tiles
 
 #: Whether a query's one set of transition masses is laid out by column signature where that saves at least
@@ -184,6 +186,9 @@ def signature_masses(prog, masses, trans_size: int) -> Optional[SignatureMasses]
     tt, en, job = prog.succ, prog.enum, prog.trans_job
     if job is None or not tt.grouped or masses.batch != 1 or masses.enum_logw is not None:
         return None
+    host = host_tables(prog._tr)
+    if host is not None and host.pairs_host is not None:
+        return _on_the_host(prog, masses, trans_size, host)
     n, W, dev = prog.n, prog.W, prog.dev
     long = lambda x: x.long()
     width = torch.tensor(prog.width, dtype = torch.int64, device = dev)
@@ -296,6 +301,71 @@ def signature_masses(prog, masses, trans_size: int) -> Optional[SignatureMasses]
                            rep_col = i32(rep_q), rep_shift = rep_shift.contiguous(),
                            max_reps = int(rep_count.max()) if rep_count.numel() else 0,
                            saving = trans_size / max(size, 1))
+
+
+def _on_the_host(prog, masses, trans_size: int, host) -> Optional[SignatureMasses]:
+    """:func:`signature_masses` of tables built on the host (:mod:`.host`): the same, by the groups of alike boundaries."""
+    n, dev = prog.n, prog.dev
+    pairs_host = host.pairs_host
+    width, firsts, group = host.tr_width, host.firsts_host, host.group_host
+    state_id = host.host[1]
+    enumerated = pairs_host["enum"]
+    none = np.zeros((host.G, prog.W + 1), dtype = np.int32)
+    zero32, zero64 = np.zeros(1, dtype = np.int32), np.zeros(host.G + 1, dtype = np.int64)
+    enum_base, enum_row, enum_e, enum_pair = (zero64, none, zero32, zero32) if enumerated is None else \
+        (enumerated["base"], enumerated["row"], enumerated["e"], enumerated["pair"])
+    tok_index, tok_ptr = (zero32, np.zeros(n + 1, dtype = np.int64)) if host.enum_lists is None else host.enum_lists
+    pair_base, pair_row = pairs_host["base"], pairs_host["row"]
+    most_pairs, most_enum = prog.succ.max_pairs, prog.succ.max_enum
+    pair_bits, enum_bits = int(most_pairs).bit_length(), int(most_enum).bit_length()
+    row_first, sig, first, ok = _column_signatures(firsts, width, state_id, n, pair_base, pair_row, pairs_host["s"], enum_base, enum_row, enum_e, enum_pair,
+                                                   tok_index, tok_ptr, enumerated is not None, pair_bits, enum_bits, most_pairs, most_enum)
+    if not ok:
+        return None
+    S = first.size
+    sig_pairs = np.zeros(S, dtype = np.int64)
+    if S:
+        of_row = np.searchsorted(row_first, first, side = "right") - 1
+        sig_pairs = (pair_row[of_row, first - row_first[of_row] + 1] - pair_row[of_row, first - row_first[of_row]]).astype(np.int64)
+    sig_off = np.cumsum(sig_pairs) - sig_pairs
+    slots = int(sig_pairs.sum())
+
+    # the positions' classes: the same class-mass rows in rank order
+    classes = position_classes(prog, masses)
+    cls_of, csteps = classes.of, classes.steps
+    cbase = np.cumsum(csteps * slots) - csteps * slots
+    size = int((csteps * slots).sum())
+    if size * SIGNATURE_MIN_SAVING > trans_size:
+        return None
+    pair_off = np.where(cls_of >= 0, cbase[np.maximum(cls_of, 0)], 0)
+    pairs = np.where(cls_of >= 0, slots, 0)
+
+    rep_t, rep_q, rep_shift = _signature_representatives(group, cls_of, width, row_first, sig, sig_off, pair_row, csteps.size, S, host.G)
+    rep_count = np.bincount(rep_t, minlength = n)
+    rep_ptr = np.concatenate([[0], np.cumsum(rep_count)]).astype(np.int32)
+    exs, pxs = _signature_slots(pairs_host["x"], pairs_host["pred_x"], firsts, width, row_first, sig, sig_off, pair_base, pair_row)
+
+    # the representatives' steps: every step of a position with one, as `transition_job` cuts them
+    assembly = prog.assembly
+    rows = assembly.trans_rows_host                                # (by position)
+    kept = np.unique(rep_t)
+    steps = assembly.steps_host.numpy()
+    whole = kept.size == np.count_nonzero(steps)
+    starts = np.cumsum(steps) - steps
+    rep_rows = rows if whole else np.concatenate([rows[a:a + m] for a, m in zip(starts[kept].tolist(), steps[kept].tolist())]) if kept.size \
+        else rows[:0]
+    TS = job_tile(rep_rows.shape[0])
+    counts = steps[kept]
+    per = (counts + TS - 1) // TS
+    owner = np.repeat(np.arange(kept.size), per)
+    within = np.arange(owner.size) - (np.cumsum(per) - per)[owner]
+    tiles = np.stack([(np.cumsum(counts) - counts)[owner] + within * TS, np.minimum(counts[owner] - within * TS, TS), kept[owner]], axis = 1).astype(np.int32)
+    arrays = [exs if exs.size else zero32, pxs if pxs.size else zero32, tiles, rep_ptr, rep_q] + ([] if whole else [rep_rows.astype(np.int32)])
+    moved = one_copy(arrays, dev)
+    wide = one_copy([pair_off.astype(np.int64), pairs.astype(np.int64), rep_shift], dev, np.int64)
+    return SignatureMasses(pair_off = wide[0], pairs = wide[1], entry_x = moved[0], pred_x = moved[1], size = size,
+                           job = (prog.trans_job[0] if whole else moved[5], moved[2], TS), rep_ptr = moved[3], rep_col = moved[4],
+                           rep_shift = wide[2], max_reps = int(rep_count.max()) if rep_count.size else 0, saving = trans_size / max(size, 1))
 
 
 @triton_jit

@@ -16,7 +16,7 @@ from pyjuice.utils.kernel_launcher import triton_jit
 from pyjuice.utils.util import host_cdiv
 
 from ....evidence import current_device
-from .transitions import boundary_groups
+from .transitions import HostTables, boundary_groups
 
 #: the words of a program
 WORD_TILE = 16
@@ -43,6 +43,9 @@ class SweepTables:
         groups = boundary_groups(tr)
         W, dev = tr.W, tr.device
         self.group, self.W = groups.group, W
+        if isinstance(groups, HostTables):
+            self.ptr, self.cols = groups.sweep_tables()
+            return
         parts, rows = [], []
         total = 0
         for k, end in groups.batches:
