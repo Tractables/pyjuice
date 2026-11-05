@@ -5,8 +5,8 @@ A byte automaton (:class:`~.byte_level.ByteAutomaton`) as a token automaton: :fu
 concatenated -- is, whichever tokens spell it (tokens that split a character included); under the end-of-sequence
 padding convention the text may be followed by end-of-sequence ids, and only by them. From every state reached at a
 token boundary, in breadth-first order from the initial state, a depth-first walk of the vocabulary's byte trie stops
-at the dead state, so the work is the number of live (state, trie node) pairs rather than states times vocabulary. The
-trie walked has its nodes merged: texts spelling the same byte classes lead to the same states from every state, so
+at the dead state, and takes a subtree a level at a time where every class below a node leads a state to one successor
+(:func:`_walk_one`), so the work is far below the number of live (state, trie node) pairs. The trie walked has its nodes merged: texts spelling the same byte classes lead to the same states from every state, so
 they are one node, and what no state reads is left out (:func:`_merged_trie`).
 Tokens leading to the same state from every reached state share a class: two independent 64-bit random linear hashes
 of every merged node's successors, summed during the walks, then one representative token per class.
@@ -211,16 +211,151 @@ def _classes_read(table, dead):
 
 
 @njit(cache = True)
-def _walk(table, dead, initial, ptr, edge_class, edge_node, holds, r1, r2, r3, r4, budget):
+def _classes_below(ptr, edge_class, edge_node, W):
+    """uint64 [merged nodes, W]: the classes of every edge below a node, as bits (a child is numbered past its parent)."""
+    M = ptr.shape[0] - 1
+    below = np.zeros((M, W), dtype = np.uint64)
+    for u in range(M - 1, -1, -1):
+        for e in range(ptr[u], ptr[u + 1]):
+            c = edge_class[e]
+            w = edge_node[e]
+            for k in range(W):
+                below[u, k] |= below[w, k]
+            below[u, c >> 6] |= np.uint64(1) << np.uint64(c & 63)
+    return below
+
+
+@njit(cache = True)
+def _usual_move(table, q, usual, same, count):
+    """Keep ``usual[q]``, the successor most classes lead ``q`` to (``count`` zeros), and ``same[q]``, those classes as bits."""
+    C = table.shape[1]
+    best, most = table[q, 0], 0
+    for c in range(C):
+        x = table[q, c]
+        count[x] += 1
+        if count[x] > most:
+            most, best = count[x], x
+    for c in range(C):
+        count[table[q, c]] = 0
+    for c in range(C):
+        if table[q, c] == best:
+            same[q, c >> 6] |= np.uint64(1) << np.uint64(c & 63)
+    usual[q] = best
+
+
+@njit(cache = True)
+def _usual_moves(table, usual, same, count):
+    """:func:`_usual_move` of every state not known yet (threads walking only read them)."""
+    for q in range(table.shape[0]):
+        if usual[q] < 0:
+            _usual_move(table, q, usual, same, count)
+
+
+@njit(cache = True)
+def _walk_one(s, a1, b1, a2, b2, table, dead, ptr, edge_class, edge_node, below, usual, same, count, W, h1, h2, d1, d2, stack_node, stack_q,
+              find, holds, ends_before, seen, order, num):
+    """
+    The hashes of a depth-first walk of the merged trie (:func:`_merged_trie`) from state ``s``, through live states, added: to
+    ``h1`` and ``h2``, or by ranges of nodes to ``d1`` and ``d2`` (:func:`_add_ranges`), the same numbers. Most of a walk is
+    not walked: where every class below a node leads a state to one successor (:func:`_usual_move`: a string's characters
+    to the string, nearly all to the dead state), that successor holds for the whole next level of the subtree, and so on
+    level by level as long as it holds: a level of a breadth-first numbered trie is a range. With ``find``, every state a
+    token ends at (``holds``, as prefix counts ``ends_before``) is kept in ``order`` if not ``seen``. Returns ``(steps, num)``.
+    """
+    stack_node[0], stack_q[0] = 0, s
+    top = 1
+    steps = 0
+    while top > 0:
+        top -= 1
+        u, q = stack_node[top], stack_q[top]
+        if usual[q] < 0:
+            _usual_move(table, q, usual, same, count)
+        steps += 1
+        inside = True
+        for k in range(W):
+            if below[u, k] & ~same[q, k] != 0:
+                inside = False
+                break
+        if not inside:
+            steps += ptr[u + 1] - ptr[u]
+            for e in range(ptr[u], ptr[u + 1]):
+                q2 = table[q, edge_class[e]]
+                if q2 == dead:
+                    continue
+                w = edge_node[e]
+                x = np.uint64(q2 + 1)
+                h1[w] += a1 * x + b1
+                h2[w] += a2 * x + b2
+                if find and holds[w] and not seen[q2]:                 # a token ends here: a boundary state
+                    seen[q2] = True
+                    order[num] = q2
+                    num += 1
+                if ptr[w + 1] > ptr[w]:
+                    stack_node[top] = w
+                    stack_q[top] = q2
+                    top += 1
+            continue
+        t = usual[q]
+        first, last = u, u
+        while t != dead:
+            e0, e1 = ptr[first], ptr[last + 1]
+            if e1 == e0:
+                break
+            first, last = edge_node[e0], edge_node[e1 - 1]             # the next level: all of it at state t
+            x = np.uint64(t + 1)
+            y1, y2 = a1 * x + b1, a2 * x + b2
+            d1[first] += y1
+            d1[last + 1] -= y1
+            d2[first] += y2
+            d2[last + 1] -= y2
+            if find and not seen[t] and ends_before[last + 1] > ends_before[first]:
+                seen[t] = True
+                order[num] = t
+                num += 1
+            steps += 1
+            if usual[t] < 0:
+                _usual_move(table, t, usual, same, count)
+            inside = True
+            for k in range(W):
+                if below[u, k] & ~same[t, k] != 0:
+                    inside = False
+                    break
+            if not inside:                                             # no longer: the level's nodes walk on from t
+                for w in range(first, last + 1):
+                    if ptr[w + 1] > ptr[w]:
+                        stack_node[top] = w
+                        stack_q[top] = t
+                        top += 1
+                break
+            t = usual[t]
+    return steps, num
+
+
+@njit(cache = True)
+def _add_ranges(h, d):
+    """Add to the hashes ``h`` what the differences ``d`` say."""
+    total = np.uint64(0)
+    for i in range(d.shape[0]):
+        total += d[i]
+        h[i] += total
+
+
+@njit(cache = True)
+def _walk(table, dead, initial, ptr, edge_class, edge_node, holds, r1, r2, r3, r4, below, usual, same, count, budget):
     """The states reached at token boundaries (breadth-first from ``initial``) and, per merged node, two hashes of its
-    successors from them: from every reached state a depth-first walk of the merged trie (:func:`_merged_trie`) through
-    live states -- as far as ``budget`` edges go: ``(h1, h2, states, walked)``, the first ``walked`` of them walked (every
-    state a walk found, if it is all of them). The hashes tell apart the nodes these states tell apart, by the state they
-    lead to, whether tokens end at them or not."""
+    successors from them: from every reached state a walk (:func:`_walk_one`) -- as far as ``budget`` steps go: ``(h1, h2,
+    states, walked)``, the first ``walked`` of them walked (every state a walk found, if it is all of them). The hashes
+    tell apart the nodes these states tell apart, by the state they lead to, whether tokens end at them or not."""
     S = table.shape[0]
     M = ptr.shape[0] - 1
+    W = below.shape[1]
     h1 = np.zeros(M + 2, dtype = np.uint64)
     h2 = np.zeros(M + 2, dtype = np.uint64)
+    d1 = np.zeros(M + 2, dtype = np.uint64)
+    d2 = np.zeros(M + 2, dtype = np.uint64)
+    ends_before = np.zeros(M + 1, dtype = np.int32)
+    for u in range(M):
+        ends_before[u + 1] = ends_before[u] + holds[u]
     order = np.empty(S, dtype = np.int64)
     seen = np.zeros(S, dtype = np.bool_)
     order[0] = initial
@@ -232,98 +367,62 @@ def _walk(table, dead, initial, ptr, edge_class, edge_node, holds, r1, r2, r3, r
     while head < num and steps < budget:
         s = order[head]
         head += 1
-        a1, b1, a2, b2 = r1[s], r2[s], r3[s], r4[s]
-        stack_node[0] = 0
-        stack_q[0] = s
-        top = 1
-        while top > 0:
-            top -= 1
-            u = stack_node[top]
-            q = stack_q[top]
-            steps += ptr[u + 1] - ptr[u]
-            for e in range(ptr[u], ptr[u + 1]):
-                q2 = table[q, edge_class[e]]
-                if q2 == dead:
-                    continue
-                w = edge_node[e]
-                x = np.uint64(q2 + 1)
-                h1[w] += a1 * x + b1
-                h2[w] += a2 * x + b2
-                if holds[w] and not seen[q2]:                          # a token ends here: a boundary state
-                    seen[q2] = True
-                    order[num] = q2
-                    num += 1
-                stack_node[top] = w
-                stack_q[top] = q2
-                top += 1
+        done, num = _walk_one(s, r1[s], r2[s], r3[s], r4[s], table, dead, ptr, edge_class, edge_node, below, usual, same, count, W, h1, h2, d1, d2,
+                              stack_node, stack_q, True, holds, ends_before, seen, order, num)
+        steps += done
+    _add_ranges(h1, d1)
+    _add_ranges(h2, d2)
     return h1, h2, order[:num], head
 
 
 @njit(cache = True)
-def _walks(table, dead, states, ptr, edge_class, edge_node, r1, r2, r3, r4, h1, h2, budget):
-    """:func:`_walk`'s hashes, added to ``h1`` and ``h2``, from ``states`` in turn, as far as ``budget`` edges go: how many
+def _walks(table, dead, states, ptr, edge_class, edge_node, r1, r2, r3, r4, below, usual, same, count, h1, h2, budget):
+    """:func:`_walk`'s hashes, added to ``h1`` and ``h2``, from ``states`` in turn, as far as ``budget`` steps go: how many
     were walked, one at least."""
     M = ptr.shape[0] - 1
+    W = below.shape[1]
+    d1 = np.zeros(h1.shape[0], dtype = np.uint64)
+    d2 = np.zeros(h1.shape[0], dtype = np.uint64)
     stack_node = np.empty(M + 1, dtype = np.int32)
     stack_q = np.empty(M + 1, dtype = np.int32)
+    no_ends = np.zeros(1, dtype = np.int32)
+    no_seen = np.zeros(1, dtype = np.bool_)
+    no_order = np.zeros(1, dtype = np.int64)
     steps, i = 0, 0
     while i < states.shape[0] and (i == 0 or steps < budget):
         s = states[i]
         i += 1
-        a1, b1, a2, b2 = r1[s], r2[s], r3[s], r4[s]
-        stack_node[0] = 0
-        stack_q[0] = s
-        top = 1
-        while top > 0:
-            top -= 1
-            u = stack_node[top]
-            q = stack_q[top]
-            steps += ptr[u + 1] - ptr[u]
-            for e in range(ptr[u], ptr[u + 1]):
-                q2 = table[q, edge_class[e]]
-                if q2 == dead:
-                    continue
-                w = edge_node[e]
-                x = np.uint64(q2 + 1)
-                h1[w] += a1 * x + b1
-                h2[w] += a2 * x + b2
-                stack_node[top] = w
-                stack_q[top] = q2
-                top += 1
+        done, _ = _walk_one(s, r1[s], r2[s], r3[s], r4[s], table, dead, ptr, edge_class, edge_node, below, usual, same, count, W, h1, h2, d1, d2,
+                            stack_node, stack_q, False, no_seen, no_ends, no_seen, no_order, 0)
+        steps += done
+    _add_ranges(h1, d1)
+    _add_ranges(h2, d2)
     return i
 
 
 @njit(parallel = True, cache = True)
-def _walks_parallel(table, dead, states, ptr, edge_class, edge_node, r1, r2, r3, r4, P, slots):
-    """:func:`_walks` of all ``states``, no budget, in parallel: ``P`` walkers take every ``P``-th state, each summing into
-    its own hashes -- ``slots`` of them, the merged nodes and two more --, then summed."""
+def _walks_parallel(table, dead, states, ptr, edge_class, edge_node, r1, r2, r3, r4, below, usual, same, P, slots):
+    """:func:`_walks` of all ``states``, no budget, in parallel, every state's :func:`_usual_move` known: ``P`` walkers take every
+    ``P``-th state, each summing into its own hashes -- ``slots`` of them, the merged nodes and two more --, then summed."""
     S = states.shape[0]
+    W = below.shape[1]
     h1 = np.zeros((P, slots), dtype = np.uint64)
     h2 = np.zeros((P, slots), dtype = np.uint64)
+    no_count = np.zeros(1, dtype = np.int32)
+    no_ends = np.zeros(1, dtype = np.int32)
+    no_seen = np.zeros(1, dtype = np.bool_)
+    no_order = np.zeros(1, dtype = np.int64)
     for c in prange(P):
         stack_node = np.empty(slots, dtype = np.int32)
         stack_q = np.empty(slots, dtype = np.int32)
+        d1 = np.zeros(slots, dtype = np.uint64)
+        d2 = np.zeros(slots, dtype = np.uint64)
         for i in range(c, S, P):
             s = states[i]
-            a1, b1, a2, b2 = r1[s], r2[s], r3[s], r4[s]
-            stack_node[0] = 0
-            stack_q[0] = s
-            top = 1
-            while top > 0:
-                top -= 1
-                u = stack_node[top]
-                q = stack_q[top]
-                for e in range(ptr[u], ptr[u + 1]):
-                    q2 = table[q, edge_class[e]]
-                    if q2 == dead:
-                        continue
-                    w = edge_node[e]
-                    x = np.uint64(q2 + 1)
-                    h1[c, w] += a1 * x + b1
-                    h2[c, w] += a2 * x + b2
-                    stack_node[top] = w
-                    stack_q[top] = q2
-                    top += 1
+            _walk_one(s, r1[s], r2[s], r3[s], r4[s], table, dead, ptr, edge_class, edge_node, below, usual, same, no_count, W, h1[c], h2[c], d1, d2,
+                      stack_node, stack_q, False, no_seen, no_ends, no_seen, no_order, 0)
+        _add_ranges(h1[c], d1)
+        _add_ranges(h2[c], d2)
     o1 = np.zeros(slots, dtype = np.uint64)
     o2 = np.zeros(slots, dtype = np.uint64)
     for c in range(P):
@@ -468,7 +567,7 @@ def _not_told_apart(table: np.ndarray, dead: int, states: np.ndarray, quotient) 
 
 
 def _walk_the_rest(table: np.ndarray, dead: int, rest: np.ndarray, ptr: np.ndarray, edge_class: np.ndarray, edge_node: np.ndarray,
-                   r: Sequence[np.ndarray], h1: np.ndarray, h2: np.ndarray) -> None:
+                   r: Sequence[np.ndarray], walking: tuple, h1: np.ndarray, h2: np.ndarray) -> None:
     """
     The token classes as if walks from ``rest`` were added to the hashes ``h1`` and ``h2``, with next to no walks: of two
     hundred thousand states a few hundred tell apart all a walk from every one would (a state in a long string reads its
@@ -489,11 +588,12 @@ def _walk_the_rest(table: np.ndarray, dead: int, rest: np.ndarray, ptr: np.ndarr
             if left.size == 0:
                 break
             if budget < WALKS_IN_THREADS or get_num_threads() == 1:
-                walked = _walks(table, dead, left, ptr, edge_class, edge_node, r[0], r[1], r[2], r[3], h1, h2, budget)
+                walked = _walks(table, dead, left, ptr, edge_class, edge_node, r[0], r[1], r[2], r[3], *walking, h1, h2, budget)
                 left = left[walked:]
                 budget *= 2
             else:                                                       # (states that do tell much apart: all at once)
-                a1, a2 = _walks_parallel(table, dead, left, ptr, edge_class, edge_node, r[0], r[1], r[2], r[3],
+                _usual_moves(table, walking[1], walking[2], walking[3])
+                a1, a2 = _walks_parallel(table, dead, left, ptr, edge_class, edge_node, r[0], r[1], r[2], r[3], *walking[:3],
                                          min(get_num_threads(), left.size), M + 2)
                 with np.errstate(over = "ignore"):
                     h1 += a1
@@ -799,7 +899,7 @@ def _canonical_token_table(automaton: ByteAutomaton, states: np.ndarray, remap: 
     return out, accept[order]
 
 
-#: so many edges of the merged trie are walked first, or a table of so many entries stays on one thread: waking a team is
+#: so many steps of walks of the merged trie come first, or a table of so many entries stays on one thread: waking a team is
 #: milliseconds on a busy machine
 SERIAL_STEPS = 1 << 19
 NO_BUDGET = 1 << 62
@@ -832,14 +932,16 @@ def to_tokens(automaton: ByteAutomaton, vocabulary: Vocabulary, eos_padding: boo
                                                                  byte_class, _classes_read(table, dead_byte), V)
     M = ptr.size - 1
     complete = automaton.minimal and start != dead_byte and _byte_complete(trie)
-    h1, h2, states, walked = _walk(table, dead_byte, start, ptr, edge_class, edge_node, holds, r[0], r[1], r[2], r[3],
+    walking = (_classes_below(ptr, edge_class, edge_node, (table.shape[1] + 63) // 64), np.full(S, -1, dtype = np.int32),
+               np.zeros((S, (table.shape[1] + 63) // 64), dtype = np.uint64), np.zeros(S, dtype = np.int32))
+    h1, h2, states, walked = _walk(table, dead_byte, start, ptr, edge_class, edge_node, holds, r[0], r[1], r[2], r[3], *walking,
                                    SERIAL_STEPS if complete else NO_BUDGET)
     if walked < states.size:        # the states reached at token boundaries: every one a byte text reaches
         left = np.ones(S, dtype = bool)
         left[states[:walked]] = False
         states = bfs_order(table, start)
         states = states[states != dead_byte]
-        _walk_the_rest(table, dead_byte, states[left[states]], ptr, edge_class, edge_node, r, h1, h2)
+        _walk_the_rest(table, dead_byte, states[left[states]], ptr, edge_class, edge_node, r, walking, h1, h2)
     offsets, has_text = vocabulary._offsets, vocabulary._has_text
     empty = np.nonzero(has_text & (offsets[1:] == offsets[:-1]))[0]
     if empty.size:                                                      # empty text: every state to itself

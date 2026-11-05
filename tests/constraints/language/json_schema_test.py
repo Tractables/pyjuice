@@ -337,6 +337,75 @@ def test_the_table_of_a_token_automaton_from_its_moves_is_the_dense_one(monkeypa
     assert from_moves > 0.9 * 8 * len(cases)
 
 
+def test_walks_by_ranges_give_the_hashes_of_every_step():
+    """Random automata and tokens: the walks that take the levels of a subtree at once, where every class below a node leads
+    a state to one successor, against a walk of every node from every state: the same hash of every merged node, to the
+    bit, and the same boundary states -- the successor holding for a level or more and then no longer, included."""
+    from pyjuice.constraints.language.backend import token_lift as T
+    rng = np.random.default_rng(1)
+    uses_ranges = 0
+    for case in range(120):
+        C = int(rng.integers(1, 7))
+        K = int(rng.integers(2, 40))
+        dead = K - 1
+        table = np.full((K, C), dead, dtype = np.int32)
+        kind = case % 4
+        for q in range(K - 1):                                  # (strings, counters, mostly dead, anything)
+            if kind == 0 or (kind == 3 and rng.random() < 0.5):
+                table[q] = q
+            elif kind == 1:
+                table[q] = min(q + 1, K - 2)
+            elif kind == 2 and rng.random() < 0.3:
+                table[q] = dead
+            for c in rng.integers(0, C, int(rng.integers(0, max(C // 2, 1) + 1))).tolist():
+                table[q, c] = rng.integers(0, K)
+        tokens = [bytes(rng.integers(0, C, int(rng.integers(1, 7))).tolist()) for _ in range(int(rng.integers(5, 120)))]
+        trie = T._trie(jc.Vocabulary(tokens))
+        byte_class = np.minimum(np.arange(256), C - 1)
+        ptr, edge_class, edge_node, token_node, holds = T._merged_trie(trie.first_child, trie.node_byte, trie.end_ptr, trie.end_ids, byte_class,
+                                                                       np.ones(C, dtype = np.bool_), len(tokens))
+        M, S = ptr.size - 1, K
+        r = [rng.integers(1, 2 ** 63, size = S, dtype = np.uint64) | np.uint64(1) for _ in range(4)]
+        want1, want2 = np.zeros(M + 2, dtype = np.uint64), np.zeros(M + 2, dtype = np.uint64)
+        order, seen = [0], {0}
+        head = 0
+        while head < len(order):                                # every node from every state found
+            s = order[head]
+            head += 1
+            stack = [(0, s)]
+            while stack:
+                u, q = stack.pop()
+                for e in range(ptr[u], ptr[u + 1]):
+                    q2 = int(table[q, edge_class[e]])
+                    if q2 == dead:
+                        continue
+                    w = int(edge_node[e])
+                    x = np.uint64(q2 + 1)
+                    with np.errstate(over = "ignore"):
+                        want1[w] += r[0][s] * x + r[1][s]
+                        want2[w] += r[2][s] * x + r[3][s]
+                    if holds[w] and q2 not in seen:
+                        seen.add(q2)
+                        order.append(q2)
+                    stack.append((w, q2))
+        W = (C + 63) // 64
+        below = T._classes_below(ptr, edge_class, edge_node, W)
+        usual, same = np.full(S, -1, dtype = np.int32), np.zeros((S, W), dtype = np.uint64)
+        count = np.zeros(S, dtype = np.int32)
+        h1, h2, states, walked = T._walk(table, dead, 0, ptr, edge_class, edge_node, holds, *r, below, usual, same, count, 1 << 62)
+        assert np.array_equal(h1, want1) and np.array_equal(h2, want2), case
+        assert sorted(states.tolist()) == sorted(order) and walked == states.size, case
+        uses_ranges += bool((usual >= 0).any())
+        some = np.array(order, dtype = np.int64)                # from these states again, both other ways of walking
+        again1, again2 = np.zeros(M + 2, dtype = np.uint64), np.zeros(M + 2, dtype = np.uint64)
+        assert T._walks(table, dead, some, ptr, edge_class, edge_node, *r, below, usual, same, count, again1, again2, 1 << 62) == some.size
+        assert np.array_equal(again1, want1) and np.array_equal(again2, want2), case
+        T._usual_moves(table, usual, same, count)
+        par1, par2 = T._walks_parallel(table, dead, some, ptr, edge_class, edge_node, *r, below, usual, same, min(3, some.size), M + 2)
+        assert np.array_equal(par1, want1) and np.array_equal(par2, want2), case
+    assert uses_ranges == 120
+
+
 def test_numbers_below_a_combinator_are_written_one_way():
     from pyjuice.constraints.language.backend.json_schema import canonical_number
     for x, text in [(1, "1"), (1.0, "1"), (-0.0, "0"), (0, "0"), (1.5, "1.5"), (1e-7, "0.0000001"),
