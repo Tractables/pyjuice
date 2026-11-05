@@ -2,6 +2,8 @@
 The transition tables of a small automaton, built on the host (:mod:`pyjuice.constraints.inference.dfa_exact.kernels.transitions.host`),
 against the device's: the same values, types and shapes, whatever the automaton, over random automata and sizes.
 """
+import dataclasses
+
 import pytest
 import torch
 
@@ -157,6 +159,32 @@ def test_the_enumerated_tokens_and_the_grouped_tables_take_one_pass(monkeypatch)
     assert TR.boundary_groups(off).swept is None
 
 
+def test_a_pass_without_the_lists_is_for_tables_without_them(monkeypatch):
+    """What a program asks for: one pass, no lists, and the rest the same. Tables with the lists, after it: a pass of their own, for them."""
+    dfa = jc.DFA.contains([[1, 2]], 5)
+    layout = build_layout(dfa, 16, device = DEV)
+    tr = layout.transitions(DEV)
+    off = on_the_device(tr)
+    classes = TokenClasses(layout.token_class, dfa.num_classes, 1, host = layout.token_class.numpy(), device = DEV)
+    passes = []
+    sweep = TR.tables.BoundaryGroups.sweep
+    monkeypatch.setattr(TR.tables.BoundaryGroups, "sweep", lambda self, *a, **k: (passes.append(k.get("lists", True)), sweep(self, *a, **k))[1])
+    en = TR.enumerated_tokens(off, classes, lists = False)
+    without = TR.transition_tables(off, True, en, lists = False)
+    assert passes == [False] and without.enum_e is None and without.enum_pair is None
+    want = TR.transition_tables(tr, True, TR.enumerated_tokens(tr, classes))
+    assert_same(want, dataclasses.replace(without, enum_e = want.enum_e, enum_pair = want.enum_pair), "without the lists")
+    code = en.code.long()
+    stats = TR.transition_stats(off)
+    e, pair = TR.boundary_groups(off).enumerated_lists(code)
+    assert_same(e, want.enum_e, "every column's")
+    assert_same(pair, want.enum_pair, "every column's")
+    assert TR.transition_stats(off) == stats                            # (a pass for the lists alone: nothing else it leaves changed)
+    TR.enumerated_tokens(off, classes, lists = False)
+    other = TR.enumerated_tokens(off, classes, lists = False)
+    assert_same(want, TR.transition_tables(off, True, other), "with them, after a pass without")
+
+
 @pytest.mark.parametrize("asked", ["no tokens", "ungrouped", "no tokens, ungrouped"])
 def test_a_pass_left_for_the_grouped_tables_of_these_tokens_is_for_nothing_else(asked):
     """What the enumerated tokens' pass made, asked for anything else first: that thing, and the pass let go of."""
@@ -234,6 +262,37 @@ def test_a_table_over_every_boundary_past_its_limit_is_the_same(big, monkeypatch
     assert_same(TR.next_col_table(tr), want, "next col")
 
 
+def whole(prog):
+    """A program's grouped tables with every column's enumerated entries, which on the device come when asked for."""
+    ptr, e, pair = prog.enum_lists()
+    return dataclasses.replace(prog.succ, enum_ptr = ptr, enum_e = e, enum_pair = pair)
+
+
+def as_on_the_host(sig):
+    """A signature layout without its own lists, which only the device's has."""
+    return dataclasses.replace(sig, rep_enum_ptr = None, rep_enum_e = None, rep_enum_pair = None)
+
+
+def assert_lists_of_representatives(prog, sig):
+    """A signature layout's lists on the device: of its representative columns those columns' whole, of the others none."""
+    if not prog.enum.on:
+        assert sig.rep_enum_ptr is None
+        return
+    ptr, e, pair = prog.enum_lists()
+    reps = {(t, q) for t in range(prog.n) for q in sig.rep_col[sig.rep_ptr[t]:sig.rep_ptr[t + 1]].tolist()}
+    own = sig.rep_enum_ptr
+    assert own.shape == ptr.shape and own.dtype == ptr.dtype
+    for t in range(prog.n):
+        for q in range(prog.W):
+            a, b = int(own[t, q]), int(own[t, q + 1])
+            if (t, q) not in reps:
+                assert a == b, (t, q)
+                continue
+            c, d = int(ptr[t, q]), int(ptr[t, q + 1])
+            assert sig.rep_enum_e[a:b].tolist() == e[c:d].tolist(), (t, q)
+            assert sig.rep_enum_pair[a:b].tolist() == pair[c:d].tolist(), (t, q)
+
+
 CASES = [("hmm", 8), ("hmm_block_sparse", 8), ("pd", 8), ("pd_blockified", 8), ("hand", 5), ("hand_left", 5)]
 AUTOMATA = {"contains": lambda V: jc.DFA.contains([[1, 2]], V), "either": lambda V: jc.DFA.contains([[1, 2]], V) | jc.DFA.contains([[2, 2]], V),
             "absent": lambda V: jc.Not(jc.DFA.contains([[2, 2]], V))}
@@ -258,8 +317,10 @@ def test_a_programs_signature_layout_is_the_devices(kind, n, name, build_pc, mon
     assert on_host and not off
     assert (sig is None) == (sig_off is None)
     if sig is not None:
-        assert_same(sig, sig_off, f"signature {kind} {name}")
-    for field in ("succ", "enum", "next_col"):
+        assert_same(sig, as_on_the_host(sig_off), f"signature {kind} {name}")
+        assert_lists_of_representatives(prog_off, sig_off)
+    assert_same(prog.succ, whole(prog_off), f"succ {kind} {name}")
+    for field in ("enum", "next_col"):
         assert_same(getattr(prog, field), getattr(prog_off, field), f"{field} {kind} {name}")
     assert_same(prog.ungrouped_tables(), prog_off.ungrouped_tables(), f"ungrouped {kind} {name}")
     assert prog.transition_stats == prog_off.transition_stats
@@ -303,7 +364,8 @@ def test_signatures_of_enumerated_tokens_and_of_positions_apart_are_the_devices(
         assert (sig is None) == (sig_off is None), seed
         if sig is None:                                        # (a position without steps, say: nothing to lay out)
             continue
-        assert_same(sig, sig_off, f"signature {kind} {seed}")
+        assert_same(sig, as_on_the_host(sig_off), f"signature {kind} {seed}")
+        assert_lists_of_representatives(prog_off, sig_off)
         compared += 1
         enumerated += prog.enum.num > 0
         classes = max(classes, prog.assembly.position_classes.steps.size)
@@ -321,3 +383,59 @@ def test_two_groups_with_columns_alike_share_their_signatures(build_pc):
     groups = TR.boundary_groups(prog._tr)
     assert len(groups.firsts) < prog.n
     assert sig is not None and sig.pairs.numel() == prog.n
+
+
+def test_masses_by_signature_read_no_columns_lists_but_their_representatives(build_pc, monkeypatch):
+    """A first query on the device: no pass for every column's enumerated entries. Asked for, they come once, and are the host's."""
+    from pyjuice.constraints.inference.dfa_exact import backend as BE
+    V, n = 12, 24
+    pc = build_pc("hmm", n, V)
+    monkeypatch.setattr(BE, "ENUMERATE_MAX_TOKENS", 1)
+    monkeypatch.setattr(BE, "ENUMERATE_MIN_FRACTION", 0.0)
+    monkeypatch.setattr(TS, "SIGNATURE_MIN_SAVING", 0.0)
+    monkeypatch.setattr(H, "HOST_ENTRIES", 0)
+    for seed in range(24):
+        cc = jc.compile(enumerating_automaton(seed, V), pc)
+        prog = cc.backend.program()
+        if cc.backend.layout.satisfiable and prog.enum.num > 0:
+            break
+    assert prog.succ.enum_e is None and prog.succ.enum_ptr is not None
+    lists = TR.tables.BoundaryGroups.enumerated_lists
+
+    def not_read(self, code):
+        raise AssertionError("every column's enumerated entries were read")
+    with monkeypatch.context() as m:
+        m.setattr(TR.tables.BoundaryGroups, "enumerated_lists", not_read)
+        m.setattr(prog, "group_worth", True)
+        sig = prog.signature_layout(cc.backend.state.masses())
+        assert sig is not None and sig.rep_enum_ptr is not None
+    calls = []
+    monkeypatch.setattr(TR.tables.BoundaryGroups, "enumerated_lists", lambda self, code: (calls.append(1), lists(self, code))[1])
+    first = prog.enum_lists()
+    assert first[1] is prog.enum_lists()[1] and calls == [1]
+
+
+def test_a_program_takes_one_pass_over_the_moves(build_pc, monkeypatch):
+    """Its enumerated tokens' and its tables', without the lists: the most of what a long layout costs, once."""
+    from pyjuice.constraints.inference.dfa_exact import backend as BE
+    monkeypatch.setattr(BE, "ENUMERATE_MAX_TOKENS", 1)
+    monkeypatch.setattr(BE, "ENUMERATE_MIN_FRACTION", 0.0)
+    monkeypatch.setattr(H, "HOST_ENTRIES", 0)
+    passes = []
+    sweep = TR.tables.BoundaryGroups.sweep
+    monkeypatch.setattr(TR.tables.BoundaryGroups, "sweep", lambda self, *a, **k: (passes.append(k.get("lists", True)), sweep(self, *a, **k))[1])
+    prog = jc.compile(jc.DFA.contains([[1, 2]], 5), build_pc("hmm", 8, 5)).backend.program()
+    assert prog.enum.on and passes == [False]
+
+
+def test_the_ungrouped_tables_come_when_first_read(build_pc):
+    """A whole pass over the moves, which a program that may never read them does not make; what it is to read is known before."""
+    pc = build_pc("hmm", 8, 3)
+    cc = jc.compile(jc.DFA.contains([[1, 2]], 3), pc)
+    prog = cc.backend.program()
+    assert not prog.trans_grouped and not cc.backend.grouped and prog._ungrouped is None
+    assert prog.transition_buffer().numel() == 1 and prog._ungrouped is None             # (no masses to hold, for those tables)
+    assert prog.trans.grouped is False and prog.trans is prog._ungrouped and not prog.trans_persistent
+    grouped = prog.succ
+    prog.trans_grouped = True
+    assert prog.trans is grouped

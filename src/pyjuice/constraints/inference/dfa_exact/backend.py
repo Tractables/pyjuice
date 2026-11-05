@@ -212,7 +212,7 @@ class DFAExactBackend(Backend):
 
     @property
     def grouped(self) -> bool:
-        return self.program().trans.grouped
+        return self.program().trans_grouped
 
     @property
     def bytes_per_sample(self) -> int:

@@ -13,6 +13,8 @@ import pytest
 import torch
 
 import pyjuice.constraints as jc
+from pyjuice.constraints.inference.dfa_exact import backend as BE
+from pyjuice.constraints.inference.dfa_exact.kernels.transitions import host as H
 from pyjuice.constraints.inference.dfa_exact.kernels.transitions import signatures as TS
 
 _spec = importlib.util.spec_from_file_location("strong_check_test", os.path.join(os.path.dirname(__file__), "strong_check_test.py"))
@@ -54,6 +56,32 @@ def test_signature_masses_give_the_per_column_ones_to_the_bit(mode, storage, mon
     monkeypatch.setattr(TS, "SIGNATURE_MASSES", False)
     col = run_session(cc, data, masks, None, storage, "fp32")
     assert prog.trans_sig is None
+    for i in sig:
+        for u, v in zip(sig[i], col[i]):
+            assert torch.equal(u, v), f"call {i}: the signature masses differ from the per-column ones"
+
+
+@cuda_only
+@pytest.mark.parametrize("mode", ["l2r", "diffusion"])
+def test_signature_masses_on_the_device_with_enumerated_tokens_give_the_per_column_ones_to_the_bit(mode, monkeypatch):
+    """The lists of the representative columns against every column's, the same kernels' operands, chunked alike: to the bit."""
+    monkeypatch.setattr(H, "HOST_ENTRIES", 0)
+    monkeypatch.setattr(BE, "ENUMERATE_MAX_TOKENS", 1)
+    monkeypatch.setattr(BE, "ENUMERATE_MIN_FRACTION", 0.0)
+    pc, dfa, data = long_hmm()
+    cc = jc.compile(dfa, pc)
+    prog = cc.backend.program()
+    assert prog.enum.num > 0 and prog.succ.enum_e is None
+    monkeypatch.setattr(prog, "group_worth", True)
+    masks = schedule(mode, data.size(0), data.size(1))
+    monkeypatch.setattr(TS, "SIGNATURE_MASSES", True)
+    check_against_reference(cc, Float64Reference(pc, dfa, data.size(1)), data, masks, None, "compact", "fp32")
+    assert prog.trans_grouped and prog.trans_sig is not None and prog.trans_sig.rep_enum_ptr is not None, "the signature layout was not taken"
+    assert prog._enum_lists is None, "every column's lists were read"
+    sig = run_session(cc, data, masks, None, "compact", "fp32")
+    monkeypatch.setattr(TS, "SIGNATURE_MASSES", False)
+    col = run_session(cc, data, masks, None, "compact", "fp32")
+    assert prog.trans_sig is None and prog._enum_lists is not None
     for i in sig:
         for u, v in zip(sig[i], col[i]):
             assert torch.equal(u, v), f"call {i}: the signature masses differ from the per-column ones"

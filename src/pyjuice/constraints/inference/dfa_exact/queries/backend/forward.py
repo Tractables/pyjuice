@@ -157,7 +157,7 @@ def run_forward(backend, bufs: dict, plan, x: torch.Tensor, missing: torch.Tenso
     dot = PRECISIONS[precision]
     live = liveness.live if liveness is not None else None
     succ_lists = None                                                  # entry loops under pruning: a column's entries
-    if liveness is not None and (prog.trans.grouped or prog.entry_loop):         # whose successor is live, where few are
+    if liveness is not None and (prog.trans_grouped or prog.entry_loop):         # whose successor is live, where few are
         succ_lists = lambda: liveness.successor_lists(backend.state)   # (built by the first launch that can take them)
 
     if hold is not None and compact is not None:       # the fused sums' order of the rows computing their values,

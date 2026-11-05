@@ -35,6 +35,7 @@ from pyjuice.utils.util import host_cdiv, host_next_power_of_2
 from .....distributions.categorical import _exact_dot
 from ..common import _next_col_of, grid_chunks, one_copy
 from .host import host_tables
+from .tables import boundary_groups
 from .host_kernels import _column_signatures, _signature_representatives, _signature_slots
 from .masses import TRANSITION_PAIR_TILE, TRANSITION_TILES, job_tile, job_tiles
 
@@ -59,6 +60,8 @@ class SignatureMasses:
         ``rep_col`` int32 / ``rep_shift`` int64: a column's first pair's slot less its first pair's number)
     :ivar max_reps: the most representative columns at a position
     :ivar saving: the per-column layout's floats over these
+    :ivar rep_enum_ptr, rep_enum_e, rep_enum_pair: the representative columns' enumerated entries, built on the device (:meth:`~.tables.BoundaryGroups.enumerated_of`), None
+        when the program's tables have them all
     """
 
     pair_off: torch.Tensor
@@ -72,6 +75,9 @@ class SignatureMasses:
     rep_shift: torch.Tensor
     max_reps: int
     saving: float
+    rep_enum_ptr: Optional[torch.Tensor] = None
+    rep_enum_e: Optional[torch.Tensor] = None
+    rep_enum_pair: Optional[torch.Tensor] = None
 
 
 def _signed(value: int) -> int:
@@ -211,22 +217,13 @@ def signature_masses(prog, masses, trans_size: int) -> Optional[SignatureMasses]
     end = T[ecol] + 1 == n
     next_t = (T[ecol] + 1).clamp(max = n)
     succ_state = torch.where(end, -7, sid[next_t, torch.where(end, torch.zeros_like(eidx), entry_succ[eidx])])
-    # its enumerated tokens: (token's column of the probabilities, pair relative to the column's first)
+    # its enumerated tokens: how many. Which, and to which of its pairs, says its state and which of its pairs are live, by the classes of its state in their order: those
+    # the signature already has, so no column's need reading (nor can two columns' differ, whose signatures agree)
     if enum:
         enum_ptr = long(tt.enum_ptr).view(n, W + 1)
-        enum_e, enum_pair = long(tt.enum_e), long(tt.enum_pair)
-        tok_ptr, tok_index = long(en.ptr), long(en.index)
-        ns_, ne_ = enum_ptr[T, Q], enum_ptr[T, Q + 1]
-        nenum = ne_ - ns_
-        nstart = torch.cumsum(nenum, dim = 0) - nenum
-        ncol, nk = _spread(nenum)
-        nidx = ns_[ncol] + nk
-        tok = tok_index[tok_ptr[T[ncol]] + enum_e[nidx]]
-        rel = enum_pair[nidx] - gfirst[ncol]
-        evals = tok * 65536 + rel
+        nenum = enum_ptr[T, Q + 1] - enum_ptr[T, Q]
     else:
         nenum = torch.zeros(T.numel(), dtype = torch.int64, device = dev)
-        nstart, ncol, evals = nenum, torch.zeros(0, dtype = torch.int64, device = dev), torch.zeros(0, dtype = torch.int64, device = dev)
     # a column's sizes, in that order, one key where they fit in it (the rows' order is theirs: one sort, not four)
     pair_bits, enum_bits = int(tt.max_pairs).bit_length(), int(tt.max_enum).bit_length()
     if int(prog.K).bit_length() + pair_bits + enum_bits < 62:
@@ -234,13 +231,10 @@ def signature_masses(prog, masses, trans_size: int) -> Optional[SignatureMasses]
     else:
         sizes = [sid[T, Q], npairs, nenum, (T + 1 == n).long()]
     # (the operands' hashes: no second one, exactly checked below)
-    first, sig = _unique_rows(sizes + [_segment_hash(succ_state, ecol, cstart, npairs, tt.max_pairs, 1)] +
-                              ([_segment_hash(evals, ncol, nstart, nenum, tt.max_enum, 3)] if enum else []))
+    first, sig = _unique_rows(sizes + [_segment_hash(succ_state, ecol, cstart, npairs, tt.max_pairs, 1)])
     rep = first[sig]                                               # every column's signature's first column
     # exact: every column's operands are its first's (no hash collision)
     if not torch.equal(succ_state, succ_state[cstart[rep[ecol]] + ek]):
-        return None
-    if enum and not torch.equal(evals, evals[nstart[rep[ncol]] + nk]):
         return None
     S = first.numel()
     sig_pairs = npairs[first]
@@ -295,12 +289,15 @@ def signature_masses(prog, masses, trans_size: int) -> Optional[SignatureMasses]
     rep_rows = job[0][on[job[0][:, 1].long()]].contiguous()
     TS = job_tile(rep_rows.size(0))
     i32 = lambda x: x.to(torch.int32).contiguous()
+    lists = (None, None, None)
+    if enum:                                                       # (their enumerated entries, the only ones read)
+        lists = boundary_groups(prog._tr).enumerated_of(rep_t, rep_q, gfirst[reps], en.code.long())
     return SignatureMasses(pair_off = torch.from_numpy(pair_off).to(dev), pairs = torch.from_numpy(pairs).to(dev),
                            entry_x = i32(exs), pred_x = i32(pxs), size = size,
                            job = (rep_rows, i32(job_tiles(kept, prog.pos_steps[kept], TS)), TS), rep_ptr = i32(rep_ptr),
                            rep_col = i32(rep_q), rep_shift = rep_shift.contiguous(),
                            max_reps = int(rep_count.max()) if rep_count.numel() else 0,
-                           saving = trans_size / max(size, 1))
+                           saving = trans_size / max(size, 1), rep_enum_ptr = lists[0], rep_enum_e = lists[1], rep_enum_pair = lists[2])
 
 
 def _on_the_host(prog, masses, trans_size: int, host) -> Optional[SignatureMasses]:
@@ -446,11 +443,12 @@ def signature_transition_masses(trans, sig: SignatureMasses, masses, prog):
         TP = TRANSITION_PAIR_TILE
     enum = en.on
     eprobs = masses.enum_probs if enum else masses.table
+    enum_ptr, enum_e, enum_pair = (tt.entry_ptr, tt.entry_ptr, tt.entry_ptr) if not enum else (sig.rep_enum_ptr, sig.rep_enum_e, sig.rep_enum_pair) \
+        if sig.rep_enum_ptr is not None else (tt.enum_ptr, tt.enum_e, tt.enum_pair)
     for first, size in grid_chunks(tiles.size(0) * num_qtiles, 0):
         _signature_transition_kernel[(size,)](
             masses.table, masses.row, trans, rows, tiles, prog.delta, prog.state_id, prog.col_of_state, tt.entry_succ,
-            tt.entry_ptr, prog.token_classes.class_of_stored32, tt.enum_ptr if enum else tt.entry_ptr,
-            tt.enum_e if enum else tt.entry_ptr, tt.enum_pair if enum else tt.entry_ptr, en.ptr, en.index, eprobs,
+            tt.entry_ptr, prog.token_classes.class_of_stored32, enum_ptr, enum_e, enum_pair, en.ptr, en.index, eprobs,
             masses.prow, sig.rep_ptr, sig.rep_col, sig.rep_shift, prog.width_t, W, C, prog.K, prog.n,
             masses.table.size(1), eprobs.size(1), prog.input_start, num_qtiles, sig.pair_off, sig.pairs, first,
             TS = TS, QT = QT, TP = TP, TC = cfg["TC"], TE = min(64, max(16, host_next_power_of_2(max(tt.max_enum, 1)))),

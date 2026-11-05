@@ -17,7 +17,7 @@ import torch
 from ..kernels.prod import skip_masks_for
 from ..kernels.live import live_successors
 from ..kernels.sample_transitions import sample_transition_masses
-from ..kernels.transitions import (SampleMasses, enumerated_tokens, next_col_table, sample_classes,
+from ..kernels.transitions import (SampleMasses, boundary_groups, enumerated_tokens, next_col_table, sample_classes,
                                    sample_masses, transition_masses, transition_stats, transition_tables)
 from ..kernels.common import available_memory, most_in_runs
 from .circuit import TRANS_COLS, circuit_tables
@@ -140,10 +140,10 @@ class Program:
         self.next_col_arg = self.delta if self.homogeneous else self.next_col    # (a pointer the kernels never read)
         self.mass_row = backend.state.class_mass_rows()[2]               # input node -> its row of the class masses
         self.token_classes = backend.token_classes
-        self.enum = enumerated_tokens(tr, backend.token_classes)         # the enumerated classes' codes and tokens
+        self.enum = enumerated_tokens(tr, backend.token_classes, lists = False)   # the enumerated classes' codes and tokens
         # every column's distinct successors (evidence pruning's liveness sweeps; the forward's tables when its
         # transitions are grouped: decided below, once the steps are known)
-        self.succ = transition_tables(tr, grouped = True, enum = self.enum)
+        self.succ = transition_tables(tr, grouped = True, enum = self.enum, lists = False)
         self.transition_stats = transition_stats(tr)
 
         regions = np.asarray(backend.sum_regions)
@@ -199,7 +199,7 @@ class Program:
         self.group_worth = grouped_worth(self.transition_stats, int(pairs.sum()))
         self.entry_loop = entry_loop(self.transition_stats, self.C)    # ungrouped kernels: entries, or every class
         self.trans_pairs = pairs
-        self._tr, self._ungrouped = tr, None
+        self._tr, self._ungrouped, self._enum_lists = tr, None, None
         steps_t = assembly.steps_host                                       # input steps per position
         self.pos_steps = assembly.pos_steps                                 # int64 [n]
         self.pairs_t = pairs.to(dev)                                        # int64 [n]: the boundaries' pairs
@@ -210,14 +210,14 @@ class Program:
         self.trans_layout: Optional[SampleMasses] = None                    # the query's masses: one set, or a sample's
         self.trans_sig = None                                               # ... one set by column signature, or not
         self._sig = None                                                    # (the signature layout and its row map)
-        self.trans = self.succ if self.grouped_for(self.trans_size) else self.ungrouped_tables()
-        self.trans_persistent = self.trans.grouped                  # (grouped transitions are always kept whole)
+        self.trans_grouped = self.grouped_for(self.trans_size)      # (the ungrouped tables: when first read, see `trans`)
+        self.trans_persistent = self.trans_grouped                  # (grouped transitions are always kept whole)
 
     def transition_buffer(self) -> torch.Tensor:
         """Where the query's transition masses go (``trans_size`` floats for one set of masses, a per-sample layout's
         ``size``, see :meth:`transitions`; allocated on first use, and again for more) -- under the ungrouped tables,
         whose kernels read no masses, a float."""
-        if not self.trans.grouped:
+        if not self.trans_grouped:
             size = 1
         elif self.trans_layout is not None:
             size = self.trans_layout.size
@@ -274,7 +274,7 @@ class Program:
     def mass_x(self, kind: str) -> torch.Tensor:
         """The query's tables' ``entry_x`` or ``pred_x`` (``kind``) as the grouped kernels index the masses with them:
         the pairs' signature slots under masses by column signature (:attr:`trans_sig`), else the tables' own."""
-        if self.trans.grouped and self.trans_layout is None and self.trans_sig is not None:
+        if self.trans_grouped and self.trans_layout is None and self.trans_sig is not None:
             return getattr(self.trans_sig, kind)
         return getattr(self.trans, kind)
 
@@ -295,6 +295,21 @@ class Program:
         return self._ungrouped
 
     @property
+    def trans(self):
+        """The query's transition tables: the grouped, or the ungrouped, as :meth:`transitions` says; these are a whole pass over the moves, made when first read."""
+        return self.succ if self.trans_grouped else self.ungrouped_tables()
+
+    def enum_lists(self) -> tuple:
+        """``(enum_ptr, enum_e, enum_pair)`` of every column (:class:`~..kernels.transitions.TransitionTables`): on the device, a pass over the moves when first asked for: masses
+        by column signature read those of few columns (:class:`~..kernels.transitions.signatures.SignatureMasses`), and this is for masses per column."""
+        tt = self.succ
+        if tt.enum_e is not None:
+            return tt.enum_ptr, tt.enum_e, tt.enum_pair
+        if self._enum_lists is None:
+            self._enum_lists = boundary_groups(self._tr).enumerated_lists(self.enum.code.long())
+        return (tt.enum_ptr, *self._enum_lists)
+
+    @property
     def trans_top_down(self):
         """The transitions as the top-down kernels read them: the forward's (the query's, see :meth:`transitions`)."""
         return self.trans
@@ -311,8 +326,8 @@ class Program:
         sig = self.signature_layout(masses) if layout is None else None    # one set: by column signature, if it saves
         size = layout.size if layout is not None else (self.trans_size if sig is None else sig.size)
         grouped = self.grouped_for(size)
-        if grouped != self.trans.grouped or (grouped and (layout is not self.trans_layout or sig is not self.trans_sig)):
-            self.trans = self.succ if grouped else self.ungrouped_tables()
+        if grouped != self.trans_grouped or (grouped and (layout is not self.trans_layout or sig is not self.trans_sig)):
+            self.trans_grouped = grouped
             self.trans_persistent = grouped
             self.trans_layout = layout if grouped else None
             self.trans_sig = sig if grouped else None

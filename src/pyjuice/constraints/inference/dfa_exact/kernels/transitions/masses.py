@@ -190,12 +190,11 @@ def transition_masses(trans, job, masses, prog):
     enum = en.on
     logw = enum and masses.enum_logw is not None
     eprobs = masses.enum_probs if enum else masses.table
+    enum_ptr, enum_e, enum_pair = prog.enum_lists() if enum else (tt.entry_ptr, tt.entry_ptr, tt.entry_ptr)
     for first, size in grid_chunks(tiles.size(0) * num_qtiles, 0):
         _transition_kernel[(size, masses.batch)](
             masses.table, masses.row, stride, trans, rows, tiles, prog.delta, prog.state_id, prog.col_of_state,
-            tt.entry_succ, tt.entry_ptr, prog.token_classes.class_of_stored32, tt.enum_ptr if enum else tt.entry_ptr,
-            tt.enum_e if enum else tt.entry_ptr,
-            tt.enum_pair if enum else tt.entry_ptr, en.ptr, en.index, eprobs, masses.prow,
+            tt.entry_succ, tt.entry_ptr, prog.token_classes.class_of_stored32, enum_ptr, enum_e, enum_pair, en.ptr, en.index, eprobs, masses.prow,
             masses.lognorm if logw else masses.table, masses.enum_logw if logw else masses.table, prog.width_t, W, C,
             prog.K, prog.n, masses.table.size(1), eprobs.size(1), enum_logw_stride(masses), prog.input_start, num_qtiles,
             prog.pair_off, prog.pairs_t, first,

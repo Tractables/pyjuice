@@ -56,7 +56,7 @@ class TransitionTables:
     :ivar max_pairs: grouped only, the most pairs of any column
     :ivar enum_ptr, enum_e, enum_pair: grouped only, the enumerated classes' live entries of every column, as a CSR
         (``enum_ptr`` [n, W + 1] int32, global numbers): the token's number ``e`` at its boundary and the pair it leads
-        to; ``max_enum`` the most of any column
+        to; ``max_enum`` the most of any column. A program's on the device has ``enum_ptr`` alone, how many a column has (:meth:`~..compiled.program.Program.enum_lists`)
     :ivar cls_ptr, cls_col, cls_succ: the same (column, class) entries BY CLASS: the columns where class ``c`` leads
         somewhere at ``t``, ascending, ``cls_col[cls_ptr[t, c] .. cls_ptr[t, c + 1]]`` (``cls_ptr`` [n, C + 1] int32,
         global numbers), and their successors (a sequence end's: its one column) -- the class weights' walk over a
