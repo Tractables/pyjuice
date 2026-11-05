@@ -274,6 +274,16 @@ def _trie(vocabulary: Vocabulary) -> _Trie:
     return vocabulary._byte_trie
 
 
+#: a node with more children than this has those a state lives on found by their bytes, if the state leads nowhere on most (a trie
+#: of classes, its children not by increasing class, has fewer: see :data:`FEW_CLASSES`)
+MANY_CHILDREN = 64
+#: the lowest bit of a word, by a de Bruijn sequence
+_DE_BRUIJN = np.uint64(0x03f79d71b4cb0a89)
+_TRAILING_ZEROS = np.zeros(64, dtype = np.int64)
+for _bit in range(64):
+    _TRAILING_ZEROS[(((1 << _bit) * int(_DE_BRUIJN)) & (2 ** 64 - 1)) >> 58] = _bit
+
+
 @njit(cache = True)
 def _bytes_of_classes(byte_class, C):
     """uint64 [C, 4]: the bytes of every class, as bits."""
@@ -284,30 +294,59 @@ def _bytes_of_classes(byte_class, C):
 
 
 @njit(cache = True)
-def _usual_move(table, class_bytes, q, usual, same, count):
+def _usual_move(table, class_bytes, q, dead, usual, same, count):
     """Keep ``usual[q]``, the successor most classes lead ``q`` to (``count`` zeros), and ``same[q]``, the bytes of those classes as bits."""
     C = table.shape[1]
-    best, most = table[q, 0], 0
+    row = table[q]
+    live = 0
     for c in range(C):
-        x = table[q, c]
+        live += row[c] != dead
+    if 2 * live <= C:                                           # (nearly all states: the dead state)
+        same[q, :] = ~np.uint64(0)
+        for c in range(C):
+            if row[c] != dead:
+                for k in range(4):
+                    same[q, k] &= ~class_bytes[c, k]
+        usual[q] = dead
+        return
+    best, most = row[0], 0
+    for c in range(C):
+        x = row[c]
         count[x] += 1
         if count[x] > most:
             most, best = count[x], x
     for c in range(C):
-        count[table[q, c]] = 0
+        count[row[c]] = 0
     for c in range(C):
-        if table[q, c] == best:
+        if row[c] == best:
             for k in range(4):
                 same[q, k] |= class_bytes[c, k]
     usual[q] = best
 
 
 @njit(cache = True)
-def _usual_moves(table, class_bytes, usual, same, count):
+def _usual_moves(table, class_bytes, dead, usual, same, count):
     """:func:`_usual_move` of every state not known yet (threads walking only read them)."""
     for q in range(table.shape[0]):
         if usual[q] < 0:
-            _usual_move(table, class_bytes, q, usual, same, count)
+            _usual_move(table, class_bytes, q, dead, usual, same, count)
+
+
+@njit(cache = True)
+def _into_child(w, q2, a1, b1, a2, b2, h1, h2, first_child, stack_node, stack_q, top, find, ends_before, seen, order, num):
+    """A walk at state ``q2`` at the node ``w``: its hashes, the state if a token ends here, the node to go on from if it has children."""
+    x = np.uint64(q2 + 1)
+    h1[w] += a1 * x + b1
+    h2[w] += a2 * x + b2
+    if find and ends_before[w + 1] > ends_before[w] and not seen[q2]:
+        seen[q2] = True
+        order[num] = q2
+        num += 1
+    if first_child[w + 1] > first_child[w]:
+        stack_node[top] = w
+        stack_q[top] = q2
+        top += 1
+    return top, num
 
 
 @njit(cache = True)
@@ -328,7 +367,7 @@ def _walk_one(s, a1, b1, a2, b2, table, dead, byte_class, first_child, node_byte
         top -= 1
         u, q = stack_node[top], stack_q[top]
         if usual[q] < 0:
-            _usual_move(table, class_bytes, q, usual, same, count)
+            _usual_move(table, class_bytes, q, dead, usual, same, count)
         steps += 1
         inside = True
         for k in range(4):
@@ -336,22 +375,31 @@ def _walk_one(s, a1, b1, a2, b2, table, dead, byte_class, first_child, node_byte
                 inside = False
                 break
         if not inside:
-            steps += first_child[u + 1] - first_child[u]
-            for w in range(first_child[u], first_child[u + 1]):
+            e0, e1 = first_child[u], first_child[u + 1]
+            if usual[q] == dead and e1 - e0 > MANY_CHILDREN:    # (of so many, those that live: found by their bytes)
+                for k in range(4):
+                    bits = ~same[q, k]
+                    while bits != np.uint64(0):
+                        low = bits & (~bits + np.uint64(1))
+                        bits ^= low
+                        b = 64 * k + _TRAILING_ZEROS[np.int64((low * _DE_BRUIJN) >> np.uint64(58))]
+                        lo, hi = e0, e1
+                        while lo < hi:
+                            mid = (lo + hi) >> 1
+                            if node_byte[mid] < b:
+                                lo = mid + 1
+                            else:
+                                hi = mid
+                        steps += 1
+                        if lo < e1 and node_byte[lo] == b:
+                            top, num = _into_child(lo, table[q, byte_class[b]], a1, b1, a2, b2, h1, h2, first_child, stack_node, stack_q, top, find, ends_before, seen,
+                                                   order, num)
+                continue
+            steps += e1 - e0
+            for w in range(e0, e1):
                 q2 = table[q, byte_class[node_byte[w]]]
-                if q2 == dead:
-                    continue
-                x = np.uint64(q2 + 1)
-                h1[w] += a1 * x + b1
-                h2[w] += a2 * x + b2
-                if find and ends_before[w + 1] > ends_before[w] and not seen[q2]:      # a token ends here: a boundary state
-                    seen[q2] = True
-                    order[num] = q2
-                    num += 1
-                if first_child[w + 1] > first_child[w]:
-                    stack_node[top] = w
-                    stack_q[top] = q2
-                    top += 1
+                if q2 != dead:
+                    top, num = _into_child(w, q2, a1, b1, a2, b2, h1, h2, first_child, stack_node, stack_q, top, find, ends_before, seen, order, num)
             continue
         t = usual[q]
         first, last = u, u
@@ -372,7 +420,7 @@ def _walk_one(s, a1, b1, a2, b2, table, dead, byte_class, first_child, node_byte
                 num += 1
             steps += 1
             if usual[t] < 0:
-                _usual_move(table, class_bytes, t, usual, same, count)
+                _usual_move(table, class_bytes, t, dead, usual, same, count)
             inside = True
             for k in range(4):
                 if below[u, k] & ~same[t, k] != 0:
@@ -665,7 +713,7 @@ def _walk_the_rest(table: np.ndarray, dead: int, rest: np.ndarray, byte_class: n
                 left = left[walked:]
                 budget *= 2
             else:                                                       # (states that do tell much apart: all at once)
-                _usual_moves(table, *walking)
+                _usual_moves(table, walking[0], dead, *walking[1:])
                 a1, a2 = _walks_parallel(table, dead, left, byte_class, first_child, node_byte, r[0], r[1], r[2], r[3], trie.below, *walking[:3],
                                          min(get_num_threads(), left.size), M + 2)
                 with np.errstate(over = "ignore"):
@@ -1016,7 +1064,7 @@ def _canonical_token_table(automaton: ByteAutomaton, states: np.ndarray, remap: 
 #: below so many classes of bytes the trie over the classes is small, and worth making: few classes, so many tokens spell the same
 FEW_CLASSES = 16
 #: so many steps of walks of the trie come first; a table of so many entries stays on one thread
-SERIAL_STEPS = 1 << 19
+SERIAL_STEPS = 1 << 18
 NO_BUDGET = 1 << 62
 #: the table of a token automaton of at least so many entries, minimal already, is made from its moves (:func:`_canonical_token_table`,
 #: the dense table of its rows costing no more below it), in threads from :data:`THREADS_ENTRIES` on

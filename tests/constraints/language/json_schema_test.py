@@ -398,7 +398,7 @@ def test_walks_by_ranges_give_the_hashes_of_every_step():
         again1, again2 = np.zeros(M + 2, dtype = np.uint64), np.zeros(M + 2, dtype = np.uint64)
         assert T._walks(table, dead, some, byte_class, first_child, node_byte, *r, trie.below, class_bytes, usual, same, count, again1, again2, 1 << 62) == some.size
         assert np.array_equal(again1, want1) and np.array_equal(again2, want2), case
-        T._usual_moves(table, class_bytes, usual, same, count)
+        T._usual_moves(table, class_bytes, dead, usual, same, count)
         par1, par2 = T._walks_parallel(table, dead, some, byte_class, first_child, node_byte, *r, trie.below, class_bytes, usual, same, min(3, some.size), M + 2)
         assert np.array_equal(par1, want1) and np.array_equal(par2, want2), case
     assert uses_ranges == 120
@@ -445,6 +445,8 @@ def test_the_trie_of_the_classes_or_of_the_bytes_the_same_automaton(few, monkeyp
         if case % 3 == 0:
             a = A.minimize(a)
         tokens = [bytes([b]) for b in range(256)] if case % 2 else []
+        if case % 2:                                                        # (a node of many children, bytes that live on none of them)
+            tokens += [bytes([first, b]) for first in range(C) for b in rng.choice(256, 128, replace = False).tolist()]
         tokens += [bytes(rng.integers(0, C + 3, int(rng.integers(1, 7))).tolist()) for _ in range(120)] + [b""]
         vocabulary = jc.Vocabulary(tokens + [None], eos = [len(tokens)], size = len(tokens) + 3)
         eos = bool(case % 5)
