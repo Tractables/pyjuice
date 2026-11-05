@@ -23,6 +23,7 @@ import numpy as np
 from numba import njit
 
 from .byte_level import ByteAutomaton
+from .counters import Wired, kept_copies, runs_of
 from .dfa import _column_classes, minimal_moves, moves_of_table, product_bfs
 
 
@@ -34,7 +35,7 @@ def _joint(parts: Sequence[ByteAutomaton]) -> Tuple[np.ndarray, List[np.ndarray]
     """``(byte_class, columns)``: the bytes none of ``parts`` (one each, whatever their copies) tells apart -- the coarsest
     common refinement of their classes, numbered by their smallest byte -- and the class every part has for each of them."""
     if len(parts) == 1:
-        return parts[0].byte_class, [np.arange(parts[0].table.shape[1], dtype = np.int64)]
+        return parts[0].byte_class, [np.arange(parts[0]._kept_table.shape[1], dtype = np.int64)]
     classes = np.ascontiguousarray(np.stack([a.byte_class for a in parts]))
     byte_class, first = _column_classes(classes)
     return byte_class, list(classes[:, first])
@@ -45,7 +46,10 @@ def _from_moves(ptr: np.ndarray, cls: np.ndarray, dst: np.ndarray, initial: int,
     """The canonical minimal automaton of moves as CSR per state over byte classes (:func:`~.dfa.minimal_moves`; the
     classes numbered by their smallest byte: its breadth-first numbering, the same over any classes numbered so, reads
     bytes in order), and the classes it tells apart."""
-    out, accepting = minimal_moves(ptr, cls, dst, accept, initial, C)
+    return _from_minimal(*minimal_moves(ptr, cls, dst, accept, initial, C)[:2], byte_class)
+
+
+def _from_minimal(out: np.ndarray, accepting: np.ndarray, byte_class: np.ndarray) -> ByteAutomaton:
     column_class, first = _column_classes(out)
     return ByteAutomaton(None, 0, accepting, accepting.size - 1, table = out if first.size == out.shape[1] else out[:, first],
                          byte_class = column_class[byte_class], minimal = True)
@@ -245,9 +249,10 @@ def _subsets(edge_ptr, edge_class, edge_dst, eps_ptr, eps_dst, accept, start, C)
     """
     The subset construction of an automaton with empty moves: its moves as CSR per state (``edge_ptr`` [N + 1], the class
     ``edge_class`` of every move and its successor ``edge_dst``), its empty moves too (``eps_ptr`` [N + 1], ``eps_dst``),
-    ``accept`` bool [N], the initial state ``start``, over ``C`` classes. Returns ``(ptr, cls, dst, accepting, initial)``: the
-    moves of the sets reachable from the initial one, to sets but the empty one, as CSR, classes ascending, and bool for every
-    number (those of no reachable set: their rows lead nowhere that is read).
+    ``accept`` bool [N], the initial state ``start``, over ``C`` classes. Returns ``(ptr, cls, dst, accepting, initial, state, pool, at,
+    kept)``: the moves of the sets reachable from the initial one, to sets but the empty one, as CSR, classes ascending, and bool
+    for every number (those of no reachable set: their rows lead nowhere that is read); then what the sets are: every state's
+    standing (:data:`_READ`: a set of its own, reached), and the states ``pool[at[k]:at[k + 1]]`` of the ``kept`` others.
 
     Nearly all states of automata joined by empty moves are sets of their own: without empty moves, with one move on a
     class at the most, classes ascending, they move as they are. Such a state IS a set, numbered as the state, its row its
@@ -444,7 +449,7 @@ def _subsets(edge_ptr, edge_class, edge_dst, eps_ptr, eps_dst, accept, start, C)
     accepting = np.empty(N + kept, dtype = np.bool_)
     accepting[:N] = accept
     accepting[N:] = acc[:kept]
-    return ptr[:N + kept + 1], cls[:moves], dst[:moves], accepting, initial
+    return ptr[:N + kept + 1], cls[:moves], dst[:moves], accepting, initial, state, pool, at, kept
 
 
 @njit(cache = True)
@@ -525,7 +530,7 @@ def determinized(num: int, start: int, end: int, src, lo, hi, dst, eps_src, eps_
     accept[end] = True
     eps_ptr, eps = _csr(eps_src, eps_dst, num)
     C = int(byte_class[-1]) + 1
-    ptr, cls, moved, acc, initial = _subsets(edge_ptr, edge_class, edge_dst, eps_ptr, eps, accept, start, C)
+    ptr, cls, moved, acc, initial = _subsets(edge_ptr, edge_class, edge_dst, eps_ptr, eps, accept, start, C)[:5]
     return _from_moves(ptr, cls, moved, initial, acc, C, byte_class)
 
 
@@ -560,6 +565,7 @@ class _Joined:
         self.extra = 0                                          # fresh states, numbered after the parts'
         self.eps: List[Tuple[int, int]] = []
         self.accepting: List[int] = []
+        self.wired: List[Wired] = []                            # (the repetitions wired short: see :mod:`.counters`)
 
     def add(self, a: ByteAutomaton) -> int:
         """A copy of ``a``: the number of its first state (its states follow in order)."""
@@ -606,10 +612,17 @@ class _Joined:
         lo, hi = x.lo, x.hi                                     # "rep"
         copies = max(lo, 1) if hi is None else hi
         part = force(x.parts[0]) if copies > 1 or hi is None else x.parts[0]
+        short = kept_copies(part, lo, copies) if copies > 1 else None
+        if short is not None:
+            lo, copies, wired = short
+            self.wired.append(wired)
         accepting = [start] if lo == 0 else []
         prev = [start]                                          # the states a next copy is entered from
         for i in range(copies):
             e, acc = self.wire(part)
+            if short is not None:
+                wired.offsets.append(e - part.initial)
+                wired.parts.append(len(self.parts) - 1)
             self.eps += [(p, e) for p in prev]
             prev = acc
             if i + 1 >= lo:
@@ -647,9 +660,9 @@ class _Joined:
         part = np.fromiter((distinct.setdefault(id(a), len(distinct)) for a in self.parts), dtype = np.int64, count = len(self.parts))
         own = list({id(a): a for a in self.parts}.values())
         byte_class, cols = _joint(own)
-        tables = np.concatenate([a.table.ravel() for a in own])
+        tables = np.concatenate([a._kept_table.ravel() for a in own])
         table_at = np.zeros(len(own) + 1, dtype = np.int64)
-        np.cumsum([a.table.size for a in own], out = table_at[1:])
+        np.cumsum([a._kept_table.size for a in own], out = table_at[1:])
         edge_ptr, edge_class, edge_dst = _moves_of_parts(tables, table_at, np.asarray([a.num_states for a in own], dtype = np.int64),
                                                          np.asarray([a.dead for a in own], dtype = np.int64), np.stack(cols).astype(np.int64),
                                                          part, np.asarray(self.offsets, dtype = np.int64), total)
@@ -660,8 +673,17 @@ class _Joined:
         pairs = np.where(pairs >= 0, pairs, self.size - 1 - pairs)             # (placeholders after the parts)
         eps_ptr, eps = _csr(pairs[:, 0], pairs[:, 1].astype(np.int32), total)
         C = int(byte_class.max()) + 1
-        ptr, cls, moved, acc, initial = _subsets(edge_ptr, edge_class, edge_dst, eps_ptr, eps, accept, start if start >= 0 else self.size - 1 - start, C)
-        return _from_moves(ptr, cls, moved, initial, acc, C, byte_class)
+        ptr, cls, moved, acc, initial, state, pool, at, kept = _subsets(edge_ptr, edge_class, edge_dst, eps_ptr, eps, accept,
+                                                                        start if start >= 0 else self.size - 1 - start, C)
+        if not self.wired and not any(a.counted for a in own):
+            return _from_moves(ptr, cls, moved, initial, acc, C, byte_class)
+        out, accepting_, block, place = minimal_moves(ptr, cls, moved, acc, initial, C)
+        number = np.full(block.size, -1, dtype = np.int32)
+        live = block >= 0
+        number[live] = place[block[live]]
+        a = _from_minimal(out, accepting_, byte_class)
+        a.counted = runs_of(self.wired, self.parts, self.offsets, total, ptr, cls, moved, acc, state == _READ, pool, at, kept, number)
+        return a
 
 
 class Expr:

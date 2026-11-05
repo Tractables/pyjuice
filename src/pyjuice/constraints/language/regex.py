@@ -202,9 +202,15 @@ class _Text(Constraint):
     # Capabilities, from the automaton
     # ---------------------------------------------------------------------------------------------
 
+    def _short_way(self) -> Optional[DFA]:
+        """The token automaton, if a subclass has a way there not through the whole byte automaton."""
+        return None
+
     def automaton(self) -> DFA:
         if self._automaton is None:
-            self._automaton = to_tokens(self._byte_automaton(), self._vocabulary, self._eos_padding)
+            self._automaton = self._short_way()
+            if self._automaton is None:
+                self._automaton = to_tokens(self._byte_automaton(), self._vocabulary, self._eos_padding)
         return self._automaton
 
     def matcher(self) -> Matcher:

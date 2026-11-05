@@ -273,9 +273,10 @@ def hopcroft(delta, accept):
 def minimal_moves(ptr, cls, dst, accept, initial, C):
     """
     The minimal automaton of the moves ``(ptr, cls, dst)`` as CSR per state, classes ascending -- a class a state has no
-    move on goes to a state from which nothing is accepted -- in canonical form: ``(out, accepting)``, int32 [states, C]
-    and bool [states], the live states numbered in breadth-first order from the initial one (state 0), the one dead state
-    last. Its time goes with the moves, not with states times classes (but for ``out``, filled once).
+    move on goes to a state from which nothing is accepted -- in canonical form: ``(out, accepting, block, place)``, int32
+    [states, C] and bool [states], the live states numbered in breadth-first order from the initial one (state 0), the one
+    dead state last; a state's new number is ``place[block[state]]`` (block -1: dead). Its time goes with the moves, not with
+    states times classes (but for ``out``, filled once).
     """
     K = ptr.shape[0] - 1
     among = np.zeros(K, dtype = np.bool_)
@@ -294,7 +295,7 @@ def minimal_moves(ptr, cls, dst, accept, initial, C):
                 num += 1
     block, m = _live_partition(ptr, cls, dst, accept, among, C)
     if block[initial] < 0:                                      # no text: the dead state alone
-        return np.zeros((1, C), dtype = np.int32), np.zeros(1, dtype = np.bool_)
+        return np.zeros((1, C), dtype = np.int32), np.zeros(1, dtype = np.bool_), block, np.zeros(1, dtype = np.int32)
     rep = np.empty(m, dtype = np.int32)                         # any member represents its block
     for q in range(K):
         if block[q] >= 0:
@@ -318,7 +319,7 @@ def minimal_moves(ptr, cls, dst, accept, initial, C):
                     num += 1
                 out[head, cls[e]] = place[b]
         head += 1
-    return out, accepting
+    return out, accepting, block, place
 
 
 @njit(cache = True)

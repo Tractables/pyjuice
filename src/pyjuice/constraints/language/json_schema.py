@@ -304,6 +304,28 @@ class JSONSchema(_Text):
             self._bytes = compile_schema(self._prepared, self._whitespace)
         return self._bytes
 
+    def _short_way(self):
+        """The token automaton through a short byte automaton (:mod:`~.backend.counters`), the copies of a bounded repetition put
+        back at the end. It takes a vocabulary whose every byte is a token; without, or where it does not hold, None."""
+        if self._bytes is not None:
+            return None
+        from .backend.counters import COUNTING, NotCounted, Reach
+        from .backend.json_schema import compile_schema
+        from .backend.token_lift import _byte_complete, _trie, to_tokens
+        trie = _trie(self._vocabulary)
+        if not _byte_complete(trie):
+            return None
+        counting = COUNTING.set(Reach(self._vocabulary, trie.data))
+        try:
+            a = compile_schema(self._prepared, self._whitespace)
+            if not a.counted:                                   # (nothing left out: it is the byte automaton)
+                self._bytes = a
+            return to_tokens(a, self._vocabulary, self._eos_padding)
+        except NotCounted:
+            return None
+        finally:
+            COUNTING.reset(counting)
+
     def _text_matches(self, text: str) -> bool:
         return self._byte_automaton().accepts(text.encode("utf-8"))
 

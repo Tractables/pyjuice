@@ -22,6 +22,7 @@ from numba import get_num_threads, njit, prange
 
 from ..dfa import DFA
 from ..vocabulary import Vocabulary
+from .counters import NotCounted, expanded_moves, states_put_back
 from .dfa import bfs_order
 from .byte_level import ByteAutomaton
 
@@ -788,11 +789,11 @@ def _sparse_rows(table, dead, states, remap, gptr, gclass, gnode, class_at, itse
 
 
 @njit(parallel = True, cache = True)
-def _sparse_rows_parallel(table, dead, states, remap, gptr, gclass, gnode, class_at, itself, accepting, end_class, K, C, moves, row_at, row_len, P):
-    """:func:`_sparse_rows` of all rows in ``P`` parts."""
+def _sparse_rows_parallel(table, dead, states, remap, gptr, gclass, gnode, class_at, itself, accepting, end_class, K, C, moves, row_at, row_len, R, P):
+    """:func:`_sparse_rows` of the first ``R`` rows in ``P`` parts."""
     for p in prange(P):
         _sparse_rows(table, dead, states, remap, gptr, gclass, gnode, class_at, itself, accepting, end_class, K, C, moves, row_at, row_len,
-                     p * K // P, (p + 1) * K // P)
+                     p * R // P, (p + 1) * R // P)
 
 
 @njit(cache = True)
@@ -864,38 +865,41 @@ def _sparse_table_parallel(moves, row_at, row_len, order, place, K, pad, out, P)
 
 
 def _canonical_token_table(automaton: ByteAutomaton, states: np.ndarray, remap: np.ndarray, merged, token_node: np.ndarray, reps: np.ndarray, kinds: np.ndarray,
-                           accept: np.ndarray, end_class: int) -> tuple:
+                           accept: np.ndarray, end_class: int, K_full: int) -> tuple:
     """
     The table in canonical numbering of a token automaton minimal already, and its accepting states: what
     ``DFA._of_classes(...)._renumbered()`` makes of the dense table of every state's every class, without it: nearly all of
     that table is the dead state. Moves from a walk of the representatives' trie, the breadth-first order over them, then
-    the table once, as it will stand.
+    the table once, as it will stand. Of ``K_full`` states ``states`` are the first (the others: the copies an automaton has left
+    out, its :attr:`~.byte_level.ByteAutomaton.counted`, put back here).
     """
     K, C = states.size, reps.size
-    P = min(get_num_threads(), K) if K * C >= THREADS_ENTRIES else 1
+    threads = get_num_threads()
     gptr, gclass, gnode, class_at = _rep_trie(*merged, np.where(kinds == 0, token_node[reps], -1).astype(np.int64))
     itself = np.nonzero(kinds == 1)[0].astype(np.int64)
     moves = np.empty(K * C + 1, dtype = np.int64)               # (room for all, where a part starts; only what is written is touched)
-    row_at, row_len = np.zeros(K + 2, dtype = np.int64), np.zeros(K + 2, dtype = np.int64)
-    args = (automaton.table, automaton.dead, states, remap, gptr, gclass, gnode, class_at, itself, accept, end_class, K, C, moves, row_at, row_len)
-    if P > 1:
-        _sparse_rows_parallel(*args, P)
+    row_at, row_len = np.zeros(K_full + 2, dtype = np.int64), np.zeros(K_full + 2, dtype = np.int64)
+    args = (automaton._kept_table, automaton.dead, states, remap, gptr, gclass, gnode, class_at, itself, accept, end_class, K_full, C, moves, row_at, row_len)
+    if K * C >= THREADS_ENTRIES and threads > 1:
+        _sparse_rows_parallel(*args, K, min(threads, K))
     else:
         _sparse_rows(*args, 0, K)
-    pad = K + 1
+    if automaton.counted:
+        moves = expanded_moves(automaton.counted, remap, K, K_full, moves, row_at, row_len, accept, threads)
+    pad = K_full + 1
     if end_class >= 0:                                          # a state accepting the empty text alone is the padding's
-        alone = np.nonzero(accept[:K] & (row_len[:K] == 1))[0]
+        alone = np.nonzero(accept[:K_full] & (row_len[:K_full] == 1))[0]
         if alone.size:
             pad = int(alone[0])
-        moves[K * C] = (end_class << 32) | (K + 1)
-        row_at[K + 1], row_len[K + 1] = K * C, 1
+        moves[-1] = (end_class << 32) | (K_full + 1)
+        row_at[K_full + 1], row_len[K_full + 1] = moves.size - 1, 1
         accept[pad] = True
-    order, place = _sparse_order(moves, row_at, row_len, K, C, pad)
+    order, place = _sparse_order(moves, row_at, row_len, K_full, C, pad)
     out = np.empty((order.size, C), dtype = np.int64)
-    if P > 1:
-        _sparse_table_parallel(moves, row_at, row_len, order, place, K, pad, out, P)
+    if K_full * C >= THREADS_ENTRIES and threads > 1:
+        _sparse_table_parallel(moves, row_at, row_len, order, place, K_full, pad, out, min(threads, K_full))
     else:
-        _sparse_table(moves, row_at, row_len, order, place, K, pad, out, 0, order.size)
+        _sparse_table(moves, row_at, row_len, order, place, K_full, pad, out, 0, order.size)
     return out, accept[order]
 
 
@@ -922,7 +926,7 @@ def to_tokens(automaton: ByteAutomaton, vocabulary: Vocabulary, eos_padding: boo
     """
     V, S = vocabulary.size, automaton.num_states
     trie = _trie(vocabulary)
-    table, byte_class = automaton.table, automaton.byte_class
+    table, byte_class = automaton._kept_table, automaton.byte_class
     dead_byte, start = automaton.dead, automaton.initial
     rng = np.random.default_rng(0)
     r = [rng.integers(1, 2 ** 63, size = S, dtype = np.uint64) for _ in range(4)]
@@ -932,6 +936,8 @@ def to_tokens(automaton: ByteAutomaton, vocabulary: Vocabulary, eos_padding: boo
                                                                  byte_class, _classes_read(table, dead_byte), V)
     M = ptr.size - 1
     complete = automaton.minimal and start != dead_byte and _byte_complete(trie)
+    if automaton.counted and not complete:
+        raise NotCounted
     walking = (_classes_below(ptr, edge_class, edge_node, (table.shape[1] + 63) // 64), np.full(S, -1, dtype = np.int32),
                np.zeros((S, (table.shape[1] + 63) // 64), dtype = np.uint64), np.zeros(S, dtype = np.int32))
     h1, h2, states, walked = _walk(table, dead_byte, start, ptr, edge_class, edge_node, holds, r[0], r[1], r[2], r[3], *walking,
@@ -957,13 +963,14 @@ def to_tokens(automaton: ByteAutomaton, vocabulary: Vocabulary, eos_padding: boo
     token_class, reps, hashed = _token_classes(h1, h2, token_node)
     kinds = np.where(hashed & has_text[reps], np.where(offsets[reps + 1] == offsets[reps], 1, 0), 2).astype(np.int64)
     K, C = states.size, reps.size
-    remap = np.full(S, K, dtype = np.int64)                             # unreached (the byte dead state among them)
+    K_full = K + states_put_back(automaton.counted) if automaton.counted else K
+    remap = np.full(S, K_full, dtype = np.int64)                        # unreached (the byte dead state among them)
     remap[states] = np.arange(K)
-    if complete and K * C >= SPARSE_ENTRIES:
-        accept = np.zeros(K + 2, dtype = bool)
+    if complete and (automaton.counted or K * C >= SPARSE_ENTRIES):
+        accept = np.zeros(K_full + 2, dtype = bool)
         accept[:K] = automaton.accept[states]
         end_class = int(token_class[eos[0]]) if eos_padding and eos.size else -1
-        out, kept = _canonical_token_table(automaton, states, remap, (ptr, edge_class, edge_node), token_node, reps, kinds, accept, end_class)
+        out, kept = _canonical_token_table(automaton, states, remap, (ptr, edge_class, edge_node), token_node, reps, kinds, accept, end_class, K_full)
         return DFA._of_classes(V, torch.from_numpy(token_class), torch.from_numpy(out), 0, torch.from_numpy(kept))
     dead, pad = K, K + 1
     out = np.empty((K + 2, C), dtype = np.int64)

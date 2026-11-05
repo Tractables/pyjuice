@@ -406,7 +406,7 @@ def test_the_subset_construction_is_the_plain_one(one_a_class, eps_share):
             eps_ptr[u + 1] += 1
         eps_ptr = np.cumsum(eps_ptr)
         eps_dst = np.array([v for _, v in sorted(eps, key = lambda p: p[0])], dtype = np.int32)
-        ptr, cls, dst, acc, initial = A._subsets(edge_ptr, edge_class, edge_dst, eps_ptr, eps_dst, np.array(accept, dtype = np.bool_), start, C)
+        ptr, cls, dst, acc, initial, *_ = A._subsets(edge_ptr, edge_class, edge_dst, eps_ptr, eps_dst, np.array(accept, dtype = np.bool_), start, C)
         assert ptr.size - 1 == acc.size and ptr[-1] == dst.size == cls.size
         got = A._from_moves(ptr, cls, dst, initial, acc, C, np.arange(256) % C)
         table, accepting = plain_subsets(N, moves, eps, accept, start, C)
@@ -428,7 +428,7 @@ def test_a_state_found_behind_the_sweep_through_a_set_is_read():
     edge_dst = np.array([m[2] for m in moves], dtype = np.int32)
     eps_ptr = np.cumsum([0] + [sum(e[0] == u for e in eps) for u in range(N)]).astype(np.int64)
     eps_dst = np.array([e[1] for e in eps], dtype = np.int32)
-    ptr, cls, dst, acc, initial = A._subsets(edge_ptr, edge_class, edge_dst, eps_ptr, eps_dst, np.array(accept, dtype = np.bool_), start, C)
+    ptr, cls, dst, acc, initial, *_ = A._subsets(edge_ptr, edge_class, edge_dst, eps_ptr, eps_dst, np.array(accept, dtype = np.bool_), start, C)
     got = A._from_moves(ptr, cls, dst, initial, acc, C, np.arange(256) % C)
     want, want_accept = plain_minimal(*plain_subsets(N, moves, eps, accept, start, C), 0)
     assert got.table[:, got.byte_class[np.arange(C)]].tolist() == want and got.accept.tolist() == want_accept

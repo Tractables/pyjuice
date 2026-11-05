@@ -13,6 +13,7 @@ from typing import List, Sequence, Tuple
 
 import numpy as np
 
+from .counters import NotCounted
 from .dfa import _column_classes
 
 MAX_CODE_POINT = 0x10FFFF
@@ -33,6 +34,8 @@ class ByteAutomaton:
     :ivar accept: bool [num_states]
     :ivar dead: the one state no accepting state is reachable from (it loops on every byte)
     :ivar minimal: whether it is minimal (made so by :func:`~.automata.minimize` and the algebra's operations)
+    :ivar counted: None, or the repetitions left out of it (:mod:`~.counters`): then it is not the automaton of its texts,
+        reading its table raises :class:`~.counters.NotCounted`, and only :func:`~.token_lift.to_tokens` knows how to go on
 
     Made from ``delta`` (the first argument), or from ``table`` and ``byte_class`` (keywords; ``delta`` None); the
     other form is made on first use.
@@ -48,9 +51,12 @@ class ByteAutomaton:
         self.initial, self.dead = int(initial), int(dead)
         self.accept = np.asarray(accept, dtype = bool)
         self.minimal = bool(minimal)
+        self.counted = None
 
     @property
     def delta(self) -> np.ndarray:
+        if self.counted:
+            raise NotCounted
         if self._delta is None:
             self._delta = np.ascontiguousarray(self._table[:, self._byte_class])
         return self._delta
@@ -61,6 +67,15 @@ class ByteAutomaton:
 
     @property
     def table(self) -> np.ndarray:
+        if self.counted:
+            raise NotCounted
+        if self._table is None:
+            self._classes()
+        return self._table
+
+    @property
+    def _kept_table(self) -> np.ndarray:
+        """:attr:`table`, of an automaton with repetitions left out too."""
         if self._table is None:
             self._classes()
         return self._table
