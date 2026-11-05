@@ -146,7 +146,7 @@ class TopDownPlan:
     once_iv: torch.Tensor
     prior: np.ndarray
     dead: Optional[torch.Tensor]
-    dead_regions: list
+    dead_regions: np.ndarray
     cw_fill: bool = True
     busy: Optional[list] = None
     input_reads: Optional[np.ndarray] = None
@@ -480,7 +480,7 @@ def top_down_prior(prog, td, observed: np.ndarray, B: int, kept: bool, liveness)
         return free
     slots = prog.iv_slots
     live = np.asarray(liveness.num_live, dtype = np.int64) if liveness is not None else B * slots
-    sums = td.reg_iv[np.unique(np.asarray(prog.reg_iv_host), return_index = True)[1]]    # sum interval -> number
+    sums = td.reg_iv[np.unique(prog.reg_iv_np, return_index = True)[1]]    # sum interval -> number
     worth = sums[free[sums] & (live > slots)]
     if worth.size == 0:
         return np.zeros(I, dtype = bool)
@@ -544,5 +544,5 @@ def top_down_plan(prog, td, targets: Optional[np.ndarray], once: np.ndarray, val
                        per_sample = needed[td.reg_iv] & ~r_once,
                        once_iv = once_iv.tensor, prior = reads,
                        dead = None if dead_rows is None else dead_rows.tensor.view(-1, 2),
-                       dead_regions = np.nonzero(sample & td.dead_region)[0].tolist(), cw_fill = cw_fill,
+                       dead_regions = np.nonzero(sample & td.dead_region)[0], cw_fill = cw_fill,
                        busy = busy, input_reads = positions, fold_part = fold_part, fold_ptr = fold_ptr)

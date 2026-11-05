@@ -139,7 +139,7 @@ def _forward_shape(prog) -> _ForwardShape:
     """The :class:`_ForwardShape` of ``prog``'s :class:`~...compiled.circuit.Assembly`."""
     assembly = prog.assembly
     F = _Flat(*_FW_FIELDS)
-    reg_iv = np.asarray(prog.reg_iv_host)
+    reg_iv = prog.reg_iv_np
     full, runs_of, ivs_of, ranges, idle = [], [], [], [], []
     run_ptr, run_part, run_launch, brun_part = [0], [], [], []
     part_first = assembly.part_ptr.tolist()

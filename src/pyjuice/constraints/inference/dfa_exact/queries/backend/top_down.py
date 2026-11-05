@@ -104,7 +104,7 @@ def run_backward(backend, bufs: dict, flows: dict, plan, x: torch.Tensor, missin
         for row in range(prog.root_rows[1] - prog.root_rows[0]):
             dest[base + row * width:base + row * width + cols] = 0.0
     if td.dead is not None:                              # rows no launch writes, of the regions computed per sample
-        dead_width = max(int(f_widths[r]) for r in td.dead_regions)
+        dead_width = int(np.asarray(f_widths)[td.dead_regions].max())
         if dead_width > 0:
             fill_dead_rows(node_flows, td.dead, fregions, dead_width)
 

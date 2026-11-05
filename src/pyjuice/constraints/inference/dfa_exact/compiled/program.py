@@ -150,6 +150,7 @@ class Program:
 
         regions = np.asarray(backend.sum_regions)
         self.slots = regions[:, 2].tolist()
+        self.slots_host = regions[:, 2]
         self.reg_slots = torch.from_numpy(regions[:, 2].copy()).to(dev)
         # every sum interval's slots, for evidence pruning and query plans (host)
         self.iv_slots = self.reach.slots_of(self.iv_bounds)

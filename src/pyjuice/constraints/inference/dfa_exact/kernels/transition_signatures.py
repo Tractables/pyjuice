@@ -90,17 +90,17 @@ def _mix(v: torch.Tensor, salt: int) -> torch.Tensor:
     return z ^ _shift_right(z, 31)
 
 
-def _segment_hash(vals: torch.Tensor, seg: torch.Tensor, starts: torch.Tensor, lengths: torch.Tensor,
+def _segment_hash(vals: torch.Tensor, seg: torch.Tensor, starts: torch.Tensor, lengths: torch.Tensor, longest: int,
                   salt: int) -> torch.Tensor:
     """Every segment's polynomial hash of its values (``vals`` int64, ``seg`` every value's segment, ``starts`` /
-    ``lengths`` the segments' in ``vals``), wrapping: 0 for an empty segment."""
+    ``lengths`` the segments' in ``vals``, ``longest`` the longest's length), wrapping: 0 for an empty segment."""
     out = torch.zeros(lengths.numel(), dtype = torch.int64, device = vals.device)
     if vals.numel() == 0:
         return out
     k = torch.arange(vals.numel(), device = vals.device) - starts[seg]
     base = 0x100000001B3 + 2 * salt
     powers, power = [], 1
-    for _ in range(int(k.max()) + 1):
+    for _ in range(longest):
         powers.append(_signed(power))
         power = power * base % (1 << 64)
     pw = torch.tensor(powers, dtype = torch.int64, device = vals.device)
@@ -222,9 +222,15 @@ def signature_masses(prog, masses, trans_size: int) -> Optional[SignatureMasses]
     else:
         nenum = torch.zeros(T.numel(), dtype = torch.int64, device = dev)
         nstart, ncol, evals = nenum, torch.zeros(0, dtype = torch.int64, device = dev), torch.zeros(0, dtype = torch.int64, device = dev)
-    first, sig = _unique_rows([sid[T, Q], npairs, nenum, (T + 1 == n).long()] +
-                              [_segment_hash(succ_state, ecol, cstart, npairs, h) for h in (1, 2)] +
-                              [_segment_hash(evals, ncol, nstart, nenum, h) for h in (3, 4)])
+    # a column's sizes, in that order, one key where they fit in it (the rows' order is theirs: one sort, not four)
+    pair_bits, enum_bits = int(tt.max_pairs).bit_length(), int(tt.max_enum).bit_length()
+    if int(prog.K).bit_length() + pair_bits + enum_bits < 62:
+        sizes = [(((sid[T, Q] << pair_bits) | npairs) << enum_bits | nenum) << 1 | (T + 1 == n).long()]
+    else:
+        sizes = [sid[T, Q], npairs, nenum, (T + 1 == n).long()]
+    # (the operands' hashes: no second one, exactly checked below)
+    first, sig = _unique_rows(sizes + [_segment_hash(succ_state, ecol, cstart, npairs, tt.max_pairs, 1)] +
+                              ([_segment_hash(evals, ncol, nstart, nenum, tt.max_enum, 3)] if enum else []))
     rep = first[sig]                                               # every column's signature's first column
     # exact: every column's operands are its first's (no hash collision)
     if not torch.equal(succ_state, succ_state[cstart[rep[ecol]] + ek]):

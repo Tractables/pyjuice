@@ -919,7 +919,13 @@ def _walk_boundaries(prog) -> None:
         ends = prog.iv_ends_np[np.asarray(c.host["child_ivs"], dtype = np.int64)]
         c.host["walk"].update(at = k, ts = x, tlist = tables[starts[2 * k]:starts[2 * k] + x.size],
                               t2i = tables[starts[2 * k + 1]:starts[2 * k + 1] + n], ta = ends[:, 0] - 1, te = ends[:, 1])
-    template.shared["walk_ts"] = ts
+    sizes = np.fromiter((x.size for x in ts), dtype = np.int64, count = len(ts))
+    runs = np.zeros(len(ts) + 1, dtype = np.int64)                     # (every walk's entries, 16 bytes in and one more)
+    np.cumsum(-(-(sizes + 1) // 2) * 2, out = runs[1:])
+    flat = np.concatenate(ts) if ts else np.zeros(0, dtype = np.int64)
+    run = np.repeat(np.arange(len(ts)), sizes)
+    within = np.arange(flat.size) - np.repeat(np.cumsum(sizes) - sizes, sizes)
+    template.shared["walk_entries"] = (flat, run, runs[run] + within + 1, np.cumsum(sizes) - sizes, runs, sizes.tolist())
 
 
 def _input_block_boundaries(la: TopDownLaunch, prog) -> tuple:
@@ -936,16 +942,16 @@ def _input_block_boundaries(la: TopDownLaunch, prog) -> tuple:
         n, W = prog.n, prog.W
         pp = prog.ungrouped_tables().pred_ptr.view(n, W + 1).cpu().numpy().astype(np.int64)   # (the CUDA walk runs
         counts = pp[:, W] - pp[:, 0]                                   # ungrouped: every boundary's predecessors)
-        ecums = []
-        for x in prog.assembly.top_down.shared["walk_ts"]:
-            ecum = np.zeros(x.size + 1, dtype = np.int64)
-            np.cumsum(counts[x], out = ecum[1:])
-            ecums.append(ecum)
-        buf, starts = pack_aligned(ecums, np.int64)
-        kept = prog.walk_entries = (ecums, torch.from_numpy(buf).to(prog.dev), starts.tolist())
-    ecums, tables, starts = kept
+        flat, run, places, firsts, runs, sizes = prog.assembly.top_down.shared["walk_entries"]
+        entries = counts[flat]
+        total = np.cumsum(entries)                                     # (every walk's sums: all of them, less those before)
+        buf = np.zeros(int(runs[-1]), dtype = np.int64)
+        buf[places] = total - (total[firsts[run]] - entries[firsts[run]])
+        kept = prog.walk_entries = (buf, torch.from_numpy(buf).to(prog.dev), runs.tolist(), sizes)
+    buf, tables, starts, sizes = kept
     k = walk["at"]
-    return walk, ecums[k], tables[starts[k]:starts[k] + ecums[k].size]
+    first, last = starts[k], starts[k] + sizes[k] + 1
+    return walk, buf[first:last], tables[first:last]
 
 
 def _work_space(prog, size: int, counters: int):

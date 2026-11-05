@@ -234,7 +234,7 @@ class PriorPool:
             return
         prog, layout = self.state._backend.program(), self.state.batch_layout(1)
         full = layout["node_size"]
-        self.reg_floats = (prog.reg_rows * np.asarray(layout["sum_widths"], dtype = np.int64) + ALIGN - 1) // ALIGN * ALIGN
+        self.reg_floats = (prog.reg_rows * layout["sum_widths_host"] + ALIGN - 1) // ALIGN * ALIGN
         K = len(prog.sum_ivs)
         self.iv_floats = np.zeros(K, dtype = np.int64)
         np.add.at(self.iv_floats, prog.reg_iv_np, self.reg_floats)
@@ -396,10 +396,20 @@ class PriorPool:
             self.stamp[int(iv)] = self.queries
         todo = plan.todo.numpy()
         checkpoint = self._checkpoints()
-        for r in np.nonzero(todo[prog.reg_iv_np])[0]:
-            r = int(r)
-            if r in self.extents:
-                continue
+        new = [r for r in np.nonzero(todo[prog.reg_iv_np])[0].tolist() if r not in self.extents]
+        if new and self.free:                          # (all of them in the first hole, as first fit puts them, at once)
+            sizes = self.reg_floats[new]
+            ends = np.cumsum(sizes)
+            off, room = self.free[0]
+            if int(ends[-1]) <= room:
+                self.extents.update(zip(new, zip((off + ends - sizes).tolist(), sizes.tolist())))
+                if int(ends[-1]) == room:
+                    del self.free[0]
+                else:
+                    self.free[0] = (off + int(ends[-1]), room - int(ends[-1]))
+                self._version += 1
+                new = []
+        for r in new:
             floats = int(self.reg_floats[r])
             off = self._take(floats)
             while off is None:
@@ -419,9 +429,10 @@ class PriorPool:
         self._open()
         layout = self.state.batch_layout(1)
         if self._table is None or self._table[0] != self._version:
-            R = len(layout["sum_widths"])
-            offsets = [self.extents[r][0] if r in self.extents else -1 for r in range(R)]
-            self._table = (self._version, offsets, torch.tensor(offsets, dtype = torch.int64, device = self.state._device))
+            offsets = np.full(len(layout["sum_widths"]), -1, dtype = np.int64)
+            if self.extents:
+                offsets[list(self.extents)] = [extent[0] for extent in self.extents.values()]
+            self._table = (self._version, offsets.tolist(), torch.from_numpy(offsets).to(self.state._device))
         return dict(mars = self.buffer, offset = self._table[1], width = layout["sum_widths"], offset_t = self._table[2],
                     width_t = layout["sum_widths_t"])
 
@@ -495,8 +506,8 @@ class State:
         if layout is None:
             be = self._backend
             layout = buffer_layout(be.input_range, be.sum_regions, be.element_regions, B)
-            layout["sum_offsets_t"] = torch.tensor(layout["sum_offsets"], dtype = torch.int64, device = self._device)
-            layout["sum_widths_t"] = torch.tensor(layout["sum_widths"], dtype = torch.int64, device = self._device)
+            layout["sum_offsets_t"] = torch.from_numpy(layout["sum_offsets_host"]).to(self._device)
+            layout["sum_widths_t"] = torch.from_numpy(layout["sum_widths_host"]).to(self._device)
             self._layouts[B] = layout
         return layout
 
@@ -577,8 +588,8 @@ class State:
             if pf["size"] == 0:                          # (nothing has rows yet: every region's 0)
                 pf["offset_t"] = pf["width_t"] = torch.zeros(len(pf["offset"]), dtype = torch.int64, device = self._device)
             else:
-                pf["offset_t"] = torch.tensor(np.maximum(pf["offset"], 0), dtype = torch.int64, device = self._device)
-                pf["width_t"] = torch.tensor(pf["width"], dtype = torch.int64, device = self._device)
+                pf["offset_t"] = torch.from_numpy(np.maximum(np.asarray(pf["offset"], dtype = np.int64), 0)).to(self._device)
+                pf["width_t"] = torch.from_numpy(np.asarray(pf["width"], dtype = np.int64)).to(self._device)
         return pf
 
     def storage(self, name: str) -> Optional[torch.Tensor]:

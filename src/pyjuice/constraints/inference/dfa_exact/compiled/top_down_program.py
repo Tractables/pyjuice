@@ -80,7 +80,7 @@ def top_down_program(backend) -> TopDownProgram:
     prog.td_most = np.stack([most_in_runs(prog.entries[t.child_a], ptr), most_in_runs(prog.exits[t.child_b], ptr),
                              most_in_runs(prog.all_iv_slots[t.child_iv], ptr)], axis = 1).ravel().tolist()
     prog.cw_most = most_in_runs(prog.exits[t.cw_bound], t.cw_ptr).tolist()
-    prog.td_slots = most_in_runs(np.asarray(prog.slots, dtype = np.int64)[t.group_reg], t.group_ptr).tolist()
+    prog.td_slots = most_in_runs(prog.slots_host[t.group_reg], t.group_ptr).tolist()
     return TopDownProgram(steps = t.steps, skip = skip_masks_for(prog.reach, t.spec_table, device = prog.dev), dead = t.dead,
                           dead_region = t.dead_region, iv_bounds = t.iv_bounds, reg_iv = t.reg_iv,
                           elem_regions = t.elem_regions, shared = t.shared)

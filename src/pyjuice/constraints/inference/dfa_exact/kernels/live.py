@@ -511,16 +511,17 @@ class Liveness:
         tables = prog.live_tables.get(key)
         if tables is None:                           # where the intervals' columns and their tiles' counts go
             sel = np.nonzero(intervals)[0]
-            sizes = [B * prog.sum_iv_slots[k] for k in sel]
+            columns = B * prog.iv_slots[sel]
+            sizes = columns.tolist()
             if sizes and max(sizes) >= 1 << 31:                    # (an interval's columns are int32 in the lists)
                 raise ValueError(f"An interval's {max(sizes)} columns (batch {B}) are past what its lane order holds; "
                                  f"use a smaller batch.")
-            starts = np.cumsum([0] + sizes)
-            tiles = np.cumsum([0] + [host_cdiv(z, LIST_TILE) for z in sizes])
+            starts = np.concatenate([[0], np.cumsum(columns)])
+            tiles = np.concatenate([[0], np.cumsum((columns + LIST_TILE - 1) // LIST_TILE)])
             K = len(prog.sum_ivs)
             first, index = np.full(K, -1, dtype = np.int64), np.full(K, -1, dtype = np.int64)
             first[sel], index[sel] = starts[:-1], np.arange(len(sel))
-            reg_iv = np.asarray(prog.reg_iv_host)
+            reg_iv = prog.reg_iv_np
             group = np.where(index[reg_iv] >= 0, index[reg_iv], len(sel))  # an ordered interval's place, or past them
             regs = np.argsort(group, kind = "stable")                      # every ordered interval's regions, then
             reg_ptr = np.searchsorted(group[regs], np.arange(len(sel) + 2))  # the others'

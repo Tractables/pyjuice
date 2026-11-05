@@ -119,9 +119,9 @@ def buffer_layout(input_range, sum_regions, element_regions, batch_size: int) ->
     columns per row; its size is that of the largest group.
 
     :returns: a dict with ``input_offset``, ``sum_offsets`` and ``sum_widths`` (one per sum
-        region; row ``r`` of region ``i`` starts at ``sum_offsets[i] + (r - first_row) * sum_widths[i]``),
-        ``node_size``, ``element_widths`` (one per product layer group; row ``r`` starts at
-        ``(r - first_row) * width``) and ``element_size``
+        region; row ``r`` of region ``i`` starts at ``sum_offsets[i] + (r - first_row) * sum_widths[i]``), the same as
+        arrays ``sum_offsets_host`` and ``sum_widths_host``, ``node_size``, ``element_widths`` (one per product layer
+        group; row ``r`` starts at ``(r - first_row) * width``) and ``element_size``
     """
     B = int(batch_size)
     input_start, input_end = input_range
@@ -132,5 +132,5 @@ def buffer_layout(input_range, sum_regions, element_regions, batch_size: int) ->
     sum_offsets = np.concatenate([[_align(input_end * B)], ends[:-1]]) if ends.size else ends
     element_widths = [_align(B * slots) for _, _, slots in element_regions]
     element_size = max(((end - first) * w for (first, end, _), w in zip(element_regions, element_widths)), default = 0)
-    return dict(input_offset = 0, sum_offsets = sum_offsets.tolist(), sum_widths = widths.tolist(),
-                node_size = node_size, element_widths = element_widths, element_size = element_size)
+    return dict(input_offset = 0, sum_offsets = sum_offsets.tolist(), sum_widths = widths.tolist(), sum_offsets_host = sum_offsets,
+                sum_widths_host = widths, node_size = node_size, element_widths = element_widths, element_size = element_size)
