@@ -97,49 +97,37 @@ def moves_of_table(delta, accept):
 
 
 @njit(cache = True)
-def _coarsest(into_ptr, into_class, into_src, accept, C):
+def _coarsest(into_ptr, into_class, into_src, live, level, C):
     """
-    The coarsest partition of the states that keeps accepting and rejecting states apart and is respected by every
-    class's moves: Hopcroft's algorithm over moves, not over states times classes. ``into_class`` / ``into_src`` from
-    ``into_ptr[t]`` to ``into_ptr[t + 1]`` are the moves into state ``t``. A state without a move on a class goes to a
-    state outside the partition, of which no block needs splitting by: a partition respected by the moves into every
-    other block is respected by those. Returns ``(block, num_blocks)``, int32 [states], blocks in no particular order.
+    The coarsest partition of the states ``live`` that is respected by every class's moves and keeps apart those of two
+    ``level`` s: Hopcroft's algorithm over moves, not over states times classes. ``into_class`` / ``into_src`` from
+    ``into_ptr[t]`` to ``into_ptr[t + 1]`` are the moves into state ``t``, ``live`` holds the states by level, ``level[i]`` the
+    first place of the ``i``-th level. A state without a move on a class goes to a state outside the partition, of which no
+    block needs splitting by: a partition respected by the moves into every other block is respected by those. Returns
+    ``(block, num_blocks)``, int32 [states] (-1 for the others), blocks in no particular order.
 
     A block is a splitter once, all its classes at a time, when it is made: of a block split the smaller part is a new
     block, the other keeps its number and its place among the splitters, if it has one. A state's moves are thus read
     at most ``log2(states) + 1`` times.
     """
-    L = accept.shape[0]
-    elems = np.empty(L, dtype = np.int32)                       # blocks as ranges of `elems`; `loc`: a state's place
-    loc = np.empty(L, dtype = np.int32)
-    block = np.empty(L, dtype = np.int32)
+    K = into_ptr.shape[0] - 1
+    L = live.shape[0]
+    elems = live.copy()                                         # blocks as ranges of `elems`; `loc`: a state's place
+    loc = np.empty(K, dtype = np.int32)
+    block = np.full(K, -1, dtype = np.int32)
     start = np.zeros(L + 1, dtype = np.int32)
     size = np.zeros(L + 1, dtype = np.int32)
-    num_accept = 0
-    for q in range(L):
-        if accept[q]:
-            num_accept += 1
-    on_accept, on_rest = 0, num_accept
-    other_block = 1 if num_accept > 0 else 0
-    for q in range(L):
-        if accept[q]:
-            elems[on_accept], loc[q], block[q] = q, on_accept, 0
-            on_accept += 1
-        else:
-            elems[on_rest], loc[q], block[q] = q, on_rest, other_block
-            on_rest += 1
-    num_blocks = 0
-    if num_accept > 0:
-        size[0] = num_accept
-        num_blocks = 1
-    if num_accept < L:
-        start[num_blocks], size[num_blocks] = num_accept, L - num_accept
-        num_blocks += 1
+    num_blocks = level.shape[0] - 1
+    for b in range(num_blocks):
+        start[b], size[b] = level[b], level[b + 1] - level[b]
+        for i in range(level[b], level[b + 1]):
+            q = elems[i]
+            loc[q], block[q] = i, b
     stack = np.empty(L + 1, dtype = np.int32)
     for b in range(num_blocks):
-        stack[b] = b
+        stack[b] = num_blocks - 1 - b
     top = num_blocks
-    moved = np.empty(into_ptr[L], dtype = np.int32)             # the moves into a block, by class: their sources
+    moved = np.empty(into_ptr[K], dtype = np.int32)             # the moves into a block, by class: their sources
     count = np.zeros(C, dtype = np.int32)
     where = np.empty(C, dtype = np.int32)
     classes = np.empty(C, dtype = np.int32)
@@ -212,73 +200,52 @@ def _coarsest(into_ptr, into_class, into_src, accept, C):
 
 @njit(cache = True)
 def _live_partition(ptr, cls, dst, accept, among, C):
-    """The states of ``among`` an accepting state is reachable from, and the partition :func:`_coarsest` of them, by the
-    moves ``(ptr, cls, dst)`` among them: ``(number, block, num_blocks)``, ``number`` int32 [states] a live state's place
-    in ``block``, -1 for the others."""
+    """The partition :func:`_coarsest` of the states of ``among`` an accepting state is reachable from, by the moves ``(ptr,
+    cls, dst)`` among them: ``(block, num_blocks)``, ``block`` int32 [states], -1 for the others. Its first blocks are by the
+    walk back from the accepting states: states alike are as far from one (the accepting ones, at no distance, apart from
+    the others among them), which spares most of the splits; a move into a live state is from a live one."""
     K = ptr.shape[0] - 1
-    back = np.zeros(K + 1, dtype = np.int64)                    # the moves into every state: by a walk back from the
-    for q in range(K):                                          # accepting states
+    into_ptr = np.zeros(K + 1, dtype = np.int64)
+    for q in range(K):
         if among[q]:
             for e in range(ptr[q], ptr[q + 1]):
-                back[dst[e] + 1] += 1
+                into_ptr[dst[e] + 1] += 1
     for t in range(K):
-        back[t + 1] += back[t]
-    src = np.empty(back[K], dtype = np.int32)
-    fill = back[:K].copy()
+        into_ptr[t + 1] += into_ptr[t]
+    into_class = np.empty(into_ptr[K], dtype = np.int32)
+    into_src = np.empty(into_ptr[K], dtype = np.int32)
+    fill = into_ptr[:K].copy()
     for q in range(K):
         if among[q]:
             for e in range(ptr[q], ptr[q + 1]):
                 t = dst[e]
-                src[fill[t]] = q
+                into_class[fill[t]], into_src[fill[t]] = cls[e], q
                 fill[t] += 1
     live = np.empty(K, dtype = np.int32)
-    number = np.full(K, -1, dtype = np.int32)
+    seen = np.zeros(K, dtype = np.bool_)
     L = 0
     for q in range(K):
         if among[q] and accept[q]:
-            number[q] = 0
+            seen[q] = True
             live[L] = q
             L += 1
+    level = np.empty(K + 2, dtype = np.int32)                   # (the walk back level by level)
+    level[0] = 0
+    levels = 0
     head = 0
     while head < L:
-        t = live[head]
-        head += 1
-        for k in range(back[t], back[t + 1]):
-            q = src[k]
-            if number[q] < 0:
-                number[q] = 0
-                live[L] = q
-                L += 1
-    L = 0
-    for q in range(K):
-        if number[q] == 0:
-            number[q] = L
-            L += 1
-    into_ptr = np.zeros(L + 1, dtype = np.int64)
-    accepting = np.empty(L, dtype = np.bool_)
-    for q in range(K):
-        i = number[q]
-        if i >= 0:
-            accepting[i] = accept[q]
-            for e in range(ptr[q], ptr[q + 1]):
-                j = number[dst[e]]
-                if j >= 0:
-                    into_ptr[j + 1] += 1
-    for t in range(L):
-        into_ptr[t + 1] += into_ptr[t]
-    into_class = np.empty(into_ptr[L], dtype = np.int32)
-    into_src = np.empty(into_ptr[L], dtype = np.int32)
-    fill = into_ptr[:L].copy()
-    for q in range(K):
-        i = number[q]
-        if i >= 0:
-            for e in range(ptr[q], ptr[q + 1]):
-                j = number[dst[e]]
-                if j >= 0:
-                    into_class[fill[j]], into_src[fill[j]] = cls[e], i
-                    fill[j] += 1
-    block, num_blocks = _coarsest(into_ptr, into_class, into_src, accepting, C)
-    return number, block, num_blocks
+        levels += 1
+        level[levels] = L
+        for i in range(head, level[levels]):
+            t = live[i]
+            for k in range(into_ptr[t], into_ptr[t + 1]):
+                q = into_src[k]
+                if not seen[q]:
+                    seen[q] = True
+                    live[L] = q
+                    L += 1
+        head = level[levels]
+    return _coarsest(into_ptr, into_class, into_src, live[:L], level[:levels + 1], C)
 
 
 @njit(cache = True)
@@ -291,12 +258,12 @@ def hopcroft(delta, accept):
     """
     K, C = delta.shape
     ptr, cls, dst = moves_of_table(delta, accept)
-    number, block, num_blocks = _live_partition(ptr, cls, dst, accept, np.ones(K, dtype = np.bool_), C)
+    block, num_blocks = _live_partition(ptr, cls, dst, accept, np.ones(K, dtype = np.bool_), C)
     out = np.full(K, num_blocks, dtype = np.int64)
     dead = False
     for q in range(K):
-        if number[q] >= 0:
-            out[q] = block[number[q]]
+        if block[q] >= 0:
+            out[q] = block[q]
         else:
             dead = True
     return out, num_blocks + 1 if dead else num_blocks
@@ -325,16 +292,16 @@ def minimal_moves(ptr, cls, dst, accept, initial, C):
                 among[t] = True
                 queue[num] = t
                 num += 1
-    number, block, m = _live_partition(ptr, cls, dst, accept, among, C)
-    if number[initial] < 0:                                     # no text: the dead state alone
+    block, m = _live_partition(ptr, cls, dst, accept, among, C)
+    if block[initial] < 0:                                      # no text: the dead state alone
         return np.zeros((1, C), dtype = np.int32), np.zeros(1, dtype = np.bool_)
     rep = np.empty(m, dtype = np.int32)                         # any member represents its block
     for q in range(K):
-        if number[q] >= 0:
-            rep[block[number[q]]] = q
+        if block[q] >= 0:
+            rep[block[q]] = q
     place = np.full(m, -1, dtype = np.int32)
     order = np.empty(m, dtype = np.int32)
-    order[0] = block[number[initial]]
+    order[0] = block[initial]
     place[order[0]] = 0
     num, head = 1, 0
     out = np.full((m + 1, C), m, dtype = np.int32)
@@ -343,9 +310,8 @@ def minimal_moves(ptr, cls, dst, accept, initial, C):
         r = rep[order[head]]
         accepting[head] = accept[r]
         for e in range(ptr[r], ptr[r + 1]):
-            i = number[dst[e]]
-            if i >= 0:
-                b = block[i]
+            b = block[dst[e]]
+            if b >= 0:
                 if place[b] < 0:
                     place[b] = num
                     order[num] = b
