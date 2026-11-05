@@ -16,9 +16,12 @@ from pyjuice.constraints.language.backend.json_schema import compile_schema
 from pyjuice.constraints.language.json_schema import _prepare
 
 
-@pytest.fixture(autouse = True)
-def few_copies_left_out(monkeypatch):
+@pytest.fixture(autouse = True, params = ["behaviours", "walks"])
+def few_copies_left_out(monkeypatch, request):
+    """(the rows and classes by behaviours or by walks: the copies are put back in either's)"""
     monkeypatch.setattr(counters, "MIN_LEFT_OUT", 1)
+    if request.param == "walks":
+        monkeypatch.setattr(token_lift, "BEHAVIOUR_ENTRIES", 0)
 
 
 def vocabulary_of(rng, longest = 12, count = 300, pieces = ()):

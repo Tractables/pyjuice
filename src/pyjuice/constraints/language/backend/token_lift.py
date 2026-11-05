@@ -21,6 +21,7 @@ from numba import get_num_threads, njit, prange
 
 from ..dfa import DFA
 from ..vocabulary import Vocabulary
+from .behaviours import behaviours_of, classes_of_behaviours, rows_of_behaviours
 from .counters import NotCounted, expanded_moves, states_put_back
 from .dfa import bfs_order
 from .byte_level import ByteAutomaton
@@ -183,119 +184,6 @@ class _Trie:
         return places
 
 
-@njit(cache = True)
-def _trie_of_classes(first_child, node_byte, end_ptr, end_ids, byte_class, read, V):
-    """
-    The trie as far as an automaton can tell: a trie over its classes, the nodes whose texts spell the same classes one node (from any
-    state such texts lead to the same state), edges on a class ``read`` by no state left out. Numbered breadth-first, each holding its
-    trie nodes, at most once per trie node: what :class:`_Trie` keeps, the classes for bytes: ``(first_child, node_byte, ends_before,
-    end_nodes, token_end)``; a token no walk gets to is where a token without text is.
-    """
-    N = first_child.shape[0] - 1
-    C = read.shape[0]
-    members = np.empty(N, dtype = np.int32)
-    first = np.empty(N + 1, dtype = np.int32)
-    out_child = np.empty(N + 1, dtype = np.int32)
-    out_label = np.zeros(N, dtype = np.uint8)
-    ends_before = np.empty(N + 1, dtype = np.int32)
-    end_nodes = np.empty(N + 3, dtype = np.int32)
-    token_end = np.zeros(V, dtype = np.int32)
-    count = np.zeros(C, dtype = np.int32)
-    place = np.empty(C, dtype = np.int32)
-    touched = np.empty(C, dtype = np.int32)
-    members[0], first[0], first[1] = 0, 0, 1
-    end_nodes[0] = 0
-    ends_before[0] = 0
-    E, num, m = 1, 1, 0
-    while m < num:
-        out_child[m] = num
-        a, b = first[m], first[m + 1]
-        if m > 0:
-            held = False
-            for i in range(a, b):
-                u = members[i]
-                for k in range(end_ptr[u], end_ptr[u + 1]):
-                    token_end[end_ids[k]] = E
-                    held = True
-            if held:
-                end_nodes[E] = m
-                E += 1
-        ends_before[m + 1] = E
-        if b == a + 1 and first_child[members[a] + 1] <= first_child[members[a]] + 1:   # (most nodes: a chain)
-            u = members[a]
-            w = first_child[u]
-            if w < first_child[u + 1] and read[byte_class[node_byte[w]]]:
-                end = first[num]
-                members[end] = w
-                first[num + 1] = end + 1
-                out_label[num] = byte_class[node_byte[w]]
-                num += 1
-            m += 1
-            continue
-        t = 0
-        for i in range(a, b):
-            u = members[i]
-            for w in range(first_child[u], first_child[u + 1]):
-                c = byte_class[node_byte[w]]
-                if read[c]:
-                    if count[c] == 0:
-                        touched[t] = c
-                        t += 1
-                    count[c] += 1
-        end = first[num]
-        for j in range(t):
-            c = touched[j]
-            place[c] = end
-            end += count[c]
-            count[c] = 0
-            first[num + 1] = end
-            out_label[num] = c
-            num += 1
-        for i in range(a, b):
-            u = members[i]
-            for w in range(first_child[u], first_child[u + 1]):
-                c = byte_class[node_byte[w]]
-                if read[c]:
-                    members[place[c]] = w
-                    place[c] += 1
-        m += 1
-    out_child[num] = num
-    end_nodes[E], end_nodes[E + 1] = num, num + 1
-    return out_child[:num + 1], out_label[:num], ends_before[:num + 1], end_nodes[:E + 2], token_end
-
-
-@njit(cache = True)
-def _classes_read(table, dead):
-    """bool [classes]: the classes on which some live state moves to a live state (a column at a time: most say so soon)."""
-    S, C = table.shape
-    read = np.zeros(C, dtype = np.bool_)
-    for c in range(C):
-        for q in range(S):
-            if q != dead and table[q, c] != dead:
-                read[c] = True
-                break
-    return read
-
-
-class _TrieOfClasses:
-    """A :class:`_Trie` over an automaton's classes (:func:`_trie_of_classes`), for that automaton's walks. ``letters``, what
-    :class:`_Trie` reads through the automaton's byte classes, reads through this."""
-
-    letters = np.arange(256, dtype = np.int64)
-
-    def __init__(self, trie: _Trie, byte_class: np.ndarray, read: np.ndarray, vocabulary: Vocabulary):
-        self.first_child, self.node_byte, self.ends_before, self.end_nodes, self.token_end = _trie_of_classes(trie.first_child, trie.node_byte, trie.end_ptr, trie.end_ids,
-                                                                                                              byte_class, read, vocabulary.size)
-        self.below = _bytes_below(self.first_child, self.node_byte)
-        self.token_end[trie.empty] = self.end_nodes.size - 2
-        self.parent = _parents(self.first_child)
-
-    def token_ends(self, V: int, eos: tuple) -> np.ndarray:
-        """As :meth:`_Trie.token_ends`: its own, of this automaton."""
-        self.token_end[list(eos)] = self.end_nodes.size - 1
-        return self.token_end
-
-
 def _trie(vocabulary: Vocabulary) -> _Trie:
     """The vocabulary's byte trie, built on first use and kept with it."""
     if vocabulary._byte_trie is None:
@@ -303,8 +191,7 @@ def _trie(vocabulary: Vocabulary) -> _Trie:
     return vocabulary._byte_trie
 
 
-#: a node with more children than this has those a state lives on found by their bytes, if the state leads nowhere on most (a trie
-#: of classes, its children not by increasing class, has fewer: see :data:`FEW_CLASSES`)
+#: a node with more children than this has those a state lives on found by their bytes, if the state leads nowhere on most
 MANY_CHILDREN = 64
 #: the lowest bit of a word, by a de Bruijn sequence
 _DE_BRUIJN = np.uint64(0x03f79d71b4cb0a89)
@@ -1044,27 +931,34 @@ def _sparse_table_parallel(moves, row_at, row_len, order, place, K, pad, out, P)
 _NO_FIRST_MOVES = (np.empty(0, dtype = np.int32), np.zeros(1, dtype = np.int32))
 
 
-def _canonical_token_table(automaton: ByteAutomaton, states: np.ndarray, remap: np.ndarray, trie, letters: np.ndarray, reps: np.ndarray, kinds: np.ndarray, accept: np.ndarray,
-                           end_class: int, K_full: int) -> tuple:
-    """
-    The table in canonical numbering of a token automaton minimal already, and its accepting states: what
-    ``DFA._of_classes(...)._renumbered()`` makes of the dense table of every state's every class, without it: nearly all of
-    that table is the dead state. Moves from a walk of the representatives' trie, the breadth-first order over them, then
-    the table once, as it will stand. Of ``K_full`` states ``states`` are the first (the others: the copies an automaton has left
-    out, its :attr:`~.byte_level.ByteAutomaton.counted`, put back here).
-    """
+def _rows_by_walks(automaton: ByteAutomaton, states: np.ndarray, remap: np.ndarray, trie: "_Trie", reps: np.ndarray, kinds: np.ndarray, accept: np.ndarray,
+                   end_class: int, K_full: int) -> tuple:
+    """The moves of the first ``states.size`` states of a token automaton minimal already, by a walk of the representatives' trie from every state."""
     K, C = states.size, reps.size
-    threads = get_num_threads()
     rep_node = np.where(kinds == 0, trie.end_nodes[trie.token_end[np.minimum(reps, trie.token_end.size - 1)]], -1).astype(np.int64)
-    gptr, gclass, gnode, class_at = _rep_trie(trie.first_child, trie.node_byte, letters, trie.parent, rep_node)
+    gptr, gclass, gnode, class_at = _rep_trie(trie.first_child, trie.node_byte, automaton.byte_class, trie.parent, rep_node)
     itself = np.nonzero(kinds == 1)[0].astype(np.int64)
     moves = np.empty(K * C + 1, dtype = np.int64)               # (room for all, where a part starts; only what is written is touched)
     row_at, row_len = np.zeros(K_full + 2, dtype = np.int64), np.zeros(K_full + 2, dtype = np.int64)
     args = (automaton._kept_table, automaton.dead, states, remap, gptr, gclass, gnode, class_at, itself, accept, end_class, K_full, C, moves, row_at, row_len)
+    threads = get_num_threads()
     if K * C >= THREADS_ENTRIES and threads > 1:
         _sparse_rows_parallel(*args, K, min(threads, K))
     else:
         _sparse_rows(*args, 0, K)
+    return moves, row_at, row_len
+
+
+def _table_of_rows(automaton: ByteAutomaton, remap: np.ndarray, K: int, K_full: int, C: int, moves: np.ndarray, row_at: np.ndarray, row_len: np.ndarray, accept: np.ndarray,
+                   end_class: int) -> tuple:
+    """
+    The table in canonical numbering of a token automaton minimal already, and its accepting states: what
+    ``DFA._of_classes(...)._renumbered()`` makes of the dense table of every state's every class, without it: nearly all of
+    that table is the dead state. From the moves of the first ``K`` of its ``K_full`` states (the others: the copies an automaton has left
+    out, its :attr:`~.byte_level.ByteAutomaton.counted`, put back here), the breadth-first order over them, then the table once, as it
+    will stand.
+    """
+    threads = get_num_threads()
     first_at, first_moves = _NO_FIRST_MOVES
     if automaton.counted:
         moves, first_at, first_moves = expanded_moves(automaton.counted, remap, K, K_full, moves, row_at, row_len, accept, threads)
@@ -1087,12 +981,14 @@ def _canonical_token_table(automaton: ByteAutomaton, states: np.ndarray, remap: 
     return out, accept[order]
 
 
-#: below so many classes of bytes the trie over the classes is small, and worth making: few classes, so many tokens spell the same
-FEW_CLASSES = 16
+#: an automaton of at most so many entries has its tokens' classes and rows from the behaviours of the trie's nodes, reading at most so many
+#: moves for them (:mod:`.behaviours`; they read a few times its entries: past that, the walks and their checks, in threads, cost less)
+BEHAVIOUR_ENTRIES = 1 << 18
+BEHAVIOUR_WORK = 1 << 21
 #: so many steps of walks of the trie come first; a table of so many entries stays on one thread
 SERIAL_STEPS = 1 << 18
 NO_BUDGET = 1 << 62
-#: the table of a token automaton of at least so many entries, minimal already, is made from its moves (:func:`_canonical_token_table`,
+#: the table of a token automaton of at least so many entries, minimal already, is made from its moves (:func:`_table_of_rows`,
 #: the dense table of its rows costing no more below it), in threads from :data:`THREADS_ENTRIES` on
 SPARSE_ENTRIES = 1 << 13
 THREADS_ENTRIES = 1 << 18
@@ -1131,35 +1027,49 @@ def to_tokens(automaton: ByteAutomaton, vocabulary: Vocabulary, eos_padding: boo
     trie = _trie(vocabulary)
     table, byte_class = automaton._kept_table, automaton.byte_class
     dead_byte, start = automaton.dead, automaton.initial
-    r = _random_words(S)
     complete = automaton.minimal and start != dead_byte and _byte_complete(trie)
     if automaton.counted and not complete:
         raise NotCounted
-    through, letters = trie, byte_class
-    if table.shape[1] < FEW_CLASSES:
-        through = _TrieOfClasses(trie, byte_class, _classes_read(table, dead_byte), vocabulary)
-        letters = through.letters
-    M = through.first_child.size - 1
-    walking = (_bytes_of_classes(letters, max(table.shape[1], int(letters.max()) + 1)), np.full(S, -1, dtype = np.int32), np.zeros((S, 4), dtype = np.uint64), np.zeros(S, dtype = np.int32))
-    h1, h2, states, walked = _walk(table, dead_byte, start, letters, through.first_child, through.node_byte, through.ends_before, r[0], r[1], r[2], r[3], through.below, *walking,
+    eos = np.asarray(vocabulary.eos, dtype = np.int64)
+    padded = eos_padding and eos.size > 0
+    token_end = trie.token_ends(V, vocabulary.eos if eos_padding else ())
+    if complete and S * table.shape[1] <= BEHAVIOUR_ENTRIES:
+        T, behaviour_of, at, source, target = behaviours_of(table, dead_byte, byte_class, trie.parent, trie.node_byte, BEHAVIOUR_WORK)
+        if T >= 0:
+            token_class, reps, behaviour = classes_of_behaviours(behaviour_of, T, trie.end_nodes, token_end)
+            states = np.arange(S, dtype = np.int64)
+            states[start], states[0] = 0, start
+            states = states[states != dead_byte]
+            K, C = states.size, reps.size
+            K_full = K + states_put_back(automaton.counted) if automaton.counted else K
+            remap = np.full(S, K_full, dtype = np.int64)
+            remap[states] = np.arange(K)
+            accept = np.zeros(K_full + 2, dtype = bool)
+            accept[:K] = automaton.accept[states]
+            end_class = int(token_class[eos[0]]) if padded else -1
+            rows = rows_of_behaviours(behaviour, T, at, source, target, remap, accept, end_class, K, K_full)
+            out, kept = _table_of_rows(automaton, remap, K, K_full, C, *rows, accept, end_class)
+            return DFA._of_classes(V, torch.from_numpy(token_class), torch.from_numpy(out), 0, torch.from_numpy(kept))
+    r = _random_words(S)
+    M = trie.first_child.size - 1
+    walking = (_bytes_of_classes(byte_class, table.shape[1]), np.full(S, -1, dtype = np.int32), np.zeros((S, 4), dtype = np.uint64), np.zeros(S, dtype = np.int32))
+    h1, h2, states, walked = _walk(table, dead_byte, start, byte_class, trie.first_child, trie.node_byte, trie.ends_before, r[0], r[1], r[2], r[3], trie.below, *walking,
                                    SERIAL_STEPS if complete else NO_BUDGET)
     if walked < states.size:        # the states reached at token boundaries: every one a byte text reaches
         left = np.ones(S, dtype = bool)
         left[states[:walked]] = False
         states = bfs_order(table, start)
         states = states[states != dead_byte]
-        _walk_the_rest(table, dead_byte, states[left[states]], letters, through, r, walking, h1, h2)
+        _walk_the_rest(table, dead_byte, states[left[states]], byte_class, trie, r, walking, h1, h2)
     offsets, has_text = vocabulary._offsets, vocabulary._has_text
     if trie.empty.size:                                                 # empty text: every state to itself
         with np.errstate(over = "ignore"):
             x = (states + 1).astype(np.uint64)
             h1[M] = np.sum(r[0][states] * x + r[1][states], dtype = np.uint64)
             h2[M] = np.sum(r[2][states] * x + r[3][states], dtype = np.uint64)
-    eos = np.asarray(vocabulary.eos, dtype = np.int64)
-    if eos_padding and eos.size:                                        # a class of their own
+    if padded:                                                          # a class of their own
         h1[M + 1] = h2[M + 1] = np.uint64(2 ** 64 - 1)
-    token_end = through.token_ends(V, vocabulary.eos if eos_padding else ())
-    token_class, reps, hashed = _token_classes(h1, h2, through.end_nodes, token_end)
+    token_class, reps, hashed = _token_classes(h1, h2, trie.end_nodes, token_end)
     kinds = np.where(hashed & has_text[reps], np.where(offsets[reps + 1] == offsets[reps], 1, 0), 2).astype(np.int64)
     K, C = states.size, reps.size
     K_full = K + states_put_back(automaton.counted) if automaton.counted else K
@@ -1168,8 +1078,9 @@ def to_tokens(automaton: ByteAutomaton, vocabulary: Vocabulary, eos_padding: boo
     if complete and (automaton.counted or K * C >= SPARSE_ENTRIES):
         accept = np.zeros(K_full + 2, dtype = bool)
         accept[:K] = automaton.accept[states]
-        end_class = int(token_class[eos[0]]) if eos_padding and eos.size else -1
-        out, kept = _canonical_token_table(automaton, states, remap, through, letters, reps, kinds, accept, end_class, K_full)
+        end_class = int(token_class[eos[0]]) if padded else -1
+        rows = _rows_by_walks(automaton, states, remap, trie, reps, kinds, accept, end_class, K_full)
+        out, kept = _table_of_rows(automaton, remap, K, K_full, C, *rows, accept, end_class)
         return DFA._of_classes(V, torch.from_numpy(token_class), torch.from_numpy(out), 0, torch.from_numpy(kept))
     dead, pad = K, K + 1
     out = np.empty((K + 2, C), dtype = np.int64)
