@@ -338,8 +338,8 @@ def test_the_table_of_a_token_automaton_from_its_moves_is_the_dense_one(monkeypa
 
 
 def test_walks_by_ranges_give_the_hashes_of_every_step():
-    """Random automata and tokens: the walks that take the levels of a subtree at once, where every class below a node leads
-    a state to one successor, against a walk of every node from every state: the same hash of every merged node, to the
+    """Random automata and tokens: the walks that take the levels of a subtree at once, where every byte below a node leads
+    a state to one successor, against a walk of every node from every state: the same hash of every trie node, to the
     bit, and the same boundary states -- the successor holding for a level or more and then no longer, included."""
     from pyjuice.constraints.language.backend import token_lift as T
     rng = np.random.default_rng(1)
@@ -359,12 +359,12 @@ def test_walks_by_ranges_give_the_hashes_of_every_step():
                 table[q] = dead
             for c in rng.integers(0, C, int(rng.integers(0, max(C // 2, 1) + 1))).tolist():
                 table[q, c] = rng.integers(0, K)
-        tokens = [bytes(rng.integers(0, C, int(rng.integers(1, 7))).tolist()) for _ in range(int(rng.integers(5, 120)))]
+        shortest = 3 if case % 8 == 1 else 1                    # (counters, and no token ends at the first levels: not a state of a boundary there)
+        tokens = [bytes(rng.integers(0, C, int(rng.integers(shortest, 7))).tolist()) for _ in range(int(rng.integers(5, 120)))]
         trie = T._trie(jc.Vocabulary(tokens))
         byte_class = np.minimum(np.arange(256), C - 1)
-        ptr, edge_class, edge_node, token_node, holds = T._merged_trie(trie.first_child, trie.node_byte, trie.end_ptr, trie.end_ids, byte_class,
-                                                                       np.ones(C, dtype = np.bool_), len(tokens))
-        M, S = ptr.size - 1, K
+        first_child, node_byte, end_ptr = trie.first_child, trie.node_byte, trie.end_ptr
+        M, S = first_child.size - 1, K
         r = [rng.integers(1, 2 ** 63, size = S, dtype = np.uint64) | np.uint64(1) for _ in range(4)]
         want1, want2 = np.zeros(M + 2, dtype = np.uint64), np.zeros(M + 2, dtype = np.uint64)
         order, seen = [0], {0}
@@ -375,35 +375,125 @@ def test_walks_by_ranges_give_the_hashes_of_every_step():
             stack = [(0, s)]
             while stack:
                 u, q = stack.pop()
-                for e in range(ptr[u], ptr[u + 1]):
-                    q2 = int(table[q, edge_class[e]])
+                for w in range(first_child[u], first_child[u + 1]):
+                    q2 = int(table[q, byte_class[node_byte[w]]])
                     if q2 == dead:
                         continue
-                    w = int(edge_node[e])
                     x = np.uint64(q2 + 1)
                     with np.errstate(over = "ignore"):
                         want1[w] += r[0][s] * x + r[1][s]
                         want2[w] += r[2][s] * x + r[3][s]
-                    if holds[w] and q2 not in seen:
+                    if end_ptr[w + 1] > end_ptr[w] and q2 not in seen:
                         seen.add(q2)
                         order.append(q2)
                     stack.append((w, q2))
-        W = (C + 63) // 64
-        below = T._classes_below(ptr, edge_class, edge_node, W)
-        usual, same = np.full(S, -1, dtype = np.int32), np.zeros((S, W), dtype = np.uint64)
+        class_bytes = T._bytes_of_classes(byte_class, C)
+        usual, same = np.full(S, -1, dtype = np.int32), np.zeros((S, 4), dtype = np.uint64)
         count = np.zeros(S, dtype = np.int32)
-        h1, h2, states, walked = T._walk(table, dead, 0, ptr, edge_class, edge_node, holds, *r, below, usual, same, count, 1 << 62)
+        h1, h2, states, walked = T._walk(table, dead, 0, byte_class, first_child, node_byte, trie.ends_before, *r, trie.below, class_bytes, usual, same, count, 1 << 62)
         assert np.array_equal(h1, want1) and np.array_equal(h2, want2), case
         assert sorted(states.tolist()) == sorted(order) and walked == states.size, case
         uses_ranges += bool((usual >= 0).any())
         some = np.array(order, dtype = np.int64)                # from these states again, both other ways of walking
         again1, again2 = np.zeros(M + 2, dtype = np.uint64), np.zeros(M + 2, dtype = np.uint64)
-        assert T._walks(table, dead, some, ptr, edge_class, edge_node, *r, below, usual, same, count, again1, again2, 1 << 62) == some.size
+        assert T._walks(table, dead, some, byte_class, first_child, node_byte, *r, trie.below, class_bytes, usual, same, count, again1, again2, 1 << 62) == some.size
         assert np.array_equal(again1, want1) and np.array_equal(again2, want2), case
-        T._usual_moves(table, usual, same, count)
-        par1, par2 = T._walks_parallel(table, dead, some, ptr, edge_class, edge_node, *r, below, usual, same, min(3, some.size), M + 2)
+        T._usual_moves(table, class_bytes, usual, same, count)
+        par1, par2 = T._walks_parallel(table, dead, some, byte_class, first_child, node_byte, *r, trie.below, class_bytes, usual, same, min(3, some.size), M + 2)
         assert np.array_equal(par1, want1) and np.array_equal(par2, want2), case
     assert uses_ranges == 120
+
+
+def every_token_walked(a, vocabulary, eos):
+    """The minimal automaton of a walk of every token from every state of a byte automaton, byte by byte: nothing else of the module's."""
+    V, S = vocabulary.size, a.num_states
+    offsets, has_text = vocabulary._offsets, vocabulary._has_text
+    data = np.frombuffer(vocabulary._buffer, dtype = np.uint8)
+    table = np.full((S + 1, V), a.dead, dtype = np.int64)
+    for t in np.nonzero(has_text)[0].tolist():
+        q = np.arange(S)
+        for x in data[offsets[t]:offsets[t + 1]].tolist():
+            q = a.table[q, a.byte_class[x]]
+        table[:S, t] = q
+    accept = np.append(a.accept, False)
+    if eos:
+        for e in vocabulary.eos:
+            table[np.nonzero(a.accept)[0], e] = S
+            table[S, e] = S
+        accept[S] = True
+    return jc.DFA(V, torch.arange(V), torch.from_numpy(table), a.initial, torch.from_numpy(accept)).minimize()
+
+
+@pytest.mark.parametrize("few", [0, 300])
+def test_the_trie_of_the_classes_or_of_the_bytes_the_same_automaton(few, monkeypatch):
+    """Whichever trie the walks go through: the automaton of a walk of every token from every state, on few classes and many, tokens no
+    walk gets to, tokens of empty text, ids past the trie's, with every byte a token or not."""
+    from pyjuice.constraints.language.backend import automata as A, token_lift as T
+    monkeypatch.setattr(T, "FEW_CLASSES", few)
+    rng = np.random.default_rng(2)
+    for case in range(60):
+        C = int(rng.integers(2, 12))
+        byte_class = np.minimum(np.arange(256), C - 1)
+        K = int(rng.integers(2, 40))
+        table = np.full((K, C), K - 1, dtype = np.int32)
+        moves = rng.random((K, C)) < rng.choice([0.2, 0.5, 0.9])
+        table[moves] = rng.integers(0, K, moves.sum())
+        table[K - 1] = K - 1
+        accept = rng.random(K) < 0.5
+        accept[K - 1] = False
+        a = A._from_classes(table, 0, accept, byte_class)
+        if case % 3 == 0:
+            a = A.minimize(a)
+        tokens = [bytes([b]) for b in range(256)] if case % 2 else []
+        tokens += [bytes(rng.integers(0, C + 3, int(rng.integers(1, 7))).tolist()) for _ in range(120)] + [b""]
+        vocabulary = jc.Vocabulary(tokens + [None], eos = [len(tokens)], size = len(tokens) + 3)
+        eos = bool(case % 5)
+        assert T.to_tokens(a, vocabulary, eos) == every_token_walked(a, vocabulary, eos), case
+
+
+def test_token_classes_from_the_hashes():
+    """Tokens are one class exactly if both hashes of their places are the same, numbered by their smallest, a class of no hash told
+    as such; more classes than the table of slots starts with, neighbours with one hash the same."""
+    from pyjuice.constraints.language.backend import token_lift as T
+    rng = np.random.default_rng(3)
+    for distinct in (1, 3, 40, 3000):
+        E = 6000
+        end_nodes = np.sort(rng.choice(20000, E, replace = False)).astype(np.int32)
+        h1, h2 = np.zeros(20002, dtype = np.uint64), np.zeros(20002, dtype = np.uint64)
+        values = rng.integers(1, 2 ** 62, size = (distinct, 2), dtype = np.uint64)
+        values[distinct // 2] = values[0, 0], values[0, 1] ^ np.uint64(1)         # (one hash the same, the other nearly: in one slot)
+        pick = rng.integers(0, distinct, E)
+        pick[:3] = [0, distinct // 2, 0]
+        if distinct > 3:
+            pick[3:40] = pick[3]                                        # (a run)
+        h1[end_nodes], h2[end_nodes] = values[pick, 0], values[pick, 1]
+        zero = rng.random(E) < 0.1
+        h1[end_nodes[zero]], h2[end_nodes[zero]] = 0, 0
+        V = 9000
+        token_end = rng.integers(0, E, V).astype(np.int32)
+        token_class, reps, hashed = T._token_classes(h1, h2, end_nodes, token_end)
+        first, want = {}, []
+        for t, e in enumerate(token_end.tolist()):
+            key = (int(h1[end_nodes[e]]), int(h2[end_nodes[e]]))
+            want.append(first.setdefault(key, len(first)))
+        assert token_class.tolist() == want, distinct
+        assert reps.tolist() == [want.index(c) for c in range(len(first))], distinct
+        assert hashed.tolist() == [key != (0, 0) for key in first], distinct
+
+
+@pytest.mark.parametrize("few", [0, 300])
+def test_ids_a_vocabulary_grew_after_its_trie(few, monkeypatch):
+    """The trie made for a vocabulary serves it with more ids, and those lead nowhere, on either trie."""
+    from pyjuice.constraints.language.backend import automata as A, token_lift as T
+    monkeypatch.setattr(T, "FEW_CLASSES", few)
+    tokens = [bytes([b]) for b in range(256)] + [b"ab", b"abab", None]
+    small = jc.Vocabulary(tokens, eos = [len(tokens) - 1])
+    T._trie(small)
+    large = small.with_size(small.size + 5)
+    for a in (A.force(A.repeat(A.literal(b"ab"), 0, 3)), A.force(A.repeat(A.byte_ranges([(i, i) for i in range(0, 200, 8)]), 0, 3))):
+        for eos in (False, True):
+            got = T.to_tokens(a, large, eos)
+            assert got == every_token_walked(a, large, eos), (a.byte_class.max(), eos)
 
 
 def test_numbers_below_a_combinator_are_written_one_way():
