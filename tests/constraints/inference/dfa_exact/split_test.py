@@ -78,10 +78,11 @@ class Splits:
 
     def __init__(self, monkeypatch):
         self.seen = {"forward": [], "top_down": []}
-        for name, kind in (("_lifted_sum_kernel", "forward"), ("_lifted_sum_aux_kernel", "forward"),
-                           ("_lifted_sum_top_down_kernel", "top_down"),
-                           ("_lifted_sum_top_down_aux_kernel", "top_down")):
-            monkeypatch.setattr(lifted_sum, name, self._spy(getattr(lifted_sum, name), kind))
+        for module, name, kind in ((lifted_sum.fused_forward, "_lifted_sum_kernel", "forward"),
+                                   (lifted_sum.fused_forward, "_lifted_sum_aux_kernel", "forward"),
+                                   (lifted_sum.fused_top_down, "_lifted_sum_top_down_kernel", "top_down"),
+                                   (lifted_sum.fused_top_down, "_lifted_sum_top_down_aux_kernel", "top_down")):
+            monkeypatch.setattr(module, name, self._spy(getattr(module, name), kind))
 
     def _spy(self, kernel, kind):
         seen = self.seen[kind]
@@ -165,24 +166,24 @@ def test_split_calls_are_reproducible_and_reset_their_counters(kind, build_pc, g
     for a, b in zip(first, again):
         assert torch.equal(a, b)
     torch.cuda.synchronize()
-    for buf in lifted_sum._SPLIT_BUFFERS.values():
-        assert int(buf[:lifted_sum.SPLIT_TILES].view(torch.int32).abs().sum()) == 0
+    for buf in lifted_sum.tile_rules._SPLIT_BUFFERS.values():
+        assert int(buf[:lifted_sum.tile_rules.SPLIT_TILES].view(torch.int32).abs().sum()) == 0
 
 
 def test_split_count():
     """No split once a launch has the programs it needs; else a power of two, at most ``SPLIT_MAX``, shares of at
     least ``SPLIT_MIN_SHARE`` chunks."""
-    sms = lifted_sum._num_sms(DEV)
-    need = lifted_sum.SPLIT_PROGRAMS_PER_SM * sms
-    assert lifted_sum.split_count(need, 1 << 10, DEV) == 1
-    assert lifted_sum.split_count(1, 1 << 10, DEV) == lifted_sum.SPLIT_MAX
-    assert lifted_sum.split_count(1, 2 * lifted_sum.SPLIT_MIN_SHARE - 1, DEV) == 1
-    assert lifted_sum.split_count(1, 4 * lifted_sum.SPLIT_MIN_SHARE, DEV) == 4
+    sms = lifted_sum.tile_rules._num_sms(DEV)
+    need = lifted_sum.tile_rules.SPLIT_PROGRAMS_PER_SM * sms
+    assert lifted_sum.tile_rules.split_count(need, 1 << 10, DEV) == 1
+    assert lifted_sum.tile_rules.split_count(1, 1 << 10, DEV) == lifted_sum.tile_rules.SPLIT_MAX
+    assert lifted_sum.tile_rules.split_count(1, 2 * lifted_sum.tile_rules.SPLIT_MIN_SHARE - 1, DEV) == 1
+    assert lifted_sum.tile_rules.split_count(1, 4 * lifted_sum.tile_rules.SPLIT_MIN_SHARE, DEV) == 4
     for programs in (1, 3, 17, need // 3, need - 1):
         for chunks in (1, 5, 32, 1000):
-            s = lifted_sum.split_count(programs, chunks, DEV)
-            assert s & (s - 1) == 0 and s <= lifted_sum.SPLIT_MAX
-            assert s == 1 or chunks // s >= lifted_sum.SPLIT_MIN_SHARE
+            s = lifted_sum.tile_rules.split_count(programs, chunks, DEV)
+            assert s & (s - 1) == 0 and s <= lifted_sum.tile_rules.SPLIT_MAX
+            assert s == 1 or chunks // s >= lifted_sum.tile_rules.SPLIT_MIN_SHARE
             assert s == 1 or programs * s // 2 < need
 
 
@@ -197,14 +198,14 @@ def test_pre_passes_are_the_plain_loops(kind, gated, build_pc, gate_sums, monkey
     kw = dict(sum_external_params = gates_of(pc, 3)) if gated else {}
     cc = jc.compile(jc.DFA.contains([[0, 1, 1], [2, 0]], V) & jc.Not(jc.DFA.contains([[2, 2]], V)), pc)
     splits = Splits(monkeypatch)
-    monkeypatch.setattr(lifted_sum, "PRE_MIN_TILES", 1)
+    monkeypatch.setattr(lifted_sum.tile_rules, "PRE_MIN_TILES", 1)
     pre = queries(cc, data, missing, kw)
     took = {k: any(p for _, _, p in v) for k, v in splits.seen.items()}
     if kind in WIDE:
         assert took["top_down"], splits.seen["top_down"]
     if kind == "hmm48" or (kind == "wide_hmm" and not gated):   # gates of 8 children are per edge: no forward pre
         assert took["forward"], splits.seen["forward"]
-    monkeypatch.setattr(lifted_sum, "PRE_MIN_TILES", 1 << 30)
+    monkeypatch.setattr(lifted_sum.tile_rules, "PRE_MIN_TILES", 1 << 30)
     count = {k: len(v) for k, v in splits.seen.items()}
     plain = queries(cc, data, missing, kw)
     assert not any(p for k, v in splits.seen.items() for _, _, p in v[count[k]:])

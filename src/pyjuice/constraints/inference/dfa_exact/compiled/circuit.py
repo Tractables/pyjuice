@@ -203,7 +203,7 @@ def circuit_tables(pc, structure, dev, **switches) -> "CircuitTables":
 def dense_groups_switch() -> int:
     """The dense path's smallest node block (:data:`~..kernels.sum.DENSE_MIN_BLOCK`): which sum parts are dense."""
     from ..kernels import sum as lifted_sum
-    return lifted_sum.DENSE_MIN_BLOCK
+    return lifted_sum.dense.DENSE_MIN_BLOCK
 
 
 # -------------------------------------------------------------------------------------------------

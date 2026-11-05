@@ -62,7 +62,7 @@ def sum_path(request, monkeypatch):
     only (``dense_pruned``) or all of them -- the test batches are below the size dense pruning starts from."""
     import pyjuice.constraints.inference.dfa_exact.queries.backend.forward as F
     from pyjuice.constraints.inference.dfa_exact.kernels import sum as lifted_sum
-    monkeypatch.setattr(lifted_sum, "DENSE_MIN_BLOCK", 1 << 30 if request.param == "fused" else 1)
+    monkeypatch.setattr(lifted_sum.dense, "DENSE_MIN_BLOCK", 1 << 30 if request.param == "fused" else 1)
     monkeypatch.setattr(F, "prune_dense", (lambda ncols, live: live < ncols) if request.param == "dense_pruned" else
                         (lambda ncols, live: False))
     return request.param

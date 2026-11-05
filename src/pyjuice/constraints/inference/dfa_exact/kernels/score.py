@@ -43,7 +43,7 @@ from .common import (IDENTITY, NODE_TILE, pack_aligned, _block_ptr, _exit_width,
                      _tf32_operand, _tile_rows, grid_chunks, node_groups, node_tiles, tensor, pdl_launch)
 from .prod import _lse_step_one_exp
 from .prod_top_down import _once, _out_flows_ptr, _parent_base, _parent_lane
-from .sum import _num_sms
+from .sum.tile_rules import _num_sms
 from .c import get_class_weights_module
 
 

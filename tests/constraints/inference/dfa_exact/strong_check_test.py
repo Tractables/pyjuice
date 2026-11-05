@@ -497,7 +497,7 @@ def hmm_pc(n, latents, V, seed = 0, block = None):
     """A homogeneous HMM of ``latents`` states over ``V`` tokens (Categorical inputs): its transition sums are dense
     blocks of ``block`` (default ``latents``) nodes, which take the backend's dense matrix products from
     ``DENSE_MIN_BLOCK``."""
-    from pyjuice.constraints.inference.dfa_exact.kernels.sum import DENSE_MIN_BLOCK
+    from pyjuice.constraints.inference.dfa_exact.kernels.sum.dense import DENSE_MIN_BLOCK
     assert (block or latents) >= DENSE_MIN_BLOCK
     torch.manual_seed(seed)
     ns = juice.structures.HMM(seq_length = n, num_latents = latents, num_emits = V, homogeneous = True,
@@ -846,7 +846,7 @@ def test_sums_by_sample_against_float64(gates, mode, precision, monkeypatch):
     import pyjuice.constraints.inference.dfa_exact.kernels.sum as lifted_sum
     import pyjuice.constraints.inference.dfa_exact.queries.backend.forward as F
     import pyjuice.constraints.inference.dfa_exact.queries.backend.top_down as TD
-    monkeypatch.setattr(lifted_sum, "PER_SAMPLE_MIN_LANES", 0)
+    monkeypatch.setattr(lifted_sum.dense_common, "PER_SAMPLE_MIN_LANES", 0)
     calls = []
     for mod, name in ((F, "fused_sum"), (TD, "per_sample_dense_sum_top_down")):
         monkeypatch.setattr(mod, name, lambda *a, real = getattr(mod, name), name = name, **k:

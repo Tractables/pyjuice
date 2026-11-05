@@ -102,8 +102,8 @@ def recorded_plans(monkeypatch):
             return plan
         return planned
 
-    monkeypatch.setattr(lifted_sum, "_cuda_plan", recorded(lifted_sum._cuda_plan, plans))
-    monkeypatch.setattr(lifted_sum, "_cuda_td_plan", recorded(lifted_sum._cuda_td_plan, td_plans))
+    monkeypatch.setattr(lifted_sum.fused_forward, "_cuda_plan", recorded(lifted_sum.fused_cuda._cuda_plan, plans))
+    monkeypatch.setattr(lifted_sum.fused_top_down, "_cuda_td_plan", recorded(lifted_sum.fused_cuda._cuda_td_plan, td_plans))
     return plans, td_plans
 
 
@@ -121,9 +121,9 @@ def listed(monkeypatch):
         return launch
 
     monkeypatch.setattr(forward_queries, "fused_sum",
-                        with_list(lifted_sum.fused_sum, "sel", True, lambda a: a["cids"].size(0)))
+                        with_list(lifted_sum.fused_forward.fused_sum, "sel", True, lambda a: a["cids"].size(0)))
     monkeypatch.setattr(top_down_queries, "fused_sum_top_down",
-                        with_list(lifted_sum.fused_sum_top_down, "idx", False, lambda a: a["tables"]["cb_row"].numel()))
+                        with_list(lifted_sum.fused_top_down.fused_sum_top_down, "idx", False, lambda a: a["tables"]["cb_row"].numel()))
 
 
 def operands(plan):
@@ -157,20 +157,20 @@ def test_the_cuda_sums_are_the_triton_kernels(latents, B, external, storage, pre
     if lists:
         listed(monkeypatch)
     if table:                                                           # (every block's weights are one run)
-        tables, td_tables = lifted_sum._cuda_tables, lifted_sum._cuda_td_tables
-        monkeypatch.setattr(lifted_sum, "_cuda_tables", lambda *a: (lambda t: t and t[:3] + (False,))(tables(*a)))
-        monkeypatch.setattr(lifted_sum, "_cuda_td_tables",
+        tables, td_tables = lifted_sum.fused_cuda._cuda_tables, lifted_sum.fused_cuda._cuda_td_tables
+        monkeypatch.setattr(lifted_sum.fused_cuda, "_cuda_tables", lambda *a: (lambda t: t and t[:3] + (False,))(tables(*a)))
+        monkeypatch.setattr(lifted_sum.fused_cuda, "_cuda_td_tables",
                             lambda *a: (lambda t: t and t[:6] + (False,) + t[7:])(td_tables(*a)))
-    monkeypatch.setattr(lifted_sum, "CUDA_MIN_TILES", 0)                # every launch it may take
+    monkeypatch.setattr(lifted_sum.fused_cuda, "CUDA_MIN_TILES", 0)                # every launch it may take
     if split:
-        monkeypatch.setattr(lifted_sum, "SPLIT_MIN_SHARE", 1)           # shares of a chunk
+        monkeypatch.setattr(lifted_sum.tile_rules, "SPLIT_MIN_SHARE", 1)           # shares of a chunk
     got = calls(cc, B, kw, precision, storage)
     for ps in (plans, td_plans):                                        # (shares)
         assert ps and (any(p[3] > 1 for p in ps) if split else all(p[3] == 1 for p in ps)), [p[2:4] for p in ps]
     want_ops = {"fp32": None, "tf32": "tf32", "bf16": "bf16"}[precision]  # (fragment-ordered weights: a decoder's)
     assert all(operands(p) == want_ops for p in plans + td_plans)
-    monkeypatch.setattr(lifted_sum, "SPLIT_MIN_SHARE", 8)
-    monkeypatch.setattr(lifted_sum, "CUDA_MIN_TILES", 1 << 40)          # none
+    monkeypatch.setattr(lifted_sum.tile_rules, "SPLIT_MIN_SHARE", 8)
+    monkeypatch.setattr(lifted_sum.fused_cuda, "CUDA_MIN_TILES", 1 << 40)          # none
     want = calls(cc, B, kw, precision, storage)
     assert_same(got, want, precision)
 
@@ -191,15 +191,15 @@ def test_the_cuda_top_down_writes_aliased_rows(external, storage, precision, spl
     _, td_plans = recorded_plans(monkeypatch)
     if lists:
         listed(monkeypatch)
-    monkeypatch.setattr(lifted_sum, "CUDA_MIN_TILES", 0)
+    monkeypatch.setattr(lifted_sum.fused_cuda, "CUDA_MIN_TILES", 0)
     if split:
-        monkeypatch.setattr(lifted_sum, "SPLIT_MIN_SHARE", 1)
+        monkeypatch.setattr(lifted_sum.tile_rules, "SPLIT_MIN_SHARE", 1)
     got = calls(cc, B, kw, precision, storage, n = n)
     assert any(bool((p[1][1] >= 0).any()) for p in td_plans), "no aliased rows"
     assert any(p[1][1].numel() > p[1][-1] and p[1][-1] > 1 for p in td_plans), "no launch of child blocks in slices"
     assert any(p[3] > 1 for p in td_plans) == split
-    monkeypatch.setattr(lifted_sum, "SPLIT_MIN_SHARE", 8)
-    monkeypatch.setattr(lifted_sum, "CUDA_MIN_TILES", 1 << 40)
+    monkeypatch.setattr(lifted_sum.tile_rules, "SPLIT_MIN_SHARE", 8)
+    monkeypatch.setattr(lifted_sum.fused_cuda, "CUDA_MIN_TILES", 1 << 40)
     want = calls(cc, B, kw, precision, storage, n = n)
     assert_same(got, want, precision)
 
@@ -221,13 +221,13 @@ def test_the_weights_in_fragment_order(external, precision, gate_sums, set_split
     pc = circuit(128, external != "none", gate_sums)
     cc = jc.compile(jc.DFA.contains([[1, 2]], V) & jc.Not(jc.DFA.contains([[2, 2]], V)), pc)
     kw = inputs(pc, B, external)
-    monkeypatch.setattr(lifted_sum, "CUDA_MIN_TILES", 0)
+    monkeypatch.setattr(lifted_sum.fused_cuda, "CUDA_MIN_TILES", 0)
     set_split("off")                                    # (a split follows the kernels' occupancy, which may differ)
     plans, td_plans = recorded_plans(monkeypatch)
     builds = []
     fragment_weights = mod.fragment_weights
     monkeypatch.setattr(mod, "fragment_weights",
-                        lambda *a: builds.append((lifted_sum._tiles_key(a[2]), a[3])) or fragment_weights(*a))
+                        lambda *a: builds.append((lifted_sum.fused_cuda._tiles_key(a[2]), a[3])) or fragment_weights(*a))
     same = lambda a, b: all(torch.equal(x, y) for x, y in zip(a, b)) and len(a) == len(b)
 
     want = calls(cc, B, kw, precision, "dense", allow_param_copy = False)
@@ -262,9 +262,9 @@ def test_the_weights_in_fragment_order(external, precision, gate_sums, set_split
 
     marginal, conditional = queries()
     assert torch.isfinite(marginal).any()
-    real = lifted_sum._cuda_fragments
+    real = lifted_sum.fused_cuda._cuda_fragments
     for zeroed in (False, True):                                        # forward, top-down
-        monkeypatch.setattr(lifted_sum, "_cuda_fragments", lambda mod, frags, params, wbase, td, bf16 = False:
+        monkeypatch.setattr(lifted_sum.fused_cuda, "_cuda_fragments", lambda mod, frags, params, wbase, td, bf16 = False:
                             real(mod, frags, params, wbase, td, bf16) * (0.0 if td == zeroed else 1.0))
         m, c = queries()
         assert torch.isneginf(m).all() if not zeroed else torch.equal(m, marginal)
@@ -289,7 +289,7 @@ def test_tf32_products_round_to_nearest(reference, monkeypatch):
     data = torch.randint(0, V, (B, n), generator = g).to(DEV)
     missing = torch.rand(B, n, generator = g).to(DEV) < 0.5
     want = reference.marginal(cc, data, missing, inputs = kw).view(-1).double()
-    monkeypatch.setattr(lifted_sum, "CUDA_MIN_TILES", 0)
+    monkeypatch.setattr(lifted_sum.fused_cuda, "CUDA_MIN_TILES", 0)
     with cc.decoder(precision = "tf32", **kw) as decoder:
         got = decoder.marginal(data, missing).view(-1).double()
     fin = torch.isfinite(want)
@@ -314,12 +314,12 @@ def test_a_cuda_launch_is_one_call(external, storage, precision, gate_sums, monk
     kw = inputs(pc, 3, external)
     plans, td_plans = recorded_plans(monkeypatch)
     nones = []                                                          # the launches without a CUDA plan
-    for name in ("_cuda_plan", "_cuda_td_plan"):
-        real = getattr(lifted_sum, name)
-        monkeypatch.setattr(lifted_sum, name,
+    for module, name in ((lifted_sum.fused_forward, "_cuda_plan"), (lifted_sum.fused_top_down, "_cuda_td_plan")):
+        real = getattr(module, name)
+        monkeypatch.setattr(module, name,
                             (lambda real: lambda *a, **k: (lambda p: nones.append(p is None) or p)(real(*a, **k)))(real))
-    monkeypatch.setattr(lifted_sum, "CUDA_MIN_TILES", 0)                # every launch it may take
-    monkeypatch.setattr(lifted_sum, "SPLIT_MIN_SHARE", 1)               # shares of a chunk: merged
+    monkeypatch.setattr(lifted_sum.fused_cuda, "CUDA_MIN_TILES", 0)                # every launch it may take
+    monkeypatch.setattr(lifted_sum.tile_rules, "SPLIT_MIN_SHARE", 1)               # shares of a chunk: merged
     calls(cc, 3, kw, precision, storage)                                # (compiled, warm)
     del nones[:]
     with profile(activities = [ProfilerActivity.CUDA]) as prof:
@@ -330,6 +330,6 @@ def test_a_cuda_launch_is_one_call(external, storage, precision, gate_sums, monk
     assert any("fused_sum_merge_kernel" in k for k in events), sorted(events)                      # the shares merged
     triton_pre = sum(c for k, c in events.items() if k.startswith("_forward_prepass") or k.startswith("_top_down_prepass"))
     assert triton_pre <= sum(nones), (triton_pre, sum(nones))
-    monkeypatch.setattr(lifted_sum, "SPLIT_MIN_SHARE", 8)
-    monkeypatch.setattr(lifted_sum, "CUDA_MIN_TILES", 1 << 40)          # none
+    monkeypatch.setattr(lifted_sum.tile_rules, "SPLIT_MIN_SHARE", 8)
+    monkeypatch.setattr(lifted_sum.fused_cuda, "CUDA_MIN_TILES", 1 << 40)          # none
     assert_same(got, calls(cc, 3, kw, precision, storage), precision)

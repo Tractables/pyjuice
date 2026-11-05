@@ -108,7 +108,7 @@ def test_the_tables_follow_their_switches(build_pc, monkeypatch):
     monkeypatch.undo()
     assert groups() == default
     first = jc.compile(dfa, pc).backend.program()
-    monkeypatch.setattr(lifted_sum, "DENSE_MIN_BLOCK", 1 << 30)
+    monkeypatch.setattr(lifted_sum.dense, "DENSE_MIN_BLOCK", 1 << 30)
     other = jc.compile(dfa, pc).backend.program()
     assert other.assembly.circuit is not first.assembly.circuit
 

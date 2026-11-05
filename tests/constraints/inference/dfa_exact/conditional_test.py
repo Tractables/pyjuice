@@ -65,7 +65,7 @@ def evidence(pattern, n, B = 6, seed = 0):
 def sum_path(request, monkeypatch):
     """The fused sum kernels, or the dense path with its products on the live columns only or on every column."""
     from pyjuice.constraints.inference.dfa_exact.kernels import sum as lifted_sum
-    monkeypatch.setattr(lifted_sum, "DENSE_MIN_BLOCK", 1 << 30 if request.param == "fused" else 1)
+    monkeypatch.setattr(lifted_sum.dense, "DENSE_MIN_BLOCK", 1 << 30 if request.param == "fused" else 1)
     monkeypatch.setattr(F, "prune_dense", (lambda ncols, live: False) if request.param == "dense_unpruned" else
                         (lambda ncols, live: live < ncols))
     return request.param

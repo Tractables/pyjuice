@@ -37,7 +37,7 @@ def sum_path(request, monkeypatch):
     on every column -- which reads the slots a held block computed under less evidence left finite."""
     from pyjuice.constraints.inference.dfa_exact.kernels import sum as lifted_sum
     from pyjuice.constraints.inference.dfa_exact.queries.backend import forward as F
-    monkeypatch.setattr(lifted_sum, "DENSE_MIN_BLOCK", 1 << 30 if request.param == "fused" else 1)
+    monkeypatch.setattr(lifted_sum.dense, "DENSE_MIN_BLOCK", 1 << 30 if request.param == "fused" else 1)
     monkeypatch.setattr(F, "prune_dense", (lambda ncols, live: False) if request.param == "dense_unpruned" else
                         (lambda ncols, live: live < ncols))
     return request.param
@@ -387,7 +387,7 @@ def test_sums_compute_the_lanes_of_the_rows_computing_theirs(kind, path, build_p
     circuit's results, the storage values are re-gathered into filled with NaN."""
     from pyjuice.constraints.inference.dfa_exact.kernels import sum as lifted_sum
     from pyjuice.constraints.inference.dfa_exact.queries.backend import forward as F
-    monkeypatch.setattr(lifted_sum, "DENSE_MIN_BLOCK", 1 if path == "dense" else 1 << 30)
+    monkeypatch.setattr(lifted_sum.dense, "DENSE_MIN_BLOCK", 1 if path == "dense" else 1 << 30)
     nan_new_storage(monkeypatch)
     n = KINDS[kind]
     cc = jc.compile(jc.DFA.contains([[1, 2]], V), build_pc(kind, n, V))

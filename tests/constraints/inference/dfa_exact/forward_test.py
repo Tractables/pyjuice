@@ -56,7 +56,7 @@ def sum_path(request, monkeypatch):
     """Run the sum layers' node blocks through the fused kernel only, or through the dense (cuBLAS) path wherever
     they qualify -- the test circuits' blocks are far below the size the dense path is used from by default."""
     from pyjuice.constraints.inference.dfa_exact.kernels import sum as lifted_sum
-    monkeypatch.setattr(lifted_sum, "DENSE_MIN_BLOCK", 1 if request.param == "dense" else 1 << 30)
+    monkeypatch.setattr(lifted_sum.dense, "DENSE_MIN_BLOCK", 1 if request.param == "dense" else 1 << 30)
     return request.param
 
 
@@ -460,7 +460,7 @@ def test_bf16_dense_products_multiply_bf16_weight_copies(tied, stacked, referenc
     import pyjuice.constraints.inference.dfa_exact.kernels.sum as lifted_sum
     import pyjuice.constraints.inference.dfa_exact.queries.backend.forward as F
     able = "out_dtype" in (torch.mm.__doc__ or "") and torch.cuda.is_bf16_supported()
-    assert lifted_sum._bf16_products(torch.device("cuda:0")) == able
+    assert lifted_sum.dense_common._bf16_products(torch.device("cuda:0")) == able
     if not able:
         pytest.skip("torch.mm multiplies no bf16 matrices into fp32 ones here: bf16 queries' dense products run TF32")
     if not stacked:
@@ -471,8 +471,8 @@ def test_bf16_dense_products_multiply_bf16_weight_copies(tied, stacked, referenc
     data[:, 2:4] = torch.tensor([1, 2])
     missing[:] = False
     want = reference.marginal(cc, data, missing)
-    built, copy = [], lifted_sum._bf16_copy
-    monkeypatch.setattr(lifted_sum, "_bf16_copy", lambda copies, key, make: copy(copies, key,
+    built, copy = [], lifted_sum.dense_common._bf16_copy
+    monkeypatch.setattr(lifted_sum.dense_common, "_bf16_copy", lambda copies, key, make: copy(copies, key,
                                                                                 lambda: built.append(key) or make()))
     with juice.fast_inference():
         got = cc.marginal(data, missing, storage = "compact", precision = "bf16")
@@ -485,7 +485,7 @@ def test_bf16_dense_products_multiply_bf16_weight_copies(tied, stacked, referenc
     fin = torch.isfinite(want)
     assert (got[fin] - want[fin]).abs().max() < 1.5e-2
     base = cc.marginal(data, missing, storage = "compact", precision = "bf16")
-    monkeypatch.setattr(lifted_sum, "_bf16_copy", lambda copies, key, make: 2 * copy(copies, key, make))
+    monkeypatch.setattr(lifted_sum.dense_common, "_bf16_copy", lambda copies, key, make: 2 * copy(copies, key, make))
     doubled = cc.marginal(data, missing, storage = "compact", precision = "bf16")
     # not exactly: a layer's log 2 higher outputs give its children's exponentials other last bits, some rounding to
     # another bf16 value (~1e-4 here) -- a run reading anything but the copies would be off by log 2
@@ -543,7 +543,8 @@ def test_live_columns_are_shifted_and_exponentiated(rows, width, num_live):
     a column of -inf gives zeros. A narrow pass (a program per column, the block taller than its row tile) and passes
     wide enough for column tiles (``_LIVE_EXP_TILES``: rows past a row tile, or within one; the last tile partly past
     the live columns), whose bits must be a program per column's."""
-    from pyjuice.constraints.inference.dfa_exact.kernels.sum import _live_shifted_exp, _live_shifted_exp_kernel
+    from pyjuice.constraints.inference.dfa_exact.kernels.sum.dense_common import (_live_shifted_exp,
+                                                                                  _live_shifted_exp_kernel)
     g = torch.Generator().manual_seed(0)
     x = (torch.randn(rows, width + 8, generator = g) * 4).cuda()
     x[:, 7] = float("-inf")
