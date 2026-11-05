@@ -52,7 +52,7 @@ def random_automaton(seed):
 
 
 def on_the_device(tr):
-    return Transitions(tr.delta, tr.state_id, tr.col_of_state, tr.width)
+    return Transitions(tr.delta, tr.state_id, tr.col_of_state, tr.width, tr.order)
 
 
 @pytest.mark.parametrize("enumerate_max", [0, 1])
@@ -84,6 +84,124 @@ def test_the_tables_of_a_random_automaton_are_the_devices(seed, enumerate_max):
         assert sweeps.group == sweeps_off.group and sweeps.W == sweeps_off.W
         assert_same(sweeps.ptr, sweeps_off.ptr, "sweep ptr")
         assert sweeps.cols.numel() == sweeps_off.cols.numel() and torch.equal(sweeps.cols, sweeps_off.cols), (seed, n)
+
+
+@pytest.mark.parametrize("seed", range(12))
+def test_every_boundarys_columns_keep_the_order_of_the_states(seed):
+    """What a state's pairs rest on: one order of the states, which the columns of every boundary keep."""
+    dfa = random_automaton(seed)
+    for n in (1, 5, 33):
+        tr = build_layout(dfa, n, device = DEV).transitions(DEV)
+        assert sorted(tr.order.tolist()) == list(range(tr.K))
+        rank = torch.empty_like(tr.order)
+        rank[tr.order] = torch.arange(tr.K, device = DEV)
+        for t, w in enumerate(tr.width):
+            states = tr.state_id[t, :w]
+            assert (rank[states][1:] > rank[states][:-1]).all(), (seed, n, t)
+            assert tr.col_of_state[t, states].tolist() == list(range(w)), (seed, n, t)
+
+
+@pytest.mark.parametrize("seed", range(12))
+def test_a_states_pairs_are_the_successors_of_its_moves(seed):
+    """Against the moves, a state at a time: its distinct successors in the order of the columns, and every move's among them."""
+    tr = on_the_device(build_layout(random_automaton(seed), 16, device = DEV).transitions(DEV))
+    groups = TR.boundary_groups(tr)
+    state, moves = groups.state.clone(), groups.succ.clone()
+    count, start, succ, of_move = groups.pairs
+    rank = {s: i for i, s in enumerate(tr.order.tolist())}
+    for x in range(tr.K):
+        here = state == x
+        want = sorted(set(moves[here].tolist()), key = rank.__getitem__)
+        assert succ[start[x]:start[x] + count[x]].tolist() == want, (seed, x)
+        assert succ[start[x] + of_move[here].long()].tolist() == moves[here].tolist(), (seed, x)
+
+
+@pytest.mark.parametrize("enumerate_max", [0, 1])
+@pytest.mark.parametrize("seed", range(12))
+def test_the_tables_a_group_of_boundaries_at_a_time_are_the_hosts(seed, enumerate_max, monkeypatch):
+    """Every group its own batch, so that a sequence end has one of its own, and none kept: the same tables, and a batch's numbers are their group's."""
+    monkeypatch.setattr(TR.tables, "BOUNDARY_BATCH", 1)
+    monkeypatch.setattr(TR.tables, "BOUNDARY_ENTRIES_KEPT", -1)
+    dfa = random_automaton(seed)
+    for n in (2, 5, 16):
+        layout = build_layout(dfa, n, device = DEV)
+        tr = layout.transitions(DEV)
+        off = on_the_device(tr)
+        classes = TokenClasses(layout.token_class, dfa.num_classes, enumerate_max, host = layout.token_class.numpy(), device = DEV)
+        en, en_off = TR.enumerated_tokens(tr, classes), TR.enumerated_tokens(off, classes)
+        assert_same(en, en_off, f"enumerated {seed} {n}")
+        for grouped in (True, False):
+            assert_same(TR.transition_tables(tr, grouped, en), TR.transition_tables(off, grouped, en_off), f"tables {seed} {n} {grouped}")
+        assert TR.transition_stats(tr) == TR.transition_stats(off), (seed, n)
+
+
+def test_the_enumerated_tokens_and_the_grouped_tables_take_one_pass(monkeypatch):
+    """Over the moves, the most of what a long layout costs. For the same tokens; for others, or a second time, a pass of its own, and the same tables."""
+    dfa = jc.DFA.contains([[1, 2]], 5)
+    layout = build_layout(dfa, 16, device = DEV)
+    off = on_the_device(layout.transitions(DEV))
+    classes = TokenClasses(layout.token_class, dfa.num_classes, 1, host = layout.token_class.numpy(), device = DEV)
+    assert classes.num_enumerated > 0
+    passes = []
+    sweep = TR.tables.BoundaryGroups.sweep
+    monkeypatch.setattr(TR.tables.BoundaryGroups, "sweep", lambda self, *a, **k: (passes.append(a[0]), sweep(self, *a, **k))[1])
+    en = TR.enumerated_tokens(off, classes)
+    assert passes == [True] and TR.boundary_groups(off).swept[0] is en
+    first = TR.transition_tables(off, True, en)
+    assert passes == [True] and TR.boundary_groups(off).swept is None and first.num_entries > 0
+    assert_same(first, TR.transition_tables(off, True, en), "a second time")
+    assert passes == [True, True]
+    assert_same(TR.enumerated_tokens(off, classes), en, "again")
+    other = TR.enumerated_tokens(off, classes)
+    assert_same(first, TR.transition_tables(off, True, other), "the same tokens, another object")
+    assert TR.boundary_groups(off).swept is None
+
+
+@pytest.mark.parametrize("asked", ["no tokens", "ungrouped", "no tokens, ungrouped"])
+def test_a_pass_left_for_the_grouped_tables_of_these_tokens_is_for_nothing_else(asked):
+    """What the enumerated tokens' pass made, asked for anything else first: that thing, and the pass let go of."""
+    dfa = jc.DFA.contains([[1, 2]], 5)
+    layout = build_layout(dfa, 16, device = DEV)
+    tr = layout.transitions(DEV)
+    off = on_the_device(tr)
+    classes = TokenClasses(layout.token_class, dfa.num_classes, 1, host = layout.token_class.numpy(), device = DEV)
+    en, en_off = TR.enumerated_tokens(tr, classes), TR.enumerated_tokens(off, classes)
+    grouped = "ungrouped" not in asked
+    tokens = "no tokens" not in asked
+    got = TR.transition_tables(off, grouped, en_off if tokens else None)
+    assert got.grouped == grouped and TR.boundary_groups(off).swept is None
+    assert_same(TR.transition_tables(tr, grouped, en if tokens else None), got, asked)
+
+
+def test_a_programs_tables_read_the_moves_once_and_no_entries(monkeypatch):
+    """The statistics and the classes' columns come with the pass: no second one, none of what a pass makes unneeded."""
+    dfa = jc.DFA.contains([[1, 2]], 5)
+    layout = build_layout(dfa, 16, device = DEV)
+    off = on_the_device(layout.transitions(DEV))
+    classes = TokenClasses(layout.token_class, dfa.num_classes, 1, host = layout.token_class.numpy(), device = DEV)
+    def no_entries(self, k, end):
+        raise AssertionError("a pass over the entries")
+    monkeypatch.setattr(TR.tables.BoundaryGroups, "entries", no_entries)
+    en = TR.enumerated_tokens(off, classes)
+    assert TR.transition_tables(off, True, en).num_entries > 0
+    assert TR.transition_stats(off)[2] >= 1 and TR.boundary_groups(off).class_columns.numel() > 0
+
+
+@pytest.mark.parametrize("domain", [2, (1 << 15) - 1, 1 << 15, (1 << 15) + 1, 1 << 16, 1 << 31, (1 << 31) + 1, 1 << 40])
+def test_a_sort_key_in_the_smallest_type_is_the_key(domain):
+    """To the last value below the domain; a stable sort of it the sort of the key."""
+    key = torch.tensor([domain - 1, 0, domain // 2, domain - 1, 0], device = DEV)
+    small = TR.tables._sort_key(key, domain)
+    assert small.tolist() == key.tolist()
+    assert torch.equal(torch.argsort(small, stable = True), torch.argsort(key, stable = True))
+    assert small.dtype == (torch.int16 if domain <= 1 << 15 else torch.int32 if domain <= 1 << 31 else torch.int64)
+
+
+def test_more_entries_than_int32_pointers_reach_is_an_error_not_a_wrong_table(monkeypatch):
+    off = on_the_device(build_layout(jc.DFA.contains([[1, 2]], 5), 16, device = DEV).transitions(DEV))
+    monkeypatch.setattr(TR.tables, "TABLE_ENTRIES_MOST", 0)
+    with pytest.raises(RuntimeError, match = "int32"):
+        TR.transition_tables(off, True)
 
 
 @pytest.mark.parametrize("enumerate_max", [0, 1])

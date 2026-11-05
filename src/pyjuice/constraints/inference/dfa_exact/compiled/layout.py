@@ -57,7 +57,7 @@ class BoundaryLayout:
     width: torch.Tensor
     table: object                                     # the automaton's: a tensor, or one to come (it holds the automaton's moves, not the automaton)
     satisfiable: bool
-    on_device: tuple                                  # (device, delta, state_id, col_of_state), as they were built
+    on_device: tuple                                  # (device, delta, state_id, col_of_state, order), as they were built
 
     @cached_property
     def delta(self) -> torch.Tensor:
@@ -109,14 +109,14 @@ class BoundaryLayout:
         tr = kept.get(device)
         if tr is None:
             widths = [int(w) for w in self.width.tolist()]
-            dev, delta, state_id, col_of_state = self.on_device
+            dev, delta, state_id, col_of_state, order = self.on_device
             host = None                                       # (built on the host: at hand)
             if "state_id" in self.__dict__ and self.num_states * self.num_classes <= LAYOUT_HOST_ENTRIES:
                 host = (self.delta.numpy(), self.state_id.numpy(), self.col_of_state.numpy())
             if dev == device:
-                tr = Transitions(delta, state_id, col_of_state, widths, host)
+                tr = Transitions(delta, state_id, col_of_state, widths, order, host)
             else:
-                tr = Transitions(delta.to(device), state_id.to(device), col_of_state.to(device), widths, host)
+                tr = Transitions(delta.to(device), state_id.to(device), col_of_state.to(device), widths, order.to(device), host)
             kept[device] = tr
         return tr
 
@@ -148,6 +148,7 @@ class Transitions:
 
     :ivar delta, state_id, col_of_state: the layout's, on the device
     :ivar width: the boundaries' columns (Python ints)
+    :ivar order: int64 [K] the states in the order of the columns: every boundary's columns are those of its states in this order
     :ivar host: ``(delta, state_id, col_of_state)`` as arrays, for a small automaton (its tables are then built on the host,
         :mod:`~..kernels.transitions.host`), else None
     """
@@ -156,6 +157,7 @@ class Transitions:
     state_id: torch.Tensor
     col_of_state: torch.Tensor
     width: list
+    order: torch.Tensor
     host: Optional[tuple] = None
 
     @property
@@ -351,7 +353,7 @@ def _layout_columns(reach, accept_in, to_accept):
                 state_id[t, col] = s
                 col_of_state[t, s] = col
                 col += 1
-    return width, state_id, col_of_state
+    return width, state_id, col_of_state, order
 
 
 #: an automaton of at most so many table entries has its layout built on the host (a few array operations a boundary on
@@ -376,12 +378,12 @@ def _build(dfa: DFA, n: int, device = None, report = None) -> BoundaryLayout:
     if report is not None:
         report.advance()
         report.stage("layout: columns", 1)
-    width, state_id, col_of_state = _layout_columns(reach, accept_in, to_accept)
+    width, state_id, col_of_state, order = _layout_columns(reach, accept_in, to_accept)
     host = torch.from_numpy(state_id), torch.from_numpy(col_of_state)
     # (the automaton's tables are not copied: nothing writes them)
     layout = BoundaryLayout(n = n, token_class = dfa._token_class, width = torch.from_numpy(width),
                             table = dfa._table, satisfiable = bool(width[0] > 0),
-                            on_device = (dev, delta, host[0].to(dev), host[1].to(dev)))
+                            on_device = (dev, delta, host[0].to(dev), host[1].to(dev), torch.from_numpy(order).to(dev)))
     layout.__dict__.update(state_id = host[0], col_of_state = host[1])        # (the host's, as they were built)
     if report is not None:
         report.advance()
@@ -457,7 +459,7 @@ def _build_on_device(dfa: DFA, n: int, dev: torch.device, report = None) -> Boun
     col_of_state[rows, order[at]] = cols[rows, at]
     # (the automaton's tables are not copied: nothing writes them)
     layout = BoundaryLayout(n = n, token_class = dfa._token_class, width = width.cpu(), table = dfa._table,
-                            satisfiable = bool(width[0] > 0), on_device = (dev, delta, state_id, col_of_state))
+                            satisfiable = bool(width[0] > 0), on_device = (dev, delta, state_id, col_of_state, order))
     if report is not None:
         report.advance()
     return layout

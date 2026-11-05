@@ -51,7 +51,7 @@ class SweepTables:
         total = 0
         for k, end in groups.batches:
             Gb = end - k
-            g, q, _, s = groups.entries(k, end)
+            g, q, s = groups.live_pairs(k, end)
             key = torch.unique((g * (W + 1) + s) * (W + 1) + q)         # by group, successor, column
             at = key // (W + 1)
             counts = torch.bincount(at, minlength = Gb * (W + 1)).view(Gb, W + 1)

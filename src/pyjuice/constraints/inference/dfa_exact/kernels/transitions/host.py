@@ -52,7 +52,6 @@ class HostTables:
         self.batches = [(0, self.G)] if self.G else []
         self.g, self.q, self.c, self.s = entries
         self.most = None
-        self.holding = False
         self.host = tr.host
         ends_here = firsts + 1 == self.n
         self.ends_here = ends_here
@@ -61,9 +60,6 @@ class HostTables:
         self.pairs_host = None                                  # the grouped tables, for the signature layout
         self._enum_codes = None
         self.enum_lists = None                                  # the enumerated tokens' classes per boundary, on the host
-
-    def release(self) -> None:
-        self.holding = False
 
     @cached_property
     def at(self) -> torch.Tensor:

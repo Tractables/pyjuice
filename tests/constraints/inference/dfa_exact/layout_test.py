@@ -530,3 +530,4 @@ def test_a_layout_built_on_the_host_is_the_one_built_on_the_device(seed, monkeyp
         assert torch.equal(host.width, device.width) and host.satisfiable == device.satisfiable, (K, C, n)
         assert torch.equal(host.state_id, device.state_id) and torch.equal(host.col_of_state, device.col_of_state), (K, C, n)
         assert torch.equal(host.on_device[2].cpu(), host.state_id) and torch.equal(host.on_device[3].cpu(), host.col_of_state)
+        assert torch.equal(host.on_device[4], device.on_device[4]), (K, C, n)                     # (the states in the order of the columns)

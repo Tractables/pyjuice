@@ -17,7 +17,7 @@ import torch
 from ..kernels.prod import skip_masks_for
 from ..kernels.live import live_successors
 from ..kernels.sample_transitions import sample_transition_masses
-from ..kernels.transitions import (SampleMasses, boundary_groups, enumerated_tokens, next_col_table, sample_classes,
+from ..kernels.transitions import (SampleMasses, enumerated_tokens, next_col_table, sample_classes,
                                    sample_masses, transition_masses, transition_stats, transition_tables)
 from ..kernels.common import available_memory, most_in_runs
 from .circuit import TRANS_COLS, circuit_tables
@@ -130,8 +130,6 @@ class Program:
         # the automaton's transitions and the boundaries' column maps (int32: what the kernels read a boundary's
         # transitions through, see Transitions; the tables below are built from them, a boundary at a time)
         tr = layout.transitions(dev)
-        groups = boundary_groups(tr)
-        groups.holding = True
         self.delta, self.state_id, self.col_of_state = (x.to(torch.int32).contiguous()
                                                         for x in (tr.delta, tr.state_id, tr.col_of_state))
         self.K, self.W, self.C = tr.K, tr.W, tr.C
@@ -214,7 +212,6 @@ class Program:
         self._sig = None                                                    # (the signature layout and its row map)
         self.trans = self.succ if self.grouped_for(self.trans_size) else self.ungrouped_tables()
         self.trans_persistent = self.trans.grouped                  # (grouped transitions are always kept whole)
-        groups.release()
 
     def transition_buffer(self) -> torch.Tensor:
         """Where the query's transition masses go (``trans_size`` floats for one set of masses, a per-sample layout's
