@@ -24,6 +24,7 @@ from ..vocabulary import Vocabulary
 from .counters import NotCounted, expanded_moves, states_put_back
 from .dfa import bfs_order
 from .byte_level import ByteAutomaton
+from .threads import few_threads
 
 
 # -------------------------------------------------------------------------------------------------
@@ -993,21 +994,21 @@ def _canonical_token_table(automaton: ByteAutomaton, states: np.ndarray, remap: 
 
 #: below so many classes of bytes the trie over the classes is small, and worth making: few classes, so many tokens spell the same
 FEW_CLASSES = 16
-#: so many steps of walks of the trie come first, or a table of so many entries stays on one thread: waking a team is
-#: milliseconds on a busy machine
+#: so many steps of walks of the trie come first; a table of so many entries stays on one thread
 SERIAL_STEPS = 1 << 19
 NO_BUDGET = 1 << 62
 #: the table of a token automaton of at least so many entries, minimal already, is made from its moves (:func:`_canonical_token_table`,
-#: the dense table of its rows costing no more below it), in threads from :data:`THREADS_ENTRIES` on (below that, waking a team is the cost)
+#: the dense table of its rows costing no more below it), in threads from :data:`THREADS_ENTRIES` on
 SPARSE_ENTRIES = 1 << 19
-THREADS_ENTRIES = 1 << 24
+THREADS_ENTRIES = 1 << 18
 #: states checked on the quotient of the trie (:func:`_walk_the_rest`): at first so many, then twice as many a time,
 #: on one thread below :data:`SERIAL_CHECKS`; states failing are walked, so many edges in threads at the most at a time
 FIRST_CHECKS = 256
-SERIAL_CHECKS = 1 << 12
+SERIAL_CHECKS = 1 << 8
 WALKS_IN_THREADS = 1 << 24
 
 
+@few_threads
 def to_tokens(automaton: ByteAutomaton, vocabulary: Vocabulary, eos_padding: bool) -> DFA:
     """
     The minimal :class:`~pyjuice.constraints.DFA` over ``vocabulary``'s ids of the token sequences whose text the

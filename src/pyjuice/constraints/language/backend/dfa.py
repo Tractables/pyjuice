@@ -8,6 +8,8 @@ by equal content (:func:`_column_classes`). Tables are int64 ``[states, classes]
 import numpy as np
 from numba import get_num_threads, njit, prange
 
+from .threads import few_threads
+
 
 @njit(cache = True)
 def bfs_order(delta, initial):
@@ -47,10 +49,11 @@ def _renumbered_parallel(delta, order, remap, out, P):
         _renumbered_rows(delta, order, remap, out, p * R // P, (p + 1) * R // P)
 
 
-#: a table of at least this many entries is renumbered in threads (waking a team is milliseconds on a busy machine)
+#: a table of at least this many entries is renumbered in threads
 PARALLEL_ENTRIES = 1 << 24
 
 
+@few_threads
 def renumbered(delta: np.ndarray, order: np.ndarray) -> np.ndarray:
     """The table of the states ``order`` (every successor among them), numbered by their place there."""
     remap = np.empty(delta.shape[0], dtype = np.int64)

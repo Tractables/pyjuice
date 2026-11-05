@@ -447,3 +447,27 @@ def test_the_minimal_table_is_the_plain_one(dead_share):
         got = A._from_classes(np.array(table, dtype = np.int32), 0, np.array(accept, dtype = np.bool_), np.arange(256) % C)
         want, want_accept = plain_minimal(table, accept, 0)
         assert got.table[:, got.byte_class[np.arange(C)]].tolist() == want and got.accept.tolist() == want_accept, (case, table, accept)
+
+
+def test_kernels_run_on_a_few_threads_and_leave_the_count_as_it_was():
+    import numba
+    from pyjuice.constraints.language.backend import threads
+    seen = []
+    run = threads.few_threads(lambda: seen.append(numba.get_num_threads()))
+    was = numba.get_num_threads()
+    try:
+        numba.set_num_threads(1)
+        run()
+        assert seen == [1] and numba.get_num_threads() == 1        # (fewer: as they are)
+        numba.set_num_threads(was)
+        threads.MOST_THREADS, keep = 1, threads.MOST_THREADS
+        try:
+            run()
+            assert seen[-1] == 1 and numba.get_num_threads() == was or was == 1
+            with pytest.raises(ZeroDivisionError):
+                threads.few_threads(lambda: 1 // 0)()
+            assert numba.get_num_threads() == was
+        finally:
+            threads.MOST_THREADS = keep
+    finally:
+        numba.set_num_threads(was)

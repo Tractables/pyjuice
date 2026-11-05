@@ -632,4 +632,4 @@ def expanded_moves(roots: List[Run], remap: np.ndarray, K: int, K_full: int, mov
 
 
 #: so many moves to write are worth a team
-PARALLEL_MOVES = 1 << 22
+PARALLEL_MOVES = 1 << 18
