@@ -25,7 +25,8 @@ from pyjuice.constraints.inference.dfa_exact.queries import marginal as QM
 from pyjuice.constraints.inference.dfa_exact.queries.conditional import class_weights
 from pyjuice.constraints.inference.dfa_exact.kernels import score as S
 from pyjuice.constraints.inference.dfa_exact.kernels.live import sample_successors
-from pyjuice.constraints.inference.dfa_exact.kernels.score import _offsets_when_counted, score_tables
+from pyjuice.constraints.inference.dfa_exact.kernels.score import score_tables
+from pyjuice.constraints.inference.dfa_exact.kernels.score.class_rows import _offsets_when_counted
 from pyjuice.constraints.inference.dfa_exact.queries.backend import plans as QP
 from pyjuice.constraints.distributions import TokenClasses
 from pyjuice.constraints.evidence import candidate_tensor
@@ -317,11 +318,11 @@ def test_live_class_rows_match_a_brute_force(constraint, kind, storage, pattern,
     a step, a key's first place carried over the steps -- else in registers), and under a session's per-sample classes
     (``classes``, stood in for the session's): a class the sample rules out has none. ``contains``: boundaries whose
     class order (most columns first) is not the classes', with classes of different rows there."""
-    monkeypatch.setattr(S, "CLASS_ROWS_SHARED", shared)
+    monkeypatch.setattr(S.class_rows, "CLASS_ROWS_SHARED", shared)
     if one_pair:
-        monkeypatch.setattr(S, "LIVE_CLASS_LANES", 1)
-        monkeypatch.setattr(S, "CLASS_CANDIDATE_TILE", 2)
-        monkeypatch.setattr(S, "CLASS_CANDIDATE_REGISTERS", 0)
+        monkeypatch.setattr(S.class_rows, "LIVE_CLASS_LANES", 1)
+        monkeypatch.setattr(S.class_rows, "CLASS_CANDIDATE_TILE", 2)
+        monkeypatch.setattr(S.class_rows, "CLASS_CANDIDATE_REGISTERS", 0)
     n = {"walks": 6}.get(kind, KINDS.get(kind))
     cc = jc.compile(CONSTRAINTS[constraint](), build_pc(kind, n, V))
     data, missing = evidence(pattern, n)
@@ -384,13 +385,13 @@ def test_shared_rows_are_exact_whatever_the_keys(kind, storage, pattern, build_p
     positions = missing.any(dim = 0).numpy()
     B, dev = data.size(0), cc.pc.params.device
     out = {}
-    for name, shared, mask, sort in (("unshared", False, S.CLASS_ROW_KEY_MASK, False),
-                                     ("keys", True, S.CLASS_ROW_KEY_MASK, False), ("collide", True, 0, True),
+    for name, shared, mask, sort in (("unshared", False, S.class_rows.CLASS_ROW_KEY_MASK, False),
+                                     ("keys", True, S.class_rows.CLASS_ROW_KEY_MASK, False), ("collide", True, 0, True),
                                      ("collide_registers", True, 0, False)):
-        monkeypatch.setattr(S, "CLASS_ROWS_SHARED", shared)
-        monkeypatch.setattr(S, "CLASS_ROW_KEY_MASK", mask)
-        monkeypatch.setattr(S, "CLASS_CANDIDATE_TILE", 2 if sort else 1024)
-        monkeypatch.setattr(S, "CLASS_CANDIDATE_REGISTERS", 0 if sort else 2048)
+        monkeypatch.setattr(S.class_rows, "CLASS_ROWS_SHARED", shared)
+        monkeypatch.setattr(S.class_rows, "CLASS_ROW_KEY_MASK", mask)
+        monkeypatch.setattr(S.class_rows, "CLASS_CANDIDATE_TILE", 2 if sort else 1024)
+        monkeypatch.setattr(S.class_rows, "CLASS_CANDIDATE_REGISTERS", 0 if sort else 2048)
         report = {}
         with torch.no_grad():
             groups, _ = class_weights(cc.backend, data, missing.to(dev), positions, storage = storage, report = report)
@@ -501,13 +502,13 @@ def test_candidates_in_registers_are_the_sorts(C):
         key, order, col_pos = key.to(dev), order.to(dev).contiguous(), col_pos.to(dev)
         want = torch.full((N, C), -7, dtype = torch.int32, device = dev)
         got = want.clone()
-        TK = min(S.CLASS_CANDIDATE_TILE, triton.next_power_of_2(C))
+        TK = min(S.class_rows.CLASS_CANDIDATE_TILE, triton.next_power_of_2(C))
         ordered = torch.empty(N, C, dtype = torch.int64, device = dev)
-        S._ordered_keys_kernel[(N, triton.cdiv(C, TK))](key, order, col_pos, ordered, C, B, TC = TK)
+        S.class_rows._ordered_keys_kernel[(N, triton.cdiv(C, TK))](key, order, col_pos, ordered, C, B, TC = TK)
         keys, sidx = torch.sort(ordered, dim = 1, stable = True)
-        S._class_candidates_kernel[(N,)](keys, sidx, order, col_pos, want, C, B, TC = TK, num_warps = 4)
+        S.class_rows._class_candidates_kernel[(N,)](keys, sidx, order, col_pos, want, C, B, TC = TK, num_warps = 4)
         CP = max(2, triton.next_power_of_2(C))
-        S._sorted_candidates_kernel[(N,)](key, order, col_pos, got, C, B, CP = CP, RB = CP.bit_length() - 1,
+        S.class_rows._sorted_candidates_kernel[(N,)](key, order, col_pos, got, C, B, CP = CP, RB = CP.bit_length() - 1,
                                           num_warps = 8 if CP == 1024 else 4)
         assert torch.equal(got, want), (B, N, distinct)
         assert (got >= 0).all()
@@ -548,7 +549,7 @@ def test_class_weights_walk_every_samples_own_live_columns(kind, storage, one_sa
     those it gets alone. Also with one sample per program (``one_sample``: every lane walks the same columns), and
     reading the products' top-down values compact."""
     if one_sample:
-        monkeypatch.setattr(S, "CLASS_WEIGHT_LANES", 1)
+        monkeypatch.setattr(S.class_weights, "CLASS_WEIGHT_LANES", 1)
     n = KINDS[kind]
     cc = jc.compile(CONSTRAINTS["either"](), build_pc(kind, n, V))
     data, missing = evidence("mixed", n, B = 12)
@@ -589,7 +590,7 @@ def test_the_two_class_weight_walks_give_the_same_bits(kind, name, pattern, stor
     dev = cc.pc.params.device
     out = {}
     for walk in (1, 2, 0):
-        monkeypatch.setattr(S, "CLASS_WEIGHT_WALK", walk)
+        monkeypatch.setattr(S.class_weights, "CLASS_WEIGHT_WALK", walk)
         with torch.no_grad():
             out[walk] = [w for _, _, w in dense_weights(class_weights(cc.backend, data, missing.to(dev), positions,
                                                                       storage = storage)[0])]
@@ -695,7 +696,7 @@ def test_candidates_over_many_rows_and_bf16_tables(tiles, build_pc, monkeypatch)
     """An HMM whose input nodes read 256 rows (the kernel's whole chunks of rows), in fp32 and with a bf16 token table
     inside fast_inference, with either of the kernel's tiles; and a constraint no string satisfies."""
     from pyjuice.constraints.inference.dfa_exact.kernels import score
-    monkeypatch.setattr(score, "SCORE_CANDIDATE_PAIRS", 1 << 30 if tiles == "small" else 0)
+    monkeypatch.setattr(score.group, "SCORE_CANDIDATE_PAIRS", 1 << 30 if tiles == "small" else 0)
     torch.manual_seed(0)
     n = 6
     pc = juice.compile(juice.structures.HMM(seq_length = n, num_latents = 256, num_emits = V),

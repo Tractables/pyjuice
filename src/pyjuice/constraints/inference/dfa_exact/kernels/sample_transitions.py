@@ -29,7 +29,7 @@ from pyjuice.utils.kernel_launcher import triton_jit
 from pyjuice.utils.util import host_cdiv
 
 from .common import grid_chunks
-from .prod import _lse_step_one_exp
+from .prod.launches import _lse_step_one_exp
 from .transitions import SampleMasses, enum_logw_stride
 
 #: :func:`_sample_transition_kernel`'s tiles: the rows of a job tile a program takes (dividing the job's tile), entries

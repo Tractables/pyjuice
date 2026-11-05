@@ -539,11 +539,11 @@ def walk_launches(monkeypatch):
     """Every ``input @ block`` launch offered to the CUDA kernels (switched on): whether they took it, and what it is
     made of."""
     seen = []
-    real = prod_top_down._input_block_cuda
+    real = prod_top_down.walk._input_block_cuda
 
     def record(la, tiles, height, prog, compact, *args):
         taken = real(la, tiles, height, prog, compact, *args)
-        if not prod_top_down.INPUT_BLOCK_CUDA:                           # (the Triton kernel's run)
+        if not prod_top_down.walk.INPUT_BLOCK_CUDA:                           # (the Triton kernel's run)
             return taken
         masses, obs_class, once_iv = args[4], args[5], args[6]
         c_kind, out_temp, (c_full, out_full) = la.kinds
@@ -555,15 +555,15 @@ def walk_launches(monkeypatch):
                          **(taken or {})))
         return taken
 
-    monkeypatch.setattr(prod_top_down, "_input_block_cuda", record)
+    monkeypatch.setattr(prod_top_down.run, "_input_block_cuda", record)
     return seen
 
 
 def both_walks(monkeypatch, run):
     """``run()`` on the Triton kernel, then on the CUDA kernels."""
-    monkeypatch.setattr(prod_top_down, "INPUT_BLOCK_CUDA", False)
+    monkeypatch.setattr(prod_top_down.walk, "INPUT_BLOCK_CUDA", False)
     want = run()
-    monkeypatch.setattr(prod_top_down, "INPUT_BLOCK_CUDA", True)
+    monkeypatch.setattr(prod_top_down.walk, "INPUT_BLOCK_CUDA", True)
     return want, run()
 
 
@@ -580,7 +580,7 @@ WALK_CTAS = {"default": (16, 512, 64), "8_wide": (8, 0, 0), "2": (2, 512, 0), "1
 
 def set_walk_ctas(monkeypatch, cta):
     for name, value in zip(("NODES", "WIDE", "WARP_ITEMS"), WALK_CTAS[cta]):
-        monkeypatch.setattr(prod_top_down, "INPUT_BLOCK_CUDA_" + name, value)
+        monkeypatch.setattr(prod_top_down.walk, "INPUT_BLOCK_CUDA_" + name, value)
 
 
 @pytest.mark.skipif(get_module() is None, reason = "the CUDA kernels are unavailable")
@@ -614,8 +614,8 @@ def test_cuda_walk_with_deferred_units_gives_the_triton_values(kind, name, patte
     defers to the kernel staging every code, with the kept-once parents' -- with 1 code, that kernel's one CTA summing
     every deferred unit in turn -- the Triton kernel's values bit for bit."""
     set_walk_ctas(monkeypatch, cta)
-    monkeypatch.setattr(prod_top_down, "INPUT_BLOCK_CUDA_CODES", codes)
-    monkeypatch.setattr(prod_top_down, "INPUT_BLOCK_CUDA_DEFER_CTAS", 1 if codes == 1 else 0)
+    monkeypatch.setattr(prod_top_down.walk, "INPUT_BLOCK_CUDA_CODES", codes)
+    monkeypatch.setattr(prod_top_down.walk, "INPUT_BLOCK_CUDA_DEFER_CTAS", 1 if codes == 1 else 0)
     n = WALK_KINDS[kind]
     cc = jc.compile(CONSTRAINTS[name](), walk_pc(kind, build_pc))
     data, missing = evidence(pattern, n)
@@ -727,11 +727,11 @@ def test_cuda_walk_at_every_shared_memory_of_a_warp_team(walk_launches, monkeypa
     data = torch.randint(0, Vw, (B, n), generator = g)
     missing = (torch.arange(n) >= n // 2)[None, :].expand(B, n)
     run = lambda: top_down_blocks(cc, data, missing, storage = "compact")[0]
-    monkeypatch.setattr(prod_top_down, "INPUT_BLOCK_CUDA", False)
+    monkeypatch.setattr(prod_top_down.walk, "INPUT_BLOCK_CUDA", False)
     want = run()
-    monkeypatch.setattr(prod_top_down, "INPUT_BLOCK_CUDA", True)
+    monkeypatch.setattr(prod_top_down.walk, "INPUT_BLOCK_CUDA", True)
     for codes in range(1, C + 1):
-        monkeypatch.setattr(prod_top_down, "INPUT_BLOCK_CUDA_CODES", codes)
+        monkeypatch.setattr(prod_top_down.walk, "INPUT_BLOCK_CUDA_CODES", codes)
         assert_same_bits(run(), want)
     assert all(la["taken"] for la in walk_launches)
     teams = {la["smem"] for la in walk_launches if la["warps"] and la["tn"] == 16}
@@ -744,7 +744,7 @@ def test_cuda_walk_with_every_code_too_wide_for_a_cta_of_many(classes, children,
     """Too many classes for a CTA of 16 children to stage them all in 45 KB (the deferred kernel's): CTAs of fewer, and
     past it for one child, of one child with as much as the device takes; the Triton kernel's values bit for bit."""
     monkeypatch.setattr(program, "GROUP_MIN_RATIO", 1 << 30)
-    monkeypatch.setattr(prod_top_down, "INPUT_BLOCK_CUDA_WARP_ITEMS", 0)
+    monkeypatch.setattr(prod_top_down.walk, "INPUT_BLOCK_CUDA_WARP_ITEMS", 0)
     n, B = 5, 2
     dfa, Vw = _many_classes(8, classes)
     ns = juice.structures.HMM(seq_length = n, num_latents = 32, num_emits = Vw)

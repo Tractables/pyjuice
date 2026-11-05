@@ -694,18 +694,18 @@ def test_successor_lists_change_nothing(kind, form, storage, evidence_kind, buil
             return launch
 
     for name in ("_input_block_kernel", "_input_block_group_kernel"):
-        monkeypatch.setattr(K, name, Spy(getattr(K, name)))
-    spans, products = K.Launch.input_boundaries, F.products
+        monkeypatch.setattr(K.run, name, Spy(getattr(K.run, name)))
+    spans, products = K.launches.Launch.input_boundaries, F.products
     out, seen = {}, {}
     for arm in ("always", "alternate", "never", "unbuilt"):
         modes = set()
-        monkeypatch.setattr(K.Launch, "input_boundaries", spans)
+        monkeypatch.setattr(K.launches.Launch, "input_boundaries", spans)
         monkeypatch.setattr(F, "products", products)
         if arm == "unbuilt":
             monkeypatch.setattr(F, "products", lambda *args, succ_lists = None, **kwargs: products(*args, **kwargs))
         elif arm == "alternate":                                            # (every launch as if over every boundary:
             monkeypatch.setattr(L.Liveness, "successor_lists", alternate)   # the steps choose, the launches cannot)
-            monkeypatch.setattr(K.Launch, "input_boundaries", property(lambda self: np.arange(n)))
+            monkeypatch.setattr(K.launches.Launch, "input_boundaries", property(lambda self: np.arange(n)))
             monkeypatch.setattr(L, "SUCCESSOR_LIST_MAX_LIVE", 2.0)
         else:
             monkeypatch.setattr(L.Liveness, "successor_lists", real)

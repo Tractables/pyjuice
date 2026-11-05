@@ -647,19 +647,19 @@ def test_the_cuda_walk_reads_the_enumerated_masses(kind, evidence_kind, build_pc
     data, missing, inputs = evidence(n, B, evidence_kind)
     cc = jc.compile(singleton_automaton(), pc)
     assert cc.backend.token_classes.num_enumerated == 7 and not cc.backend.grouped
-    taken, real = [], prod_top_down._input_block_cuda
+    taken, real = [], prod_top_down.walk._input_block_cuda
 
     def record(*args):
         out = real(*args)
-        if prod_top_down.INPUT_BLOCK_CUDA:
+        if prod_top_down.walk.INPUT_BLOCK_CUDA:
             taken.append(out is not None)
         return out
 
-    monkeypatch.setattr(prod_top_down, "_input_block_cuda", record)
+    monkeypatch.setattr(prod_top_down.run, "_input_block_cuda", record)
     masks = [missing] + [(torch.arange(n) >= t)[None, :].expand(B, n) for t in range(1, n)]   # (left to right)
     out = {}
     for cuda in (False, True):
-        monkeypatch.setattr(prod_top_down, "INPUT_BLOCK_CUDA", cuda)
+        monkeypatch.setattr(prod_top_down.walk, "INPUT_BLOCK_CUDA", cuda)
         with cc.decoder(storage = "compact", **inputs) as decoder:
             out[cuda] = [decoder.conditional(data, mk) for mk in masks]
     assert taken and all(taken)
