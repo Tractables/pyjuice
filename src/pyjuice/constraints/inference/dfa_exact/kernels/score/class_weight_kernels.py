@@ -431,7 +431,7 @@ def _class_weight_cuda(mod, la, tiles, height, cw, rows, prog, bufs, element_flo
         ts = st["ts"]
         maxl = getattr(prog, "_cw_max_list", None)
         if maxl is None:                                               # every boundary's longest class list (once)
-            cp = prog.trans.cls_ptr.view(-1, prog.C + 1)
+            cp = prog.class_lists()[0].view(-1, prog.C + 1)
             maxl = prog._cw_max_list = (cp[:, 1:] - cp[:, :-1]).amax(1).cpu().numpy()
         kept = prog.cw_walks[la.number] = (max(1, int(max(maxl[t] for t in ts))), max(prog.width[t] for t in ts),
                                            max(prog.width[t + 1] for t in ts))
@@ -452,7 +452,7 @@ def _class_weight_cuda(mod, la, tiles, height, cw, rows, prog, bufs, element_flo
     cnt = torch.empty(st["T"] * B * lanes, dtype = torch.int32, device = prog.dev)
     mod.cw_class_cuda(cw["buf"], cw["col"], cw["K"], rows.count, rows.cls, rows.off, element_flows, temp_flows,
                       node_mars, prior["mars"], temp, prog.width_t, prog.intervals.of, prog.intervals.info,
-                      prog.intervals.table, once_iv, prog.trans.cls_ptr, prog.trans.cls_col, prog.trans.cls_succ,
+                      prog.intervals.table, once_iv, *prog.class_lists(),
                       liveness.live, count, start, columns, compact.rank, compact.off, la.dests, tiles, la.ptr,
                       la.parents, regions["offset"], regions["width"], regions["first"], prior["offset"],
                       prior["width"], prior["reg_prior"], st["tlist"], st["t2i"], tab, cnt, int(elem_first),

@@ -384,7 +384,7 @@ def class_weight_rows(prog, liveness, col_pos: torch.Tensor, col_K: torch.Tensor
     :param col_K, col_first: int64 [N] on the device, every column's row group's rows and first column
     :param group_first: int64 [row groups + 1] on the device, every row group's first column, then ``N``
     """
-    tt, n, W, C = prog.trans, prog.n, prog.W, prog.C
+    tt, n, W, C = prog.succ, prog.n, prog.W, prog.C                         # (`cls_order`: both forms')
     N, G, dev = col_K.numel(), group_first.numel() - 1, prog.dev
     shared = CLASS_ROWS_SHARED and stored is not None and N > 0
     M, a, b = max(N, 1), N + 1 + (N + 1) % 2, G + 2 + G % 2                 # (pieces 16 B aligned)
@@ -406,8 +406,8 @@ def class_weight_rows(prog, liveness, col_pos: torch.Tensor, col_K: torch.Tensor
         while (prune or shared) and TC > 1 and N * host_cdiv(C, TC) < 4 * _num_sms(dev):   # (programs filling the
             TC //= 2                                                                         # device)
         TP = max(1, LIVE_CLASS_LANES // TC)
-        _live_classes_kernel[(N, host_cdiv(C, TC))](liveness.live if prune else row, tt.cls_ptr, tt.cls_col,
-                                                     tt.cls_succ, col_pos, col_K, row, floats, off, key, elen,
+        _live_classes_kernel[(N, host_cdiv(C, TC))](liveness.live if prune else row, *prog.class_lists(),
+                                                     col_pos, col_K, row, floats, off, key, elen,
                                                      stored if shared else row, n, W, C, B, N,
                                                      liveness.allowed if classes else row, a_stride, CLASS_ROW_KEY_MASK,
                                                      TC = TC, TP = TP, PRUNE = prune, ALLOWED = classes, KEYS = shared,
@@ -425,8 +425,8 @@ def class_weight_rows(prog, liveness, col_pos: torch.Tensor, col_K: torch.Tensor
                 _ordered_keys_kernel[(N, host_cdiv(C, TK))](key, tt.cls_order, col_pos, ordered, C, B, TC = TK)
                 keys, sidx = torch.sort(ordered, dim = 1, stable = True)
                 _class_candidates_kernel[(N,)](keys, sidx, tt.cls_order, col_pos, rep, C, B, TC = TK, num_warps = 4)
-            _class_reps_kernel[(N, host_cdiv(C, TC))](liveness.live if prune else row, tt.cls_ptr, tt.cls_col,
-                                                      tt.cls_succ, col_pos, col_K, row, rep, elen, stored, floats, off,
+            _class_reps_kernel[(N, host_cdiv(C, TC))](liveness.live if prune else row, *prog.class_lists(),
+                                                      col_pos, col_K, row, rep, elen, stored, floats, off,
                                                       prog.next_col_arg, prog.delta, prog.state_id, prog.col_of_state,
                                                       n, W, C, B, prog.K, N, TC = TC, TP = TP, PRUNE = prune,
                                                       HOMOGENEOUS = prog.homogeneous, num_warps = 4)

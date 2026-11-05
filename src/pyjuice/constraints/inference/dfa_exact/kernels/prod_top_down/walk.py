@@ -82,8 +82,8 @@ def _input_block_boundaries(la: TopDownLaunch, prog) -> tuple:
     kept = getattr(prog, "walk_entries", None)
     if kept is None:
         n, W = prog.n, prog.W
-        pp = prog.ungrouped_tables().pred_ptr.view(n, W + 1).cpu().numpy().astype(np.int64)   # (the CUDA walk runs
-        counts = pp[:, W] - pp[:, 0]                                   # ungrouped: every boundary's predecessors)
+        pp = prog.ungrouped_tables().pred_ptr.view(n, W + 1)           # (the CUDA walk runs ungrouped: every boundary's predecessors)
+        counts = (pp[:, W].long() - pp[:, 0].long()).cpu().numpy()
         flat, run, places, firsts, runs, sizes = prog.assembly.top_down.shared["walk_entries"]
         entries = counts[flat]
         total = np.cumsum(entries)                                     # (every walk's sums: all of them, less those before)

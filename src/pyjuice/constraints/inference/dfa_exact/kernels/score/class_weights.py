@@ -73,7 +73,7 @@ def run_class_weights(launches, cw: dict, prog, bufs, element_flows, temp_flows,
     temp, temp_width = bufs
     tflow_width = temp_width if tflow_width is None else tflow_width
     n, W, C = prog.n, prog.W, prog.C
-    ivs, tt = prog.intervals, prog.trans
+    ivs = prog.intervals
     prune = liveness is not None
     lists = liveness.lists() if prune else (cw["K"],) * 3
     ctables = (compact.off, compact.rank) if compact is not None else (cw["K"],) * 2
@@ -101,8 +101,7 @@ def run_class_weights(launches, cw: dict, prog, bufs, element_flows, temp_flows,
         for first, size in grid_chunks(host_cdiv(B, TB), 1):
             _class_weight_kernel[(tiles.numel() // NODE_TILE * (height // TN), size, host_cdiv(max(rows.most, 1), TC))](
                 cw["buf"], cw["col"], cw["K"], rows.count, rows.cls, rows.off, element_flows, temp_flows, node_mars,
-                prior["mars"], temp, prog.next_col_arg, prog.delta, prog.state_id, prog.col_of_state, tt.cls_ptr,
-                tt.cls_col, tt.cls_succ,
+                prior["mars"], temp, prog.next_col_arg, prog.delta, prog.state_id, prog.col_of_state, *prog.class_lists(),
                 liveness.live if prune else cw["K"], prog.width_t,
                 ivs.of, ivs.info, ivs.table, once_iv, *lists, *ctables,
                 la.dests, tiles, la.ptr, la.parents, regions["offset"], regions["width"], regions["first"],

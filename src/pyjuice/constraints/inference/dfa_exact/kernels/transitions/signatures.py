@@ -220,8 +220,7 @@ def signature_masses(prog, masses, trans_size: int) -> Optional[SignatureMasses]
     # its enumerated tokens: how many. Which, and to which of its pairs, says its state and which of its pairs are live, by the classes of its state in their order: those
     # the signature already has, so no column's need reading (nor can two columns' differ, whose signatures agree)
     if enum:
-        enum_ptr = long(tt.enum_ptr).view(n, W + 1)
-        nenum = enum_ptr[T, Q + 1] - enum_ptr[T, Q]
+        nenum = boundary_groups(prog._tr).enumerated_counts(en, T, Q)
     else:
         nenum = torch.zeros(T.numel(), dtype = torch.int64, device = dev)
     # a column's sizes, in that order, one key where they fit in it (the rows' order is theirs: one sort, not four)

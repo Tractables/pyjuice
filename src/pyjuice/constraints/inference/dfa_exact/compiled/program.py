@@ -140,7 +140,7 @@ class Program:
         self.next_col_arg = self.delta if self.homogeneous else self.next_col    # (a pointer the kernels never read)
         self.mass_row = backend.state.class_mass_rows()[2]               # input node -> its row of the class masses
         self.token_classes = backend.token_classes
-        self.enum = enumerated_tokens(tr, backend.token_classes, lists = False)   # the enumerated classes' codes and tokens
+        self.enum = enumerated_tokens(tr, backend.token_classes)         # the enumerated classes' codes and tokens
         # every column's distinct successors (evidence pruning's liveness sweeps; the forward's tables when its
         # transitions are grouped: decided below, once the steps are known)
         self.succ = transition_tables(tr, grouped = True, enum = self.enum, lists = False)
@@ -199,7 +199,7 @@ class Program:
         self.group_worth = grouped_worth(self.transition_stats, int(pairs.sum()))
         self.entry_loop = entry_loop(self.transition_stats, self.C)    # ungrouped kernels: entries, or every class
         self.trans_pairs = pairs
-        self._tr, self._ungrouped, self._enum_lists = tr, None, None
+        self._tr, self._ungrouped, self._enum_lists, self._class_lists = tr, None, None, None
         steps_t = assembly.steps_host                                       # input steps per position
         self.pos_steps = assembly.pos_steps                                 # int64 [n]
         self.pairs_t = pairs.to(dev)                                        # int64 [n]: the boundaries' pairs
@@ -291,7 +291,7 @@ class Program:
     def ungrouped_tables(self):
         """The ungrouped transition tables (one entry per live class), built when first needed."""
         if self._ungrouped is None:
-            self._ungrouped = transition_tables(self._tr, grouped = False, enum = self.enum)
+            self._ungrouped = transition_tables(self._tr, grouped = False, enum = self.enum, lists = False)
         return self._ungrouped
 
     @property
@@ -306,8 +306,19 @@ class Program:
         if tt.enum_e is not None:
             return tt.enum_ptr, tt.enum_e, tt.enum_pair
         if self._enum_lists is None:
-            self._enum_lists = boundary_groups(self._tr).enumerated_lists(self.enum.code.long())
-        return (tt.enum_ptr, *self._enum_lists)
+            groups = boundary_groups(self._tr)
+            self._enum_lists = (groups.enumerated_pointers(self.enum), *groups.enumerated_lists(self.enum.code.long()))
+        return self._enum_lists
+
+    def class_lists(self) -> tuple:
+        """``(cls_ptr, cls_col, cls_succ)`` (:class:`~..kernels.transitions.TransitionTables`), of either form: on the device, a pass over the moves when first asked for, by a
+        conditional's class weights: as much of a long layout's tables as all the rest, which a marginal never reads."""
+        tt = self.succ
+        if tt.cls_col is not None:
+            return tt.cls_ptr, tt.cls_col, tt.cls_succ
+        if self._class_lists is None:
+            self._class_lists = boundary_groups(self._tr).class_lists()
+        return self._class_lists
 
     @property
     def trans_top_down(self):

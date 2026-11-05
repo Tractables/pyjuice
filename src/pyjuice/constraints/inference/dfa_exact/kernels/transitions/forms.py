@@ -2,7 +2,7 @@
 What a layout's transitions are read as: the enumerated tokens and the transition tables, whichever side built them (:mod:`.tables`, :mod:`.host`).
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 import numpy as np
 import torch
@@ -25,6 +25,8 @@ class EnumeratedTokens:
     :ivar num: the tokens over all boundaries (0: none is live at this length, or nothing is enumerated)
     :ivar on: whether any class is enumerated, which is what the codes depend on: without, every code is the class itself;
         with, a stored class's is its stored column, past the classes enumerated before it, even if ``num`` is 0
+    :ivar column_rows, column_sizes: with any, on the device: how many enumerated entries lie below every column of every group of alike boundaries (int32 [groups, W + 1], a
+        batch's after another's, modulo 2^32), and every group's (Python ints), what ``enum_ptr`` is made of when it is wanted (:class:`~.tables.BoundaryGroups`)
     """
 
     ptr: torch.Tensor
@@ -34,6 +36,8 @@ class EnumeratedTokens:
     num: int
     ptr_host: np.ndarray
     on: bool
+    column_rows: Optional[list] = field(default = None, compare = False)
+    column_sizes: Optional[list] = field(default = None, compare = False)
 
 
 @dataclass(frozen = True)
@@ -56,11 +60,12 @@ class TransitionTables:
     :ivar max_pairs: grouped only, the most pairs of any column
     :ivar enum_ptr, enum_e, enum_pair: grouped only, the enumerated classes' live entries of every column, as a CSR
         (``enum_ptr`` [n, W + 1] int32, global numbers): the token's number ``e`` at its boundary and the pair it leads
-        to; ``max_enum`` the most of any column. A program's on the device has ``enum_ptr`` alone, how many a column has (:meth:`~..compiled.program.Program.enum_lists`)
+        to; ``max_enum`` the most of any column. Not in a program's tables, on the device (:meth:`~..compiled.program.Program.enum_lists`)
     :ivar cls_ptr, cls_col, cls_succ: the same (column, class) entries BY CLASS: the columns where class ``c`` leads
         somewhere at ``t``, ascending, ``cls_col[cls_ptr[t, c] .. cls_ptr[t, c + 1]]`` (``cls_ptr`` [n, C + 1] int32,
         global numbers), and their successors (a sequence end's: its one column) -- the class weights' walk over a
-        class's columns (:func:`~.kernels.score.class_weight_kernels._class_weight_kernel`); ``max_cls`` the most of any (boundary, class);
+        class's columns (:func:`~.kernels.score.class_weight_kernels._class_weight_kernel`). Not in a program's tables, on the device
+        (:meth:`~..compiled.program.Program.class_lists`); ``max_cls`` the most of any (boundary, class);
         ``cls_order`` [n, C] int32, every boundary's classes by their columns, most first (the walk's lanes take
         classes in this order, so that a program's classes have lists of a length)
     :ivar entry_class, pred_class: ungrouped only, [entries] int32: every entry's class, in the entry and the
