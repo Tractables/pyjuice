@@ -4,6 +4,8 @@ automaton, the copies of a chain put back in its moves, against the whole byte a
 bounds, mandatory copies and optional ones, nested, in unbounded repetitions, under tokens that span many copies. Where it cannot
 be done, the long way, the same.
 """
+import copy
+import pickle
 import random
 
 import numpy as np
@@ -803,7 +805,9 @@ TO_COME = [
 
 def to_come(schema, vocabulary, eos, monkeypatch):
     """The automaton, its table left to come, and as it is without that."""
-    want = jc.JSONSchema(schema, vocabulary, eos_padding = eos).automaton()
+    with monkeypatch.context() as m:
+        m.setattr(token_lift, "TABLE_TO_COME", 1 << 62)
+        want = jc.JSONSchema(schema, vocabulary, eos_padding = eos).automaton()
     assert torch.is_tensor(want._table)
     with monkeypatch.context() as m:
         m.setattr(token_lift, "TABLE_TO_COME", 0)
@@ -829,7 +833,7 @@ def test_a_table_written_when_first_read(schema, threads, eos, monkeypatch):
     assert torch.equal(got.accept, want.accept) and torch.equal(got.token_class, want.token_class)
     assert got._table is table and table.made is None
     same(got, want, schema)
-    assert got._table is table.made and table.dense() is table.made and table.parts is None
+    assert got._table is table.made and table.dense() is table.made
 
 
 @pytest.mark.parametrize("eos", [True, False])
@@ -841,11 +845,29 @@ def test_a_table_made_on_a_device_is_the_hosts(schema, device, at_a_time, eos, m
     monkeypatch.setattr(token_lift, "TABLE_ON_DEVICE_MOVES", at_a_time)
     got, want = to_come(schema, vocabulary_of(random.Random(0), pieces = LONG_TOKENS), eos, monkeypatch)
     on = got._table.on_device(device)
-    assert got._table.made is None and on.dtype == torch.int64 and on.device.type == device
-    assert torch.equal(on.cpu(), want._delta), schema
+    assert got._table.made is None and on.dtype == torch.int32 and on.device.type == device
+    assert torch.equal(on.cpu().long(), want._delta), schema
     same(got, want, schema)                                             # (the host's, after it)
-    assert torch.equal(got._table.to(device), on)
-    assert torch.equal(got._table, on.cpu())
+    assert torch.equal(got._table, on.cpu().long())
+
+
+@pytest.mark.parametrize("eos", [True, False])
+@pytest.mark.parametrize("at_a_time", [1, 1 << 24])
+@pytest.mark.parametrize("device", on_devices())
+@pytest.mark.parametrize("schema", TO_COME)
+def test_the_pairs_of_a_table_to_come(schema, device, at_a_time, eos, monkeypatch):
+    """Every pair of states a move of the table joins but into the dead state, and none other, and few twice: without the table."""
+    monkeypatch.setattr(token_lift, "TABLE_ON_DEVICE_MOVES", at_a_time)
+    got, want = to_come(schema, vocabulary_of(random.Random(0), pieces = LONG_TOKENS), eos, monkeypatch)
+    state, succ = got._table.pairs_on(device)
+    assert got._table.made is None and state.dtype == succ.dtype == torch.int64 and state.device.type == device
+    table, K = want._delta, want.num_states
+    dead = (table == torch.arange(K)[:, None]).all(dim = 1) & ~want._accept
+    rows, cls = torch.nonzero(~dead[table], as_tuple = True)
+    pairs = set(zip(rows.tolist(), table[rows, cls].tolist()))
+    found = list(zip(state.tolist(), succ.tolist()))
+    assert set(found) == pairs, schema
+    assert len(found) <= 2 * len(pairs)
 
 
 def test_a_copy_nothing_leads_to():
@@ -859,11 +881,14 @@ def test_a_copy_nothing_leads_to():
     row_at = np.asarray([0, 1, 1], dtype = np.int64)
     row_len = np.asarray([1, 0, 0], dtype = np.int64)
     order = np.asarray([0, 3, 1], dtype = np.int32)
+    first_moves = np.asarray([1, 0], dtype = np.int32)
     for device in on_devices():
-        table = token_lift.TableToCome(moves, row_at, row_len, copies, order, 1, 2, 6, 2)
+        table = token_lift.TableToCome(moves, row_at, row_len, copies, order, first_moves, 1, 2, 6, 2)
         on = table.on_device(device)
         assert on.size() == (3, 2)
         assert on.cpu().tolist() == [[1, 2], [1, 2], [2, 2]] == table.dense().tolist()
+        state, succ = table.pairs_on(device)
+        assert sorted(zip(state.tolist(), succ.tolist())) == [(0, 1), (1, 1)]    # (the first, and the first copy's; not the others')
 
 
 def test_tables_on_a_device_leave_the_hosts_to_come(monkeypatch):
@@ -873,12 +898,12 @@ def test_tables_on_a_device_leave_the_hosts_to_come(monkeypatch):
     table = got._table
     for device in on_devices()[1:]:
         on = got._tables_on(device)[1]
-        assert got._table is table and table.made is None and torch.equal(on.cpu(), want._delta)
+        assert got._table is table and table.made is None and torch.equal(on.cpu().long(), want._delta)
         assert got._tables_on(device)[1] is on
     assert torch.equal(got._tables_on("cpu")[1], want._delta) and got._table is table.made
     for device in on_devices()[1:]:
         got, want = to_come(STRING, vocabulary, True, monkeypatch)      # the host's first, then the device's: that one
-        assert torch.equal(got.delta, want.delta) and torch.equal(got._tables_on(device)[1].cpu(), want._delta)
+        assert torch.equal(got.delta, want.delta) and torch.equal(got._tables_on(device)[1].cpu().long(), want._delta)
 
 
 def test_a_table_written_goes_to_a_device_as_it_is(monkeypatch):
@@ -888,8 +913,74 @@ def test_a_table_written_goes_to_a_device_as_it_is(monkeypatch):
     host = table.dense()
     assert got._table is table
     for device in on_devices():
-        assert torch.equal(table.on_device(device).cpu(), want._delta)
-        assert torch.equal(got._tables_on(device)[1].cpu(), host)
+        assert torch.equal(table.on_device(device).cpu().long(), want._delta)
+        assert torch.equal(got._tables_on(device)[1].cpu().long(), host)
+        state, succ = table.pairs_on(device)
+        assert table.written_on is None                                 # (the table's moves let go)
+        assert torch.equal(host[state.cpu()].eq(succ.cpu()[:, None]).any(dim = 1), torch.ones(state.numel(), dtype = torch.bool))
+    first, last = on_devices()[-1], on_devices()[0]                     # (the moves kept on one device, the pairs asked for on another)
+    table.on_device(first)
+    state, _ = table.pairs_on(last)
+    assert state.device.type == last and state.numel() > 0
+
+
+def test_a_token_past_every_copy():
+    """A move on from any copy past the last, into the window, none staying among the copies (short chains so far leave out more copies than that). By hand: two copies
+    of one state, a move three on; what would be a copy before the first is the padding's state, here with a place and a row of its own."""
+    copies = counters.Copies(np.asarray([7, 9], dtype = np.int64), np.asarray([1], dtype = np.int64), np.asarray([2], dtype = np.int64), np.asarray([0], dtype = np.int64),
+                             np.asarray([0, 1], dtype = np.int64), np.asarray([0], dtype = np.int32), np.asarray([3], dtype = np.int32), np.asarray([0], dtype = np.int32),
+                             np.asarray([0], dtype = np.int32), np.asarray([0, 1], dtype = np.int64), np.asarray([3], dtype = np.int32), np.asarray([0], dtype = np.int64),
+                             np.asarray([0, 1, 2, 3, 4], dtype = np.int32))
+    moves = np.asarray([(0 << 32) | 7, (1 << 32) | 8, (1 << 32) | 6, 0], dtype = np.int64)
+    row_at = np.asarray([0, 3, 3, 3, 3, 3, 2], dtype = np.int64)
+    row_len = np.asarray([2, 0, 0, 0, 0, 0, 1], dtype = np.int64)
+    order = np.asarray([0, 7, 8, 2, 3, 5, 6], dtype = np.int32)
+    first_moves = np.asarray([1, 0], dtype = np.int32)
+    want = [[1, 2], [3, 5], [4, 5], [5, 5], [5, 5], [5, 5], [5, 6]]
+    for device in on_devices():
+        table = token_lift.TableToCome(moves, row_at, row_len, copies, order, first_moves, 5, 6, 9, 2)
+        assert table.on_device(device).cpu().tolist() == want == table.dense().tolist()
+        state, succ = table.pairs_on(device)
+        assert sorted(zip(state.tolist(), succ.tolist())) == [(0, 1), (0, 2), (1, 3), (2, 4), (6, 6)]
+
+
+@pytest.mark.parametrize("copying", [lambda d: pickle.loads(pickle.dumps(d)), copy.deepcopy, copy.copy])
+def test_a_table_to_come_is_kept_and_copied_with_its_automaton(copying, monkeypatch):
+    got, want = to_come(STRING, vocabulary_of(random.Random(0), pieces = LONG_TOKENS), True, monkeypatch)
+    other = copying(got)
+    assert isinstance(other._table, token_lift.TableToCome)
+    same(other, want, "a copy")
+    for device in on_devices():
+        assert torch.equal(copying(got)._tables_on(device)[1].cpu().long(), want._delta)
+    assert got == want
+
+
+def test_a_tree_circuit_on_a_table_to_come(monkeypatch):
+    """Its layout and reachability read what they read of the table, however it is held; the same answers."""
+    if not torch.cuda.is_available():
+        pytest.skip("needs a device")
+    import pyjuice.nodes.distributions as dists
+    vocabulary = vocabulary_of(random.Random(0), pieces = LONG_TOKENS)
+    schema = {"type": "array", "items": {"type": "string", "maxLength": 12}, "maxItems": 6}
+    n = 8
+    torch.manual_seed(0)
+    ns = juice.structures.PD(data_shape = (n,), num_latents = 4, split_intervals = 1, structure_type = "sum_dominated", input_dist = dists.Categorical(num_cats = vocabulary.size))
+    ns.init_parameters(perturbation = 2.0)
+    pc = juice.compile(ns, verbose = False).to("cuda")
+    monkeypatch.setattr(layout, "LAYOUT_HOST_ENTRIES", 0)
+    monkeypatch.setattr(token_lift, "TABLE_TO_COME", 1 << 62)
+    eager = jc.compile(jc.JSONSchema(schema, vocabulary), pc)
+    dfa = eager.backend.automaton
+    data = dfa.sample(torch.zeros(1, n, vocabulary.size, device = "cuda"), 4, generator = torch.Generator(device = "cuda").manual_seed(0))[0]
+    missing = torch.zeros(4, n, dtype = torch.bool, device = "cuda")
+    missing[:, n // 2:] = True
+    want = eager.marginal(data, missing), eager.conditional(data, missing)
+    monkeypatch.setattr(token_lift, "TABLE_TO_COME", 0)
+    monkeypatch.setattr(token_lift, "SPARSE_ENTRIES", 0)
+    late = jc.compile(jc.JSONSchema(schema, vocabulary), pc)
+    assert isinstance(late.backend.automaton._table, token_lift.TableToCome)
+    for a, b in zip((late.marginal(data, missing), late.conditional(data, missing)), want):
+        assert torch.allclose(a, b, atol = 1e-4, rtol = 1e-4)
 
 
 @pytest.mark.parametrize("eos", [True, False])
@@ -905,6 +996,7 @@ def test_a_compile_and_its_queries_leave_the_table_unwritten(eos, monkeypatch):
     ns.init_parameters(perturbation = 2.0)
     pc = juice.compile(ns, verbose = False).to("cuda")
     monkeypatch.setattr(layout, "LAYOUT_HOST_ENTRIES", 0)
+    monkeypatch.setattr(token_lift, "TABLE_TO_COME", 1 << 62)
     eager = jc.compile(jc.JSONSchema(schema, vocabulary, eos_padding = eos), pc)
 
     def answers(cc, data, missing):
@@ -931,8 +1023,15 @@ def test_a_compile_and_its_queries_leave_the_table_unwritten(eos, monkeypatch):
     assert isinstance(table, token_lift.TableToCome)
     for a, b in zip(answers(late, data, missing), want):
         assert torch.allclose(a, b, atol = 1e-4, rtol = 1e-4)
+    automaton = late.backend.automaton                                  # (the device's table, as it is)
+    weights = torch.randn(2, n, vocabulary.size, device = "cuda", generator = torch.Generator(device = "cuda").manual_seed(1))
+    assert torch.allclose(automaton.wmc(weights), dfa.wmc(weights))
+    drawn = automaton.sample(weights, 3, generator = torch.Generator(device = "cuda").manual_seed(2))
+    assert torch.equal(drawn, dfa.sample(weights, 3, generator = torch.Generator(device = "cuda").manual_seed(2)))
     built = late.backend.layout
     assert (built.num_states, built.num_classes) == (dfa.num_states, dfa.num_classes)
     monkeypatch.setattr(token_lift.TableToCome, "dense", real)
     assert torch.equal(built.delta, dfa._delta)                         # (asked for: as the eager one, kept where the layout keeps it)
     assert built.delta is table.made and late.backend.automaton._table is table
+    longer, other = layout.build_layout(automaton, n + 1, "cuda"), layout.build_layout(dfa, n + 1, "cuda")      # (its pairs from the table to come, written or not)
+    assert torch.equal(longer.width, other.width) and torch.equal(longer.state_id, other.state_id) and torch.equal(longer.col_of_state, other.col_of_state)

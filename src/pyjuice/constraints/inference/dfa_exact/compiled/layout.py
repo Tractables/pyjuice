@@ -412,13 +412,16 @@ def _build_on_device(dfa: DFA, n: int, dev: torch.device, report = None) -> Boun
     """:func:`_build`, on the device."""
     K = dfa.num_states
     _, delta, accept = dfa._tables_on(dev)                                  # [K, C], [K]
-    delta = delta.long()
-    # the sweeps walk the automaton's transitions but those into a state that never accepts and never leaves itself:
-    # most of its [K, C] table, and nothing can be accepted through them
     accept = accept.bool()
-    dead = (delta == torch.arange(K, device = dev)[:, None]).all(dim = 1) & ~accept
-    state, cls = torch.nonzero(~dead[delta], as_tuple = True)
-    succ = delta[state, cls]
+    # the sweeps walk the pairs of states the automaton joins, each once (a state's classes lead to some ten states), but those into a state that never
+    # accepts and never leaves itself: most of its [K, C] table, and nothing can be accepted through them. At every boundary: it is most of a long layout's cost
+    if isinstance(dfa._table, torch.Tensor):
+        dead = (delta == torch.arange(K, device = dev)[:, None]).all(dim = 1) & ~accept
+        state, cls = torch.nonzero(~dead[delta], as_tuple = True)
+        keys = torch.unique(state * K + delta[state, cls])
+        state, succ = torch.div(keys, K, rounding_mode = "floor"), torch.remainder(keys, K)
+    else:
+        state, succ = dfa._table.pairs_on(dev)
 
     def forward(row):                                                       # the successors of a set of states
         nxt = torch.zeros(K, dtype = torch.bool, device = dev)

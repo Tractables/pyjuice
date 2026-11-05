@@ -118,10 +118,11 @@ class BoundaryGroups:
         self.holding = False                                                 # (see `release`)
         # the automaton's transitions between states some boundary has, a CSR by state
         active = (tr.col_of_state >= 0).any(dim = 0)
-        keep = active[tr.delta]
-        keep[~active] = False
-        self.state, self.cls = torch.nonzero(keep, as_tuple = True)
-        self.succ = tr.delta[self.state, self.cls]
+        rows = torch.nonzero(active)[:, 0]
+        table = tr.delta[rows]
+        at, self.cls = torch.nonzero(active.index_select(0, table.ravel()).view_as(table), as_tuple = True)
+        self.state = rows[at]
+        self.succ = table[at, self.cls]
         self.count = torch.bincount(self.state, minlength = tr.K)
         self.start = torch.cumsum(self.count, dim = 0) - self.count
         # ... at most so many of them a batch

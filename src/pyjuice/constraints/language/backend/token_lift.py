@@ -1010,19 +1010,40 @@ def _written_moves(moves, row_at, row_len, K):
     return states, cls, targets
 
 
-class TableToCome:
-    """The dense table of a token automaton, as :func:`_table_of_rows` leaves it, written when first asked for: most of a large automaton's
-    cost and memory, and not everything reads it. :meth:`dense` once on the host; :meth:`on_device` makes it where it is wanted, none of it on the host."""
+@njit(cache = True)
+def _first_moves_of_run(copies, first_moves, r):
+    """Of the rows of the run ``r`` the first moves (:func:`~.counters._first_moves`), the first of each to every state: in which of the rows, and their ``g`` and ``v``."""
+    lo, u = copies.row_of[r], copies.u[r]
+    total = 0
+    for local in range(lo, lo + u):
+        total += first_moves[copies.firsts_at[local]]
+    rows = np.empty(total, dtype = np.int64)
+    g = np.empty(total, dtype = np.int64)
+    v = np.empty(total, dtype = np.int64)
+    at = 0
+    for local in range(lo, lo + u):
+        f, start = copies.firsts_at[local], copies.row_at[local]
+        for j in range(f + 1, f + 1 + first_moves[f]):
+            e = start + first_moves[j]
+            rows[at], g[at], v[at] = local - lo, copies.g[e], copies.v[e]
+            at += 1
+    return rows, g, v
 
-    def __init__(self, moves, row_at, row_len, copies, order, K, pad, T, C):
-        self.parts = (moves, row_at, row_len, copies, order, K, pad, T)
+
+class TableToCome:
+    """The dense table of a token automaton, as :func:`_table_of_rows` leaves it, not made until it is wanted: most of a large automaton's cost and memory. :meth:`dense`
+    writes it once on the host. :meth:`on_device` makes it where it is wanted, in int32, what the kernels read, none of it on the host: a tenth of the time, the moves being
+    few and the rest a scatter, and not at the mercy of how fast the kernel supplies the host's memory. :meth:`pairs_on` is what a layout needs of it, without it."""
+
+    def __init__(self, moves, row_at, row_len, copies, order, first_moves, K, pad, T, C):
+        self.parts = (moves, row_at, row_len, copies, order, first_moves, K, pad, T)
         self.rows, self.classes = order.size, C
-        self.made = None
+        self.made, self.written_on = None, None
 
     @few_threads
     def dense(self) -> torch.Tensor:
         if self.made is None:
-            moves, row_at, row_len, copies, order, K, pad, T = self.parts
+            moves, row_at, row_len, copies, order, _, K, pad, T = self.parts
             place = _places(order, T)
             out = np.empty((self.rows, self.classes), dtype = np.int64)
             threads = get_num_threads()
@@ -1030,38 +1051,75 @@ class TableToCome:
                 _sparse_table_parallel(moves, row_at, row_len, copies, order, place, K, pad, out, min(threads, self.rows))
             else:
                 _sparse_table(moves, row_at, row_len, copies, order, place, K, pad, out, 0, self.rows)
-            self.made, self.parts = torch.from_numpy(out), None
+            self.made = torch.from_numpy(out)
         return self.made
 
-    def on_device(self, device) -> torch.Tensor:
-        """The same table on ``device``, none of it written on the host (unless it is already): a tenth of the time, the moves being few and the rest a
-        scatter, and not at the mercy of how fast the kernel supplies the host's memory. It has a row past the last, which a state of no place (-1) writes."""
-        if self.made is not None:
-            return self.made.to(device)
-        moves, row_at, row_len, copies, order, K, pad, T = self.parts
+    def _places_on(self, device) -> torch.Tensor:
+        """Every state's place, the padding's state's being the padding's, -1 for a state of none."""
+        order, K, pad, T = self.parts[4], self.parts[6], self.parts[7], self.parts[8]
         places = torch.full((T,), -1, dtype = torch.int64, device = device)
         places[torch.from_numpy(order).to(device).long()] = torch.arange(self.rows, device = device)
         places[K + 1] = places[pad]
-        out = torch.full((self.rows + 1, self.classes), int(places[K]), dtype = torch.int64, device = device)
-        states, classes, targets = (torch.from_numpy(x).to(device) for x in _written_moves(moves, row_at, row_len, K + 2))
-        out[places[states], classes] = places[targets]
-        window = torch.from_numpy(copies.window).to(device).long()
-        cls, g, v = (torch.from_numpy(x).to(device).long() for x in (copies.cls, copies.g, copies.v))
+        return places
+
+    def _moves_of_copies(self, device, r, local, g, v):
+        """So many at a time: the moves ``g``, ``v``, of the rows ``local``, of every copy of the run ``r``: from which state and to which (as :func:`copy_target`).
+        Only from the last copies a move on through the chain reaches the window's."""
+        copies = self.parts[3]
+        u, extra, first = int(copies.u[r]), int(copies.extra[r]), int(copies.first[r])
+        step = max(1, TABLE_ON_DEVICE_MOVES // max(g.numel(), 1))
+        plain = extra - max(int(g.max()), 0) if g.numel() else extra
+        fixed, on = g < 0, (g - 1) * u + v
+        for k0 in range(1, plain + 1, step):
+            k = torch.arange(k0, min(k0 + step, plain + 1), device = device)[:, None]
+            yield first + (k - 1) * u + local, torch.where(fixed, v, first + k * u + on)
+        past = torch.from_numpy(copies.window[copies.window_at[r]:]).to(device).long()
+        for k0 in range(max(plain, 0) + 1, extra + 1, step):
+            k = torch.arange(k0, min(k0 + step, extra + 1), device = device)[:, None]
+            q = k + g
+            ahead = torch.where(q <= extra, first + k * u + on, past[((q - extra).clamp(min = 0) * u + v).clamp(max = past.numel() - 1)])
+            yield first + (k - 1) * u + local, torch.where(fixed, v, ahead)
+
+    def _written_on(self, device) -> tuple:
+        """The moves of the states written out on ``device`` (:func:`_written_moves`), for :meth:`on_device` and :meth:`pairs_on`, which a layout calls after it."""
+        moves, row_at, row_len, K = self.parts[0], self.parts[1], self.parts[2], self.parts[6]
+        return tuple(torch.from_numpy(x).to(device) for x in _written_moves(moves, row_at, row_len, K + 2))
+
+    def on_device(self, device) -> torch.Tensor:
+        """The table on ``device``, in int32. (It has a row past the last, which a state of no place, -1, writes.)"""
+        copies, K = self.parts[3], self.parts[6]
+        places = self._places_on(device)
+        values = places.to(torch.int32)
+        out = torch.full((self.rows + 1, self.classes), int(places[K]), dtype = torch.int32, device = device)
+        self.written_on = self._written_on(device)
+        states, classes, targets = self.written_on
+        out[places[states], classes] = values[targets]
         for r in range(copies.u.size):
-            u, extra = int(copies.u[r]), int(copies.extra[r])
-            at = int(copies.row_of[r])
-            local = torch.from_numpy(np.repeat(np.arange(u, dtype = np.int64), np.diff(copies.row_at[at:at + u + 1]))).to(device)
+            at, u = int(copies.row_of[r]), int(copies.u[r])
             lo, hi = int(copies.row_at[at]), int(copies.row_at[at + u])
-            r_cls, r_g, r_v = cls[lo:hi], g[lo:hi], v[lo:hi]
-            past = window[int(copies.window_at[r]):]
-            first = int(copies.first[r])
-            step = max(1, TABLE_ON_DEVICE_MOVES // max(hi - lo, 1))
-            for k0 in range(1, extra + 1, step):                # (as :func:`~.counters.copy_target`, for these copies' moves together)
-                k = torch.arange(k0, min(k0 + step, extra + 1), device = device)[:, None]
-                q = k + r_g
-                on = torch.where(q <= extra, first + (q - 1) * u + r_v, past[((q - extra).clamp(min = 0) * u + r_v).clamp(max = past.numel() - 1)])
-                out[places[first + (k - 1) * u + local], r_cls.expand_as(q)] = places[torch.where(r_g < 0, r_v, on)]
+            local = torch.from_numpy(np.repeat(np.arange(u, dtype = np.int64), np.diff(copies.row_at[at:at + u + 1]))).to(device)
+            cls, g, v = (torch.from_numpy(x[lo:hi]).to(device).long() for x in (copies.cls, copies.g, copies.v))
+            for states, targets in self._moves_of_copies(device, r, local, g, v):
+                out[places[states], cls.expand_as(states)] = values[targets]
         return out[:self.rows]
+
+    def pairs_on(self, device) -> tuple:
+        """``(state, succ)``, int64: the pairs of states a token joins, but those into the dead state, on ``device``, without the table. A pair may come twice, from
+        a copy where a move on through the chain and one out of it meet; nearly all of the table's moves do not come, a state's classes leading to some ten states."""
+        copies, first_moves = self.parts[3], self.parts[5]
+        places = self._places_on(device)
+        written, self.written_on = self.written_on, None
+        states, _, targets = written if written is not None and written[0].device == torch.device(device) else self._written_on(device)
+        keys = torch.unique(places[states] * self.rows + places[targets])
+        state, succ = [torch.div(keys, self.rows, rounding_mode = "floor")], [torch.remainder(keys, self.rows)]
+        for r in range(copies.u.size):
+            local, g, v = (torch.from_numpy(x).to(device) for x in _first_moves_of_run(copies, first_moves, r))
+            for states, targets in self._moves_of_copies(device, r, local, g, v):
+                state.append(places[states].ravel())
+                succ.append(places[targets].ravel())
+        state, succ = torch.cat(state), torch.cat(succ)
+        keep = state >= 0                                       # (a state of no place; no move is to the dead state, which is what the moves leave out)
+        return state[keep], succ[keep]
 
 
 _NO_FIRST_MOVES = np.zeros(1, dtype = np.int32)
@@ -1110,7 +1168,7 @@ def _table_of_rows(automaton: ByteAutomaton, remap: np.ndarray, K: int, K_kept: 
     if first_at is None:
         first_at = np.full(K_kept + 2, -1, dtype = np.int32)
     order = _sparse_order(moves, row_at, row_len, first_at, first_moves, copies, K_kept, K_full + 2, C, pad)
-    table = TableToCome(moves, row_at, row_len, copies, order, K_kept, pad, K_full + 2, C)
+    table = TableToCome(moves, row_at, row_len, copies, order, first_moves, K_kept, pad, K_full + 2, C)
     return table if order.size * C >= TABLE_TO_COME else table.dense(), _in_order(accept, order)
 
 
@@ -1124,8 +1182,9 @@ NO_BUDGET = 1 << 62
 #: the table of a token automaton of at least so many entries, minimal already, is made from its moves (:func:`_table_of_rows`,
 #: the dense table of its rows costing no more below it), in threads from :data:`THREADS_ENTRIES` on
 SPARSE_ENTRIES = 1 << 13
-#: a token automaton's table of at least so many entries is written when first read
-TABLE_TO_COME = 1 << 22
+#: a token automaton's table of at least so many entries is made when wanted, where it is wanted (a layout on a device makes it there, from 2^19 entries: see
+#: :data:`~...inference.dfa_exact.compiled.layout.LAYOUT_HOST_ENTRIES`; and these are numpy's 4 MB, from which it asks for huge pages: see :func:`~.counters.room_for`)
+TABLE_TO_COME = 1 << 19
 #: so many moves a time, making such a table on a device
 TABLE_ON_DEVICE_MOVES = 1 << 24
 THREADS_ENTRIES = 1 << 18

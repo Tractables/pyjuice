@@ -185,7 +185,7 @@ class DFA(Constraint):
             if isinstance(table, torch.Tensor) or device.type == "cpu":
                 table = self._delta.to(device)
             else:
-                table = table.on_device(device)                 # (made there: the host's is written if something asks for it)
+                table = table.on_device(device)                 # (made there, in int32: the host's is written if something asks for it)
             self._device_tables[device] = (self._token_class.to(device), table, self._accept.to(device))
         return self._device_tables[device]
 
@@ -236,6 +236,7 @@ class DFA(Constraint):
         """beta[t][b, q] = log sum over completions x_t..x_{n-1} from state q of their weight,
         restricted to completions ending in an accepting state; beta[n] = log 1[q accepting]."""
         _, delta, accept = self._tables_on(lwc.device)
+        delta = delta.long()
         B, n, C = lwc.shape
         beta = [None] * (n + 1)
         beta[n] = torch.where(accept, 0.0, float("-inf")).to(lwc.dtype)[None, :].expand(B, -1)
