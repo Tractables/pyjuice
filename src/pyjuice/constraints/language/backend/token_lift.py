@@ -928,6 +928,209 @@ def _sparse_order(moves, row_at, row_len, first_at, first_moves, copies, K, T, C
 
 
 @njit(cache = True)
+def _sparse_order_repeats(moves, row_at, row_len, first_at, first_moves, copies, K, T, C, pad, periods, least):
+    """
+    :func:`_sparse_order`, the same order, of an automaton with copies not written out (:class:`~.counters.Copies`): a state of a chain is led to from some ten
+    states, so the order reads ten moves a state, though far into a chain it only repeats -- a level is the level ``p`` before, every state so many copies on.
+    Where that is seen it is not walked, but copied: ``periods`` the longest period ``p`` looked for (0: no look), ``least`` the fewest states worth copying.
+    Returns the order, and how many of its states were copied.
+
+    What makes a repeat certain, at the start of a level (the queue's states from ``b`` to ``c``), against the level ``p`` before (from ``a`` to ``a2``):
+
+    * every state between ``a`` and ``b`` was a copy's, its row read before (``odd``), and none of its moves led past its chain's end (``J`` at least 1 says
+      so: by how far they stand): so what it added to the queue was a function of its row and of which states of its chain, from its own copy on, the queue
+      had had;
+    * the level is the earlier one state for state, every state ``shift[r]`` further on in its chain ``r``, whole copies;
+    * from the earliest copy of the earlier level on, a state of a chain was in the queue then exactly if the state ``shift[r]`` further on is now.
+
+    Then the states from ``b`` on add what those from ``a`` on added, ``shift[r]`` further on, and after them the same holds again; so on, as long as no move
+    leads past a chain's end: ``J`` times, by the furthest any state between ``a`` and ``b`` stands and the furthest a row of its chain leads (``reach``).
+    """
+    order = np.empty(T, dtype = np.int32)
+    seen = np.zeros(T, dtype = np.uint8)                        # (1: in the queue; 2, during a check alone: since the earlier level)
+    read = np.zeros(copies.firsts_at.size, dtype = np.bool_)
+    order[0], seen[0] = 0, 1
+    num, head = 1, 0
+    mask = (np.int64(1) << 32) - 1
+    r, u, end, copy_at = 0, np.int64(0), np.int64(0), np.int64(1) << 62
+    first = copies.first
+    R = copies.u.size
+    reach = np.zeros(R, dtype = np.int64)
+    for i in range(R):
+        for j in range(copies.later_at[copies.row_of[i]], copies.later_at[copies.row_of[i] + copies.u[i]]):
+            if copies.later[j] > reach[i]:
+                reach[i] = copies.later[j]
+    ring = periods + 1
+    starts = np.zeros(ring, dtype = np.int64)                   # where the last levels start in the queue, the level ``e`` at ``e % ring``: a period's and one
+    alike = np.zeros(periods + 1, dtype = np.int64)             # how many levels on end have been as long as the level ``p`` before
+    shift, low, top = np.zeros(R, dtype = np.int64), np.zeros(R, dtype = np.int64), np.zeros(R, dtype = np.int64)
+    high, known = np.int64(0), 0                                # the highest state among the queue's first ``known``: past it, none has been in it
+    level, level_end = 0, 1
+    odd = 0                                                     # the last place in the queue whose state was written out, or a copy's of a row not read yet
+    next_try, wait = 0, 1
+    repeated = 0
+    while head < num:
+        if head == level_end and periods > 0:
+            level += 1
+            starts[level % ring] = head
+            level_end = num
+            size = num - head
+            tried, copied = False, False
+            for p in range(1, periods + 1):
+                e = level - p
+                if e >= 0 and starts[(e + 1) % ring] - starts[e % ring] == size:
+                    alike[p] += 1
+                else:
+                    alike[p] = 0
+            for p in range(1, periods + 1):
+                if alike[p] < p or level < next_try or copied:
+                    continue
+                a, a2, b, c = starts[(level - p) % ring], starts[(level - p + 1) % ring], head, num
+                if odd >= a:
+                    continue
+                tried = True
+                P = b - a
+                ok = True
+                for i in range(R):
+                    shift[i], low[i], top[i] = 0, np.int64(1) << 62, -1
+                rr = 0
+                for i in range(c - b):                          # the level, state for state the earlier one's, whole copies on
+                    x, y = np.int64(order[a + i]), np.int64(order[b + i])
+                    if not first[rr] <= x < first[rr + 1]:
+                        rr = np.searchsorted(first, x, side = "right") - 1
+                    d = y - x
+                    if shift[rr] != d:
+                        if shift[rr] != 0 or d <= 0 or d % copies.u[rr] != 0:
+                            ok = False
+                            break
+                        shift[rr] = d
+                    if y >= first[rr + 1]:
+                        ok = False
+                        break
+                    if x < low[rr]:
+                        low[rr] = x
+                if not ok:
+                    continue
+                for i in range(a, b):                           # how far the states that are to repeat stand
+                    x = np.int64(order[i])
+                    if not first[rr] <= x < first[rr + 1]:
+                        rr = np.searchsorted(first, x, side = "right") - 1
+                    if shift[rr] == 0:
+                        ok = False
+                        break
+                    if x > top[rr]:
+                        top[rr] = x
+                if not ok:
+                    continue
+                J = np.int64(1) << 62
+                for i in range(R):
+                    if shift[i] > 0:
+                        J = min(J, (first[i + 1] - 1 - reach[i] - top[i]) // shift[i])
+                J = min(J, (T - c) // P)
+                if J < 1 or J * P < least:
+                    continue
+                for i in range(known, c):
+                    if order[i] > high:
+                        high = order[i]
+                known = c
+                for i in range(a2, c):                          # in the queue then exactly if so far on now
+                    seen[order[i]] = 2
+                wrong = 0
+                for i in range(R):
+                    if shift[i] > 0:
+                        d = shift[i]
+                        lo = low[i] - (low[i] - first[i]) % copies.u[i]
+                        for x in range(lo, min(first[i + 1] - d, high + 1)):
+                            wrong += (seen[x] == 1) != (seen[x + d] != 0)
+                for i in range(a2, c):
+                    seen[order[i]] = 1
+                if wrong:
+                    continue
+                on = np.empty(P, dtype = np.int32)              # copied: the states from ``a2`` to ``c``, ``J`` times, each its chain's shift on
+                for i in range(P):
+                    x = np.int64(order[a2 + i])
+                    if not first[rr] <= x < first[rr + 1]:
+                        rr = np.searchsorted(first, x, side = "right") - 1
+                    on[i] = shift[rr]
+                at = c
+                for j in range(J):
+                    for i in range(P):
+                        x = order[at - P + i] + on[i]
+                        order[at + i] = x
+                        seen[x] = 1
+                    at += P
+                head, num = b + J * P, at
+                repeated += J * P
+                level, level_end = 0, num
+                starts[0] = head
+                alike[:] = 0
+                copied = True
+            if copied:
+                next_try, wait = 0, 1
+            elif tried:
+                wait = min(2 * wait, 1 << 20)
+                next_try = level + wait
+        here = head
+        q = np.int64(order[head])
+        head += 1
+        if q > K + 1:
+            l = q - copy_at
+            if l < 0 or l >= u:
+                if not first[r] <= q < first[r + 1]:
+                    r = np.searchsorted(first, q, side = "right") - 1
+                u, end = copies.u[r], first[r + 1]
+                l = (q - first[r]) % u
+                copy_at = q - l
+            local = copies.row_of[r] + l
+            if read[local]:
+                for j in range(copies.later_at[local], copies.later_at[local + 1]):
+                    t = copy_at + copies.later[j]
+                    if t >= end:
+                        t = np.int64(copies.window[copies.window_at[r] + u + t - end])
+                    num = _reached(t, seen, order, num)
+                continue
+            odd = here
+            read[local] = True
+            f, at = copies.firsts_at[local], copies.row_at[local]
+            for j in range(f + 1, f + 1 + first_moves[f]):
+                e = at + first_moves[j]
+                t = np.int64(copies.v[e])
+                if copies.g[e] >= 0:
+                    t += copy_at + copies.g[e] * u
+                    if t >= end:
+                        t = np.int64(copies.window[copies.window_at[r] + u + t - end])
+                num = _reached(pad if t == K + 1 else t, seen, order, num)
+            continue
+        odd = here
+        at, n = row_at[q], row_len[q]
+        if seen[K] == 0:                                        # (the dead state's place: until it has one)
+            expected = 0
+            for k in range(at, at + n):
+                c = moves[k] >> 32
+                if c > expected and seen[K] == 0:
+                    seen[K] = 1
+                    order[num] = K
+                    num += 1
+                expected = c + 1
+                t = moves[k] & mask
+                num = _reached(pad if t == K + 1 else t, seen, order, num)
+            if expected < C and seen[K] == 0:
+                seen[K] = 1
+                order[num] = K
+                num += 1
+        elif first_at[q] >= 0:
+            f = first_at[q]
+            for j in range(f + 1, f + 1 + first_moves[f]):
+                t = moves[at + first_moves[j]] & mask
+                num = _reached(pad if t == K + 1 else t, seen, order, num)
+        else:
+            for k in range(at, at + n):
+                t = moves[k] & mask
+                num = _reached(pad if t == K + 1 else t, seen, order, num)
+    return order[:num], repeated
+
+
+@njit(cache = True)
 def _places(order, T):
     """Every state's place in ``order``, -1 for the rest of the ``T``."""
     place = np.full(T, -1, dtype = np.int64)
@@ -1123,6 +1326,10 @@ class TableToCome:
 
 
 _NO_FIRST_MOVES = np.zeros(1, dtype = np.int32)
+#: (:func:`_sparse_order_repeats`) the longest period, in levels, at which the breadth-first order of chains of copies is looked at for a repeat, and the fewest
+#: states a repeat is to copy to be worth its checks
+ORDER_PERIODS = 32
+ORDER_REPEAT_LEAST = 1 << 10
 
 
 def _rows_by_walks(automaton: ByteAutomaton, states: np.ndarray, remap: np.ndarray, trie: "_Trie", reps: np.ndarray, kinds: np.ndarray, accept: np.ndarray,
@@ -1167,7 +1374,10 @@ def _table_of_rows(automaton: ByteAutomaton, remap: np.ndarray, K: int, K_kept: 
         accept[pad] = True
     if first_at is None:
         first_at = np.full(K_kept + 2, -1, dtype = np.int32)
-    order = _sparse_order(moves, row_at, row_len, first_at, first_moves, copies, K_kept, K_full + 2, C, pad)
+    if copies.u.size:                                           # (chains of copies: where the order repeats, it is copied)
+        order, _ = _sparse_order_repeats(moves, row_at, row_len, first_at, first_moves, copies, K_kept, K_full + 2, C, pad, ORDER_PERIODS, ORDER_REPEAT_LEAST)
+    else:
+        order = _sparse_order(moves, row_at, row_len, first_at, first_moves, copies, K_kept, K_full + 2, C, pad)
     table = TableToCome(moves, row_at, row_len, copies, order, first_moves, K_kept, pad, K_full + 2, C)
     return table if order.size * C >= TABLE_TO_COME else table.dense(), _in_order(accept, order)
 

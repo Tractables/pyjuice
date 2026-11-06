@@ -23,6 +23,7 @@ from pyjuice.constraints.language.backend.json_schema import compile_schema
 def few_copies_left_out(monkeypatch, request):
     """(the rows and classes by behaviours or by walks: the copies are put back in either's)"""
     monkeypatch.setattr(counters, "MIN_LEFT_OUT", 1)
+    monkeypatch.setattr(token_lift, "ORDER_REPEAT_LEAST", 1)                            # (the order of a chain: every repeat copied, however short)
     if request.param == "walks":
         monkeypatch.setattr(token_lift, "BEHAVIOUR_ENTRIES", 0)
 
@@ -1035,3 +1036,154 @@ def test_a_compile_and_its_queries_leave_the_table_unwritten(eos, monkeypatch):
     assert built.delta is table.made and late.backend.automaton._table is table
     longer, other = layout.build_layout(automaton, n + 1, "cuda"), layout.build_layout(dfa, n + 1, "cuda")      # (its pairs from the table to come, written or not)
     assert torch.equal(longer.width, other.width) and torch.equal(longer.state_id, other.state_id) and torch.equal(longer.col_of_state, other.col_of_state)
+
+
+def chains_of(K, C, runs, written, window, pad, end):
+    """What the breadth-first order reads, as :func:`~pyjuice.constraints.language.backend.counters.expanded_moves` leaves it, of ``K`` states written out and
+    chains of copies that are not. ``runs``: a chain's ``(copies, rows)``, a row its moves ``(class, copies on, state of that copy)`` or ``(class, -1, state)``,
+    classes ascending; ``written``: a state's moves ``(class, state)``; ``window``: the states past a chain's end; ``pad`` the padding's state, with a row of its
+    own if ``end``. The chains' states stand from ``K + 2`` on, a chain after another, a copy after another."""
+    u, extra = [len(rows) for _, rows in runs], [copies for copies, _ in runs]
+    first = np.cumsum([K + 2] + [a * b for a, b in zip(u, extra)]).astype(np.int64)
+    copy_row_at, cls, g, v, firsts_at, first_moves = [0], [], [], [], [], []
+    for _, rows in runs:
+        for row in rows:
+            firsts_at.append(len(first_moves))
+            first_moves.append(0)
+            told = set()
+            for i, (c, on, state) in enumerate(row):                                # (what the order reads of a copy's row: the first move to every state)
+                cls.append(c), g.append(on), v.append(state)
+                if (on, state) not in told:
+                    told.add((on, state))
+                    first_moves.append(i)
+            first_moves[firsts_at[-1]] = len(told)
+            copy_row_at.append(len(cls))
+    firsts_at.append(len(first_moves))
+    as32 = lambda x: np.asarray(x, dtype = np.int32)
+    u, row_of = np.asarray(u, dtype = np.int64), np.concatenate([[0], np.cumsum(u)[:-1]]).astype(np.int64)
+    copy_row_at, cls, g, v, firsts_at, first_moves = np.asarray(copy_row_at, dtype = np.int64), as32(cls), as32(g), as32(v), as32(firsts_at), as32(first_moves)
+    later_at, later = counters._first_moves_on(firsts_at, first_moves, copy_row_at, row_of, u, g, v)
+    window_at = np.cumsum([0] + [len(w) for w in window])[:-1].astype(np.int64)
+    copies = counters.Copies(first, u, np.asarray(extra, dtype = np.int64), row_of, copy_row_at, cls, g, v, firsts_at, later_at, later, window_at,
+                             as32([x for w in window for x in w]))
+    moves, row_at, row_len = [], np.zeros(K + 2, dtype = np.int64), np.zeros(K + 2, dtype = np.int64)
+    for q, row in enumerate(written):
+        row_at[q], row_len[q] = len(moves), len(row)
+        moves += [(c << 32) | t for c, t in row]
+    if end:
+        row_at[K + 1], row_len[K + 1] = len(moves), 1
+        moves.append(((C - 1) << 32) | (K + 1))
+    return np.asarray(moves, dtype = np.int64), row_at, row_len, np.full(K + 2, -1, dtype = np.int32), first_moves, copies, K, int(first[-1]), C, pad
+
+
+def random_chains(rng):
+    """Random chains (:func:`chains_of`): rows that lead on through their chain, some copies on, out of it, past its end, or nowhere; and states written out that
+    lead to one another and into the chains. Chains long or short, entered at their first copies alone, as a schema's are, or anywhere, far ahead too; the states
+    written out reached early or one after another, so late into a chain -- what a repeat must not be copied over."""
+    long, anywhere, late = rng.random() < 0.6, rng.random() < 0.5, rng.random() < 0.5
+    K, C, R = rng.randint(2, 30 if late else 10), rng.randint(3, 7), rng.randint(1, 3)
+    u = [rng.randint(1, 5) for _ in range(R)]
+    extra = [rng.choice([40, 80, 150, 300] if long else [3, 6, 12, 25, 60]) for _ in range(R)]
+    first = np.cumsum([K + 2] + [a * b for a, b in zip(u, extra)]).tolist()
+    T = first[-1]
+    out = list(range(K)) + [K + 1]
+    runs, reach = [], []
+    for r in range(R):
+        far, most, on, rows = rng.randint(1, 3), 0, rng.choice([0.4, 0.75, 0.95]), []
+        for _ in range(u[r]):
+            row = []
+            for c in sorted(rng.sample(range(C), rng.randint(1, C))):
+                if rng.random() < on:                                               # on through the chain
+                    row.append((c, rng.randint(0, far), rng.randrange(u[r])))
+                    most = max(most, row[-1][1] * u[r] + row[-1][2])
+                else:                                                               # to one state from every copy
+                    row.append((c, -1, rng.randrange(K + 2, T) if anywhere and rng.random() < 0.2 else rng.choice(out)))
+            rows.append(row)
+        runs.append((extra[r], rows))
+        reach.append(most)
+    window = [[rng.randrange(K) for _ in range(u[r] + reach[r] + 1)] for r in range(R)]
+    written = []
+    for q in range(K):
+        row = []
+        for c in sorted(rng.sample(range(C), rng.randint(1, C))):
+            x = rng.random()
+            if late and q + 1 < K and x < 0.5:                                      # the next state written out: one a level
+                t = q + 1
+            elif x < 0.7:
+                t = rng.choice(out)
+            elif x < 0.85 or not anywhere:                                          # into a chain's first copy
+                r = rng.randrange(R)
+                t = first[r] + rng.randrange(u[r])
+            else:                                                                   # into a chain, anywhere
+                t = rng.randrange(K + 2, T)
+            row.append((c, t))
+        written.append(row)
+    end = rng.random() < 0.5                                                        # (the padding's state: its own, or a state written out)
+    return chains_of(K, C, runs, written, window, rng.choice(out) if end else K + 1, end)
+
+
+def reached_ahead(copy, state, on, also):
+    """A chain of two states a copy, the first leading to both of the next copy, and a state written out that leads to the chain's start and, at once, to the
+    ``state``-th of its ``copy``-th copy: reached long before the chain gets there, a level being the one before a copy on all the while. ``on``: whether the
+    second state leads on too (then two fronts in one chain, the first to run into what the second has left); ``also``: to the copy after as well."""
+    second = [(0, 1, 1)] if on else [(0, -1, 0)]
+    start = 3
+    ahead = [(1, start + 2 * copy + state)] + ([(2, start + 2 * copy + 2 + state)] if also else [])
+    return chains_of(1, 3, [(80, [[(0, 1, 0), (1, 1, 1)], second])], [[(0, start)] + ahead], [[0] * 6], 2, False)
+
+
+def order_cases():
+    """Chains for the order: a state reached ahead of its chain, every way; then random ones."""
+    for copy in (3, 8, 30, 77):
+        for state in (0, 1):
+            for on in (False, True):
+                for also in (False, True):
+                    yield ("ahead", copy, state, on, also), reached_ahead(copy, state, on, also)
+    rng = random.Random(0)
+    for k in range(3000):
+        yield ("random", k), random_chains(rng)
+
+
+def test_the_order_that_copies_its_repeats_is_the_breadth_first_order():
+    """Where a chain's order repeats it is copied, and it is the order a walk of every state gives: on chains with a state reached ahead of them (a level is the
+    one before so many copies on, and what follows it will not be) and on random ones, at every period looked for and with repeats of any length."""
+    copied, kept, walked, few, ahead = 0, 0, 0, 0, 0
+    for name, args in order_cases():
+        want = token_lift._sparse_order(*args)
+        assert np.unique(want).size == want.size
+        for periods, least in ((32, 1), (3, 1), (1, 1), (32, 40), (0, 1)):
+            got, repeated = token_lift._sparse_order_repeats(*args, periods, least)
+            assert np.array_equal(got, want), (name, periods, least)
+            assert 0 <= repeated < want.size and (repeated == 0 or (periods > 0 and repeated >= least))
+            if (periods, least) == (32, 1) and name[0] == "random":
+                copied += repeated > 0
+                kept += repeated
+                walked += want.size
+            elif (periods, least) == (32, 1):
+                ahead += repeated > 0
+            elif (periods, least) == (32, 40):
+                few += repeated > 0
+    # (not vacuous: a third of the random orders with a repeat, a third of their states copied; and past a state reached ahead the order repeats again)
+    assert copied > 1000 and few > 500 and 3 * kept > walked and ahead >= 24, (copied, few, kept, walked, ahead)
+
+
+@pytest.mark.parametrize("schema, share", [
+    ({"type": "string", "maxLength": 400}, 0.5),
+    ({"type": "array", "items": {"type": "object", "properties": {"a": {"type": "string", "maxLength": 6}}, "additionalProperties": False}, "maxItems": 300}, 0.5),
+    ({"type": "array", "items": {"type": "object", "properties": {"a": {"type": "boolean"}, "b": {"type": "null"}}, "required": ["a", "b"],
+                                 "additionalProperties": False}, "maxItems": 300}, 0.75),
+    ({"anyOf": [{"type": "string", "maxLength": 300}, {"type": "array", "items": {"type": "boolean"}, "maxItems": 150}]}, 0.2),   # (two chains at a time)
+    ({"type": "object", "properties": {"a": {"type": "string", "maxLength": 200}, "b": {"type": "string", "maxLength": 350}}, "required": ["a", "b"],
+      "additionalProperties": False}, 0.2),                                                                                     # (one after the other)
+])
+def test_a_schemas_chains_are_copied_into_its_order(schema, share, monkeypatch):
+    """A schema's own chains: so large a share of their states' places is copied, the order a walk of every state's, and the automaton the long way's."""
+    calls = []
+    real = token_lift._sparse_order_repeats
+    monkeypatch.setattr(token_lift, "_sparse_order_repeats", lambda *a: (calls.append((a, real(*a))), calls[-1][1])[1])
+    vocabulary = vocabulary_of(random.Random(2), pieces = LONG_TOKENS)
+    assert check(schema, vocabulary)
+    (args, (order, repeated)), = calls
+    assert np.array_equal(order, token_lift._sparse_order(*args[:10]))
+    assert repeated > share * order.size, (repeated, order.size)
+
