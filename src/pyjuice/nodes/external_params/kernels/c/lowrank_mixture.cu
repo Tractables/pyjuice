@@ -23,7 +23,8 @@
 //     expand_bw     data:        vnf[node, b K + r] = log f_b[node] + A_b[node, r] - log S_b[node]
 //                   normalizer:  vnf[node, b K + r] = log f_b[node] + A_b[node, r] - log Z_b[node]
 //     (plain backward on each half: virtual element flows `vef` -- stored, whatever the buffer held --; the data
-//      half's parameter flows are `F+`, the normalizer half's are the denominator flow `F-`)
+//      half's parameter flows are `F+`, the normalizer half's are the denominator flow `F-`, kept divided by the
+//      parameters: `take`)
 //     collapse_bw   element_flows[child, b] = logsumexp_r vef_data[child, b K + r]
 //
 // with the factors' gradients beside: `dA` from the two responsibilities the forward kept (each rank's share of S and
@@ -44,6 +45,7 @@
 #include <vector>
 #include <c10/cuda/CUDAStream.h>
 #include <c10/cuda/CUDAException.h>
+#include <cuda_bf16.h>
 
 namespace {
 
@@ -217,11 +219,17 @@ __global__ void sub_b_kernel(float* __restrict__ grad_b, const float* __restrict
     for (int r = 0; r < K; r++) g[(long)r * N] -= expf(fz[r]);
 }
 
-// dst += src; src = 0: the normalizer half's parameter flows taken into the denominator flow
-__global__ void take_kernel(float* __restrict__ dst, float* __restrict__ src, long n) {
+// dst += src / theta; src = 0: the normalizer half's parameter flows -- `theta * W`, the plain kernels' -- taken into
+// the denominator's statistic `W`, which is kept free of the parameters (a parameter of 0 has no flow: nothing)
+inline __device__ float as_float(float x) { return x; }
+inline __device__ float as_float(__nv_bfloat16 x) { return __bfloat162float(x); }
+
+template <typename TP>
+__global__ void take_kernel(float* __restrict__ dst, float* __restrict__ src, const TP* __restrict__ theta, long n) {
     const long t = (long)blockIdx.x * blockDim.x + threadIdx.x;
     if (t >= n) return;
-    dst[t] += src[t];
+    const float th = as_float(theta[t]);
+    if (th > 0.0f) dst[t] += src[t] / th;
     src[t] = 0.0f;
 }
 
@@ -378,12 +386,21 @@ void lowrank_sub_b_hosted(std::vector<c10::optional<torch::Tensor>> grads, torch
         if (grads[s].has_value()) lowrank_sub_b(*grads[s], vefz, (int64_t)s * B * K, eidz, B, K);
 }
 
-void lowrank_take(torch::Tensor dst, torch::Tensor src) {
+void lowrank_take(torch::Tensor dst, torch::Tensor src, torch::Tensor theta) {
     check(dst, "dst", torch::kFloat32, src.numel()); check(src, "src", torch::kFloat32, -1);
+    TORCH_CHECK(theta.is_cuda() && theta.is_contiguous() && theta.numel() == src.numel(),
+                "lowrank mixture: the parameters of the flows taken: ", theta.numel(), " for ", src.numel());
     const long n = src.numel();
     if (n == 0) return;
-    take_kernel<<<grid_of(n), THREADS, 0, at::cuda::getCurrentCUDAStream()>>>(
-        dst.data_ptr<float>(), src.data_ptr<float>(), n);
+    auto stream = at::cuda::getCurrentCUDAStream();
+    if (theta.scalar_type() == torch::kBFloat16) {
+        take_kernel<__nv_bfloat16><<<grid_of(n), THREADS, 0, stream>>>(
+            dst.data_ptr<float>(), src.data_ptr<float>(), (const __nv_bfloat16*)theta.data_ptr(), n);
+    } else {
+        TORCH_CHECK(theta.scalar_type() == torch::kFloat32, "lowrank mixture: parameters in fp32 or bf16");
+        take_kernel<float><<<grid_of(n), THREADS, 0, stream>>>(
+            dst.data_ptr<float>(), src.data_ptr<float>(), theta.data_ptr<float>(), n);
+    }
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
@@ -396,7 +413,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("lowrank_expand_bw", &lowrank_expand_bw, "virtual node flows (and dLL/dA from the kept responsibilities)");
     m.def("lowrank_collapse_bw", &lowrank_collapse_bw, "element flows from the virtual ones (and their part of dLL/dB)");
     m.def("lowrank_sub_b", &lowrank_sub_b, "a copy's normalizer part of dLL/dB, from the host's virtual element flows");
-    m.def("lowrank_take", &lowrank_take, "dst += src, src = 0");
+    m.def("lowrank_take", &lowrank_take, "dst += src / theta, src = 0");
     m.def("lowrank_backward_pre", &lowrank_backward_pre, "`lowrank_expand` and `lowrank_expand_bw`, one call");
     m.def("lowrank_sub_b_hosted", &lowrank_sub_b_hosted, "`lowrank_sub_b` for every copy a host holds");
 }

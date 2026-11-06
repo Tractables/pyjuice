@@ -21,7 +21,7 @@ import torch
 import pyjuice as juice
 import pyjuice.nodes.distributions as dists
 from pyjuice.nodes import inputs, multiply, summate
-from pyjuice.nodes import LowRankSumParams
+from pyjuice.nodes import LowRankSumParams, BlockScaleSumParams
 
 
 NUM_CATS = 6
@@ -566,6 +566,111 @@ def test_without_the_denominator_flow(form):
     after = _dense(sums_off[0], pc_off.get_node_params(sums_off[0]))
     assert _close(after, flows / flows.sum(dim = 1, keepdim = True), rtol = 1e-4, atol = 1e-6)
     assert not _close(after, before)
+
+
+# ---------------------------------------------------------------- the low-rank scale that is a BlockScale gate
+
+GATE_T, GATE_L, GATE_BS = 5, 16, 4
+GATE_NK = GATE_L // GATE_BS
+
+
+def _gated_chain(desc):
+    """A tied HMM of 16 latents in blocks of 4, its transitions carrying `desc`, registered as the group "tr"."""
+    torch.manual_seed(0)
+    trans = []
+    with juice.set_block_size(GATE_BS):
+        ni = inputs(GATE_T - 1, num_node_blocks = GATE_NK, dist = dists.Categorical(num_cats = NUM_CATS))
+        src, cur = None, ni
+        for var in range(GATE_T - 2, -1, -1):
+            cx = ni.duplicate(var, tie_params = True)
+            ns = summate(cur, num_node_blocks = GATE_NK, external_params = desc) if src is None \
+                else src.duplicate(cur, tie_params = True)
+            src = src or ns
+            trans.append(ns)
+            cur = multiply(cx, ns)
+        root = summate(cur, num_node_blocks = 1, block_size = 1)
+    torch.manual_seed(0)
+    root.init_parameters(perturbation = 2.0)
+    pc = juice.compile(root, verbose = False).to(torch.device("cuda:0"))
+    pc.register_external_params_group("tr", trans[::-1])
+    return pc, src
+
+
+def _gate_as_factors(gate, form):
+    """A BlockScale log gate `[B, n * NK, CK]` as low-rank factors of rank NK with the same scale: `A` picks a
+    node's block (its one-hot; in the mixture form its log), `B` holds the block's gate at every child."""
+    batch, n = gate.size(0), gate.size(1) // GATE_NK
+    onehot = torch.eye(GATE_NK, device = gate.device).repeat_interleave(GATE_BS, dim = 0)        # [L, NK]
+    A = onehot if form == "exp_sum" else torch.where(onehot > 0, 0.0, -60.0)
+    A = A[None, None].expand(batch, n, GATE_L, GATE_NK).reshape(batch, n * GATE_L, GATE_NK)
+    B = gate.view(batch, n, GATE_NK, GATE_NK).repeat_interleave(GATE_BS, dim = 3)                # a child's block
+    return A.contiguous(), B.reshape(batch, n * GATE_NK, GATE_L).contiguous()
+
+
+@pytest.mark.parametrize("form,virtual", [("exp_sum", False), ("sum_exp", False), ("sum_exp", True)])
+@pytest.mark.parametrize("momentum", [0.0, 0.9])
+def test_a_blockscale_gate_as_factors_trains_as_blockscale(form, virtual, momentum, monkeypatch):
+    """A low-rank scale of rank = the node blocks can BE a BlockScale gate: the same effective parameters per
+    sample, so the same training -- the shared parameters after every Anemone step, with momentum too. The momentum
+    is what tells how the denominator flow is kept: averaged over steps as `F-`, it carries the parameters of past
+    steps (3e-2 from BlockScale's after 16 steps, measured); kept free of them, as BlockScale's is, it is the same
+    update. The gate's gradient is the factors', summed over a gate's children."""
+    import pyjuice.nodes.external_params.lowrank_virtual as lowrank_virtual
+
+    if virtual and not _virtual_available():
+        pytest.skip("the low-rank mixture's CUDA extension is not built")
+    monkeypatch.setattr(lowrank_virtual, "ENABLED", virtual)
+    batch = 32
+    pc_g, src_g = _gated_chain(BlockScaleSumParams(block_size = GATE_BS, ch_block_size = GATE_BS))
+    pc_f, src_f = _gated_chain(LowRankSumParams(rank = GATE_NK, form = form))
+    assert torch.equal(pc_g.params, pc_f.params)
+    dev = pc_g.params.device
+    opts = [juice.optim.Anemone(pc, step_size = 0.5, momentum = momentum, niters_per_update = 1, pseudocount = 1e-6)
+            for pc in (pc_g, pc_f)]
+    g = torch.Generator(device = "cpu").manual_seed(1)
+    for step in range(8):
+        x = torch.randint(0, NUM_CATS, (batch, GATE_T), generator = g).to(dev)
+        gate = torch.log_softmax(1.5 * torch.randn(batch, (GATE_T - 1) * GATE_NK, GATE_NK, generator = g), -1).to(dev)
+        gate = gate.contiguous()
+        A, B = _gate_as_factors(gate, form)
+        grad_g, grad_f = torch.zeros_like(gate), (torch.zeros_like(A), torch.zeros_like(B))
+        ll_g = pc_g(x, sum_external_params = {"tr": gate})
+        ll_f = pc_f(x, sum_external_params = {"tr": (A, B)})
+        assert torch.allclose(ll_g, ll_f, rtol = 0, atol = 5e-3), f"step {step}: {float((ll_g - ll_f).abs().max())}"
+        pc_g.backward(x, allow_modify_flows = False, logspace_flows = True, sum_external_params_grad = {"tr": grad_g})
+        pc_f.backward(x, allow_modify_flows = False, logspace_flows = True, sum_external_params_grad = {"tr": grad_f})
+        assert type(pc_f.external_params_nodes[src_f].__dict__["_lr_state"]) is (tuple if virtual else dict)
+        # d LL / d log gate[block, child block] = the sum of d LL / d B[block, child] over the block's children
+        summed = grad_f[1].view(batch, GATE_T - 1, GATE_NK, GATE_NK, GATE_BS).sum(-1).reshape(gate.shape)
+        assert float((summed - grad_g).abs().max()) <= 3e-3 * float(grad_g.abs().max()), f"step {step}: gradient"
+        for opt in opts:
+            opt.step()
+        ps, pe = src_g._param_range
+        worst = float((pc_g.params[ps:pe] - pc_f.params[ps:pe]).abs().max())
+        assert worst < 2e-5, f"step {step + 1}: the shared parameters {worst} apart"
+
+
+@pytest.mark.parametrize("form", FORMS)
+def test_the_denominator_statistic_is_free_of_the_parameters(form):
+    """What the backward accumulates is `W = F- / theta`: read with other parameters, `F-` is those times the same
+    `W` -- the parameters of the pass that made it are not in it."""
+    rank, batch = 3, 6
+    pc, sums, _, _, _, _ = _pair("sparse", form, rank = rank)
+    dev = pc.params.device
+    torch.manual_seed(21)
+    data = torch.randint(0, NUM_CATS, (batch, pc.num_vars), device = dev)
+    ext = {a: _factors(a, rank, batch, dev, seed = 150 + i) for i, a in enumerate(sums)}
+    _passes(pc, sums, data, ext)
+    a = sums[0]
+    desc, sources = a.external_params, [(pc.external_params_nodes[a], a)]
+    ps, pe = a._param_range
+    before = desc.materialize_denom_flows(a, pc.params, pc.denom_param_flows, sources).clone()
+    other = pc.params.clone()
+    other[ps:pe] *= torch.rand(pe - ps, device = dev) + 0.5
+    after = desc.materialize_denom_flows(a, other, pc.denom_param_flows, sources)
+    assert float(before.sum()) > 1.0
+    assert torch.allclose(after / other[ps:pe], before / pc.params[ps:pe], rtol = 1e-5, atol = 1e-7)
+    assert not torch.allclose(after, before, rtol = 1e-2)
 
 
 # ---------------------------------------------------------------- "sum_exp" on the virtual batch (`lowrank_virtual`)

@@ -47,11 +47,22 @@ class LowRankSumParams(ExternalSumParams):
     concatenates both along axis 1: `A` over the members' nodes, `B` over their ranks.
 
     **Training.** The backward writes the element and parameter flows itself, and `d LL / d A`, `d LL / d B` into
-    the gradient buffers. With `apply_z_correction` it also accumulates the denominator flow
-    `F-[i, j] = sum_b f_b[i] * theta_b[i, j]`, and the M-step is the conditional `theta <- normalize(theta * F+ / F-)`
+    the gradient buffers. With `apply_z_correction` it also accumulates the denominator flow's statistic, and the
+    M-step is the conditional `theta <- normalize(theta * F+ / F-)`
     (:func:`~.external_params.ExternalSumParams.compute_em_correction`): `Z_b` depends on `theta`, so
-    `normalize(F+)` alone is not EM here, as for BlockScale. `F-` is kept in the parameter flows' layout: unlike
-    BlockScale's it has no smaller form.
+    `normalize(F+)` alone is not EM here, as for BlockScale. What is kept is
+
+    .. code-block:: text
+
+        W[i, j] = sum_b f_b[i] * g_b[i, j] / Z_b[i]            F-[i, j] = theta[i, j] * W[i, j]
+
+    in the parameter flows' layout (it has no smaller form here), FREE OF THE PARAMETERS as BlockScale's gate-space
+    statistic is, and multiplied by them when `F-` is read. That is what an optimizer averaging the flows over steps
+    needs (Anemone's momentum): the update is then `normalize(avg F+ / avg W)`, the M-step of the averaged
+    statistics. Kept as `F-` itself, the average would carry the parameters of past steps against the current ones
+    in `theta * F+ / F-` -- a parameter that grew is pushed further -- and the training is another: MEASURED, a
+    low-rank scale built to equal a BlockScale gate, Anemone with momentum 0.9, parameters against BlockScale's
+    after 16 steps 3e-2 apart that way, and the same to rounding this way and without momentum either way.
 
     :note: the passes here are plain torch -- dense per node vector, `exp_sum` over `[B, M, N]` in chunks of samples,
            `sum_exp` by float64 matmuls (a sample's child values spread over hundreds of nats, more than float32
@@ -307,7 +318,7 @@ class LowRankSumParams(ExternalSumParams):
 
             q_b[i, j]   = f_b[i] * theta_b[i, j] * c_b[j] / n_b[i]           # the flow along the edge
             element flow[j, b] = sum_i q_b[i, j]          F+[i, j] += sum_b q_b[i, j]
-            F-[i, j]   += sum_b f_b[i] * theta_b[i, j]                       # with `apply_z_correction`
+            W[i, j]    += sum_b f_b[i] * g_b[i, j] / Z_b[i]                  # with `apply_z_correction`: F- / theta
             dLL/dg-log  = q_b - f_b * theta_b                                # chained into dLL/dA, dLL/dB
 
         The element flows of a child several node vectors of the layer share add up.
@@ -382,6 +393,8 @@ class LowRankSumParams(ExternalSumParams):
                     q -= t                                                   # dLL / d log g
                     dA[s:e] = torch.bmm(q, Bm[s:e].transpose(1, 2))
                     dB[s:e] = torch.bmm(A[s:e].transpose(1, 2), q)
+        if want_denom:                                                       # sum_b f theta_b -> W, free of theta
+            Fm = torch.where(theta > 0, Fm / theta, torch.zeros_like(Fm))
         return torch.cat(lef, dim = 0), Fp, Fm, dA, dB
 
     def _backward_sum_exp(self, A, Bm, theta, lc, lf, ln, lz, want_flows, want_denom, want_grads):
@@ -400,8 +413,8 @@ class LowRankSumParams(ExternalSumParams):
             xb, sb, yb = self._mixture_terms(Bm, None, theta64)
             lv = self._log_ratio(lf, lz).double()
             pz = (lv[:, None, :] + At + sb).exp()                            # f e^A e^shift / Z
-            if want_denom:
-                Fm = (theta64 * torch.einsum("bri,brj->ij", pz, xb)).float()
+            if want_denom:                                                   # W: `F-` without its `theta`
+                Fm = torch.einsum("bri,brj->ij", pz, xb).float()
             if want_grads:
                 dA = (p * yc - pz * yb).transpose(1, 2).float()
                 dB = (xc * pt - xb * torch.matmul(pz, theta64)).float()
@@ -410,8 +423,8 @@ class LowRankSumParams(ExternalSumParams):
     # ------------------------------------------------------------------ denominators
 
     def _denom_offsets(self, layer):
-        """Per node vector of the layer: where its `F-` (the parameter flows' layout) and its top-down term (one
-        float a node) start in the circuit's denominator buffer."""
+        """Per node vector of the layer: where its `W` (`F- / theta`, the parameter flows' layout) and its top-down
+        term (one float a node) start in the circuit's denominator buffer."""
         cached = layer.__dict__.get("_lr_denom_offsets")
         if cached is None:
             base = layer.denom_flow_slices[0][0]
@@ -424,14 +437,14 @@ class LowRankSumParams(ExternalSumParams):
         return cached
 
     def denom_flow_sizes(self, layer) -> list:
-        """All of a layer's in its first forward partition's slice: per node vector, `F-` as the parameter flows lie,
-        then one float a node for the top-down term (:func:`accumulate_denom_top_down`)."""
+        """All of a layer's in its first forward partition's slice: per node vector, `W = F- / theta` as the parameter
+        flows lie, then one float a node for the top-down term (:func:`accumulate_denom_top_down`)."""
         total = sum(ns._param_flow_range[1] - ns._param_flow_range[0] + ns.num_nodes for ns in layer.nodes)
         return [total] + [0] * (layer.num_fw_partitions - 1)
 
     def accumulate_denom_top_down(self, layer, node_flows, denom_param_flows, scale) -> None:
-        """The top-down term `scale * P_td[i] * theta[i, j]` of `F+` belongs in `F-` too. `theta` is not at hand
-        here, so `scale * P_td[i]` is kept per node and multiplied in when `F-` is read
+        """The top-down term `scale * P_td[i] * theta[i, j]` of `F+` belongs in `F-` too: `scale * P_td[i]` is kept
+        per node -- its part of `W`, the same for every child -- and multiplied by the parameters when `F-` is read
         (:func:`materialize_denom_flows`)."""
         offsets = self._denom_offsets(layer)
         for ns in layer.nodes:
@@ -440,8 +453,8 @@ class LowRankSumParams(ExternalSumParams):
             denom_param_flows[off:off + ns.num_nodes] += node_flows[nid_start:nid_end].reshape(-1) * scale
 
     def materialize_denom_flows(self, ns, params, denom_param_flows, denom_sources, out = None):
-        """`F-` of `ns`'s parameters, as `param_flows[pfs:pfe]` lies: the sum over `ns` and its tied copies of what
-        each accumulated, and of their top-down terms times the parameters."""
+        """`F-` of `ns`'s parameters, as `param_flows[pfs:pfe]` lies: the parameters (as they are NOW) times the sum,
+        over `ns` and its tied copies, of the `W` each accumulated and of its top-down term."""
         size = ns._param_flow_range[1] - ns._param_flow_range[0]
         total = torch.zeros(size, dtype = denom_param_flows.dtype, device = denom_param_flows.device) if out is None \
             else out.zero_()
@@ -452,6 +465,8 @@ class LowRankSumParams(ExternalSumParams):
             total += denom_param_flows[off:off + size]
             top += denom_param_flows[td:td + ns.num_nodes]
             geo = self._geometry(layer, self._info(layer, member), denom_param_flows.device)
-        if geo is not None and bool((top != 0).any()):
-            total.index_add_(0, geo["local"], params[geo["pid"]].to(total.dtype) * top[geo["row"]])
+        if geo is not None:
+            total.index_add_(0, geo["local"], top[geo["row"]])
+            ps, pe = (ns.get_source_ns() if ns.is_tied() else ns)._param_range
+            total.mul_(params[ps:pe].to(total.dtype))
         return total

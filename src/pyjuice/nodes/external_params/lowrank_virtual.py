@@ -198,10 +198,10 @@ def forward(desc, layer, ns_tensors, node_mars, element_mars, params, kwargs, st
     return None
 
 
-def _take_denominators(mod, desc, layer, infos, scratch, denom_param_flows) -> None:
-    """The normalizer half's parameter flows, accumulated in `scratch` by a plain backward of `layer`, into the
-    layer's denominator flow (its node vectors' own slices, which lie as their parameter flows do); `scratch` zero
-    again."""
+def _take_denominators(mod, desc, layer, infos, scratch, denom_param_flows, params) -> None:
+    """The normalizer half's parameter flows, accumulated in `scratch` by a plain backward of `layer` -- `F-`, with
+    the parameters of this pass in it --, into the layer's denominator statistic `W = F- / theta` (its node vectors'
+    own slices, which lie as their parameter flows do, as their parameters do); `scratch` zero again."""
     offsets, taken = desc._denom_offsets(layer), set()
     for info in infos:
         pfs, pfe = info.ns._param_flow_range
@@ -209,11 +209,14 @@ def _take_denominators(mod, desc, layer, infos, scratch, denom_param_flows) -> N
             continue
         taken.add((pfs, pfe))
         off = offsets[id(info.ns)][0]
-        mod.lowrank_take(denom_param_flows[off:off + pfe - pfs], scratch[pfs:pfe])
+        ps, pe = _source(info.ns)._param_range
+        mod.lowrank_take(denom_param_flows[off:off + pfe - pfs], scratch[pfs:pfe], params[ps:pe])
 
 
 def _flush(mod, desc, group, bufs, cols, K, batch, params, param_flows, denom_param_flows, want_denom, precision) -> None:
-    """One plain backward of the host's layer over the normalizer columns of the copies written into its rows."""
+    """One plain backward of the host's layer over the normalizer columns of the copies written into its rows: its
+    parameter flows are the copies' `F-` summed (`W`, once divided by the parameters), its element flows their
+    gradients' normalizer part."""
     from pyjuice.layer.sum_layer import SumLayer
 
     layer, info, rows = group["host"]
@@ -231,7 +234,7 @@ def _flush(mod, desc, group, bufs, cols, K, batch, params, param_flows, denom_pa
         SumLayer.backward(layer, bufs["vnf_h"], bufs["vef_h"], bufs["zero_h"], bufs["vem_h"], params,
                           param_flows = scratch, logspace_flows = True, precision = precision)
         if want_denom:
-            _take_denominators(mod, desc, layer, [info], scratch, denom_param_flows)
+            _take_denominators(mod, desc, layer, [info], scratch, denom_param_flows, params)
         if want_grads:
             mod.lowrank_sub_b_hosted([None if grads is None else grads[1] for grads in members], bufs["vef_h"], rows,
                                      batch, K)
@@ -308,7 +311,8 @@ def backward(desc, layer, ns_tensors, ns_grad_tensors, node_flows, element_flows
             SumLayer.backward(layer, bufz["vnf_z"], bufz["vef_z"], bufs["zero"], bufz["vem_z"], params,
                               param_flows = scratch, logspace_flows = True, precision = precision)
             if want_denom:
-                _take_denominators(mod, desc, layer, [info for info, _ in ns_tensors], scratch, denom_param_flows)
+                _take_denominators(mod, desc, layer, [info for info, _ in ns_tensors], scratch, denom_param_flows,
+                                   params)
 
         for (info, _), grads in zip(ns_tensors, ns_grad_tensors):
             rows = desc._geometry(layer, info, dev)["rows"]
