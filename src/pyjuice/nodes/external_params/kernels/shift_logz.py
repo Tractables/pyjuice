@@ -1,7 +1,7 @@
 """
 The +-log-Z normalizer shift, in Triton.
 
-A port of `lowrank_shift_logz` from `c/lowrank_backward.cu`, with the same contract:
+A port of `shift_logz` from `c/shift_logz.cu`, with the same contract:
 
     node_mars[nids[r] + m, b] += sign * log_z[r, m, b]
 
@@ -45,7 +45,7 @@ def _shift_logz_kernel(node_mars, nids, log_z, batch_size, num_rows,
 
 
 def shift_logz_triton(node_mars, nids, log_z, block_size: int, sign: float) -> None:
-    """`node_mars[nids[r] + m, b] += sign * log_z[r, m, b]`, matching `lowrank_shift_logz` from the
+    """`node_mars[nids[r] + m, b] += sign * log_z[r, m, b]`, matching `shift_logz` from the
     CUDA extension argument for argument so the two are drop-in for each other."""
     batch_size = node_mars.size(1)
     num_rows = nids.size(0)
@@ -72,6 +72,6 @@ def shift_logz(node_mars, nids, log_z, block_size: int, sign: float) -> None:
 
     mod = get_module()
     if mod is not None:
-        mod.lowrank_shift_logz(node_mars, nids, log_z, block_size, sign)
+        mod.shift_logz(node_mars, nids, log_z, block_size, sign)
     else:
         shift_logz_triton(node_mars, nids, log_z, block_size, sign)

@@ -1,5 +1,5 @@
 """
-Lazy loader for the CUDA low-rank forward correction.
+Lazy loaders for the external parameterizations' CUDA kernels.
 
 Mirrors `pyjuice.layer.kernels.c`: the extension is JIT-compiled on first use, and if anything about
 the toolchain is missing (no `nvcc`, no compiler, compile error) the loader disables itself and the
@@ -222,8 +222,7 @@ def get_module():
     from pyjuice.utils.cuda_ext import jit_load
     try:
         _module = jit_load("pyjuice_external_params_cuda",
-                           sources = [os.path.join(_THIS_DIR, "lowrank_forward.cu"),
-                                      os.path.join(_THIS_DIR, "lowrank_backward.cu"),
+                           sources = [os.path.join(_THIS_DIR, "shift_logz.cu"),
                                       os.path.join(_THIS_DIR, "staging_transpose.cu"),
                                       os.path.join(_THIS_DIR, "bindings.cu")],
                            extra_cuda_cflags = flags, verbose = False)
@@ -244,7 +243,7 @@ def is_available() -> bool:
 
 # Separate from the plain one: the block-scale forward is a fork of pyjuice's CuTe sum kernel and needs
 # CUTLASS headers, an arch-specific `sm_XXa` flag and the driver API, none of which the plain kernels
-# want. Two extensions also means a CUTLASS-related failure cannot disable the low-rank kernels.
+# want. Two extensions also means a CUTLASS-related failure cannot disable the plain kernels.
 _cute_module = None
 _cute_attempted = False
 

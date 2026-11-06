@@ -712,7 +712,7 @@ class ExternalParamsSumLayer(SumLayer):
             for ns_info, _ in ns_tensors
         ]
 
-        # `pre_backward_layer` may change this layer's node values in place (BlockScale and LowRank shift them by log Z,
+        # `pre_backward_layer` may change this layer's node values in place (BlockScale shifts them by log Z,
         # undone in `post_backward_layer`), which a capture the deferral left on its side stream may still read -- a
         # tied layer's above, its products' children's values: it finishes first (`deferred_par.join_side`)
         deferred_par.join_side(node_mars.device)

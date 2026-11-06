@@ -145,8 +145,7 @@ class BlockScaleSumParams(_ForwardMixin, _BackwardMixin, _SampleMixin, _Denomina
         self.block_size = block_size
         self.ch_block_size = ch_block_size
 
-        # `Z = sum_c phi * theta` depends on `theta`, unlike the low-rank parameterization where the
-        # shared parameters' contribution to the normalizer was the constant 1. So the M-step pyjuice
+        # `Z = sum_c phi * theta` depends on `theta`. So the M-step pyjuice
         # performs -- normalize the flows per node -- solves a stationarity condition missing the term
         # `sum_b f_b * theta_b`, and is therefore not exactly EM under a live gate. Setting this makes
         # the layer accumulate that term too (`requests_denom_param_flows` -> the denominator flow,

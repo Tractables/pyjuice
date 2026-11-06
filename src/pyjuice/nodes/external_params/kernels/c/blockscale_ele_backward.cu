@@ -16,7 +16,7 @@
 //
 //   1. read `logT` instead of `node_mars`. NOT done here: `logT` is indexed identically to
 //      `node_mars`, so the caller shifts `node_mars` in place by `+log_z` around the backward
-//      (`lowrank_shift_logz`, already in the tree) and this kernel is none the wiser.
+//      (`shift_logz`, already in the tree) and this kernel is none the wiser.
 //   2. scale each parent's contribution by its gate. `phi` depends on the parent's EDGE BLOCK and on
 //      the child's gate index, so it is not constant over either MMA operand and cannot be folded into
 //      one. It does not have to be: the kernel already merges each k-tile through an online

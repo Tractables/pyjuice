@@ -340,8 +340,8 @@ class _CudaGraphsMixin:
         now, expanded through containers.
 
         Held by a recorded graph so that nothing its capture baked a pointer to can be freed while it may
-        still be replayed. A layer may drop a tensor from a cache after the capture -- BlockScale and
-        LowRank evict per-batch plans, each with its own `log Z` buffers -- and a replay would then write
+        still be replayed. A layer may drop a tensor from a cache after the capture -- BlockScale
+        evicts per-batch plans, each with its own `log Z` buffers -- and a replay would then write
         into memory since handed to something else.
         """
         refs = []

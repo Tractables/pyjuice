@@ -20,7 +20,7 @@ Two invariants come for free and pin down what the oracle cannot:
     launcher's autotuning safe.
 
 A portable Triton fork now covers every shape, so the parameterization itself needs no CUDA toolchain
-apart from the normalizer shift (`lowrank_shift_logz`, the one kernel here with no Triton port). These
+apart from the normalizer shift (`shift_logz`, the one kernel here with no Triton port). These
 tests still skip wholesale without the CuTe/TMA extension, because what they check is that all the
 forks agree with the oracle -- and the CuTe one is the fork most of them exercise. The Triton fork is
 pinned separately by `test_shapes_only_the_triton_fork_reaches` and
@@ -792,7 +792,7 @@ def test_the_whole_path_runs_without_any_cuda_extension():
 @cuda_only
 @pytest.mark.parametrize("rows,block_size,batch", [(4, 128, 128), (7, 64, 1), (3, 256, 512)])
 def test_the_logz_shift_port_matches_the_cuda_kernel(rows, block_size, batch):
-    """`shift_logz_triton` against `lowrank_shift_logz`, BIT for bit.
+    """`shift_logz_triton` against the CUDA `shift_logz`, BIT for bit.
 
     `sign` is exactly +-1, so the multiply is a negation or a no-op and the remaining add rounds once
     either way -- there is no reason for these to differ, and if they ever do, the gated backward's
@@ -813,7 +813,7 @@ def test_the_logz_shift_port_matches_the_cuda_kernel(rows, block_size, batch):
 
     for sign in (1.0, -1.0):
         cuda_out, triton_out = base.clone(), base.clone()
-        mod.lowrank_shift_logz(cuda_out, nids, log_z, block_size, sign)
+        mod.shift_logz(cuda_out, nids, log_z, block_size, sign)
         shift_logz_triton(triton_out, nids, log_z, block_size, sign)
         assert torch.equal(cuda_out, triton_out), \
             f"sign={sign}: max|d| = {(cuda_out - triton_out).abs().max().item()}"
