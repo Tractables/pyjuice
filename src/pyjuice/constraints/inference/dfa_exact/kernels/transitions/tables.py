@@ -3,6 +3,7 @@ The tables of a layout's transitions, built once per constraint: the boundaries 
 or by class, the enumerated tokens.
 """
 
+import dataclasses
 import weakref
 from functools import cached_property
 from typing import Optional, Tuple
@@ -306,8 +307,8 @@ class BoundaryGroups:
 
     def sweep(self, grouped: bool, codes = None, from_counts: bool = False) -> dict:
         """
-        One pass over every batch of groups, for what the tables hold (:func:`transition_tables`) but the lists by class and the enumerated entries (:meth:`class_lists`,
-        :meth:`enumerated_lists`, what few queries read, each a pass of its own): nothing of a batch is kept but its tables' segments, int32. The pairs need no sort
+        One pass over every batch of groups, for what the tables hold (:func:`transition_tables`) but the predecessors, the lists by class and the enumerated entries (:meth:`predecessors`,
+        :meth:`class_lists`, :meth:`enumerated_lists`, what few queries read, each a pass of its own): nothing of a batch is kept but its tables' segments, int32. The pairs need no sort
         (:attr:`pairs`). How many columns a class leads somewhere from, and how many enumerated entries a column has, come from the live pairs' class sets (:attr:`class_sets`):
         the ungrouped tables, one entry a move, read the moves. ``codes(counts, k, end)``: the classes' codes [end - k, C] (``counts``, those columns, if ``from_counts``), None
         without any: enumerated or not, a class is so at every group.
@@ -315,21 +316,15 @@ class BoundaryGroups:
         tr = self.tr
         C, W, n, dev = tr.C, tr.W, tr.n, tr.device
         counting = from_counts or self._class_columns is None
-        out = dict(succ = [], x = [], col = [], px = [], cls = [], pcls = [], entry_rows = [], pred_rows = [], enum_rows = [],
-                   sizes = [], esizes = [], pairs = [], max_pairs = [], max_enum = [], coded = codes is not None)
+        out = dict(succ = [], x = [], cls = [], entry_rows = [], enum_rows = [], sizes = [], esizes = [], pairs = [], max_pairs = [], max_enum = [], coded = codes is not None)
         counted = []
         reading = counting or codes is not None or not grouped
 
-        def with_predecessors(eg, eq, es, ex, rows):
-            """A batch's entries by group, column, then successor or class, and those leading to every next column: by group, successor, then what they were."""
-            Gb = rows.size(0)
-            by_succ = torch.argsort(_sort_key(eg * (W + 1) + es, Gb * (W + 1)), stable = True)
+        def with_entries(es, ex, rows):
+            """A batch's entries by group, column, then successor or class."""
             out["entry_rows"].append(rows)
-            out["pred_rows"].append(_rows_below(eg, es, Gb, W))
             out["succ"].append(es.to(torch.int32)); out["x"].append(ex.to(torch.int32))
-            out["col"].append(eq.index_select(0, by_succ).to(torch.int32)); out["px"].append(ex.index_select(0, by_succ).to(torch.int32))
             out["sizes"].append(rows[:, W])
-            return by_succ
 
         for k, end in self.batches:
             Gb = end - k
@@ -365,12 +360,12 @@ class BoundaryGroups:
                 found = rows[:, W]
                 if cols:
                     out["max_pairs"].append(on_col.max())
-                eg, eq, es = g.index_select(0, of_k), q.index_select(0, of_k), s[kept]
+                eg, es = g.index_select(0, of_k), s[kept]
                 if at_end is not None:
                     es = torch.where(at_end.index_select(0, of_k), torch.zeros_like(es), es)
-                with_predecessors(eg, eq, es, torch.arange(eg.numel(), device = dev) - (torch.cumsum(found, dim = 0) - found).index_select(0, eg), rows)
+                with_entries(es, torch.arange(eg.numel(), device = dev) - (torch.cumsum(found, dim = 0) - found).index_select(0, eg), rows)
                 out["pairs"].append(found)
-                del of_k, eg, eq, es, kept
+                del of_k, eg, es, kept
                 if code is not None:                                         # how many enumerated entries a column has
                     if of_l is not None:
                         enumerated = torch.bincount(in_set[code.index_select(0, member) < 0], minlength = S)
@@ -386,10 +381,8 @@ class BoundaryGroups:
             else:
                 if at_end is not None:
                     ms = torch.where(at_end.index_select(0, of_m), torch.zeros_like(ms), ms)
-                eg, eq = g.index_select(0, of_m), q.index_select(0, of_m)
-                by_succ = with_predecessors(eg, eq, ms, c if code is None else code, _rows_of(g, q, torch.bincount(of_m, minlength = cols), Gb, W))
-                out["cls"].append(c); out["pcls"].append(c.index_select(0, by_succ))
-                del eg, eq, by_succ
+                with_entries(ms, c if code is None else code, _rows_of(g, q, torch.bincount(of_m, minlength = cols), Gb, W))
+                out["cls"].append(c)
             del g, q, states, of, s, of_m, ms, c, class_key, pair_count, code, counts, of_l, sets
         for name in ("sizes", "esizes", "pairs"):                            # (each read once: every read waits for the device)
             out[name] = torch.cat(out[name]).tolist() if out[name] else []
@@ -404,6 +397,36 @@ class BoundaryGroups:
             self.by_class = dict(max_cls = int(counts.max()) if counts.numel() else 0,
                                  cls_order = torch.argsort(-counts, dim = 1, stable = True)[self.at].to(torch.int32).contiguous())
         return out
+
+    def predecessors(self, tt: TransitionTables) -> tuple:
+        """``(pred_ptr, pred_col, pred_x, pred_class)`` (:class:`TransitionTables`) of the tables ``tt``, from their entries as they lie, by group, column, then successor or class: those
+        leading to every next column, by group, successor, then what they were, a stable sort on the smallest keys that fit. No move read."""
+        tr = self.tr
+        W, n, dev = tr.W, tr.n, tr.device
+        ptr = tt.entry_ptr.view(n, W + 1)
+        firsts = torch.tensor(self.firsts, dtype = torch.long, device = dev)
+        sizes = (ptr[firsts, W] - ptr[firsts, 0]).tolist()
+        in_entries = np.concatenate([[0], np.cumsum(sizes)]).astype(np.int64).tolist()
+        columns = torch.arange(W, dtype = torch.int32, device = dev)
+        rows, cols, xs, classes = [], [], [], []
+        for k, end in self.batches:
+            Gb = end - k
+            a, b = in_entries[k], in_entries[end]
+            row = ptr[firsts[k:end]]
+            ints = torch.int32 if Gb * (W + 1) < 1 << 31 else torch.int64
+            eg = torch.repeat_interleave(torch.arange(Gb, dtype = ints, device = dev), (row[:, W] - row[:, 0]).long())
+            eq = torch.repeat_interleave(columns.repeat(Gb), (row[:, 1:] - row[:, :-1]).reshape(-1).long())
+            es = tt.entry_succ[a:b].to(ints)
+            by_succ = torch.argsort(_sort_key(eg * (W + 1) + es, Gb * (W + 1)), stable = True)
+            rows.append(_rows_below(eg, es, Gb, W))
+            cols.append(eq.index_select(0, by_succ))
+            xs.append(tt.entry_x[a:b].index_select(0, by_succ))
+            if tt.entry_class is not None:
+                classes.append(tt.entry_class[a:b].index_select(0, by_succ))
+            del row, eg, eq, es, by_succ
+        total = in_entries[-1]
+        return (_pointers(rows, sizes, self.at, n, W + 1, dev), _joined(cols, total, dev), _joined(xs, total, dev),
+                _joined(classes, total, dev) if tt.entry_class is not None else None)
 
     def class_lists(self) -> tuple:
         """``(cls_ptr, cls_col, cls_succ)`` (:class:`TransitionTables`), a pass of their own: every live pair's entries, one a class of its set (:attr:`class_sets`), by group, class,
@@ -588,9 +611,10 @@ def transition_tables(tr, grouped: bool, enum: Optional[EnumeratedTokens] = None
     accepted string, most boundaries are alike: a JSON Schema automaton of 24k states has 81 distinct of 1024. The
     distinct boundaries are built together, in batches (:data:`BOUNDARY_BATCH`).
 
-    ``lists`` False, on the device: neither the lists by class (``cls_ptr``, ``cls_col``, ``cls_succ``) nor the enumerated entries (``enum_ptr``, ``enum_e``, ``enum_pair``): None.
-    They are most of the tables and few queries read them: a conditional's class weights the first (:meth:`~...compiled.program.Program.class_lists`), and masses by column
-    signature those of few columns of the others (:meth:`~...compiled.program.Program.enum_lists`, :meth:`BoundaryGroups.enumerated_of`).
+    ``lists`` False, on the device: neither the predecessors (``pred_ptr``, ``pred_col``, ``pred_x``, ``pred_class``), nor the lists by class (``cls_ptr``, ``cls_col``, ``cls_succ``), nor
+    the enumerated entries (``enum_ptr``, ``enum_e``, ``enum_pair``): None. They are most of the tables and few queries read them: a top-down pass, or a forward with ``block @ input``
+    steps, the first (:meth:`~...compiled.program.Program.pred_lists`), a conditional's class weights the second (:meth:`~...compiled.program.Program.class_lists`), and masses by column
+    signature those of few columns of the last (:meth:`~...compiled.program.Program.enum_lists`, :meth:`BoundaryGroups.enumerated_of`).
     """
     if isinstance(boundary_groups(tr), HostTables):
         return boundary_groups(tr).transition_tables(grouped, enum)
@@ -617,10 +641,13 @@ def transition_tables(tr, grouped: bool, enum: Optional[EnumeratedTokens] = None
             enum_ptr = pointers(out["enum_rows"], esizes)
             enum_e, enum_pair = groups.enumerated_lists(code)
     cls_ptr, cls_col, cls_succ = groups.class_lists() if lists else (None, None, None)
-    return TransitionTables(grouped = grouped, entry_ptr = pointers(out["entry_rows"], sizes), entry_succ = _joined(out["succ"], base, dev),
-                            entry_x = _joined(out["x"], base, dev), pred_ptr = pointers(out["pred_rows"], sizes), pred_col = _joined(out["col"], base, dev),
-                            pred_x = _joined(out["px"], base, dev), num_pairs = [out["pairs"][g] for g in group] if grouped else [],
-                            max_pairs = out["max_pairs"], enum_ptr = enum_ptr, enum_e = enum_e, enum_pair = enum_pair, max_enum = out["max_enum"],
-                            cls_ptr = cls_ptr, cls_col = cls_col, cls_succ = cls_succ, **groups.by_class, entry_class = None if grouped else _joined(out["cls"], base, dev),
-                            pred_class = None if grouped else _joined(out["pcls"], base, dev),
-                            boundary_base = torch.from_numpy(per_boundary).to(dev), num_entries = int(per_boundary[-1]))
+    tables = TransitionTables(grouped = grouped, entry_ptr = pointers(out["entry_rows"], sizes), entry_succ = _joined(out["succ"], base, dev),
+                              entry_x = _joined(out["x"], base, dev), pred_ptr = None, pred_col = None,
+                              pred_x = None, num_pairs = [out["pairs"][g] for g in group] if grouped else [],
+                              max_pairs = out["max_pairs"], enum_ptr = enum_ptr, enum_e = enum_e, enum_pair = enum_pair, max_enum = out["max_enum"],
+                              cls_ptr = cls_ptr, cls_col = cls_col, cls_succ = cls_succ, **groups.by_class, entry_class = None if grouped else _joined(out["cls"], base, dev),
+                              boundary_base = torch.from_numpy(per_boundary).to(dev), num_entries = int(per_boundary[-1]))
+    if lists:
+        pred_ptr, pred_col, pred_x, pred_class = groups.predecessors(tables)
+        tables = dataclasses.replace(tables, pred_ptr = pred_ptr, pred_col = pred_col, pred_x = pred_x, pred_class = pred_class)
+    return tables

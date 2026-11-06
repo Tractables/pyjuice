@@ -192,10 +192,11 @@ def run_products(stages, bufs, prog, regions, element_mars, node_mars, masses, o
                     else:
                         l_kind, out_temp, (out_full, l_full) = kinds
                         tile = _flat_tile(lanes)
+                        pred_ptr, pred_col, _, _ = prog.pred_lists()
                         for first, size in grid_chunks(host_cdiv(lanes, tile), 1):
                             _block_input_kernel[(cnt, size)](
                                 element_mars, node_mars, temp, obs_class, prog.next_col_arg, prog.delta, prog.state_id,
-                                    prog.col_of_state, **margs, pred_ptr = tt.pred_ptr, pred_col = tt.pred_col,
+                                    prog.col_of_state, **margs, pred_ptr = pred_ptr, pred_col = pred_col,
                                 pred_x = prog.mass_x("pred_x"), width = prog.width_t, iv_of = ivs.of, iv_info = ivs.info,
                                 iv_table = ivs.table, live = live, steps = part, B = B, n = n, W = W,
                                 C = C, K = prog.K, input_start = prog.input_start, pid0 = first, HOMOGENEOUS = prog.homogeneous, L_KIND = l_kind,

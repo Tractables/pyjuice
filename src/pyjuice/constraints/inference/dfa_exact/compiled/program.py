@@ -200,6 +200,7 @@ class Program:
         self.entry_loop = entry_loop(self.transition_stats, self.C)    # ungrouped kernels: entries, or every class
         self.trans_pairs = pairs
         self._tr, self._ungrouped, self._enum_lists, self._class_lists = tr, None, None, None
+        self._pred_lists = {}                                               # (by form of the tables)
         steps_t = assembly.steps_host                                       # input steps per position
         self.pos_steps = assembly.pos_steps                                 # int64 [n]
         self.pairs_t = pairs.to(dev)                                        # int64 [n]: the boundaries' pairs
@@ -275,8 +276,12 @@ class Program:
         """The query's tables' ``entry_x`` or ``pred_x`` (``kind``) as the grouped kernels index the masses with them:
         the pairs' signature slots under masses by column signature (:attr:`trans_sig`), else the tables' own."""
         if self.trans_grouped and self.trans_layout is None and self.trans_sig is not None:
-            return getattr(self.trans_sig, kind)
-        return getattr(self.trans, kind)
+            sig = self.trans_sig
+            if kind == "pred_x" and sig.pred_x is None:
+                from ..kernels.transitions import signatures as TS
+                sig.pred_x = TS.predecessor_slots(self, sig)
+            return getattr(sig, kind)
+        return self.pred_lists()[2] if kind == "pred_x" else getattr(self.trans, kind)
 
     def signature_layout(self, masses):
         """The :class:`~..kernels.transitions.signatures.SignatureMasses` of ``masses``' row map (one set), or None
@@ -298,6 +303,17 @@ class Program:
     def trans(self):
         """The query's transition tables: the grouped, or the ungrouped, as :meth:`transitions` says; these are a whole pass over the moves, made when first read."""
         return self.succ if self.trans_grouped else self.ungrouped_tables()
+
+    def pred_lists(self, tables = None) -> tuple:
+        """``(pred_ptr, pred_col, pred_x, pred_class)`` of ``tables``, the query's by default (:class:`~..kernels.transitions.TransitionTables`): on the device, made from their entries when
+        first asked for, and kept: half of a table's bytes, which a forward by ``input @ block`` steps alone, an HMM's, never reads."""
+        tt = self.trans if tables is None else tables
+        if tt.pred_col is not None:
+            return tt.pred_ptr, tt.pred_col, tt.pred_x, tt.pred_class
+        kept = self._pred_lists.get(tt.grouped)
+        if kept is None:
+            kept = self._pred_lists[tt.grouped] = boundary_groups(self._tr).predecessors(tt)
+        return kept
 
     def enum_lists(self) -> tuple:
         """``(enum_ptr, enum_e, enum_pair)`` of every column (:class:`~..kernels.transitions.TransitionTables`): on the device, a pass over the moves when first asked for: masses

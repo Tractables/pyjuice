@@ -82,7 +82,7 @@ def _input_block_boundaries(la: TopDownLaunch, prog) -> tuple:
     kept = getattr(prog, "walk_entries", None)
     if kept is None:
         n, W = prog.n, prog.W
-        pp = prog.ungrouped_tables().pred_ptr.view(n, W + 1)           # (the CUDA walk runs ungrouped: every boundary's predecessors)
+        pp = prog.ungrouped_tables().entry_ptr.view(n, W + 1)          # (the CUDA walk runs ungrouped: every boundary's predecessors, as many as its entries)
         counts = (pp[:, W].long() - pp[:, 0].long()).cpu().numpy()
         flat, run, places, firsts, runs, sizes = prog.assembly.top_down.shared["walk_entries"]
         entries = counts[flat]
@@ -175,13 +175,14 @@ def _input_block_cuda(la: TopDownLaunch, tiles: torch.Tensor, height: int, prog,
         return None
     ws, done = _work_space(prog, space, T * B)
     defer = _defer_space(prog, 2 + 2 * (tiles.numel() // NODE_TILE) * (height // tn) * B)
-    tt, ivs = prog.trans_top_down, prog.intervals
+    ivs = prog.intervals
+    pred_ptr, pred_col, pred_x, pred_class = prog.pred_lists(prog.trans_top_down)
     c_kind, out_temp, (c_full, out_full) = la.kinds
     sample = masses.batch > 1
-    classes = allowed is not None and tt.pred_class is not None
+    classes = allowed is not None and pred_class is not None
     a_stride = n * C if classes and allowed.size(0) > 1 else 0               # (one set: every sample's)
     mod.ibtd_cuda(element_flows, temp_flows, node_flows, node_mars, obs_class, masses.table, masses.row,
-                  masses.stride if sample else masses.row, tt.pred_ptr, tt.pred_col, tt.pred_x, prog.width_t, ivs.of,
+                  masses.stride if sample else masses.row, pred_ptr, pred_col, pred_x, prog.width_t, ivs.of,
                   ivs.info, ivs.table, once_iv, compact.off, compact.count, compact.start, compact.columns,
                   compact.rank, la.children, tiles, la.ptr, la.parents, common["reg_offset"], common["reg_width"],
                   common["reg_first"], st["tlist"], st["t2i"], ecum_t, ws[:nterms],
@@ -191,6 +192,6 @@ def _input_block_cuda(la: TopDownLaunch, tiles: torch.Tensor, height: int, prog,
                   height // tn, tn, threads, warps, not warps, lp, cq, sample, c_kind, out_temp, c_full, out_full,
                   ea["code"], ea["tok_ptr"], ea["eidx"], ea["eprobs"], ea["prow"], ea["lognorm"], ea["enum_logw"],
                   ea["Cs"], mw, ea["num_enum"], ea["logw_stride"], ea["LOGW"],
-                  tt.pred_class if classes else tt.pred_x, allowed if classes else obs_class, a_stride, classes,
+                  pred_class if classes else pred_x, allowed if classes else obs_class, a_stride, classes,
                   ms, defer, INPUT_BLOCK_CUDA_DEFER_CTAS)
     return dict(tn = tn, threads = threads, warps = warps, smem = staged(tn) * (8 if warps else 1), codes = ms)

@@ -209,6 +209,7 @@ def test_the_moves_past_what_the_class_sets_may_take_say_the_same(seed, enumerat
             assert bool(read) == (most < terms), (seed, n, most, terms)
             groups = TR.boundary_groups(off)
             made = dict(zip(LISTS[3:], groups.class_lists()))
+            made.update(zip(PREDECESSORS, groups.predecessors(got)))
             if en.on:
                 made.update(zip(LISTS[:3], (groups.enumerated_pointers(en), *groups.enumerated_lists(en.code.long()))))
             assert_same(want, dataclasses.replace(got, **made), f"{seed} {n} {most}")
@@ -257,6 +258,7 @@ def test_the_enumerated_tokens_and_the_grouped_tables_take_one_pass(monkeypatch)
 
 
 LISTS = ("enum_ptr", "enum_e", "enum_pair", "cls_ptr", "cls_col", "cls_succ")
+PREDECESSORS = ("pred_ptr", "pred_col", "pred_x", "pred_class")
 
 
 @pytest.mark.parametrize("grouped", [True, False])
@@ -273,11 +275,12 @@ def test_tables_without_the_lists_are_the_tables_and_the_lists_come_when_asked_f
     en = TR.enumerated_tokens(off, classes)
     assert passes == [True]
     without = TR.transition_tables(off, grouped, en, lists = False)
-    assert all(getattr(without, f) is None for f in LISTS) and passes == ([True] if grouped else [True, False])
+    assert all(getattr(without, f) is None for f in LISTS + PREDECESSORS) and passes == ([True] if grouped else [True, False])
     want = TR.transition_tables(tr, grouped, TR.enumerated_tokens(tr, classes))
     groups = TR.boundary_groups(off)
     stats = TR.transition_stats(off)
     made = dict(zip(LISTS[3:], groups.class_lists()))
+    made.update(zip(PREDECESSORS, groups.predecessors(without)))
     if grouped:
         made.update(zip(LISTS[:3], (groups.enumerated_pointers(en), *groups.enumerated_lists(en.code.long()))))
     assert_same(want, dataclasses.replace(without, **made), "the lists when asked for")
@@ -436,16 +439,17 @@ def whole(prog, tables = None):
     """A program's tables, the grouped by default, with every list they have elsewhere: on the device those come when asked for."""
     tables = prog.succ if tables is None else tables
     cls_ptr, cls_col, cls_succ = prog.class_lists()
-    tables = dataclasses.replace(tables, cls_ptr = cls_ptr, cls_col = cls_col, cls_succ = cls_succ)
+    tables = dataclasses.replace(tables, cls_ptr = cls_ptr, cls_col = cls_col, cls_succ = cls_succ, **dict(zip(PREDECESSORS, prog.pred_lists(tables))))
     if not tables.grouped:
         return tables
     ptr, e, pair = prog.enum_lists()
     return dataclasses.replace(tables, enum_ptr = ptr, enum_e = e, enum_pair = pair)
 
 
-def as_on_the_host(sig):
-    """A signature layout without its own lists, which only the device's has."""
-    return dataclasses.replace(sig, rep_enum_ptr = None, rep_enum_e = None, rep_enum_pair = None)
+def as_on_the_host(sig, prog):
+    """A signature layout without its own lists, which only the device's has, and with the predecessors' slots, which it has when read."""
+    assert sig.pred_x is None
+    return dataclasses.replace(sig, pred_x = TS.predecessor_slots(prog, sig), rep_enum_ptr = None, rep_enum_e = None, rep_enum_pair = None)
 
 
 def assert_lists_of_representatives(prog, sig):
@@ -500,7 +504,7 @@ def test_a_programs_signature_layout_is_the_devices(kind, n, name, build_pc, mon
     assert on_host and not off
     assert (sig is None) == (sig_off is None)
     if sig is not None:
-        assert_same(sig, as_on_the_host(sig_off), f"signature {kind} {name}")
+        assert_same(sig, as_on_the_host(sig_off, prog_off), f"signature {kind} {name}")
         assert_lists_of_representatives(prog_off, sig_off)
     assert_same(prog.succ, whole(prog_off), f"succ {kind} {name}")
     for field in ("enum", "next_col"):
@@ -550,7 +554,7 @@ def test_signatures_of_enumerated_tokens_and_of_positions_apart_are_the_devices(
         assert (sig is None) == (sig_off is None), seed
         if sig is None:                                        # (a position without steps, say: nothing to lay out)
             continue
-        assert_same(sig, as_on_the_host(sig_off), f"signature {kind} {seed}")
+        assert_same(sig, as_on_the_host(sig_off, prog_off), f"signature {kind} {seed}")
         assert_lists_of_representatives(prog_off, sig_off)
         compared += 1
         enumerated += prog.enum.num > 0
@@ -601,7 +605,7 @@ def test_the_order_of_signatures_only_a_hash_tells_apart_is_the_hosts(build_pc, 
         prog = cc.backend.program()
         made.append(TS.signature_masses(prog, cc.backend.state.masses(), prog.trans_size))
     assert made[0] is not None and int(made[0].pairs.max()) >= 2 * m     # (at least these, two pairs each)
-    assert_same(made[0], as_on_the_host(made[1]), "signatures")
+    assert_same(made[0], as_on_the_host(made[1], prog), "signatures")
 
 
 def test_representatives_of_positions_of_classes_in_turn_are_by_position(build_pc, monkeypatch):
@@ -629,7 +633,7 @@ def test_representatives_of_positions_of_classes_in_turn_are_by_position(build_p
             prog = cc.backend.program()
             made.append((TS.signature_masses(prog, cc.backend.state.masses(), prog.trans_size), cc, prog))
         if len(made) == 2 and made[0][0] is not None:
-            assert_same(made[0][0], as_on_the_host(made[1][0]), f"{seed}")
+            assert_same(made[0][0], as_on_the_host(made[1][0], made[1][2]), f"{seed}")
             rep_t = torch.repeat_interleave(torch.arange(n, device = DEV), made[1][0].rep_ptr[1:] - made[1][0].rep_ptr[:-1])
             apart += len(TR.boundary_groups(made[1][2]._tr).firsts) >= 4 and rep_t.numel() > 0
     assert apart >= 2, apart
@@ -644,7 +648,7 @@ def test_a_table_of_no_entries_keeps_its_one_zero_in_a_signature_layout(entries,
     assert not cc.backend.layout.satisfiable
     prog = cc.backend.program()
     sig = TS.signature_masses(prog, cc.backend.state.masses(), prog.trans_size)
-    assert sig is None or (sig.entry_x.tolist() == [0] and sig.pred_x.tolist() == [0])
+    assert sig is None or (sig.entry_x.tolist() == [0] and (sig.pred_x if sig.pred_x is not None else TS.predecessor_slots(prog, sig)).tolist() == [0])
 
 
 def test_two_groups_with_columns_alike_share_their_signatures(build_pc):
@@ -701,10 +705,47 @@ def test_a_program_takes_one_pass_reads_no_move_and_no_list(build_pc, monkeypatc
 
     def not_read(self, *a):
         raise AssertionError("a list, for a program")
-    for name in ("class_lists", "enumerated_lists", "enumerated_pointers", "_live_moves"):
+    for name in ("class_lists", "enumerated_lists", "enumerated_pointers", "predecessors", "_live_moves"):
         monkeypatch.setattr(TR.tables.BoundaryGroups, name, not_read)
     prog = jc.compile(jc.DFA.contains([[1, 2]], 5), build_pc("hmm", 8, 5)).backend.program()
-    assert prog.enum.on and passes == [True] and all(getattr(prog.succ, f) is None for f in LISTS)
+    assert prog.enum.on and passes == [True] and all(getattr(prog.succ, f) is None for f in LISTS + PREDECESSORS)
+
+
+@pytest.mark.parametrize("kind, n", CASES)
+def test_the_predecessors_come_when_first_read(kind, n, build_pc, monkeypatch):
+    """A forward by ``input @ block`` steps alone, an HMM's, reads none, of either form of the tables; a ``block @ input`` step or a top-down pass does, once, and the program keeps
+    them. To the bit as tables made on the host do, whichever form the query takes."""
+    V = 3
+    pc = build_pc(kind, n, V)
+    x = torch.zeros(2, n, dtype = torch.long, device = DEV)
+    missing = torch.zeros_like(x, dtype = torch.bool)
+    missing[:, n // 2:] = True
+    dfa = lambda: jc.Not(jc.DFA.contains([[2, 2]], V))
+    monkeypatch.setattr(H, "HOST_ENTRIES", 1 << 20)
+    cc = jc.compile(dfa(), pc)
+    assert cc.backend.program().succ.pred_col is not None
+    want_m, want_c = cc.marginal(x, missing).clone(), cc.conditional(x, missing).clone()
+    monkeypatch.setattr(H, "HOST_ENTRIES", 0)
+    calls = []
+    predecessors = TR.tables.BoundaryGroups.predecessors
+    monkeypatch.setattr(TR.tables.BoundaryGroups, "predecessors", lambda self, tt: (calls.append(tt), predecessors(self, tt))[1])
+    cc = jc.compile(dfa(), pc)
+    prog = cc.backend.program()
+    assert not calls and prog.succ.pred_col is None
+    got_m = cc.marginal(x, missing).clone()
+    assert torch.equal(got_m, want_m)
+    assert prog.trans.pred_col is None
+    forward_reads = any(la.form == "block_input" for la in prog.assembly.launches)
+    assert bool(calls) == forward_reads, (kind, [la.form for la in prog.assembly.launches][:6])
+    if kind == "hmm":
+        assert not forward_reads
+    got_c = cc.conditional(x, missing)
+    assert torch.equal(got_c, want_c)
+    assert len(calls) == len({t.grouped for t in calls})                    # (once a form of the tables: a query takes its own)
+    if kind == "hmm":
+        assert calls                                                        # (a tree of no such step needs none)
+    held, made = prog.pred_lists(), max(len(calls), 1)
+    assert torch.equal(cc.conditional(x, missing), want_c) and prog.pred_lists() is held and len(calls) == made
 
 
 def test_the_lists_by_class_come_with_a_first_conditional(build_pc, monkeypatch):

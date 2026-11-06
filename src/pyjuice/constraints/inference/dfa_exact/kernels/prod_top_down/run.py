@@ -107,7 +107,7 @@ def run_top_down(launches, bufs, prog, regions, element_flows, temp_flows, node_
             tile = max(16, min(_flat_tile(max(lanes_max, 1)), TOP_DOWN_TILE_LANES // tn))
             kernel = _input_block_top_down_kernel if la.form == "input_block" else _block_input_top_down_kernel
             pdl = pdl_launch(element_flows.device)
-            tables = (tt.pred_ptr, tt.pred_col, prog.mass_x("pred_x")) if la.form == "input_block" else \
+            tables = (*prog.pred_lists()[:2], prog.mass_x("pred_x")) if la.form == "input_block" else \
                 (tt.entry_ptr, tt.entry_succ, prog.mass_x("entry_x"))
             for first, size in grid_chunks(host_cdiv(lanes_max, tile), 1):
                 kernel[(tiles.numel() // NODE_TILE * (height // tn), size)](

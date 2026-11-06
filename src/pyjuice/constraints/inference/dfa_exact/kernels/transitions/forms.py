@@ -55,7 +55,7 @@ class TransitionTables:
     :ivar entry_succ, entry_x: [entries] int32, every entry's successor column and where its mass is: its class's
         code, or its pair's number within the boundary
     :ivar pred_ptr, pred_col, pred_x: the entries leading to column ``j`` at ``t + 1``, as a CSR (``pred_ptr``
-        [n, W + 1]) into their columns and their mass indices
+        [n, W + 1]) into their columns and their mass indices. Not in a program's tables, on the device, until read (:meth:`~..compiled.program.Program.pred_lists`)
     :ivar num_pairs: grouped only, pairs per boundary (Python ints)
     :ivar max_pairs: grouped only, the most pairs of any column
     :ivar enum_ptr, enum_e, enum_pair: grouped only, the enumerated classes' live entries of every column, as a CSR
@@ -82,9 +82,9 @@ class TransitionTables:
     entry_ptr: torch.Tensor
     entry_succ: torch.Tensor
     entry_x: torch.Tensor
-    pred_ptr: torch.Tensor
-    pred_col: torch.Tensor
-    pred_x: torch.Tensor
+    pred_ptr: Optional[torch.Tensor]
+    pred_col: Optional[torch.Tensor]
+    pred_x: Optional[torch.Tensor]
     num_pairs: list
     max_pairs: int
     enum_ptr: Optional[torch.Tensor] = None

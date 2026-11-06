@@ -53,7 +53,7 @@ class SignatureMasses:
     :ivar pair_off, pairs: int64 [n] on the device: position ``t``'s steps' masses start at ``pair_off[t]``, a step's
         ``pairs[t]`` floats after the previous rank's (its class's first float; the signatures' slots)
     :ivar entry_x, pred_x: int32 on the device, the grouped tables' entries' and predecessors' mass indices: their
-        pair's signature slot
+        pair's signature slot (``pred_x``, built on the device, None until read: :func:`predecessor_slots`)
     :ivar size: the floats of the masses
     :ivar job: the representative columns' steps, as :func:`~.transitions.transition_job` cuts them
     :ivar rep_ptr, rep_col, rep_shift: the representative columns at every position (``rep_ptr`` int32 [n + 1] into
@@ -67,7 +67,7 @@ class SignatureMasses:
     pair_off: torch.Tensor
     pairs: torch.Tensor
     entry_x: torch.Tensor
-    pred_x: torch.Tensor
+    pred_x: Optional[torch.Tensor]
     size: int
     job: tuple
     rep_ptr: torch.Tensor
@@ -282,12 +282,8 @@ def signature_masses(prog, masses, trans_size: int) -> Optional[SignatureMasses]
     rep_ptr = torch.cat([torch.zeros(1, dtype = torch.int64, device = dev), torch.cumsum(rep_count, dim = 0)])
     del read, visit, within, rows, group, seen, reps, rep_row, of_group, T, Q, es, gfirst
 
-    # the entries' and predecessors' mass indices: their pair's slot, a predecessor's by its pair's number in its group (none: a table's one 0, as it lies)
-    exs, pxs = tt.entry_x, tt.pred_x
-    if entries:
-        exs = _ranges(sig_off.to(torch.int32).index_select(0, sig), npairs, entries)
-        in_group = torch.tensor(in_entries, dtype = torch.long, device = dev)
-        pxs = exs.index_select(0, torch.repeat_interleave(base, in_group[1:] - in_group[:-1]) + tt.pred_x)
+    # the entries' mass indices: their pair's slot (none: a table's one 0, as it lies)
+    exs = _ranges(sig_off.to(torch.int32).index_select(0, sig), npairs, entries) if entries else tt.entry_x
 
     # the representatives' steps: every step of a position with one, as `transition_job` cuts them
     kept = torch.unique(rep_t)
@@ -300,11 +296,23 @@ def signature_masses(prog, masses, trans_size: int) -> Optional[SignatureMasses]
     if enum:                                                       # (their enumerated entries, the only ones read)
         lists = groups.enumerated_of(rep_t, rep_q, rep_first, en.code.long())
     return SignatureMasses(pair_off = torch.from_numpy(pair_off).to(dev), pairs = torch.from_numpy(pairs).to(dev),
-                           entry_x = i32(exs), pred_x = i32(pxs), size = size,
+                           entry_x = i32(exs), pred_x = None, size = size,
                            job = (rep_rows, i32(job_tiles(kept, prog.pos_steps[kept], TS)), TS), rep_ptr = i32(rep_ptr),
                            rep_col = i32(rep_q), rep_shift = rep_shift.contiguous(),
                            max_reps = int(rep_count.max()) if rep_count.numel() else 0,
                            saving = trans_size / max(size, 1), rep_enum_ptr = lists[0], rep_enum_e = lists[1], rep_enum_pair = lists[2])
+
+
+def predecessor_slots(prog, sig: SignatureMasses) -> torch.Tensor:
+    """:attr:`SignatureMasses.pred_x` of ``prog``'s grouped tables, when first read: a predecessor's slot is its pair's, by its number in its group (none: a table's one 0, as it lies)."""
+    tt = prog.succ
+    _, _, pred_x, _ = prog.pred_lists(tt)
+    groups = boundary_groups(prog._tr)
+    firsts = torch.tensor(groups.firsts, dtype = torch.long, device = prog.dev)
+    entry_ptr = tt.entry_ptr.view(prog.n, prog.W + 1)
+    base = entry_ptr[firsts, 0]
+    in_group = (entry_ptr[firsts, prog.W] - base).long()
+    return sig.entry_x.index_select(0, torch.repeat_interleave(base, in_group) + pred_x).contiguous() if int(in_group.sum()) else pred_x
 
 
 def _on_the_host(prog, masses, trans_size: int, host) -> Optional[SignatureMasses]:
