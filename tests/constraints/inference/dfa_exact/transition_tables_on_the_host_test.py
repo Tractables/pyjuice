@@ -6,6 +6,7 @@ import dataclasses
 import gc
 import weakref
 
+import numpy as np
 import pytest
 import torch
 
@@ -118,6 +119,100 @@ def test_a_states_pairs_are_the_successors_of_its_moves(seed):
         want = sorted(set(moves[here].tolist()), key = rank.__getitem__)
         assert succ[start[x]:start[x] + count[x]].tolist() == want, (seed, x)
         assert succ[start[x] + of_move[here].long()].tolist() == moves[here].tolist(), (seed, x)
+
+
+def assert_class_sets_are_the_pairs(groups):
+    """Against the moves, a pair at a time: its set's classes are those leading to it, ascending, and pairs of one set lead by one set of classes."""
+    state, moves, cls = groups.state.tolist(), groups.succ.tolist(), groups.cls.tolist()
+    count, start, succ, of_move = groups.pairs
+    of_pair, member, in_set, first, size = groups.class_sets
+    assert of_pair.dtype == torch.int32 and member.dtype == torch.int32 and of_pair.numel() == succ.numel()
+    assert first.numel() == size.numel() and int(size.sum()) == member.numel() == in_set.numel()
+    by_pair = {}
+    for x, c, m in zip(state, cls, of_move.tolist()):
+        by_pair.setdefault(int(start[x]) + m, []).append(c)
+    sets = {}
+    for pair, classes in by_pair.items():
+        k = int(of_pair[pair])
+        assert member[first[k]:first[k] + size[k]].tolist() == classes == sorted(classes), pair
+        assert (in_set[first[k]:first[k] + size[k]] == k).all()
+        assert sets.setdefault(tuple(classes), k) == k, classes              # (one number a set)
+    assert len(sets) == first.numel() and len(by_pair) == succ.numel()
+
+
+@pytest.mark.parametrize("seed", range(24))
+def test_the_class_sets_are_the_pairs(seed):
+    for n in (1, 16):
+        tr = on_the_device(build_layout(random_automaton(seed), n, device = DEV).transitions(DEV))
+        groups = TR.boundary_groups(tr)
+        state = groups.state.clone()
+        groups.pairs
+        groups.state = state
+        assert_class_sets_are_the_pairs(groups)
+
+
+@pytest.mark.parametrize("weights", ["none", "by their number"])
+def test_a_collision_of_the_class_sets_hash_only_costs_a_second_try(weights, monkeypatch):
+    """Sets of different sizes that collide, or of one size: told apart by what they read, and the next weights' sets, the tables' the same."""
+    dfa = jc.DFA.contains([[1, 2]], 5)
+    layout = build_layout(dfa, 16, device = DEV)
+    tr = layout.transitions(DEV)
+    off = on_the_device(tr)
+    classes = TokenClasses(layout.token_class, dfa.num_classes, 1, host = layout.token_class.numpy(), device = DEV)
+    tries = []
+    honest = TR.tables._set_weights
+
+    def set_weights(C, seed, dev):
+        tries.append(seed)
+        return honest(C, seed, dev) if seed > 0 else torch.full((C,), 0 if weights == "none" else 1, dtype = torch.int64, device = dev)
+    monkeypatch.setattr(TR.tables, "_set_weights", set_weights)
+    groups = TR.boundary_groups(off)
+    state = groups.state.clone()
+    groups.pairs
+    groups.state = state
+    assert_class_sets_are_the_pairs(groups)
+    assert tries == [0, 1]
+    want = TR.transition_tables(tr, True, TR.enumerated_tokens(tr, classes))
+    assert_same(want, TR.transition_tables(off, True, TR.enumerated_tokens(off, classes)), "after a second try")
+
+
+def test_class_sets_that_never_read_back_are_an_error_not_a_wrong_table(monkeypatch):
+    """No hash telling two sets apart, whatever it tries: at the end of its tries, no table on a wrong set."""
+    off = on_the_device(build_layout(jc.DFA.contains([[1, 2]], 5), 16, device = DEV).transitions(DEV))
+    monkeypatch.setattr(TR.tables, "_set_weights", lambda C, seed, dev: torch.zeros(C, dtype = torch.int64, device = dev))
+    with pytest.raises(RuntimeError, match = "sets of classes"):
+        TR.boundary_groups(off).class_sets
+
+
+@pytest.mark.parametrize("enumerate_max", [0, 1])
+@pytest.mark.parametrize("seed", range(12))
+def test_the_moves_past_what_the_class_sets_may_take_say_the_same(seed, enumerate_max, monkeypatch):
+    """Past :data:`CLASS_SET_TERMS` a batch reads its moves; up to it, to the last term, none: the same tables either way, the lists asked for after, the host's."""
+    dfa = random_automaton(seed)
+    read = []
+    moves = TR.tables.BoundaryGroups._live_moves
+    monkeypatch.setattr(TR.tables.BoundaryGroups, "_live_moves", lambda self, *a: (read.append(1), moves(self, *a))[1])
+    for n in (1, 5, 16):
+        layout = build_layout(dfa, n, device = DEV)
+        tr = layout.transitions(DEV)
+        classes = TokenClasses(layout.token_class, dfa.num_classes, enumerate_max, host = layout.token_class.numpy(), device = DEV)
+        want = TR.transition_tables(tr, True, TR.enumerated_tokens(tr, classes))
+        probe = on_the_device(tr)
+        groups = TR.boundary_groups(probe)
+        terms = max((end - k) * groups.class_sets[1].numel() for k, end in groups.batches)
+        for most in (terms, terms - 1):
+            monkeypatch.setattr(TR.tables, "CLASS_SET_TERMS", most)
+            read.clear()
+            off = on_the_device(tr)
+            en = TR.enumerated_tokens(off, classes)
+            got = TR.transition_tables(off, True, en, lists = False)
+            assert bool(read) == (most < terms), (seed, n, most, terms)
+            groups = TR.boundary_groups(off)
+            made = dict(zip(LISTS[3:], groups.class_lists()))
+            if en.on:
+                made.update(zip(LISTS[:3], (groups.enumerated_pointers(en), *groups.enumerated_lists(en.code.long()))))
+            assert_same(want, dataclasses.replace(got, **made), f"{seed} {n} {most}")
+            assert TR.transition_stats(tr) == TR.transition_stats(off), (seed, n, most)
 
 
 @pytest.mark.parametrize("enumerate_max", [0, 1])
@@ -287,9 +382,15 @@ def test_lists_past_what_int32_pointers_reach_are_an_error_when_read_and_no_soon
     assert entries < moves and enumerated > 0                           # (not vacuous)
     monkeypatch.setattr(TR.tables, "TABLE_ENTRIES_MOST", entries)
     assert_same(tables, TR.transition_tables(off, True, en, lists = False), "the tables, to the last entry")
+    candidates = TR.tables.BoundaryGroups._candidates
+
+    def no_pass(self, *a):
+        raise AssertionError("a pass for lists it cannot point at")
+    monkeypatch.setattr(TR.tables.BoundaryGroups, "_candidates", no_pass)
     for _ in range(2):                                                  # (and again: nothing half made kept)
         with pytest.raises(RuntimeError, match = "int32"):
             groups.class_lists()
+    monkeypatch.setattr(TR.tables.BoundaryGroups, "_candidates", candidates)
     with pytest.raises(RuntimeError, match = "int32"):
         TR.transition_tables(off, True, en)
     monkeypatch.setattr(TR.tables, "TABLE_ENTRIES_MOST", moves)
@@ -367,9 +468,17 @@ def assert_lists_of_representatives(prog, sig):
             assert sig.rep_enum_pair[a:b].tolist() == pair[c:d].tolist(), (t, q)
 
 
+def turns_about(m = 2):
+    """The first state goes on, and to whichever of a cycle of ``m`` can still reach the end, in turn: a column of one state and size at every boundary, leading to any of them, which
+    only the hash of its operands tells apart: the order of the signatures is the hash's."""
+    cycle = (torch.arange(m)[:, None] + 1) % m + 1
+    delta = torch.cat([torch.cat([torch.arange(1, m + 1), torch.zeros(1, dtype = torch.long)])[None], cycle.expand(m, m + 1)])
+    return jc.DFA(m + 1, torch.arange(m + 1), delta, 0, [1])
+
+
 CASES = [("hmm", 8), ("hmm_block_sparse", 8), ("pd", 8), ("pd_blockified", 8), ("hand", 5), ("hand_left", 5)]
 AUTOMATA = {"contains": lambda V: jc.DFA.contains([[1, 2]], V), "either": lambda V: jc.DFA.contains([[1, 2]], V) | jc.DFA.contains([[2, 2]], V),
-            "absent": lambda V: jc.Not(jc.DFA.contains([[2, 2]], V))}
+            "absent": lambda V: jc.Not(jc.DFA.contains([[2, 2]], V)), "by turns": lambda V: turns_about()}
 
 
 @pytest.mark.parametrize("name", list(AUTOMATA))
@@ -410,13 +519,16 @@ def enumerating_automaton(seed, V):
     return jc.DFA(V, token_class[torch.randperm(V, generator = g)], delta, 0, torch.randperm(K, generator = g)[:max(K // 2, 1)].tolist())
 
 
+@pytest.mark.parametrize("one_group_a_batch", [False, True])
 @pytest.mark.parametrize("kind, n", [("hmm", 24), ("hmm_untied", 12)])
-def test_signatures_of_enumerated_tokens_and_of_positions_apart_are_the_devices(kind, n, build_pc, monkeypatch):
+def test_signatures_of_enumerated_tokens_and_of_positions_apart_are_the_devices(kind, n, one_group_a_batch, build_pc, monkeypatch):
     """Columns told apart by their enumerated tokens alone, positions reading rows of their own (each a class of positions, with its own
-    representatives): the same layout, column for column. What every saving would have refused is built here too."""
+    representatives): the same layout, column for column. What every saving would have refused is built here too. Batches of many groups or of one, a sequence end's its own."""
     from pyjuice.constraints.inference.dfa_exact import backend as BE
     V = 12
     pc = build_pc(kind, n, V)
+    if one_group_a_batch:
+        monkeypatch.setattr(TR.tables, "BOUNDARY_BATCH", 1)
     monkeypatch.setattr(BE, "ENUMERATE_MAX_TOKENS", 1)
     monkeypatch.setattr(BE, "ENUMERATE_MIN_FRACTION", 0.0)
     monkeypatch.setattr(TS, "SIGNATURE_MIN_SAVING", 0.0)
@@ -445,6 +557,94 @@ def test_signatures_of_enumerated_tokens_and_of_positions_apart_are_the_devices(
         classes = max(classes, prog.assembly.position_classes.steps.size)
     assert compared >= 8 and enumerated >= 4, (compared, enumerated)   # (not vacuous)
     assert (classes > 1) == (kind == "hmm_untied"), classes
+
+
+def test_columns_whose_hashes_collide_refuse_the_layout(build_pc, monkeypatch):
+    """Every column's operands hashed alike: columns of one state and size that lead to different states are told apart by reading them, and the layout refused. Where none are, the
+    same layout, as the sizes and the operands say the same."""
+    monkeypatch.setattr(H, "HOST_ENTRIES", 0)
+    monkeypatch.setattr(TS, "SIGNATURE_MIN_SAVING", 0.0)
+
+    def both(dfa, pc):
+        cc = jc.compile(dfa, pc)
+        if not cc.backend.layout.satisfiable:
+            return None, None
+        prog = cc.backend.program()
+        masses = cc.backend.state.masses()
+        honest = TS.signature_masses(prog, masses, prog.trans_size)
+        with monkeypatch.context() as m:
+            m.setattr(TS, "_mix", lambda v, salt: torch.zeros_like(v))
+            return honest, TS.signature_masses(prog, masses, prog.trans_size)
+    n = 24
+    pc = build_pc("hmm", n, 12)
+    alike = 0
+    for seed in range(12):
+        honest, forced = both(enumerating_automaton(seed, 12), pc)
+        if honest is not None:
+            assert forced is not None, seed
+            assert_same(honest, forced, f"{seed}")
+            alike += 1
+    assert alike >= 2
+    honest, forced = both(turns_about(), build_pc("hmm", n, 3))
+    assert honest is not None and forced is None
+
+
+def test_the_order_of_signatures_only_a_hash_tells_apart_is_the_hosts(build_pc, monkeypatch):
+    """Many of them, one state and size each: another hash, or one that forgets the order of a column's operands, puts them in another order, and slots with them."""
+    m, n = 7, 32
+    pc = build_pc("hmm", n, m + 1)
+    monkeypatch.setattr(TS, "SIGNATURE_MIN_SAVING", 0.0)
+    made = []
+    for entries in (1 << 20, 0):
+        monkeypatch.setattr(H, "HOST_ENTRIES", entries)
+        cc = jc.compile(turns_about(m), pc)
+        prog = cc.backend.program()
+        made.append(TS.signature_masses(prog, cc.backend.state.masses(), prog.trans_size))
+    assert made[0] is not None and int(made[0].pairs.max()) >= 2 * m     # (at least these, two pairs each)
+    assert_same(made[0], as_on_the_host(made[1]), "signatures")
+
+
+def test_representatives_of_positions_of_classes_in_turn_are_by_position(build_pc, monkeypatch):
+    """Classes of positions that take turns, over boundaries that differ: the first position of a class and group is not in the order of the classes and groups."""
+    from pyjuice.constraints.inference.dfa_exact import backend as BE
+    V, n = 12, 24
+    pc = build_pc("hmm", n, V)
+    monkeypatch.setattr(BE, "ENUMERATE_MAX_TOKENS", 1)
+    monkeypatch.setattr(BE, "ENUMERATE_MIN_FRACTION", 0.0)
+    monkeypatch.setattr(TS, "SIGNATURE_MIN_SAVING", 0.0)
+    honest = TS.position_classes
+
+    def in_turn(prog, masses):
+        real = honest(prog, masses)
+        return TS.PositionClasses(masses.row, np.where(real.of >= 0, np.arange(prog.n) % 2, -1), np.array([real.steps[0], real.steps[0]]))
+    monkeypatch.setattr(TS, "position_classes", in_turn)
+    apart = 0
+    for seed in range(24):
+        made = []
+        for entries in (1 << 20, 0):
+            monkeypatch.setattr(H, "HOST_ENTRIES", entries)
+            cc = jc.compile(enumerating_automaton(seed, V), pc)
+            if not cc.backend.layout.satisfiable:
+                break
+            prog = cc.backend.program()
+            made.append((TS.signature_masses(prog, cc.backend.state.masses(), prog.trans_size), cc, prog))
+        if len(made) == 2 and made[0][0] is not None:
+            assert_same(made[0][0], as_on_the_host(made[1][0]), f"{seed}")
+            rep_t = torch.repeat_interleave(torch.arange(n, device = DEV), made[1][0].rep_ptr[1:] - made[1][0].rep_ptr[:-1])
+            apart += len(TR.boundary_groups(made[1][2]._tr).firsts) >= 4 and rep_t.numel() > 0
+    assert apart >= 2, apart
+
+
+@pytest.mark.parametrize("entries", [1 << 20, 0])
+def test_a_table_of_no_entries_keeps_its_one_zero_in_a_signature_layout(entries, build_pc, monkeypatch):
+    """Nothing accepted at this length: a program's tables and their signature layout, on the host or the device, hold what a kernel reads of nothing."""
+    monkeypatch.setattr(H, "HOST_ENTRIES", entries)
+    monkeypatch.setattr(TS, "SIGNATURE_MIN_SAVING", 0.0)
+    cc = jc.compile(jc.DFA.contains([[1, 2, 1]], 4), build_pc("hmm", 2, 4))
+    assert not cc.backend.layout.satisfiable
+    prog = cc.backend.program()
+    sig = TS.signature_masses(prog, cc.backend.state.masses(), prog.trans_size)
+    assert sig is None or (sig.entry_x.tolist() == [0] and sig.pred_x.tolist() == [0])
 
 
 def test_two_groups_with_columns_alike_share_their_signatures(build_pc):
@@ -489,8 +689,8 @@ def test_masses_by_signature_read_no_columns_lists_but_their_representatives(bui
     assert first[1] is prog.enum_lists()[1] and calls == [1]
 
 
-def test_a_program_takes_one_pass_over_the_moves_and_none_for_the_lists(build_pc, monkeypatch):
-    """Its enumerated tokens' and its tables': the most of what a long layout costs, once. The lists, most of what is left, not at all."""
+def test_a_program_takes_one_pass_reads_no_move_and_no_list(build_pc, monkeypatch):
+    """Its enumerated tokens' and its tables': the most of what a long layout costs, once, over pairs. The moves, up to 17 times as many, and the lists, not at all."""
     from pyjuice.constraints.inference.dfa_exact import backend as BE
     monkeypatch.setattr(BE, "ENUMERATE_MAX_TOKENS", 1)
     monkeypatch.setattr(BE, "ENUMERATE_MIN_FRACTION", 0.0)
@@ -501,7 +701,7 @@ def test_a_program_takes_one_pass_over_the_moves_and_none_for_the_lists(build_pc
 
     def not_read(self, *a):
         raise AssertionError("a list, for a program")
-    for name in ("class_lists", "enumerated_lists", "enumerated_pointers"):
+    for name in ("class_lists", "enumerated_lists", "enumerated_pointers", "_live_moves"):
         monkeypatch.setattr(TR.tables.BoundaryGroups, name, not_read)
     prog = jc.compile(jc.DFA.contains([[1, 2]], 5), build_pc("hmm", 8, 5)).backend.program()
     assert prog.enum.on and passes == [True] and all(getattr(prog.succ, f) is None for f in LISTS)
