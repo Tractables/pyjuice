@@ -77,6 +77,18 @@ def _leaf(pattern: str) -> ByteAutomaton:
     return hit
 
 
+_SEPARATORS: Dict[Tuple[ByteAutomaton, str], ByteAutomaton] = {}
+
+
+def _separator(ws: ByteAutomaton, mark: str) -> ByteAutomaton:
+    """``W<mark>W`` as one automaton, of a whitespace that is one (kept, as the leaves are): an object's every member and an array's every item wire it, and
+    wiring its three parts each time was most of what a schema of many members wired."""
+    hit = _SEPARATORS.get((ws, mark))
+    if hit is None:
+        hit = _SEPARATORS[(ws, mark)] = A.force(A.concat(ws, A.literal(mark.encode("utf-8")), ws))
+    return hit
+
+
 def float_text(x: float) -> str:
     """A float as the canonical form writes it: the shortest digits that read back, positional for decimal
     exponents -5 to 15 (``.0`` if integral), else ``d.ddde+N`` / ``d.ddde-N``."""
@@ -225,9 +237,9 @@ class _Compiler:
         return A.literal(text.encode("utf-8"))
 
     def sep(self, mark: str, ws: Optional[ByteAutomaton] = None) -> ByteAutomaton:
-        """``W<mark>W``."""
+        """``W<mark>W``: one automaton (:func:`_separator`), or of a whitespace not evaluated yet, its three parts."""
         ws = self.ws if ws is None else ws
-        return A.concat(ws, self.lit(mark), ws)
+        return _separator(ws, mark) if type(ws) is ByteAutomaton else A.concat(ws, self.lit(mark), ws)
 
     def object_of(self, value: ByteAutomaton, nonempty: bool, key: Optional[ByteAutomaton] = None) -> ByteAutomaton:
         """Objects of ``key`` names (default: any string) and ``value`` values (none: ``nonempty`` False)."""
@@ -469,9 +481,10 @@ class _Compiler:
         """``{W"a"W:Wvalue W,W ...W}``: ``items`` -- ``(name, value automaton, required)`` -- in order, the optional
         ones may be left out (not all if ``nonempty``), see :func:`~.automata.members`."""
         wired = []
-        for name, value, required in items:
-            first = A.concat(self.ws, self.lit(json.dumps(name, ensure_ascii = False)), self.sep(":"))
-            wired.append((first, A.concat(self.ws, self.lit(","), first), value, required))
+        colon, comma = self.sep(":"), self.sep(",")
+        for name, value, required in items:                     # (a name after another member: ``W,W"a"W:W``, the first's text after ``W,``)
+            key = self.lit(json.dumps(name, ensure_ascii = False))
+            wired.append((A.concat(self.ws, key, colon), A.concat(comma, key, colon), value, required))
         empty = not nonempty and not any(r for _, _, r in items)
         return A.members(self.lit("{"), A.concat(self.ws, self.lit("}")), wired, empty)
 

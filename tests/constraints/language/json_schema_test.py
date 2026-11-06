@@ -549,13 +549,80 @@ def test_a_schema_is_copied_as_deepcopy_copies_it():
     assert shared["enum"] == ["a", None, 1, 1.5, True]
 
 
-def test_the_random_words():
+def test_the_random_words(monkeypatch):
+    """The hashes' words: odd where they multiply, the same for as many states whatever was asked for before, and kept to a bound -- not made again for an
+    automaton of fewer states than one before it."""
     from pyjuice.constraints.language.backend import token_lift as T
-    for S in (1, 100, T._KEPT_WORDS, T._KEPT_WORDS + 1):
+    monkeypatch.setattr(T, "_WORDS", np.empty((4, 0), dtype = np.uint64))
+    monkeypatch.setattr(T, "_KEPT_WORDS", 1 << 14)
+    made = []
+    rng = np.random.default_rng
+    monkeypatch.setattr(np.random, "default_rng", lambda *a: (made.append(a), rng(*a))[1])
+    first = None
+    for S, again in ((100, True), (1, False), (5000, True), (4000, False), (6000, False), (T._KEPT_WORDS, True), (9000, False), (T._KEPT_WORDS + 1, True),
+                     (T._KEPT_WORDS + 1, True), (300, False)):                         # (more made: twice as many kept; past the bound: each time)
+        made.clear()
         words = T._random_words(S)
+        assert (len(made) == 4) == again and len(made) in (0, 4), (S, len(made))
         assert len(words) == 4 and all(w.size == S and w.dtype == np.uint64 for w in words)
         assert (words[0] & np.uint64(1)).all() and (words[2] & np.uint64(1)).all()      # (odd: they multiply, nothing lost)
         assert all(np.array_equal(a, b) for a, b in zip(words, T._random_words(S)))
+        first = [w.copy() for w in words] if first is None else first
+        assert all(np.array_equal(a[:100], b[:100]) for a, b in zip(first, T._random_words(max(S, 100))))
+        assert all(np.unique(w).size == w.size for w in words)
+        assert all(not np.array_equal(a >> np.uint64(1), b >> np.uint64(1)) for a, b in itertools.combinations(words, 2)) or S == 1      # (four arrays, not one four times)
+    assert T._WORDS.shape == (4, T._KEPT_WORDS)                                          # (past the bound: made, not kept)
+
+
+def test_a_constraint_keeps_its_schema_as_it_was_given():
+    """The schema a constraint was made of, a copy each time it is asked for: what is written twice in it one object, whatever its owner does to it later;
+    of a schema holding what the bytes kept do not write (a dictionary of a type of its own), the same by the copy made before."""
+    import collections
+    import copy
+    vocabulary = jc.Vocabulary([bytes([b]) for b in range(256)] + [None], eos = [256])
+    shared = {"type": "string", "maxLength": 3}
+    for wrap in (dict, collections.OrderedDict):
+        schema = wrap({"type": "object", "properties": {"a": shared, "b": {"type": "array", "items": shared}, "c": {"description": "anything"},
+                                                         "d": {"type": "string", "pattern": "^ab?$"}}, "required": ["a"], "additionalProperties": False})
+        as_given = copy.deepcopy(schema)
+        c = jc.JSONSchema(schema, vocabulary)
+        assert schema == as_given and c._prepared != as_given                              # (what the converter reads is rewritten: a copy, not the schema)
+        assert (type(c._schema) is bytes) == (wrap is dict)
+        got = c.schema
+        assert got == schema and got is not schema and got["properties"]["a"] is not shared
+        assert got["properties"]["a"] is got["properties"]["b"]["items"]
+        assert c.schema is not got
+        states = c.automaton().num_states
+        got["properties"]["a"]["maxLength"] = 1                                          # (the copy is its reader's)
+        schema["properties"]["a"]["maxLength"] = 5                                       # (and the schema its owner's)
+        assert c.schema["properties"]["a"]["maxLength"] == 3
+        assert jc.JSONSchema(c.schema, vocabulary).automaton().num_states == states != jc.JSONSchema(schema, vocabulary).automaton().num_states
+        schema["properties"]["a"]["maxLength"] = 3
+    text = '{"type": "object", "properties": {"a": {"type": "string", "maxLength": 3}}, "additionalProperties": false}'
+    assert jc.JSONSchema(text, vocabulary).schema == __import__("json").loads(text)
+
+
+def test_a_separator_is_its_three_parts_and_kept():
+    """``W<mark>W`` as one automaton: the texts of whitespace, the mark, whitespace; made once for a whitespace and a mark; of a whitespace not evaluated
+    yet, the three parts as before. An object's members read through it accept what they did."""
+    from pyjuice.constraints.language.backend import automata as A, json_schema as B
+    for whitespace in (r"[ ]?", r"[ \n]*", ""):
+        compiler = B._Compiler({"type": "null"}, whitespace)
+        for mark in (":", ","):
+            one = compiler.sep(mark)
+            assert type(one) is B.ByteAutomaton and one is compiler.sep(mark) is B._Compiler({"type": "null"}, whitespace).sep(mark)
+            assert A.equivalent(one, A.force(A.concat(compiler.ws, compiler.lit(mark), compiler.ws)))
+            assert one is not compiler.sep("," if mark == ":" else ":")
+        loose = compiler.sep(":", compiler.ws_any)
+        assert type(loose) is A.Expr and A.equivalent(A.force(loose), A.force(A.concat(compiler.ws_any, compiler.lit(":"), compiler.ws_any)))
+        items = [("a", compiler.boolean, True), ("b c", compiler.null, False), ("d", compiler.integer, False)]
+        ws, lit = compiler.ws, compiler.lit
+        wired = []
+        for name, value, required in items:                                             # (as the members were wired before: a name's parts, and again after a comma)
+            first = A.concat(ws, lit(json.dumps(name)), A.concat(ws, lit(":"), ws))
+            wired.append((first, A.concat(ws, lit(","), first), value, required))
+        for nonempty in (False, True):
+            assert A.equivalent(A.force(compiler._members(items, nonempty)), A.force(A.members(lit("{"), A.concat(ws, lit("}")), wired, False)))
 
 
 def behaviour_at(table, dead, byte_class, text):

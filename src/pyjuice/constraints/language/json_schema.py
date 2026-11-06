@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import copy
 import json
+import marshal
 from typing import Any, Dict, Optional, Union
 
 import numpy as np
@@ -153,10 +154,20 @@ def _copied(x: Any, memo: Dict[int, Any]) -> Any:
     return copy.deepcopy(x)
 
 
-def _prepare(schema: Dict[str, Any]) -> Dict[str, Any]:
-    """The schema as the converter is to get it (a copy: patterns rewritten, objects of annotations only emptied), or
-    :class:`ValueError` with where and why it is refused (see the module docstring)."""
-    root = _copied(schema, {})
+def _snapshot(schema: Dict[str, Any]) -> Optional[bytes]:
+    """``schema`` as bytes a copy of it is read back from (``marshal.loads``: what :func:`_copied` makes of JSON, what is written twice in it once too, at a
+    tenth of its cost), or None of one holding what those bytes do not: an object of a type of its own, or nesting too deep."""
+    try:
+        return marshal.dumps(schema)
+    except ValueError:
+        return None
+
+
+def _prepare(schema: Dict[str, Any], root: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """The schema as the converter is to get it (a copy -- ``root``, where the caller has made one -- with patterns rewritten and objects of annotations only
+    emptied), or :class:`ValueError` with where and why it is refused (see the module docstring)."""
+    if root is None:
+        root = _copied(schema, {})
     rewritten, sound = set(), set()
 
     def resolve(ref: str, where: str):
@@ -304,15 +315,16 @@ class JSONSchema(_Text):
         if not isinstance(schema, dict):
             raise TypeError(f"`schema` must be a dict or JSON text of an object, got {type(schema).__name__}.")
         super().__init__(vocabulary, eos_padding)
-        self._prepared = _prepare(schema)
+        kept = _snapshot(schema)                    # (the schema as it is now, whatever its owner does to it later; and the copy to rewrite, from it)
+        self._prepared = _prepare(schema, None if kept is None else marshal.loads(kept))
         _checked(whitespace)
-        self._schema = _copied(schema, {})
+        self._schema = _copied(schema, {}) if kept is None else kept
         self._whitespace = whitespace
         self._bytes = None
 
     @property
     def schema(self) -> Dict[str, Any]:
-        return copy.deepcopy(self._schema)
+        return marshal.loads(self._schema) if type(self._schema) is bytes else copy.deepcopy(self._schema)
 
     @property
     def whitespace(self) -> str:

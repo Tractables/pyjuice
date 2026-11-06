@@ -1406,10 +1406,13 @@ WALKS_IN_THREADS = 1 << 24
 
 
 def _random_words(S: int) -> list:
-    """Four arrays of ``S`` random words for the hashes, the first and third odd; those of few states kept (a generator takes time)."""
+    """Four arrays of ``S`` random words for the hashes, the first and third odd, each array from a generator of its own: the same words whatever was asked
+    for before. Kept, to :data:`_KEPT_WORDS` states (a generator takes time: 0.8 ms for an automaton of 25 thousand states, each time), at least twice as many
+    each time more are made."""
     global _WORDS
     if S > _WORDS.shape[1]:
-        words = np.random.default_rng(0).integers(1, 2 ** 63, size = (4, max(S, _KEPT_WORDS)), dtype = np.uint64)
+        size = S if S > _KEPT_WORDS else min(max(S, 2 * _WORDS.shape[1], 1 << 12), _KEPT_WORDS)
+        words = np.stack([np.random.default_rng(k).integers(1, 2 ** 63, size = size, dtype = np.uint64) for k in range(4)])
         words[0] |= np.uint64(1)
         words[2] |= np.uint64(1)
         if S > _KEPT_WORDS:
@@ -1418,7 +1421,7 @@ def _random_words(S: int) -> list:
     return list(_WORDS[:, :S])
 
 
-_KEPT_WORDS = 1 << 12
+_KEPT_WORDS = 1 << 18
 _WORDS = np.empty((4, 0), dtype = np.uint64)
 
 
