@@ -704,7 +704,7 @@ def fresh_counts(layout: "CompactLayout", regions: np.ndarray, fresh: np.ndarray
     samples of those whose products a compact query computes -- every one, but in the interval of sum ``regions``
     (bool [sum regions]: those some rows hold the inside values of, see :func:`partial_carry`) that are all its
     regions, those ``fresh`` (bool [sum regions, B]): its products' values are read by those sums alone, which compute
-    the other rows' lanes only (:func:`fresh_order`). See :func:`~.prod._fresh_tile`.
+    the other rows' lanes only (:func:`fresh_order`). See :func:`~.kernels.prod.launches._fresh_tile`.
     """
     prog = layout.prog
     out = np.ones((len(prog.all_ivs), layout.B), dtype = np.int32)

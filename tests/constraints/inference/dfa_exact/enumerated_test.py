@@ -11,7 +11,8 @@ every token against float64); the transition masses against float64 sums over ev
 support of a session; and the key check: marginals, conditionals and log marginals with enumeration are those without
 it, on every kind of PC, dense and compact storage, transitions kept and rebuilt in chunks (the top-down then reads
 class masses by code), under no, dense, top-k and value-masked evidence; bit-identical where nothing is enumerated
-(an ungrouped automaton, or one without singletons, whatever the constant).
+(an ungrouped automaton, or one without singletons, whatever the constant). Classes enumerated but live nowhere at this
+length: the stored classes are numbered past them all the same.
 """
 import random
 
@@ -317,9 +318,9 @@ def test_transition_masses_with_enumerated_classes_match_a_float64_brute_force(b
     there of ``p(v)`` -- and under dense evidence of a session, per sample, of ``q(v) = p(v) w(v) / Z``, over the
     sample's entries alone (:class:`~pyjuice.constraints.inference.dfa_exact.kernels.transitions.SampleMasses`): an
     entry no allowed class leads along has no mass (its log-sum would be -inf). One set of masses laid out by column
-    or by column signature (:mod:`~pyjuice.constraints.inference.dfa_exact.kernels.transition_signatures`), read as the
+    or by column signature (:mod:`~pyjuice.constraints.inference.dfa_exact.kernels.transitions.signatures`), read as the
     kernels read them."""
-    from pyjuice.constraints.inference.dfa_exact.kernels import transition_signatures
+    from pyjuice.constraints.inference.dfa_exact.kernels.transitions import signatures as transition_signatures
     monkeypatch.setattr(P, "GROUP_MIN_RATIO", 0)
     monkeypatch.setattr(transition_signatures, "SIGNATURE_MASSES", signatures)
     n, B = 6, 3
@@ -502,6 +503,115 @@ def test_enumerated_classes_change_nothing(kind, transitions, storage, evidence_
         assert_close(got, want, n)
 
 
+def late_singleton_automaton(n, vocab = V):
+    """Tokens 1 and 2 (one class), for as long as one likes; only past ``n + 1`` of them do the tokens 0, 3 and 4 lead
+    anywhere, each somewhere else: three singletons of five classes, none of them live at length ``n``, and the class
+    of tokens 1 and 2 numbered past a singleton."""
+    a, b, c, dead = n + 2, n + 3, n + 4, n + 5
+
+    def rows(pairs):
+        return [pairs.get(v, dead) for v in range(vocab)]
+    table = [rows({1: q + 1, 2: q + 1}) for q in range(n + 1)]
+    table.append(rows({1: n + 1, 2: n + 1, 0: a, 3: b, 4: c}))
+    table.append(rows({1: a, 2: a}))
+    table.append(rows({1: a, 2: a}))
+    table.append(rows({1: b, 2: b}))
+    table.append(rows({}))
+    return jc.DFA.from_dense(vocab, table, 0, list(range(n + 2)) + [a])
+
+
+def evidence_of_tokens_1_and_2(n, B, kind, K = 6, seed = 0):
+    """:func:`evidence`, for :func:`late_singleton_automaton`: the observed tokens among 1 and 2, and both of them
+    with a weight everywhere (some other tokens with one besides)."""
+    data, missing, inputs = evidence(n, B, kind, K, seed)
+    data = 1 + data % 2
+    if kind == "dense":
+        E = inputs["categorical_evidence_logp"]
+        E[..., 1:3] = torch.where(torch.isinf(E[..., 1:3]), 0.0, E[..., 1:3])
+    if kind == "topk":
+        g = torch.Generator().manual_seed(seed)
+        others = torch.tensor([v for v in range(V) if v not in (1, 2)])
+        rest = others[torch.argsort(torch.rand(B, n, V - 2, generator = g), dim = 2)[..., :K - 2]]
+        inputs["soft_evidence_cat_ids"] = torch.cat([torch.tensor([1, 2]).expand(B, n, 2), rest], dim = 2).to(DEV)
+    return data, missing, inputs
+
+
+@pytest.mark.parametrize("evidence_kind", ["none", "dense", "topk"])
+@pytest.mark.parametrize("storage", ["dense", "compact"])
+@pytest.mark.parametrize("transitions", ["grouped", "classes", "entries"])
+@pytest.mark.parametrize("kind", ["hmm", "hmm_untied", "pd"])
+def test_singletons_live_nowhere_at_this_length(kind, transitions, storage, evidence_kind, build_pc, monkeypatch):
+    """Classes enumerated, but none of them live at any boundary of this length (nothing to enumerate: no token in
+    the boundaries' lists) -- the stored classes are numbered past them all the same, and a mass read by class would
+    read another class's column."""
+    monkeypatch.setattr(P, "GROUP_MIN_RATIO", 0 if transitions == "grouped" else 1 << 30)
+    monkeypatch.setattr(P, "ENTRY_LOOP_MAX_LIVE", 2 if transitions == "entries" else 0)
+    n, B = KINDS[kind], 4
+    pc = build_pc(kind, n, V, input_dist = dists.SoftEvidenceCategorical if evidence_kind != "none" else None)
+    data, missing, inputs = evidence_of_tokens_1_and_2(n, B, evidence_kind)
+    out = {}
+    for enumerate_max in (0, 1):
+        monkeypatch.setattr(BE, "ENUMERATE_MAX_TOKENS", enumerate_max)
+        cc = jc.compile(late_singleton_automaton(n), pc)
+        classes = cc.backend.token_classes
+        assert classes.num_enumerated == (3 if enumerate_max else 0)
+        if enumerate_max:                                                    # (what the case is)
+            assert cc.backend.program().enum.num == 0
+            live_class = int(classes.token_class[1])
+            assert int(classes.stored_of_class[live_class]) != live_class
+        out[enumerate_max] = queries(cc, data, missing, inputs, storage)
+    assert torch.isfinite(out[1][0]).any()
+    for got, want in zip(out[1], out[0]):
+        assert_close(got, want, n)
+
+
+@pytest.mark.parametrize("evidence_kind", ["none", "dense", "topk"])
+@pytest.mark.parametrize("transitions", ["grouped", "classes", "entries"])
+def test_singletons_live_nowhere_in_a_session(transitions, evidence_kind, build_pc, monkeypatch):
+    """The same, left to right in one decoder (the held values reused) and over candidates, of a class live and of
+    classes that are not."""
+    monkeypatch.setattr(P, "GROUP_MIN_RATIO", 0 if transitions == "grouped" else 1 << 30)
+    monkeypatch.setattr(P, "ENTRY_LOOP_MAX_LIVE", 2 if transitions == "entries" else 0)
+    n, B = 6, 4
+    pc = build_pc("hmm", n, V, input_dist = dists.SoftEvidenceCategorical if evidence_kind != "none" else None)
+    data, _, inputs = evidence_of_tokens_1_and_2(n, B, evidence_kind)
+    candidates = torch.tensor([1, 2, 0, 3, 11]).expand(B, n, 5).to(DEV)      # (live, live, singletons, a dead class)
+    out = {}
+    for enumerate_max in (0, 1):
+        monkeypatch.setattr(BE, "ENUMERATE_MAX_TOKENS", enumerate_max)
+        cc = jc.compile(late_singleton_automaton(n), pc)
+        got = []
+        with cc.decoder(storage = "compact", precision = "fp32", **inputs) as decoder:
+            for t in range(n):
+                missing = torch.ones_like(data, dtype = torch.bool)
+                missing[:, :t] = False
+                got.append(decoder.conditional(data, missing))
+                got.append(decoder.conditional(data, missing, candidates = candidates))
+        out[enumerate_max] = got
+    assert torch.isfinite(out[1][0]).any()
+    for got, want in zip(out[1], out[0]):
+        assert_close(got, want, n)
+
+
+@pytest.mark.parametrize("banned", [0, 1, None])
+def test_singletons_live_nowhere_against_every_string(banned, build_pc):
+    """On the library's settings, nothing patched: the marginal is the sum over every string the automaton accepts --
+    with token 0 banned (its class, one token and dead everywhere, numbered before the rest), with another banned (the
+    rest numbered first), of the automaton above."""
+    n = 4
+    pc = build_pc("hmm", n, V)
+    tokens = [1, 2] if banned is None else [v for v in range(V) if v != banned]
+    dfa = late_singleton_automaton(n) if banned is None else ~jc.DFA.contains([[banned]], V)
+    cc = jc.compile(dfa, pc)
+    assert cc.backend.token_classes.num_enumerated > 0 and cc.backend.program().enum.num == 0
+    strings = torch.cartesian_prod(*[torch.tensor(tokens)] * n).to(DEV)
+    with torch.no_grad():
+        want = torch.logsumexp(pc(strings).view(-1).double(), dim = 0).float()
+    with cc.decoder(storage = "dense", precision = "fp32") as decoder:
+        got = decoder.marginal(strings[:1], torch.ones(1, n, dtype = torch.bool, device = DEV))
+    assert_close(got, want, n)
+
+
 @pytest.mark.parametrize("evidence_kind", ["dense", "topk"])
 def test_enumerated_classes_change_nothing_with_mixed_input_layers(evidence_kind, monkeypatch):
     """Categorical and SoftEvidenceCategorical input layers in one PC (variables alternating): the per-sample rows
@@ -647,19 +757,19 @@ def test_the_cuda_walk_reads_the_enumerated_masses(kind, evidence_kind, build_pc
     data, missing, inputs = evidence(n, B, evidence_kind)
     cc = jc.compile(singleton_automaton(), pc)
     assert cc.backend.token_classes.num_enumerated == 7 and not cc.backend.grouped
-    taken, real = [], prod_top_down._input_block_cuda
+    taken, real = [], prod_top_down.walk._input_block_cuda
 
     def record(*args):
         out = real(*args)
-        if prod_top_down.INPUT_BLOCK_CUDA:
+        if prod_top_down.walk.INPUT_BLOCK_CUDA:
             taken.append(out is not None)
         return out
 
-    monkeypatch.setattr(prod_top_down, "_input_block_cuda", record)
+    monkeypatch.setattr(prod_top_down.run, "_input_block_cuda", record)
     masks = [missing] + [(torch.arange(n) >= t)[None, :].expand(B, n) for t in range(1, n)]   # (left to right)
     out = {}
     for cuda in (False, True):
-        monkeypatch.setattr(prod_top_down, "INPUT_BLOCK_CUDA", cuda)
+        monkeypatch.setattr(prod_top_down.walk, "INPUT_BLOCK_CUDA", cuda)
         with cc.decoder(storage = "compact", **inputs) as decoder:
             out[cuda] = [decoder.conditional(data, mk) for mk in masks]
     assert taken and all(taken)

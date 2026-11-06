@@ -102,11 +102,14 @@ def _widened_to_pc(constraint: Constraint, structure) -> Constraint:
     """``constraint`` over the PC's vocabulary when every input the backends read ranges over the same number of
     values, more than the constraint's vocabulary, and the constraint widens; else ``constraint`` itself (a mismatch
     left is the backends' to report)."""
-    values = set()
-    for info in structure.nodes:
-        module = lookup(info.ns.dist) if info.kind == "input" else None
-        if module is not None:
-            values.add(module.num_values(info.ns.dist))
+    values = structure.__dict__.get("_input_values")            # (kept with the structure)
+    if values is None:
+        values = set()
+        for info in structure.nodes:
+            module = lookup(info.ns.dist) if info.kind == "input" else None
+            if module is not None:
+                values.add(module.num_values(info.ns.dist))
+        structure.__dict__["_input_values"] = values
     if len(values) == 1:
         (num_values,) = values
         if num_values > constraint.vocab_size:

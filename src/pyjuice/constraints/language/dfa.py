@@ -29,7 +29,7 @@ from typing import Dict, Iterable, List, Mapping, Optional, Sequence
 import numpy as np
 import torch
 
-from .backend.dfa import _column_classes, bfs_order, hopcroft, product_bfs
+from .backend.dfa import _column_classes, bfs_order, hopcroft, product_bfs, renumbered
 from .base import Constraint, Matcher, Tokens
 
 
@@ -62,9 +62,10 @@ class DFA(Constraint):
         if delta.dim() != 2 or delta.size(0) < 1:
             raise ValueError(f"`delta` must be [num_states, num_classes], got {tuple(delta.shape)}.")
         K, C = delta.shape
-        if token_class.min() < 0 or token_class.max() >= C:
+        tokens, table = token_class.numpy(), delta.numpy()                 # (no thread team for a look at each)
+        if tokens.min() < 0 or tokens.max() >= C:
             raise ValueError(f"`token_class` values must lie in [0, {C}).")
-        if delta.min() < 0 or delta.max() >= K:
+        if table.min() < 0 or table.max() >= K:
             raise ValueError(f"`delta` successors must lie in [0, {K}) (the DFA must be complete).")
         if not 0 <= int(initial) < K:
             raise ValueError(f"`initial` must lie in [0, {K}), got {initial}.")
@@ -80,12 +81,36 @@ class DFA(Constraint):
             mask[ids] = True
             accept = mask
 
-        self._token_class, self._delta = _compress_classes(token_class, delta)
+        self._token_class, self._table = _compress_classes(token_class, delta)
         self._initial = int(initial)
         self._accept = accept.clone()
         self._live = None              # [K] bool: an accepting state is reachable
         self._accept_in = None         # list: _accept_in[r][q] = acceptance reachable in exactly r steps
         self._device_tables = {}
+
+    @classmethod
+    def _of_classes(cls, vocab_size: int, token_class: torch.Tensor, delta: torch.Tensor, initial: int,
+                    accept: torch.Tensor) -> "DFA":
+        """A DFA of tables the constructor would keep as they are: complete, its classes numbered by their smallest token,
+        no two columns the same; the tables are its own. ``delta`` may be one to come (``dense`` makes it, first read; it knows its ``rows`` and
+        ``classes``), a large token automaton's."""
+        out = cls.__new__(cls)
+        Constraint.__init__(out, vocab_size)
+        out._token_class, out._table, out._initial, out._accept = token_class, delta, initial, accept
+        out._live, out._accept_in, out._device_tables = None, None, {}
+        return out
+
+    @classmethod
+    def _of_numbered_classes(cls, vocab_size: int, token_class: torch.Tensor, delta: torch.Tensor, initial: int,
+                             accept: torch.Tensor) -> "DFA":
+        """:meth:`_of_classes` of classes numbered by their smallest token, none of them empty, whose columns may repeat
+        (a look at the vocabulary only if they do)."""
+        table = delta.numpy()
+        group, first = _column_classes(table)
+        if first.size < table.shape[1]:
+            token_class = torch.from_numpy(group[token_class.numpy()])
+            delta = torch.from_numpy(np.ascontiguousarray(table[:, first]))
+        return cls._of_classes(vocab_size, token_class, delta, initial, accept)
 
     # ---------------------------------------------------------------------------------------------
     # Tables
@@ -93,11 +118,13 @@ class DFA(Constraint):
 
     @property
     def num_states(self) -> int:
-        return self._delta.size(0)
+        table = self._table
+        return table.size(0) if isinstance(table, torch.Tensor) else table.rows
 
     @property
     def num_classes(self) -> int:
-        return self._delta.size(1)
+        table = self._table
+        return table.size(1) if isinstance(table, torch.Tensor) else table.classes
 
     @property
     def initial(self) -> int:
@@ -110,6 +137,14 @@ class DFA(Constraint):
     @property
     def token_class(self) -> torch.Tensor:
         return self._token_class.clone()
+
+    @property
+    def _delta(self) -> torch.Tensor:
+        """The table, written now if it is still to come."""
+        table = self._table
+        if not isinstance(table, torch.Tensor):
+            table = self._table = table.dense()
+        return table
 
     @property
     def delta(self) -> torch.Tensor:
@@ -146,8 +181,12 @@ class DFA(Constraint):
     def _tables_on(self, device):
         device = torch.device(device)
         if device not in self._device_tables:
-            self._device_tables[device] = (self._token_class.to(device), self._delta.to(device),
-                                           self._accept.to(device))
+            table = self._table
+            if isinstance(table, torch.Tensor) or device.type == "cpu":
+                table = self._delta.to(device)
+            else:
+                table = table.on_device(device)                 # (made there, in int32: the host's is written if something asks for it)
+            self._device_tables[device] = (self._token_class.to(device), table, self._accept.to(device))
         return self._device_tables[device]
 
     # ---------------------------------------------------------------------------------------------
@@ -197,6 +236,7 @@ class DFA(Constraint):
         """beta[t][b, q] = log sum over completions x_t..x_{n-1} from state q of their weight,
         restricted to completions ending in an accepting state; beta[n] = log 1[q accepting]."""
         _, delta, accept = self._tables_on(lwc.device)
+        delta = delta.long()
         B, n, C = lwc.shape
         beta = [None] * (n + 1)
         beta[n] = torch.where(accept, 0.0, float("-inf")).to(lwc.dtype)[None, :].expand(B, -1)
@@ -257,8 +297,8 @@ class DFA(Constraint):
         block, num_blocks = hopcroft(d, acc)
         rep = np.empty(num_blocks, dtype = np.int64)
         rep[block] = np.arange(reach.size)                      # any member represents its block
-        merged = DFA(self.vocab_size, self._token_class, torch.from_numpy(block[d[rep]]), int(block[0]),
-                     torch.from_numpy(acc[rep]))
+        merged = DFA._of_numbered_classes(self.vocab_size, self._token_class, torch.from_numpy(block[d[rep]]), int(block[0]),
+                                          torch.from_numpy(acc[rep]))
         return merged._renumbered()
 
     def equivalent(self, other: "DFA") -> bool:
@@ -266,11 +306,12 @@ class DFA(Constraint):
         return self.minimize() == other.minimize()
 
     def _renumbered(self) -> "DFA":
-        """Canonical numbering: states in BFS order (classes visited in increasing order)."""
-        order = torch.from_numpy(bfs_order(self._delta.numpy(), self._initial))
-        remap = torch.full((self.num_states,), -1, dtype = torch.long)
-        remap[order] = torch.arange(order.numel())
-        return DFA(self.vocab_size, self._token_class, remap[self._delta[order]], 0, self._accept[order])
+        """Canonical numbering: states in BFS order (classes visited in increasing order); the states left out, if any,
+        tell no two columns apart that the others do not."""
+        delta = self._delta.numpy()
+        order = bfs_order(delta, self._initial)
+        return DFA._of_classes(self.vocab_size, self._token_class, torch.from_numpy(renumbered(delta, order)), 0,
+                               torch.from_numpy(self._accept.numpy()[order]))
 
     # ---------------------------------------------------------------------------------------------
     # Builders
@@ -365,10 +406,19 @@ class DFA(Constraint):
         for s in range(len(goto)):
             if final[s]:
                 delta[s] = [s] * (len(alphabet) + 1)
-        token_class = torch.full((vocab_size,), len(alphabet), dtype = torch.long)
-        token_class[torch.as_tensor(alphabet)] = torch.arange(len(alphabet))
-        accept = [s for s in range(len(goto)) if final[s]]
-        return cls(vocab_size, token_class, delta, 0, accept).minimize()
+        # the classes numbered by their smallest token: every other token's after the alphabet's below its first
+        first = next((i for i, t in enumerate(alphabet) if t != i), len(alphabet))
+        tokens = np.asarray(alphabet, dtype = np.int64)
+        table = np.asarray(delta, dtype = np.int64)
+        accepting = torch.from_numpy(np.asarray(final, dtype = bool))
+        if first == vocab_size:                                 # (no other token)
+            token_class = torch.from_numpy(tokens.argsort())
+            return cls._of_numbered_classes(vocab_size, token_class, torch.from_numpy(table[:, :-1]), 0, accepting).minimize()
+        order = np.r_[np.arange(first), len(alphabet), np.arange(first, len(alphabet))]
+        token_class = np.full(vocab_size, first, dtype = np.int64)
+        token_class[tokens] = np.where(np.arange(tokens.size) < first, np.arange(tokens.size), np.arange(tokens.size) + 1)
+        return cls._of_numbered_classes(vocab_size, torch.from_numpy(token_class), torch.from_numpy(table[:, order]), 0,
+                                        accepting).minimize()
 
     # ---------------------------------------------------------------------------------------------
     # Identity
@@ -444,20 +494,19 @@ def _joint_classes(dfas: Sequence[DFA]):
         raise ValueError("Cannot combine DFAs over different vocabularies.")
     sizes = [d.num_classes for d in dfas]
     if float(np.prod(sizes, dtype = np.float64)) <= 2 ** 24:
-        # mixed-radix key per token, then a counting pass: O(V + prod(C_i)), no sort over V
-        key = torch.zeros(vocab, dtype = torch.long)
+        # mixed-radix key per token, then a counting pass: O(V + prod(C_i)), no sort over V (no thread team for a look)
+        key = np.zeros(vocab, dtype = np.int64)
         for d, c in zip(dfas, sizes):
-            key = key * c + d._token_class
-        present = torch.bincount(key, minlength = int(np.prod(sizes))) > 0
-        keys = torch.nonzero(present).flatten()                            # sorted joint keys
-        remap = torch.cumsum(present.long(), dim = 0) - 1
-        token_class = remap[key]
-        child_class = torch.empty(keys.numel(), len(dfas), dtype = torch.long)
-        rest = keys.clone()
+            key = key * c + d._token_class.numpy()
+        present = np.bincount(key, minlength = int(np.prod(sizes))) > 0
+        keys = np.flatnonzero(present)                                      # sorted joint keys
+        remap = np.cumsum(present) - 1
+        child_class = np.empty((keys.size, len(dfas)), dtype = np.int64)
+        rest = keys.copy()
         for i in range(len(dfas) - 1, -1, -1):
             child_class[:, i] = rest % sizes[i]
-            rest = rest // sizes[i]
-        return token_class, child_class
+            rest //= sizes[i]
+        return torch.from_numpy(remap[key]), torch.from_numpy(child_class)
     stacked = torch.stack([d._token_class for d in dfas], dim = 1)          # [V, k]
     child_class, token_class = torch.unique(stacked, dim = 0, return_inverse = True)
     return token_class, child_class
@@ -502,7 +551,7 @@ def product(dfas: Sequence[DFA], mode: str) -> DFA:
 
 def complement(dfa: DFA) -> DFA:
     """Sequences the DFA rejects (a complete DFA: flip the accepting states)."""
-    return DFA(dfa.vocab_size, dfa._token_class, dfa._delta, dfa.initial, ~dfa._accept).minimize()
+    return DFA._of_classes(dfa.vocab_size, dfa._token_class, dfa._delta, dfa.initial, ~dfa._accept).minimize()
 
 
 def concatenate(dfas: Sequence[DFA]) -> DFA:
@@ -550,18 +599,23 @@ def _concatenate_pair(a: DFA, b: DFA) -> DFA:
 def _compress_classes(token_class: torch.Tensor, delta: torch.Tensor):
     """Merge classes with identical successor columns, drop classes no token belongs to, and number
     the remaining classes by their smallest token (a canonical form for a given transition table)."""
-    used = torch.nonzero(torch.bincount(token_class, minlength = delta.size(1))).flatten()   # O(V), no sort
-    sub = np.ascontiguousarray(delta[:, used].numpy())
+    tokens, table = token_class.numpy(), delta.numpy()
+    used = np.flatnonzero(np.bincount(tokens, minlength = table.shape[1]))   # O(V), no sort
+    sub = np.ascontiguousarray(table if used.size == table.shape[1] else table[:, used])
     group, first_col = _column_classes(sub)                                  # merge identical columns (one pass)
-    cols, inv = torch.from_numpy(np.ascontiguousarray(sub[:, first_col])), torch.from_numpy(group)
-    old_to_new = torch.full((delta.size(1),), -1, dtype = torch.long)
-    old_to_new[used] = inv
-    tc = old_to_new[token_class]
-    # number classes by first (smallest) token
-    C = cols.size(1)
-    first = torch.full((C,), token_class.numel(), dtype = torch.long)
-    first.scatter_reduce_(0, tc, torch.arange(tc.numel()), reduce = "amin")
-    order = torch.argsort(first)
-    rank = torch.empty_like(order)
-    rank[order] = torch.arange(C)
-    return rank[tc].contiguous(), cols[:, order].contiguous()
+    # (every column its own group: `first_col` counts up from 0, and the table stays as it is; it is the caller's, so
+    # one copy of it)
+    cols = sub.copy() if first_col.size == sub.shape[1] else np.ascontiguousarray(sub[:, first_col])
+    old_to_new = np.full(table.shape[1], -1, dtype = np.int64)
+    old_to_new[used] = group
+    tc = old_to_new[tokens]
+    # number classes by first (smallest) token: a repeated index keeps the value assigned last
+    C = cols.shape[1]
+    first = np.full(C, tokens.size, dtype = np.int64)
+    first[tc[::-1]] = np.arange(tokens.size - 1, -1, -1)
+    order = np.argsort(first, kind = "stable")
+    if np.array_equal(order, np.arange(C)):
+        return torch.from_numpy(tc), torch.from_numpy(cols)
+    rank = np.empty(C, dtype = np.int64)
+    rank[order] = np.arange(C)
+    return torch.from_numpy(rank[tc]), torch.from_numpy(np.ascontiguousarray(cols[:, order]))

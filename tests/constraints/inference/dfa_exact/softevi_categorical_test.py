@@ -105,7 +105,7 @@ def assert_close(got, want, n):
 def sum_path(request, monkeypatch):
     """The sum layers through the fused kernel only, or the dense (cuBLAS) path wherever they qualify."""
     from pyjuice.constraints.inference.dfa_exact.kernels import sum as lifted_sum
-    monkeypatch.setattr(lifted_sum, "DENSE_MIN_BLOCK", 1 if request.param == "dense" else 1 << 30)
+    monkeypatch.setattr(lifted_sum.dense, "DENSE_MIN_BLOCK", 1 if request.param == "dense" else 1 << 30)
     return request.param
 
 
@@ -118,7 +118,7 @@ def transitions(request, monkeypatch):
     import pyjuice.constraints.inference.dfa_exact.kernels.prod as prod
     monkeypatch.setattr(P, "GROUP_MIN_RATIO", 0 if request.param == "grouped" else 1 << 30)
     if request.param == "input_groups":
-        monkeypatch.setattr(prod, "GROUP_MIN_LANES", 0)
+        monkeypatch.setattr(prod.run, "GROUP_MIN_LANES", 0)
     return request.param
 
 
@@ -476,9 +476,9 @@ def test_score_weights_paths(shared, columns, rows, reference, monkeypatch):
     every way."""
     from pyjuice.constraints.inference.dfa_exact.kernels import score
     if columns == "in shares":
-        monkeypatch.setattr(score, "SCORE_SHARE_ROWS", 1)
-    monkeypatch.setattr(score, "CLASS_ROWS_SHARED", rows == "shared")
-    shares, real = [], score._score_weights_kernel
+        monkeypatch.setattr(score.group, "SCORE_SHARE_ROWS", 1)
+    monkeypatch.setattr(score.class_rows, "CLASS_ROWS_SHARED", rows == "shared")
+    shares, real = [], score.group._score_weights_kernel
 
     class Recorded:
         def __getitem__(self, grid):
@@ -487,7 +487,7 @@ def test_score_weights_paths(shared, columns, rows, reference, monkeypatch):
                 return real[grid](*args, **kwargs)
             return launch
 
-    monkeypatch.setattr(score, "_score_weights_kernel", Recorded())
+    monkeypatch.setattr(score.group, "_score_weights_kernel", Recorded())
     n, Vm = 4, 50
     torch.manual_seed(0)
     ns = juice.structures.GeneralizedHMM(seq_length = n, num_latents = 160, block_size = 32,

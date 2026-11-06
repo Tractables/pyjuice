@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from typing import Any, Dict
 
+import numpy as np
 import torch
 
 from .layout import BoundaryLayout
@@ -16,6 +17,29 @@ from .layout import BoundaryLayout
 # -------------------------------------------------------------------------------------------------
 # The PC side
 # -------------------------------------------------------------------------------------------------
+
+class Regions:
+    """The sum regions of a backend, ``(first_row, end_row, slots)`` each, as a read-only sequence of tuples (Python
+    ints), and ``array``: int64 [regions, 3]. A circuit may have tens of thousands of them, and a new constraint new ones."""
+
+    __slots__ = ("array",)
+
+    def __init__(self, array: np.ndarray):
+        self.array = array
+
+    def __len__(self) -> int:
+        return self.array.shape[0]
+
+    def __getitem__(self, r: int) -> tuple:
+        first, end, slots = self.array[r].tolist()
+        return first, end, slots
+
+    def __iter__(self):
+        return map(tuple, self.array.tolist())
+
+    def __array__(self, dtype = None, copy = None):
+        return self.array if dtype is None else self.array.astype(dtype, copy = False)
+
 
 def build_pc_tables(structure, layout: BoundaryLayout, pc) -> Dict[str, Any]:
     """
@@ -48,86 +72,25 @@ def build_pc_tables(structure, layout: BoundaryLayout, pc) -> Dict[str, Any]:
           product kernels read every product from this one table;
         * ``input_range`` -- the ``node_mars`` rows ``(first, last + 1)`` of all input nodes;
         * ``root_rows`` -- the ``node_mars`` rows ``(first, last + 1)`` of the root nodes;
-        * ``sum_regions`` -- one ``(first_row, end_row, slots)`` per sum node group, in row order: its
-          ``node_mars`` rows and the slots its block takes per sample;
+        * ``sum_regions`` -- one ``(first_row, end_row, slots)`` per sum node group, in row order
+          (:class:`Regions`): its ``node_mars`` rows and the slots its block takes per sample;
         * ``element_regions`` -- one ``(first_row, end_row, slots)`` per product layer group, in
           ``pc.inner_layer_groups`` order: its ``element_mars`` rows and the most slots any of its
           products takes per sample.
 
         :func:`buffer_layout` turns the regions into offsets and widths for a batch size.
     """
-    n = structure.num_vars
-    info_of = {info.ns: info for info in structure.nodes}
+    from ..kernels.common import most_in_runs
+    from .circuit import circuit_rows                # (it imports the kernels, which import this module)
+    rows = circuit_rows(structure, pc)
     reach = layout.reachability
-
-    def block(a, b):
-        return reach.slots(a, b + 1)
-
-    # rows of every node group, from the layers (node_mars for inputs and sums, element_mars for products)
-    first_row, stale = {}, []
-
-    def number(layer, row):
-        for ns in layer.nodes:
-            first_row[ns] = row
-            if tuple(getattr(ns, "_output_ind_range", ())) != (row, row + ns.num_nodes):
-                stale.append(ns)
-            row += ns.num_nodes
-
-    for layer in pc.input_layer_group:
-        number(layer, layer._output_ind_range[0])
-    for lg in pc.inner_layer_groups:
-        for layer in lg.layers:
-            number(layer, layer._layer_nid_range[0])
-    if stale:
-        from ....errors import ConstraintCompileError
-        raise ConstraintCompileError(
-            f"The PC's node groups no longer describe this circuit: {len(stale)} of them record other rows than "
-            f"the circuit's layers. This happens when the same node graph has been compiled again into "
-            f"another circuit. Compile the constraint against the circuit compiled last, or compile a fresh "
-            f"copy of the nodes.")
-
-    S = 1
-    for info in structure.nodes:
-        if info.kind != "input":
-            (a, b), = info.scope_runs
-            S = max(S, block(a, b))
-
-    dev = pc.device
-    product_rows = []
-    for lg in pc.inner_layer_groups:
-        if not lg.is_prod():
-            continue
-        for layer in lg.layers:
-            parts = []
-            for ns in layer.nodes:
-                (a, b), = info_of[ns].scope_runs
-                order = sorted(range(len(ns.chs)), key = lambda k: info_of[ns.chs[k]].scope_runs[0][0])
-                chs = [ns.chs[k] for k in order]
-                starts = [info_of[cs].scope_runs[0][0] for cs in chs]
-                child_rows = torch.stack([first_row[cs] + _product_child_index(ns, k) for cs, k in zip(chs, order)],
-                                         dim = 1)                                       # [num_nodes, k]
-                bounds = torch.tensor(starts + [b + 1]).expand(ns.num_nodes, -1)
-                out = first_row[ns] + torch.arange(ns.num_nodes)
-                parts.append((out, child_rows, bounds))
-            product_rows.append(_concat_padded(parts, dev))
-
-    # buffer regions: every sum node group keeps exactly its own block per sample; a product layer group
-    # (scratch, consumed by the next sum layer) keeps its largest product's block
-    slots = lambda ns: block(*info_of[ns].scope_runs[0])
-    sum_regions = sorted((first_row[ns], first_row[ns] + ns.num_nodes, slots(ns))
-                         for lg in pc.inner_layer_groups if lg.is_sum() for layer in lg.layers for ns in layer.nodes)
-    element_regions = []
-    for lg in pc.inner_layer_groups:
-        if lg.is_prod():
-            rows = [layer._layer_nid_range for layer in lg.layers]
-            element_regions.append((min(r[0] for r in rows), max(r[1] for r in rows),
-                                    max(slots(ns) for layer in lg.layers for ns in layer.nodes)))
-
-    ranges = [layer._output_ind_range for layer in pc.input_layer_group]
-    return dict(columns_per_sample = S, product_rows = product_rows,
-                input_range = (min(r[0] for r in ranges), max(r[1] for r in ranges)),
-                root_rows = tuple(pc._root_node_range),
-                sum_regions = tuple(sum_regions), element_regions = tuple(element_regions))
+    reach.prepare(rows.node_ivs)
+    slots = reach.slots_of(rows.node_ends)
+    most = most_in_runs(slots[rows.group_iv], rows.group_ptr).tolist()
+    return dict(columns_per_sample = max(1, int(slots.max(initial = 1))),
+                product_rows = rows.on_device(pc.device), input_range = rows.input_range, root_rows = rows.root_rows,
+                sum_regions = Regions(np.concatenate([rows.sum_rows, slots[rows.sum_iv][:, None]], axis = 1)),
+                element_regions = tuple((first, end, m) for (first, end, _), m in zip(rows.product_groups, most)))
 
 
 #: Every region starts, and every sum and product row is padded, to a multiple of this many floats (64 bytes),
@@ -156,37 +119,18 @@ def buffer_layout(input_range, sum_regions, element_regions, batch_size: int) ->
     columns per row; its size is that of the largest group.
 
     :returns: a dict with ``input_offset``, ``sum_offsets`` and ``sum_widths`` (one per sum
-        region; row ``r`` of region ``i`` starts at ``sum_offsets[i] + (r - first_row) * sum_widths[i]``),
-        ``node_size``, ``element_widths`` (one per product layer group; row ``r`` starts at
-        ``(r - first_row) * width``) and ``element_size``
+        region; row ``r`` of region ``i`` starts at ``sum_offsets[i] + (r - first_row) * sum_widths[i]``), the same as
+        arrays ``sum_offsets_host`` and ``sum_widths_host``, ``node_size``, ``element_widths`` (one per product layer
+        group; row ``r`` starts at ``(r - first_row) * width``) and ``element_size``
     """
     B = int(batch_size)
     input_start, input_end = input_range
-    offset = _align(input_end * B)
-    sum_offsets, sum_widths = [], []
-    for first, end, slots in sum_regions:
-        width = _align(B * slots)
-        sum_offsets.append(offset); sum_widths.append(width)
-        offset += (end - first) * width                                       # stays aligned
+    regions = np.asarray(sum_regions, dtype = np.int64).reshape(-1, 3)
+    widths = (B * regions[:, 2] + ALIGN - 1) // ALIGN * ALIGN
+    ends = _align(input_end * B) + np.cumsum((regions[:, 1] - regions[:, 0]) * widths)   # (stays aligned)
+    node_size = int(ends[-1]) if ends.size else _align(input_end * B)
+    sum_offsets = np.concatenate([[_align(input_end * B)], ends[:-1]]) if ends.size else ends
     element_widths = [_align(B * slots) for _, _, slots in element_regions]
     element_size = max(((end - first) * w for (first, end, _), w in zip(element_regions, element_widths)), default = 0)
-    return dict(input_offset = 0, sum_offsets = sum_offsets, sum_widths = sum_widths,
-                node_size = offset, element_widths = element_widths, element_size = element_size)
-
-
-def _product_child_index(ns, k) -> torch.Tensor:
-    """[num_nodes] the node of child ``k`` (within that child's group) that each product node multiplies."""
-    if ns.is_block_sparse():
-        off = torch.arange(ns.num_nodes) % ns.block_size
-        return ns.edge_ids[torch.arange(ns.num_nodes) // ns.block_size, k].cpu() * ns.chs[k].block_size + off
-    return ns.edge_ids[:, k].cpu()
-
-
-def _concat_padded(rows, dev):
-    """Stack (out [r], child_rows [r, k_i], bounds [r, k_i + 1]) parts, padding to the largest k with -1."""
-    k = max(child.size(1) for _, child, _ in rows)
-    pad = lambda x, width: torch.nn.functional.pad(x, (0, width - x.size(1)), value = -1)
-    out = torch.cat([o for o, _, _ in rows])
-    child = torch.cat([pad(c, k) for _, c, _ in rows])
-    bounds = torch.cat([pad(bd, k + 1) for _, _, bd in rows])
-    return tuple(t.to(dev, torch.int32) for t in (out, child, bounds))
+    return dict(input_offset = 0, sum_offsets = sum_offsets.tolist(), sum_widths = widths.tolist(), sum_offsets_host = sum_offsets,
+                sum_widths_host = widths, node_size = node_size, element_widths = element_widths, element_size = element_size)

@@ -42,6 +42,52 @@ def pack_aligned(arrays: Sequence[np.ndarray], dtype) -> Tuple[np.ndarray, np.nd
     return buf, starts
 
 
+def one_copy(arrays: Sequence[np.ndarray], device, dtype = np.int32) -> list:
+    """``arrays`` on ``device`` in one copy (every copy from the host waits for the stream), of their shapes, each as
+    :func:`pack_aligned` places it."""
+    buf, starts = pack_aligned([a.reshape(-1) for a in arrays], dtype)
+    table = torch.from_numpy(buf).to(device)
+    return [table[at:at + a.size].view(a.shape) for a, at in zip(arrays, starts.tolist())]
+
+
+class OneCopy:
+    """Int32 tables of a circuit's launches on their way to the device, in one copy (thousands of them; every copy from
+    the host waits for the stream): :meth:`add` gives a place for a table, :meth:`upload` copies them all, and
+    :func:`settled` reads the tables at their places in what was built with them."""
+
+    class Place:
+        __slots__ = ("host", "tensor")
+
+    def __init__(self):
+        self.places = []
+
+    def add(self, array: np.ndarray) -> "OneCopy.Place":
+        place = OneCopy.Place()
+        place.host, place.tensor = np.asarray(array), None
+        self.places.append(place)
+        return place
+
+    def upload(self, dev) -> None:
+        buf, starts = pack_aligned([p.host.reshape(-1) for p in self.places], np.int32)
+        tables = torch.from_numpy(buf).to(dev)
+        for p, s in zip(self.places, starts.tolist()):
+            p.tensor, shape = tables[s:s + p.host.size], p.host.shape
+            if len(shape) != 1:
+                p.tensor = p.tensor.view(shape)
+            p.host = None
+
+
+def settled(x):
+    """``x``, a tuple or dict of them or anything else, with the tables of :class:`OneCopy` at their places."""
+    if isinstance(x, OneCopy.Place):
+        return x.tensor
+    if isinstance(x, tuple):
+        return tuple(settled(v) for v in x)
+    if isinstance(x, dict):
+        return {k: settled(v) for k, v in x.items()}
+    return x
+
+
 class IndexList:
     """An int32 index list of a query plan: ``host`` (numpy) until :meth:`IndexLists.upload` copies it to the device
     (``tensor``) and drops it -- a cached plan holds the device copy alone (the host one may view a planner's whole
@@ -64,11 +110,54 @@ NODE_TILE = 16
 _NODE_TILE = tl.constexpr(NODE_TILE)
 
 
+def packed(columns: np.ndarray, radix: int) -> np.ndarray:
+    """int64 [rows]: every row of the non-negative ``columns`` [rows, k] (each below ``radix``) as one number, in the
+    rows' lexicographic order."""
+    out = columns[:, 0].astype(np.int64)
+    for c in range(1, columns.shape[1]):
+        out = out * radix + columns[:, c]
+    return out
+
+
+def _row_keys(keys) -> Tuple[Optional[np.ndarray], np.ndarray]:
+    """``(numbers, cols)``: the rows of ``keys`` (int arrays, a value per row each, or [rows, k]) as [rows, k] ``cols``,
+    and as one int64 each in their lexicographic order, where those fit (else None)."""
+    cols = np.concatenate([np.asarray(k, dtype = np.int64).reshape(len(keys[0]), -1) for k in keys], axis = 1)
+    if cols.shape[0] == 0:
+        return None, cols
+    low, span = cols.min(axis = 0), cols.max(axis = 0) - cols.min(axis = 0) + 1
+    room = 1
+    for s in span.tolist():
+        room *= s
+    if room >= 1 << 62:
+        return None, cols
+    out = cols[:, 0] - low[0]
+    for c in range(1, cols.shape[1]):
+        out = out * span[c] + (cols[:, c] - low[c])
+    return out, cols
+
+
 def node_groups(*keys: np.ndarray) -> np.ndarray:
     """Every row's group (int64 [rows]): the rows with equal ``keys`` (int arrays, a value per row each, or [rows, k])
-    share one."""
-    cols = np.concatenate([np.asarray(k, dtype = np.int64).reshape(len(keys[0]), -1) for k in keys], axis = 1)
-    return np.unique(cols, axis = 0, return_inverse = True)[1].reshape(-1)
+    share one, numbered in the rows' lexicographic order."""
+    numbers, cols = _row_keys(keys)
+    if numbers is None:
+        return np.unique(cols, axis = 0, return_inverse = True)[1].reshape(-1)
+    return np.unique(numbers, return_inverse = True)[1].reshape(-1)
+
+
+def first_occurrence_groups(*keys: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """``(group, first)``: :func:`node_groups`' rows with equal ``keys``, numbered as they first occur, and every group's
+    first row."""
+    numbers, cols = _row_keys(keys)
+    if numbers is None:
+        _, at, inverse = np.unique(cols, axis = 0, return_index = True, return_inverse = True)
+    else:
+        _, at, inverse = np.unique(numbers, return_index = True, return_inverse = True)
+    order = np.argsort(at)
+    rank = np.empty(at.size, dtype = np.int64)
+    rank[order] = np.arange(at.size)
+    return rank[inverse.reshape(-1)], at[order]
 
 
 @njit(cache = True)
@@ -183,7 +272,7 @@ def _exit_width(width, t2, n):
 @triton.jit
 def _interval(iv_of, iv_info, a, b, n):
     """``(slots, positions, pairs)`` of the interval ``[a, b)``: its blocks' slots per sample, and where its
-    position and pair tables start (-1 when it keeps every pair; see :class:`~.layout.IntervalTables`)."""
+    position and pair tables start (-1 when it keeps every pair; see :class:`~.dfa_exact.compiled.reachability.IntervalTables`)."""
     k = tl.load(iv_of + a * (n + 1) + b).to(tl.int64) * 3
     return tl.load(iv_info + k).to(tl.int32), tl.load(iv_info + k + 1), tl.load(iv_info + k + 2)  # 32-bit index math
 
@@ -255,3 +344,21 @@ def pdl_launch(dev: torch.device) -> bool:
     if hit is None:
         hit = _PDL[key] = torch.cuda.get_device_capability(key)[0] >= 9
     return hit
+
+
+def most_in_runs(values: np.ndarray, ptr: np.ndarray, floor: int = 0) -> np.ndarray:
+    """int64 [len(ptr) - 1]: the largest of every run ``values[ptr[k]:ptr[k + 1]]``, at least ``floor`` (an empty run:
+    ``floor``)."""
+    out = np.full(ptr.size - 1, floor, dtype = np.int64)
+    some = ptr[1:] > ptr[:-1]
+    if some.any():
+        out[some] = np.maximum(np.maximum.reduceat(values, ptr[:-1][some]), floor)
+    return out
+
+
+def available_memory(dev: torch.device) -> int:
+    """The bytes this process can still take on a GPU: its free memory and the blocks the caching allocator holds unused
+    (read in one call: :func:`torch.cuda.memory_stats` flattens every statistic, a millisecond on the host)."""
+    stats = torch.cuda.memory_stats_as_nested_dict(dev)
+    held = stats["reserved_bytes"]["all"]["current"] - stats["allocated_bytes"]["all"]["current"] if stats else 0
+    return torch.cuda.mem_get_info(dev)[0] + held

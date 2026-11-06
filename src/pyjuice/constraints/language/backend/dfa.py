@@ -1,12 +1,14 @@
 """
 Numba kernels of the DFA algorithms in :mod:`pyjuice.constraints.language.dfa`: the breadth-first order of the
-reachable states (:func:`bfs_order`), Hopcroft's minimization (:func:`hopcroft`), the breadth-first product of
-several DFAs over their joint classes (:func:`product_bfs`), and the columns of a table grouped by equal content
-(:func:`_column_classes`). Tables are int64 ``[states, classes]``, complete.
+reachable states (:func:`bfs_order`), Hopcroft's minimization over moves (:func:`hopcroft`, :func:`minimal_moves`), the
+breadth-first product of several DFAs over their joint classes (:func:`product_bfs`), and the columns of a table grouped
+by equal content (:func:`_column_classes`). Tables are int64 ``[states, classes]``, complete.
 """
 
 import numpy as np
-from numba import njit
+from numba import get_num_threads, njit, prange
+
+from .threads import few_threads
 
 
 @njit(cache = True)
@@ -19,7 +21,7 @@ def bfs_order(delta, initial):
     order[0] = initial
     seen[initial] = True
     num, head = 1, 0
-    while head < num:
+    while head < num and num < K:                               # (every state found: the order is known)
         q = order[head]
         head += 1
         for c in range(C):
@@ -32,81 +34,143 @@ def bfs_order(delta, initial):
 
 
 @njit(cache = True)
-def hopcroft(delta, accept):
-    """
-    The coarsest partition of the states that keeps accepting and rejecting states apart and is respected by every
-    class's transitions -- Hopcroft's algorithm (every state reachable, the table complete): the block of every state
-    (int64 [K], blocks numbered in no particular order) and the number of blocks.
-    """
+def _renumbered_rows(delta, order, remap, out, lo, hi):
+    C = delta.shape[1]
+    for i in range(lo, hi):
+        q = order[i]
+        for c in range(C):
+            out[i, c] = remap[delta[q, c]]
+
+
+@njit(parallel = True, cache = True)
+def _renumbered_parallel(delta, order, remap, out, P):
+    R = order.shape[0]
+    for p in prange(P):
+        _renumbered_rows(delta, order, remap, out, p * R // P, (p + 1) * R // P)
+
+
+#: a table of at least this many entries is renumbered in threads
+PARALLEL_ENTRIES = 1 << 24
+
+
+@few_threads
+def renumbered(delta: np.ndarray, order: np.ndarray) -> np.ndarray:
+    """The table of the states ``order`` (every successor among them), numbered by their place there."""
+    remap = np.empty(delta.shape[0], dtype = np.int64)
+    remap[order] = np.arange(order.size)
+    out = np.empty((order.size, delta.shape[1]), dtype = np.int64)
+    if out.size >= PARALLEL_ENTRIES and get_num_threads() > 1:
+        _renumbered_parallel(delta, order, remap, out, get_num_threads())
+    else:
+        _renumbered_rows(delta, order, remap, out, 0, order.size)
+    return out
+
+
+@njit(cache = True)
+def moves_of_table(delta, accept):
+    """A complete table's moves as CSR per state, classes ascending: ``(ptr, cls, dst)``, without those into a state that
+    accepts nothing and only loops -- nearly all of a table's, as a rule."""
     K, C = delta.shape
-    # the predecessors of every (class, state), as CSR
-    ptr = np.zeros(C * K + 1, dtype = np.int64)
+    sink = np.zeros(K, dtype = np.bool_)
+    for q in range(K):
+        if not accept[q]:
+            loops = True
+            for c in range(C):
+                if delta[q, c] != q:
+                    loops = False
+                    break
+            sink[q] = loops
+    ptr = np.zeros(K + 1, dtype = np.int64)
+    for q in range(K):
+        n = 0
+        for c in range(C):
+            if not sink[delta[q, c]]:
+                n += 1
+        ptr[q + 1] = ptr[q] + n
+    cls = np.empty(ptr[K], dtype = np.int32)
+    dst = np.empty(ptr[K], dtype = np.int32)
+    at = 0
     for q in range(K):
         for c in range(C):
-            ptr[c * K + delta[q, c] + 1] += 1
-    for i in range(C * K):
-        ptr[i + 1] += ptr[i]
-    pred = np.empty(K * C, dtype = np.int64)
-    fill = ptr[:-1].copy()
-    for q in range(K):
-        for c in range(C):
-            t = c * K + delta[q, c]
-            pred[fill[t]] = q
-            fill[t] += 1
-    # blocks as contiguous ranges of `elems`; `loc` the position of every state in it
-    elems = np.empty(K, dtype = np.int64)
-    loc = np.empty(K, dtype = np.int64)
-    block = np.empty(K, dtype = np.int64)
-    start = np.zeros(K + 1, dtype = np.int64)
-    size = np.zeros(K + 1, dtype = np.int64)
-    num_accept = 0
-    for q in range(K):
-        if accept[q]:
-            num_accept += 1
-    num_blocks = 0
-    first = np.array([0, num_accept], dtype = np.int64)
-    fill2 = first.copy()
-    for q in range(K):
-        side = 0 if accept[q] else 1
-        elems[fill2[side]] = q
-        loc[q] = fill2[side]
-        fill2[side] += 1
-    for side in range(2):
-        n = num_accept if side == 0 else K - num_accept
-        if n > 0:
-            start[num_blocks], size[num_blocks] = first[side], n
-            for i in range(first[side], first[side] + n):
-                block[elems[i]] = num_blocks
-            num_blocks += 1
-    # splitters (block, class): every class with the smaller initial block
-    wl_block = np.empty(K * C + C, dtype = np.int64)
-    wl_class = np.empty(K * C + C, dtype = np.int64)
-    queued = np.zeros(K * C + C, dtype = np.bool_)
-    top = 0
-    smaller = 0 if num_blocks == 1 or size[0] <= size[1] else 1
-    for c in range(C):
-        wl_block[top], wl_class[top] = smaller, c
-        queued[smaller * C + c] = True
-        top += 1
-    marked = np.zeros(K + 1, dtype = np.int64)                 # per block: its marked states sit at its front
-    touched = np.empty(K + 1, dtype = np.int64)
-    splitter = np.empty(K, dtype = np.int64)
+            t = delta[q, c]
+            if not sink[t]:
+                cls[at], dst[at] = c, t
+                at += 1
+    return ptr, cls, dst
+
+
+@njit(cache = True)
+def _coarsest(into_ptr, into_class, into_src, live, level, C):
+    """
+    The coarsest partition of the states ``live`` that is respected by every class's moves and keeps apart those of two
+    ``level`` s: Hopcroft's algorithm over moves, not over states times classes. ``into_class`` / ``into_src`` from
+    ``into_ptr[t]`` to ``into_ptr[t + 1]`` are the moves into state ``t``, ``live`` holds the states by level, ``level[i]`` the
+    first place of the ``i``-th level. A state without a move on a class goes to a state outside the partition, of which no
+    block needs splitting by: a partition respected by the moves into every other block is respected by those. Returns
+    ``(block, num_blocks)``, int32 [states] (-1 for the others), blocks in no particular order.
+
+    A block is a splitter once, all its classes at a time, when it is made: of a block split the smaller part is a new
+    block, the other keeps its number and its place among the splitters, if it has one. A state's moves are thus read
+    at most ``log2(states) + 1`` times.
+    """
+    K = into_ptr.shape[0] - 1
+    L = live.shape[0]
+    elems = live.copy()                                         # blocks as ranges of `elems`; `loc`: a state's place
+    loc = np.empty(K, dtype = np.int32)
+    block = np.full(K, -1, dtype = np.int32)
+    start = np.zeros(L + 1, dtype = np.int32)
+    size = np.zeros(L + 1, dtype = np.int32)
+    num_blocks = level.shape[0] - 1
+    for b in range(num_blocks):
+        start[b], size[b] = level[b], level[b + 1] - level[b]
+        for i in range(level[b], level[b + 1]):
+            q = elems[i]
+            loc[q], block[q] = i, b
+    stack = np.empty(L + 1, dtype = np.int32)
+    for b in range(num_blocks):
+        stack[b] = num_blocks - 1 - b
+    top = num_blocks
+    moved = np.empty(into_ptr[K], dtype = np.int32)             # the moves into a block, by class: their sources
+    count = np.zeros(C, dtype = np.int32)
+    where = np.empty(C, dtype = np.int32)
+    classes = np.empty(C, dtype = np.int32)
+    marked = np.zeros(L + 1, dtype = np.int32)                  # per block: its marked states sit at its front
+    touched = np.empty(L + 1, dtype = np.int32)
     while top > 0:
         top -= 1
-        B, c = wl_block[top], wl_class[top]
-        queued[B * C + c] = False
-        n = size[B]
-        for i in range(n):                                       # (B may itself split below: its states first)
-            splitter[i] = elems[start[B] + i]
-        num_touched = 0
-        for i in range(n):
-            t = splitter[i]
-            for k in range(ptr[c * K + t], ptr[c * K + t + 1]):
-                p = pred[k]
+        B = stack[top]
+        first, last = start[B], start[B] + size[B]
+        num_classes = 0
+        for i in range(first, last):
+            t = elems[i]
+            for k in range(into_ptr[t], into_ptr[t + 1]):
+                c = into_class[k]
+                if count[c] == 0:
+                    classes[num_classes] = c
+                    num_classes += 1
+                count[c] += 1
+        place = 0
+        for i in range(num_classes):
+            c = classes[i]
+            where[c] = place
+            place += count[c]
+            count[c] = 0
+        for i in range(first, last):
+            t = elems[i]
+            for k in range(into_ptr[t], into_ptr[t + 1]):
+                c = into_class[k]
+                moved[where[c]] = into_src[k]
+                where[c] += 1
+        begin = 0
+        for i in range(num_classes):                            # (B may split on the way: its moves are copied)
+            end = where[classes[i]]
+            num_touched = 0
+            for k in range(begin, end):
+                p = moved[k]
                 b = block[p]
                 front = start[b] + marked[b]
                 pos = loc[p]
-                if pos >= front:                                 # not marked yet: move it to the front
+                if pos >= front:                                # not marked yet: move it to the front
                     if marked[b] == 0:
                         touched[num_touched] = b
                         num_touched += 1
@@ -114,28 +178,151 @@ def hopcroft(delta, accept):
                     elems[front], loc[p] = p, front
                     elems[pos], loc[other] = other, pos
                     marked[b] += 1
-        for j in range(num_touched):
-            b = touched[j]
-            m = marked[b]
-            marked[b] = 0
-            if m == size[b]:
-                continue
-            new = num_blocks                                     # the marked part becomes a block of its own
-            num_blocks += 1
-            start[new], size[new] = start[b], m
-            start[b] += m
-            size[b] -= m
-            for i in range(start[new], start[new] + m):
-                block[elems[i]] = new
-            for cc in range(C):
-                if queued[b * C + cc]:
-                    s = new
+            begin = end
+            for j in range(num_touched):
+                b = touched[j]
+                m = marked[b]
+                marked[b] = 0
+                if m == size[b]:
+                    continue
+                new = num_blocks
+                num_blocks += 1
+                if 2 * m <= size[b]:
+                    start[new], size[new] = start[b], m
+                    start[b] += m
+                    size[b] -= m
                 else:
-                    s = new if size[new] <= size[b] else b
-                wl_block[top], wl_class[top] = s, cc
-                queued[s * C + cc] = True
+                    start[new], size[new] = start[b] + m, size[b] - m
+                    size[b] = m
+                for x in range(start[new], start[new] + size[new]):
+                    block[elems[x]] = new
+                stack[top] = new
                 top += 1
     return block, num_blocks
+
+
+@njit(cache = True)
+def _live_partition(ptr, cls, dst, accept, among, C):
+    """The partition :func:`_coarsest` of the states of ``among`` an accepting state is reachable from, by the moves ``(ptr,
+    cls, dst)`` among them: ``(block, num_blocks)``, ``block`` int32 [states], -1 for the others. Its first blocks are by the
+    walk back from the accepting states: states alike are as far from one (the accepting ones, at no distance, apart from
+    the others among them), which spares most of the splits; a move into a live state is from a live one."""
+    K = ptr.shape[0] - 1
+    into_ptr = np.zeros(K + 1, dtype = np.int64)
+    for q in range(K):
+        if among[q]:
+            for e in range(ptr[q], ptr[q + 1]):
+                into_ptr[dst[e] + 1] += 1
+    for t in range(K):
+        into_ptr[t + 1] += into_ptr[t]
+    into_class = np.empty(into_ptr[K], dtype = np.int32)
+    into_src = np.empty(into_ptr[K], dtype = np.int32)
+    fill = into_ptr[:K].copy()
+    for q in range(K):
+        if among[q]:
+            for e in range(ptr[q], ptr[q + 1]):
+                t = dst[e]
+                into_class[fill[t]], into_src[fill[t]] = cls[e], q
+                fill[t] += 1
+    live = np.empty(K, dtype = np.int32)
+    seen = np.zeros(K, dtype = np.bool_)
+    L = 0
+    for q in range(K):
+        if among[q] and accept[q]:
+            seen[q] = True
+            live[L] = q
+            L += 1
+    level = np.empty(K + 2, dtype = np.int32)                   # (the walk back level by level)
+    level[0] = 0
+    levels = 0
+    head = 0
+    while head < L:
+        levels += 1
+        level[levels] = L
+        for i in range(head, level[levels]):
+            t = live[i]
+            for k in range(into_ptr[t], into_ptr[t + 1]):
+                q = into_src[k]
+                if not seen[q]:
+                    seen[q] = True
+                    live[L] = q
+                    L += 1
+        head = level[levels]
+    return _coarsest(into_ptr, into_class, into_src, live[:L], level[:levels + 1], C)
+
+
+@njit(cache = True)
+def hopcroft(delta, accept):
+    """
+    The coarsest partition of the states that keeps accepting and rejecting states apart and is respected by every
+    class's transitions (every state reachable, the table complete): the block of every state (int64 [K], blocks numbered
+    in no particular order) and the number of blocks. The states nothing accepted is reachable from are one block, the
+    last; the moves into them are not looked at (:func:`_coarsest`).
+    """
+    K, C = delta.shape
+    ptr, cls, dst = moves_of_table(delta, accept)
+    block, num_blocks = _live_partition(ptr, cls, dst, accept, np.ones(K, dtype = np.bool_), C)
+    out = np.full(K, num_blocks, dtype = np.int64)
+    dead = False
+    for q in range(K):
+        if block[q] >= 0:
+            out[q] = block[q]
+        else:
+            dead = True
+    return out, num_blocks + 1 if dead else num_blocks
+
+
+@njit(cache = True)
+def minimal_moves(ptr, cls, dst, accept, initial, C):
+    """
+    The minimal automaton of the moves ``(ptr, cls, dst)`` as CSR per state, classes ascending -- a class a state has no
+    move on goes to a state from which nothing is accepted -- in canonical form: ``(out, accepting, block, place)``, int32
+    [states, C] and bool [states], the live states numbered in breadth-first order from the initial one (state 0), the one
+    dead state last; a state's new number is ``place[block[state]]`` (block -1: dead). Its time goes with the moves, not with
+    states times classes (but for ``out``, filled once).
+    """
+    K = ptr.shape[0] - 1
+    among = np.zeros(K, dtype = np.bool_)
+    queue = np.empty(K, dtype = np.int32)
+    queue[0] = initial
+    among[initial] = True
+    num, head = 1, 0
+    while head < num:
+        q = queue[head]
+        head += 1
+        for e in range(ptr[q], ptr[q + 1]):
+            t = dst[e]
+            if not among[t]:
+                among[t] = True
+                queue[num] = t
+                num += 1
+    block, m = _live_partition(ptr, cls, dst, accept, among, C)
+    if block[initial] < 0:                                      # no text: the dead state alone
+        return np.zeros((1, C), dtype = np.int32), np.zeros(1, dtype = np.bool_), block, np.zeros(1, dtype = np.int32)
+    rep = np.empty(m, dtype = np.int32)                         # any member represents its block
+    for q in range(K):
+        if block[q] >= 0:
+            rep[block[q]] = q
+    place = np.full(m, -1, dtype = np.int32)
+    order = np.empty(m, dtype = np.int32)
+    order[0] = block[initial]
+    place[order[0]] = 0
+    num, head = 1, 0
+    out = np.full((m + 1, C), m, dtype = np.int32)
+    accepting = np.zeros(m + 1, dtype = np.bool_)
+    while head < num:
+        r = rep[order[head]]
+        accepting[head] = accept[r]
+        for e in range(ptr[r], ptr[r + 1]):
+            b = block[dst[e]]
+            if b >= 0:
+                if place[b] < 0:
+                    place[b] = num
+                    order[num] = b
+                    num += 1
+                out[head, cls[e]] = place[b]
+        head += 1
+    return out, accepting, block, place
 
 
 @njit(cache = True)

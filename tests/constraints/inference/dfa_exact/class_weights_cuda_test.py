@@ -1,6 +1,6 @@
 """
 The class weights on CUDA (kernels/c/class_weights.cu, ``cw_class_cuda``: the entry tables, then the rows staged in
-shared memory; dispatched from ``score.run_class_weights`` for ``input @ block`` steps with one exit column and one
+shared memory; dispatched from ``score.class_weights.run_class_weights`` for ``input @ block`` steps with one exit column and one
 step a destination, on compact values under evidence pruning): sessions with the kernels forced on, at every CTA shape
 (1, 2 or 4 destinations, 128 or 256 threads), against the float64 reference (strong_check's bars) and, bit for bit,
 against the same sessions on the Triton kernel (the walk-length rule off: every launch it applies to); what it declines
@@ -48,18 +48,46 @@ def test_sessions_match_the_reference_and_the_triton_kernel_to_the_bit(kind, mod
     cc = jc.compile(dfa, pc)
     masks = schedule(mode, data.size(0), data.size(1))
     calls = _calls(monkeypatch)
-    monkeypatch.setattr(score, "CLASS_WEIGHT_CUDA", True)
-    monkeypatch.setattr(score, "CLASS_WEIGHT_CUDA_WALK", 0)                  # (every launch: the small cases' walks are short)
-    monkeypatch.setattr(score, "CLASS_WEIGHT_CUDA_DESTS", shape[0])
-    monkeypatch.setattr(score, "CLASS_WEIGHT_CUDA_THREADS", shape[1])
+    monkeypatch.setattr(score.class_weights, "CLASS_WEIGHT_CUDA", True)
+    monkeypatch.setattr(score.class_weight_kernels, "CLASS_WEIGHT_CUDA_WALK", 0)                  # (every launch: the small cases' walks are short)
+    monkeypatch.setattr(score.class_weight_kernels, "CLASS_WEIGHT_CUDA_DESTS", shape[0])
+    monkeypatch.setattr(score.class_weight_kernels, "CLASS_WEIGHT_CUDA_THREADS", shape[1])
     check_against_reference(cc, Float64Reference(pc, dfa, data.size(1)), data, masks, inputs, "compact", "fp32")
     cuda = run_session(cc, data, masks, inputs, "compact", "fp32")
     assert calls, "the CUDA kernel served no launch"
     n = len(calls)
-    monkeypatch.setattr(score, "CLASS_WEIGHT_CUDA", False)
+    monkeypatch.setattr(score.class_weights, "CLASS_WEIGHT_CUDA", False)
     triton = run_session(cc, data, masks, inputs, "compact", "fp32")
     assert len(calls) == n, "the Triton kernel forced, the CUDA kernel still ran"
     assert cuda.keys() == triton.keys()
+    for i in cuda:
+        for u, v in zip(cuda[i], triton[i]):
+            assert torch.equal(u, v), f"call {i}: the CUDA and Triton class weights differ"
+
+
+@needs_kernel
+def test_rows_of_exactly_the_default_limit_of_shared_memory(monkeypatch):
+    """A CTA of 4 destinations whose rows take 48 KB (boundaries of 1536 columns): with the kernel's static shared
+    memory, past what a kernel has unless it asks for more, though the rows alone are within it. Bit for bit against
+    the Triton kernel."""
+    K, C, n, B = 1536, 40, 6, 2
+    V = 2 * C
+    dfa = jc.DFA(V, torch.arange(V) % C, (torch.arange(K)[:, None] * C + torch.arange(C)[None, :]) % K, 0,
+                 torch.ones(K, dtype = torch.bool))                       # (every state from the initial in two tokens)
+    pc = strong.hmm_pc(n, strong.SMALL["hmm"]["latents"], V, 0)
+    cc = jc.compile(dfa, pc)
+    data = torch.randint(0, V, (B, n), generator = torch.Generator().manual_seed(0))
+    masks = schedule("l2r", B, n)
+    calls = _calls(monkeypatch)
+    monkeypatch.setattr(score.class_weights, "CLASS_WEIGHT_CUDA", True)
+    monkeypatch.setattr(score.class_weight_kernels, "CLASS_WEIGHT_CUDA_WALK", 0)
+    monkeypatch.setattr(score.class_weight_kernels, "CLASS_WEIGHT_CUDA_DESTS", 4)
+    monkeypatch.setattr(score.class_weight_kernels, "CLASS_WEIGHT_CUDA_THREADS", 256)
+    cuda = run_session(cc, data, masks, None, "compact", "fp32")
+    mod = dfa_c.get_class_weights_module()
+    assert any(mod.cw_stage_smem(a[-8], a[-11], a[-10]) == 48 * 1024 for a in calls), "no CTA of exactly 48 KB"
+    monkeypatch.setattr(score.class_weights, "CLASS_WEIGHT_CUDA", False)
+    triton = run_session(cc, data, masks, None, "compact", "fp32")
     for i in cuda:
         for u, v in zip(cuda[i], triton[i]):
             assert torch.equal(u, v), f"call {i}: the CUDA and Triton class weights differ"
@@ -70,7 +98,7 @@ def test_it_declines_dense_storage(monkeypatch):
     pc, dfa, data, inputs = small_case("hmm")
     cc = jc.compile(dfa, pc)
     calls = _calls(monkeypatch)
-    monkeypatch.setattr(score, "CLASS_WEIGHT_CUDA", True)
-    monkeypatch.setattr(score, "CLASS_WEIGHT_CUDA_WALK", 0)
+    monkeypatch.setattr(score.class_weights, "CLASS_WEIGHT_CUDA", True)
+    monkeypatch.setattr(score.class_weight_kernels, "CLASS_WEIGHT_CUDA_WALK", 0)
     run_session(cc, data, schedule("l2r", data.size(0), data.size(1)), inputs, "dense", "fp32")
     assert not calls

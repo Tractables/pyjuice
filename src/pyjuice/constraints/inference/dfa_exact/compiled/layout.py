@@ -12,21 +12,23 @@ is valid, and this one gathers the (column, column) pairs the automaton cannot j
 product kernels skip (:class:`Reachability`).
 
 The layout depends only on the automaton and ``n`` -- never on the PC, its parameters or evidence -- so it
-is built once and cached by the automaton's fingerprint.
+is built once and kept with the automaton object (hashing the automaton's tables would take longer than building it).
 """
 
 from __future__ import annotations
 
-import math
+import weakref
 from collections import OrderedDict
 from dataclasses import dataclass
 from functools import cached_property
-from typing import Dict, Optional, Tuple
+from typing import Optional
 
+import numpy as np
 import torch
+from numba import njit
 
 from ....language.dfa import DFA
-
+from .reachability import Reachability
 
 
 @dataclass(frozen = True)
@@ -40,7 +42,7 @@ class BoundaryLayout:
     :ivar state_id: [n+1, W] automaton state of every column, ``-1`` for padding (``W`` = max width); a
         boundary's columns run from the state farthest from acceptance to the nearest, ties by state id
     :ivar col_of_state: [n+1, K] column of every automaton state, ``-1`` if inactive
-    :ivar delta: [K, C] the automaton's transitions: the successor state of every (state, class)
+    :ivar delta: [K, C] the automaton's transitions: the successor state of every (state, class), on the host, made if it is to come
     :ivar satisfiable: whether any string of length ``n`` is accepted. If not, every boundary is empty.
 
     Boundary 0 holds only the initial state (column 0), and every active state at boundary ``n`` is
@@ -53,28 +55,39 @@ class BoundaryLayout:
     n: int
     token_class: torch.Tensor
     width: torch.Tensor
-    state_id: torch.Tensor
-    col_of_state: torch.Tensor
-    delta: torch.Tensor
+    table: object                                     # the automaton's: a tensor, or one to come (it holds the automaton's moves, not the automaton)
     satisfiable: bool
+    on_device: tuple                                  # (device, delta, state_id, col_of_state, order), as they were built
+
+    @cached_property
+    def delta(self) -> torch.Tensor:
+        return self.table if isinstance(self.table, torch.Tensor) else self.table.dense()
+
+    @cached_property
+    def state_id(self) -> torch.Tensor:
+        return self.on_device[2].cpu()
+
+    @cached_property
+    def col_of_state(self) -> torch.Tensor:
+        return self.on_device[3].cpu()
 
     @property
     def max_width(self) -> int:
-        return self.state_id.size(1)
+        return self.on_device[2].size(1)
 
     @cached_property
     def reachability(self) -> "Reachability":
         """The pairs of columns the automaton joins, per interval (:class:`Reachability`, built on first use and kept
         with the layout)."""
-        return Reachability(self)
+        return Reachability(weakref.proxy(self))     # (it keeps it: no cycle to wait for a collection)
 
     @property
     def num_classes(self) -> int:
-        return self.delta.size(1)
+        return self.on_device[1].size(1)
 
     @property
     def num_states(self) -> int:
-        return self.delta.size(0)
+        return self.on_device[1].size(0)
 
     def next_col_at(self, t: int) -> torch.Tensor:
         """[width[t], C]: the column at boundary ``t + 1`` reached from every column at ``t`` by a token of each class,
@@ -91,8 +104,21 @@ class BoundaryLayout:
 
     def transitions(self, device) -> "Transitions":
         """The layout's transitions on ``device`` (:class:`Transitions`)."""
-        return Transitions(self.delta.to(device), self.state_id.to(device), self.col_of_state.to(device),
-                           [int(w) for w in self.width.tolist()])
+        device = torch.device(device)
+        kept = self.__dict__.setdefault("_transitions", {})
+        tr = kept.get(device)
+        if tr is None:
+            widths = [int(w) for w in self.width.tolist()]
+            dev, delta, state_id, col_of_state, order = self.on_device
+            host = None                                       # (built on the host: at hand)
+            if "state_id" in self.__dict__ and self.num_states * self.num_classes <= LAYOUT_HOST_ENTRIES:
+                host = (self.delta.numpy(), self.state_id.numpy(), self.col_of_state.numpy())
+            if dev == device:
+                tr = Transitions(delta, state_id, col_of_state, widths, order, host)
+            else:
+                tr = Transitions(delta.to(device), state_id.to(device), col_of_state.to(device), widths, order.to(device), host)
+            kept[device] = tr
+        return tr
 
     @cached_property
     def successors(self):
@@ -122,12 +148,17 @@ class Transitions:
 
     :ivar delta, state_id, col_of_state: the layout's, on the device
     :ivar width: the boundaries' columns (Python ints)
+    :ivar order: int64 [K] the states in the order of the columns: every boundary's columns are those of its states in this order
+    :ivar host: ``(delta, state_id, col_of_state)`` as arrays, for a small automaton (its tables are then built on the host,
+        :mod:`~..kernels.transitions.host`), else None
     """
 
     delta: torch.Tensor
     state_id: torch.Tensor
     col_of_state: torch.Tensor
     width: list
+    order: torch.Tensor
+    host: Optional[tuple] = None
 
     @property
     def n(self) -> int:
@@ -154,13 +185,14 @@ class Transitions:
         return next_columns(self.delta, self.state_id, self.col_of_state, t, self.width[t])
 
 
-_CACHE: "OrderedDict[tuple, BoundaryLayout]" = OrderedDict()
+_CACHE: "OrderedDict[tuple, Tuple[weakref.ref, BoundaryLayout]]" = OrderedDict()
 _CACHE_SIZE = 64
 
 
 def build_layout(automaton: DFA, n: int, device = None, report = None) -> BoundaryLayout:
     """
-    The :class:`BoundaryLayout` of ``automaton`` over ``n`` positions (cached by fingerprint and ``n``; on the host).
+    The :class:`BoundaryLayout` of ``automaton`` over ``n`` positions (kept for the automaton object and ``n``; on the
+    host).
 
     :param automaton: a complete DFA (what the ``automaton`` capability returns)
     :type automaton: DFA
@@ -175,15 +207,186 @@ def build_layout(automaton: DFA, n: int, device = None, report = None) -> Bounda
         raise TypeError(f"Expected a DFA, got {type(automaton).__name__}.")
     if n < 0:
         raise ValueError(f"`n` must be non-negative, got {n}.")
-    key = (automaton.fingerprint(), int(n))
-    layout = _CACHE.get(key)
-    if layout is not None:
+    key = (id(automaton), int(n))
+    kept = _CACHE.get(key)
+    if kept is not None and kept[0]() is automaton:                       # (an id is only unique among live objects)
         _CACHE.move_to_end(key)
-        return layout
+        return kept[1]
     layout = _build(automaton, int(n), device, report)
-    _CACHE[key] = layout
+
+    def forget(ref):                                                      # (a dead automaton's layout: freed with it)
+        kept = _CACHE.get(key)
+        if kept is not None and kept[0] is ref:
+            del _CACHE[key]
+
+    _CACHE[key] = (weakref.ref(automaton, forget), layout)
+    _CACHE.move_to_end(key)
     if len(_CACHE) > _CACHE_SIZE:
         _CACHE.popitem(last = False)
+    return layout
+
+
+@njit(cache = True)
+def _state_edges(delta, accept):
+    """The automaton's transitions but those into a state that never accepts and never leaves itself: most of its [K, C]
+    table, and nothing can be accepted through them. ``(ptr, succ)``: every state's distinct successors, CSR."""
+    K, C = delta.shape
+    dead = np.empty(K, dtype = np.bool_)
+    for s in range(K):
+        loops = not accept[s]
+        if loops:
+            for c in range(C):
+                if delta[s, c] != s:
+                    loops = False
+                    break
+        dead[s] = loops
+    ptr = np.zeros(K + 1, dtype = np.int64)
+    stamp = np.full(K, -1, dtype = np.int64)
+    succ = np.empty(4 * K + 16, dtype = np.int64)
+    num = 0
+    for s in range(K):
+        for c in range(C):
+            t = delta[s, c]
+            if stamp[t] != s and not dead[t]:
+                stamp[t] = s
+                if num == succ.shape[0]:
+                    more = np.empty(2 * num, dtype = np.int64)
+                    more[:num] = succ[:num]
+                    succ = more
+                succ[num] = t
+                num += 1
+        ptr[s + 1] = num
+    return ptr, succ[:num]
+
+
+@njit(cache = True)
+def _reachable(ptr, succ, initial, K, n):
+    """bool [n + 1, K]: the states reachable from ``initial`` in exactly ``t`` tokens. A row equal to the one before stays
+    (a step is a function of the row), so the rest are copies: decoding at a length well past the shortest accepted
+    string, a sweep settles after a few dozen boundaries of a thousand."""
+    reach = np.zeros((n + 1, K), dtype = np.bool_)
+    reach[0, initial] = True
+    for t in range(n):
+        for s in range(K):
+            if reach[t, s]:
+                for k in range(ptr[s], ptr[s + 1]):
+                    reach[t + 1, succ[k]] = True
+        same = True
+        for s in range(K):
+            if reach[t + 1, s] != reach[t, s]:
+                same = False
+                break
+        if same:
+            reach[t + 2:] = reach[t + 1]
+            break
+    return reach
+
+
+@njit(cache = True)
+def _accepting(ptr, succ, accept, n):
+    """``(accept_in, to_accept)``: bool [n + 1, K], the states from which acceptance is reachable in exactly ``t`` tokens
+    (a row equal to the one before stays), and every state's fewest tokens to acceptance (within ``n``, else ``n + 1``)."""
+    K = accept.shape[0]
+    accept_in = np.zeros((n + 1, K), dtype = np.bool_)
+    to_accept = np.full(K, n + 1, dtype = np.int64)
+    for s in range(K):
+        if accept[s]:
+            accept_in[0, s] = True
+            to_accept[s] = 0
+    for t in range(n):
+        same = True
+        for s in range(K):
+            found = False
+            for k in range(ptr[s], ptr[s + 1]):
+                if accept_in[t, succ[k]]:
+                    found = True
+                    break
+            accept_in[t + 1, s] = found
+            if found != accept_in[t, s]:
+                same = False
+            if found and to_accept[s] > t + 1:
+                to_accept[s] = t + 1
+        if same:
+            accept_in[t + 2:] = accept_in[t + 1]
+            break
+    return accept_in, to_accept
+
+
+@njit(cache = True)
+def _layout_columns(reach, accept_in, to_accept):
+    """``(width, state_id, col_of_state)`` (:class:`BoundaryLayout`, int64), from the sweeps: :func:`_reachable`,
+    :func:`_accepting`."""
+    rows, K = reach.shape
+    n = rows - 1
+    active = np.empty((rows, K), dtype = np.bool_)
+    width = np.zeros(rows, dtype = np.int64)
+    W = 1
+    for t in range(rows):
+        count = 0
+        for s in range(K):
+            on = reach[t, s] and accept_in[n - t, s]
+            active[t, s] = on
+            if on:
+                count += 1
+        width[t] = count
+        W = max(W, count)
+    # the column order: the fewest tokens to acceptance (within n), descending, then the state id
+    count_of = np.zeros(n + 3, dtype = np.int64)
+    for s in range(K):
+        count_of[to_accept[s]] += 1
+    place = np.empty(n + 3, dtype = np.int64)
+    at = 0
+    for v in range(n + 2, -1, -1):
+        place[v] = at
+        at += count_of[v]
+    order = np.empty(K, dtype = np.int64)
+    for s in range(K):
+        order[place[to_accept[s]]] = s
+        place[to_accept[s]] += 1
+    state_id = np.full((rows, W), -1, dtype = np.int64)
+    col_of_state = np.full((rows, K), -1, dtype = np.int64)
+    for t in range(rows):
+        col = 0
+        for i in range(K):
+            s = order[i]
+            if active[t, s]:
+                state_id[t, col] = s
+                col_of_state[t, s] = col
+                col += 1
+    return width, state_id, col_of_state, order
+
+
+#: an automaton of at most so many table entries has its layout built on the host (a few array operations a boundary on
+#: the device are milliseconds, the same sweeps in compiled loops microseconds); larger, on the device, where they scale
+LAYOUT_HOST_ENTRIES = 1 << 19
+
+
+def _build(dfa: DFA, n: int, device = None, report = None) -> BoundaryLayout:
+    dev = torch.device("cpu") if device is None else torch.device(device)
+    if dev.type != "cpu" and dfa.num_states * dfa.num_classes > LAYOUT_HOST_ENTRIES:
+        return _build_on_device(dfa, n, dev, report)
+    delta = dfa._tables_on(dev)[1].long()
+    accept = dfa._accept.numpy()
+    ptr, succ = _state_edges(dfa._delta.numpy(), accept)
+    if report is not None:
+        report.stage("layout: reachable states", 1)
+    reach = _reachable(ptr, succ, dfa.initial, accept.size, n)
+    if report is not None:
+        report.advance()
+        report.stage("layout: accepting states", 1)
+    accept_in, to_accept = _accepting(ptr, succ, accept, n)
+    if report is not None:
+        report.advance()
+        report.stage("layout: columns", 1)
+    width, state_id, col_of_state, order = _layout_columns(reach, accept_in, to_accept)
+    host = torch.from_numpy(state_id), torch.from_numpy(col_of_state)
+    # (the automaton's tables are not copied: nothing writes them)
+    layout = BoundaryLayout(n = n, token_class = dfa._token_class, width = torch.from_numpy(width),
+                            table = dfa._table, satisfiable = bool(width[0] > 0),
+                            on_device = (dev, delta, host[0].to(dev), host[1].to(dev), torch.from_numpy(order).to(dev)))
+    layout.__dict__.update(state_id = host[0], col_of_state = host[1])        # (the host's, as they were built)
+    if report is not None:
+        report.advance()
     return layout
 
 
@@ -207,15 +410,29 @@ def _sweep(first: torch.Tensor, step, n: int, report, stage: str) -> torch.Tenso
     return out
 
 
-def _build(dfa: DFA, n: int, device = None, report = None) -> BoundaryLayout:
-    K, C = dfa.num_states, dfa.num_classes
-    dev = torch.device("cpu") if device is None else torch.device(device)
+def _build_on_device(dfa: DFA, n: int, dev: torch.device, report = None) -> BoundaryLayout:
+    """:func:`_build`, on the device."""
+    K = dfa.num_states
     _, delta, accept = dfa._tables_on(dev)                                  # [K, C], [K]
-    delta = delta.long()
+    accept = accept.bool()
+    # the sweeps walk the pairs of states the automaton joins, each once (a state's classes lead to some ten states), but those into a state that never
+    # accepts and never leaves itself: most of its [K, C] table, and nothing can be accepted through them. At every boundary: it is most of a long layout's cost
+    if isinstance(dfa._table, torch.Tensor):
+        dead = (delta == torch.arange(K, device = dev)[:, None]).all(dim = 1) & ~accept
+        state, cls = torch.nonzero(~dead[delta], as_tuple = True)
+        keys = torch.unique(state * K + delta[state, cls])
+        state, succ = torch.div(keys, K, rounding_mode = "floor"), torch.remainder(keys, K)
+    else:
+        state, succ = dfa._table.pairs_on(dev)
 
     def forward(row):                                                       # the successors of a set of states
         nxt = torch.zeros(K, dtype = torch.bool, device = dev)
-        nxt[delta[row].reshape(-1)] = True
+        nxt[succ[row[state]]] = True
+        return nxt
+
+    def backward(row):                                                      # the states with a successor in a set
+        nxt = torch.zeros(K, dtype = torch.bool, device = dev)
+        nxt[state[row[succ]]] = True
         return nxt
 
     initial = torch.zeros(K, dtype = torch.bool, device = dev)
@@ -223,168 +440,26 @@ def _build(dfa: DFA, n: int, device = None, report = None) -> BoundaryLayout:
     # reachable from the initial state in exactly t tokens ...
     reach = _sweep(initial, forward, n, report, "layout: reachable states")
     # ... and able to reach acceptance in exactly n - t more tokens
-    accept_in = _sweep(accept.bool(), lambda row: row[delta].any(dim = 1), n, report, "layout: accepting states")
-    active = (reach & accept_in.flip(0)).cpu()                              # [n+1, K]
+    accept_in = _sweep(accept, backward, n, report, "layout: accepting states")
+    active = reach & accept_in.flip(0)                                      # [n+1, K]
     # the column order: the fewest tokens to acceptance (within n), descending, then the state id
-    to_accept = torch.where(accept_in.any(dim = 0), accept_in.to(torch.uint8).argmax(dim = 0), n + 1).cpu()
+    to_accept = torch.where(accept_in.any(dim = 0), accept_in.to(torch.uint8).argmax(dim = 0), n + 1)
+    order = torch.argsort((n + 1 - to_accept) * K + torch.arange(K, device = dev))     # the states in that order
 
+    if report is not None:
+        report.stage("layout: columns", 1)
     width = active.sum(dim = 1)
     W = max(int(width.max()), 1)
-    state_id = torch.full((n + 1, W), -1, dtype = torch.long)
-    col_of_state = torch.full((n + 1, K), -1, dtype = torch.long)
+    in_order = active[:, order]
+    cols = torch.cumsum(in_order, dim = 1) - 1                              # a state's column, were it active
+    rows, at = torch.nonzero(in_order, as_tuple = True)
+    state_id = torch.full((n + 1, W), -1, dtype = torch.long, device = dev)
+    state_id[rows, cols[rows, at]] = order[at]
+    col_of_state = torch.full((n + 1, K), -1, dtype = torch.long, device = dev)
+    col_of_state[rows, order[at]] = cols[rows, at]
+    # (the automaton's tables are not copied: nothing writes them)
+    layout = BoundaryLayout(n = n, token_class = dfa._token_class, width = width.cpu(), table = dfa._table,
+                            satisfiable = bool(width[0] > 0), on_device = (dev, delta, state_id, col_of_state, order))
     if report is not None:
-        report.stage("layout: columns", n + 1)
-    for t in range(n + 1):
-        if t > 0 and torch.equal(active[t], active[t - 1]):                 # (the same states: the same columns)
-            state_id[t], col_of_state[t] = state_id[t - 1], col_of_state[t - 1]
-        else:
-            ids = torch.nonzero(active[t]).flatten()
-            ids = ids[torch.argsort((n + 1 - to_accept[ids]) * K + ids)]
-            state_id[t, :ids.numel()] = ids
-            col_of_state[t, ids] = torch.arange(ids.numel())
-        if report is not None:
-            report.advance()
-
-    return BoundaryLayout(n = n, token_class = dfa.token_class, width = width, state_id = state_id,
-                          col_of_state = col_of_state, delta = dfa.delta.to(torch.long).contiguous(),
-                          satisfiable = bool(width[0] > 0))
-
-
-class Reachability:
-    """
-    Which (column at boundary ``a``, column at boundary ``b``) pairs the automaton joins in exactly ``b - a``
-    tokens -- the entries of a block over ``[a, b)`` that are not structurally ``-inf``, and the only ones a block
-    keeps: its SLOTS, the joined pairs in row-major order. A sequence end (``b == n``) is one column, joined from
-    every column that can still accept. Per interval, computed on demand by one forward sweep per entry boundary
-    (the pair matrices dropped as the sweep moves on):
-
-    * :meth:`slots`: how many pairs are joined. A prefix (``a == 0``) or a suffix (``b == n``) joins every pair --
-      every column is reachable from the initial state and can still accept -- so neither is swept;
-    * :meth:`positions`: every pair's slot, or None when every pair is joined (pair ``(i, j)`` in slot ``i * X +
-      j``, ``X`` the exit width);
-    * :meth:`occupancy`: which ``tile x tile`` tiles of columns hold a joined pair.
-
-    :param layout: the constraint's layout
-    :param tile: the side of an occupancy tile, in columns
-    """
-
-    def __init__(self, layout: BoundaryLayout, tile: int = 16):
-        self.n = layout.n
-        self.width = [int(w) for w in layout.width.tolist()]
-        self.tile = tile
-        self._layout = layout
-        self._occupancy: Dict[Tuple[int, int], torch.Tensor] = {}
-        self._slots: Dict[Tuple[int, int], int] = {}
-        self._positions: Dict[Tuple[int, int], Optional[torch.Tensor]] = {}
-
-    def exit_width(self, b: int) -> int:
-        return 1 if b == self.n else self.width[b]
-
-    def _every_pair(self, a: int, b: int) -> bool:
-        return a == 0 or b == self.n
-
-    def slots(self, a: int, b: int) -> int:
-        """The joined pairs of the interval ``[a, b)``: the slots of its blocks."""
-        if self._every_pair(a, b):
-            return self.width[a] * self.exit_width(b)
-        if (a, b) not in self._slots:
-            self._sweep(a)
-        return self._slots[a, b]
-
-    def positions(self, a: int, b: int) -> Optional[torch.Tensor]:
-        """int32 [width[a], exit width at b]: the slot of every pair, -1 where not joined; None if every pair is
-        joined."""
-        if self._every_pair(a, b):
-            return None
-        if (a, b) not in self._positions:
-            self._sweep(a)
-        return self._positions[a, b]
-
-    def _advance(self, cur: torch.Tensor, t: int) -> torch.Tensor:
-        """[R, width[t]] 0/1 -> [R, width[t + 1]]: the columns one token on (a scatter through every column's state's
-        distinct successors, :attr:`BoundaryLayout.successors`, those active at ``t + 1``)."""
-        layout = self._layout
-        ids = layout.state_id[t, :self.width[t]]
-        ptr, states = layout.successors
-        counts = ptr[ids + 1] - ptr[ids]
-        k = torch.repeat_interleave(torch.arange(ids.numel()), counts)
-        at = ptr[ids][k] + torch.arange(k.numel()) - (torch.cumsum(counts, 0) - counts)[k]
-        cols = layout.col_of_state[t + 1][states[at]]
-        keep = cols >= 0
-        nxt = torch.zeros(cur.size(0), self.width[t + 1])
-        nxt.index_add_(1, cols[keep], cur[:, k[keep]])
-        return (nxt > 0).to(cur.dtype)
-
-    def _sweep(self, a: int):
-        """Every interval starting at ``a``: pairs (a, b) for b = a, ..., n, kept as occupancy, slots and
-        positions."""
-        cur = torch.eye(self.width[a])
-        for b in range(a, self.n + 1):
-            if b > a:
-                cur = self._advance(cur, b - 1)
-            pairs = (cur.sum(dim = 1, keepdim = True) if b == self.n else cur) > 0
-            self._occupancy[a, b] = _tile_any(pairs, self.tile, self.tile)
-            count = int(pairs.sum())
-            self._slots[a, b] = count
-            self._positions[a, b] = None if count == pairs.numel() else \
-                torch.where(pairs, torch.cumsum(pairs.flatten(), 0).view_as(pairs) - 1, -1).to(torch.int32)
-
-    def pairs(self, a: int, b: int) -> torch.Tensor:
-        """bool [width[a], exit width at b]: the joined pairs (computed afresh, not cached)."""
-        cur = torch.eye(self.width[a])
-        for t in range(a, b):
-            cur = self._advance(cur, t)
-        return (cur.sum(dim = 1, keepdim = True) if b == self.n else cur) > 0
-
-    def occupancy(self, a: int, b: int) -> torch.Tensor:
-        """bool [ceil(width[a] / tile), ceil(exit width at b / tile)]."""
-        if (a, b) not in self._occupancy:
-            self._sweep(a)
-        return self._occupancy[a, b]
-
-
-def _tile_any(m: torch.Tensor, tr: int, tc: int) -> torch.Tensor:
-    """[ceil(R / tr), ceil(C / tc)]: whether each tr x tc tile of the bool matrix ``m`` holds a True."""
-    R, C = m.shape
-    I, J = math.ceil(R / tr), math.ceil(C / tc)
-    p = torch.zeros(I * tr, J * tc, dtype = torch.bool)
-    p[:R, :C] = m
-    return p.view(I, tr, J, tc).any(dim = 3).any(dim = 1)
-
-
-@dataclass(frozen = True)
-class IntervalTables:
-    """
-    Where the product kernels find the slots of the blocks over every interval they read or write (see
-    :class:`Reachability`).
-
-    :ivar of: int32 [(n + 1) * (n + 1)], the number of interval ``[a, b)`` at ``a * (n + 1) + b`` (-1 if unused)
-    :ivar info: int64 [intervals, 3], per interval: its slots per sample, and where its positions and its pairs
-        start in ``table`` -- both -1 when every pair is joined (pair ``(i, j)`` is then in slot ``i * X + j``)
-    :ivar table: int32, the positions (``[entry columns, exit columns]``, every pair's slot or -1) and the pairs
-        (``[slots]``, ``i * X + j`` of every slot's pair) of the intervals where not every pair is joined
-    """
-
-    of: torch.Tensor
-    info: torch.Tensor
-    table: torch.Tensor
-
-
-def interval_tables(reach: Reachability, intervals, device) -> IntervalTables:
-    """The :class:`IntervalTables` of ``intervals`` (``(a, b)`` boundary pairs), on ``device``."""
-    n = reach.n
-    of = torch.full(((n + 1) * (n + 1),), -1, dtype = torch.int32)
-    info, parts, size = [], [], 0
-    for k, (a, b) in enumerate(intervals):
-        of[a * (n + 1) + b] = k
-        positions = reach.positions(a, b)
-        if positions is None:
-            info.append((reach.slots(a, b), -1, -1))
-        else:
-            pairs = torch.nonzero(positions.flatten() >= 0).flatten().to(torch.int32)
-            info.append((pairs.numel(), size, size + positions.numel()))
-            parts += [positions.flatten(), pairs]
-            size += positions.numel() + pairs.numel()
-    table = torch.cat(parts) if parts else torch.zeros(1, dtype = torch.int32)
-    return IntervalTables(of.to(device), torch.tensor(info, dtype = torch.int64).reshape(-1, 3).to(device),
-                          table.to(device))
+        report.advance()
+    return layout

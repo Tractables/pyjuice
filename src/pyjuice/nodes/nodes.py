@@ -10,6 +10,20 @@ from pyjuice.utils import BitSet
 from pyjuice.graph import RegionGraph, PartitionNode, InnerRegionNode, InputRegionNode
 
 
+_compilations = 0
+
+
+def compilations() -> int:
+    """How many times node groups have been given rows in a circuit, or cleared of them (:func:`note_compilation`): what
+    reads their rows need not read them again until this changes."""
+    return _compilations
+
+
+def note_compilation() -> None:
+    global _compilations
+    _compilations += 1
+
+
 def node_iterator(root_ns: CircuitNodes, reverse: bool = False):
     def dfs(ns: CircuitNodes, fn: Callable, visited: set = set()):
         if ns in visited:
@@ -259,6 +273,7 @@ class CircuitNodes():
         return False
 
     def _clear_tensor_circuit_hooks(self, recursive: bool = True):
+        note_compilation()
 
         def clear_hooks(ns):
             if hasattr(ns, "_param_range"):

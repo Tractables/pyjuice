@@ -1,4 +1,4 @@
-// The dfa_exact backend's dense live-column products (`kernels/sum.py`: `_dense_sum_live`, the live branch of
+// The dfa_exact backend's dense live-column products (`kernels/sum/dense_live.py`: `_dense_sum_live`, the live branch of
 // `dense_sum_top_down`) at a bf16 query, fused on tensor cores for narrow steps -- fewer live columns than a 64-column
 // tile, the decode's common case (an HMM-4096 diffusion session: 83% of its dense steps). Per output row m < M and live
 // lane k < L (column perm[k] of x, [K, *] fp32 with row stride x_ld):

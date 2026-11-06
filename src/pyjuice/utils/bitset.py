@@ -3,6 +3,10 @@ from __future__ import annotations
 from typing import List
 from copy import deepcopy
 
+#: the set bits of every byte value, as `BitSet` numbers them (the most significant first)
+_BITS_OF_BYTE = [[j for j in range(8) if byte & (1 << (7 - j))] for byte in range(256)]
+
+
 class BitSet(object):
     def __init__(self, byte_length = 1):
         self.values = bytearray(b"\x00" * byte_length)
@@ -20,11 +24,11 @@ class BitSet(object):
 
     def to_list(self):
         vals = []
-        for i in range(self.byte_length):
-            for j in range(8):
-                if (self.values[i] & (1 << (7 - j))) != 0:
-                    vals.append(i * 8 + j)
-        
+        for i, byte in enumerate(self.values):
+            if byte:
+                base = i * 8
+                vals += [base + j for j in _BITS_OF_BYTE[byte]]
+
         return vals
 
     def add(self, value):

@@ -89,7 +89,7 @@ def sum_path(request, monkeypatch):
     """The sum layers through the fused kernel only, or the dense (cuBLAS) path wherever they qualify -- gated layers
     never do: their weights differ per sample."""
     from pyjuice.constraints.inference.dfa_exact.kernels import sum as lifted_sum
-    monkeypatch.setattr(lifted_sum, "DENSE_MIN_BLOCK", 1 if request.param == "dense" else 1 << 30)
+    monkeypatch.setattr(lifted_sum.dense, "DENSE_MIN_BLOCK", 1 if request.param == "dense" else 1 << 30)
     return request.param
 
 

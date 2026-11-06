@@ -18,7 +18,7 @@ import triton.language as tl
 import pyjuice as juice
 import pyjuice.constraints as jc
 from pyjuice.constraints.inference.dfa_exact.kernels.common import _lse_step
-from pyjuice.constraints.inference.dfa_exact.kernels.prod import _lse_step_one_exp
+from pyjuice.constraints.inference.dfa_exact.kernels.prod.launches import _lse_step_one_exp
 from pyjuice.constraints.inference.dfa_exact.queries.marginal import marginal
 
 V = 3
@@ -56,7 +56,7 @@ def sum_path(request, monkeypatch):
     """Run the sum layers' node blocks through the fused kernel only, or through the dense (cuBLAS) path wherever
     they qualify -- the test circuits' blocks are far below the size the dense path is used from by default."""
     from pyjuice.constraints.inference.dfa_exact.kernels import sum as lifted_sum
-    monkeypatch.setattr(lifted_sum, "DENSE_MIN_BLOCK", 1 if request.param == "dense" else 1 << 30)
+    monkeypatch.setattr(lifted_sum.dense, "DENSE_MIN_BLOCK", 1 if request.param == "dense" else 1 << 30)
     return request.param
 
 
@@ -261,7 +261,7 @@ def test_skipping_empty_tiles_changes_nothing(build_pc, monkeypatch):
     """A wide automaton, so that blocks span several tiles and some (output tile, shared chunk) pairs cannot be
     joined: skipping them gives what computing them gives."""
     from pyjuice.constraints.inference.dfa_exact.kernels import prod
-    from pyjuice.constraints.inference.dfa_exact.compiled.layout import Reachability
+    from pyjuice.constraints.inference.dfa_exact.compiled.reachability import Reachability
     rng = random.Random(0)
     K, n = 48, 8
     dfa = jc.DFA.from_dense(V, [[rng.randrange(K) for _ in range(V)] for _ in range(K)], 0, rng.sample(range(K), 12))
@@ -277,7 +277,7 @@ def test_skipping_empty_tiles_changes_nothing(build_pc, monkeypatch):
     assert kept < total                                                  # something is skipped
     data, missing = evidence(n, 4)
     with_skip = cc.marginal(data, missing, storage = "dense")
-    monkeypatch.setattr(prod, "SKIP_EMPTY_TILES", False)
+    monkeypatch.setattr(prod.run, "SKIP_EMPTY_TILES", False)
     assert_close(with_skip, cc.marginal(data, missing, storage = "dense"), n)
 
 
@@ -316,7 +316,7 @@ def test_fast_inference_keeps_the_class_masses(kind, build_pc, reference, monkey
     monkeypatch.setattr(categorical, "class_masses", lambda *a, **k: calls.append(1) or computed(*a, **k))
     builds, built = [], P.transition_masses                              # the transition masses follow them
     monkeypatch.setattr(P, "transition_masses", lambda *a, **k: builds.append(1) or built(*a, **k))
-    from pyjuice.constraints.inference.dfa_exact.kernels import transition_signatures as TS    # (by column, or by
+    from pyjuice.constraints.inference.dfa_exact.kernels.transitions import signatures as TS    # (by column, or by
     built_sig = TS.signature_transition_masses                                                  # signature)
     monkeypatch.setattr(TS, "signature_transition_masses", lambda *a, **k: builds.append(1) or built_sig(*a, **k))
     per_query = len(pc.input_layer_group)                                # one call per input layer
@@ -460,7 +460,7 @@ def test_bf16_dense_products_multiply_bf16_weight_copies(tied, stacked, referenc
     import pyjuice.constraints.inference.dfa_exact.kernels.sum as lifted_sum
     import pyjuice.constraints.inference.dfa_exact.queries.backend.forward as F
     able = "out_dtype" in (torch.mm.__doc__ or "") and torch.cuda.is_bf16_supported()
-    assert lifted_sum._bf16_products(torch.device("cuda:0")) == able
+    assert lifted_sum.dense_common._bf16_products(torch.device("cuda:0")) == able
     if not able:
         pytest.skip("torch.mm multiplies no bf16 matrices into fp32 ones here: bf16 queries' dense products run TF32")
     if not stacked:
@@ -471,8 +471,8 @@ def test_bf16_dense_products_multiply_bf16_weight_copies(tied, stacked, referenc
     data[:, 2:4] = torch.tensor([1, 2])
     missing[:] = False
     want = reference.marginal(cc, data, missing)
-    built, copy = [], lifted_sum._bf16_copy
-    monkeypatch.setattr(lifted_sum, "_bf16_copy", lambda copies, key, make: copy(copies, key,
+    built, copy = [], lifted_sum.dense_common._bf16_copy
+    monkeypatch.setattr(lifted_sum.dense_common, "_bf16_copy", lambda copies, key, make: copy(copies, key,
                                                                                 lambda: built.append(key) or make()))
     with juice.fast_inference():
         got = cc.marginal(data, missing, storage = "compact", precision = "bf16")
@@ -485,7 +485,7 @@ def test_bf16_dense_products_multiply_bf16_weight_copies(tied, stacked, referenc
     fin = torch.isfinite(want)
     assert (got[fin] - want[fin]).abs().max() < 1.5e-2
     base = cc.marginal(data, missing, storage = "compact", precision = "bf16")
-    monkeypatch.setattr(lifted_sum, "_bf16_copy", lambda copies, key, make: 2 * copy(copies, key, make))
+    monkeypatch.setattr(lifted_sum.dense_common, "_bf16_copy", lambda copies, key, make: 2 * copy(copies, key, make))
     doubled = cc.marginal(data, missing, storage = "compact", precision = "bf16")
     # not exactly: a layer's log 2 higher outputs give its children's exponentials other last bits, some rounding to
     # another bf16 value (~1e-4 here) -- a run reading anything but the copies would be off by log 2
@@ -543,7 +543,8 @@ def test_live_columns_are_shifted_and_exponentiated(rows, width, num_live):
     a column of -inf gives zeros. A narrow pass (a program per column, the block taller than its row tile) and passes
     wide enough for column tiles (``_LIVE_EXP_TILES``: rows past a row tile, or within one; the last tile partly past
     the live columns), whose bits must be a program per column's."""
-    from pyjuice.constraints.inference.dfa_exact.kernels.sum import _live_shifted_exp, _live_shifted_exp_kernel
+    from pyjuice.constraints.inference.dfa_exact.kernels.sum.dense_common import (_live_shifted_exp,
+                                                                                  _live_shifted_exp_kernel)
     g = torch.Generator().manual_seed(0)
     x = (torch.randn(rows, width + 8, generator = g) * 4).cuda()
     x[:, 7] = float("-inf")
@@ -569,9 +570,10 @@ def test_transition_masses_match_brute_force(build_pc, monkeypatch, signatures):
     float64, on an automaton whose columns have more successors than one pair tile takes and more classes than one
     chunk, with token probabilities down to e^-100 and one emission row below e^-90 altogether (pairs whose class
     masses are all below the fp32 normal range); laid out by column, and by column signature
-    (:mod:`~pyjuice.constraints.inference.dfa_exact.kernels.transition_signatures`), read as the kernels read them."""
+    (:mod:`~pyjuice.constraints.inference.dfa_exact.kernels.transitions.signatures`), read as the kernels read them."""
     import pyjuice.constraints.inference.dfa_exact.compiled.program as P
-    from pyjuice.constraints.inference.dfa_exact.kernels import transitions, transition_signatures
+    from pyjuice.constraints.inference.dfa_exact.kernels import transitions
+    from pyjuice.constraints.inference.dfa_exact.kernels.transitions import signatures as transition_signatures
     monkeypatch.setattr(P, "GROUP_MIN_RATIO", 0)
     monkeypatch.setattr(transition_signatures, "SIGNATURE_MASSES", signatures)
     rng = random.Random(0)
@@ -590,7 +592,7 @@ def test_transition_masses_match_brute_force(build_pc, monkeypatch, signatures):
     tt, width, nc = prog.trans, prog.width, cc.backend.layout.next_col_table()
     ptr, succ = tt.entry_ptr.long().cpu(), tt.entry_succ.long().cpu()
     assert tt.grouped and prog.trans_persistent and tt.max_pairs > 16    # several pair tiles at the narrowest
-    assert nc.size(2) > transitions.TRANSITION_TILES["TC"]
+    assert nc.size(2) > transitions.masses.TRANSITION_TILES["TC"]
     assert cc.backend.token_classes.num_enumerated > 0                   # (most classes one token: enumerated)
     T = prog.transition_buffer().double().cpu()
     layer = next(iter(pc.input_layer_group))                             # the class masses, in float64 from the
@@ -654,7 +656,7 @@ def test_splitting_block_block_tiles_changes_nothing(build_pc, monkeypatch):
     data, missing = evidence(n, 4)
 
     def marginal(per_sm):
-        monkeypatch.setattr(prod, "BLOCK_BLOCK_PROGRAMS_PER_SM", per_sm)
+        monkeypatch.setattr(prod.run, "BLOCK_BLOCK_PROGRAMS_PER_SM", per_sm)
         bufs = cc.backend.state.buffers(data.size(0))
         bufs["node_mars"].fill_(float("nan"))
         bufs["element_mars"].fill_(float("nan"))
@@ -699,9 +701,9 @@ def test_grouped_input_steps_change_nothing(kind, B, G, storage, build_pc, monke
     from pyjuice.constraints.inference.dfa_exact.kernels import prod
     from pyjuice.constraints.inference.dfa_exact.kernels import common
     monkeypatch.setattr(P, "GROUP_MIN_RATIO", 1 << 30)                       # transitions class by class
-    monkeypatch.setattr(prod, "GROUP_MIN_LANES", 0)                          # groups however narrow the launch
-    kernel = CountingKernel(prod._input_block_group_kernel)
-    monkeypatch.setattr(prod, "_input_block_group_kernel", kernel)
+    monkeypatch.setattr(prod.run, "GROUP_MIN_LANES", 0)                          # groups however narrow the launch
+    kernel = CountingKernel(prod.input_block._input_block_group_kernel)
+    monkeypatch.setattr(prod.run, "_input_block_group_kernel", kernel)
     n = KINDS[kind]
     cc = jc.compile(CONSTRAINTS["contains"](), build_pc(kind, n, V))
     data, missing = evidence(n, B)
@@ -730,9 +732,9 @@ def test_compact_groups_read_blocks_kept_once(kind, build_pc, monkeypatch):
     import pyjuice.constraints.inference.dfa_exact.compiled.program as P
     from pyjuice.constraints.inference.dfa_exact.kernels import prod
     monkeypatch.setattr(P, "GROUP_MIN_RATIO", 1 << 30)                       # transitions class by class
-    monkeypatch.setattr(prod, "GROUP_MIN_LANES", 0)                          # groups however narrow the launch
-    kernel = CountingKernel(prod._input_block_group_kernel)
-    monkeypatch.setattr(prod, "_input_block_group_kernel", kernel)
+    monkeypatch.setattr(prod.run, "GROUP_MIN_LANES", 0)                          # groups however narrow the launch
+    kernel = CountingKernel(prod.input_block._input_block_group_kernel)
+    monkeypatch.setattr(prod.run, "_input_block_group_kernel", kernel)
     n = KINDS[kind]
     cc = jc.compile(CONSTRAINTS["contains"](), build_pc(kind, n, V))
     data, missing = evidence(n, 16)
@@ -752,17 +754,19 @@ def test_narrow_launches_run_one_step_per_program(build_pc, reference, monkeypat
     import pyjuice.constraints.inference.dfa_exact.compiled.program as P
     from pyjuice.constraints.inference.dfa_exact.kernels import prod
     monkeypatch.setattr(P, "GROUP_MIN_RATIO", 1 << 30)
-    kernel = CountingKernel(prod._input_block_group_kernel)
-    monkeypatch.setattr(prod, "_input_block_group_kernel", kernel)
+    kernel = CountingKernel(prod.input_block._input_block_group_kernel)
+    monkeypatch.setattr(prod.run, "_input_block_group_kernel", kernel)
     n = KINDS["hmm"]
     cc = jc.compile(CONSTRAINTS["contains"](), build_pc("hmm", n, V))
     data, missing = evidence(n, 4)
     assert input_block_groups(cc)
-    lanes = max(4 * l.S_max for kind, _, layers in cc.backend.program().steps if kind == "prod"
-                for stages, _, _ in layers for launches in stages for l in launches if l.form == "input_block" and l.steps[2] is not None)
+    prog = cc.backend.program()
+    lanes = max(4 * prog.most_of(l)[2] for kind, _, layers in prog.steps if kind == "prod"
+                for stages, _, _ in layers for launches in stages for l in launches
+                if l.form == "input_block" and l.steps[2] is not None)
     want = reference.marginal(cc, data, missing)
     for limit, launched in ((lanes, False), (lanes - 1, True)):
-        monkeypatch.setattr(prod, "GROUP_MIN_LANES", limit)
+        monkeypatch.setattr(prod.run, "GROUP_MIN_LANES", limit)
         kernel.launches = 0
         assert_close(cc.marginal(data, missing, storage = "dense"), want, n)
         assert (kernel.launches > 0) == launched
@@ -793,15 +797,15 @@ def test_every_tuned_candidate_gives_the_same_marginal(kind, build_pc, monkeypat
     import pyjuice.constraints.inference.dfa_exact.compiled.program as P
     from pyjuice.constraints.inference.dfa_exact.kernels import prod
     monkeypatch.setattr(P, "GROUP_MIN_RATIO", 1 << 30)                       # transitions class by class
-    monkeypatch.setattr(prod, "GROUP_MIN_LANES", 0)                          # groups however narrow the launch
+    monkeypatch.setattr(prod.run, "GROUP_MIN_LANES", 0)                          # groups however narrow the launch
     n, B = KINDS[kind], 4
     cc = jc.compile(CONSTRAINTS["contains"](), build_pc(kind, n, V))
     data, missing = evidence(n, B)
     offered, chosen, launched = {}, set(), set()
     for name, fields in (("_block_block_kernel", ("TM", "TN", "TK", "num_warps")),
                          ("_input_block_group_kernel", ("G", "ONE_EXP"))):
-        kernel = getattr(prod, name)
-        monkeypatch.setattr(prod, name, type("Recording", (), {"__getitem__": lambda self, grid, kernel = kernel,
+        kernel = getattr(prod.run, name)
+        monkeypatch.setattr(prod.run, name, type("Recording", (), {"__getitem__": lambda self, grid, kernel = kernel,
             fields = fields: lambda *a, **k: launched.add(tuple(k[f] for f in fields)) or kernel[grid](*a, **k)})())
 
     def marginal(k, missing):
@@ -809,7 +813,7 @@ def test_every_tuned_candidate_gives_the_same_marginal(kind, build_pc, monkeypat
             offered.setdefault(key[0], set()).add(len(candidates))
             chosen.add(candidates[min(k, len(candidates) - 1)])
             return candidates[min(k, len(candidates) - 1)]
-        monkeypatch.setattr(prod.autotune, "pick", pick)
+        monkeypatch.setattr(prod.run.autotune, "pick", pick)
         chosen.clear(), launched.clear()
         bufs = cc.backend.state.buffers(B)
         bufs["node_mars"].fill_(float("nan"))
@@ -829,7 +833,7 @@ def test_every_tuned_candidate_gives_the_same_marginal(kind, build_pc, monkeypat
         for k in range(1, max((max(c) for c in offered.values()), default = 1)):
             assert_close(marginal(k, miss), want, n)
     assert set(offered) == tuned_sites(cc, B)
-    assert all(c == {len(prod.BLOCK_BLOCK_TILES)} for site, c in offered.items() if site == "lifted_block_block")
+    assert all(c == {len(prod.run.BLOCK_BLOCK_TILES)} for site, c in offered.items() if site == "lifted_block_block")
     assert all(c == {2 * (1 + len(P.INPUT_BLOCK_GROUP_ALTERNATIVES))} for site, c in offered.items()
                if site == "lifted_input_block_group")
 
@@ -841,7 +845,7 @@ def test_tuning_runs_once_per_launch_shape(kind, build_pc, monkeypatch):
     import pyjuice.constraints.inference.dfa_exact.compiled.program as P
     from pyjuice.constraints.inference.dfa_exact.kernels import prod
     from pyjuice.layer.kernels import autotune
-    monkeypatch.setattr(prod, "GROUP_MIN_LANES", 0)
+    monkeypatch.setattr(prod.run, "GROUP_MIN_LANES", 0)
     monkeypatch.setattr(P, "GROUP_MIN_RATIO", 1 << 30)
     monkeypatch.setattr(autotune, "_CACHE", {})                              # nothing tuned yet
     timed, best_of = [], autotune.best_of

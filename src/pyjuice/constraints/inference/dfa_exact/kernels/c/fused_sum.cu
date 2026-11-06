@@ -1,4 +1,4 @@
-// The dfa_exact backend's fused sums on tensor cores, for the launches their pre-passes serve (`kernels/sum.py`):
+// The dfa_exact backend's fused sums on tensor cores, for the launches their pre-passes serve (`kernels/sum/fused_cuda.py`):
 //   forward (`fused_sum`): node blocks of 32 nodes over the same children, read in chunks of 32 children;
 //   top-down (`fused_sum_top_down`, TD): child blocks of 32 children under the same parents, read in chunks of a
 //   parent node block's 32 nodes -- the forward with children and nodes exchanged (a parent's weights to a child
@@ -34,7 +34,7 @@
 // written to the block's rows (top-down: element rows, or an aliased sum's rows).
 // Pruned (the region's columns in the liveness' lane order), a tile past the live columns is written -inf.
 //
-// A launch of few tiles splits every tile's chunks in shares (`kernels/sum.py`, `_cuda_split`): every share stores its
+// A launch of few tiles splits every tile's chunks in shares (`kernels/sum/fused_cuda.py`, `_cuda_split`): every share stores its
 // sums and shifts in the split buffer, the first one the tile's columns and samples too, and the merge kernel
 // combines them in order -- out = log(sum of acc exp(T - T')) + T' (T' their maximum).
 
@@ -64,7 +64,7 @@ __device__ __forceinline__ void pdl_trigger() {
 #define NBT 4              // row blocks per CTA
 #define BS 32              // rows per block, reduction rows per chunk
 #define THREADS 256
-#define SPLIT_TILES 4096   // the split buffer's counters (`kernels/sum.py`, SPLIT_TILES): not used here
+#define SPLIT_TILES 4096   // the split buffer's counters (`kernels/sum/tile_rules.py`, SPLIT_TILES): not used here
 #define MAX_SHARE_CELLS 256    // external parameters: the most chunks a share (their cells in shared memory)
 #define MAX_SHARE_TABLE 128    // weights not in one run per block: the most chunks a share (their firsts too)
 #define OFF_SAMPLES 255        // external parameters, lanes: up to this many samples, the column's interval's lane
@@ -226,7 +226,7 @@ __device__ __forceinline__ void put(const Where& w, int b, long long r, long lon
 // The pre-pass of chunk `blockIdx.x` and a tile of PRE_COLS columns from `blockIdx.y PRE_COLS`: the chunk's 32 rows
 // -- forward the children `cids[32 ch + i]` (element rows), top-down the parent entry's node block (TD: less the
 // column's sample's log Z, EXT) --, their maximum per column t, and e = exp(x - t) in the order the sums read it
-// (`_frag_offsets` / `_frag_offsets_bf16` in `kernels/sum.py`: a group of 8 columns' 32 rows contiguous, the tile's
+// (`_frag_offsets` / `_frag_offsets_bf16` in `kernels/sum/fused_forward.py`: a group of 8 columns' 32 rows contiguous, the tile's
 // groups from `32 k0` of the chunk's rows), t at `pre_cm + ch pre_ld + k`. Pruned, the live columns (the region's lane
 // order) alone are read, the rest -inf: e 0, as the Triton pre-pass writes them.
 #define PRE_COLS 64
@@ -898,7 +898,7 @@ static void launch_tn(const Args& a, int tn, dim3 grid, unsigned pre_tiles, cuda
 }
 
 
-// One launch of either direction: the tables as `kernels/sum.py` passes them (`_cuda_forward`, `_cuda_top_down`)
+// One launch of either direction: the tables as `kernels/sum/fused_cuda.py` passes them (`_cuda_forward`, `_cuda_top_down`)
 void fused_sum_cuda(bool td, torch::Tensor out0, torch::Tensor out1, torch::Tensor weights, torch::Tensor wfrag,
                     torch::Tensor wbase, int64_t wstride, torch::Tensor pre, int64_t pre_ld, int64_t pre_cm,
                     torch::Tensor rows, torch::Tensor rreg, torch::Tensor colreg, torch::Tensor sel,

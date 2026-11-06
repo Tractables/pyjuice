@@ -23,7 +23,7 @@ A block kept once for every sample (``prior_mars``, see :mod:`.plans`) is comput
 slots hold finite values. The arguments above still make every such slot a term of a dead product -- it is only ever
 added to -inf -- so the values stay exact. They do enter the maxima ``block @ block`` shifts its exponentials by, which
 can flush a live entry's terms: the tiles where that happens are computed again exactly (see
-:func:`~.prod._block_block_tile`).
+:func:`~.kernels.prod.block_block._block_block_tile`).
 """
 
 from dataclasses import dataclass
@@ -154,9 +154,9 @@ def _live_backward_kernel(live, back, obs_class, next_col, delta, state_id, col_
 def _live_columns(live, ivs, iv_of, iv_info, iv_table, width, k, tile, B, n, W, TILE: tl.constexpr):
     """Tile ``tile`` of sum interval ``k``'s ``B * slots`` columns (sample-major): ``(columns, in range, live, first
     column in the lists, slots)`` -- a column is live where its slot's two ends are live for its sample."""
-    a = tl.load(ivs + k * 4)
-    e = tl.load(ivs + k * 4 + 1)
-    first = tl.load(ivs + k * 4 + 2).to(tl.int64)
+    a = tl.load(ivs + k * 4).to(tl.int32)
+    e = tl.load(ivs + k * 4 + 1).to(tl.int32)
+    first = tl.load(ivs + k * 4 + 2)
     S, _, pairs = _interval(iv_of, iv_info, a, e, n)
     X = _exit_width(width, e, n)
     col = tile * TILE + tl.arange(0, TILE)
@@ -511,18 +511,22 @@ class Liveness:
         tables = prog.live_tables.get(key)
         if tables is None:                           # where the intervals' columns and their tiles' counts go
             sel = np.nonzero(intervals)[0]
-            sizes = [B * prog.sum_iv_slots[k] for k in sel]
-            starts = np.cumsum([0] + sizes)
-            tiles = np.cumsum([0] + [host_cdiv(z, LIST_TILE) for z in sizes])
+            columns = B * prog.iv_slots[sel]
+            sizes = columns.tolist()
+            if sizes and max(sizes) >= 1 << 31:                    # (an interval's columns are int32 in the lists)
+                raise ValueError(f"An interval's {max(sizes)} columns (batch {B}) are past what its lane order holds; "
+                                 f"use a smaller batch.")
+            starts = np.concatenate([[0], np.cumsum(columns)])
+            tiles = np.concatenate([[0], np.cumsum((columns + LIST_TILE - 1) // LIST_TILE)])
             K = len(prog.sum_ivs)
             first, index = np.full(K, -1, dtype = np.int64), np.full(K, -1, dtype = np.int64)
             first[sel], index[sel] = starts[:-1], np.arange(len(sel))
-            reg_iv = np.asarray(prog.reg_iv_host)
+            reg_iv = prog.reg_iv_np
             group = np.where(index[reg_iv] >= 0, index[reg_iv], len(sel))  # an ordered interval's place, or past them
             regs = np.argsort(group, kind = "stable")                      # every ordered interval's regions, then
             reg_ptr = np.searchsorted(group[regs], np.arange(len(sel) + 2))  # the others'
             table = torch.tensor([(*prog.sum_ivs[k], f, t) for k, f, t in zip(sel, starts[:-1], tiles[:-1])],
-                                 dtype = torch.int32).reshape(-1, 4).to(dev)
+                                 dtype = torch.int64).reshape(-1, 4).to(dev)     # (all the intervals' columns: past 2^31)
             to_dev = lambda x: torch.from_numpy(np.ascontiguousarray(x)).to(dev)
             tables = (sizes, first.tolist(), index.tolist(), int(starts[-1]), int(tiles[-1]), table,
                       to_dev(regs.astype(np.int32)), to_dev(reg_ptr.astype(np.int32)),

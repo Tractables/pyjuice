@@ -77,6 +77,18 @@ def _leaf(pattern: str) -> ByteAutomaton:
     return hit
 
 
+_SEPARATORS: Dict[Tuple[ByteAutomaton, str], ByteAutomaton] = {}
+
+
+def _separator(ws: ByteAutomaton, mark: str) -> ByteAutomaton:
+    """``W<mark>W`` as one automaton, of a whitespace that is one (kept, as the leaves are): an object's every member and an array's every item wire it, and
+    wiring its three parts each time was most of what a schema of many members wired."""
+    hit = _SEPARATORS.get((ws, mark))
+    if hit is None:
+        hit = _SEPARATORS[(ws, mark)] = A.force(A.concat(ws, A.literal(mark.encode("utf-8")), ws))
+    return hit
+
+
 def float_text(x: float) -> str:
     """A float as the canonical form writes it: the shortest digits that read back, positional for decimal
     exponents -5 to 15 (``.0`` if integral), else ``d.ddde+N`` / ``d.ddde-N``."""
@@ -113,7 +125,7 @@ def compile_schema(schema: Dict[str, Any], whitespace: str) -> ByteAutomaton:
     """The minimal byte automaton of the canonical texts of ``schema``'s instances: ``schema`` as
     :func:`~pyjuice.constraints.language.json_schema._prepare` returns it (checked: one form per schema object, the
     keywords that form reads), ``whitespace`` the pattern of what may stand around separators."""
-    return _Compiler(schema, whitespace).value(schema)
+    return A.minimize(_Compiler(schema, whitespace).value(schema))
 
 
 class _Canon:
@@ -225,22 +237,25 @@ class _Compiler:
         return A.literal(text.encode("utf-8"))
 
     def sep(self, mark: str, ws: Optional[ByteAutomaton] = None) -> ByteAutomaton:
-        """``W<mark>W``."""
+        """``W<mark>W``: one automaton (:func:`_separator`), or of a whitespace not evaluated yet, its three parts."""
         ws = self.ws if ws is None else ws
-        return A.concat(ws, self.lit(mark), ws)
+        return _separator(ws, mark) if type(ws) is ByteAutomaton else A.concat(ws, self.lit(mark), ws)
 
     def object_of(self, value: ByteAutomaton, nonempty: bool, key: Optional[ByteAutomaton] = None) -> ByteAutomaton:
         """Objects of ``key`` names (default: any string) and ``value`` values (none: ``nonempty`` False)."""
-        member = A.concat(self.string if key is None else key, self.sep(":"), value)
-        body = A.concat(member, A.star(A.concat(self.sep(","), member)))
+        body = A.list_of(A.concat(self.string if key is None else key, self.sep(":"), value), self.sep(","))
         return A.concat(self.lit("{"), self.ws, body if nonempty else A.optional(body), self.ws, self.lit("}"))
 
     def array_of(self, item: ByteAutomaton, lo: int, hi: Optional[int]) -> ByteAutomaton:
         """Arrays of ``lo`` to ``hi`` (None: any number of) ``item``s."""
         if hi == 0:
             return A.concat(self.lit("["), self.ws, self.lit("]"))
-        rest = A.concat(self.lit(","), self.ws, item)
-        body = A.concat(item, A.repeat(rest, max(lo - 1, 0), None if hi is None else hi - 1))
+        if lo <= 1 and hi is None:
+            body = A.list_of(item, A.concat(self.lit(","), self.ws))
+        else:
+            item = A.force(item)                                # (copies of it)
+            body = A.concat(item, A.repeat(A.concat(self.lit(","), self.ws, item), max(lo - 1, 0),
+                                           None if hi is None else hi - 1))
         return A.concat(self.lit("["), self.ws, body if lo >= 1 else A.optional(body), self.ws, self.lit("]"))
 
     def empty_object(self) -> ByteAutomaton:
@@ -385,11 +400,13 @@ class _Compiler:
         if hit is None:
             if canon is None and self._subtracts(s):                # a subtracting combinator: its own form
                 hit = self.value(s, "A", self.keep(_Canon(self, s)))
-            elif canon is None:
-                hit = A.force(self._parity(s))
+            elif canon is None:                                 # (evaluated with what holds it, the whole at once)
+                hit = self._parity(s)
             else:
                 hit = A.force(self._value(s, mode, canon))
             self.memo[key] = hit
+        else:                                                   # used again: copies of one automaton
+            hit = self.memo[key] = A.force(hit)
         return hit
 
     def _subtracts(self, s: Dict[str, Any]) -> bool:
@@ -460,33 +477,16 @@ class _Compiler:
         value = self.value(members) if isinstance(members, dict) else self.free()[0]
         return self.object_of(value, s.get("minProperties", 0) >= 1)
 
-    def _members(self, items, nonempty: bool) -> ByteAutomaton:
+    def _members(self, items, nonempty: bool):
         """``{W"a"W:Wvalue W,W ...W}``: ``items`` -- ``(name, value automaton, required)`` -- in order, the optional
-        ones may be left out (not all if ``nonempty``). Two tracks of states between the members -- nothing written
-        yet, or something (the next member then follows ``W,``) -- through one copy of every value."""
-        j = _Joined()
-        k = len(items)
-        none, some = [j.fresh() for _ in range(k + 1)], [j.fresh() for _ in range(k + 1)]
-
-        def enter(x, sources, targets):
-            entry, accepting = j.wire(x)
-            j.eps.extend((u, entry) for u in sources)
-            j.eps.extend((q, t) for q in accepting for t in targets)
-            return entry, accepting
-
-        start, _ = enter(self.lit("{"), [], [none[0]])
-        for i, (name, value, required) in enumerate(items):
-            first = A.concat(self.ws, self.lit(json.dumps(name, ensure_ascii = False)), self.sep(":"))
-            later = A.concat(self.ws, self.lit(","), first)
-            v, done = j.wire(value)
-            enter(first, [none[i]], [v])
-            enter(later, [some[i]], [v])
-            j.eps.extend((q, some[i + 1]) for q in done)
-            if not required:
-                j.eps += [(none[i], none[i + 1]), (some[i], some[i + 1])]
+        ones may be left out (not all if ``nonempty``), see :func:`~.automata.members`."""
+        wired = []
+        colon, comma = self.sep(":"), self.sep(",")
+        for name, value, required in items:                     # (a name after another member: ``W,W"a"W:W``, the first's text after ``W,``)
+            key = self.lit(json.dumps(name, ensure_ascii = False))
+            wired.append((A.concat(self.ws, key, colon), A.concat(comma, key, colon), value, required))
         empty = not nonempty and not any(r for _, _, r in items)
-        _, j.accepting = enter(A.concat(self.ws, self.lit("}")), [some[k]] + ([none[k]] if empty else []), [])
-        return j.build(start)
+        return A.members(self.lit("{"), A.concat(self.ws, self.lit("}")), wired, empty)
 
     # ---------------------------------------------------------------------------------------------
     # Below a subtracting combinator
@@ -573,12 +573,7 @@ class _Compiler:
         n = len(entries)
         none, some, tail = [j.fresh() for _ in range(n + 1)], [j.fresh() for _ in range(n + 1)], j.fresh()
 
-        def enter(x, sources, targets):
-            entry, accepting = j.wire(x)
-            j.eps.extend((u, entry) for u in sources)
-            j.eps.extend((q, t) for q in accepting for t in targets)
-            return entry, accepting
-
+        enter = j.enter
         start, _ = enter(self.lit("{"), [], [none[0]])
         for i, (name, value) in enumerate(entries):
             first = A.concat(ws, self.lit(json.dumps(name, ensure_ascii = False)), self.sep(":", ws))
@@ -586,9 +581,10 @@ class _Compiler:
             v, done = j.wire(value)
             enter(first, [none[i]], [v])
             enter(later, [some[i]], [v])
-            j.eps.extend((q, some[i + 1]) for q in done)
+            for q in done:
+                j.eps += (q, some[i + 1])
             if name not in required:
-                j.eps += [(none[i], none[i + 1]), (some[i], some[i + 1])]
+                j.eps += (none[i], none[i + 1], some[i], some[i + 1])
         if extra is not None:                                   # members of the other names, after them
             member = A.force(A.concat(canon.other(self, "B"), self.sep(":", ws), extra))
             enter(A.concat(ws, member), [none[n]], [tail])

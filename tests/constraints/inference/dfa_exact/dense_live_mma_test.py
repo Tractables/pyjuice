@@ -85,7 +85,7 @@ SHAPES = [(4096, 4096, 8, 16, False), (64, 4096, 3, 1584, True), (104, 1000, 17,
 def test_every_arm_matches_float64(M, K, L, ncols, scattered, k_major):
     mod = dfa_c.get_dense_live_module()
     A, x, perm, rank = _case(M, K, L, ncols, k_major, scattered)
-    op = lifted_sum._dense_live_operand(A)
+    op = lifted_sum.dense_live._dense_live_operand(A)
     assert op is not None and op[0] == k_major
     arms = dfa_c.dense_live_arms(M, K, L)
     assert arms, "no arm offered"
@@ -99,7 +99,7 @@ def test_every_arm_matches_float64(M, K, L, ncols, scattered, k_major):
         fin = torch.isfinite(want)
         assert fin.any()
         chain = out0.clone()
-        lifted_sum._bf16_live_chain(x, perm, rank, L, ncols, [(A, chain, chain.stride(0), mode)])
+        lifted_sum.dense_live._bf16_live_chain(x, perm, rank, L, ncols, [(A, chain, chain.stride(0), mode)])
         d_chain = float((chain.double() - want)[fin].abs().max())
         for code in codes:
             out = out0.clone()
@@ -204,9 +204,9 @@ def test_it_declines_what_it_does_not_serve(monkeypatch):
     assert dfa_c.dense_live_arms(256, 256, 64) == [] and dfa_c.dense_live_arms(256, 256, 1000) == []
     assert dfa_c.dense_live_arms(256, 256, 63) and dfa_c.dense_live_arms(1, 1, 1)
     A, x, perm, rank = _case(64, 72, 5, 8, True, False)
-    assert lifted_sum._dense_live_operand(A[:, 1:]) is None                              # a base off 16 bytes
+    assert lifted_sum.dense_live._dense_live_operand(A[:, 1:]) is None                              # a base off 16 bytes
     off = torch.zeros(72, 70, dtype = torch.bfloat16, device = DEV)[:, :64].t()          # MN-major, columns of 70
-    assert lifted_sum._dense_live_operand(off) is None
+    assert lifted_sum.dense_live._dense_live_operand(off) is None
     out = torch.zeros(64, 8, device = DEV)
-    lifted_sum._bf16_live_step(x[1:], perm, rank, 5, 8, [(A[:, 1:], out, 8, 0)])        # K = 71, off: the chain
+    lifted_sum.dense_live._bf16_live_step(x[1:], perm, rank, 5, 8, [(A[:, 1:], out, 8, 0)])        # K = 71, off: the chain
     assert not calls and torch.isfinite(out[1:, perm[1:].long()]).all()          # (row 0: zero weights, -inf)

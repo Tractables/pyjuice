@@ -70,6 +70,18 @@ def test_token_classes_are_compressed():
         assert (dense[:, toks] == dense[:, toks[:1]]).all()
 
 
+@pytest.mark.parametrize("wrap", [torch.tensor, np.array], ids = ["tensor", "numpy"])
+def test_an_automaton_keeps_its_tables_when_the_caller_changes_its_own(wrap):
+    # every class used, told apart and in order: the table stays as it is, and is still not the caller's
+    token_class, delta = wrap([0, 1, 2]), wrap([[1, 2, 0], [2, 0, 1], [0, 1, 2]])
+    dfa = jc.DFA(3, token_class, delta, 0, [2])
+    dense = dfa.to_dense().clone()
+    delta[:] = 0
+    token_class[:] = 0
+    assert torch.equal(dfa.to_dense(), dense)
+    assert dfa.accepts([0, 0]) and dfa.accepts([1]) and not dfa.accepts([2])
+
+
 def test_from_transitions_partial_map_with_arbitrary_ids():
     # "a token 1 somewhere, then a token 2 later", over V = 4, with outlines-style sparse ids
     V = 4

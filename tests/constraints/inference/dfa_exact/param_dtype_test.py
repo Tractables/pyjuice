@@ -24,7 +24,7 @@ GATES = dict(child_gate = lambda ns: next(d for d in (2, 1) if ns.ch_block_size 
 
 @pytest.fixture(params = ["fused", "dense"])
 def sum_path(request, monkeypatch):
-    monkeypatch.setattr(lifted_sum, "DENSE_MIN_BLOCK", 1 << 30 if request.param == "fused" else 1)
+    monkeypatch.setattr(lifted_sum.dense, "DENSE_MIN_BLOCK", 1 << 30 if request.param == "fused" else 1)
     monkeypatch.setattr(F, "prune_dense", lambda ncols, live: live < ncols)
     return request.param
 

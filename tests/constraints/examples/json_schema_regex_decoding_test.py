@@ -15,7 +15,6 @@ import torch
 import pyjuice as juice
 import pyjuice.constraints as jc
 
-pytest.importorskip("interegular")                     # (Regex and JSONSchema read patterns with it)
 
 #: every printable ASCII character, a few longer pieces, and an end-of-sequence id (it spells no text)
 TOKENS = [bytes([b]) for b in range(32, 127)] + [b'{"', b'":', b'","', b'"}', b"name", b"20", None]

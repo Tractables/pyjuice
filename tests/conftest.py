@@ -23,6 +23,11 @@ workers. Run the suite once to seed the cache; every run after that is balanced.
 _DURATIONS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".test_durations")
 _durations_seen = {}   # nodeid -> seconds (this run; accumulates setup+call+teardown)
 
+# Tests force a tuner's answers, and their measurements are of the moment: none of them is for what this machine's later
+# processes start from, nor do tests go by what earlier ones measured (`autotune._Store`; its own test turns it on).
+os.environ["PYJUICE_AUTOTUNE_PERSIST"] = "0"
+
+
 def _pin_gpu():
     """Pin this process (the xdist controller, or one worker) to one GPU of the pool.
 
@@ -89,6 +94,8 @@ def pytest_configure(config):
     # Only now is it safe to import torch
     import torch
     torch.set_num_threads(1)                    # (see `_pin_gpu`'s CPU limits)
+    # A kernel candidate that fails for anything but the device's limits is dropped quietly for a user; here, a failure
+    config.addinivalue_line("filterwarnings", "error::pyjuice.layer.kernels.autotune.KernelCandidateWarning")
 
     # Kernel launch-config autotuning is deliberately left at the library default (on), so the suite
     # runs the same code path users do. MEASURED with a warm Triton cache: the full suite takes 340s

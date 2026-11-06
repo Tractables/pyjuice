@@ -62,7 +62,7 @@ def sum_path(request, monkeypatch):
     only (``dense_pruned``) or all of them -- the test batches are below the size dense pruning starts from."""
     import pyjuice.constraints.inference.dfa_exact.queries.backend.forward as F
     from pyjuice.constraints.inference.dfa_exact.kernels import sum as lifted_sum
-    monkeypatch.setattr(lifted_sum, "DENSE_MIN_BLOCK", 1 << 30 if request.param == "fused" else 1)
+    monkeypatch.setattr(lifted_sum.dense, "DENSE_MIN_BLOCK", 1 << 30 if request.param == "fused" else 1)
     monkeypatch.setattr(F, "prune_dense", (lambda ncols, live: live < ncols) if request.param == "dense_pruned" else
                         (lambda ncols, live: False))
     return request.param
@@ -352,6 +352,34 @@ def test_per_boundary_liveness_equals_per_sample(kind, build_pc, monkeypatch):
             every = np.ones(len(prog.sum_ivs), dtype = bool)
             oa, ob = a.order(every), b.order(every)
             assert torch.equal(oa.perm, ob.perm) and torch.equal(oa.rank, ob.rank) and torch.equal(oa.counts, ob.counts)
+
+
+@pytest.mark.slow
+def test_the_lane_order_past_2_to_the_31_columns(build_pc):
+    """Every sum interval's columns together past int32 (a PD by an automaton of 512 columns, a batch of 2048; two
+    lists of 10 GB or more): every interval's live columns as counted by hand, and the lists read at their true place."""
+    K, n, B = 512, 8, 2048
+    Vw = 2 * K
+    dfa = jc.DFA(Vw, torch.arange(Vw) % K, (torch.arange(K)[:, None] + torch.arange(K)[None, :]) % K, 0,
+                 torch.ones(K, dtype = torch.bool))
+    cc = jc.compile(dfa, build_pc("pd", n, Vw))
+    prog = cc.backend.program()
+    obs = torch.full((B, n), -1, dtype = torch.int32)
+    obs[B // 2:, 3] = 7
+    obs = obs.cuda()
+    lv = liveness(prog, obs, B)
+    counts = lv.num_live
+    order = lv._all
+    live = lv.live.view(B, n + 1, prog.W).bool()
+    for k, (a, e) in enumerate(prog.sum_ivs):
+        pairs = prog.reach.pairs(a, e).double().cuda()
+        X = pairs.size(1)
+        want = ((live[:, a, :pairs.size(0)].double() @ pairs) * live[:, e, :X].double()).sum()
+        assert counts[k] == int(want), (a, e)
+    last = int(np.argmax(order.first))
+    assert order.first[last] >= 1 << 31, "the lists are within int32: this test tests nothing"
+    S = prog.sum_iv_slots[last]
+    assert torch.equal(order.rank[order.first[last]:order.first[last] + S].cpu(), torch.arange(S, dtype = torch.int32))
 
 
 def test_the_shared_memory_sweep_over_wide_boundaries(build_pc, monkeypatch):
@@ -666,18 +694,18 @@ def test_successor_lists_change_nothing(kind, form, storage, evidence_kind, buil
             return launch
 
     for name in ("_input_block_kernel", "_input_block_group_kernel"):
-        monkeypatch.setattr(K, name, Spy(getattr(K, name)))
-    spans, products = K.Launch.input_boundaries, F.products
+        monkeypatch.setattr(K.run, name, Spy(getattr(K.run, name)))
+    spans, products = K.launches.Launch.input_boundaries, F.products
     out, seen = {}, {}
     for arm in ("always", "alternate", "never", "unbuilt"):
         modes = set()
-        monkeypatch.setattr(K.Launch, "input_boundaries", spans)
+        monkeypatch.setattr(K.launches.Launch, "input_boundaries", spans)
         monkeypatch.setattr(F, "products", products)
         if arm == "unbuilt":
             monkeypatch.setattr(F, "products", lambda *args, succ_lists = None, **kwargs: products(*args, **kwargs))
         elif arm == "alternate":                                            # (every launch as if over every boundary:
             monkeypatch.setattr(L.Liveness, "successor_lists", alternate)   # the steps choose, the launches cannot)
-            monkeypatch.setattr(K.Launch, "input_boundaries", property(lambda self: np.arange(n)))
+            monkeypatch.setattr(K.launches.Launch, "input_boundaries", property(lambda self: np.arange(n)))
             monkeypatch.setattr(L, "SUCCESSOR_LIST_MAX_LIVE", 2.0)
         else:
             monkeypatch.setattr(L.Liveness, "successor_lists", real)

@@ -8,14 +8,12 @@ texts in random tokenizations, near misses, exact draws from the automaton; the 
 identity; composition; a tokenizer in place of a vocabulary; the missing optional dependency.
 """
 import random
-import sys
+import re
 
 import pytest
 import torch
 
 import pyjuice.constraints as jc
-
-pytest.importorskip("interegular")
 
 #: a small vocabulary: é (c3 a9) whole and split, an empty token (19), a token with no text (20), two ends (21, 22)
 TOKENS = [b"a", b"b", b"ab", b"A", b"c", b"ca", b"t", b"cat", b"e", b"0", b"10", b".", b"\n", b"\xc3", b"\xa9",
@@ -156,13 +154,10 @@ def test_padding():
 @pytest.mark.parametrize("pattern", [r"^a", r"a$", r"\bcat", r"(a)\1", r"(?m)a", r"a(?m:b)", r"(?x)a b", r"\p{L}",
                                      r"(a", r"a{2,1}", r"(?=a)[abc]*", r"a(?=b)", r"(x(?!a))*", r"b|(?<=a)b", "(?i)é",
                                      r"(?i:\xdf)", "(?i)[a-z]|ä", r"a++a", r"(?>a|ab)c", r"[]a]", r"[^]a]",
-                                     r"(?#note)a", r"(?i:(?-i:a)b)"])
+                                     r"(?u:a)", r"(?u)a", r"(?i:(?-i:a)b)"])
 def test_refused(pattern):
-    """Anchors, \\b, backreferences, (?m), (?x), \\p{} and malformed patterns; lookarounds anywhere in the pattern
-    (interegular's automata for some are wrong: (?=a)[abc]* accepting "aA"); (?i) with a character outside ASCII
-    (interegular folds those by Unicode, and ß upper-cases to two characters); possessive repetition (interegular's
-    a++a accepts "aa"), atomic groups; a ']' first in a class (which interegular reads otherwise); what interegular
-    fails on (a comment)."""
+    """Anchors, \\b, backreferences, (?m), (?x), \\p{} and malformed patterns; lookarounds anywhere in the pattern; (?i)
+    with a character outside ASCII; possessive repetition, atomic groups; a ']' first in a class; (?u:...)."""
     with pytest.raises(ValueError, match = "Unsupported regular expression"):
         jc.Regex(pattern, VOCAB)
     with pytest.raises(TypeError):
@@ -216,9 +211,114 @@ def test_a_tokenizer_for_a_vocabulary(byte_level):
     transformers = pytest.importorskip("transformers")
     wrapped = transformers.PreTrainedTokenizerFast(tokenizer_object = tok, eos_token = "<|endoftext|>")
     assert jc.Regex("[a-z]+", wrapped) == jc.Regex("[a-z]+", jc.Vocabulary.from_tokenizer(wrapped))
+    # read once, while it says the same: a constraint per example pays neither the reading nor the byte trie
+    assert jc.Regex("a", wrapped).vocabulary is jc.Regex("b", wrapped).vocabulary
+    before = jc.Regex("a", wrapped).vocabulary
+    wrapped.add_tokens(["<another>"])
+    assert jc.Regex("a", wrapped).vocabulary is not before and jc.Regex("a", wrapped).vocab_size == before.size + 1
 
 
-def test_without_interegular(monkeypatch):
-    monkeypatch.setitem(sys.modules, "interegular", None)
-    with pytest.raises(ImportError, match = r"pyjuice\[constraints\]"):
-        jc.Regex("ab", VOCAB)
+#: every construct, as `re` reads it: those the reader has to take apart, the corners of what Python accepts
+CONSTRUCTS = [r"a{2}", r"a{2,}", r"a{,2}", r"a{2,3}", r"a{0}", r"a{0,0}", r"(a)", r"()", r"(a|)", r"(|a)", r"(a*)*", r"(a*)+",
+              r"(a+)*", r"(a?)*", r"(a|ab)(c|bcd)", r"(?:a|ab)*", r"[^a]", r"[^ab]", r"[a-c]", r"[^a-c]", r"[a-]", r"[-a]",
+              r"[a\-z]", r"\d", r"\D", r"\w", r"\W", r"\s", r"\S", r"[\d]", r"[\D]", r"[\W]", r"[^\W]", r"[\S]", r".", r".*",
+              r".{2}", r"(?s).", r"(?s:.)", r"(?s:.)|\n", r"(?i)a", r"(?i)A", r"(?i)[a-c]", r"(?i)[^a]", r"(?i)[^a-c]", r"(?i)\w",
+              r"(?i)\W", r"(?i).", r"(?i:a)b", r"a(?i:b)", r"(?i:[A-Z])", r"(?i:[Z-a])", r"(?i)[Z-a]", r"(?i)[^Z-a]", r"\x41",
+              r"\101", r"\u0041", r"\U00000041", r"\0", r"\a", r"\f", r"\n", r"\r", r"\t", r"\v", r"\\", r"\.", r"\[", r"\]",
+              r"é", r"é+", r"[é]", r"[^é]", r"[à-ÿ]", r"[^à-ÿ]", r"日本語", r"[一-鿿]{2,3}", r"😀", r"[😀-😂]", r"\U0001F600",
+              r"[\U0001F600-\U0001F64F]", r"\u00e9", r"\xe9", r"\ud800", r"[\ud800-\udfff]", r"[a\ud800]", r"[^\ud800]",
+              r"(?a)\w", r"(?a:\w)", r"(?P<n>a)b", r"(?#note)a", r"(?:a{2}){3}", r"(?:a{1,2}){2,3}", r"(?:a|b){2,3}c",
+              r"((a|b)c){1,2}", r"(?:(?:a{2}){2}){2}", r"(?:a?){2,3}", r"(?:a*){2,3}", r"(?:a+){2,3}", r"(?:a*b?){2}", r"[ab]*a[ab]{2}",
+              r"a{", r"a{1", r"a{x}", r"a{1,x}", r"x{2", r"a|b", r"a||b", r"|", r"a|", r"(?:(?s:.)|a)", r"(?i:a|b)c",
+              r"(?s:(?i:a).)", r"[.]", r"[*+?]", r"[|]", r"[()]", r"[{}]", r"[$]", r"[\^]", r"[a^]", r"[\]]", r"[\[]", r"[a\]]"]
+_CHARS = ["a", "b", "c", "A", "B", "Z", "z", "_", "0", "9", " ", "\n", "\t", "\r", "\x0b", "\x0c", "\x1c", ".", "-", "^", "]", "[", "\\", "`",
+          "é", "É", "ß", "日", "本", "語", "😀", "\U0001F64F", "\x7f", "\x80", "ÿ", "\u07ff", "\u0800", "\uffff", "\U00010000",
+          "\U0010ffff", "K", "k", "\u212a", "ſ", "S", "s", "x", "{", "}", "1", "2", ",", "\x00", "\x07"]
+TEXTS = [""] + _CHARS + [x + y for x in _CHARS[:12] + ["é", "日"] for y in _CHARS[:12] + ["é", "日"]] + \
+    ["aaa", "aaaa", "aaaaa", "aaaaaa", "aaaaaaaa", "abc", "abcd", "acbc", "日本語", "aba", "aab", "abb", "a{", "a{1", "a{x}", "a{1,x}", "{2}", "x{2"]
+
+
+@pytest.mark.parametrize("pattern", CONSTRUCTS)
+def test_every_construct_as_python_reads_it(pattern):
+    """The byte automaton of a pattern accepts exactly the texts `re.fullmatch(pattern, text, re.ASCII)` does."""
+    from pyjuice.constraints.language.backend import automata as A
+    a = A.regex(pattern)
+    compiled = re.compile(pattern, re.ASCII)
+    for text in TEXTS:
+        assert a.accepts(text.encode()) == (compiled.fullmatch(text) is not None), (pattern, text)
+
+
+def test_random_patterns_as_python_reads_them():
+    """Random patterns of everything the reader reads, flags and bounded repetition nested, the same way."""
+    from pyjuice.constraints.language.backend import automata as A
+    rng = random.Random(1)
+    atoms = ["a", "b", "c", "A", "Z", "0", "é", "日", "😀", r"\.", ".", "[ab]", "[^a\n]", "[a-c0]", r"\d", r"\w", r"\s", r"\D", r"\W", r"\S",
+             "[éx]", "[^é]", "[à-ÿ]", "[a-zA-Z]", r"[\d_]", r"[^\W]", "\n", " ", "_", "-", r"\n", r"\t", "(?:)", "()", "[^\n]"]
+
+    def node(d):
+        r = rng.random()
+        if d == 0 or r < 0.3:
+            return rng.choice(atoms)
+        if r < 0.5:
+            return node(d - 1) + node(d - 1)
+        if r < 0.65:
+            return f"({node(d - 1)}|{node(d - 1)})"
+        if r < 0.7:
+            return f"(?:{node(d - 1)}|)"
+        if r < 0.9:
+            lo = rng.randint(0, 2)
+            hi = lo + rng.randint(0, 2)
+            return f"(?:{node(d - 1)})" + rng.choice(["*", "+", "?", f"{{{lo},{hi}}}", f"{{{lo}}}", f"{{{lo},}}", f"{{,{hi}}}", "*?", "+?", "??",
+                                                      f"{{{lo},{hi}}}?"])
+        return rng.choice(["(?i:", "(?s:", "(?is:", "(?a:"]) + node(d - 1) + ")"
+
+    checked = 0
+    for _ in range(300):
+        pattern = node(4)
+        try:
+            a = A.regex(pattern)
+        except ValueError:                                       # ((?i) with a character outside ASCII)
+            continue
+        compiled = re.compile(pattern, re.ASCII)
+        for text in TEXTS:
+            assert a.accepts(text.encode()) == (compiled.fullmatch(text) is not None), (pattern, text)
+        checked += 1
+    assert checked >= 150, checked
+
+
+def test_the_trie_of_a_vocabulary():
+    """The tables of a vocabulary's byte trie are those of a trie built by hand: every node's children by increasing
+    byte, numbered breadth-first, the tokens ending at it ascending; only tokens with nonempty text."""
+    from pyjuice.constraints.language.backend.token_lift import _trie
+    rng = random.Random(0)
+    tokens = [bytes(rng.randrange(256) if rng.random() < 0.1 else rng.choice(b"abc") for _ in range(rng.randint(0, 5)))
+              for _ in range(300)] + [None, b"", b"abc", b"abc"]
+    vocab = jc.Vocabulary(tokens, eos = [0], size = len(tokens) + 2)
+    root = {"children": {}, "ends": []}
+    for v, text in enumerate(tokens):
+        if text and v != 0:
+            at = root
+            for b in text:
+                at = at["children"].setdefault(b, {"children": {}, "ends": []})
+            at["ends"].append(v)
+    t = _trie(vocab)
+    level, u, next_child = [root], 0, 1
+    while level:
+        below = []
+        for at in level:
+            assert t.first_child[u] == next_child
+            for k, (b, c) in enumerate(sorted(at["children"].items())):
+                assert t.node_byte[next_child + k] == b
+                below.append(c)
+            next_child += len(at["children"])
+            assert t.end_ids[t.end_ptr[u]:t.end_ptr[u + 1]].tolist() == at["ends"]
+            u += 1
+        level = below
+    assert u == t.first_child.size - 1 and t.first_child[u] == next_child == u
+
+
+def test_a_constraint_pickles():
+    import pickle
+    c = jc.Regex("a+(b|é)*", VOCAB)
+    again = pickle.loads(pickle.dumps(c))
+    assert again == c and again.automaton() == c.automaton()

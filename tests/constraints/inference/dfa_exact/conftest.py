@@ -847,17 +847,17 @@ def gate_sums_fixture():
     return gate_sums
 
 
-_SPLIT_DEFAULTS = (_lifted_sum.SPLIT_PROGRAMS_PER_SM, _lifted_sum.SPLIT_MIN_SHARE, _lifted_sum.SPLIT_MAX)
+_SPLIT_DEFAULTS = (_lifted_sum.tile_rules.SPLIT_PROGRAMS_PER_SM, _lifted_sum.tile_rules.SPLIT_MIN_SHARE, _lifted_sum.tile_rules.SPLIT_MAX)
 
 
 def set_split(monkeypatch, mode: str):
-    """The fused sum kernels' split reductions (``kernels/sum.py``): ``"default"`` the library's rule, ``"max"``
+    """The fused sum kernels' split reductions (``kernels/sum/fused_cuda.py``): ``"default"`` the library's rule, ``"max"``
     every launch split as far as its reductions allow (shares of one chunk, whatever the launch's size), ``"off"``
     none; any mode after any other."""
     per_sm, min_share, most = _SPLIT_DEFAULTS
     values = {"default": (per_sm, min_share, most), "max": (1 << 20, 1, most), "off": (per_sm, min_share, 1)}[mode]
     for name, value in zip(("SPLIT_PROGRAMS_PER_SM", "SPLIT_MIN_SHARE", "SPLIT_MAX"), values):
-        monkeypatch.setattr(_lifted_sum, name, value)
+        monkeypatch.setattr(_lifted_sum.tile_rules, name, value)
 
 
 @pytest.fixture(params = ["default", "max"])
@@ -875,8 +875,8 @@ def set_split_fixture(monkeypatch):
 
 @pytest.fixture(params = ["default", "always"])
 def pre(request, monkeypatch):
-    """The fused top-down kernel's pre-pass (``kernels/sum.py``): the library's rule, or every launch that may take
+    """The fused top-down kernel's pre-pass (``kernels/sum/fused_top_down.py``): the library's rule, or every launch that may take
     it (any number of tiles of children)."""
     if request.param == "always":
-        monkeypatch.setattr(_lifted_sum, "PRE_MIN_TILES", 1)
+        monkeypatch.setattr(_lifted_sum.tile_rules, "PRE_MIN_TILES", 1)
     return request.param

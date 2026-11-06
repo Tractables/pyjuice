@@ -19,6 +19,7 @@ import torch
 import pyjuice as juice
 import pyjuice.constraints as jc
 import pyjuice.nodes.distributions as dists
+from pyjuice.constraints.inference.dfa_exact.compiled import program
 from pyjuice.constraints.inference.dfa_exact.kernels import prod_top_down
 from pyjuice.constraints.inference.dfa_exact.kernels.c import get_module
 from pyjuice.constraints.inference.dfa_exact.queries.backend import forward as F
@@ -67,7 +68,7 @@ def sum_path(request, monkeypatch):
     """The fused sum kernels, or the dense path with its products on the live columns only or on every column (the
     dead ones read too: they must hold -inf)."""
     from pyjuice.constraints.inference.dfa_exact.kernels import sum as lifted_sum
-    monkeypatch.setattr(lifted_sum, "DENSE_MIN_BLOCK", 1 << 30 if request.param == "fused" else 1)
+    monkeypatch.setattr(lifted_sum.dense, "DENSE_MIN_BLOCK", 1 << 30 if request.param == "fused" else 1)
     monkeypatch.setattr(F, "prune_dense", (lambda ncols, live: False) if request.param == "dense_unpruned" else
                         (lambda ncols, live: live < ncols))
     return request.param
@@ -538,11 +539,11 @@ def walk_launches(monkeypatch):
     """Every ``input @ block`` launch offered to the CUDA kernels (switched on): whether they took it, and what it is
     made of."""
     seen = []
-    real = prod_top_down._input_block_cuda
+    real = prod_top_down.walk._input_block_cuda
 
     def record(la, tiles, height, prog, compact, *args):
         taken = real(la, tiles, height, prog, compact, *args)
-        if not prod_top_down.INPUT_BLOCK_CUDA:                           # (the Triton kernel's run)
+        if not prod_top_down.walk.INPUT_BLOCK_CUDA:                           # (the Triton kernel's run)
             return taken
         masses, obs_class, once_iv = args[4], args[5], args[6]
         c_kind, out_temp, (c_full, out_full) = la.kinds
@@ -554,15 +555,15 @@ def walk_launches(monkeypatch):
                          **(taken or {})))
         return taken
 
-    monkeypatch.setattr(prod_top_down, "_input_block_cuda", record)
+    monkeypatch.setattr(prod_top_down.run, "_input_block_cuda", record)
     return seen
 
 
 def both_walks(monkeypatch, run):
     """``run()`` on the Triton kernel, then on the CUDA kernels."""
-    monkeypatch.setattr(prod_top_down, "INPUT_BLOCK_CUDA", False)
+    monkeypatch.setattr(prod_top_down.walk, "INPUT_BLOCK_CUDA", False)
     want = run()
-    monkeypatch.setattr(prod_top_down, "INPUT_BLOCK_CUDA", True)
+    monkeypatch.setattr(prod_top_down.walk, "INPUT_BLOCK_CUDA", True)
     return want, run()
 
 
@@ -579,7 +580,7 @@ WALK_CTAS = {"default": (16, 512, 64), "8_wide": (8, 0, 0), "2": (2, 512, 0), "1
 
 def set_walk_ctas(monkeypatch, cta):
     for name, value in zip(("NODES", "WIDE", "WARP_ITEMS"), WALK_CTAS[cta]):
-        monkeypatch.setattr(prod_top_down, "INPUT_BLOCK_CUDA_" + name, value)
+        monkeypatch.setattr(prod_top_down.walk, "INPUT_BLOCK_CUDA_" + name, value)
 
 
 @pytest.mark.skipif(get_module() is None, reason = "the CUDA kernels are unavailable")
@@ -613,8 +614,8 @@ def test_cuda_walk_with_deferred_units_gives_the_triton_values(kind, name, patte
     defers to the kernel staging every code, with the kept-once parents' -- with 1 code, that kernel's one CTA summing
     every deferred unit in turn -- the Triton kernel's values bit for bit."""
     set_walk_ctas(monkeypatch, cta)
-    monkeypatch.setattr(prod_top_down, "INPUT_BLOCK_CUDA_CODES", codes)
-    monkeypatch.setattr(prod_top_down, "INPUT_BLOCK_CUDA_DEFER_CTAS", 1 if codes == 1 else 0)
+    monkeypatch.setattr(prod_top_down.walk, "INPUT_BLOCK_CUDA_CODES", codes)
+    monkeypatch.setattr(prod_top_down.walk, "INPUT_BLOCK_CUDA_DEFER_CTAS", 1 if codes == 1 else 0)
     n = WALK_KINDS[kind]
     cc = jc.compile(CONSTRAINTS[name](), walk_pc(kind, build_pc))
     data, missing = evidence(pattern, n)
@@ -699,6 +700,63 @@ def test_cuda_walk_past_45k_of_shared_memory(build_pc, walk_launches, monkeypatc
     assert_same_bits(got, want)
     assert all(la["taken"] for la in walk_launches)
     assert max(la["smem"] for la in walk_launches) > 45 * 1024
+
+
+def _many_classes(K, C, seed = 0):
+    """A random automaton of ``K`` states and ``C`` token classes of two tokens each (so none enumerated), every state
+    accepting, and its vocabulary."""
+    g = torch.Generator().manual_seed(seed)
+    Vw = 2 * C
+    return jc.DFA(Vw, torch.arange(Vw) % C, torch.randint(0, K, (K, C), generator = g), 0,
+                  torch.ones(K, dtype = torch.bool)), Vw
+
+
+@pytest.mark.skipif(get_module() is None, reason = "the CUDA kernels are unavailable")
+def test_cuda_walk_at_every_shared_memory_of_a_warp_team(walk_launches, monkeypatch):
+    """A CTA of 8 samples, a warp each, of every size up to the 45 KB ``_input_block_cuda`` allows it (the codes staged
+    going up, 512 B a code here): its static shared memory takes the last two sizes past the 48 KB a kernel has unless
+    it asks for more (JSON hard_1 and hard_6 by HMM-4096 failed there, "invalid argument"), the Triton kernel's values
+    bit for bit. The small circuits' largest team, 15 KB, is nowhere near that."""
+    monkeypatch.setattr(program, "GROUP_MIN_RATIO", 1 << 30)              # (their transitions ungrouped)
+    C, n, B = 96, 6, 6
+    dfa, Vw = _many_classes(8, C)
+    ns = juice.structures.HMM(seq_length = n, num_latents = 32, num_emits = Vw)
+    ns.init_parameters(perturbation = 2.0)
+    cc = jc.compile(dfa, juice.compile(ns, verbose = False).to("cuda:0"))
+    g = torch.Generator().manual_seed(0)
+    data = torch.randint(0, Vw, (B, n), generator = g)
+    missing = (torch.arange(n) >= n // 2)[None, :].expand(B, n)
+    run = lambda: top_down_blocks(cc, data, missing, storage = "compact")[0]
+    monkeypatch.setattr(prod_top_down.walk, "INPUT_BLOCK_CUDA", False)
+    want = run()
+    monkeypatch.setattr(prod_top_down.walk, "INPUT_BLOCK_CUDA", True)
+    for codes in range(1, C + 1):
+        monkeypatch.setattr(prod_top_down.walk, "INPUT_BLOCK_CUDA_CODES", codes)
+        assert_same_bits(run(), want)
+    assert all(la["taken"] for la in walk_launches)
+    teams = {la["smem"] for la in walk_launches if la["warps"] and la["tn"] == 16}
+    assert {45 * 1024 - 512, 45 * 1024} <= teams, sorted(teams)
+
+
+@pytest.mark.skipif(get_module() is None, reason = "the CUDA kernels are unavailable")
+@pytest.mark.parametrize("classes, children", [(800, 8), (12000, 1)])
+def test_cuda_walk_with_every_code_too_wide_for_a_cta_of_many(classes, children, walk_launches, monkeypatch):
+    """Too many classes for a CTA of 16 children to stage them all in 45 KB (the deferred kernel's): CTAs of fewer, and
+    past it for one child, of one child with as much as the device takes; the Triton kernel's values bit for bit."""
+    monkeypatch.setattr(program, "GROUP_MIN_RATIO", 1 << 30)
+    monkeypatch.setattr(prod_top_down.walk, "INPUT_BLOCK_CUDA_WARP_ITEMS", 0)
+    n, B = 5, 2
+    dfa, Vw = _many_classes(8, classes)
+    ns = juice.structures.HMM(seq_length = n, num_latents = 32, num_emits = Vw)
+    ns.init_parameters(perturbation = 2.0)
+    cc = jc.compile(dfa, juice.compile(ns, verbose = False).to("cuda:0"))
+    g = torch.Generator().manual_seed(0)
+    data = torch.randint(0, Vw, (B, n), generator = g)
+    missing = torch.tensor([[True] * n, [False, True, True, False, True]])
+    want, got = both_walks(monkeypatch, lambda: top_down_blocks(cc, data, missing, storage = "compact")[0])
+    assert_same_bits(got, want)
+    assert all(la["taken"] for la in walk_launches)
+    assert min(la["tn"] for la in walk_launches) == children
 
 
 @pytest.mark.skipif(get_module() is None, reason = "the CUDA kernels are unavailable")

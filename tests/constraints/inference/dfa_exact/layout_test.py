@@ -1,5 +1,6 @@
 import itertools
 import random
+import weakref
 
 import pytest
 import torch
@@ -8,8 +9,9 @@ import pyjuice as juice
 import pyjuice.constraints as jc
 from pyjuice.constraints.inference.dfa_exact.kernels.prod import skip_masks
 from pyjuice.constraints.inference.dfa_exact.kernels.transitions import transition_stats, transition_tables
-from pyjuice.constraints.inference.dfa_exact.compiled.layout import (Reachability, _tile_any, build_layout,
-                                                                    interval_tables)
+from pyjuice.constraints.inference.dfa_exact.compiled import layout as layout_module
+from pyjuice.constraints.inference.dfa_exact.compiled.layout import build_layout
+from pyjuice.constraints.inference.dfa_exact.compiled.reachability import Reachability, _tile_any, interval_tables
 
 
 def random_dfa(K, V, seed):
@@ -345,11 +347,21 @@ def test_unsatisfiable_constraint_has_empty_boundaries():
     assert not L.satisfiable and (L.width == 0).all() and all(L.next_col_at(t).numel() == 0 for t in range(2))
 
 
-def test_layouts_are_cached_by_fingerprint():
-    a = build_layout(jc.DFA.contains([[1, 2]], 6), 4)
-    b = build_layout(jc.DFA.contains([[1, 2]], 6), 4)               # separately built, equal automaton
-    assert a is b
-    assert build_layout(jc.DFA.contains([[1, 2]], 6), 5) is not a
+def test_layouts_are_kept_with_the_automaton():
+    dfa = jc.DFA.contains([[1, 2]], 6)
+    a = build_layout(dfa, 4)
+    assert build_layout(dfa, 4) is a
+    assert build_layout(dfa, 5) is not a
+    twin = build_layout(jc.DFA.contains([[1, 2]], 6), 4)            # separately built, equal automaton: equal tables
+    assert twin is not a and torch.equal(twin.state_id, a.state_id) and torch.equal(twin.col_of_state, a.col_of_state)
+
+
+def test_a_layout_is_never_taken_for_a_dead_automatons():
+    """An id is only unique among live objects: an entry whose automaton died under the same id is not this one's."""
+    dead, alive = jc.DFA.contains([[1, 2]], 6), jc.DFA.contains([[2, 1]], 6)
+    stale = build_layout(dead, 4)
+    layout_module._CACHE[(id(alive), 4)] = (weakref.ref(dead), stale)
+    assert build_layout(alive, 4) is not stale
 
 
 def test_pruning_on_a_word_count_constraint(word_count):
@@ -494,3 +506,28 @@ def test_a_graph_compiled_again_is_refused():
     first = juice.compile(ns, verbose = False)
     juice.compile(ns, verbose = False)
     jc.compile(jc.DFA.contains([[1, 2]], V), first)
+
+
+@pytest.mark.parametrize("seed", range(8))
+def test_a_layout_built_on_the_host_is_the_one_built_on_the_device(seed, monkeypatch):
+    """`build_layout` in compiled loops and in a few array operations a boundary on the device: the same widths and
+    columns, whatever the automaton (states that never accept and never leave, sweeps that settle early, nothing
+    accepted, a sequence as long as the automaton takes to settle)."""
+    from pyjuice.constraints.inference.dfa_exact.compiled import layout as L
+    g = torch.Generator().manual_seed(seed)
+    K, C = int(torch.randint(1, 40, (1,), generator = g)), int(torch.randint(1, 6, (1,), generator = g))
+    delta = torch.randint(0, K, (K, C), generator = g)
+    if seed % 2:                                             # states that never accept and never leave
+        delta[K // 2:] = torch.arange(K // 2, K)[:, None]
+    accept = [] if seed == 3 else torch.randperm(K, generator = g)[:max(K // 4, 1)].tolist()
+    dfa = jc.DFA(C, torch.arange(C), delta, 0, accept)
+    dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    for n in (0, 1, 3, 17):
+        monkeypatch.setattr(L, "LAYOUT_HOST_ENTRIES", 1 << 30)
+        host = L._build(dfa, n, dev)
+        monkeypatch.setattr(L, "LAYOUT_HOST_ENTRIES", 0)
+        device = L._build(dfa, n, dev) if dev.type != "cpu" else L._build_on_device(dfa, n, dev)
+        assert torch.equal(host.width, device.width) and host.satisfiable == device.satisfiable, (K, C, n)
+        assert torch.equal(host.state_id, device.state_id) and torch.equal(host.col_of_state, device.col_of_state), (K, C, n)
+        assert torch.equal(host.on_device[2].cpu(), host.state_id) and torch.equal(host.on_device[3].cpu(), host.col_of_state)
+        assert torch.equal(host.on_device[4], device.on_device[4]), (K, C, n)                     # (the states in the order of the columns)

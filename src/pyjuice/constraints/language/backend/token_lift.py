@@ -1,0 +1,1541 @@
+"""
+A byte automaton (:class:`~.byte_level.ByteAutomaton`) as a token automaton: :func:`to_tokens` turns it into a
+:class:`~pyjuice.constraints.DFA` over a
+:class:`~pyjuice.constraints.Vocabulary`'s ids: a token sequence is accepted when its text -- the tokens' bytes,
+concatenated -- is, whichever tokens spell it (tokens that split a character included); under the end-of-sequence
+padding convention the text may be followed by end-of-sequence ids, and only by them. From every state reached at a
+token boundary, in breadth-first order from the initial state, a depth-first walk of the vocabulary's byte trie stops
+at the dead state, and takes a subtree a level at a time where every byte below a node leads a state to one successor
+(:func:`_walk_one`), so the work is far below the number of live (state, trie node) pairs.
+Tokens leading to the same state from every reached state share a class: two independent 64-bit random linear hashes
+of every trie node's successors, summed during the walks, then one representative token per class.
+"""
+
+from __future__ import annotations
+
+from typing import Sequence
+
+import numpy as np
+import torch
+from numba import get_num_threads, njit, prange
+
+from ..dfa import DFA
+from ..vocabulary import Vocabulary
+from .behaviours import behaviours_of, classes_of_behaviours, rows_of_behaviours
+from .counters import NO_COPIES, NotCounted, expanded_moves, states_put_back, room_for
+from .dfa import bfs_order
+from .byte_level import ByteAutomaton
+from .threads import few_threads
+
+
+# -------------------------------------------------------------------------------------------------
+# Token automata
+# -------------------------------------------------------------------------------------------------
+
+@njit(cache = True)
+def _trie_tables(data, offsets, tokens):
+    """The byte trie of ``tokens`` (ids; ``data[offsets[v]:offsets[v + 1]]`` the bytes of ``v``, none of them empty), its
+    nodes numbered breadth-first, every node's children together and by increasing byte: ``(first_child, node_byte,
+    end_ptr, end_ids)``: a node's children are the nodes ``first_child[u]`` to ``first_child[u + 1] - 1``, ``node_byte``
+    the byte into every node, the tokens ending at it CSR (ascending)."""
+    most = data.shape[0] + 1                                    # (every byte a node, at most)
+    child = np.empty(most, dtype = np.int32)                    # as they appear: first child, next sibling, byte
+    sibling = np.empty(most, dtype = np.int32)
+    byte = np.empty(most, dtype = np.uint8)
+    end_node = np.empty(tokens.shape[0], dtype = np.int32)
+    root = np.full(256, -1, dtype = np.int32)
+    child[0] = -1
+    num = 1
+    for i in range(tokens.shape[0]):
+        v = tokens[i]
+        u = 0
+        for k in range(offsets[v], offsets[v + 1]):
+            b = data[k]
+            if u == 0:
+                w = root[b]
+            else:
+                w = child[u]
+                while w >= 0 and byte[w] != b:
+                    w = sibling[w]
+            if w < 0:
+                w = num
+                num += 1
+                byte[w], child[w] = b, -1
+                sibling[w], child[u] = child[u], w
+                if u == 0:
+                    root[b] = w
+            u = w
+        end_node[i] = u
+    # breadth-first: every node's children (by increasing byte) get the next numbers
+    number = np.empty(num, dtype = np.int32)
+    order = np.empty(num, dtype = np.int32)
+    first_child = np.empty(num + 1, dtype = np.int32)
+    node_byte = np.empty(num, dtype = np.uint8)
+    number[0], order[0], node_byte[0] = 0, 0, 0
+    last = 1
+    for i in range(num):
+        first_child[i] = last
+        at = last
+        w = child[order[i]]
+        while w >= 0:                                           # (insertion: a node has few children, but for the root)
+            j = at
+            while j > last and node_byte[j - 1] > byte[w]:
+                node_byte[j], order[j] = node_byte[j - 1], order[j - 1]
+                j -= 1
+            node_byte[j], order[j] = byte[w], w
+            at += 1
+            w = sibling[w]
+        last = at
+    first_child[num] = last
+    for i in range(num):
+        number[order[i]] = i
+    end_ptr = np.zeros(num + 1, dtype = np.int32)
+    for i in range(tokens.shape[0]):
+        end_ptr[number[end_node[i]] + 1] += 1
+    for i in range(num):
+        end_ptr[i + 1] += end_ptr[i]
+    end_ids = np.empty(tokens.shape[0], dtype = np.int32)
+    fill = end_ptr[:num].copy()
+    for i in range(tokens.shape[0]):
+        u = number[end_node[i]]
+        end_ids[fill[u]] = tokens[i]
+        fill[u] += 1
+    return first_child, node_byte, end_ptr, end_ids
+
+
+@njit(cache = True)
+def _bytes_below(first_child, node_byte):
+    """uint64 [nodes, 4]: the bytes of every edge below a node, as bits (a child is numbered past its parent)."""
+    M = first_child.shape[0] - 1
+    below = np.zeros((M, 4), dtype = np.uint64)
+    for u in range(M - 1, -1, -1):
+        for w in range(first_child[u], first_child[u + 1]):
+            b = node_byte[w]
+            for k in range(4):
+                below[u, k] |= below[w, k]
+            below[u, b >> 6] |= np.uint64(1) << np.uint64(b & 63)
+    return below
+
+
+@njit(cache = True)
+def _ends(end_ptr, end_ids, V, empty):
+    """
+    Where :func:`_token_classes` reads the hashes of tokens, in order: the root (nothing is added to it: tokens without text are
+    there), the nodes tokens end at, the place past the trie's nodes for tokens of empty text (``empty``) and the one past that for
+    the ends of sequence under padding. ``(end_nodes, token_end)``: those places, and every token's among them.
+    """
+    M = end_ptr.shape[0] - 1
+    E = 3
+    for u in range(1, M):
+        if end_ptr[u + 1] > end_ptr[u]:
+            E += 1
+    end_nodes = np.empty(E, dtype = np.int32)
+    token_end = np.zeros(V, dtype = np.int32)
+    end_nodes[0] = 0
+    n = 1
+    for u in range(1, M):
+        if end_ptr[u + 1] > end_ptr[u]:
+            end_nodes[n] = u
+            for k in range(end_ptr[u], end_ptr[u + 1]):
+                token_end[end_ids[k]] = n
+            n += 1
+    end_nodes[n], end_nodes[n + 1] = M, M + 1
+    for i in range(empty.shape[0]):
+        token_end[empty[i]] = n
+    return end_nodes, token_end
+
+
+@njit(cache = True)
+def _parents(first_child):
+    """Every node's parent (the root's: itself)."""
+    M = first_child.shape[0] - 1
+    parent = np.zeros(M, dtype = np.int32)
+    for u in range(M):
+        for w in range(first_child[u], first_child[u + 1]):
+            parent[w] = u
+    return parent
+
+
+class _Trie:
+    """The byte trie of a vocabulary's tokens with nonempty text, breadth-first (:func:`_trie_tables`), and what walks of it read
+    whatever the automaton: the bytes below every node (:func:`_bytes_below`), where tokens end (:func:`_ends`)."""
+
+    def __init__(self, vocabulary: Vocabulary):
+        offsets, has_text = vocabulary._offsets, vocabulary._has_text
+        self.data = np.frombuffer(vocabulary._buffer, dtype = np.uint8)
+        tokens = np.nonzero(has_text & (offsets[1:] > offsets[:-1]))[0]
+        self.first_child, self.node_byte, self.end_ptr, self.end_ids = _trie_tables(self.data, offsets, tokens)
+        self.below = _bytes_below(self.first_child, self.node_byte)
+        self.ends_before = self.end_ptr
+        self.empty = np.nonzero(has_text & (offsets[1:] == offsets[:-1]))[0]
+        self.end_nodes, self.token_end = _ends(self.end_ptr, self.end_ids, vocabulary.size, self.empty)
+        self.parent = _parents(self.first_child)
+        self._places = {}
+
+    def token_ends(self, V: int, eos: tuple) -> np.ndarray:
+        """Every token's place among :attr:`end_nodes`, of ``V`` ids (more than the trie was made for: they have no text), the ids ``eos``
+        at the last place."""
+        places = self._places.get((V, eos))
+        if places is None:
+            places = np.zeros(V, dtype = np.int32)
+            places[:self.token_end.size] = self.token_end
+            places[list(eos)] = self.end_nodes.size - 1
+            self._places[V, eos] = places
+        return places
+
+
+def _trie(vocabulary: Vocabulary) -> _Trie:
+    """The vocabulary's byte trie, built on first use and kept with it."""
+    if vocabulary._byte_trie is None:
+        vocabulary._byte_trie = _Trie(vocabulary)
+    return vocabulary._byte_trie
+
+
+#: a node with more children than this has those a state lives on found by their bytes, if the state leads nowhere on most
+MANY_CHILDREN = 64
+#: the lowest bit of a word, by a de Bruijn sequence
+_DE_BRUIJN = np.uint64(0x03f79d71b4cb0a89)
+_TRAILING_ZEROS = np.zeros(64, dtype = np.int64)
+for _bit in range(64):
+    _TRAILING_ZEROS[(((1 << _bit) * int(_DE_BRUIJN)) & (2 ** 64 - 1)) >> 58] = _bit
+
+
+@njit(cache = True)
+def _bytes_of_classes(byte_class, C):
+    """uint64 [C, 4]: the bytes of every class, as bits."""
+    out = np.zeros((C, 4), dtype = np.uint64)
+    for b in range(256):
+        out[byte_class[b], b >> 6] |= np.uint64(1) << np.uint64(b & 63)
+    return out
+
+
+@njit(cache = True)
+def _usual_move(table, class_bytes, q, dead, usual, same, count):
+    """Keep ``usual[q]``, the successor most classes lead ``q`` to (``count`` zeros), and ``same[q]``, the bytes of those classes as bits."""
+    C = table.shape[1]
+    row = table[q]
+    live = 0
+    for c in range(C):
+        live += row[c] != dead
+    if 2 * live <= C:                                           # (nearly all states: the dead state)
+        same[q, :] = ~np.uint64(0)
+        for c in range(C):
+            if row[c] != dead:
+                for k in range(4):
+                    same[q, k] &= ~class_bytes[c, k]
+        usual[q] = dead
+        return
+    best, most = row[0], 0
+    for c in range(C):
+        x = row[c]
+        count[x] += 1
+        if count[x] > most:
+            most, best = count[x], x
+    for c in range(C):
+        count[row[c]] = 0
+    for c in range(C):
+        if row[c] == best:
+            for k in range(4):
+                same[q, k] |= class_bytes[c, k]
+    usual[q] = best
+
+
+@njit(cache = True)
+def _usual_moves(table, class_bytes, dead, usual, same, count):
+    """:func:`_usual_move` of every state not known yet (threads walking only read them)."""
+    for q in range(table.shape[0]):
+        if usual[q] < 0:
+            _usual_move(table, class_bytes, q, dead, usual, same, count)
+
+
+@njit(cache = True)
+def _into_child(w, q2, a1, b1, a2, b2, h1, h2, first_child, stack_node, stack_q, top, find, ends_before, seen, order, num):
+    """A walk at state ``q2`` at the node ``w``: its hashes, the state if a token ends here, the node to go on from if it has children."""
+    x = np.uint64(q2 + 1)
+    h1[w] += a1 * x + b1
+    h2[w] += a2 * x + b2
+    if find and ends_before[w + 1] > ends_before[w] and not seen[q2]:
+        seen[q2] = True
+        order[num] = q2
+        num += 1
+    if first_child[w + 1] > first_child[w]:
+        stack_node[top] = w
+        stack_q[top] = q2
+        top += 1
+    return top, num
+
+
+@njit(cache = True)
+def _walk_one(s, a1, b1, a2, b2, table, dead, byte_class, first_child, node_byte, below, class_bytes, usual, same, count, h1, h2, d1, d2, stack_node, stack_q,
+              find, ends_before, seen, order, num):
+    """
+    The hashes of a depth-first walk of the trie from state ``s``, through live states, added: to ``h1`` and ``h2``, or by ranges
+    of nodes to ``d1`` and ``d2`` (:func:`_add_ranges`), the same numbers. Most of a walk is not walked: where every byte below a
+    node leads a state to one successor (:func:`_usual_move`: a string's characters to the string, nearly all to the dead state), that
+    successor holds for the whole next level of the subtree, and so on level by level as long as it holds: a level of a breadth-first
+    numbered trie is a range. With ``find``, every state a token ends at (``ends_before``, by node, how many nodes before it tokens end at) is kept in ``order`` if not ``seen``. Returns
+    ``(steps, num)``.
+    """
+    stack_node[0], stack_q[0] = 0, s
+    top = 1
+    steps = 0
+    while top > 0:
+        top -= 1
+        u, q = stack_node[top], stack_q[top]
+        if usual[q] < 0:
+            _usual_move(table, class_bytes, q, dead, usual, same, count)
+        steps += 1
+        inside = True
+        for k in range(4):
+            if below[u, k] & ~same[q, k] != 0:
+                inside = False
+                break
+        if not inside:
+            e0, e1 = first_child[u], first_child[u + 1]
+            if usual[q] == dead and e1 - e0 > MANY_CHILDREN:    # (of so many, those that live: found by their bytes)
+                for k in range(4):
+                    bits = ~same[q, k]
+                    while bits != np.uint64(0):
+                        low = bits & (~bits + np.uint64(1))
+                        bits ^= low
+                        b = 64 * k + _TRAILING_ZEROS[np.int64((low * _DE_BRUIJN) >> np.uint64(58))]
+                        lo, hi = e0, e1
+                        while lo < hi:
+                            mid = (lo + hi) >> 1
+                            if node_byte[mid] < b:
+                                lo = mid + 1
+                            else:
+                                hi = mid
+                        steps += 1
+                        if lo < e1 and node_byte[lo] == b:
+                            top, num = _into_child(lo, table[q, byte_class[b]], a1, b1, a2, b2, h1, h2, first_child, stack_node, stack_q, top, find, ends_before, seen,
+                                                   order, num)
+                continue
+            steps += e1 - e0
+            for w in range(e0, e1):
+                q2 = table[q, byte_class[node_byte[w]]]
+                if q2 != dead:
+                    top, num = _into_child(w, q2, a1, b1, a2, b2, h1, h2, first_child, stack_node, stack_q, top, find, ends_before, seen, order, num)
+            continue
+        t = usual[q]
+        first, last = u, u
+        while t != dead:
+            e0, e1 = first_child[first], first_child[last + 1]
+            if e1 == e0:
+                break
+            first, last = e0, e1 - 1                                    # the next level: all of it at state t
+            x = np.uint64(t + 1)
+            y1, y2 = a1 * x + b1, a2 * x + b2
+            d1[first] += y1
+            d1[last + 1] -= y1
+            d2[first] += y2
+            d2[last + 1] -= y2
+            if find and not seen[t] and ends_before[last + 1] > ends_before[first]:
+                seen[t] = True
+                order[num] = t
+                num += 1
+            steps += 1
+            if usual[t] < 0:
+                _usual_move(table, class_bytes, t, dead, usual, same, count)
+            inside = True
+            for k in range(4):
+                if below[u, k] & ~same[t, k] != 0:
+                    inside = False
+                    break
+            if not inside:                                              # no longer: the level's nodes walk on from t
+                for w in range(first, last + 1):
+                    if first_child[w + 1] > first_child[w]:
+                        stack_node[top] = w
+                        stack_q[top] = t
+                        top += 1
+                break
+            t = usual[t]
+    return steps, num
+
+
+@njit(cache = True)
+def _add_ranges(h, d):
+    """Add to the hashes ``h`` what the differences ``d`` say."""
+    total = np.uint64(0)
+    for i in range(d.shape[0]):
+        total += d[i]
+        h[i] += total
+
+
+@njit(cache = True)
+def _walk(table, dead, initial, byte_class, first_child, node_byte, ends_before, r1, r2, r3, r4, below, class_bytes, usual, same, count, budget):
+    """The states reached at token boundaries (breadth-first from ``initial``) and, per trie node, two hashes of its
+    successors from them: from every reached state a walk (:func:`_walk_one`) -- as far as ``budget`` steps go: ``(h1, h2,
+    states, walked)``, the first ``walked`` of them walked (every state a walk found, if it is all of them). The hashes
+    tell apart the nodes these states tell apart, by the state they lead to, whether tokens end at them or not."""
+    S = table.shape[0]
+    M = first_child.shape[0] - 1
+    h1 = np.zeros(M + 2, dtype = np.uint64)
+    h2 = np.zeros(M + 2, dtype = np.uint64)
+    d1 = np.zeros(M + 2, dtype = np.uint64)
+    d2 = np.zeros(M + 2, dtype = np.uint64)
+    order = np.empty(S, dtype = np.int64)
+    seen = np.zeros(S, dtype = np.bool_)
+    order[0] = initial
+    seen[initial] = True
+    num, head = 1, 0
+    stack_node = np.empty(M + 1, dtype = np.int32)
+    stack_q = np.empty(M + 1, dtype = np.int32)
+    steps = 0
+    while head < num and steps < budget:
+        s = order[head]
+        head += 1
+        done, num = _walk_one(s, r1[s], r2[s], r3[s], r4[s], table, dead, byte_class, first_child, node_byte, below, class_bytes, usual, same, count, h1, h2, d1, d2,
+                              stack_node, stack_q, True, ends_before, seen, order, num)
+        steps += done
+    _add_ranges(h1, d1)
+    _add_ranges(h2, d2)
+    return h1, h2, order[:num], head
+
+
+@njit(cache = True)
+def _walks(table, dead, states, byte_class, first_child, node_byte, r1, r2, r3, r4, below, class_bytes, usual, same, count, h1, h2, budget):
+    """:func:`_walk`'s hashes, added to ``h1`` and ``h2``, from ``states`` in turn, as far as ``budget`` steps go: how many
+    were walked, one at least."""
+    M = first_child.shape[0] - 1
+    d1 = np.zeros(h1.shape[0], dtype = np.uint64)
+    d2 = np.zeros(h1.shape[0], dtype = np.uint64)
+    stack_node = np.empty(M + 1, dtype = np.int32)
+    stack_q = np.empty(M + 1, dtype = np.int32)
+    no_ends = np.zeros(1, dtype = np.int32)
+    no_seen = np.zeros(1, dtype = np.bool_)
+    no_order = np.zeros(1, dtype = np.int64)
+    steps, i = 0, 0
+    while i < states.shape[0] and (i == 0 or steps < budget):
+        s = states[i]
+        i += 1
+        done, _ = _walk_one(s, r1[s], r2[s], r3[s], r4[s], table, dead, byte_class, first_child, node_byte, below, class_bytes, usual, same, count, h1, h2, d1, d2,
+                            stack_node, stack_q, False, no_ends, no_seen, no_order, 0)
+        steps += done
+    _add_ranges(h1, d1)
+    _add_ranges(h2, d2)
+    return i
+
+
+@njit(parallel = True, cache = True)
+def _walks_parallel(table, dead, states, byte_class, first_child, node_byte, r1, r2, r3, r4, below, class_bytes, usual, same, P, slots):
+    """:func:`_walks` of all ``states``, no budget, in parallel, every state's :func:`_usual_move` known: ``P`` walkers take every
+    ``P``-th state, each summing into its own hashes -- ``slots`` of them, the trie's nodes and two more --, then summed."""
+    S = states.shape[0]
+    h1 = np.zeros((P, slots), dtype = np.uint64)
+    h2 = np.zeros((P, slots), dtype = np.uint64)
+    no_count = np.zeros(1, dtype = np.int32)
+    no_ends = np.zeros(1, dtype = np.int32)
+    no_seen = np.zeros(1, dtype = np.bool_)
+    no_order = np.zeros(1, dtype = np.int64)
+    for c in prange(P):
+        stack_node = np.empty(slots, dtype = np.int32)
+        stack_q = np.empty(slots, dtype = np.int32)
+        d1 = np.zeros(slots, dtype = np.uint64)
+        d2 = np.zeros(slots, dtype = np.uint64)
+        for i in range(c, S, P):
+            s = states[i]
+            _walk_one(s, r1[s], r2[s], r3[s], r4[s], table, dead, byte_class, first_child, node_byte, below, class_bytes, usual, same, no_count, h1[c], h2[c], d1, d2,
+                      stack_node, stack_q, False, no_ends, no_seen, no_order, 0)
+        _add_ranges(h1[c], d1)
+        _add_ranges(h2[c], d2)
+    o1 = np.zeros(slots, dtype = np.uint64)
+    o2 = np.zeros(slots, dtype = np.uint64)
+    for c in range(P):
+        for t in range(slots):
+            o1[t] += h1[c, t]
+            o2[t] += h2[c, t]
+    return o1, o2
+
+
+@njit(cache = True)
+def _more_slots(h1, h2, rep, first, num, cap):
+    """The places of nodes ``rep[first:num]``, each with hashes of its own, in a table of ``cap`` slots."""
+    slots = np.full(cap, -1, dtype = np.int32)
+    for k in range(first, num):
+        n = rep[k]
+        at = np.int64((h1[n] ^ (h2[n] >> np.uint64(17))) & np.uint64(cap - 1))
+        while slots[at] >= 0:
+            at = (at + 1) & (cap - 1)
+        slots[at] = k
+    return slots
+
+
+@njit(cache = True)
+def _quotient(h1, h2, first_child, node_byte, byte_class):
+    """
+    The trie with the nodes of the same hashes as one (no state walked tells them apart; the root stays alone):
+    ``(gptr, gclass, gnode, into, zero)``: its edges, one per (node, class), as CSR, the edges into every node, and the
+    node of those no walk reached (-1: none: nothing goes on from it). What the walks have told apart a child of it keeps: the
+    nodes of a node's children on a class are one, as the same states lead to the same states.
+    """
+    M = first_child.shape[0] - 1
+    cap = 4096
+    slots = np.full(cap, -1, dtype = np.int32)
+    of = np.empty(M, dtype = np.int32)
+    rep = np.empty(cap // 2, dtype = np.int32)
+    of[0], rep[0] = 0, 0
+    G = 1
+    zero = -1
+    p1, p2, pg = np.uint64(0), np.uint64(0), -1
+    for u in range(1, M):
+        x1, x2 = h1[u], h2[u]
+        if x1 == p1 and x2 == p2 and pg >= 0:                   # (nodes side by side are mostly alike)
+            of[u] = pg
+            continue
+        at = np.int64((x1 ^ (x2 >> np.uint64(17))) & np.uint64(cap - 1))
+        while True:
+            g = slots[at]
+            if g < 0:
+                g = G
+                G += 1
+                slots[at] = g
+                rep[g] = u
+                if x1 == 0 and x2 == 0:
+                    zero = g
+                if 2 * G >= cap:
+                    cap *= 2
+                    slots = _more_slots(h1, h2, rep, 1, G, cap)
+                    more = np.empty(cap // 2, dtype = np.int32)
+                    more[:G] = rep[:G]
+                    rep = more
+                break
+            if h1[rep[g]] == x1 and h2[rep[g]] == x2:
+                break
+            at = (at + 1) & (cap - 1)
+        p1, p2, pg = x1, x2, g
+        of[u] = g
+    E = 0
+    for u in range(M):
+        if of[u] != zero:
+            E += first_child[u + 1] - first_child[u]
+    have = np.zeros((G, 4), dtype = np.uint64)                  # (every class is below 256: a byte's)
+    src = np.empty(E, dtype = np.int32)
+    gclass = np.empty(E, dtype = np.int32)
+    gnode = np.empty(E, dtype = np.int32)
+    num = 0
+    gptr = np.zeros(G + 1, dtype = np.int64)
+    for u in range(M):
+        g = of[u]
+        if g == zero:
+            continue
+        for w in range(first_child[u], first_child[u + 1]):
+            c = byte_class[node_byte[w]]
+            bit = np.uint64(1) << np.uint64(c & 63)
+            if have[g, c >> 6] & bit == 0:
+                have[g, c >> 6] |= bit
+                src[num], gclass[num], gnode[num] = g, c, of[w]
+                gptr[g + 1] += 1
+                num += 1
+    for g in range(G):
+        gptr[g + 1] += gptr[g]
+    fill = gptr[:G].copy()
+    out_class = np.empty(num, dtype = np.int32)
+    out_node = np.empty(num, dtype = np.int32)
+    into = np.zeros(G, dtype = np.int32)
+    for i in range(num):
+        g = src[i]
+        out_class[fill[g]], out_node[fill[g]] = gclass[i], gnode[i]
+        fill[g] += 1
+        into[gnode[i]] += 1
+    return gptr, out_class, out_node, into, zero
+
+
+@njit(cache = True)
+def _check_part(table, dead, states, first, step, gptr, gclass, gnode, into, zero, bad):
+    """``bad[i]``, every ``step``-th of ``states`` from ``first``, unless the state leads every trie node of a node of the
+    quotient (:func:`_quotient`) to one state, or nowhere: it then tells no two of them apart. A walk of the quotient from
+    the root gives every node it reaches a state: another edge into that node must say the same, and every edge into it
+    must be walked: from a node reached, on a class that does not die. Then by induction over a trie node's depth it leads
+    to its quotient node's state. Through a node no walk reached (``zero``) it fails: that says nowhere for the tokens."""
+    G = gptr.shape[0] - 1
+    value = np.empty(G, dtype = np.int32)
+    stamp = np.full(G, -1, dtype = np.int64)
+    queue = np.empty(G, dtype = np.int32)
+    for i in range(first, states.shape[0], step):
+        stamp[0] = i
+        value[0] = states[i]
+        queue[0] = 0
+        num, head = 1, 0
+        edges, needed = 0, 0
+        ok = True
+        while head < num and ok:
+            g = queue[head]
+            head += 1
+            q = value[g]
+            for e in range(gptr[g], gptr[g + 1]):
+                q2 = table[q, gclass[e]]
+                if q2 == dead:
+                    continue
+                w = gnode[e]
+                edges += 1
+                if stamp[w] != i:
+                    stamp[w] = i
+                    value[w] = q2
+                    queue[num] = w
+                    num += 1
+                    needed += into[w]
+                    if w == zero:
+                        ok = False
+                        break
+                elif value[w] != q2:
+                    ok = False
+                    break
+        bad[i] = not ok or edges != needed
+
+
+@njit(parallel = True, cache = True)
+def _check_parallel(table, dead, states, gptr, gclass, gnode, into, zero, bad, P):
+    """:func:`_check_part` of all ``states``: ``P`` parts."""
+    for c in prange(P):
+        _check_part(table, dead, states, c, P, gptr, gclass, gnode, into, zero, bad)
+
+
+def _not_told_apart(table: np.ndarray, dead: int, states: np.ndarray, quotient) -> np.ndarray:
+    """Those of ``states`` that tell apart two trie nodes of a node of the quotient (:func:`_check_part`)."""
+    bad = np.empty(states.size, dtype = bool)
+    threads = get_num_threads()
+    if states.size >= SERIAL_CHECKS and threads > 1:
+        _check_parallel(table, dead, states, *quotient, bad, min(threads, states.size))
+    else:
+        _check_part(table, dead, states, 0, 1, *quotient, bad)
+    return states[bad]
+
+
+def _walk_the_rest(table: np.ndarray, dead: int, rest: np.ndarray, byte_class: np.ndarray, trie: "_Trie", r: Sequence[np.ndarray], walking: tuple, h1: np.ndarray,
+                   h2: np.ndarray) -> None:
+    """
+    The token classes as if walks from ``rest`` were added to the hashes ``h1`` and ``h2``, with next to no walks: of two
+    hundred thousand states a few hundred tell apart all a walk from every one would (a state in a long string reads its
+    tokens like the next). The nodes the hashes so far tell apart are a far smaller graph (:func:`_quotient`). Every state
+    is checked on it (:func:`_check_part`), and walks only if it tells apart what the hashes do not; from then on the graph
+    is that much larger. The states that have passed tell nothing apart whatever the graph comes to be: what they cannot
+    tell apart stays together or is told apart by others.
+    """
+    first_child, node_byte = trie.first_child, trie.node_byte
+    M = first_child.size - 1
+    quotient = _quotient(h1, h2, first_child, node_byte, byte_class)
+    budget, at, batch = M, 0, FIRST_CHECKS
+    while at < rest.size:
+        left = rest[at:at + batch]
+        at += left.size
+        batch *= 2
+        while True:
+            left = _not_told_apart(table, dead, left, quotient)
+            if left.size == 0:
+                break
+            if budget < WALKS_IN_THREADS or get_num_threads() == 1:
+                walked = _walks(table, dead, left, byte_class, first_child, node_byte, r[0], r[1], r[2], r[3], trie.below, *walking, h1, h2, budget)
+                left = left[walked:]
+                budget *= 2
+            else:                                                       # (states that do tell much apart: all at once)
+                _usual_moves(table, walking[0], dead, *walking[1:])
+                a1, a2 = _walks_parallel(table, dead, left, byte_class, first_child, node_byte, r[0], r[1], r[2], r[3], trie.below, *walking[:3],
+                                         min(get_num_threads(), left.size), M + 2)
+                with np.errstate(over = "ignore"):
+                    h1 += a1
+                    h2 += a2
+                left = left[:0]
+            if left.size == 0 and at >= rest.size:
+                return
+            quotient = _quotient(h1, h2, first_child, node_byte, byte_class)
+            if left.size == 0:
+                break
+
+
+@njit(cache = True)
+def _token_classes(h1, h2, end_nodes, token_end):
+    """The tokens of the same hashes as one class, the classes numbered by their smallest token: ``(token_class, reps, hashed)``:
+    int64 [V], every class's smallest token, and whether it has a hash (a class without leads nowhere from any state). The hashes
+    are read at ``end_nodes``, in order, and such a node is mostly like the one before; ``token_end`` is every token's place among them."""
+    E = end_nodes.shape[0]
+    V = token_end.shape[0]
+    of_end = np.empty(E, dtype = np.int32)
+    cap = 1024
+    slots = np.full(cap, -1, dtype = np.int32)
+    rep_node = np.empty(cap // 2, dtype = np.int32)
+    num = 0
+    p1, p2, pc = np.uint64(0), np.uint64(0), -1
+    for i in range(E):
+        m = end_nodes[i]
+        x1, x2 = h1[m], h2[m]
+        if x1 == p1 and x2 == p2 and pc >= 0:
+            of_end[i] = pc
+            continue
+        at = np.int64((x1 ^ (x2 >> np.uint64(17))) & np.uint64(cap - 1))
+        while True:
+            c = slots[at]
+            if c < 0:
+                c = num
+                slots[at] = c
+                rep_node[c] = m
+                num += 1
+                if 2 * num >= cap:
+                    cap *= 2
+                    slots = _more_slots(h1, h2, rep_node, 0, num, cap)
+                    more = np.empty(cap // 2, dtype = np.int32)
+                    more[:num] = rep_node[:num]
+                    rep_node = more
+                break
+            if h1[rep_node[c]] == x1 and h2[rep_node[c]] == x2:
+                break
+            at = (at + 1) & (cap - 1)
+        p1, p2, pc = x1, x2, c
+        of_end[i] = c
+    rank = np.full(num, -1, dtype = np.int32)
+    reps = np.empty(num, dtype = np.int64)
+    token_class = np.empty(V, dtype = np.int64)
+    classes = 0
+    for t in range(V):
+        p = of_end[token_end[t]]
+        c = rank[p]
+        if c < 0:
+            c = classes
+            rank[p] = c
+            reps[c] = t
+            classes += 1
+        token_class[t] = c
+    hashed = np.empty(classes, dtype = np.bool_)
+    for p in range(num):
+        if rank[p] >= 0:
+            hashed[rank[p]] = h1[rep_node[p]] != 0 or h2[rep_node[p]] != 0
+    return token_class, reps[:classes], hashed
+
+
+def _byte_complete(trie: "_Trie") -> bool:
+    """Whether every byte is a token's whole text: then every state a byte text reaches is reached at a token
+    boundary, and states a byte text tells apart are told apart by tokens."""
+    first, last = trie.first_child[0], trie.first_child[1]
+    if last - first != 256:
+        return False
+    return bool((trie.end_ptr[first + 1:last + 1] > trie.end_ptr[first:last]).all())
+
+
+@njit(cache = True)
+def _rows(table, dead, states, reps, kinds, offsets, data, byte_class, remap, out, lo, hi):
+    """Rows ``lo`` to ``hi`` of ``out`` [len(states), len(reps)]: the successor of every state on every representative
+    token, by ``remap`` -- kind 0 its bytes (``data``), 1 empty text (the state itself), 2 nowhere (the dead state)."""
+    C = reps.shape[0]
+    gone = remap[dead]
+    for i in range(lo, hi):
+        s = states[i]
+        for c in range(C):
+            kind = kinds[c]
+            if kind == 2:
+                out[i, c] = gone
+            elif kind == 1:
+                out[i, c] = remap[s]
+            else:
+                t = reps[c]
+                q = s
+                for k in range(offsets[t], offsets[t + 1]):
+                    q = table[q, byte_class[data[k]]]
+                    if q == dead:
+                        break
+                out[i, c] = remap[q]
+
+
+@njit(parallel = True, cache = True)
+def _rows_parallel(table, dead, states, reps, kinds, offsets, data, byte_class, remap, out, P):
+    """:func:`_rows` in ``P`` parts."""
+    R = states.shape[0]
+    for c in prange(P):
+        _rows(table, dead, states, reps, kinds, offsets, data, byte_class, remap, out, c * R // P, (c + 1) * R // P)
+
+
+@njit(cache = True)
+def _rep_trie(first_child, node_byte, byte_class, parent, rep_node):
+    """The trie as far as the representative tokens go, ``rep_node`` the node of every class's (-1: none): ``(gptr, gclass,
+    gnode, class_at)``, its edges as CSR, on classes, and the class ending at every node (-1: none). The root is node 0, the others
+    numbered as they are found."""
+    M = first_child.shape[0] - 1
+    keep = np.zeros(M, dtype = np.bool_)
+    keep[0] = True
+    kept = np.empty(M, dtype = np.int32)
+    kept[0] = 0
+    G = 1
+    for c in range(rep_node.shape[0]):
+        m = rep_node[c]
+        if m >= 0:
+            while not keep[m]:
+                keep[m] = True
+                kept[G] = m
+                G += 1
+                m = parent[m]
+    number = np.empty(M, dtype = np.int32)
+    edges = 0
+    for g in range(G):
+        m = kept[g]
+        number[m] = g
+        for w in range(first_child[m], first_child[m + 1]):
+            edges += keep[w]
+    class_at = np.full(G, -1, dtype = np.int32)
+    for c in range(rep_node.shape[0]):
+        if rep_node[c] >= 0:
+            class_at[number[rep_node[c]]] = c
+    gptr = np.zeros(G + 1, dtype = np.int32)
+    gclass = np.empty(edges, dtype = np.int32)
+    gnode = np.empty(edges, dtype = np.int32)
+    edges = 0
+    for g in range(G):
+        m = kept[g]
+        for w in range(first_child[m], first_child[m + 1]):
+            if keep[w]:
+                gclass[edges], gnode[edges] = byte_class[node_byte[w]], number[w]
+                edges += 1
+        gptr[g + 1] = edges
+    return gptr, gclass, gnode, class_at
+
+
+@njit(cache = True)
+def _sparse_rows(table, dead, states, remap, gptr, gclass, gnode, class_at, itself, accepting, end_class, K, C, moves, row_at, row_len, lo, hi):
+    """
+    Rows ``lo`` to ``hi`` of the token automaton as moves but those to the dead state, classes ascending: ``moves[row_at[i]:
+    row_at[i] + row_len[i]]``, ``(class << 32) | state``, from place ``lo * C`` on, room for all. From every state a walk of
+    :func:`_rep_trie` through live states; classes of empty text lead to the state itself (``itself``), and with
+    ``end_class`` >= 0, of an accepting state to the state ``K + 1`` for now, the padding's.
+    """
+    G = gptr.shape[0] - 1
+    stack_node = np.empty(G + 1, dtype = np.int32)
+    stack_q = np.empty(G + 1, dtype = np.int32)
+    at = lo * C
+    for i in range(lo, hi):
+        row_at[i] = at
+        n = 0
+        stack_node[0] = 0
+        stack_q[0] = states[i]
+        top = 1
+        while top > 0:
+            top -= 1
+            u = stack_node[top]
+            q = stack_q[top]
+            for e in range(gptr[u], gptr[u + 1]):
+                q2 = table[q, gclass[e]]
+                if q2 == dead:
+                    continue
+                w = gnode[e]
+                c = class_at[w]
+                if c >= 0 and remap[q2] != K:
+                    moves[at + n] = (np.int64(c) << 32) | remap[q2]
+                    n += 1
+                if gptr[w + 1] > gptr[w]:
+                    stack_node[top] = w
+                    stack_q[top] = q2
+                    top += 1
+        for j in range(itself.shape[0]):
+            moves[at + n] = (itself[j] << 32) | i
+            n += 1
+        if end_class >= 0 and accepting[i]:
+            moves[at + n] = (end_class << 32) | (K + 1)
+            n += 1
+        if n > 32:
+            moves[at:at + n] = np.sort(moves[at:at + n])
+        else:
+            for a in range(at + 1, at + n):
+                x = moves[a]
+                b = a
+                while b > at and moves[b - 1] > x:
+                    moves[b] = moves[b - 1]
+                    b -= 1
+                moves[b] = x
+        row_len[i] = n
+        at += n
+
+
+@njit(parallel = True, cache = True)
+def _sparse_rows_parallel(table, dead, states, remap, gptr, gclass, gnode, class_at, itself, accepting, end_class, K, C, moves, row_at, row_len, R, P):
+    """:func:`_sparse_rows` of the first ``R`` rows in ``P`` parts."""
+    for p in prange(P):
+        _sparse_rows(table, dead, states, remap, gptr, gclass, gnode, class_at, itself, accepting, end_class, K, C, moves, row_at, row_len,
+                     p * R // P, (p + 1) * R // P)
+
+
+@njit(cache = True)
+def _reached(t, seen, order, num):
+    """``t`` in the order, if it is not yet: how many are."""
+    if seen[t]:
+        return num
+    seen[t] = True
+    order[num] = t
+    return num + 1
+
+
+@njit(cache = True)
+def _sparse_order(moves, row_at, row_len, first_at, first_moves, copies, K, T, C, pad):
+    """:func:`~.dfa.bfs_order` of the rows of :func:`_sparse_rows` from state 0, of ``T`` states: the states in that order, the dead state ``K`` where a row has
+    its first gap, the padding's state ``K + 1`` being ``pad``. Of a row only those of its moves are read that ``first_moves[first_at[state]]`` counts and lists, if
+    any: the first to each state. Past ``K + 1`` a state's row is its run's first copy's (:class:`~.counters.Copies`), of which but the first time only the moves
+    on through the chain. A mark a state: nearly all reads find one, and the marks' memory is an eighth of the places' the order does not need (:func:`_places`)."""
+    order = np.empty(T, dtype = np.int32)
+    seen = np.zeros(T, dtype = np.bool_)
+    read = np.zeros(copies.firsts_at.size, dtype = np.bool_)
+    order[0], seen[0] = 0, True
+    num, head = 1, 0
+    mask = (np.int64(1) << 32) - 1
+    r, u, end, copy_at = 0, np.int64(0), np.int64(0), np.int64(1) << 62
+    while head < num:
+        q = np.int64(order[head])
+        head += 1
+        if q > K + 1:
+            l = q - copy_at
+            if l < 0 or l >= u:                                 # (in another copy than the state before; mostly it is not, no division then)
+                if not copies.first[r] <= q < copies.first[r + 1]:
+                    r = np.searchsorted(copies.first, q, side = "right") - 1
+                u, end = copies.u[r], copies.first[r + 1]
+                l = (q - copies.first[r]) % u
+                copy_at = q - l
+            local = copies.row_of[r] + l
+            if read[local]:
+                for j in range(copies.later_at[local], copies.later_at[local + 1]):
+                    t = copy_at + copies.later[j]
+                    if t >= end:
+                        t = np.int64(copies.window[copies.window_at[r] + u + t - end])
+                    num = _reached(t, seen, order, num)
+                continue
+            read[local] = True
+            f, at = copies.firsts_at[local], copies.row_at[local]
+            for j in range(f + 1, f + 1 + first_moves[f]):
+                e = at + first_moves[j]
+                t = np.int64(copies.v[e])
+                if copies.g[e] >= 0:
+                    t += copy_at + copies.g[e] * u
+                    if t >= end:
+                        t = np.int64(copies.window[copies.window_at[r] + u + t - end])
+                num = _reached(pad if t == K + 1 else t, seen, order, num)
+            continue
+        at, n = row_at[q], row_len[q]
+        if not seen[K]:                                         # (the dead state's place: until it has one)
+            expected = 0
+            for k in range(at, at + n):
+                c = moves[k] >> 32
+                if c > expected:
+                    num = _reached(K, seen, order, num)
+                expected = c + 1
+                t = moves[k] & mask
+                num = _reached(pad if t == K + 1 else t, seen, order, num)
+            if expected < C:
+                num = _reached(K, seen, order, num)
+        elif first_at[q] >= 0:
+            f = first_at[q]
+            for j in range(f + 1, f + 1 + first_moves[f]):
+                t = moves[at + first_moves[j]] & mask
+                num = _reached(pad if t == K + 1 else t, seen, order, num)
+        else:
+            for k in range(at, at + n):
+                t = moves[k] & mask
+                num = _reached(pad if t == K + 1 else t, seen, order, num)
+    return order[:num]
+
+
+@njit(cache = True)
+def _sparse_order_repeats(moves, row_at, row_len, first_at, first_moves, copies, K, T, C, pad, periods, least):
+    """
+    :func:`_sparse_order`, the same order, of an automaton with copies not written out (:class:`~.counters.Copies`): a state of a chain is led to from some ten
+    states, so the order reads ten moves a state, though far into a chain it only repeats -- a level is the level ``p`` before, every state so many copies on.
+    Where that is seen it is not walked, but copied: ``periods`` the longest period ``p`` looked for (0: no look), ``least`` the fewest states worth copying.
+    Returns the order, and how many of its states were copied.
+
+    What makes a repeat certain, at the start of a level (the queue's states from ``b`` to ``c``), against the level ``p`` before (from ``a`` to ``a2``):
+
+    * every state between ``a`` and ``b`` was a copy's, its row read before (``odd``), and none of its moves led past its chain's end (``J`` at least 1 says
+      so: by how far they stand): so what it added to the queue was a function of its row and of which states of its chain, from its own copy on, the queue
+      had had;
+    * the level is the earlier one state for state, every state ``shift[r]`` further on in its chain ``r``, whole copies;
+    * from the earliest copy of the earlier level on, a state of a chain was in the queue then exactly if the state ``shift[r]`` further on is now.
+
+    Then the states from ``b`` on add what those from ``a`` on added, ``shift[r]`` further on, and after them the same holds again; so on, as long as no move
+    leads past a chain's end: ``J`` times, by the furthest any state between ``a`` and ``b`` stands and the furthest a row of its chain leads (``reach``).
+    """
+    order = np.empty(T, dtype = np.int32)
+    seen = np.zeros(T, dtype = np.uint8)                        # (1: in the queue; 2, during a check alone: since the earlier level)
+    read = np.zeros(copies.firsts_at.size, dtype = np.bool_)
+    order[0], seen[0] = 0, 1
+    num, head = 1, 0
+    mask = (np.int64(1) << 32) - 1
+    r, u, end, copy_at = 0, np.int64(0), np.int64(0), np.int64(1) << 62
+    first = copies.first
+    R = copies.u.size
+    reach = np.zeros(R, dtype = np.int64)
+    for i in range(R):
+        for j in range(copies.later_at[copies.row_of[i]], copies.later_at[copies.row_of[i] + copies.u[i]]):
+            if copies.later[j] > reach[i]:
+                reach[i] = copies.later[j]
+    ring = periods + 1
+    starts = np.zeros(ring, dtype = np.int64)                   # where the last levels start in the queue, the level ``e`` at ``e % ring``: a period's and one
+    alike = np.zeros(periods + 1, dtype = np.int64)             # how many levels on end have been as long as the level ``p`` before
+    shift, low, top = np.zeros(R, dtype = np.int64), np.zeros(R, dtype = np.int64), np.zeros(R, dtype = np.int64)
+    high, known = np.int64(0), 0                                # the highest state among the queue's first ``known``: past it, none has been in it
+    level, level_end = 0, 1
+    odd = 0                                                     # the last place in the queue whose state was written out, or a copy's of a row not read yet
+    next_try, wait = 0, 1
+    repeated = 0
+    while head < num:
+        if head == level_end and periods > 0:
+            level += 1
+            starts[level % ring] = head
+            level_end = num
+            size = num - head
+            tried, copied = False, False
+            for p in range(1, periods + 1):
+                e = level - p
+                if e >= 0 and starts[(e + 1) % ring] - starts[e % ring] == size:
+                    alike[p] += 1
+                else:
+                    alike[p] = 0
+            for p in range(1, periods + 1):
+                if alike[p] < p or level < next_try or copied:
+                    continue
+                a, a2, b, c = starts[(level - p) % ring], starts[(level - p + 1) % ring], head, num
+                if odd >= a:
+                    continue
+                tried = True
+                P = b - a
+                ok = True
+                for i in range(R):
+                    shift[i], low[i], top[i] = 0, np.int64(1) << 62, -1
+                rr = 0
+                for i in range(c - b):                          # the level, state for state the earlier one's, whole copies on
+                    x, y = np.int64(order[a + i]), np.int64(order[b + i])
+                    if not first[rr] <= x < first[rr + 1]:
+                        rr = np.searchsorted(first, x, side = "right") - 1
+                    d = y - x
+                    if shift[rr] != d:
+                        if shift[rr] != 0 or d <= 0 or d % copies.u[rr] != 0:
+                            ok = False
+                            break
+                        shift[rr] = d
+                    if y >= first[rr + 1]:
+                        ok = False
+                        break
+                    if x < low[rr]:
+                        low[rr] = x
+                if not ok:
+                    continue
+                for i in range(a, b):                           # how far the states that are to repeat stand
+                    x = np.int64(order[i])
+                    if not first[rr] <= x < first[rr + 1]:
+                        rr = np.searchsorted(first, x, side = "right") - 1
+                    if shift[rr] == 0:
+                        ok = False
+                        break
+                    if x > top[rr]:
+                        top[rr] = x
+                if not ok:
+                    continue
+                J = np.int64(1) << 62
+                for i in range(R):
+                    if shift[i] > 0:
+                        J = min(J, (first[i + 1] - 1 - reach[i] - top[i]) // shift[i])
+                J = min(J, (T - c) // P)
+                if J < 1 or J * P < least:
+                    continue
+                for i in range(known, c):
+                    if order[i] > high:
+                        high = order[i]
+                known = c
+                for i in range(a2, c):                          # in the queue then exactly if so far on now
+                    seen[order[i]] = 2
+                wrong = 0
+                for i in range(R):
+                    if shift[i] > 0:
+                        d = shift[i]
+                        lo = low[i] - (low[i] - first[i]) % copies.u[i]
+                        for x in range(lo, min(first[i + 1] - d, high + 1)):
+                            wrong += (seen[x] == 1) != (seen[x + d] != 0)
+                for i in range(a2, c):
+                    seen[order[i]] = 1
+                if wrong:
+                    continue
+                on = np.empty(P, dtype = np.int32)              # copied: the states from ``a2`` to ``c``, ``J`` times, each its chain's shift on
+                for i in range(P):
+                    x = np.int64(order[a2 + i])
+                    if not first[rr] <= x < first[rr + 1]:
+                        rr = np.searchsorted(first, x, side = "right") - 1
+                    on[i] = shift[rr]
+                at = c
+                for j in range(J):
+                    for i in range(P):
+                        x = order[at - P + i] + on[i]
+                        order[at + i] = x
+                        seen[x] = 1
+                    at += P
+                head, num = b + J * P, at
+                repeated += J * P
+                level, level_end = 0, num
+                starts[0] = head
+                alike[:] = 0
+                copied = True
+            if copied:
+                next_try, wait = 0, 1
+            elif tried:
+                wait = min(2 * wait, 1 << 20)
+                next_try = level + wait
+        here = head
+        q = np.int64(order[head])
+        head += 1
+        if q > K + 1:
+            l = q - copy_at
+            if l < 0 or l >= u:
+                if not first[r] <= q < first[r + 1]:
+                    r = np.searchsorted(first, q, side = "right") - 1
+                u, end = copies.u[r], first[r + 1]
+                l = (q - first[r]) % u
+                copy_at = q - l
+            local = copies.row_of[r] + l
+            if read[local]:
+                for j in range(copies.later_at[local], copies.later_at[local + 1]):
+                    t = copy_at + copies.later[j]
+                    if t >= end:
+                        t = np.int64(copies.window[copies.window_at[r] + u + t - end])
+                    num = _reached(t, seen, order, num)
+                continue
+            odd = here
+            read[local] = True
+            f, at = copies.firsts_at[local], copies.row_at[local]
+            for j in range(f + 1, f + 1 + first_moves[f]):
+                e = at + first_moves[j]
+                t = np.int64(copies.v[e])
+                if copies.g[e] >= 0:
+                    t += copy_at + copies.g[e] * u
+                    if t >= end:
+                        t = np.int64(copies.window[copies.window_at[r] + u + t - end])
+                num = _reached(pad if t == K + 1 else t, seen, order, num)
+            continue
+        odd = here
+        at, n = row_at[q], row_len[q]
+        if seen[K] == 0:                                        # (the dead state's place: until it has one)
+            expected = 0
+            for k in range(at, at + n):
+                c = moves[k] >> 32
+                if c > expected and seen[K] == 0:
+                    seen[K] = 1
+                    order[num] = K
+                    num += 1
+                expected = c + 1
+                t = moves[k] & mask
+                num = _reached(pad if t == K + 1 else t, seen, order, num)
+            if expected < C and seen[K] == 0:
+                seen[K] = 1
+                order[num] = K
+                num += 1
+        elif first_at[q] >= 0:
+            f = first_at[q]
+            for j in range(f + 1, f + 1 + first_moves[f]):
+                t = moves[at + first_moves[j]] & mask
+                num = _reached(pad if t == K + 1 else t, seen, order, num)
+        else:
+            for k in range(at, at + n):
+                t = moves[k] & mask
+                num = _reached(pad if t == K + 1 else t, seen, order, num)
+    return order[:num], repeated
+
+
+@njit(cache = True)
+def _places(order, T):
+    """Every state's place in ``order``, -1 for the rest of the ``T``."""
+    place = np.full(T, -1, dtype = np.int64)
+    for i in range(order.size):
+        place[order[i]] = i
+    return place
+
+
+@njit(cache = True)
+def _in_order(accept, order):
+    """``accept[order]``, without an index array of 8 bytes an entry on the way."""
+    out = np.empty(order.size, dtype = np.bool_)
+    for i in range(order.size):
+        out[i] = accept[order[i]]
+    return out
+
+
+@njit(cache = True)
+def copy_target(copies, r, k, e):
+    """Where the move ``e`` of a row of the copy ``k`` (from 1) of the run ``r`` leads (:class:`~.counters.Copies`). (In this file: numba's cache of a caller does
+    not see a function of another file change.)"""
+    g = copies.g[e]
+    if g < 0:
+        return np.int64(copies.v[e])
+    q = k + g
+    if q <= copies.extra[r]:
+        return copies.first[r] + (q - 1) * copies.u[r] + copies.v[e]
+    return np.int64(copies.window[copies.window_at[r] + (q - copies.extra[r]) * copies.u[r] + copies.v[e]])
+
+
+@njit(cache = True)
+def _sparse_table(moves, row_at, row_len, copies, order, place, K, pad, out, lo, hi):
+    """Rows ``lo`` to ``hi`` of the table of the states ``order``, numbered by their ``place``."""
+    C = out.shape[1]
+    gone = place[K]
+    mask = (np.int64(1) << 32) - 1
+    r = 0
+    for i in range(lo, hi):
+        q = np.int64(order[i])
+        for c in range(C):
+            out[i, c] = gone
+        if q > K + 1:
+            if not copies.first[r] <= q < copies.first[r + 1]:
+                r = np.searchsorted(copies.first, q, side = "right") - 1
+            u = copies.u[r]
+            k = (q - copies.first[r]) // u
+            local = copies.row_of[r] + q - copies.first[r] - k * u
+            for e in range(copies.row_at[local], copies.row_at[local + 1]):
+                t = copy_target(copies, r, k + 1, e)
+                out[i, copies.cls[e]] = place[pad if t == K + 1 else t]
+            continue
+        for e in range(row_at[q], row_at[q] + row_len[q]):
+            t = moves[e] & mask
+            out[i, moves[e] >> 32] = place[pad if t == K + 1 else t]
+
+
+@njit(parallel = True, cache = True)
+def _sparse_table_parallel(moves, row_at, row_len, copies, order, place, K, pad, out, P):
+    """:func:`_sparse_table` in ``P`` parts."""
+    R = order.shape[0]
+    for p in prange(P):
+        _sparse_table(moves, row_at, row_len, copies, order, place, K, pad, out, p * R // P, (p + 1) * R // P)
+
+
+@njit(cache = True)
+def _written_moves(moves, row_at, row_len, K):
+    """The moves of the first ``K`` states: from which state, of which class, to which, in three arrays."""
+    total = 0
+    for q in range(K):
+        total += row_len[q]
+    states = np.empty(total, dtype = np.int64)
+    cls = np.empty(total, dtype = np.int64)
+    targets = np.empty(total, dtype = np.int64)
+    mask = (np.int64(1) << 32) - 1
+    at = 0
+    for q in range(K):
+        for e in range(row_at[q], row_at[q] + row_len[q]):
+            states[at], cls[at], targets[at] = q, moves[e] >> 32, moves[e] & mask
+            at += 1
+    return states, cls, targets
+
+
+@njit(cache = True)
+def _first_moves_of_run(copies, first_moves, r):
+    """Of the rows of the run ``r`` the first moves (:func:`~.counters._first_moves`), the first of each to every state: in which of the rows, and their ``g`` and ``v``."""
+    lo, u = copies.row_of[r], copies.u[r]
+    total = 0
+    for local in range(lo, lo + u):
+        total += first_moves[copies.firsts_at[local]]
+    rows = np.empty(total, dtype = np.int64)
+    g = np.empty(total, dtype = np.int64)
+    v = np.empty(total, dtype = np.int64)
+    at = 0
+    for local in range(lo, lo + u):
+        f, start = copies.firsts_at[local], copies.row_at[local]
+        for j in range(f + 1, f + 1 + first_moves[f]):
+            e = start + first_moves[j]
+            rows[at], g[at], v[at] = local - lo, copies.g[e], copies.v[e]
+            at += 1
+    return rows, g, v
+
+
+class TableToCome:
+    """The dense table of a token automaton, as :func:`_table_of_rows` leaves it, not made until it is wanted: most of a large automaton's cost and memory. :meth:`dense`
+    writes it once on the host. :meth:`on_device` makes it where it is wanted, in int32, what the kernels read, none of it on the host: a tenth of the time, the moves being
+    few and the rest a scatter, and not at the mercy of how fast the kernel supplies the host's memory. :meth:`pairs_on` is what a layout needs of it, without it."""
+
+    def __init__(self, moves, row_at, row_len, copies, order, first_moves, K, pad, T, C):
+        self.parts = (moves, row_at, row_len, copies, order, first_moves, K, pad, T)
+        self.rows, self.classes = order.size, C
+        self.made, self.written_on = None, None
+
+    @few_threads
+    def dense(self) -> torch.Tensor:
+        if self.made is None:
+            moves, row_at, row_len, copies, order, _, K, pad, T = self.parts
+            place = _places(order, T)
+            out = np.empty((self.rows, self.classes), dtype = np.int64)
+            threads = get_num_threads()
+            if out.size >= THREADS_ENTRIES and threads > 1:
+                _sparse_table_parallel(moves, row_at, row_len, copies, order, place, K, pad, out, min(threads, self.rows))
+            else:
+                _sparse_table(moves, row_at, row_len, copies, order, place, K, pad, out, 0, self.rows)
+            self.made = torch.from_numpy(out)
+        return self.made
+
+    def _places_on(self, device) -> torch.Tensor:
+        """Every state's place, the padding's state's being the padding's, -1 for a state of none."""
+        order, K, pad, T = self.parts[4], self.parts[6], self.parts[7], self.parts[8]
+        places = torch.full((T,), -1, dtype = torch.int64, device = device)
+        places[torch.from_numpy(order).to(device).long()] = torch.arange(self.rows, device = device)
+        places[K + 1] = places[pad]
+        return places
+
+    def _moves_of_copies(self, device, r, local, g, v):
+        """So many at a time: the moves ``g``, ``v``, of the rows ``local``, of every copy of the run ``r``: from which state and to which (as :func:`copy_target`).
+        Only from the last copies a move on through the chain reaches the window's."""
+        copies = self.parts[3]
+        u, extra, first = int(copies.u[r]), int(copies.extra[r]), int(copies.first[r])
+        step = max(1, TABLE_ON_DEVICE_MOVES // max(g.numel(), 1))
+        plain = extra - max(int(g.max()), 0) if g.numel() else extra
+        fixed, on = g < 0, (g - 1) * u + v
+        for k0 in range(1, plain + 1, step):
+            k = torch.arange(k0, min(k0 + step, plain + 1), device = device)[:, None]
+            yield first + (k - 1) * u + local, torch.where(fixed, v, first + k * u + on)
+        past = torch.from_numpy(copies.window[copies.window_at[r]:]).to(device).long()
+        for k0 in range(max(plain, 0) + 1, extra + 1, step):
+            k = torch.arange(k0, min(k0 + step, extra + 1), device = device)[:, None]
+            q = k + g
+            ahead = torch.where(q <= extra, first + k * u + on, past[((q - extra).clamp(min = 0) * u + v).clamp(max = past.numel() - 1)])
+            yield first + (k - 1) * u + local, torch.where(fixed, v, ahead)
+
+    def _written_on(self, device) -> tuple:
+        """The moves of the states written out on ``device`` (:func:`_written_moves`), for :meth:`on_device` and :meth:`pairs_on`, which a layout calls after it."""
+        moves, row_at, row_len, K = self.parts[0], self.parts[1], self.parts[2], self.parts[6]
+        return tuple(torch.from_numpy(x).to(device) for x in _written_moves(moves, row_at, row_len, K + 2))
+
+    def on_device(self, device) -> torch.Tensor:
+        """The table on ``device``, in int32. (It has a row past the last, which a state of no place, -1, writes.)"""
+        copies, K = self.parts[3], self.parts[6]
+        places = self._places_on(device)
+        values = places.to(torch.int32)
+        out = torch.full((self.rows + 1, self.classes), int(places[K]), dtype = torch.int32, device = device)
+        self.written_on = self._written_on(device)
+        states, classes, targets = self.written_on
+        out[places[states], classes] = values[targets]
+        for r in range(copies.u.size):
+            at, u = int(copies.row_of[r]), int(copies.u[r])
+            lo, hi = int(copies.row_at[at]), int(copies.row_at[at + u])
+            local = torch.from_numpy(np.repeat(np.arange(u, dtype = np.int64), np.diff(copies.row_at[at:at + u + 1]))).to(device)
+            cls, g, v = (torch.from_numpy(x[lo:hi]).to(device).long() for x in (copies.cls, copies.g, copies.v))
+            for states, targets in self._moves_of_copies(device, r, local, g, v):
+                out[places[states], cls.expand_as(states)] = values[targets]
+        return out[:self.rows]
+
+    def pairs_on(self, device) -> tuple:
+        """``(state, succ)``, int64: the pairs of states a token joins, but those into the dead state, on ``device``, without the table. A pair may come twice, from
+        a copy where a move on through the chain and one out of it meet; nearly all of the table's moves do not come, a state's classes leading to some ten states."""
+        copies, first_moves = self.parts[3], self.parts[5]
+        places = self._places_on(device)
+        written, self.written_on = self.written_on, None
+        states, _, targets = written if written is not None and written[0].device == torch.device(device) else self._written_on(device)
+        keys = torch.unique(places[states] * self.rows + places[targets])
+        state, succ = [torch.div(keys, self.rows, rounding_mode = "floor")], [torch.remainder(keys, self.rows)]
+        for r in range(copies.u.size):
+            local, g, v = (torch.from_numpy(x).to(device) for x in _first_moves_of_run(copies, first_moves, r))
+            for states, targets in self._moves_of_copies(device, r, local, g, v):
+                state.append(places[states].ravel())
+                succ.append(places[targets].ravel())
+        state, succ = torch.cat(state), torch.cat(succ)
+        keep = state >= 0                                       # (a state of no place; no move is to the dead state, which is what the moves leave out)
+        return state[keep], succ[keep]
+
+
+_NO_FIRST_MOVES = np.zeros(1, dtype = np.int32)
+#: (:func:`_sparse_order_repeats`) the longest period, in levels, at which the breadth-first order of chains of copies is looked at for a repeat, and the fewest
+#: states a repeat is to copy to be worth its checks
+ORDER_PERIODS = 32
+ORDER_REPEAT_LEAST = 1 << 10
+
+
+def _rows_by_walks(automaton: ByteAutomaton, states: np.ndarray, remap: np.ndarray, trie: "_Trie", reps: np.ndarray, kinds: np.ndarray, accept: np.ndarray,
+                   end_class: int, K_kept: int) -> tuple:
+    """The moves of the first ``states.size`` states of a token automaton minimal already, by a walk of the representatives' trie from every state."""
+    K, C = states.size, reps.size
+    rep_node = np.where(kinds == 0, trie.end_nodes[trie.token_end[np.minimum(reps, trie.token_end.size - 1)]], -1).astype(np.int64)
+    gptr, gclass, gnode, class_at = _rep_trie(trie.first_child, trie.node_byte, automaton.byte_class, trie.parent, rep_node)
+    itself = np.nonzero(kinds == 1)[0].astype(np.int64)
+    moves = room_for(K * C + 1)                                 # (room for all, where a part starts; only what is written is touched)
+    row_at, row_len = np.zeros(K_kept + 2, dtype = np.int64), np.zeros(K_kept + 2, dtype = np.int64)
+    args = (automaton._kept_table, automaton.dead, states, remap, gptr, gclass, gnode, class_at, itself, accept, end_class, K_kept, C, moves, row_at, row_len)
+    threads = get_num_threads()
+    if K * C >= THREADS_ENTRIES and threads > 1:
+        _sparse_rows_parallel(*args, K, min(threads, K))
+    else:
+        _sparse_rows(*args, 0, K)
+    return moves, row_at, row_len
+
+
+def _table_of_rows(automaton: ByteAutomaton, remap: np.ndarray, K: int, K_kept: int, K_full: int, C: int, moves: np.ndarray, row_at: np.ndarray, row_len: np.ndarray,
+                   accept: np.ndarray, end_class: int) -> tuple:
+    """
+    The table in canonical numbering of a token automaton minimal already, and its accepting states: what
+    ``DFA._of_classes(...)._renumbered()`` makes of the dense table of every state's every class, without it: nearly all of
+    that table is the dead state. From the moves of the first ``K`` states (those the short automaton does not have, of its
+    :attr:`~.byte_level.ByteAutomaton.counted`, are put back here: ``K_kept`` of them written out, ``K_full`` in all), the breadth-first
+    order over them, then the table once, as it will stand -- if it is small: a large one is left to be written when first read
+    (:class:`TableToCome`).
+    """
+    threads = get_num_threads()
+    first_at, first_moves, copies = None, _NO_FIRST_MOVES, NO_COPIES
+    if automaton.counted:
+        moves, first_at, first_moves, copies = expanded_moves(automaton.counted, remap, K, K_kept, K_full, moves, row_at, row_len, accept, threads)
+    pad = K_kept + 1
+    if end_class >= 0:                                          # a state accepting the empty text alone is the padding's (a copy of one: not before it)
+        alone = np.nonzero(accept[:K_kept] & (row_len[:K_kept] == 1))[0]
+        if alone.size:
+            pad = int(alone[0])
+        moves[-1] = (end_class << 32) | (K_kept + 1)
+        row_at[K_kept + 1], row_len[K_kept + 1] = moves.size - 1, 1
+        accept[pad] = True
+    if first_at is None:
+        first_at = np.full(K_kept + 2, -1, dtype = np.int32)
+    if copies.u.size:                                           # (chains of copies: where the order repeats, it is copied)
+        order, _ = _sparse_order_repeats(moves, row_at, row_len, first_at, first_moves, copies, K_kept, K_full + 2, C, pad, ORDER_PERIODS, ORDER_REPEAT_LEAST)
+    else:
+        order = _sparse_order(moves, row_at, row_len, first_at, first_moves, copies, K_kept, K_full + 2, C, pad)
+    table = TableToCome(moves, row_at, row_len, copies, order, first_moves, K_kept, pad, K_full + 2, C)
+    return table if order.size * C >= TABLE_TO_COME else table.dense(), _in_order(accept, order)
+
+
+#: an automaton of at most so many entries has its tokens' classes and rows from the behaviours of the trie's nodes, reading at most so many
+#: moves for them (:mod:`.behaviours`; they read a few times its entries: past that, the walks and their checks, in threads, cost less)
+BEHAVIOUR_ENTRIES = 1 << 18
+BEHAVIOUR_WORK = 1 << 21
+#: so many steps of walks of the trie come first; a table of so many entries stays on one thread
+SERIAL_STEPS = 1 << 18
+NO_BUDGET = 1 << 62
+#: the table of a token automaton of at least so many entries, minimal already, is made from its moves (:func:`_table_of_rows`,
+#: the dense table of its rows costing no more below it), in threads from :data:`THREADS_ENTRIES` on
+SPARSE_ENTRIES = 1 << 13
+#: a token automaton's table of at least so many entries is made when wanted, where it is wanted (a layout on a device makes it there, from 2^19 entries: see
+#: :data:`~...inference.dfa_exact.compiled.layout.LAYOUT_HOST_ENTRIES`; and these are numpy's 4 MB, from which it asks for huge pages: see :func:`~.counters.room_for`)
+TABLE_TO_COME = 1 << 19
+#: so many moves a time, making such a table on a device
+TABLE_ON_DEVICE_MOVES = 1 << 24
+THREADS_ENTRIES = 1 << 18
+#: states checked on the quotient of the trie (:func:`_walk_the_rest`): at first so many, then twice as many a time,
+#: on one thread below :data:`SERIAL_CHECKS`; states failing are walked, so many edges in threads at the most at a time
+FIRST_CHECKS = 1 << 12
+SERIAL_CHECKS = 1 << 8
+WALKS_IN_THREADS = 1 << 24
+
+
+def _random_words(S: int) -> list:
+    """Four arrays of ``S`` random words for the hashes, the first and third odd, each array from a generator of its own: the same words whatever was asked
+    for before. Kept, to :data:`_KEPT_WORDS` states (a generator takes time: 0.8 ms for an automaton of 25 thousand states, each time), at least twice as many
+    each time more are made."""
+    global _WORDS
+    if S > _WORDS.shape[1]:
+        size = S if S > _KEPT_WORDS else min(max(S, 2 * _WORDS.shape[1], 1 << 12), _KEPT_WORDS)
+        words = np.stack([np.random.default_rng(k).integers(1, 2 ** 63, size = size, dtype = np.uint64) for k in range(4)])
+        words[0] |= np.uint64(1)
+        words[2] |= np.uint64(1)
+        if S > _KEPT_WORDS:
+            return list(words)
+        _WORDS = words
+    return list(_WORDS[:, :S])
+
+
+_KEPT_WORDS = 1 << 18
+_WORDS = np.empty((4, 0), dtype = np.uint64)
+
+
+def _how_many(automaton: ByteAutomaton, K: int) -> tuple:
+    """Of the states of a token automaton of the ``K`` of a byte automaton: how many have their moves written out, and how many there are."""
+    if not automaton.counted:
+        return K, K
+    inner, outer = states_put_back(automaton.counted)
+    return K + inner, K + inner + outer
+
+
+@few_threads
+def to_tokens(automaton: ByteAutomaton, vocabulary: Vocabulary, eos_padding: bool) -> DFA:
+    """
+    The minimal :class:`~pyjuice.constraints.DFA` over ``vocabulary``'s ids of the token sequences whose text the
+    byte automaton accepts (see the module docstring) -- with ``eos_padding``, followed by any number of
+    end-of-sequence ids and nothing else.
+    """
+    V, S = vocabulary.size, automaton.num_states
+    trie = _trie(vocabulary)
+    table, byte_class = automaton._kept_table, automaton.byte_class
+    dead_byte, start = automaton.dead, automaton.initial
+    complete = automaton.minimal and start != dead_byte and _byte_complete(trie)
+    if automaton.counted and not complete:
+        raise NotCounted
+    eos = np.asarray(vocabulary.eos, dtype = np.int64)
+    padded = eos_padding and eos.size > 0
+    token_end = trie.token_ends(V, vocabulary.eos if eos_padding else ())
+    if complete and S * table.shape[1] <= BEHAVIOUR_ENTRIES:
+        T, behaviour_of, at, source, target = behaviours_of(table, dead_byte, byte_class, trie.parent, trie.node_byte, BEHAVIOUR_WORK)
+        if T >= 0:
+            token_class, reps, behaviour = classes_of_behaviours(behaviour_of, T, trie.end_nodes, token_end)
+            states = np.arange(S, dtype = np.int64)
+            states[start], states[0] = 0, start
+            states = states[states != dead_byte]
+            K, C = states.size, reps.size
+            K_kept, K_full = _how_many(automaton, K)
+            remap = np.full(S, K_kept, dtype = np.int64)
+            remap[states] = np.arange(K)
+            accept = np.zeros(K_full + 2, dtype = bool)
+            accept[:K] = automaton.accept[states]
+            end_class = int(token_class[eos[0]]) if padded else -1
+            rows = rows_of_behaviours(behaviour, T, at, source, target, remap, accept, end_class, K, K_kept)
+            table, kept = _table_of_rows(automaton, remap, K, K_kept, K_full, C, *rows, accept, end_class)
+            return DFA._of_classes(V, torch.from_numpy(token_class), table, 0, torch.from_numpy(kept))
+    r = _random_words(S)
+    M = trie.first_child.size - 1
+    walking = (_bytes_of_classes(byte_class, table.shape[1]), np.full(S, -1, dtype = np.int32), np.zeros((S, 4), dtype = np.uint64), np.zeros(S, dtype = np.int32))
+    h1, h2, states, walked = _walk(table, dead_byte, start, byte_class, trie.first_child, trie.node_byte, trie.ends_before, r[0], r[1], r[2], r[3], trie.below, *walking,
+                                   SERIAL_STEPS if complete else NO_BUDGET)
+    if walked < states.size:        # the states reached at token boundaries: every one a byte text reaches
+        left = np.ones(S, dtype = bool)
+        left[states[:walked]] = False
+        states = bfs_order(table, start)
+        states = states[states != dead_byte]
+        _walk_the_rest(table, dead_byte, states[left[states]], byte_class, trie, r, walking, h1, h2)
+    offsets, has_text = vocabulary._offsets, vocabulary._has_text
+    if trie.empty.size:                                                 # empty text: every state to itself
+        with np.errstate(over = "ignore"):
+            x = (states + 1).astype(np.uint64)
+            h1[M] = np.sum(r[0][states] * x + r[1][states], dtype = np.uint64)
+            h2[M] = np.sum(r[2][states] * x + r[3][states], dtype = np.uint64)
+    if padded:                                                          # a class of their own
+        h1[M + 1] = h2[M + 1] = np.uint64(2 ** 64 - 1)
+    token_class, reps, hashed = _token_classes(h1, h2, trie.end_nodes, token_end)
+    kinds = np.where(hashed & has_text[reps], np.where(offsets[reps + 1] == offsets[reps], 1, 0), 2).astype(np.int64)
+    K, C = states.size, reps.size
+    K_kept, K_full = _how_many(automaton, K)
+    remap = np.full(S, K_kept, dtype = np.int64)                        # unreached (the byte dead state among them)
+    remap[states] = np.arange(K)
+    if complete and (automaton.counted or K * C >= SPARSE_ENTRIES):
+        accept = np.zeros(K_full + 2, dtype = bool)
+        accept[:K] = automaton.accept[states]
+        end_class = int(token_class[eos[0]]) if padded else -1
+        rows = _rows_by_walks(automaton, states, remap, trie, reps, kinds, accept, end_class, K_kept)
+        table, kept = _table_of_rows(automaton, remap, K, K_kept, K_full, C, *rows, accept, end_class)
+        return DFA._of_classes(V, torch.from_numpy(token_class), table, 0, torch.from_numpy(kept))
+    dead, pad = K, K + 1
+    out = np.empty((K + 2, C), dtype = np.int64)
+    out[K:] = dead
+    if K * C >= SERIAL_STEPS and get_num_threads() > 1:
+        _rows_parallel(table, dead_byte, states, reps, kinds, offsets, trie.data, byte_class, remap, out, get_num_threads())
+    else:
+        _rows(table, dead_byte, states, reps, kinds, offsets, trie.data, byte_class, remap, out, 0, K)
+    accept = np.zeros(K + 2, dtype = bool)
+    accept[:K] = automaton.accept[states]
+    if eos_padding and eos.size:
+        ce = int(token_class[eos[0]])                                   # (no text: nowhere, so far)
+        accepting = np.nonzero(accept)[0]
+        if complete:                # a state accepting the empty text alone is the padding's (else it is a new one)
+            alone = accepting[(out[accepting] == dead).all(axis = 1)]
+            pad = int(alone[0]) if alone.size else pad
+        out[accepting, ce] = pad
+        out[pad, ce] = pad
+        accept[pad] = True
+    tc, table, kept = torch.from_numpy(token_class), torch.from_numpy(out), torch.from_numpy(accept)
+    # minimal byte automaton, every byte a token: the states are told apart by tokens as by bytes -- minimal already, and
+    # so the tokens of every class (numbered by their smallest) are told apart
+    return DFA._of_classes(V, tc, table, 0, kept)._renumbered() if complete else DFA(V, tc, table, 0, kept).minimize()
+
+
+def widened(dfa: DFA, vocab_size: int) -> DFA:
+    """``dfa`` over the larger vocabulary ``0..vocab_size-1``, the new ids leading to a dead state from every state
+    (one is added if the automaton has none)."""
+    if vocab_size == dfa.vocab_size:
+        return dfa
+    delta, accept, tc = dfa.delta, dfa.accept, dfa.token_class
+    live = dfa.live_states()
+    if bool(live.all()):
+        sink = delta.size(0)
+        delta = torch.cat([delta, torch.full((1, delta.size(1)), sink, dtype = delta.dtype)], 0)
+        accept = torch.cat([accept, torch.zeros(1, dtype = torch.bool)])
+    else:
+        sink = int(torch.nonzero(~live)[0])
+    delta = torch.cat([delta, torch.full((delta.size(0), 1), sink, dtype = delta.dtype)], 1)
+    tc = torch.cat([tc, torch.full((vocab_size - dfa.vocab_size,), delta.size(1) - 1, dtype = tc.dtype)])
+    return DFA(vocab_size, tc, delta, dfa.initial, accept)

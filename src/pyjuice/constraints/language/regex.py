@@ -12,51 +12,41 @@ lookarounds, backreferences, possessive repetition, atomic groups, ``(?m)``, ``(
 a matching text is in the language, tokens that split a character included.
 
 The PC's n positions hold the text followed by end-of-sequence ids (``eos_padding``, the default: a text may end before
-the last position, and then only end-of-sequence ids follow), or the text alone. The automaton -- interegular's
-automaton over characters, its UTF-8 byte automaton, then the token automaton (:mod:`.backend.byte_level`) -- is built
-on first use. Needs the ``interegular`` package (``pip install pyjuice[constraints]``).
+the last position, and then only end-of-sequence ids follow), or the text alone. The automaton -- the byte automaton of
+Python's own parse of the pattern (:mod:`.backend.patterns`), then the token automaton (:mod:`.backend.byte_level`) -- is
+built on first use.
 """
 
 from __future__ import annotations
 
 import re
+import weakref
 from typing import Optional
 
 import torch
 
 from .base import Constraint, Matcher, Tokens
-from .backend.byte_level import ByteAutomaton, code_point_ranges, complement_ranges, to_tokens, widened
+from .backend.byte_level import ByteAutomaton
+from .backend.token_lift import to_tokens, widened
+from .backend.patterns import byte_automaton, parse
 from .dfa import DFA
 from .vocabulary import Vocabulary
 
 
-def _interegular():
-    """The ``interegular`` module and the errors its parser and automaton construction raise."""
-    try:
-        import interegular
-        from interegular.patterns import InvalidSyntax, Unsupported
-    except ImportError as e:
-        raise ImportError("`jc.Regex` needs the `interegular` package: pip install pyjuice[constraints] "
-                          "(or pip install interegular).") from e
-    return interegular, (Unsupported, InvalidSyntax)
-
-
-def _unsupported(pattern: str) -> Optional[str]:
+def _unsupported(pattern: str, tree = None) -> Optional[str]:
     """
-    Why ``pattern`` is outside what Regex reads exactly, or None. Python's own parse of the pattern (the semantics
-    promised) may hold only literals, ``.``, character classes of characters, ranges and categories, alternatives,
-    groups and greedy or lazy repetition -- what interegular's automata read as ``re`` does; refused are anchors and
-    ``\\b``, lookarounds (interegular gets some wrong: ``(?=a)[abc]*`` accepting "aA"), backreferences, possessive
-    repetition and atomic groups (``a++a`` accepting "aa"), ``(?m)`` and ``(?x)``, a flag turned off (``(?-i:a)`` in
-    a ``(?i:...)`` matching "A"), ``(?i)`` with a character outside ASCII (interegular folds those by Unicode, and "ß"
-    upper-cases to two characters), and a ``]`` first in a character class (which interegular reads otherwise).
+    Why ``pattern`` is outside what Regex reads exactly, or None. Python's own parse of the pattern (``tree``, if it is
+    at hand) may hold only literals, ``.``, character classes of characters, ranges and categories, alternatives, groups
+    and greedy or lazy repetition, what a regular language is; refused are anchors and ``\\b``, lookarounds,
+    backreferences, possessive repetition and atomic groups, ``(?m)`` and ``(?x)``, a flag turned off, ``(?u:...)``
+    (Unicode categories and folding, not this module's), ``(?i)`` with a character outside ASCII (what ``re`` folds under
+    ``re.ASCII`` depends on it), and a ``]`` first in a character class.
     """
     try:
-        from re import _constants as C, _parser as sre_parse           # Python >= 3.11
+        from re import _constants as C                                  # Python >= 3.11
     except ImportError:                                                  # pragma: no cover
         import sre_constants as C
-        import sre_parse
-    tree = sre_parse.parse(pattern, re.ASCII)
+    tree = parse(pattern) if tree is None else tree
     flags = tree.state.flags
     ignorecase, non_ascii = bool(flags & re.IGNORECASE), False
     if flags & (re.MULTILINE | re.VERBOSE):
@@ -83,6 +73,8 @@ def _unsupported(pattern: str) -> Optional[str]:
             elif op is C.SUBPATTERN:
                 if av[1] & (re.MULTILINE | re.VERBOSE):
                     return "the (?m) or (?x) flag"
+                if av[1] & re.UNICODE:
+                    return "the (?u) flag"
                 if av[2]:
                     return "a flag turned off, as in (?-i:...)"
                 ignorecase |= bool(av[1] & re.IGNORECASE)
@@ -93,7 +85,9 @@ def _unsupported(pattern: str) -> Optional[str]:
                 return special.get(op, f"{op}")
     if ignorecase and non_ascii:
         return "(?i) with a character outside ASCII"
-    i, inside = 0, False                                               # a ']' first in a class
+    if "[]" not in pattern and "[^]" not in pattern:                    # (no ']' first in a class, then)
+        return None
+    i, inside = 0, False
     while i < len(pattern):
         ch = pattern[i]
         if ch == "\\":
@@ -112,21 +106,6 @@ def _unsupported(pattern: str) -> Optional[str]:
     return None
 
 
-def _char_automaton(parsed):
-    """interegular's automaton over characters of a parsed pattern, reduced, and every symbol's characters as code
-    point ranges (its "anything else" symbol: every character no other symbol names)."""
-    from interegular.fsm import anything_else
-    fsm = parsed.to_fsm().reduce()
-    groups = fsm.alphabet.by_transition                             # symbol -> its characters (or "anything else")
-    rest = complement_ranges(code_point_ranges(ch for chars in groups.values() for ch in chars
-                                               if ch is not anything_else))
-    ranges = {}
-    for symbol, chars in groups.items():
-        own = code_point_ranges(ch for ch in chars if ch is not anything_else)
-        ranges[symbol] = sorted(own + rest) if any(ch is anything_else for ch in chars) else own
-    return fsm, ranges
-
-
 def _refused(pattern: str, err) -> ValueError:
     return ValueError(f"Unsupported regular expression {pattern!r}: {err}. Regex matches the whole text, so anchors "
                       f"(^ $ \\A \\Z) are never needed; \\b, lookarounds, backreferences, possessive repetition, atomic "
@@ -134,33 +113,43 @@ def _refused(pattern: str, err) -> ValueError:
 
 
 def _checked(pattern: str):
-    """``(compiled, parsed)``: ``pattern`` compiled by Python's ``re`` and parsed by interegular, or the
-    :class:`ValueError` saying why it is refused (see the module docstring)."""
+    """Python's parse of ``pattern``, or the :class:`ValueError` saying why it is refused (see the module docstring)."""
     if not isinstance(pattern, str):
         raise TypeError(f"`pattern` must be a str, got {type(pattern).__name__}.")
-    interegular, _ = _interegular()
     try:
-        compiled = re.compile(pattern, re.ASCII)
-    except re.error as e:
+        tree = parse(pattern)
+    except (re.error, ValueError) as e:                 # (ValueError: flags Python's parser finds incompatible)
         raise _refused(pattern, e) from None
-    why = _unsupported(pattern)
+    why = _unsupported(pattern, tree)
     if why is not None:
         raise _refused(pattern, why)
-    try:
-        parsed = interegular.parse_pattern(pattern)
-    except Exception as e:                      # interegular's own refusals, and its failures on what it cannot read
-        raise _refused(pattern, f"{type(e).__name__}: {e}") from None
-    return compiled, parsed
+    return tree
 
 
-def _pattern_bytes(pattern: str, parsed) -> ByteAutomaton:
-    """The byte automaton of the texts matching a pattern (``parsed`` by :func:`_checked`)."""
-    _, errors = _interegular()
+#: the vocabularies of the tokenizers given for one, by the tokenizer (reading one takes 0.1-0.2 s, and its byte trie goes
+#: with its vocabulary): a constraint per example should not pay them
+_TOKENIZERS = weakref.WeakKeyDictionary()
+
+
+def _vocabulary_of(tokenizer) -> Vocabulary:
+    """:meth:`Vocabulary.from_tokenizer` of ``tokenizer``, kept while it lives and says the same of its size and end of
+    sequence (a tokenizer that cannot be referred to weakly is read every time)."""
+    backend = getattr(tokenizer, "backend_tokenizer", tokenizer)
+    size = backend.get_vocab_size(with_added_tokens = True) if hasattr(backend, "get_vocab_size") else None
+    said = (size, getattr(tokenizer, "eos_token_id", None))
     try:
-        fsm, ranges = _char_automaton(parsed)
-    except errors as e:                         # (nothing the checks let through should get here)
-        raise _refused(pattern, e) from None
-    return ByteAutomaton.from_char_automaton(fsm.states, fsm.initial, fsm.finals, fsm.map, ranges)
+        kept = _TOKENIZERS.get(tokenizer)
+    except TypeError:
+        return Vocabulary.from_tokenizer(tokenizer)
+    if kept is not None and kept[0] == said:
+        return kept[1]
+    vocabulary = Vocabulary.from_tokenizer(tokenizer)
+    try:
+        _TOKENIZERS[tokenizer] = (said, vocabulary)
+    except TypeError:
+        pass
+    return vocabulary
+
 
 class _Text(Constraint):
     """
@@ -172,7 +161,7 @@ class _Text(Constraint):
 
     def __init__(self, vocabulary, eos_padding: bool):
         if not isinstance(vocabulary, Vocabulary):
-            vocabulary = Vocabulary.from_tokenizer(vocabulary)
+            vocabulary = _vocabulary_of(vocabulary)
         if eos_padding and not vocabulary.eos:
             raise ValueError("The vocabulary has no end-of-sequence ids, which `eos_padding` needs: give them to the "
                              "Vocabulary (`eos = ...`), or pass `eos_padding = False`.")
@@ -213,9 +202,15 @@ class _Text(Constraint):
     # Capabilities, from the automaton
     # ---------------------------------------------------------------------------------------------
 
+    def _short_way(self) -> Optional[DFA]:
+        """The token automaton, if a subclass has a way there not through the whole byte automaton."""
+        return None
+
     def automaton(self) -> DFA:
         if self._automaton is None:
-            self._automaton = to_tokens(self._byte_automaton(), self._vocabulary, self._eos_padding)
+            self._automaton = self._short_way()
+            if self._automaton is None:
+                self._automaton = to_tokens(self._byte_automaton(), self._vocabulary, self._eos_padding)
         return self._automaton
 
     def matcher(self) -> Matcher:
@@ -256,8 +251,7 @@ class Regex(_Text):
         if not isinstance(pattern, str):
             raise TypeError(f"`pattern` must be a str, got {type(pattern).__name__}.")
         super().__init__(vocabulary, eos_padding)
-        compiled, parsed = _checked(pattern)
-        self._pattern, self._parsed, self._re = pattern, parsed, compiled
+        self._pattern, self._tree = pattern, _checked(pattern)
 
     @property
     def pattern(self) -> str:
@@ -265,10 +259,13 @@ class Regex(_Text):
 
     def _text_matches(self, text: str) -> bool:
         """Python's `re` on the decoded text, independent of the automaton."""
-        return self._re.fullmatch(text) is not None
+        return re.fullmatch(self._pattern, text, re.ASCII) is not None
 
     def _byte_automaton(self) -> ByteAutomaton:
-        return _pattern_bytes(self._pattern, self._parsed)
+        return byte_automaton(parse(self._pattern) if self._tree is None else self._tree)
+
+    def __getstate__(self):                                     # (Python's parse does not pickle)
+        return dict(self.__dict__, _tree = None)
 
     # ---------------------------------------------------------------------------------------------
     # Identity

@@ -15,12 +15,12 @@ import random
 import re
 import sys
 
+import numpy as np
 import pytest
 import torch
 
 import pyjuice.constraints as jc
 
-pytest.importorskip("interegular")
 
 #: every byte a token, a few longer ones, an id without text, an end of sequence
 TOKENS = [bytes([b]) for b in range(256)] + [b'{"', b'":', b'","', b"null", b"true", b'"ab"', "é".encode(), None,
@@ -211,7 +211,7 @@ def test_the_token_lift_of_a_minimal_automaton_over_every_byte_is_minimal(monkey
     """Every byte a token and the byte automaton minimal: the lift walks its states apart and needs no minimization
     -- the same DFA as the walk from the initial state minimized, with the padding (merged into the state accepting
     the empty text alone, where there is one) and without."""
-    from pyjuice.constraints.language.backend import automata as A, byte_level
+    from pyjuice.constraints.language.backend import automata as A, token_lift
     from pyjuice.constraints.language.backend.json_schema import compile_schema
     from pyjuice.constraints.language.json_schema import _prepare
     automata = [compile_schema(_prepare(s), r"[ ]?") for s in (PERSON, POINTS, KIND, {"type": "string"})]
@@ -222,15 +222,576 @@ def test_the_token_lift_of_a_minimal_automaton_over_every_byte_is_minimal(monkey
         assert a.minimal
         for eos in (True, False):
             with monkeypatch.context() as m:
-                m.setattr(byte_level, "_byte_complete", lambda trie: False)
-                slow = byte_level.to_tokens(a, VOCAB, eos)
+                m.setattr(token_lift, "_byte_complete", lambda trie: False)
+                slow = token_lift.to_tokens(a, VOCAB, eos)
             for n in sorted({1, 2, 3, threads}):                # (walkers fewer than states: each takes several)
                 numba.set_num_threads(min(n, threads))
                 try:
-                    fast = byte_level.to_tokens(a, VOCAB, eos)
+                    fast = token_lift.to_tokens(a, VOCAB, eos)
+                    assert fast == slow and fast.num_states == slow.num_states, (a.num_states, eos, n)
+                    for first, serial, in_threads in ((256, 1 << 12, 1 << 24), (1, 1 << 12, 1 << 24), (1, 0, 1 << 24), (2, 0, 0)):
+                        with monkeypatch.context() as m:               # (no walk first: all by the checks)
+                            m.setattr(token_lift, "SERIAL_STEPS", 0)
+                            m.setattr(token_lift, "FIRST_CHECKS", first)
+                            m.setattr(token_lift, "SERIAL_CHECKS", serial)
+                            m.setattr(token_lift, "WALKS_IN_THREADS", in_threads)
+                            walked = token_lift.to_tokens(a, VOCAB, eos)
+                        assert walked == slow and walked.num_states == slow.num_states, (a.num_states, eos, n, first)
                 finally:
                     numba.set_num_threads(threads)
-                assert fast == slow and fast.num_states == slow.num_states, (a.num_states, eos, n)
+
+
+def test_the_checks_on_a_quotient_of_the_trie_tell_tokens_apart_as_every_walk_does(monkeypatch):
+    """Random minimal byte automata, random tokens over all 256 bytes: tokens are one class exactly if they lead every
+    state to one state, however few states have walked and with threads or without -- every token walked from every state
+    here -- and the DFA is the one every walk gives."""
+    from pyjuice.constraints.language.backend import automata as A, token_lift
+    monkeypatch.setattr(token_lift, "BEHAVIOUR_ENTRIES", 0)
+    rng = np.random.default_rng(0)
+    for case in range(60):
+        C = int(rng.integers(2, 8))
+        byte_class = np.arange(256) % C
+        K = int(rng.integers(2, 60))
+        table = np.full((K, C), K - 1, dtype = np.int32)
+        moves = rng.random((K, C)) < rng.choice([0.2, 0.5, 0.9])
+        table[moves] = rng.integers(0, K, moves.sum())
+        table[K - 1] = K - 1
+        accept = rng.random(K) < 0.5
+        accept[K - 1] = False
+        a = A._from_classes(table, 0, accept, byte_class)
+        tokens = [bytes([b]) for b in range(256)] + [bytes(rng.integers(0, 6, int(rng.integers(2, 7))).tolist()) for _ in range(300)]
+        vocabulary = jc.Vocabulary(tokens)
+        first, classes = {}, []
+        for text in tokens:
+            column = []
+            for q in range(a.num_states):
+                for b in text:
+                    q = int(a.table[q, a.byte_class[b]])
+                column.append(q)
+            classes.append(first.setdefault(tuple(column), len(first)))
+        with monkeypatch.context() as m:
+            m.setattr(token_lift, "_byte_complete", lambda trie: False)
+            slow = token_lift.to_tokens(a, vocabulary, False)
+        for steps, first_checks, serial, in_threads in ((1 << 19, 256, 1 << 12, 1 << 24), (0, 1, 1 << 12, 1 << 24), (1, 3, 0, 1 << 24),
+                                                        (0, 2, 0, 0), (40, 1, 1 << 12, 1)):
+            with monkeypatch.context() as m:
+                m.setattr(token_lift, "SERIAL_STEPS", steps)
+                m.setattr(token_lift, "FIRST_CHECKS", first_checks)
+                m.setattr(token_lift, "SERIAL_CHECKS", serial)
+                m.setattr(token_lift, "WALKS_IN_THREADS", in_threads)
+                dfa = token_lift.to_tokens(a, vocabulary, False)
+            assert dfa == slow and dfa.num_states == slow.num_states, (case, steps, first_checks)
+            if a.num_states > 1:                                # (else no state but the dead one: no walk)
+                got = dfa.token_class.tolist()
+                assert got == classes, (case, steps, first_checks)
+
+
+def same_tables(a, b, where):
+    assert a.num_states == b.num_states and a.initial == b.initial, where
+    assert torch.equal(a.delta, b.delta) and torch.equal(a.accept, b.accept) and torch.equal(a.token_class, b.token_class), where
+
+
+def test_the_table_of_a_token_automaton_from_its_moves_is_the_dense_one(monkeypatch):
+    """Minimal already: the table from every state's moves, numbered as it is made, against the dense table of every state's
+    every class numbered afterwards, entry for entry: the dead state wherever a row first has a gap, the padding merged or a
+    state of its own, tokens of empty text, on one thread and in parts -- schemas, and random automata over all 256 bytes."""
+    from pyjuice.constraints.language.backend import automata as A, token_lift
+    from pyjuice.constraints.language.backend.json_schema import compile_schema
+    from pyjuice.constraints.language.json_schema import _prepare
+    numba = pytest.importorskip("numba")
+    threads = numba.get_num_threads()
+    rng = np.random.default_rng(0)
+    cases = [(compile_schema(_prepare(s), r"[ ]?"), VOCAB) for s in (PERSON, POINTS, KIND, {"type": "string"})]
+    cases += [(A.regex(p), VOCAB) for p in ("a*", "(ab|é)+c?", "", "(a|b|c)*")]
+    for case in range(40):
+        C = int(rng.integers(1, 8))
+        K = int(rng.integers(2, 60))
+        table = np.full((K, C), K - 1, dtype = np.int32)
+        moves = rng.random((K, C)) < rng.choice([0.2, 0.5, 1.0])
+        table[moves] = rng.integers(0, K, moves.sum())
+        table[K - 1] = K - 1
+        accept = rng.random(K) < 0.5
+        accept[K - 1] = False
+        tokens = [bytes([b]) for b in range(256)] + [bytes(rng.integers(0, 6, int(rng.integers(2, 7))).tolist()) for _ in range(200)]
+        tokens += [b""] if case % 2 else []
+        cases.append((A._from_classes(table, 0, accept, np.arange(256) % C), jc.Vocabulary(tokens + [None], eos = [len(tokens)])))
+    made, real = [], token_lift._table_of_rows
+    monkeypatch.setattr(token_lift, "_table_of_rows", lambda *args: made.append(1) or real(*args))
+    monkeypatch.setattr(token_lift, "BEHAVIOUR_ENTRIES", 0)
+    from_moves = 0
+    for a, vocabulary in cases:
+        for eos in (True, False):
+            with monkeypatch.context() as m:
+                m.setattr(token_lift, "SPARSE_ENTRIES", 1 << 62)
+                dense = token_lift.to_tokens(a, vocabulary, eos)
+            assert not made
+            with monkeypatch.context() as m:                    # (from the behaviours of the trie's nodes)
+                m.setattr(token_lift, "BEHAVIOUR_ENTRIES", 1 << 62)
+                m.setattr(token_lift, "BEHAVIOUR_WORK", 1 << 62)
+                same_tables(token_lift.to_tokens(a, vocabulary, eos), dense, (a.num_states, eos, "behaviours"))
+            made.clear()
+            for n, parts in ((threads, 0), (1, 0), (min(3, threads), 0), (threads, 1 << 62)):
+                numba.set_num_threads(n)
+                try:
+                    with monkeypatch.context() as m:
+                        m.setattr(token_lift, "SPARSE_ENTRIES", 0)
+                        m.setattr(token_lift, "THREADS_ENTRIES", parts)
+                        same_tables(token_lift.to_tokens(a, vocabulary, eos), dense, (a.num_states, eos, n, parts))
+                finally:
+                    numba.set_num_threads(threads)
+                from_moves += bool(made)                        # (the others: an automaton accepting nothing, no walk)
+                made.clear()
+    assert from_moves > 0.9 * 8 * len(cases)
+
+
+def test_walks_by_ranges_give_the_hashes_of_every_step():
+    """Random automata and tokens: the walks that take the levels of a subtree at once, where every byte below a node leads
+    a state to one successor, against a walk of every node from every state: the same hash of every trie node, to the
+    bit, and the same boundary states -- the successor holding for a level or more and then no longer, included."""
+    from pyjuice.constraints.language.backend import token_lift as T
+    rng = np.random.default_rng(1)
+    uses_ranges = 0
+    for case in range(120):
+        C = int(rng.integers(1, 7))
+        K = int(rng.integers(2, 40))
+        dead = K - 1
+        table = np.full((K, C), dead, dtype = np.int32)
+        kind = case % 4
+        for q in range(K - 1):                                  # (strings, counters, mostly dead, anything)
+            if kind == 0 or (kind == 3 and rng.random() < 0.5):
+                table[q] = q
+            elif kind == 1:
+                table[q] = min(q + 1, K - 2)
+            elif kind == 2 and rng.random() < 0.3:
+                table[q] = dead
+            for c in rng.integers(0, C, int(rng.integers(0, max(C // 2, 1) + 1))).tolist():
+                table[q, c] = rng.integers(0, K)
+        shortest = 3 if case % 8 == 1 else 1                    # (counters, and no token ends at the first levels: not a state of a boundary there)
+        tokens = [bytes(rng.integers(0, C, int(rng.integers(shortest, 7))).tolist()) for _ in range(int(rng.integers(5, 120)))]
+        trie = T._trie(jc.Vocabulary(tokens))
+        byte_class = np.minimum(np.arange(256), C - 1)
+        first_child, node_byte, end_ptr = trie.first_child, trie.node_byte, trie.end_ptr
+        M, S = first_child.size - 1, K
+        r = [rng.integers(1, 2 ** 63, size = S, dtype = np.uint64) | np.uint64(1) for _ in range(4)]
+        want1, want2 = np.zeros(M + 2, dtype = np.uint64), np.zeros(M + 2, dtype = np.uint64)
+        order, seen = [0], {0}
+        head = 0
+        while head < len(order):                                # every node from every state found
+            s = order[head]
+            head += 1
+            stack = [(0, s)]
+            while stack:
+                u, q = stack.pop()
+                for w in range(first_child[u], first_child[u + 1]):
+                    q2 = int(table[q, byte_class[node_byte[w]]])
+                    if q2 == dead:
+                        continue
+                    x = np.uint64(q2 + 1)
+                    with np.errstate(over = "ignore"):
+                        want1[w] += r[0][s] * x + r[1][s]
+                        want2[w] += r[2][s] * x + r[3][s]
+                    if end_ptr[w + 1] > end_ptr[w] and q2 not in seen:
+                        seen.add(q2)
+                        order.append(q2)
+                    stack.append((w, q2))
+        class_bytes = T._bytes_of_classes(byte_class, C)
+        usual, same = np.full(S, -1, dtype = np.int32), np.zeros((S, 4), dtype = np.uint64)
+        count = np.zeros(S, dtype = np.int32)
+        h1, h2, states, walked = T._walk(table, dead, 0, byte_class, first_child, node_byte, trie.ends_before, *r, trie.below, class_bytes, usual, same, count, 1 << 62)
+        assert np.array_equal(h1, want1) and np.array_equal(h2, want2), case
+        assert sorted(states.tolist()) == sorted(order) and walked == states.size, case
+        uses_ranges += bool((usual >= 0).any())
+        some = np.array(order, dtype = np.int64)                # from these states again, both other ways of walking
+        again1, again2 = np.zeros(M + 2, dtype = np.uint64), np.zeros(M + 2, dtype = np.uint64)
+        assert T._walks(table, dead, some, byte_class, first_child, node_byte, *r, trie.below, class_bytes, usual, same, count, again1, again2, 1 << 62) == some.size
+        assert np.array_equal(again1, want1) and np.array_equal(again2, want2), case
+        T._usual_moves(table, class_bytes, dead, usual, same, count)
+        par1, par2 = T._walks_parallel(table, dead, some, byte_class, first_child, node_byte, *r, trie.below, class_bytes, usual, same, min(3, some.size), M + 2)
+        assert np.array_equal(par1, want1) and np.array_equal(par2, want2), case
+    assert uses_ranges == 120
+
+
+def every_token_walked(a, vocabulary, eos):
+    """The minimal automaton of a walk of every token from every state of a byte automaton, byte by byte: nothing else of the module's."""
+    V, S = vocabulary.size, a.num_states
+    offsets, has_text = vocabulary._offsets, vocabulary._has_text
+    data = np.frombuffer(vocabulary._buffer, dtype = np.uint8)
+    table = np.full((S + 1, V), a.dead, dtype = np.int64)
+    for t in np.nonzero(has_text)[0].tolist():
+        q = np.arange(S)
+        for x in data[offsets[t]:offsets[t + 1]].tolist():
+            q = a.table[q, a.byte_class[x]]
+        table[:S, t] = q
+    accept = np.append(a.accept, False)
+    if eos:
+        for e in vocabulary.eos:
+            table[np.nonzero(a.accept)[0], e] = S
+            table[S, e] = S
+        accept[S] = True
+    return jc.DFA(V, torch.arange(V), torch.from_numpy(table), a.initial, torch.from_numpy(accept)).minimize()
+
+
+@pytest.mark.parametrize("entries", [0, 1 << 62])
+def test_behaviours_or_walks_the_same_automaton(entries, monkeypatch):
+    """Whether by the behaviours of the trie's nodes or by walks: the automaton of a walk of every token from every state, on few classes and
+    many, tokens no walk gets to, tokens of empty text, ids past the trie's, with every byte a token or not."""
+    from pyjuice.constraints.language.backend import automata as A, token_lift as T
+    monkeypatch.setattr(T, "BEHAVIOUR_ENTRIES", entries)
+    rng = np.random.default_rng(2)
+    for case in range(60):
+        C = int(rng.integers(2, 12))
+        byte_class = np.minimum(np.arange(256), C - 1)
+        K = int(rng.integers(2, 40))
+        table = np.full((K, C), K - 1, dtype = np.int32)
+        moves = rng.random((K, C)) < rng.choice([0.2, 0.5, 0.9])
+        table[moves] = rng.integers(0, K, moves.sum())
+        table[K - 1] = K - 1
+        accept = rng.random(K) < 0.5
+        accept[K - 1] = False
+        a = A._from_classes(table, 0, accept, byte_class)
+        if case % 3 == 0:
+            a = A.minimize(a)
+        tokens = [bytes([b]) for b in range(256)] if case % 2 else []
+        if case % 2:                                                        # (a node of many children, bytes that live on none of them)
+            tokens += [bytes([first, b]) for first in range(C) for b in rng.choice(256, 128, replace = False).tolist()]
+        tokens += [bytes(rng.integers(0, C + 3, int(rng.integers(1, 7))).tolist()) for _ in range(120)] + [b""]
+        vocabulary = jc.Vocabulary(tokens + [None], eos = [len(tokens)], size = len(tokens) + 3)
+        eos = bool(case % 5)
+        assert T.to_tokens(a, vocabulary, eos) == every_token_walked(a, vocabulary, eos), case
+
+
+def test_token_classes_from_the_hashes():
+    """Tokens are one class exactly if both hashes of their places are the same, numbered by their smallest, a class of no hash told
+    as such; more classes than the table of slots starts with, neighbours with one hash the same."""
+    from pyjuice.constraints.language.backend import token_lift as T
+    rng = np.random.default_rng(3)
+    for distinct in (1, 3, 40, 3000):
+        E = 6000
+        end_nodes = np.sort(rng.choice(20000, E, replace = False)).astype(np.int32)
+        h1, h2 = np.zeros(20002, dtype = np.uint64), np.zeros(20002, dtype = np.uint64)
+        values = rng.integers(1, 2 ** 62, size = (distinct, 2), dtype = np.uint64)
+        values[distinct // 2] = values[0, 0], values[0, 1] ^ np.uint64(1)         # (one hash the same, the other nearly: in one slot)
+        pick = rng.integers(0, distinct, E)
+        pick[:3] = [0, distinct // 2, 0]
+        if distinct > 3:
+            pick[3:40] = pick[3]                                        # (a run)
+        h1[end_nodes], h2[end_nodes] = values[pick, 0], values[pick, 1]
+        zero = rng.random(E) < 0.1
+        h1[end_nodes[zero]], h2[end_nodes[zero]] = 0, 0
+        V = 9000
+        token_end = rng.integers(0, E, V).astype(np.int32)
+        token_class, reps, hashed = T._token_classes(h1, h2, end_nodes, token_end)
+        first, want = {}, []
+        for t, e in enumerate(token_end.tolist()):
+            key = (int(h1[end_nodes[e]]), int(h2[end_nodes[e]]))
+            want.append(first.setdefault(key, len(first)))
+        assert token_class.tolist() == want, distinct
+        assert reps.tolist() == [want.index(c) for c in range(len(first))], distinct
+        assert hashed.tolist() == [key != (0, 0) for key in first], distinct
+
+
+def test_the_quotient_of_the_trie_from_the_hashes():
+    """Nodes are one exactly if both hashes are the same (the root alone); edges one per (node, class), from every member's children,
+    on classes in every word of the bits; more nodes than the table of slots starts with; nothing goes on from a node no walk reached."""
+    from pyjuice.constraints.language.backend import token_lift as T
+    rng = np.random.default_rng(4)
+    for distinct, per in ((2, 3), (30, 3), (5000, 2)):
+        tokens = {bytes(rng.integers(0, 256, int(rng.integers(1, 5))).tolist()) for _ in range(30000)}
+        trie = T._trie(jc.Vocabulary(sorted(tokens)))
+        first_child, node_byte = trie.first_child, trie.node_byte
+        M = first_child.size - 1
+        byte_class = (np.arange(256) * 7 % 200).astype(np.int64)
+        values = rng.integers(1, 2 ** 62, size = (distinct, 2), dtype = np.uint64)
+        values[distinct // 2] = values[0, 0], values[0, 1] ^ np.uint64(1)          # (one hash the same, the other nearly: in one slot)
+        pick = rng.integers(-1, distinct, M + 2)
+        pick[1:3] = 0, distinct // 2                            # (neighbours)
+        h1, h2 = values[pick, 0], values[pick, 1]
+        h1[pick < 0], h2[pick < 0] = 0, 0
+        h1[0], h2[0] = 0, 0
+        gptr, gclass, gnode, into, zero = T._quotient(h1, h2, first_child, node_byte, byte_class)
+        group = {}
+        of = [0] * M
+        for u in range(1, M):
+            of[u] = group.setdefault((int(h1[u]), int(h2[u])), len(group) + 1)
+        assert gptr.size - 1 == len(group) + 1
+        assert (zero == group[(0, 0)]) if (0, 0) in group else zero == -1
+        want = {}
+        for u in range(M):
+            if of[u] != zero:
+                for w in range(first_child[u], first_child[u + 1]):
+                    want.setdefault((of[u], int(byte_class[node_byte[w]])), set()).add(of[w])
+        got = {}
+        for g in range(gptr.size - 1):
+            for e in range(gptr[g], gptr[g + 1]):
+                assert (g, int(gclass[e])) not in got
+                got[g, int(gclass[e])] = int(gnode[e])
+        assert set(got) == set(want), distinct
+        assert all(got[key] in want[key] for key in got), distinct
+        assert into.tolist() == np.bincount(np.asarray(list(got.values())), minlength = into.size).tolist()
+
+
+def test_a_schema_is_copied_as_deepcopy_copies_it():
+    """What is written twice stays one object, a cycle a cycle, anything not JSON copied; nothing of the copy is the schema's but what cannot be written to."""
+    import copy
+    import decimal
+    from pyjuice.constraints.language.json_schema import _copied
+    shared = {"type": "string", "enum": ["a", None, 1, 1.5, True]}
+    other = decimal.Decimal("1.5")
+    schema = {"a": shared, "b": [shared, {"c": shared}], "d": other, "e": (1, [2]), "f": [[]]}
+    schema["g"] = schema
+    got, want = _copied(schema, {}), copy.deepcopy(schema)
+    assert got["a"] is got["b"][0] is got["b"][1]["c"] and got["g"] is got
+    assert got["a"] is not shared and got["b"] is not schema["b"] and got["f"][0] is not schema["f"][0]
+    assert got["e"] == want["e"] and got["e"][1] is not schema["e"][1]
+    del got["g"], want["g"]
+    assert got == want
+    got["a"]["enum"].append(2)
+    assert shared["enum"] == ["a", None, 1, 1.5, True]
+
+
+def test_the_random_words(monkeypatch):
+    """The hashes' words: odd where they multiply, the same for as many states whatever was asked for before, and kept to a bound -- not made again for an
+    automaton of fewer states than one before it."""
+    from pyjuice.constraints.language.backend import token_lift as T
+    monkeypatch.setattr(T, "_WORDS", np.empty((4, 0), dtype = np.uint64))
+    monkeypatch.setattr(T, "_KEPT_WORDS", 1 << 14)
+    made = []
+    rng = np.random.default_rng
+    monkeypatch.setattr(np.random, "default_rng", lambda *a: (made.append(a), rng(*a))[1])
+    first = None
+    for S, again in ((100, True), (1, False), (5000, True), (4000, False), (6000, False), (T._KEPT_WORDS, True), (9000, False), (T._KEPT_WORDS + 1, True),
+                     (T._KEPT_WORDS + 1, True), (300, False)):                         # (more made: twice as many kept; past the bound: each time)
+        made.clear()
+        words = T._random_words(S)
+        assert (len(made) == 4) == again and len(made) in (0, 4), (S, len(made))
+        assert len(words) == 4 and all(w.size == S and w.dtype == np.uint64 for w in words)
+        assert (words[0] & np.uint64(1)).all() and (words[2] & np.uint64(1)).all()      # (odd: they multiply, nothing lost)
+        assert all(np.array_equal(a, b) for a, b in zip(words, T._random_words(S)))
+        first = [w.copy() for w in words] if first is None else first
+        assert all(np.array_equal(a[:100], b[:100]) for a, b in zip(first, T._random_words(max(S, 100))))
+        assert all(np.unique(w).size == w.size for w in words)
+        assert all(not np.array_equal(a >> np.uint64(1), b >> np.uint64(1)) for a, b in itertools.combinations(words, 2)) or S == 1      # (four arrays, not one four times)
+    assert T._WORDS.shape == (4, T._KEPT_WORDS)                                          # (past the bound: made, not kept)
+
+
+def test_a_constraint_keeps_its_schema_as_it_was_given():
+    """The schema a constraint was made of, a copy each time it is asked for: what is written twice in it one object, whatever its owner does to it later;
+    of a schema holding what the bytes kept do not write (a dictionary of a type of its own), the same by the copy made before."""
+    import collections
+    import copy
+    vocabulary = jc.Vocabulary([bytes([b]) for b in range(256)] + [None], eos = [256])
+    shared = {"type": "string", "maxLength": 3}
+    for wrap in (dict, collections.OrderedDict):
+        schema = wrap({"type": "object", "properties": {"a": shared, "b": {"type": "array", "items": shared}, "c": {"description": "anything"},
+                                                         "d": {"type": "string", "pattern": "^ab?$"}}, "required": ["a"], "additionalProperties": False})
+        as_given = copy.deepcopy(schema)
+        c = jc.JSONSchema(schema, vocabulary)
+        assert schema == as_given and c._prepared != as_given                              # (what the converter reads is rewritten: a copy, not the schema)
+        assert (type(c._schema) is bytes) == (wrap is dict)
+        got = c.schema
+        assert got == schema and got is not schema and got["properties"]["a"] is not shared
+        assert got["properties"]["a"] is got["properties"]["b"]["items"]
+        assert c.schema is not got
+        states = c.automaton().num_states
+        got["properties"]["a"]["maxLength"] = 1                                          # (the copy is its reader's)
+        schema["properties"]["a"]["maxLength"] = 5                                       # (and the schema its owner's)
+        assert c.schema["properties"]["a"]["maxLength"] == 3
+        assert jc.JSONSchema(c.schema, vocabulary).automaton().num_states == states != jc.JSONSchema(schema, vocabulary).automaton().num_states
+        schema["properties"]["a"]["maxLength"] = 3
+    text = '{"type": "object", "properties": {"a": {"type": "string", "maxLength": 3}}, "additionalProperties": false}'
+    assert jc.JSONSchema(text, vocabulary).schema == __import__("json").loads(text)
+
+
+def test_a_separator_is_its_three_parts_and_kept():
+    """``W<mark>W`` as one automaton: the texts of whitespace, the mark, whitespace; made once for a whitespace and a mark; of a whitespace not evaluated
+    yet, the three parts as before. An object's members read through it accept what they did."""
+    from pyjuice.constraints.language.backend import automata as A, json_schema as B
+    for whitespace in (r"[ ]?", r"[ \n]*", ""):
+        compiler = B._Compiler({"type": "null"}, whitespace)
+        for mark in (":", ","):
+            one = compiler.sep(mark)
+            assert type(one) is B.ByteAutomaton and one is compiler.sep(mark) is B._Compiler({"type": "null"}, whitespace).sep(mark)
+            assert A.equivalent(one, A.force(A.concat(compiler.ws, compiler.lit(mark), compiler.ws)))
+            assert one is not compiler.sep("," if mark == ":" else ":")
+        loose = compiler.sep(":", compiler.ws_any)
+        assert type(loose) is A.Expr and A.equivalent(A.force(loose), A.force(A.concat(compiler.ws_any, compiler.lit(":"), compiler.ws_any)))
+        items = [("a", compiler.boolean, True), ("b c", compiler.null, False), ("d", compiler.integer, False)]
+        ws, lit = compiler.ws, compiler.lit
+        wired = []
+        for name, value, required in items:                                             # (as the members were wired before: a name's parts, and again after a comma)
+            first = A.concat(ws, lit(json.dumps(name)), A.concat(ws, lit(":"), ws))
+            wired.append((first, A.concat(ws, lit(","), first), value, required))
+        for nonempty in (False, True):
+            assert A.equivalent(A.force(compiler._members(items, nonempty)), A.force(A.members(lit("{"), A.concat(ws, lit("}")), wired, False)))
+
+
+def behaviour_at(table, dead, byte_class, text):
+    """What a text does to every live state, by reading it byte by byte."""
+    out = {}
+    for s in range(table.shape[0]):
+        if s != dead:
+            q = s
+            for x in text:
+                q = table[q, byte_class[x]]
+            if q != dead:
+                out[s] = int(q)
+    return out
+
+
+@pytest.mark.parametrize("seed", range(5))
+def test_behaviours_of_the_trie_s_nodes(seed):
+    """Every node's behaviour against reading its text; one number for one behaviour, and none for two; more behaviours than the first
+    tables hold; the root's met again; a budget that runs out; and the classes and rows made from them."""
+    from pyjuice.constraints.language.backend import behaviours as B, token_lift as T
+    rng = np.random.default_rng(seed)
+    for case in range(12):
+        C = int(rng.integers(1, 9))
+        K = int(rng.integers(2, 70))
+        dead = K - 1
+        table = np.full((K, C), dead, dtype = np.int32)
+        density = rng.choice([0.2, 0.6, 1.0])
+        for q in range(K - 1):
+            kind = rng.integers(0, 3)
+            if kind == 0:                                       # (a string: to itself; a counter: to the next; anything)
+                table[q] = q
+            elif kind == 1:
+                table[q] = min(q + 1, K - 2)
+            else:
+                live = rng.random(C) < density
+                table[q, live] = rng.integers(0, K, live.sum())
+        byte_class = np.minimum(np.arange(256), C - 1).astype(np.int64)
+        tokens = [bytes([b]) for b in range(256)] + [bytes(rng.integers(0, C + 2, int(rng.integers(2, 8))).tolist()) for _ in range(600)]
+        vocabulary = jc.Vocabulary(sorted(set(tokens)) + [b"", None], eos = [len(set(tokens)) + 1])
+        trie = T._trie(vocabulary)
+        got = B.behaviours_of(table, dead, byte_class, trie.parent, trie.node_byte, 1 << 62)
+        n, behaviour_of, at, source, target = got
+        M = trie.first_child.size - 1
+        texts = {0: b""}
+        for u in range(M):
+            for w in range(trie.first_child[u], trie.first_child[u + 1]):
+                texts[w] = texts[u] + bytes([trie.node_byte[w]])
+        met = {}
+        for w, text in texts.items():
+            want = behaviour_at(table, dead, byte_class, text)
+            b = int(behaviour_of[w])
+            pairs = dict(zip(source[at[b]:at[b + 1]].tolist(), target[at[b]:at[b + 1]].tolist()))
+            assert pairs == want and list(pairs) == sorted(pairs), (case, text)
+            assert met.setdefault(tuple(want.items()), b) == b, (case, text)   # (one number for one behaviour)
+        assert len(set(met.values())) == len(met)                       # (and one behaviour for a number)
+        assert n >= len(met) - 1
+        assert at[n] == source.size == target.size
+        if at[n] > 1:                                                   # (too little budget: said so)
+            assert B.behaviours_of(table, dead, byte_class, trie.parent, trie.node_byte, 0)[0] == -1
+        token_end = trie.token_ends(vocabulary.size, vocabulary.eos)
+        token_class, reps, behaviour = B.classes_of_behaviours(behaviour_of, n, trie.end_nodes, token_end)
+        first = {}
+        for t in range(vocabulary.size):                                # (by their behaviours, numbered by their smallest token)
+            if t in vocabulary.eos:
+                key = "ends"
+            elif not vocabulary._has_text[t]:
+                key = ()
+            else:
+                key = tuple(behaviour_at(table, dead, byte_class, bytes(vocabulary._buffer[vocabulary._offsets[t]:vocabulary._offsets[t + 1]])).items())
+            assert token_class[t] == first.setdefault(key, len(first)), (case, t)
+        assert reps.tolist() == [token_class.tolist().index(c) for c in range(len(first))]
+        assert behaviour.tolist() == [n if key == "ends" else met[key] if key else 0 for key in first]
+        K_live = K - 1
+        accept = np.zeros(K_live + 2, dtype = bool)
+        accept[:K_live] = rng.random(K_live) < 0.5
+        remap = np.append(rng.permutation(K_live), K_live)
+        end_class = int(token_class[vocabulary.eos[0]])
+        moves, row_at, row_len = B.rows_of_behaviours(behaviour, n, at, source, target, remap, accept, end_class, K_live, K_live)
+        for s in range(K_live):
+            i = remap[s]
+            row = moves[row_at[i]:row_at[i] + row_len[i]]
+            want = []
+            for c in range(reps.size):
+                t = int(behaviour[c])
+                if c == end_class:
+                    if accept[i]:
+                        want.append((c << 32) | (K_live + 1))
+                elif t:
+                    pairs = dict(zip(source[at[t]:at[t + 1]].tolist(), target[at[t]:at[t + 1]].tolist()))
+                    if s in pairs:
+                        want.append((c << 32) | int(remap[pairs[s]]))
+            assert row.tolist() == want, (case, s)
+
+
+def test_behaviours_past_their_budget_go_by_walks(monkeypatch):
+    from pyjuice.constraints.language.backend import automata as A, token_lift as T
+    a = A.force(A.concat(A.repeat(A.byte_ranges([(97, 122)]), 1, 40), A.literal(b"$")))
+    tokens = [bytes([b]) for b in range(256)] + [b"a" * n for n in range(2, 30)] + [b"ab$", b"$$"]
+    vocabulary = jc.Vocabulary(tokens + [None], eos = [len(tokens)])
+    want = every_token_walked(a, vocabulary, True)
+    for work in (0, 1, 50, 1 << 62):
+        monkeypatch.setattr(T, "BEHAVIOUR_WORK", work)
+        assert T.to_tokens(a, vocabulary, True) == want, work
+
+
+@pytest.mark.parametrize("entries", [0, 1 << 62])
+def test_an_initial_state_that_is_not_the_first(entries, monkeypatch):
+    """A minimal automaton as anyone may number it."""
+    from pyjuice.constraints.language.backend import token_lift as T
+    from pyjuice.constraints.language.backend.byte_level import ByteAutomaton
+    monkeypatch.setattr(T, "BEHAVIOUR_ENTRIES", entries)
+    table = np.asarray([[2, 1], [0, 2], [2, 2]], dtype = np.int32)              # (1 reads "a" to 0, 0 reads "b" to 1; 1 accepts, 2 is dead)
+    a = ByteAutomaton(None, 1, np.asarray([False, True, False]), 2, table = table, byte_class = (np.arange(256) == 98).astype(np.int64), minimal = True)
+    tokens = [bytes([b]) for b in range(256)] + [b"ab", b"aba"]
+    vocabulary = jc.Vocabulary(tokens + [None], eos = [len(tokens)])
+    assert T.to_tokens(a, vocabulary, True) == every_token_walked(a, vocabulary, True)
+
+
+def test_more_behaviours_than_the_first_tables_hold():
+    """A counter with tokens of every length up to many: as many behaviours as lengths, past the first table of steps and of slots, and past
+    the first room for what they lead to."""
+    from pyjuice.constraints.language.backend import behaviours as B, token_lift as T
+    K = 3000
+    table = np.full((K, 2), K - 1, dtype = np.int32)
+    for q in range(K - 1):
+        table[q, 0] = min(q + 1, K - 2)
+    byte_class = np.ones(256, dtype = np.int64)
+    byte_class[97] = 0
+    tokens = [bytes([b]) for b in range(256)] + [b"a" * n for n in range(2, 1500)]
+    vocabulary = jc.Vocabulary(tokens + [None], eos = [len(tokens)])
+    trie = T._trie(vocabulary)
+    n, behaviour_of, at, source, target = B.behaviours_of(table, K - 1, byte_class, trie.parent, trie.node_byte, 1 << 62)
+    assert n > 1500
+    for length in (1, 2, 300, 700, 1499):
+        w = trie.end_nodes[trie.token_end[tokens.index(b"a" * length)]]
+        b = behaviour_of[w]
+        assert source[at[b]:at[b + 1]].tolist() == list(range(K - 1))
+        assert target[at[b]:at[b + 1]].tolist() == [min(q + length, K - 2) for q in range(K - 1)]
+
+
+def test_a_token_that_does_nothing_is_one_with_a_token_of_no_text():
+    """The root's behaviour met again."""
+    from pyjuice.constraints.language.backend import automata as A, token_lift as T
+    a = A._from_classes(np.asarray([[0, 1], [1, 2], [2, 2]], dtype = np.int32), 0, np.asarray([True, True, False]), (np.arange(256) == 98).astype(np.int64))
+    tokens = [bytes([b]) for b in range(256)] + [b"", b"aaa"]
+    vocabulary = jc.Vocabulary(tokens + [None], eos = [len(tokens)])
+    for entries in (0, 1 << 62):
+        T.BEHAVIOUR_ENTRIES, keep = entries, T.BEHAVIOUR_ENTRIES
+        try:
+            got = T.to_tokens(a, vocabulary, True)
+        finally:
+            T.BEHAVIOUR_ENTRIES = keep
+        assert got == every_token_walked(a, vocabulary, True), entries
+        assert a.num_states == 3 and got.token_class[256] == got.token_class[257] != got.token_class[len(tokens)], entries
+
+
+@pytest.mark.parametrize("entries", [0, 1 << 62])
+def test_ids_a_vocabulary_grew_after_its_trie(entries, monkeypatch):
+    """The trie made for a vocabulary serves it with more ids, and those lead nowhere, either way."""
+    from pyjuice.constraints.language.backend import automata as A, token_lift as T
+    monkeypatch.setattr(T, "BEHAVIOUR_ENTRIES", entries)
+    tokens = [bytes([b]) for b in range(256)] + [b"ab", b"abab", None]
+    small = jc.Vocabulary(tokens, eos = [len(tokens) - 1])
+    T._trie(small)
+    large = small.with_size(small.size + 5)
+    for a in (A.force(A.repeat(A.literal(b"ab"), 0, 3)), A.force(A.repeat(A.byte_ranges([(i, i) for i in range(0, 200, 8)]), 0, 3))):
+        for eos in (False, True):
+            got = T.to_tokens(a, large, eos)
+            assert got == every_token_walked(a, large, eos), (a.byte_class.max(), eos)
 
 
 def test_numbers_below_a_combinator_are_written_one_way():

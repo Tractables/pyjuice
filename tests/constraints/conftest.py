@@ -5,10 +5,10 @@ import torch
 
 @pytest.fixture(autouse = True)
 def nan_fresh_storage(monkeypatch):
-    """The dfa_exact backend's new storage filled with NaN (it is not filled in use, see ``state.FRESH_FILL``): a
+    """The dfa_exact backend's new storage filled with NaN (it is not filled in use, see ``prior_pool.FRESH_FILL``): a
     query reading a slot no kernel wrote gives NaN, and fails the test."""
-    from pyjuice.constraints.inference.dfa_exact import state
-    monkeypatch.setattr(state, "FRESH_FILL", float("nan"))
+    from pyjuice.constraints.inference.dfa_exact import prior_pool
+    monkeypatch.setattr(prior_pool, "FRESH_FILL", float("nan"))
 
 
 def word_kinds(strings, separators, special_ids = ()) -> torch.Tensor:

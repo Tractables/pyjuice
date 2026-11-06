@@ -128,7 +128,7 @@ def test_input_reads_count_every_step_a_plan_runs(seed):
                 for k in (range(firsts.size - 1) if g is None else g):
                     want[rows[firsts[k]:firsts[k + 1], col]] = True
             launch = NS(form = form, rows = torch.from_numpy(rows), groups_host = groups_host)
-            out.append([(launch, Cut(chunks, groups, 1, 1, 1, 1))])
+            out.append([(launch, Cut(chunks, groups, 0, 1))])
         return out
 
     def walks(want):
@@ -211,7 +211,7 @@ def flags(cc, observed, targets, valid, prior):
     K = len(prog.sum_ivs)
     sample = [(targets is None or bool(targets[:a].any() or targets[b:].any())) and not bool(prior[k])
               for k, (a, b) in enumerate(prog.sum_ivs)]
-    children = [set(prog.reg_iv_host[r] for r in np.nonzero(prog.operands[k])[0]) for k in range(K)]
+    children = [set(prog.reg_iv_host[r] for r in prog.operands[k]) for k in range(K)]
     read = set().union(*(children[k] for k in range(K) if sample[k]))
     if targets is None:
         read.add(prog.reg_iv_host[prog.root_region])

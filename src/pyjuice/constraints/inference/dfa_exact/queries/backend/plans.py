@@ -24,11 +24,16 @@ input-independent ones not kept once per sample as well. Of the values kept once
 -- the children of the products it computes per sample, of the top-down values it computes, the root's for a
 marginal -- that ``prior_mars`` does not hold, and, so that each can be computed, their children kept once that it
 does not hold either, down to the ones it holds or the inputs (:attr:`QueryPlan.prior_read`: the values read, held
-or computed, which the storage keeps while the query runs, see :class:`~...state.PriorPool`; when they do not all fit
+or computed, which the storage keeps while the query runs, see :class:`~.inference.dfa_exact.prior_pool.PriorPool`; when they do not all fit
 it, the lower ones are computed first, by plans of their own, :func:`kept_plan`). A product follows its
 sum regions (they share their scope), and a product's intermediate folds follow the product. The :class:`QueryPlan`
 is the subsets of the Program's launches, dense runs and fused parts that do so, cached on the Program by what they
 depend on.
+
+A plan's launches, index lists and everything it decides depend on what it is a function of, not on the automaton: one
+is built for the programs of a :class:`~...compiled.circuit.Assembly` (kept there), and a program takes it with what its
+automaton says, the launches' sizes in flat lists (:attr:`QueryPlan.sizes`, :attr:`QueryPlan.part_slots`,
+:attr:`TopDownPlan.fold_sizes`).
 
 A query with a top-down pass (:mod:`.top_down`) plans it the same way, mirrored: a node's top-down value is
 NEEDED when its scope meets a target (the scoring reads the top-down values of the target positions' products, each from
@@ -44,7 +49,7 @@ by sum node (region) -- is computed by none of its launches (a caching engine's 
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from typing import Optional
 
 import numpy as np
@@ -52,8 +57,9 @@ import torch
 from numba import njit
 
 from ...compiled.program import TRANS_COLS
-from .planners import IndexLists, _forward_steps, _mode_workspace, _top_down_modes, _top_down_steps, _top_down_tables, \
-    class_weight_writes
+from .planners.cuts import IndexLists, cut_parts, cut_sizes
+from .planners.forward import _forward_steps, forward_sizes
+from .planners.top_down import _mode_workspace, _top_down_modes, _top_down_steps, _top_down_tables, class_weight_writes
 
 
 #: query plans a Program keeps (the most recently used): at least this many, and at least ``PLANS_PER_POSITION`` per
@@ -83,6 +89,7 @@ class QueryPlan:
     :ivar input_reads: None (every position), or int32 [n] (device): 1 at the positions whose input values its
         launches read (:func:`input_reads`), the only ones a query computes, and ``input_positions`` those (bool,
         host)
+    :ivar sizes, part_slots: what this program's automaton says of them (:func:`~.backend.planners.forward.forward_sizes`)
     """
 
     steps: list
@@ -96,6 +103,8 @@ class QueryPlan:
     busy: Optional[list] = None
     input_reads: Optional[torch.Tensor] = None
     input_positions: Optional[np.ndarray] = None
+    sizes: list = field(default_factory = list)
+    part_slots: list = field(default_factory = list)
 
 
 @dataclass
@@ -122,9 +131,11 @@ class TopDownPlan:
     :ivar dead: None, or int32 [D, 2] (device): the rows of the regions it computes per sample that no launch writes
         (see :class:`~.top_down_program.TopDownProgram`), and ``dead_regions``, their regions
     :ivar cw_fill: a scoring plan's: whether ``dfa_class_flow`` must hold -inf before its class weight launches run
-        (:func:`~.planners.class_weight_writes`; their entries ``(launch, index list, store)``)
+        (:func:`~.backend.planners.top_down.class_weight_writes`; their entries ``(launch, index list, store)``)
     :ivar busy: the indices of the steps with anything to run, ascending (the others' parts are all empty)
     :ivar input_reads: bool [n] (host): the positions whose input values its launches read (:func:`input_reads`)
+    :ivar fold_part, fold_ptr: int64 (host): what the sizes of its fold launches' cuts are the most of
+        (:func:`~.backend.planners.cuts.cut_parts`), and ``fold_sizes`` those, of this program's automaton
     """
 
     steps: list
@@ -136,10 +147,13 @@ class TopDownPlan:
     once_iv: torch.Tensor
     prior: np.ndarray
     dead: Optional[torch.Tensor]
-    dead_regions: list
+    dead_regions: np.ndarray
     cw_fill: bool = True
     busy: Optional[list] = None
     input_reads: Optional[np.ndarray] = None
+    fold_part: Optional[np.ndarray] = None
+    fold_ptr: Optional[np.ndarray] = None
+    fold_sizes: list = field(default_factory = list)
 
 
 def _stage_inputs(stages, out: np.ndarray):
@@ -156,6 +170,8 @@ def _stage_inputs(stages, out: np.ndarray):
             for s0, s1, _, idx, _ in cut.chunks:
                 every = idx is None or idx.host is None
                 out[t[s0:s1] if every else t[s0 + np.asarray(idx.host, dtype = np.int64)]] = True
+            if cut.count == t.size:                                # (every step: no group has another)
+                continue
             for G, (idx, _) in (cut.groups or {}).items():
                 firsts = np.asarray(launch.groups_host[G], dtype = np.int64)
                 every = idx is None or idx.host is None
@@ -193,12 +209,12 @@ def input_reads(n: int, steps: list, top_down: bool = False) -> np.ndarray:
                     col = TRANS_COLS.get(la.form)
                     if col is None:
                         continue
+                    if item is None or item.host is None:           # (every child: every parent)
+                        out[np.asarray(la.host["parents"])[:, col[1]]] = True
+                        continue
                     ptr = np.asarray(la.host["ptr"], dtype = np.int64)
-                    if item is None or item.host is None:
-                        c = np.arange(ptr.size - 1)
-                    else:
-                        c = np.asarray(item.host, dtype = np.int64).ravel()
-                        c = c[c >= 0]                                # (node tiles' padding)
+                    c = np.asarray(item.host, dtype = np.int64).ravel()
+                    c = c[c >= 0]                                    # (node tiles' padding)
                     run = np.zeros(ptr[-1] + 1, dtype = np.int64)    # (the children's parents)
                     np.add.at(run, ptr[c], 1)
                     np.add.at(run, ptr[c + 1], -1)
@@ -278,7 +294,11 @@ def query_plan(prog, observed: np.ndarray, targets: Optional[np.ndarray], valid:
                   None if h is None else h.tobytes(), scoring)
         td = prog.plans.get(td_key)
         if td is None:
-            td = top_down_plan(prog, top_down["program"], targets, top_down["once"], top_down["valid"], h, scoring)
+            shared = prog.assembly.plans.get(td_key)
+            if shared is None:
+                shared = top_down_plan(prog, top_down["program"], targets, top_down["once"], top_down["valid"], h, scoring)
+            _keep_shared(prog, td_key, shared)
+            td = replace(shared, fold_sizes = cut_sizes(prog, shared.fold_part, shared.fold_ptr))
             _keep(prog, td_key, td)
         else:
             prog.plans.move_to_end(td_key)
@@ -288,7 +308,19 @@ def query_plan(prog, observed: np.ndarray, targets: Optional[np.ndarray], valid:
     if plan is not None:
         prog.plans.move_to_end(key)
         return plan
+    shared = prog.assembly.plans.get(key)
+    if shared is None:
+        shared = _forward_plan(prog, observed, targets, valid, prior, held, td)
+    _keep_shared(prog, key, shared)
+    sizes, part_slots = forward_sizes(prog, shared.todo.numpy(), shared.sample)
+    plan = replace(shared, top_down = td, sizes = sizes, part_slots = part_slots)
+    _keep(prog, key, plan)
+    return plan
 
+
+def _forward_plan(prog, observed: np.ndarray, targets: Optional[np.ndarray], valid: np.ndarray, prior: np.ndarray,
+                  held: Optional[np.ndarray], td: Optional["TopDownPlan"]) -> QueryPlan:
+    """:func:`query_plan`'s plan, whatever the automaton (``top_down``, ``sizes`` and ``part_slots`` left out)."""
     a, b = prog.iv_bounds[:, 0], prog.iv_bounds[:, 1]
     if targets is None:
         needed = np.ones_like(prior)
@@ -308,7 +340,8 @@ def query_plan(prog, observed: np.ndarray, targets: Optional[np.ndarray], valid:
     if td is not None:
         read_ivs[prog.reg_iv_np[td.per_sample | td.once]] = True
     wanted = np.zeros_like(prior)
-    wanted[prog.reg_iv_np[prog.operands[read_ivs].any(axis = 0)]] = True
+    for k in np.nonzero(read_ivs)[0].tolist():           # (the intervals of the regions the products read)
+        wanted[prog.iv_children[k]] = True
     if td is not None:
         wanted |= td.prior
     if targets is None:
@@ -332,12 +365,10 @@ def query_plan(prog, observed: np.ndarray, targets: Optional[np.ndarray], valid:
         positions |= td.input_reads
     reads = lists.add(positions.astype(np.int32))
     lists.upload(prog.dev)
-    plan = QueryPlan(steps = steps, todo = torch.from_numpy(todo), prior_read = prior_read,
+    return QueryPlan(steps = steps, todo = torch.from_numpy(todo), prior_read = prior_read,
                      prior = bool(prior_read.any()), root_prior = bool(prior[prog.reg_iv_host[prog.root_region]]),
-                     reg_prior = reg_prior.tensor, sample = sample, top_down = td, busy = busy,
+                     reg_prior = reg_prior.tensor, sample = sample, busy = busy,
                      input_reads = reads.tensor, input_positions = positions)
-    _keep(prog, key, plan)
-    return plan
 
 
 def kept_plan(prog, todo: np.ndarray, prior: np.ndarray, keep: np.ndarray) -> QueryPlan:
@@ -356,8 +387,10 @@ def kept_plan(prog, todo: np.ndarray, prior: np.ndarray, keep: np.ndarray) -> Qu
     read = todo.copy()
     for k in np.nonzero(todo)[0]:
         read[prog.iv_children[k]] = True
+    sizes, part_slots = forward_sizes(prog, todo, sample)
     return QueryPlan(steps = steps, todo = torch.from_numpy(todo), prior_read = (read & prior) | keep, prior = True,
-                     root_prior = False, reg_prior = reg_prior.tensor, sample = sample, busy = busy)
+                     root_prior = False, reg_prior = reg_prior.tensor, sample = sample, busy = busy, sizes = sizes,
+                     part_slots = part_slots)
 
 
 def read_regions(prog, plan: QueryPlan, root: bool = False) -> np.ndarray:
@@ -370,7 +403,9 @@ def read_regions(prog, plan: QueryPlan, root: bool = False) -> np.ndarray:
     ivs = plan.sample.copy()
     if plan.top_down is not None:
         ivs[prog.reg_iv_np[plan.top_down.per_sample | plan.top_down.once]] = True
-    out = prog.operands[ivs].any(axis = 0)
+    out = np.zeros(len(prog.slots), dtype = bool)
+    for k in np.nonzero(ivs)[0].tolist():
+        out[prog.operands[k]] = True
     if root:
         out[prog.root_region] = True
     return out
@@ -392,6 +427,15 @@ def _keep(prog, key, plan):
     prog.plans[key] = plan
     if len(prog.plans) > max(PLAN_CACHE_SIZE, PLANS_PER_POSITION * prog.n):
         prog.plans.popitem(last = False)
+
+
+def _keep_shared(prog, key, plan):
+    """The plan of ``key`` kept for the programs of ``prog``'s :class:`~...compiled.circuit.Assembly`, the last used."""
+    kept = prog.assembly.plans
+    kept[key] = plan
+    kept.move_to_end(key)
+    if len(kept) > max(PLAN_CACHE_SIZE, PLANS_PER_POSITION * prog.n):
+        kept.popitem(last = False)
 
 
 def held_intervals(prog, held: np.ndarray) -> np.ndarray:
@@ -437,7 +481,7 @@ def top_down_prior(prog, td, observed: np.ndarray, B: int, kept: bool, liveness)
         return free
     slots = prog.iv_slots
     live = np.asarray(liveness.num_live, dtype = np.int64) if liveness is not None else B * slots
-    sums = td.reg_iv[np.unique(np.asarray(prog.reg_iv_host), return_index = True)[1]]    # sum interval -> number
+    sums = td.reg_iv[np.unique(prog.reg_iv_np, return_index = True)[1]]    # sum interval -> number
     worth = sums[free[sums] & (live > slots)]
     if worth.size == 0:
         return np.zeros(I, dtype = bool)
@@ -480,9 +524,12 @@ def top_down_plan(prog, td, targets: Optional[np.ndarray], once: np.ndarray, val
     r_once = once[td.reg_iv]
     req = needed[td.reg_iv] & ~np.where(r_once, valid, False if held is None else held)   # sum regions computed
     t, index = _top_down_tables(prog, td)
-    m = _top_down_modes(req, positions, once, scoring, t.data, t.offsets, *_mode_workspace(t, td))
+    work = _mode_workspace(t, td)
+    m = _top_down_modes(req, positions, once, scoring, t.data, t.offsets, *work)
     lists = IndexLists()                                 # every index list, copied to the device together
-    out, busy = _top_down_steps(td, t, index, m, scoring, lists)
+    out, busy, parts = _top_down_steps(td, t, index, m, scoring, lists)
+    fold_part, fold_ptr = cut_parts(prog.assembly, parts)
+    td.shared["mode_work"] = work                        # (read: for the next plan)
     cw_fill = class_weight_writes(prog, [out[si] for si in busy], positions) if scoring else True
     prior = m[-1]
     root = prog.root_region
@@ -498,5 +545,5 @@ def top_down_plan(prog, td, targets: Optional[np.ndarray], once: np.ndarray, val
                        per_sample = needed[td.reg_iv] & ~r_once,
                        once_iv = once_iv.tensor, prior = reads,
                        dead = None if dead_rows is None else dead_rows.tensor.view(-1, 2),
-                       dead_regions = np.nonzero(sample & td.dead_region)[0].tolist(), cw_fill = cw_fill,
-                       busy = busy, input_reads = positions)
+                       dead_regions = np.nonzero(sample & td.dead_region)[0], cw_fill = cw_fill,
+                       busy = busy, input_reads = positions, fold_part = fold_part, fold_ptr = fold_ptr)
