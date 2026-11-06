@@ -79,6 +79,60 @@ def _shared_children(external, rank = 2, form = "exp_sum", **kw):
     return top, [n1, n2]
 
 
+def _two_disjoint(external, rank = 2, form = "exp_sum", **kw):
+    """Two sums of one layer, each over products of its own: of 2 and 1 node blocks, the second ragged."""
+    with juice.set_block_size(4):
+        ins = [inputs(v, num_node_blocks = 3, dist = dists.Categorical(num_cats = NUM_CATS)) for v in range(2)]
+        p1, p2 = multiply(*ins), multiply(ins[0], ins[1].duplicate(1, tie_params = False))
+        n1 = summate(p1, num_node_blocks = 2, **_ext(external, rank, form, **kw))
+        n2 = summate(p2, num_node_blocks = 2, edge_ids = torch.tensor([[0, 0, 1], [0, 2, 1]]),
+                     **_ext(external, rank, form, **kw))
+        i2 = inputs(2, num_node_blocks = 2, dist = dists.Categorical(num_cats = NUM_CATS))
+        top = summate(multiply(n1, i2), multiply(n2, i2.duplicate(2, tie_params = False)),
+                      num_node_blocks = 1, block_size = 1)
+    return top, [n1, n2]
+
+
+def _two_chains(external, rank = 2, form = "exp_sum", seq_length = 4, num_latents = 4, **kw):
+    """Two tied HMMs side by side, over variables of their own: every layer holds a transition of each, every
+    transition tied to its chain's others."""
+    tops, sums = [], []
+    with juice.set_block_size(num_latents):
+        for chain in range(2):
+            first = chain * seq_length
+            ni = inputs(first + seq_length - 1, num_node_blocks = 1, dist = dists.Categorical(num_cats = NUM_CATS))
+            mine, cur = [], ni
+            for var in range(seq_length - 2, -1, -1):
+                cx = ni.duplicate(first + var, tie_params = True)
+                ns = mine[0].duplicate(cur, tie_params = True) if mine and external else \
+                    summate(cur, num_node_blocks = 1, **_ext(external, rank, form, **kw))
+                mine.append(ns)
+                cur = multiply(cx, ns)
+            tops.append(summate(cur, num_node_blocks = 1))
+            sums += mine
+        root = summate(multiply(*tops), num_node_blocks = 1, block_size = 1)
+    return root, sums
+
+
+def _hmm_side(external, rank = 2, form = "exp_sum", seq_length = 4, num_latents = 8, **kw):
+    """A tied HMM with a plain sum over one more variable beside it, joined at the top: that sum's product stands in
+    the lowest product layer, before the chain's, so the deepest transition's children are other element rows than
+    the other transitions'."""
+    with juice.set_block_size(num_latents):
+        side = summate(multiply(inputs(seq_length, num_node_blocks = 1, dist = dists.Categorical(num_cats = NUM_CATS))),
+                       num_node_blocks = 1)
+        ni = inputs(seq_length - 1, num_node_blocks = 1, dist = dists.Categorical(num_cats = NUM_CATS))
+        sums, cur = [], ni
+        for var in range(seq_length - 2, -1, -1):
+            cx = ni.duplicate(var, tie_params = True)
+            ns = sums[0].duplicate(cur, tie_params = True) if sums and external else \
+                summate(cur, num_node_blocks = 1, **_ext(external, rank, form, **kw))
+            sums.append(ns)
+            cur = multiply(side, cx, ns) if var == 0 else multiply(cx, ns)
+        root = summate(cur, num_node_blocks = 1, block_size = 1)
+    return root, sums
+
+
 def _unreached(external, rank = 2, form = "exp_sum", **kw):
     """Two sums of one layer over three child blocks: the first reaches blocks 0 and 1 only, the second 1 and 2."""
     with juice.set_block_size(4):
@@ -97,17 +151,21 @@ def _unreached(external, rank = 2, form = "exp_sum", **kw):
 
 STRUCTURES = dict(hmm_tied = lambda **kw: _hmm(tied = True, **kw),
                   hmm_untied = lambda **kw: _hmm(tied = False, **kw),
-                  sparse = _sparse, shared_children = _shared_children, unreached = _unreached)
+                  sparse = _sparse, shared_children = _shared_children, unreached = _unreached,
+                  two_disjoint = _two_disjoint, two_chains = _two_chains, hmm_side = _hmm_side)
 
 
-def _pair(name, form, seed = 0, **kw):
-    """`(pc_a, sums_a, pc_b, sums_b)`: the circuit with factors and its plain twin, the same shared parameters."""
+def _pair(name, form, seed = 0, prepare = None, **kw):
+    """`(pc_a, sums_a, pc_b, sums_b)`: the circuit with factors and its plain twin, the same shared parameters.
+    `prepare(root)`: applied to both before they are compiled."""
     out = []
     for external in (True, False):
         torch.manual_seed(seed)
         root, sums = STRUCTURES[name](external = external, form = form, **kw)
         torch.manual_seed(seed)
         root.init_parameters(perturbation = 2.0)
+        if prepare is not None:
+            prepare(root)
         out += [root, sums]
     root_a, sums_a, root_b, sums_b = out
     dev = torch.device("cuda:0")
@@ -508,6 +566,480 @@ def test_without_the_denominator_flow(form):
     after = _dense(sums_off[0], pc_off.get_node_params(sums_off[0]))
     assert _close(after, flows / flows.sum(dim = 1, keepdim = True), rtol = 1e-4, atol = 1e-6)
     assert not _close(after, before)
+
+
+# ---------------------------------------------------------------- "sum_exp" on the virtual batch (`lowrank_virtual`)
+
+def _virtual_available():
+    from pyjuice.nodes.external_params.kernels.c import get_lowrank_module
+    return torch.cuda.is_available() and get_lowrank_module() is not None
+
+
+needs_virtual = pytest.mark.skipif(not _virtual_available(), reason = "the low-rank mixture's CUDA extension is not built")
+
+
+def _passes(pc, sums, data, ext, param_flows = True):
+    """One forward and backward with gradient buffers: everything they leave."""
+    grads = {a: (torch.zeros_like(ext[a][0]), torch.zeros_like(ext[a][1])) for a in sums}
+    lls = pc(data, sum_external_params = ext).clone()
+    pc.init_param_flows(flows_memory = 0.0)
+    pc.backward(data, allow_modify_flows = False, logspace_flows = True, compute_param_flows = param_flows,
+                sum_external_params_grad = grads)
+    path = {type(pc.external_params_nodes[a].__dict__["_lr_state"]) for a in sums}
+    return dict(lls = lls, mars = pc.node_mars.clone(), flows = pc.node_flows.clone(), fp = pc.param_flows.clone(),
+                fm = _denominators(pc, sums), dA = [grads[a][0] for a in sums], dB = [grads[a][1] for a in sums],
+                path = path)
+
+
+def _denominators(pc, sums):
+    """`F-` of every source node vector as the M-step reads it: summed over its copies, whichever of their slices
+    of the buffer holds what."""
+    desc, out = sums[0].external_params, []
+    for src in dict.fromkeys(_source(a) for a in sums):
+        sources = [(pc.external_params_nodes[a], a) for a in sums if _source(a) is src]
+        out.append(desc.materialize_denom_flows(src, pc.params, pc.denom_param_flows, sources).clone())
+    return torch.cat(out)
+
+
+def _same(x, y, rtol, atol):
+    for k in ("lls", "mars", "fp", "fm"):
+        assert torch.allclose(x[k], y[k], rtol = rtol, atol = atol, equal_nan = True), \
+            f"{k}: {float((x[k] - y[k])[torch.isfinite(x[k]) & torch.isfinite(y[k])].abs().max())}"
+    assert torch.allclose(x["flows"].exp(), y["flows"].exp(), rtol = rtol, atol = atol), "node flows"
+    for k in ("dA", "dB"):
+        for a, b in zip(x[k], y[k]):
+            assert torch.allclose(a, b, rtol = rtol, atol = max(atol, 1e-6)), f"{k}: {float((a - b).abs().max())}"
+
+
+@needs_virtual
+@pytest.mark.parametrize("name,served", [("hmm_tied", True), ("hmm_untied", True), ("sparse", True),
+                                         ("two_disjoint", True), ("two_chains", True), ("hmm_side", True),
+                                         ("shared_children", False), ("unreached", False)])
+@pytest.mark.parametrize("rank,batch", [(1, 3), (3, 5), (4, 1)])
+def test_the_virtual_batch_is_the_torch_pass(name, served, rank, batch, monkeypatch):
+    """`sum_exp` through the plain kernels on (sample, rank) columns against its torch passes: the same values, flows,
+    denominators and gradients -- taken where no child of a layer is shared by two of its node vectors, and the torch
+    passes kept where one is."""
+    import pyjuice.nodes.external_params.lowrank_virtual as lowrank_virtual
+
+    pc, sums, _, _, _, _ = _pair(name, "sum_exp", rank = rank)
+    dev = pc.params.device
+    torch.manual_seed(9)
+    data = torch.randint(0, NUM_CATS, (batch, pc.num_vars), device = dev)
+    ext = {a: _factors(a, rank, batch, dev, seed = 50 + i) for i, a in enumerate(sums)}
+
+    got = _passes(pc, sums, data, ext)
+    assert got["path"] == ({tuple} if served else {dict})
+    monkeypatch.setattr(lowrank_virtual, "ENABLED", False)
+    want = _passes(pc, sums, data, ext)
+    assert want["path"] == {dict}
+    _same(got, want, rtol = 2e-4, atol = 2e-5)
+
+    # Without parameter flows: the element flows and the gradients alone, nothing accumulated
+    monkeypatch.setattr(lowrank_virtual, "ENABLED", True)
+    again = _passes(pc, sums, data, ext, param_flows = False)
+    assert float(again["fp"].abs().sum()) == 0.0 and float(pc.denom_param_flows.abs().sum()) == 0.0
+    assert torch.allclose(again["flows"].exp(), want["flows"].exp(), rtol = 2e-4, atol = 2e-5)
+    for k in ("dA", "dB"):
+        for a, b in zip(again[k], want[k]):
+            assert torch.allclose(a, b, rtol = 2e-4, atol = 2e-5)
+
+
+@needs_virtual
+@pytest.mark.parametrize("precision,rtol", [("auto", 5e-3), ("fp32", 2e-4)])
+def test_the_virtual_batch_on_tensor_core_shapes(precision, rtol, monkeypatch):
+    """A tied HMM of 128 latents in blocks of 32 at batch 24: the shapes the plain layer's tensor-core kernels take,
+    whose products are bf16 at the default precision -- within their tolerance of the torch passes there, and close at
+    `precision = "fp32"`."""
+    import pyjuice.nodes.external_params.lowrank_virtual as lowrank_virtual
+
+    rank, batch = 4, 24
+    torch.manual_seed(0)
+    with juice.set_block_size(32):
+        ni = inputs(4, num_node_blocks = 4, dist = dists.Categorical(num_cats = NUM_CATS))
+        sums, cur = [], ni
+        for var in range(3, -1, -1):
+            cx = ni.duplicate(var, tie_params = True)
+            ns = sums[0].duplicate(cur, tie_params = True) if sums else \
+                summate(cur, num_node_blocks = 4, external_params = LowRankSumParams(rank = rank, form = "sum_exp"))
+            sums.append(ns)
+            cur = multiply(cx, ns)
+        root = summate(cur, num_node_blocks = 1, block_size = 1)
+    root.init_parameters(perturbation = 2.0)
+    pc = juice.compile(root, verbose = False, precision = precision).to(torch.device("cuda:0"))
+    dev = pc.params.device
+    data = torch.randint(0, NUM_CATS, (batch, pc.num_vars), device = dev)
+    ext = {a: _factors(a, rank, batch, dev, spread = 0.5, seed = 60 + i) for i, a in enumerate(sums)}
+
+    got = _passes(pc, sums, data, ext)
+    assert got["path"] == {tuple}
+    monkeypatch.setattr(lowrank_virtual, "ENABLED", False)
+    want = _passes(pc, sums, data, ext)
+    assert torch.allclose(got["lls"], want["lls"], rtol = 0, atol = 20 * rtol)
+    assert torch.allclose(got["fp"], want["fp"], rtol = 10 * rtol, atol = 10 * rtol * float(want["fp"].max()))
+    assert torch.allclose(got["fm"], want["fm"], rtol = 10 * rtol, atol = 10 * rtol * float(want["fm"].max()))
+    for k in ("dA", "dB"):
+        for a, b in zip(got[k], want[k]):
+            assert float((a - b).abs().max()) <= 10 * rtol * float(b.abs().max())
+
+
+@needs_virtual
+def test_the_virtual_buffers_stay_what_the_plain_kernels_expect(monkeypatch):
+    """The plain kernels pad a ragged row's edges with the circuit's dummy rows: the virtual buffers hold -inf there
+    (zero value, zero flow) from their allocation on, whatever memory they were given; the stand-in node values of
+    the backward stay 0 and the stand-in parameter flows are handed back zeroed. A pass over them after the torch
+    passes dirtied the allocator is the torch passes' result."""
+    import pyjuice.nodes.external_params.lowrank_virtual as lowrank_virtual
+
+    rank, batch = 3, 6
+    pc, sums, _, _, _, _ = _pair("sparse", "sum_exp", rank = rank)
+    dev = pc.params.device
+    torch.manual_seed(4)
+    data = torch.randint(0, NUM_CATS, (batch, pc.num_vars), device = dev)
+    ext = {a: _factors(a, rank, batch, dev, seed = 20 + i) for i, a in enumerate(sums)}
+
+    monkeypatch.setattr(lowrank_virtual, "ENABLED", False)
+    want = _passes(pc, sums, data, ext)
+    junk = [torch.full((1 << 18,), float("nan"), device = dev) for _ in range(8)]      # what freed blocks may hold
+    del junk
+    pc.node_mars.__dict__.pop("_lowrank_virtual", None)
+    monkeypatch.setattr(lowrank_virtual, "ENABLED", True)
+    got = _passes(pc, sums, data, ext)
+    assert got["path"] == {tuple}
+    _same(got, want, rtol = 2e-4, atol = 2e-5)
+
+    families = pc.node_mars._lowrank_virtual                         # (kept on the circuit's own buffer)
+    assert set(families) == {(f, batch * rank) for f in ("fw", "bw", "bw_z")}   # one node vector, no copy: no host
+    bufs = {name: buf for family in families.values() for name, buf in family.items() if name != "used"}
+    layer = pc.external_params_nodes[sums[0]]
+    kids = layer.external_params._geometry(layer, layer.external_params._info(layer, sums[0]), dev)["kids"]
+    other = torch.ones(pc.element_mars.size(0), dtype = torch.bool, device = dev)
+    other[kids] = False
+    for name in ("vem", "vem_d", "vem_z", "vef_d", "vef_z"):
+        assert bool(torch.isneginf(bufs[name][other]).all()), name
+    nodes = torch.ones(pc.node_mars.size(0), dtype = torch.bool, device = dev)
+    nodes[slice(*sums[0]._output_ind_range)] = False
+    assert bool(torch.isneginf(bufs["vnf_d"][nodes]).all()) and bool(torch.isneginf(bufs["vnf_z"][nodes]).all())
+    assert float(bufs["zero"].abs().sum()) == 0.0
+    assert float(lowrank_virtual._FLOW_SCRATCH[dev].abs().sum()) == 0.0
+
+
+@needs_virtual
+def test_the_virtual_batch_across_batch_sizes_and_its_bound(monkeypatch):
+    """Forwards at two batch sizes in turn, each followed by its backward: the buffers follow the batch. Past
+    `VIRTUAL_BYTES_MOST` the torch passes take the layer, with the same result."""
+    import pyjuice.nodes.external_params.lowrank_virtual as lowrank_virtual
+
+    rank = 2
+    pc, sums, _, _, _, _ = _pair("hmm_tied", "sum_exp", rank = rank)
+    dev = pc.params.device
+    out = dict()
+    for batch in (7, 3, 7):
+        torch.manual_seed(batch)
+        data = torch.randint(0, NUM_CATS, (batch, pc.num_vars), device = dev)
+        ext = {a: _factors(a, rank, batch, dev, seed = 70 + i) for i, a in enumerate(sums)}
+        got = _passes(pc, sums, data, ext)
+        assert got["path"] == {tuple} and {c for _, c in pc.node_mars._lowrank_virtual} == {batch * rank}
+        if batch in out:
+            _same(got, out[batch], rtol = 1e-6, atol = 1e-7)
+        out[batch] = got
+
+    need = lowrank_virtual._bytes(pc.node_mars, pc.element_mars, 7 * rank)
+    monkeypatch.setattr(lowrank_virtual, "VIRTUAL_BYTES_MOST", need - 1)
+    torch.manual_seed(7)
+    data = torch.randint(0, NUM_CATS, (7, pc.num_vars), device = dev)
+    ext = {a: _factors(a, rank, 7, dev, seed = 70 + i) for i, a in enumerate(sums)}
+    over = _passes(pc, sums, data, ext)
+    assert over["path"] == {dict}
+    _same(over, out[7], rtol = 2e-4, atol = 2e-5)
+    monkeypatch.setattr(lowrank_virtual, "VIRTUAL_BYTES_MOST", need)
+    assert _passes(pc, sums, data, ext)["path"] == {tuple}
+
+
+def _plain_backwards(monkeypatch):
+    """Counts the plain layer's backward calls and their batch (the virtual batch's columns)."""
+    from pyjuice.layer.sum_layer import SumLayer
+
+    calls, plain = [], SumLayer.backward
+
+    def counted(self, node_flows, *args, **kwargs):
+        calls.append(node_flows.size(1))
+        return plain(self, node_flows, *args, **kwargs)
+
+    monkeypatch.setattr(SumLayer, "backward", counted)
+    return calls
+
+
+@needs_virtual
+@pytest.mark.parametrize("most,hosts", [(1, 5), (2, 3), (3, 2), (5, 1), (40, 1)])
+def test_tied_copies_share_a_host_for_the_normalizer_half(most, hosts, monkeypatch):
+    """Five tied copies, one a layer: their backward's normalizer columns go into the rows of a host, as many copies
+    as `COLUMNS_MOST` holds, and one plain backward a host gives the denominator flow and the gradients' normalizer
+    part -- flushed when a host is full and at the pass's last copy. The torch passes' result, however they are
+    split."""
+    import pyjuice.nodes.external_params.lowrank_virtual as lowrank_virtual
+
+    rank, batch = 2, 4
+    pc, sums, _, _, _, _ = _pair("hmm_tied", "sum_exp", rank = rank, seq_length = 6)
+    dev = pc.params.device
+    assert len(sums) == 5
+    torch.manual_seed(13)
+    data = torch.randint(0, NUM_CATS, (batch, pc.num_vars), device = dev)
+    ext = {a: _factors(a, rank, batch, dev, seed = 80 + i) for i, a in enumerate(sums)}
+
+    cols = batch * rank
+    monkeypatch.setattr(lowrank_virtual, "COLUMNS_MOST", most * cols)
+    calls = _plain_backwards(monkeypatch)
+    got = _passes(pc, sums, data, ext)
+    assert got["path"] == {tuple}
+    gated = [c for c in calls if c != batch]                         # (the root's layer runs at the batch itself)
+    assert gated.count(cols) == (10 if most == 1 else 5)             # every layer's data half (and, unhosted, its own)
+    if most > 1:
+        assert gated.count(min(most, 40) * cols) == hosts and len(gated) == 5 + hosts
+        # ... each host's slice of the denominator flow holding its copies' sum, the others' nothing
+        desc = sums[0].external_params
+        held = [float(pc.denom_param_flows[slice(o, o + sums[0].num_edges)].abs().sum()) > 0
+                for o in (desc._denom_offsets(pc.external_params_nodes[a])[id(a)][0] for a in sums)]
+        assert sum(held) == hosts
+
+    calls.clear()
+    monkeypatch.setattr(lowrank_virtual, "ENABLED", False)
+    want = _passes(pc, sums, data, ext)
+    assert not [c for c in calls if c != batch]
+    _same(got, want, rtol = 2e-4, atol = 2e-5)
+
+    # A second backward of the same forward: the same again, nothing left over from the first
+    monkeypatch.setattr(lowrank_virtual, "ENABLED", True)
+    grads = {a: (torch.zeros_like(ext[a][0]), torch.zeros_like(ext[a][1])) for a in sums}
+    pc(data, sum_external_params = ext)
+    for _ in range(2):
+        pc.init_param_flows(flows_memory = 0.0)
+        pc.backward(data, allow_modify_flows = False, logspace_flows = True, sum_external_params_grad = grads)
+        assert torch.allclose(pc.param_flows, want["fp"], rtol = 2e-4, atol = 2e-5)
+        assert torch.allclose(_denominators(pc, sums), want["fm"], rtol = 2e-4, atol = 2e-5)
+        for k, a in enumerate(sums):
+            assert torch.allclose(grads[a][0], want["dA"][k], rtol = 2e-4, atol = 2e-5)
+            assert torch.allclose(grads[a][1], want["dB"][k], rtol = 2e-4, atol = 2e-5)
+
+
+@needs_virtual
+def test_a_host_holding_fewer_copies_than_the_pass_before(monkeypatch):
+    """A host's rows keep the columns an earlier pass wrote. A pass that gives it fewer copies -- here two of the five
+    transitions left without factors -- must not read them: the columns past its copies carry no flow."""
+    import pyjuice.nodes.external_params.lowrank_virtual as lowrank_virtual
+
+    rank, batch = 2, 4
+    pc, sums, _, _, _, _ = _pair("hmm_tied", "sum_exp", rank = rank, seq_length = 6)
+    dev = pc.params.device
+    torch.manual_seed(14)
+    data = torch.randint(0, NUM_CATS, (batch, pc.num_vars), device = dev)
+    ext = {a: _factors(a, rank, batch, dev, seed = 90 + i) for i, a in enumerate(sums)}
+    _passes(pc, sums, data, ext)                                     # five copies in one host
+
+    for kept in ([0, 2, 4], [1], [3, 4]):
+        few = [sums[i] for i in kept]
+        sub = {a: ext[a] for a in few}
+        monkeypatch.setattr(lowrank_virtual, "ENABLED", True)
+        got = _passes(pc, few, data, sub)
+        assert got["path"] == {tuple}
+        monkeypatch.setattr(lowrank_virtual, "ENABLED", False)
+        want = _passes(pc, few, data, sub)
+        _same(got, want, rtol = 2e-4, atol = 2e-5)
+
+
+@needs_virtual
+def test_copies_in_layers_of_several_node_vectors_keep_their_own_normalizer_calls(monkeypatch):
+    """Two tied chains side by side: every layer holds two node vectors, each with copies in the pass. A host takes
+    the columns of one node vector a layer -- its plain backward runs the whole layer --, so these layers run their
+    own normalizer half: two plain backwards a layer, and the torch passes' result."""
+    import pyjuice.nodes.external_params.lowrank_virtual as lowrank_virtual
+
+    rank, batch = 2, 4
+    pc, sums, _, _, _, _ = _pair("two_chains", "sum_exp", rank = rank)
+    dev = pc.params.device
+    assert len(sums) == 6 and all(len(pc.external_params_nodes[a].external_node_infos) == 2 for a in sums)
+    torch.manual_seed(15)
+    data = torch.randint(0, NUM_CATS, (batch, pc.num_vars), device = dev)
+    ext = {a: _factors(a, rank, batch, dev, seed = 100 + i) for i, a in enumerate(sums)}
+    calls = _plain_backwards(monkeypatch)
+    got = _passes(pc, sums, data, ext)
+    assert got["path"] == {tuple} and [c for c in calls if c != batch] == [batch * rank] * 6
+    monkeypatch.setattr(lowrank_virtual, "ENABLED", False)
+    _same(got, _passes(pc, sums, data, ext), rtol = 2e-4, atol = 2e-5)
+
+
+@needs_virtual
+def test_a_host_whose_rows_are_not_its_copies(monkeypatch):
+    """The deepest transition's children stand at other element rows than the other transitions' (a product of
+    another branch precedes them in its layer): what a copy writes for the host goes to the HOST's rows."""
+    import pyjuice.nodes.external_params.lowrank_virtual as lowrank_virtual
+
+    rank, batch = 2, 4
+    pc, sums, _, _, _, _ = _pair("hmm_side", "sum_exp", rank = rank)
+    dev = pc.params.device
+    desc = sums[0].external_params
+    rows = [desc._geometry(layer, desc._info(layer, a), dev)["rows"]
+            for a, layer in ((a, pc.external_params_nodes[a]) for a in sums)]
+    assert not all(torch.equal(rows[0], r) for r in rows[1:]), "every copy's children at the same rows: nothing tested"
+    torch.manual_seed(16)
+    data = torch.randint(0, NUM_CATS, (batch, pc.num_vars), device = dev)
+    ext = {a: _factors(a, rank, batch, dev, seed = 110 + i) for i, a in enumerate(sums)}
+    calls = _plain_backwards(monkeypatch)
+    got = _passes(pc, sums, data, ext)
+    assert got["path"] == {tuple} and len([c for c in calls if c not in (batch, batch * rank)]) == 1    # one host
+    monkeypatch.setattr(lowrank_virtual, "ENABLED", False)
+    _same(got, _passes(pc, sums, data, ext), rtol = 2e-4, atol = 2e-5)
+
+
+@needs_virtual
+def test_a_backward_after_one_that_stopped_midway(monkeypatch):
+    """A backward that raised after some copies were written into a host leaves them there. The next backward of
+    the same forward starts over -- the first node vector seen again resets what the pass keeps -- and is a whole
+    one: the torch passes' flows and gradients, and as few plain backwards as the first time."""
+    import pyjuice.nodes.external_params.lowrank_virtual as lowrank_virtual
+    from pyjuice.layer.sum_layer import SumLayer
+
+    rank, batch = 2, 4
+    pc, sums, _, _, _, _ = _pair("hmm_tied", "sum_exp", rank = rank, seq_length = 6)
+    dev = pc.params.device
+    torch.manual_seed(17)
+    data = torch.randint(0, NUM_CATS, (batch, pc.num_vars), device = dev)
+    ext = {a: _factors(a, rank, batch, dev, seed = 120 + i) for i, a in enumerate(sums)}
+    monkeypatch.setattr(lowrank_virtual, "ENABLED", False)
+    want = _passes(pc, sums, data, ext)
+    monkeypatch.setattr(lowrank_virtual, "ENABLED", True)
+
+    grads = {a: (torch.zeros_like(ext[a][0]), torch.zeros_like(ext[a][1])) for a in sums}
+    pc(data, sum_external_params = ext)
+    plain, seen = SumLayer.backward, []
+
+    def stops(self, node_flows, *args, **kwargs):
+        seen.append(node_flows.size(1))
+        if len([c for c in seen if c == batch * rank]) == 3:        # the third transition's data half
+            raise RuntimeError("stopped")
+        return plain(self, node_flows, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(SumLayer, "backward", stops)
+        pc.init_param_flows(flows_memory = 0.0)
+        with pytest.raises(RuntimeError, match = "stopped"):
+            pc.backward(data, allow_modify_flows = False, logspace_flows = True, sum_external_params_grad = grads)
+
+    calls = _plain_backwards(monkeypatch)
+    for _ in range(2):
+        calls.clear()
+        pc.init_param_flows(flows_memory = 0.0)
+        pc.backward(data, allow_modify_flows = False, logspace_flows = True, sum_external_params_grad = grads)
+        assert len([c for c in calls if c != batch]) == 5 + 1       # five data halves, one host
+        assert torch.allclose(pc.param_flows, want["fp"], rtol = 2e-4, atol = 2e-5)
+        assert torch.allclose(_denominators(pc, sums), want["fm"], rtol = 2e-4, atol = 2e-5)
+        for k, a in enumerate(sums):
+            assert torch.allclose(grads[a][0], want["dA"][k], rtol = 2e-4, atol = 2e-5)
+            assert torch.allclose(grads[a][1], want["dB"][k], rtol = 2e-4, atol = 2e-5)
+
+
+@pytest.mark.parametrize("form", FORMS)
+def test_nodes_no_child_of_which_is_possible(form, monkeypatch):
+    """A node block that reaches one child block, impossible for some samples (an input of probability 0): its
+    nodes' values are -inf there and they carry no flow -- finite flows and gradients everywhere, the materialized
+    circuit's, through the virtual batch and the torch passes alike."""
+    import pyjuice.nodes.external_params.lowrank_virtual as lowrank_virtual
+
+    def impossible(root):
+        for ns in root:
+            if ns.is_input() and not ns.is_tied() and ns.scope.to_list() == [0]:
+                p = ns.get_params().reshape(ns.num_nodes, NUM_CATS).clone()
+                p[4:6, 0] = 0.0                                     # (child block 2's nodes of variable 0)
+                ns.set_params(p)
+
+    rank, batch = 3, 6
+    for enabled in (True, False):
+        monkeypatch.setattr(lowrank_virtual, "ENABLED", enabled)
+        pc_a, sums_a, pc_b, sums_b, _, _ = _pair("sparse", form, rank = rank, prepare = impossible)
+        dev = pc_a.params.device
+        torch.manual_seed(18)
+        data = torch.randint(0, NUM_CATS, (batch, pc_a.num_vars), device = dev)
+        data[:3, 0] = 0
+        ext = {a: _factors(a, rank, batch, dev, seed = 130 + i) for i, a in enumerate(sums_a)}
+        grads = {a: (torch.zeros_like(ext[a][0]), torch.zeros_like(ext[a][1])) for a in sums_a}
+        lls = pc_a(data, sum_external_params = ext).reshape(-1)
+        pc_a.init_param_flows(flows_memory = 0.0)
+        pc_a.backward(data, allow_modify_flows = False, logspace_flows = True, sum_external_params_grad = grads)
+        a = sums_a[0]
+        rows = slice(*a._output_ind_range)
+        assert bool(torch.isneginf(pc_a.node_mars[rows][:4, :3]).all()) and bool(torch.isfinite(lls).all())
+        assert bool(torch.isneginf(pc_a.node_flows[rows][:4, :3]).all())
+        for x in (pc_a.param_flows, pc_a.denom_param_flows, grads[a][0], grads[a][1]):
+            assert bool(torch.isfinite(x).all())
+        ref = _reference(pc_a, sums_a, pc_b, sums_b, data, ext, form)
+        assert _close(lls, ref["lls"], rtol = 0, atol = 2e-3)
+        assert _close(_dense(a, _flows(pc_a, a)), ref["Fp"][0]) and _close(grads[a][0], ref["dA"][0])
+        assert _close(grads[a][1], ref["dB"][0])
+        fm = a.external_params.materialize_denom_flows(a, pc_a.params, pc_a.denom_param_flows,
+                                                       [(pc_a.external_params_nodes[a], a)])
+        E = a.edge_ids.size(1)
+        assert _close(_dense(a, fm.reshape(E, a.ch_block_size, a.block_size).permute(0, 2, 1)), ref["Fm"][0])
+
+
+@needs_virtual
+@pytest.mark.parametrize("name,offered", [("hmm_tied", True), ("two_disjoint", True), ("two_chains", True),
+                                          ("sparse", False)])
+def test_the_forward_with_the_product_layer_fused_in(name, offered, monkeypatch):
+    """Where the circuit leaves the product layer below to this layer's forward (its tuner's choice, forced here),
+    the virtual batch reads every product's value from its two children: the bits of the forward that was handed the
+    products' values, forward after forward; and a layer that does not go through the virtual batch after all forms
+    the products' values itself. Products of two children only (`sparse`: three, never handed over)."""
+    import pyjuice.layer.kernels.autotune as autotune
+    import pyjuice.nodes.external_params.lowrank_virtual as lowrank_virtual
+
+    pick = autotune.pick
+    choice = ["fused"]
+    monkeypatch.setattr(autotune, "pick", lambda key, cands, bench, **kw:
+                        choice[0] if key[0] == "prod_stream_fusion" else pick(key, cands, bench, **kw))
+    fused = []
+    expand = lowrank_virtual._module().lowrank_expand_fused
+
+    class Counted:
+        def __getattr__(self, attr):
+            return getattr(lowrank_virtual._module.__wrapped__(), attr)
+
+        def lowrank_expand_fused(self, *args):
+            fused.append(1)
+            return expand(*args)
+
+    real = lowrank_virtual._module
+    counted = Counted()
+    monkeypatch.setattr(lowrank_virtual, "_module", lambda: counted)
+    lowrank_virtual._module.__wrapped__ = real
+
+    rank, batch = 2, 5
+    out = dict()
+    for which in ("fused", "unfused"):
+        choice[0] = which
+        pc, sums, _, _, _, _ = _pair(name, "sum_exp", rank = rank)
+        dev = pc.params.device
+        torch.manual_seed(19)
+        data = torch.randint(0, NUM_CATS, (batch, pc.num_vars), device = dev)
+        ext = {a: _factors(a, rank, batch, dev, seed = 140 + i) for i, a in enumerate(sums)}
+        fused.clear()
+        lls = [pc(data, sum_external_params = ext).clone() for _ in range(4)]
+        assert all(torch.equal(l, lls[0]) for l in lls)
+        assert (len(fused) > 0) == (which == "fused" and offered)
+        out[which] = (lls[0], _passes(pc, sums, data, ext))
+        # Other data next: the products' values the last pass left in the circuit's buffer are not these
+        torch.manual_seed(20)
+        other = torch.randint(0, NUM_CATS, (batch, pc.num_vars), device = dev)
+        out[which] += (pc(other, sum_external_params = ext).clone(),)
+        if which == "fused":
+            # ... and the torch passes, handed the product layer the same way, form its values first
+            monkeypatch.setattr(lowrank_virtual, "ENABLED", False)
+            torch_pass = _passes(pc, sums, data, ext)
+            monkeypatch.setattr(lowrank_virtual, "ENABLED", True)
+            assert torch_pass["path"] == {dict}
+            _same(out[which][1], torch_pass, rtol = 2e-4, atol = 2e-5)
+    assert torch.equal(out["fused"][0], out["unfused"][0]) and torch.equal(out["fused"][2], out["unfused"][2])
+    assert not torch.equal(out["fused"][0], out["fused"][2])
+    _same(out["fused"][1], out["unfused"][1], rtol = 1e-6, atol = 1e-7)
 
 
 def test_refusals():

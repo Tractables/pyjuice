@@ -69,8 +69,9 @@ def _check(pc, data, missing, targets, num_cats, target_vars, atol = ATOL, **kwa
 
 
 def _chain(dist_fn, seq_length, num_latents, external = None, block_size = 4, precision = "fp32", tied = False):
-    """An HMM-like chain over `seq_length` variables; with `external` ("blockscale" / "lowrank") every transition
-    carries those external sum parameters; `tied`: every variable's emissions are the first's."""
+    """An HMM-like chain over `seq_length` variables; with `external` ("blockscale" / "lowrank" / "lowrank_sum_exp",
+    the low-rank scale's two forms) every transition carries those external sum parameters; `tied`: every variable's
+    emissions are the first's."""
     with juice.set_block_size(block_size):
         first = chain = inputs(0, num_node_blocks = num_latents // block_size, dist = dist_fn())
         transitions = []
@@ -84,6 +85,8 @@ def _chain(dist_fn, seq_length, num_latents, external = None, block_size = 4, pr
                 ext = dict(external_params = BlockScaleSumParams(ch_block_size = block_size))
             elif external == "lowrank":
                 ext = dict(external_params = LowRankSumParams(rank = 4))
+            elif external == "lowrank_sum_exp":
+                ext = dict(external_params = LowRankSumParams(rank = 4, form = "sum_exp"))
             chain = summate(multiply(chain, emit), num_node_blocks = num_latents // block_size, **ext)
             transitions.append(chain)
         root = summate(multiply(chain), num_node_blocks = 1, block_size = 1)
@@ -204,6 +207,8 @@ def test_extern_product_categorical():
     # BlockScale's backward refuses precision = "fp32", so it runs at the default precision
     ("blockscale", 4, 8), ("blockscale", 16, 16),
     ("lowrank", 4, 8), ("lowrank", 16, 16), ("lowrank", 32, 24),
+    # (the mixture form: through the plain kernels on a virtual batch, `lowrank_virtual`)
+    ("lowrank_sum_exp", 4, 8), ("lowrank_sum_exp", 16, 16), ("lowrank_sum_exp", 32, 24),
 ])
 def test_external_sum_params(external, block_size, B, categorical_path):
     torch.manual_seed(0)

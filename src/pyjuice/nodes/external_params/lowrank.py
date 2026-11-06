@@ -4,6 +4,7 @@ import torch
 from typing import Optional, Tuple
 
 from .external_params import ExternalSumParams
+from . import lowrank_virtual
 
 
 #: The forms of :class:`LowRankSumParams`: how the two factors make a parameter's per-sample scale
@@ -75,6 +76,9 @@ class LowRankSumParams(ExternalSumParams):
     #: ... and so are both flows
     replaces_shared_backward = True
     computes_external_grads = True
+    #: A forward may be handed the product layer below, its own forward not run (`stream_fusion_plan`): the mixture's
+    #: virtual batch reads the products' values from their children, every other pass forms them first
+    fuses_stream_children = True
 
     def __init__(self, rank: int, form: str = "exp_sum", apply_z_correction: bool = True, tie_external: bool = False):
         super(LowRankSumParams, self).__init__()
@@ -126,7 +130,8 @@ class LowRankSumParams(ExternalSumParams):
           a tied copy reads its source's parameters, and its flows lie in its own range as the parameters do in
           theirs;
         * `eid`, `has` -- every child's element id, and whether an edge reaches it at all; `cols`, `kids` -- the
-          children an edge reaches (their columns of the grid, their element ids), `full` -- whether that is all.
+          children an edge reaches (their columns of the grid, their element ids), `full` -- whether that is all;
+          `rows` -- every child's element id, -1 where no edge reaches it (the kernels' form).
         """
         cache = layer.__dict__.setdefault("_lr_geometry", {})
         hit = cache.get(id(ns_info.ns))
@@ -156,7 +161,7 @@ class LowRankSumParams(ExternalSumParams):
         reached = torch.nonzero(has).reshape(-1)
         geo = dict(M = M, N = N, flat = (rows * N + cols).reshape(-1), row = rows.reshape(-1), pid = pid,
                    local = local, pfid = ns._param_flow_range[0] + local, eid = eid.clamp(min = 0), has = has,
-                   cols = reached, kids = eid[reached], full = reached.numel() == N)
+                   cols = reached, kids = eid[reached], full = reached.numel() == N, rows = eid.contiguous())
         cache[id(ns)] = geo
         return geo
 
@@ -193,10 +198,17 @@ class LowRankSumParams(ExternalSumParams):
 
     def drop_device_caches(self, layer) -> None:
         super().drop_device_caches(layer)
-        for name in ("_lr_geometry", "_lr_state", "_lr_denom_offsets"):
+        for name in ("_lr_geometry", "_lr_state", "_lr_denom_offsets", "_lrv_state", "_lrv_disjoint"):
             layer.__dict__.pop(name, None)
+        lowrank_virtual.drop_device_caches()
 
     # ------------------------------------------------------------------ forward
+
+    def stream_fusion_plan(self, layer, fast_key: tuple, children) -> Optional[tuple]:
+        """What `ExternalParamsSumLayer._stream_fusion` asks for the circuit's decision to leave the product group
+        below (``children``) to this layer's forward: taken where the forward goes through the mixture's virtual batch,
+        whose `expand` then reads each product's value from its two children."""
+        return (children,) if lowrank_virtual.fuses(self, layer, children) else None
 
     def forward(self, layer, ns_info, tensors, node_mars, element_mars, params, **kwargs) -> None:
         raise NotImplementedError("`LowRankSumParams` is served by `forward_layer`.")
@@ -207,6 +219,14 @@ class LowRankSumParams(ExternalSumParams):
         vector's `log Z_b` (and `sum_exp`'s shifts) kept on the layer for the backward.
         """
         self._require_full_supply(layer, ns_tensors)
+
+        children = kwargs.pop("stream_children", None)
+        if lowrank_virtual.serves(self, layer, node_mars, element_mars):
+            return lowrank_virtual.forward(self, layer, ns_tensors, node_mars, element_mars, params, kwargs,
+                                           stream_children = children)
+        if children is not None:                                # (handed the product layer: its values, as it forms them)
+            from pyjuice.layer.fused_children import form_elements
+            form_elements(element_mars, node_mars, children)
 
         state = layer.__dict__["_lr_state"] = dict()
         for ns_info, (A, Bm) in ns_tensors:
@@ -270,8 +290,12 @@ class LowRankSumParams(ExternalSumParams):
             raise NotImplementedError("`LowRankSumParams` requires `logspace_flows = True` (the default).")
         self._require_full_supply(layer, ns_tensors)
         state = layer.__dict__.get("_lr_state")
-        if state is None or any(id(i.ns) not in state or state[id(i.ns)].size(0) != node_mars.size(1)
-                                for i, _ in ns_tensors):
+        if isinstance(state, tuple):                            # (the forward went through the virtual batch)
+            fresh = state[1] == node_mars.size(1)
+        else:
+            fresh = state is not None and all(id(i.ns) in state and state[id(i.ns)].size(0) == node_mars.size(1)
+                                              for i, _ in ns_tensors)
+        if not fresh:
             raise RuntimeError("`LowRankSumParams`: the backward needs the forward pass of the same batch first.")
 
     def post_backward_layer(self, layer, ns_tensors, ns_grad_tensors, node_flows, element_flows, node_mars,
@@ -290,6 +314,9 @@ class LowRankSumParams(ExternalSumParams):
         """
         dev = node_flows.device
         state = layer._lr_state
+        if isinstance(state, tuple):
+            return lowrank_virtual.backward(self, layer, ns_tensors, ns_grad_tensors, node_flows, element_flows,
+                                            node_mars, element_mars, params, param_flows, denom_param_flows, kwargs)
         geos = [self._geometry(layer, ns_info, dev) for ns_info, _ in ns_tensors]
         for geo in geos:
             element_flows[geo["kids"], :] = -float("inf")
