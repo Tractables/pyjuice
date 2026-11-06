@@ -18,6 +18,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional
 
+import numpy as np
 import torch
 import triton.language as tl
 from triton.language.extra.cuda import gdc_wait
@@ -49,6 +50,9 @@ SET_WEIGHT_MEMORY_SHARE = 0.125
 SET_WEIGHT_CHUNK = 1 << 24
 SET_WEIGHT_RANKS_MOST = 1 << 27
 SET_WEIGHT_PAIRS_LEAST = 1 << 14
+#: The most cells of what a query's rows are found in when they come from the sets (:func:`set_weight_rows`): (target column, class), (target column, entry of a class's
+#: sets) and (set, class); past it, the rows from the classes' own lists
+SET_WEIGHT_ROW_CELLS = 1 << 26
 
 
 @dataclass
@@ -100,6 +104,22 @@ def set_weights_apply(prog, liveness, compact) -> bool:
     return entries >= SET_WEIGHT_MIN_RATIO * pairs and entries >= SET_WEIGHT_MIN_ENTRIES * prog.n
 
 
+def set_weights_always(prog) -> bool:
+    """Whether every query of ``prog`` large enough takes the class sets, whatever its storage and liveness (:func:`set_weights_apply`): its rows then come from the sets
+    too (:func:`set_weight_rows`), and the lists by class are not read."""
+    return set_weights_apply(prog, True, True)
+
+
+def most_live_columns(prog, liveness, positions) -> list:
+    """Per target position (``positions``, bool [n] on the host), the most live columns of any sample there, every column without a liveness: what the host's count of
+    :func:`set_weight_lists` takes. Read off the liveness' lists: it waits for those alone."""
+    targets = np.nonzero(positions)[0].tolist()
+    if liveness is None:
+        return [prog.width[t] for t in targets]
+    walk = liveness.lists()[0].view(liveness.B, prog.n + 1).amax(0).tolist()
+    return [walk[t] for t in targets]
+
+
 def _class_sets_of(prog) -> tuple:
     """``(ptr, sets, most)``: every class's sets, ``sets[ptr[c] .. ptr[c + 1]]`` (int32 on the device), and the most of any class; kept with the program."""
     kept = getattr(prog, "_class_set_tables", None)
@@ -112,6 +132,96 @@ def _class_sets_of(prog) -> tuple:
         sets = torch.cat([in_set.index_select(0, torch.argsort(member, stable = True)), torch.zeros(1, dtype = in_set.dtype, device = prog.dev)])
         kept = prog._class_set_tables = (ptr.to(torch.int32).contiguous(), sets.to(torch.int32).contiguous(), int(per.max()) if per.numel() else 0)
     return kept
+
+
+def _row_tables(prog) -> tuple:
+    """``(of_entry, sets, member, weights)``: the classes of the (class, set) entries, by class, and their sets (as :func:`_class_sets_of` has them); which classes a set
+    has, bool [S, C]; what a hash of a collection of sets adds up of them, int64 [S]. Kept with the program."""
+    kept = getattr(prog, "_class_set_row_tables", None)
+    if kept is None:
+        _, member, in_set, _, in_each = boundary_groups(prog._tr).class_sets
+        ptr, sets, _ = _class_sets_of(prog)
+        S, C, dev = in_each.numel(), prog.C, prog.dev
+        of_entry = torch.repeat_interleave(torch.arange(C, device = dev), (ptr[1:] - ptr[:-1]).long())
+        table = torch.zeros(S, C, dtype = torch.bool, device = dev)
+        table[in_set, member.long()] = True
+        weights = torch.from_numpy(np.random.default_rng(7).integers(1, 1 << 62, S) | 1).to(dev)
+        kept = prog._class_set_row_tables = (of_entry, sets[:of_entry.numel()].long(), table, weights)
+    return kept
+
+
+def _collection_keys(live: torch.Tensor, sets_of: torch.Tensor, kind: torch.Tensor, of_entry: torch.Tensor, sets: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
+    """int64 [N, C], below 2^61: a hash of every class's sets with rows at every target column (``live`` bool [N, entries], ``sets_of`` how many), and of its kind. It
+    only proposes which classes share a row: :func:`set_weight_rows` checks every class against the first of its key."""
+    key = torch.zeros_like(sets_of).index_add_(1, of_entry, torch.where(live, weights.index_select(0, sets)[None, :], 0))
+    return ((key + (sets_of * 2 + kind[None, :].long()) * -7046029254386353131) >> 2) & ((1 << 61) - 1)
+
+
+def set_weight_rows(prog, sw: SetWeights, liveness, col_pos: torch.Tensor, col_K: torch.Tensor, col_first: torch.Tensor, group_first: torch.Tensor, B: int,
+                    stored: Optional[torch.Tensor] = None):
+    """
+    :func:`~.class_rows.class_weight_rows` of a query that has its lists (``sw``), without the classes' own lists: the same :class:`~.class_rows.ClassWeightRows`, field
+    for field. A class is live at a target column where a set it is in has a row there (and, under a session's per-sample classes, the sample allows it: ``liveness``,
+    read for nothing else). The pairs partition by set, so two classes have the same live pairs exactly where the same sets with rows have them: they share a row then, if
+    of a kind (both stored, or both enumerated: ``stored``, and :data:`~.class_rows.CLASS_ROWS_SHARED`), that of the first of them in the boundary's class order. A hash of
+    a class's sets with rows proposes, in that order; every class is then checked against the first of its hash, set by set. None where the tables would be large
+    (:data:`SET_WEIGHT_ROW_CELLS`): the classes' lists then.
+
+    One difference, at the sequence end: every accepting successor is one column there, so the classes' lists give one row to classes that reach different accepting
+    states from the same columns; their pairs are in different sets, and here each keeps a row of its own. The same weights in more rows, at that position alone.
+    """
+    from .class_rows import CLASS_ROWS_SHARED, ClassWeightRows
+    n, C, S, dev = prog.n, prog.C, sw.S, prog.dev
+    N = sw.count.numel()
+    if S * C > SET_WEIGHT_ROW_CELLS:
+        return None
+    of_entry, sets, member, weights = _row_tables(prog)
+    if N * max(C, of_entry.numel(), S) > SET_WEIGHT_ROW_CELLS:
+        return None
+    live = (sw.rank.index_select(0, sw.grp) >= 0).index_select(1, sets)     # [N, entries]: the entry's set has a row at the column
+    sets_of = torch.zeros(N, C, dtype = torch.int64, device = dev).index_add_(1, of_entry, live.long())
+    t = col_pos.repeat_interleave(B)
+    on = sets_of > 0
+    if liveness is not None and liveness.allowed is not None:                # (a session's per-sample classes: one set, or a sample's own)
+        allowed = liveness.allowed.view(-1, n, C)
+        b = torch.arange(N, device = dev) % B if allowed.size(0) > 1 else torch.zeros(N, dtype = torch.long, device = dev)
+        on &= allowed[b, t] != 0
+    order = prog.succ.cls_order.view(n, C).index_select(0, t).long()         # [N, C]: the boundary's classes in its order
+    every = torch.arange(C, device = dev)[None, :]
+    rep = None
+    if CLASS_ROWS_SHARED and stored is not None:
+        kind = stored.long() >= 0
+        key = torch.where(on, _collection_keys(live, sets_of, kind, of_entry, sets, weights), 1 << 61)    # (a dead class: after every live one)
+        keys, by = torch.sort(key.gather(1, order), dim = 1, stable = True)  # a key's classes, in class order
+        classes = order.gather(1, by)
+        first = torch.ones_like(keys, dtype = torch.bool)
+        first[:, 1:] = keys[:, 1:] != keys[:, :-1]
+        start = torch.cummax(torch.where(first, every, 0), dim = 1).values
+        cand = torch.empty_like(classes).scatter_(1, classes, classes.gather(1, start))    # every class's candidate: the first of its key
+        # exactly: as many sets with rows, of a kind, and every such set of the class has the candidate too
+        missing = live & ~member.view(-1).index_select(0, (sets[None, :] * C + cand.index_select(1, of_entry)).view(-1)).view(N, -1)
+        differs = torch.zeros(N, C, dtype = torch.int64, device = dev).index_add_(1, of_entry, missing.long()) > 0
+        differs |= (sets_of != sets_of.gather(1, cand)) | (kind[None, :] != kind[cand])
+        rep = torch.where(on, torch.where(differs, every, cand), -1)
+        own = on & (rep == every)
+    else:
+        own = on
+    own_o = own.gather(1, order)                                             # (in class order)
+    place = torch.cumsum(own_o, dim = 1) - 1
+    count = own_o.sum(dim = 1)
+    off = torch.zeros(N + 1, dtype = torch.int64, device = dev)
+    off[1:] = torch.cumsum(count * col_K, dim = 0)
+    local = (off[:N] - off.index_select(0, col_first)) // col_K              # a column's first row among its row group's
+    m, r = torch.nonzero(own_o, as_tuple = True)                             # every row: its column, its class's place in the order
+    cls = torch.zeros(N, C, dtype = torch.int32, device = dev)
+    cls[m, place[m, r]] = order[m, r].to(torch.int32)
+    row = torch.full((N, C), -1, dtype = torch.int32, device = dev)
+    row[m, order[m, r]] = (local[m] + place[m, r]).to(torch.int32)
+    if rep is not None:                                                      # (a class's row is its representative's)
+        row = torch.where(on, row.gather(1, rep.clamp(min = 0)), -1)
+        rep = rep.to(torch.int32).contiguous()
+    return ClassWeightRows(count = count.to(torch.int32), cls = cls, off = off, row = row.contiguous(), _host = None, _done = None, _groups = group_first.numel() - 1,
+                           rep = rep, _read = (off.index_select(0, group_first).tolist(), int(count.max())))
 
 
 def set_weight_lists(prog, liveness, col_pos: torch.Tensor, col_K: torch.Tensor, B: int, most_columns: Optional[list] = None) -> Optional[SetWeights]:

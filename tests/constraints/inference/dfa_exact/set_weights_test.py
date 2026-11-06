@@ -6,12 +6,15 @@ bars of the float64 reference; where the rule takes them, and what falls back to
 import dataclasses
 import importlib.util
 import os
+import types
 from fractions import Fraction
 
 import pytest
 import torch
 
 import pyjuice.constraints as jc
+from pyjuice.constraints.inference.dfa_exact.kernels import live as LV
+from pyjuice.constraints.inference.dfa_exact.kernels import score as S
 from pyjuice.constraints.inference.dfa_exact.kernels.score import set_weights as SW
 from pyjuice.constraints.inference.dfa_exact.kernels.transitions import host as H
 from pyjuice.constraints.inference.dfa_exact.queries import conditional as CO
@@ -148,6 +151,298 @@ def test_a_classs_live_pairs_are_those_of_the_sets_it_is_in(storage, observed, b
                 assert got == want, (seed, m, c)
                 checked += len(want)
     assert checked > 0
+
+
+def assert_same_rows(want, got, what):
+    """Two :class:`ClassWeightRows`, field for field: a column's classes up to its count (past it, nothing is written)."""
+    for name in ("count", "off", "row"):
+        a, b = getattr(want, name), getattr(got, name)
+        assert a.dtype == b.dtype and a.shape == b.shape and torch.equal(a, b), (what, name)
+    assert (want.rep is None) == (got.rep is None), what
+    if want.rep is not None:
+        assert want.rep.dtype == got.rep.dtype and torch.equal(want.rep, got.rep), (what, "rep")
+    kept = torch.arange(want.cls.size(1), device = want.cls.device)[None, :] < want.count[:, None]
+    assert want.cls.dtype == got.cls.dtype and torch.equal(want.cls[kept], got.cls[kept]), (what, "cls")
+    assert want.starts == got.starts and want.most == got.most and want._groups == got._groups, (what, want.starts, got.starts, want.most, got.most)
+
+
+@cuda_only
+@pytest.mark.parametrize("shared", [True, False])
+@pytest.mark.parametrize("storage", ["dense", "compact"])
+@pytest.mark.parametrize("kind, n", CASES)
+def test_rows_from_the_class_sets_are_the_rows_from_the_classes_lists(kind, n, storage, shared, build_pc, monkeypatch):
+    """A query that has its lists lays its rows out from them, the classes' lists not read: the same rows field for field, a row shared by the classes of the same
+    live pairs or not; under a session's per-sample classes too, one set for every sample or a sample's own. Targets before the last position: at the sequence end the
+    rows are a refinement (:func:`test_rows_at_the_sequence_end_refine_the_classes_own`)."""
+    V, B = 12, 3
+    pc = build_pc(kind, n, V)
+    monkeypatch.setattr(H, "HOST_ENTRIES", 0)
+    monkeypatch.setattr(SW, "SET_WEIGHT_PAIRS_LEAST", 0)
+    monkeypatch.setattr(SW, "SET_WEIGHTS", "force")
+    monkeypatch.setattr(S.class_rows, "CLASS_ROWS_SHARED", shared)
+    made = []
+    rows_of = SW.set_weight_rows
+    monkeypatch.setattr(CO, "set_weight_rows", lambda *a: (made.append((a, rows_of(*a))), made[-1][1])[1])
+    lists, lists_of = [], SW.set_weight_lists
+    monkeypatch.setattr(CO, "set_weight_lists", lambda *a: (lists.append(1), lists_of(*a))[1])
+    compared, merged, ruled_out = 0, 0, 0
+    for seed in range(6):
+        dfa = automaton(seed, V)
+        cc = jc.compile(dfa, pc)
+        if not cc.backend.layout.satisfiable:
+            continue
+        x, masks = evidence(dfa, n, V, B, seed)
+        for name, missing in masks.items():
+            made.clear()
+            lists.clear()
+            targets = missing.clone()
+            targets[:, n - 1] = False
+            if not targets.any():
+                continue
+            CO.conditional(cc.backend, x, missing, targets = targets, precision = "fp32", storage = storage)
+            (prog, sw, lv, col_pos, col_K, col_first, group_first, batch, stored), got = made[0]
+            assert got is not None and prog._class_lists is None and prog.succ.cls_col is None, "the classes' lists were read"
+            assert len(lists) == 1 and len(made) == 1, "the query's lists, or its rows, made more than once"
+            assert_same_rows(S.class_weight_rows(prog, lv, col_pos, col_K, col_first, group_first, batch, stored), got, (seed, name))
+            compared += 1
+            if got.rep is not None:
+                merged += int(((got.rep >= 0) & (got.rep != torch.arange(prog.C, device = DEV)[None, :])).sum())
+            if lv is None:
+                prog._class_lists = None
+                continue
+            g = torch.Generator().manual_seed(seed)
+            for samples in (1, batch):                                    # (classes ruled out: for every sample, or a sample's own)
+                allowed = (torch.rand(samples, n, prog.C, generator = g) < 0.7).to(torch.int8).to(DEV).contiguous()
+                under = types.SimpleNamespace(live = lv.live, allowed = allowed)
+                want = S.class_weight_rows(prog, under, col_pos, col_K, col_first, group_first, batch, stored)
+                assert_same_rows(want, rows_of(prog, sw, under, col_pos, col_K, col_first, group_first, batch, stored), (seed, name, samples))
+                ruled_out += int((want.row < 0).sum() - (got.row < 0).sum())
+            prog._class_lists = None                                      # (what this test's own comparison made: the next query is to make none)
+    assert compared > 0 and ruled_out > 0 and (merged > 0) == shared, (compared, merged, ruled_out)
+
+
+@cuda_only
+@pytest.mark.parametrize("storage", ["dense", "compact"])
+def test_rows_at_the_sequence_end_refine_the_classes_own(storage, build_pc, monkeypatch):
+    """At the last position every accepting successor is one column, so the classes' lists make one row of classes that reach different accepting states from the same
+    columns; the sets keep them apart: the same live classes, never a row shared that the classes' lists keep apart, and before the last position the same rows."""
+    V, n, B = 12, 8, 3
+    pc = build_pc("hmm", n, V)
+    monkeypatch.setattr(H, "HOST_ENTRIES", 0)
+    monkeypatch.setattr(SW, "SET_WEIGHT_PAIRS_LEAST", 0)
+    monkeypatch.setattr(SW, "SET_WEIGHTS", "force")
+    made = []
+    rows_of = SW.set_weight_rows
+    monkeypatch.setattr(CO, "set_weight_rows", lambda *a: (made.append((a, rows_of(*a))), made[-1][1])[1])
+    at_end, apart = 0, 0
+    for seed in range(8):
+        dfa = automaton(seed, V)
+        cc = jc.compile(dfa, pc)
+        if not cc.backend.layout.satisfiable:
+            continue
+        x, masks = evidence(dfa, n, V, B, seed)
+        for name, missing in masks.items():
+            made.clear()
+            CO.conditional(cc.backend, x, missing, precision = "fp32", storage = storage)
+            (prog, sw, lv, col_pos, col_K, col_first, group_first, batch, stored), got = made[0]
+            want = S.class_weight_rows(prog, lv, col_pos, col_K, col_first, group_first, batch, stored)
+            prog._class_lists = None
+            every = torch.arange(prog.C, device = DEV)
+            for m in range(got.count.numel()):
+                t = int(col_pos[m // batch])
+                assert torch.equal(got.rep[m] >= 0, want.rep[m] >= 0), (seed, name, m)                     # (the same live classes)
+                live = got.rep[m] >= 0
+                assert torch.equal(got.row[m][live], got.row[m][got.rep[m][live].long()]), (seed, name, m)  # (a class's row is its representative's)
+                if t + 1 < n:
+                    assert torch.equal(got.rep[m], want.rep[m]) and got.count[m] == want.count[m], (seed, name, m)
+                    continue
+                at_end += 1
+                apart += int(got.count[m] - want.count[m])
+                assert got.count[m] >= want.count[m]
+                assert torch.equal(want.rep[m][live], want.rep[m][got.rep[m][live].long()]), (seed, name, m)  # (shared by the sets: shared by the classes' lists)
+                assert int(got.count[m]) == int((got.rep[m] == every).sum())
+    assert at_end > 0 and apart > 0, (at_end, apart)                                                        # (not vacuous)
+
+
+@cuda_only
+@pytest.mark.parametrize("storage", ["dense", "compact"])
+def test_rows_from_the_class_sets_share_only_what_the_exact_check_passes(storage, build_pc, monkeypatch):
+    """The hash of a class's sets with rows only proposes. With one that tells no two classes apart, every class is checked against the first live one of its column:
+    the same live classes, no row shared that the classes' lists keep apart -- other sets, fewer of them, another kind --, some still shared, and the conditionals the
+    classes' own up to rounding."""
+    V, n, B = 12, 8, 3
+    pc = build_pc("hmm", n, V)
+    monkeypatch.setattr(H, "HOST_ENTRIES", 0)
+    monkeypatch.setattr(SW, "SET_WEIGHT_PAIRS_LEAST", 0)
+    monkeypatch.setattr(SW, "_collection_keys", lambda live, sets_of, *a: torch.zeros_like(sets_of))
+    made = []
+    rows_of = SW.set_weight_rows
+    monkeypatch.setattr(CO, "set_weight_rows", lambda *a: (made.append((a, rows_of(*a))), made[-1][1])[1])
+    refused, shared = 0, 0
+    for seed in range(8):
+        dfa = automaton(seed, V)
+        cc = jc.compile(dfa, pc)
+        if not cc.backend.layout.satisfiable:
+            continue
+        x, masks = evidence(dfa, n, V, B, seed)
+        for name, missing in masks.items():
+            targets = missing.clone()
+            targets[:, n - 1] = False                                     # (the sequence end: a refinement whatever the hash)
+            if not targets.any():
+                continue
+            monkeypatch.setattr(SW, "SET_WEIGHTS", False)
+            walked = CO.conditional(cc.backend, x, missing, targets = targets, precision = "fp32", storage = storage).clone()
+            monkeypatch.setattr(SW, "SET_WEIGHTS", "force")
+            made.clear()
+            out = CO.conditional(cc.backend, x, missing, targets = targets, precision = "fp32", storage = storage)
+            finite = ~torch.isinf(walked)
+            assert torch.equal(torch.isinf(out), ~finite) and float((out[finite] - walked[finite]).abs().max()) <= 1e-4, (seed, name)
+            (prog, sw, lv, col_pos, col_K, col_first, group_first, batch, stored), got = made[0]
+            want = S.class_weight_rows(prog, lv, col_pos, col_K, col_first, group_first, batch, stored)
+            every = torch.arange(prog.C, device = DEV)[None, :]
+            live = got.rep >= 0
+            assert torch.equal(live, want.rep >= 0), (seed, name)                                             # (the same live classes)
+            of_got = got.rep.long().clamp(min = 0)
+            assert torch.equal(want.rep.gather(1, of_got)[live], want.rep[live]), (seed, name)                # (shared here: shared by the classes' lists)
+            assert torch.equal(got.row.gather(1, of_got)[live], got.row[live]), (seed, name)                  # (a class's row is its representative's)
+            assert torch.equal(got.count.long(), (live & (got.rep == every)).sum(dim = 1)), (seed, name)
+            assert bool((got.count >= want.count).all()) and got.starts[-1] >= want.starts[-1], (seed, name)
+            order = prog.succ.cls_order.view(n, prog.C).index_select(0, col_pos.repeat_interleave(batch)).long()
+            place = torch.where(live.gather(1, order), every, prog.C).argmin(dim = 1)                         # (a column's first live class, in its order)
+            lead = order.gather(1, place[:, None])
+            some = live.any(dim = 1)
+            assert torch.equal((got.rep == lead)[some], (want.rep == lead)[some]), (seed, name)               # (the first live class's row: all the classes' lists give it)
+            refused += int((got.count - want.count).sum())
+            shared += int((live & (got.rep != every)).sum())
+    assert refused > 0 and shared > 0, (refused, shared)                                                      # (not vacuous)
+
+
+@cuda_only
+def test_rows_past_their_cells_come_from_the_classes_lists(build_pc, monkeypatch):
+    """Tables too large to lay the rows out from the sets -- the (set, class) table an automaton has, or a query's by (target column, class) and (target column, entry)
+    --, each to the last cell: the classes' lists then, the weights still through the sets, within rounding of the classes' walks."""
+    V, n = 12, 8
+    pc = build_pc("hmm", n, V)
+    monkeypatch.setattr(H, "HOST_ENTRIES", 0)
+    monkeypatch.setattr(SW, "SET_WEIGHT_PAIRS_LEAST", 0)
+    dfa = automaton(1, V)
+    cc = jc.compile(dfa, pc)
+    x, masks = evidence(dfa, n, V, 3, 1)
+    one = torch.zeros(1, n, dtype = torch.bool, device = DEV)
+    one[0, n // 2] = True
+    taken = taken_by(monkeypatch)
+    made = []
+    rows_of = SW.set_weight_rows
+    monkeypatch.setattr(CO, "set_weight_rows", lambda *a: (made.append((a, rows_of(*a))), made[-1][1])[1])
+    prog = cc.backend.program()
+    bound_by = set()
+    for data, missing in ((x[:1], one), (x, masks["none"])):               # (one target column; every column of a batch)
+        monkeypatch.setattr(SW, "SET_WEIGHTS", False)
+        want = CO.conditional(cc.backend, data, missing, precision = "fp32").clone()
+        finite = ~torch.isinf(want)
+        monkeypatch.setattr(SW, "SET_WEIGHTS", "force")
+        monkeypatch.setattr(SW, "SET_WEIGHT_ROW_CELLS", 1 << 26)
+        CO.conditional(cc.backend, data, missing, precision = "fp32")
+        sw = made[-1][0][1]
+        table, query = sw.S * prog.C, sw.count.numel() * max(prog.C, SW._row_tables(prog)[0].numel(), sw.S)
+        assert table != query
+        bound_by.add(table > query)
+        for cells, from_sets in ((max(table, query), True), (max(table, query) - 1, False), (min(table, query), False)):
+            monkeypatch.setattr(SW, "SET_WEIGHT_ROW_CELLS", cells)
+            prog._class_lists = None
+            taken.clear()
+            got = CO.conditional(cc.backend, data, missing, precision = "fp32")
+            assert (made[-1][1] is not None) == from_sets and (prog._class_lists is None) == from_sets, (cells, table, query)
+            assert taken and torch.equal(torch.isinf(got), ~finite) and float((got[finite] - want[finite]).abs().max()) <= 1e-4
+    assert bound_by == {True, False}                                        # (each of the two bounds the one that binds, once)
+
+
+@cuda_only
+def test_an_automaton_the_cuda_kernels_share_takes_the_sets_where_they_decline(build_pc, monkeypatch):
+    """Compact values under pruning on an automaton of few classes and columns are the CUDA kernels': not every query of it takes the sets, so its rows come from the
+    classes' lists; a dense query, or one with no liveness, still goes through the sets by the rule, and a compact one is left as it was, to the bit."""
+    V, n, B = 12, 8, 3
+    pc = build_pc("hmm", n, V)
+    monkeypatch.setattr(H, "HOST_ENTRIES", 0)
+    monkeypatch.setattr(SW, "SET_WEIGHT_PAIRS_LEAST", 0)
+    monkeypatch.setattr(SW, "SET_WEIGHT_MIN_ENTRIES", 0)
+    monkeypatch.setattr(SW, "SET_WEIGHT_MIN_RATIO", 0.0)
+    dfa = automaton(1, V)
+    cc = jc.compile(dfa, pc)
+    x, masks = evidence(dfa, n, V, B, 1)
+    prog = cc.backend.program()
+    assert SW.set_weights_apply(prog, None, None) and not SW.set_weights_always(prog)
+    taken = taken_by(monkeypatch)
+    made = []
+    monkeypatch.setattr(CO, "set_weight_rows", lambda *a: made.append(a))
+    through = 0
+    for name, missing in masks.items():
+        for storage in ("dense", "compact"):
+            monkeypatch.setattr(SW, "SET_WEIGHTS", False)
+            want = CO.conditional(cc.backend, x, missing, precision = "fp32", storage = storage).clone()
+            monkeypatch.setattr(SW, "SET_WEIGHTS", True)
+            taken.clear()
+            got = CO.conditional(cc.backend, x, missing, precision = "fp32", storage = storage)
+            assert bool(taken) == (storage == "dense"), (name, storage)
+            finite = ~torch.isinf(want)
+            if taken:
+                through += 1
+                assert torch.equal(torch.isinf(got), ~finite) and float((got[finite] - want[finite]).abs().max()) <= 1e-4, (name, storage)
+            else:
+                assert torch.equal(got, want), (name, storage)
+    assert through == len(masks) and not made
+
+
+@cuda_only
+@pytest.mark.parametrize("storage", ["dense", "compact"])
+def test_the_hosts_count_takes_the_most_live_columns_of_a_position(storage, build_pc, monkeypatch):
+    """What the host's count of a query's pairs goes by: per target position the most live columns of any sample there, read off the liveness -- fewer than the
+    boundary has under evidence, and not one sample's --, every column where there is no liveness. Reading it builds the liveness' lists no second time."""
+    V, n, B = 12, 8, 3
+    pc = build_pc("hmm", n, V)
+    monkeypatch.setattr(H, "HOST_ENTRIES", 0)
+    monkeypatch.setattr(SW, "SET_WEIGHT_PAIRS_LEAST", 0)
+    monkeypatch.setattr(SW, "SET_WEIGHTS", "force")
+    calls, most = [], SW.most_live_columns
+    monkeypatch.setattr(CO, "most_live_columns", lambda *a: (calls.append((a, most(*a))), calls[-1][1])[1])
+    launches = []
+
+    class Counted:                                                          # (the kernel of the live columns' lists: every launch, and whether with the ranks)
+        def __init__(self, kernel):
+            self.kernel = kernel
+
+        def __getitem__(self, grid):
+            launch = self.kernel[grid]
+            return lambda *a, **kw: (launches.append(kw["RANK"]), launch(*a, **kw))[1]
+
+    monkeypatch.setattr(LV, "_row_lists_kernel", Counted(LV._row_lists_kernel))
+    pruned, uneven, not_the_first, every = 0, 0, 0, 0
+    for seed in range(6):
+        dfa = automaton(seed, V)
+        cc = jc.compile(dfa, pc)
+        if not cc.backend.layout.satisfiable:
+            continue
+        x, masks = evidence(dfa, n, V, B, seed)
+        for name, missing in masks.items():
+            calls.clear()
+            launches.clear()
+            CO.conditional(cc.backend, x, missing, precision = "fp32", storage = storage)
+            (prog, lv, positions), got = calls[0]
+            if storage == "compact":                                        # (the lists with their ranks, as the layout reads them: built once)
+                assert launches == [True], (seed, name, launches)
+            targets = [t for t in range(n) if positions[t]]
+            assert len(calls) == 1 and len(got) == len(targets) > 0
+            if lv is None:
+                assert got == [prog.width[t] for t in targets]
+                every += 1
+                continue
+            for t, g in zip(targets, got):
+                counts = [int((lv.live[b, t, :prog.width[t]] != 0).sum()) for b in range(B)]
+                assert g == max(counts), (seed, name, t)
+                pruned += g < prog.width[t]
+                uneven += max(counts) != min(counts)
+                not_the_first += max(counts) != counts[0]
+    assert pruned > 0 and uneven > 0 and not_the_first > 0 and (every > 0) == (storage == "dense"), (pruned, uneven, not_the_first, every)
 
 
 @cuda_only

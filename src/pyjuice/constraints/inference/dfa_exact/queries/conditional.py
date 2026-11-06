@@ -26,8 +26,8 @@ from ..kernels.common import pack_aligned
 from ..kernels.compact import (STORAGES, compact_buffers, held_elsewhere, held_moves, partial_carry, query_layout,
                                regather_into, resolve_storage, worth_parking)
 from ..kernels.live import live_successors, liveness
-from ..kernels.score import (class_weight_rows, class_weight_walk, combine_set_weights, score_group, score_tables, set_weight_lists,
-                             set_weights_apply)
+from ..kernels.score import (class_weight_rows, class_weight_walk, combine_set_weights, most_live_columns, score_group, score_tables,
+                             set_weight_lists, set_weight_rows, set_weights_always, set_weights_apply)
 from ..kernels.transitions import enumerated_args
 from .backend.plans import (PLANS_PER_POSITION, PLAN_CACHE_SIZE, per_sample_intervals, prior_regions, query_plan,
                     read_regions, scope_intervals, top_down_prior)
@@ -287,7 +287,18 @@ def class_weights(backend, data: torch.Tensor, missing: torch.Tensor, positions:
     # waits for its counts (the lists with their ranks first, as the layout reads them: built once) --, unless a dense
     # query observing nothing may give the liveness up below (its rows then every column's, as they were)
     early = lv is not None and (observed.any() or succ is not None or storage == "compact")
-    if early:
+    # on an automaton whose class weights go through the pairs' class sets whatever the storage (:mod:`..kernels.score.set_weights`), the query's lists first and its rows
+    # from them: the lists by class, as large as every other table together at long lengths, are then not read at all. With nothing observed every column is live for
+    # every sample, so a position's samples share their lists
+    sets, rows = None, None
+    always = set_weights_always(prog)
+    if always:
+        if lv is not None and storage != "dense":
+            lv.lists(rank = True)
+        sets = set_weight_lists(prog, lv if observed.any() or succ is not None else None, col_pos, col_K, B, most_live_columns(prog, lv, positions))
+        if sets is not None:
+            rows = set_weight_rows(prog, sets, lv, col_pos, col_K, col_first, group_first, B, backend.token_classes.stored_of_class)
+    if early and rows is None:
         if storage != "dense":
             lv.lists(rank = True)
         rows = class_weight_rows(prog, lv, col_pos, col_K, col_first, group_first, B,
@@ -332,15 +343,15 @@ def class_weights(backend, data: torch.Tensor, missing: torch.Tensor, positions:
                               lambda: backend.state.flows(B, bufs, compact))
     else:
         flows = backend.state.flows(B, bufs, compact)
-    if not early:
+    if rows is None:
         rows = class_weight_rows(prog, lv, col_pos, col_K, col_first, group_first, B,
                                  backend.token_classes.stored_of_class)
     class_weight_walk(rows, prog, lv, compact)
     # through the pairs' class sets, on an automaton whose classes share most of their pairs: the launches write the sets' rows, the classes' are summed from them
     # (:mod:`..kernels.score.set_weights`). Their lists here, before the passes are issued: what they wait for on the device is the liveness alone, not the forward pass;
     # with nothing observed every column is live for every sample, so a position's samples share their lists, whatever the storage
-    sets = set_weight_lists(prog, lv if observed.any() or succ is not None else None, col_pos, col_K, B, [rows.walk[t] for t in np.nonzero(positions)[0].tolist()]) \
-        if set_weights_apply(prog, lv, compact) else None
+    if not always and set_weights_apply(prog, lv, compact):
+        sets = set_weight_lists(prog, lv if observed.any() or succ is not None else None, col_pos, col_K, B, [rows.walk[t] for t in np.nonzero(positions)[0].tolist()])
     gates = F.gate_context(backend, external)
     hold = None if partial is None or compact is None else dict(regions = partial, fresh = carry["fresh"])
     forward = lambda p, **kw: F.run_forward(backend, bufs, p, x, missing, obs_class, lv, precision, compact, masses,
