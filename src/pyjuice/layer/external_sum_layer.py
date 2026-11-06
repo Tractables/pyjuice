@@ -669,11 +669,19 @@ class ExternalParamsSumLayer(SumLayer):
 
         if len(ns_tensors) == 0:
             # Nothing supplied for this layer -> it is a plain sum layer
-            return super(ExternalParamsSumLayer, self).backward(
+            out = super(ExternalParamsSumLayer, self).backward(
                 node_flows, element_flows, node_mars, element_mars, params,
                 param_flows = param_flows, propagation_alg = propagation_alg, op_params = op_params,
                 **(dict(kwargs, stream_children = sc) if sc is not None else kwargs)
             )
+            # ... whose flows still reach a conditional M-step where the parameterization keeps a denominator flow:
+            # the effective parameters of this pass are the shared ones, so `F-[n, c] += sum_b f_b[n] * theta[n, c]`
+            # -- the top-down term's form, the batch's node flows in place of `P_td`. Without it the M-step divided
+            # these flows by `pseudocount * theta` alone: a damped step all but ignored its step size, and a
+            # full-batch one (pseudocount 0) overflowed to nan.
+            if param_flows is not None and denom_param_flows is not None:
+                self._accumulate_ungated_denom(node_flows, denom_param_flows, kwargs.get("logspace_flows", False))
+            return out
 
         # The product layer below fused into the parameterization's element and parameter-flow kernels where every
         # partition settled on them (`_bk_fusion_ready`); else its values formed for the kernels that read them, the
@@ -769,6 +777,17 @@ class ExternalParamsSumLayer(SumLayer):
         if fallback is not None:
             scatter_flows(node_flows, element_flows, fallback, self._element_rows())
         return None
+
+    def _accumulate_ungated_denom(self, node_flows: torch.Tensor, denom_param_flows: torch.Tensor,
+                                  logspace_flows: bool) -> None:
+        """The denominator flow of a backward that supplied nothing for this layer (see `backward`), through
+        :func:`ExternalSumParams.accumulate_denom_top_down`: it takes a value per node of the circuit, here the
+        layer's node flows summed over the batch."""
+        sid, eid = self._layer_nid_range
+        flows = node_flows[sid:eid]
+        per_node = torch.zeros(node_flows.size(0), dtype = torch.float32, device = node_flows.device)
+        per_node[sid:eid] = (flows.exp() if logspace_flows else flows).sum(dim = 1)
+        self.external_params.accumulate_denom_top_down(self, per_node, denom_param_flows, 1.0)
 
     def _bk_fusion_ready(self, batch_size: int, dtype: torch.dtype, op: bool, param_flows: bool) -> bool:
         """`SumLayer._bk_fusion_ready`, a gated call's by the parameterization's records (`_stream_fusion_bk`)."""

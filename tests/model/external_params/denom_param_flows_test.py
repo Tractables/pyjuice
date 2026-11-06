@@ -1283,6 +1283,77 @@ def test_one_gate_correction_matches_standard_em():
         (pc_on.params - pc_off.params).abs().max().item()
 
 
+# ------------------------------------------- a backward that supplied nothing, on a corrected circuit
+
+@cuda_only
+@pytest.mark.parametrize("rescale", [False, True], ids = ["mini_batch", "anemone"])
+@pytest.mark.parametrize("pseudocount", [0.0, 0.1])
+def test_ungated_backward_on_a_corrected_circuit_is_the_standard_em_step(rescale, pseudocount):
+    """A backward that was given no gate runs the shared parameters, so its denominator is `theta` times the
+    node's flow and the conditional M-step is the standard one. It used to accumulate none, and the damped step
+    then divided these flows by `pseudocount * theta` alone: the step size all but ignored (0.27 off at a
+    pseudocount of 0, 0.014 at 0.1). The rescaled step (Anemone) was right before too: it normalizes
+    `theta * F+ / F-` undamped, which any denominator of the form `theta` times a factor per node leaves the same
+    -- what breaks there is a period that mixes gated and ungated passes (the test below)."""
+    dev = torch.device("cuda:0")
+    torch.manual_seed(11)
+    x = torch.randint(0, NUM_CATS, [64, 2], device = dev)
+    r_plain, _ = _build(gated = None)
+    r_corr, _ = _build(gated = True)
+    pc_plain = juice.compile(r_plain, verbose = False).to(dev)
+    pc_corr = juice.compile(r_corr, verbose = False).to(dev)
+    assert torch.equal(pc_plain.params, pc_corr.params)
+    for pc in (pc_plain, pc_corr):
+        pc(x)
+        pc.backward(x, logspace_flows = True, flows_memory = 0.0)
+        pc.mini_batch_em(step_size = 0.5, pseudocount = pseudocount, step_size_rescaling = rescale)
+    assert bool(torch.isfinite(pc_corr.params).all())
+    assert torch.allclose(pc_corr.params, pc_plain.params, rtol = 1e-4, atol = 1e-6), \
+        (pc_corr.params - pc_plain.params).abs().max().item()
+
+
+@cuda_only
+@pytest.mark.parametrize("logspace", [True, False])
+def test_denominators_of_gated_and_ungated_backwards_add_up(logspace):
+    """One period with a gated and an ungated backward: `F-` is the gated pass's plus `theta * node flow` of the
+    ungated one, as `F+` is the sum of the two passes'."""
+    dev = torch.device("cuda:0")
+    root, ns = _build(gated = True)
+    pc = juice.compile(root, verbose = False).to(dev)
+    torch.manual_seed(12)
+    x1 = torch.randint(0, NUM_CATS, [48, 2], device = dev)
+    x2 = torch.randint(0, NUM_CATS, [32, 2], device = dev)
+    phi = _phi(ns, 48, dev)
+
+    def gated(memory):
+        pc(x1, sum_external_params = {ns: phi})
+        pc.backward(x1, logspace_flows = True, flows_memory = memory)
+
+    def ungated(memory):
+        pc(x2)
+        pc.backward(x2, logspace_flows = logspace, allow_modify_flows = False, flows_memory = memory)
+
+    gated(0.0)
+    fm_gated, fp_gated = _fminus(pc, ns).clone(), pc.param_flows.clone()
+    ungated(0.0)
+    fm_ungated, fp_ungated = _fminus(pc, ns).clone(), pc.param_flows.clone()
+
+    # The ungated pass's own: theta times the node's flow, a node's flow the sum of its `F+`
+    (ps, pe), (pfs, pfe) = ns._param_range, ns._param_flow_range
+    E, bs, cbs = ns.edge_ids.size(1), ns.block_size, ns.ch_block_size
+    nb = ns.edge_ids[0].to(dev)
+    flow = torch.zeros(ns.num_node_blocks, bs, device = dev).index_add_(
+        0, nb, fp_ungated[pfs:pfe].view(E, cbs, bs).sum(dim = 1))
+    want = pc.params[ps:pe].view(E, cbs, bs).float() * flow[nb][:, None, :]
+    assert float(flow.sum()) > 1.0
+    assert torch.allclose(fm_ungated[pfs:pfe].view(E, cbs, bs), want, rtol = 2e-3, atol = 1e-5)
+
+    gated(0.0)
+    ungated(1.0)
+    assert torch.allclose(pc.param_flows, fp_gated + fp_ungated, rtol = 1e-4, atol = 1e-5)
+    assert torch.allclose(_fminus(pc, ns), fm_gated + fm_ungated, rtol = 1e-4, atol = 1e-5)
+
+
 def _anemone_step(pc, ns, x, phi, step_size, pseudocount = 0.0):
     """One Anemone (`step_size_rescaling`) EM step under a live gate."""
     pc(x, sum_external_params = {ns: phi})
