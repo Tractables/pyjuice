@@ -35,7 +35,7 @@ from pyjuice.utils.util import host_cdiv, host_next_power_of_2
 from .....distributions.categorical import _exact_dot
 from ..common import _next_col_of, grid_chunks, one_copy
 from .host import host_tables
-from .tables import boundary_groups
+from .tables import _ranges, boundary_groups
 from .host_kernels import _column_signatures, _signature_representatives, _signature_slots
 from .masses import TRANSITION_PAIR_TILE, TRANSITION_TILES, job_tile, job_tiles
 
@@ -98,21 +98,23 @@ def _mix(v: torch.Tensor, salt: int) -> torch.Tensor:
     return z ^ _shift_right(z, 31)
 
 
-def _segment_hash(vals: torch.Tensor, seg: torch.Tensor, starts: torch.Tensor, lengths: torch.Tensor, longest: int,
-                  salt: int) -> torch.Tensor:
-    """Every segment's polynomial hash of its values (``vals`` int64, ``seg`` every value's segment, ``starts`` /
-    ``lengths`` the segments' in ``vals``, ``longest`` the longest's length), wrapping: 0 for an empty segment."""
-    out = torch.zeros(lengths.numel(), dtype = torch.int64, device = vals.device)
-    if vals.numel() == 0:
-        return out
-    k = torch.arange(vals.numel(), device = vals.device) - starts[seg]
+def _hash_powers(longest: int, salt: int, dev) -> torch.Tensor:
+    """int64 [longest]: the powers of the polynomial hash's base, wrapping."""
     base = 0x100000001B3 + 2 * salt
     powers, power = [], 1
     for _ in range(longest):
         powers.append(_signed(power))
         power = power * base % (1 << 64)
-    pw = torch.tensor(powers, dtype = torch.int64, device = vals.device)
-    return out.index_add_(0, seg, _mix(vals, salt) * pw[k])
+    return torch.tensor(powers, dtype = torch.int64, device = dev)
+
+
+def _segment_hash(vals: torch.Tensor, lengths: torch.Tensor, powers: torch.Tensor, salt: int) -> torch.Tensor:
+    """Every segment's polynomial hash of its values (``vals`` int64, a segment's after another's, ``lengths`` theirs, ``powers`` as long as the longest), wrapping: 0 for an empty
+    segment."""
+    dev = vals.device
+    seg = torch.repeat_interleave(torch.arange(lengths.numel(), device = dev), lengths)
+    place = _ranges(torch.zeros_like(lengths), lengths, vals.numel())
+    return torch.zeros(lengths.numel(), dtype = torch.int64, device = dev).index_add_(0, seg, _mix(vals, salt) * powers.index_select(0, place))
 
 
 def _spread(counts: torch.Tensor):
@@ -196,49 +198,60 @@ def signature_masses(prog, masses, trans_size: int) -> Optional[SignatureMasses]
     if host is not None and host.pairs_host is not None:
         return _on_the_host(prog, masses, trans_size, host)
     n, W, dev = prog.n, prog.W, prog.dev
-    long = lambda x: x.long()
+    groups = boundary_groups(prog._tr)
     width = torch.tensor(prog.width, dtype = torch.int64, device = dev)
-    sid = long(prog.state_id).view(n + 1, W)
-    entry_ptr = long(tt.entry_ptr).view(n, W + 1)
-    entry_succ, entry_x = long(tt.entry_succ), long(tt.entry_x)
-    pred_ptr, pred_x = long(tt.pred_ptr).view(n, W + 1), long(tt.pred_x)
+    sid = prog.state_id.view(n + 1, W)
     enum = en.on
 
-    # every column (t, q) and its pairs (entries: by column, then successor)
-    T, Q = _spread(width[:n])
-    es, ee = entry_ptr[T, Q], entry_ptr[T, Q + 1]
-    npairs = ee - es
-    cstart = torch.cumsum(npairs, dim = 0) - npairs
-    ecol, ek = _spread(npairs)                                     # every (column, pair) visit
-    eidx = es[ecol] + ek
-    gfirst = es - entry_ptr[T, 0]                                  # a column's first pair's number (the kernels')
-    if not torch.equal(entry_x[eidx], gfirst[ecol] + ek):          # (its pairs: consecutive numbers from it)
-        return None
-    end = T[ecol] + 1 == n
-    next_t = (T[ecol] + 1).clamp(max = n)
-    succ_state = torch.where(end, -7, sid[next_t, torch.where(end, torch.zeros_like(eidx), entry_succ[eidx])])
+    # every group's columns (alike boundaries, alike columns: no boundary but a group's first is looked at), and their pairs: the entries as they lie, by group, column, then successor
+    firsts = torch.tensor(groups.firsts, dtype = torch.long, device = dev)
+    of_group, Q = _spread(width.index_select(0, firsts))
+    T = firsts.index_select(0, of_group)
+    entry_ptr = tt.entry_ptr.view(n, W + 1)
+    es = entry_ptr[T, Q]
+    npairs = (entry_ptr[T, Q + 1] - es).long()
+    base = entry_ptr[firsts, 0]
+    gfirst = es - base.index_select(0, of_group)                   # a column's first pair's number (the kernels')
+    entries = int(npairs.sum())
+    in_rows = [0] + torch.cumsum(width.index_select(0, firsts), dim = 0).tolist()
+    in_entries = base.tolist() + [entries]
+    # a pair's successor's state (a sequence end: its one column's, and a column there is told by the sizes below), which every batch of groups hashes, a column's in order of its
+    # pairs. A batch's are few, whatever the length
+    succ_state = torch.empty(entries, dtype = torch.int32, device = dev)
+    hashes = torch.zeros(T.numel(), dtype = torch.int64, device = dev)
+    powers = _hash_powers(int(tt.max_pairs), 1, dev)
+    for k, end in groups.batches:
+        a, b = in_entries[k], in_entries[end]
+        if b > a:
+            at = torch.repeat_interleave((firsts[k:end] + 1) * W, torch.tensor([in_entries[g + 1] - in_entries[g] for g in range(k, end)], dtype = torch.long, device = dev))
+            state = sid.view(-1).index_select(0, at + tt.entry_succ[a:b])
+            succ_state[a:b] = state
+            hashes[in_rows[k]:in_rows[end]] = _segment_hash(state.long(), npairs[in_rows[k]:in_rows[end]], powers, 1)
+            del at, state
     # its enumerated tokens: how many. Which, and to which of its pairs, says its state and which of its pairs are live, by the classes of its state in their order: those
     # the signature already has, so no column's need reading (nor can two columns' differ, whose signatures agree)
     if enum:
-        nenum = boundary_groups(prog._tr).enumerated_counts(en, T, Q)
+        nenum = groups.enumerated_counts(en, T, Q)
     else:
         nenum = torch.zeros(T.numel(), dtype = torch.int64, device = dev)
     # a column's sizes, in that order, one key where they fit in it (the rows' order is theirs: one sort, not four)
     pair_bits, enum_bits = int(tt.max_pairs).bit_length(), int(tt.max_enum).bit_length()
+    state_of = sid[T, Q].long()
     if int(prog.K).bit_length() + pair_bits + enum_bits < 62:
-        sizes = [(((sid[T, Q] << pair_bits) | npairs) << enum_bits | nenum) << 1 | (T + 1 == n).long()]
+        sizes = [(((state_of << pair_bits) | npairs) << enum_bits | nenum) << 1 | (T + 1 == n).long()]
     else:
-        sizes = [sid[T, Q], npairs, nenum, (T + 1 == n).long()]
+        sizes = [state_of, npairs, nenum, (T + 1 == n).long()]
     # (the operands' hashes: no second one, exactly checked below)
-    first, sig = _unique_rows(sizes + [_segment_hash(succ_state, ecol, cstart, npairs, tt.max_pairs, 1)])
-    rep = first[sig]                                               # every column's signature's first column
+    first, sig = _unique_rows(sizes + [hashes])
+    del hashes, sizes, state_of, nenum
     # exact: every column's operands are its first's (no hash collision)
-    if not torch.equal(succ_state, succ_state[cstart[rep[ecol]] + ek]):
+    if not torch.equal(succ_state, succ_state.index_select(0, _ranges(es.index_select(0, first.index_select(0, sig)), npairs, entries))):
         return None
     S = first.numel()
     sig_pairs = npairs[first]
     sig_off = torch.cumsum(sig_pairs, dim = 0) - sig_pairs
     slots = int(sig_pairs.sum())
+    del succ_state
 
     # the positions' classes: the same class-mass rows in rank order
     classes = position_classes(prog, masses)
@@ -250,36 +263,31 @@ def signature_masses(prog, masses, trans_size: int) -> Optional[SignatureMasses]
     pair_off = np.where(cls_of >= 0, cbase[np.maximum(cls_of, 0)], 0)
     pairs = np.where(cls_of >= 0, slots, 0)
 
-    # representatives: every (class, signature)'s first column at a position of the class's
+    # representatives: every (class, signature)'s first column at a position of the class's: a position of a class and group seen before has none
     cls_t = torch.from_numpy(cls_of).to(dev)
-    cand = torch.nonzero(cls_t[T] >= 0).flatten()
-    _, group = torch.unique(cls_t[T[cand]] * S + sig[cand], return_inverse = True)
-    reps = torch.sort(cand[_first_of(group, int(group.max()) + 1 if group.numel() else 0)]).values   # by position, then column
-    rep_t, rep_q = T[reps], Q[reps]
-    rep_shift = sig_off[sig[reps]] - gfirst[reps]
+    of_t = groups.at
+    read = torch.nonzero(cls_t >= 0).flatten()
+    _, seen = torch.unique(cls_t[read] * len(groups.firsts) + of_t[read], return_inverse = True)
+    read = torch.sort(read[_first_of(seen, int(seen.max()) + 1 if seen.numel() else 0)]).values
+    in_row = torch.tensor(in_rows, dtype = torch.long, device = dev)
+    visit, within = _spread(width.index_select(0, read))           # (a position's columns, a position's after another's)
+    rows = in_row[of_t[read[visit]]] + within
+    _, group = torch.unique(cls_t[read[visit]] * S + sig[rows], return_inverse = True)
+    reps = torch.sort(_first_of(group, int(group.max()) + 1 if group.numel() else 0)).values   # by position, then column
+    rep_t, rep_q = read[visit[reps]], within[reps]
+    rep_row = rows[reps]
+    rep_first = gfirst[rep_row].long()
+    rep_shift = sig_off[sig[rep_row]] - rep_first
     rep_count = torch.bincount(rep_t, minlength = n)
     rep_ptr = torch.cat([torch.zeros(1, dtype = torch.int64, device = dev), torch.cumsum(rep_count, dim = 0)])
+    del read, visit, within, rows, group, seen, reps, rep_row, of_group, T, Q, es, gfirst
 
-    # the entries' and predecessors' mass indices: their pair's slot (alike boundaries share entries: one value)
-    exs = entry_x.clone()
-    slot_e = sig_off[sig[ecol]] + ek
-    exs[eidx] = slot_e
-    if not torch.equal(exs[eidx], slot_e):
-        return None
-    pairbase = torch.cat([torch.zeros(1, dtype = torch.int64, device = dev),
-                          torch.cumsum(torch.as_tensor(tt.num_pairs, dtype = torch.int64, device = dev), dim = 0)])
-    pslot = torch.full((int(pairbase[-1]),), -1, dtype = torch.int64, device = dev)
-    pslot[pairbase[T[ecol]] + entry_x[eidx]] = slot_e
-    jw = torch.where(torch.arange(n, device = dev) + 1 == n, 1, width[1:n + 1])    # columns at t + 1 (a sequence end: one)
-    boundaries = torch.arange(n, device = dev)
-    ps, pe = pred_ptr[boundaries, 0], pred_ptr[boundaries, jw]
-    pt, within = _spread(pe - ps)
-    pidx = ps[pt] + within
-    slot_p = pslot[pairbase[pt] + pred_x[pidx]]
-    pxs = pred_x.clone()
-    pxs[pidx] = slot_p
-    if (slot_p < 0).any() or not torch.equal(pxs[pidx], slot_p):
-        return None
+    # the entries' and predecessors' mass indices: their pair's slot, a predecessor's by its pair's number in its group (none: a table's one 0, as it lies)
+    exs, pxs = tt.entry_x, tt.pred_x
+    if entries:
+        exs = _ranges(sig_off.to(torch.int32).index_select(0, sig), npairs, entries)
+        in_group = torch.tensor(in_entries, dtype = torch.long, device = dev)
+        pxs = exs.index_select(0, torch.repeat_interleave(base, in_group[1:] - in_group[:-1]) + tt.pred_x)
 
     # the representatives' steps: every step of a position with one, as `transition_job` cuts them
     kept = torch.unique(rep_t)
@@ -290,7 +298,7 @@ def signature_masses(prog, masses, trans_size: int) -> Optional[SignatureMasses]
     i32 = lambda x: x.to(torch.int32).contiguous()
     lists = (None, None, None)
     if enum:                                                       # (their enumerated entries, the only ones read)
-        lists = boundary_groups(prog._tr).enumerated_of(rep_t, rep_q, gfirst[reps], en.code.long())
+        lists = groups.enumerated_of(rep_t, rep_q, rep_first, en.code.long())
     return SignatureMasses(pair_off = torch.from_numpy(pair_off).to(dev), pairs = torch.from_numpy(pairs).to(dev),
                            entry_x = i32(exs), pred_x = i32(pxs), size = size,
                            job = (rep_rows, i32(job_tiles(kept, prog.pos_steps[kept], TS)), TS), rep_ptr = i32(rep_ptr),
