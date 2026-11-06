@@ -26,7 +26,8 @@ from ..kernels.common import pack_aligned
 from ..kernels.compact import (STORAGES, compact_buffers, held_elsewhere, held_moves, partial_carry, query_layout,
                                regather_into, resolve_storage, worth_parking)
 from ..kernels.live import live_successors, liveness
-from ..kernels.score import class_weight_rows, class_weight_walk, score_group, score_tables
+from ..kernels.score import (class_weight_rows, class_weight_walk, combine_set_weights, score_group, score_tables, set_weight_lists,
+                             set_weights_apply)
 from ..kernels.transitions import enumerated_args
 from .backend.plans import (PLANS_PER_POSITION, PLAN_CACHE_SIZE, per_sample_intervals, prior_regions, query_plan,
                     read_regions, scope_intervals, top_down_prior)
@@ -335,6 +336,11 @@ def class_weights(backend, data: torch.Tensor, missing: torch.Tensor, positions:
         rows = class_weight_rows(prog, lv, col_pos, col_K, col_first, group_first, B,
                                  backend.token_classes.stored_of_class)
     class_weight_walk(rows, prog, lv, compact)
+    # through the pairs' class sets, on an automaton whose classes share most of their pairs: the launches write the sets' rows, the classes' are summed from them
+    # (:mod:`..kernels.score.set_weights`). Their lists here, before the passes are issued: what they wait for on the device is the liveness alone, not the forward pass;
+    # with nothing observed every column is live for every sample, so a position's samples share their lists, whatever the storage
+    sets = set_weight_lists(prog, lv if observed.any() or succ is not None else None, col_pos, col_K, B, [rows.walk[t] for t in np.nonzero(positions)[0].tolist()]) \
+        if set_weights_apply(prog, lv, compact) else None
     gates = F.gate_context(backend, external)
     hold = None if partial is None or compact is None else dict(regions = partial, fresh = carry["fresh"])
     forward = lambda p, **kw: F.run_forward(backend, bufs, p, x, missing, obs_class, lv, precision, compact, masses,
@@ -347,11 +353,17 @@ def class_weights(backend, data: torch.Tensor, missing: torch.Tensor, positions:
     valid |= plan.todo
 
     buf = backend.state.storage_view("dfa_class_flow", rows.starts[-1])
-    if plan.top_down.cw_fill:                           # (every weight stored by the launch writing it first: no fill)
-        buf.fill_(-float("inf"))
     cw = dict(buf = buf, col = col, K = K, rows = rows)
+    written = buf
+    if sets is not None:
+        written = backend.state.storage_view("dfa_set_flow", sets.size)
+        cw.update(sets = sets, set_buf = written)
+    if plan.top_down.cw_fill:                           # (every weight stored by the launch writing it first: no fill)
+        written.fill_(-float("inf"))
     run_backward(backend, bufs, flows, plan, x, missing, obs_class, lv, precision, class_weights = cw,
                  masses = masses, compact = compact, gates = gates)
+    if sets is not None:
+        combine_set_weights(prog, cw, col_K)
     return [(g, pos, buf[rows.starts[i]:rows.starts[i + 1]].view(-1, len(score.rows[g])), rows.row[f:f + len(pos) * B],
              None if rows.rep is None else rows.rep[f:f + len(pos) * B])
             for i, (g, pos, f) in enumerate(groups)], masses

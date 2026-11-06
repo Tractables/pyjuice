@@ -12,6 +12,7 @@ from pyjuice.utils.util import host_cdiv, host_next_power_of_2
 
 from ..common import IDENTITY, NODE_TILE, grid_chunks, tensor, pdl_launch
 from ..c import get_class_weights_module
+from . import set_weights as SW
 from .class_rows import ClassWeightRows
 from .class_weight_kernels import (CLASS_WEIGHT_CUDA, CLASS_WEIGHT_CUDA_CLASSES, _class_weight_cuda,
                                    _class_weight_kernel, _long_walk)
@@ -56,7 +57,8 @@ def run_class_weights(launches, cw: dict, prog, bufs, element_flows, temp_flows,
     ``store``: the launch writes each of its destinations first in the query, and stores the weights there; the others
     log-add them.
 
-    :param cw: ``buf`` (``dfa_class_flow``: -inf where a launch log-adds and nothing was written yet), ``rows`` (its
+    :param cw: ``sets`` (a query going through the pairs' class sets: its :class:`~.set_weights.SetWeights`, and ``set_buf`` their rows, which the launches write
+        instead, see :mod:`.set_weights`), ``buf`` (``dfa_class_flow``: -inf where a launch log-adds and nothing was written yet), ``rows`` (its
         :class:`ClassWeightRows`: every target column's live classes, and where their rows are), and per position its
         first target column (``col``, int64 [n], -1 for a position no sample targets) and its row group's rows (``K``,
         int64 [n])
@@ -70,6 +72,9 @@ def run_class_weights(launches, cw: dict, prog, bufs, element_flows, temp_flows,
     :param inside: whether the other operands' per-sample inside values are compact too (by ``compact``'s layout;
         ``regions`` and ``bufs`` are their rows')
     """
+    if cw.get("sets") is not None:                      # (through the pairs' class sets: their rows, see :mod:`.set_weights`)
+        return SW.run_set_weights(launches, cw, prog, bufs, element_flows, temp_flows, node_mars, liveness, elem_first, elem_width, B, prior, once_iv, regions,
+                                  compact, tflow_width, inside)
     temp, temp_width = bufs
     tflow_width = temp_width if tflow_width is None else tflow_width
     n, W, C = prog.n, prog.W, prog.C
