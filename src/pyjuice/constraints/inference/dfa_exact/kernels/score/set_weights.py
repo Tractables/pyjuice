@@ -25,7 +25,7 @@ from triton.language.extra.cuda import gdc_wait
 from pyjuice.utils.kernel_launcher import triton_jit
 from pyjuice.utils.util import host_cdiv, host_next_power_of_2
 
-from ..common import IDENTITY, NODE_TILE, _block_ptr, _exit_width, _interval, _logaddexp_tile, _tile_rows, grid_chunks, pdl_launch, tensor
+from ..common import IDENTITY, NODE_TILE, _block_ptr, _exit_width, _interval, _logaddexp_tile, _tile_rows, available_memory, grid_chunks, pdl_launch, tensor
 from ..prod.launches import _lse_step_one_exp, _lse_value
 from ..prod_top_down.launches import _once, _out_flows_ptr, _parent_base
 from ..transitions.tables import BoundaryGroups, _ranges, _sort_key, boundary_groups
@@ -37,12 +37,16 @@ SET_WEIGHTS = True
 #: ... on an automaton whose classes' lists hold at least ``SET_WEIGHT_MIN_RATIO`` times its pairs, and at least ``SET_WEIGHT_MIN_ENTRIES`` entries a boundary
 SET_WEIGHT_MIN_RATIO = 2.0
 SET_WEIGHT_MIN_ENTRIES = 1 << 16
-#: The most pairs a query's lists may be built from (8 bytes each kept, several times that while they are built), and the most (list group, set) cells of their
-#: rank table: past either, the classes' own walks; and the fewest pairs worth the lists: below, the classes' walks are short too (a prefix's next token on K 286,841:
+#: The most pairs a query's lists may be built from whatever the device holds (8 bytes each kept) -- past it, as many as a share of the memory this process can still
+#: take there holds (``SET_WEIGHT_MEMORY_SHARE``, as the transition masses' budget: a batch of 32 with a prefix observed on K 371,046 has 140 M) --, and the most
+#: (list group, set) cells of their rank table: past either, the classes' own walks; the lists are built a chunk of list groups at a time, of at most
+#: ``SET_WEIGHT_CHUNK`` pairs (or one group's), some 90 bytes a pair while a chunk is built; and the fewest pairs worth the lists: below, the classes' walks are short too (a prefix's next token on K 286,841:
 #: 28 pairs, 6.9 ms by the classes' walks, 9.3 through the sets). MEASURED GPT-2's vocabulary, HMM-64, 64 positions, batch 2, settled conditionals with a prefix, scattered
 #: tokens, one target or nothing observed, on the six automata of the corpus this rule takes: from 2^12 to 2^14 pairs on, the sets faster on 17 of 17 queries,
 #: 40.4 -> 15.1 s in all; below, slower on 6 of 6
 SET_WEIGHT_PAIRS_MOST = 1 << 27
+SET_WEIGHT_MEMORY_SHARE = 0.125
+SET_WEIGHT_CHUNK = 1 << 24
 SET_WEIGHT_RANKS_MOST = 1 << 27
 SET_WEIGHT_PAIRS_LEAST = 1 << 14
 
@@ -113,11 +117,12 @@ def _class_sets_of(prog) -> tuple:
 def set_weight_lists(prog, liveness, col_pos: torch.Tensor, col_K: torch.Tensor, B: int, most_columns: Optional[list] = None) -> Optional[SetWeights]:
     """
     The :class:`SetWeights` of a query's target columns (``col_pos`` int64 [N / B], every block of ``B`` columns' position; ``col_K`` int64 [N], the floats of a row),
-    from its :class:`~..live.Liveness` (None: every column live), or None where they are too many (:data:`SET_WEIGHT_PAIRS_MOST`, :data:`SET_WEIGHT_RANKS_MOST`) or
+    from its :class:`~..live.Liveness` (None: every column live), or None where they are too many (:data:`SET_WEIGHT_PAIRS_MOST` and the memory left,
+    :data:`SET_WEIGHT_RANKS_MOST`) or
     there are none, or too few to be worth the lists (:data:`SET_WEIGHT_PAIRS_LEAST`): first by the host's count, where it has one -- ``most_columns``, per target
     position the most live columns of any sample there, each of at most the tables' most pairs --, so that a query of few live columns asks nothing of the device. A
     group's live columns, their states' pairs (:attr:`~..transitions.tables.BoundaryGroups.pairs`), those whose successor is a live column of the next boundary; by
-    group, set, then column: a stable sort. It waits for the device, twice: for how many pairs there are.
+    group, set, then column: a stable sort, a chunk of groups at a time (:data:`SET_WEIGHT_CHUNK`). It waits for the device, for how many pairs there are.
     """
     if most_columns is not None and B * sum(most_columns) * max(prog.succ.max_pairs, 1) < SET_WEIGHT_PAIRS_LEAST:
         return None
@@ -148,29 +153,49 @@ def set_weight_lists(prog, liveness, col_pos: torch.Tensor, col_K: torch.Tensor,
     state = prog.state_id.reshape(-1).index_select(0, t_l * W + icol).long()
     pc = p_count.index_select(0, state)
     total = int(pc.sum())
-    if total == 0 or total > SET_WEIGHT_PAIRS_MOST or total < SET_WEIGHT_PAIRS_LEAST:
+    if total == 0 or total < SET_WEIGHT_PAIRS_LEAST:
         return None
-    of_l = torch.repeat_interleave(torch.arange(columns, device = dev), pc)
-    p = _ranges(p_start.index_select(0, state), pc, total)
-    del state, pc
-    t_next = t_l.index_select(0, of_l) + 1
-    q = prog.col_of_state.reshape(-1).index_select(0, t_next * prog.K + p_succ.index_select(0, p)).long()
-    q = torch.where((t_next == n) & (q >= 0), torch.zeros_like(q), q)      # (a sequence end: its one column)
-    g = gl.index_select(0, of_l)
-    keep = q >= 0
-    if not shared:
-        keep &= liveness.live.reshape(-1).index_select(0, ((g % B) * (n + 1) + t_next) * W + q.clamp(min = 0)) != 0
-    del t_next
-    g, q, i, x = g[keep], q[keep], icol.index_select(0, of_l)[keep], of_pair.index_select(0, p[keep]).long()
-    del of_l, p, keep, gl, t_l, icol
-    if g.numel() == 0:
+    if total > SET_WEIGHT_PAIRS_MOST and (dev.type != "cuda" or 8 * total > SET_WEIGHT_MEMORY_SHARE * available_memory(dev)):
         return None
-    counts = torch.bincount(g * S + x, minlength = G * S).view(G, S)
-    order = torch.argsort(-counts, dim = 1, stable = True)           # a group's sets, the longest list first
-    rows_of = (counts > 0).sum(dim = 1)
-    rank = torch.empty_like(order).scatter_(1, order, torch.arange(S, device = dev).expand(G, S))
-    by = torch.argsort(_sort_key(g * S + rank.reshape(-1).index_select(0, g * S + x), G * S), stable = True)
-    lens = torch.gather(counts, 1, order)[torch.arange(S, device = dev)[None, :] < rows_of[:, None]]
+    # a chunk of list groups at a time, of at most SET_WEIGHT_CHUNK pairs (or one group's): what is kept of a chunk is its lists, 8 bytes a live pair
+    pairs_to = torch.cumsum(torch.zeros(G, dtype = torch.int64, device = dev).index_add_(0, gl, pc), dim = 0).tolist()
+    columns_to = torch.cumsum(cnt, dim = 0).tolist()
+    every_set = torch.arange(S, device = dev)
+    pair_i, pair_q, lens, rows_of, ranks = [], [], [], [], []
+    g0 = 0
+    while g0 < G:
+        before = pairs_to[g0 - 1] if g0 else 0
+        g1 = g0 + 1
+        while g1 < G and pairs_to[g1] - before <= SET_WEIGHT_CHUNK:
+            g1 += 1
+        c0, c1, here, Gc = (columns_to[g0 - 1] if g0 else 0), columns_to[g1 - 1], pairs_to[g1 - 1] - before, g1 - g0
+        of_l = torch.repeat_interleave(torch.arange(c1 - c0, device = dev), pc[c0:c1])
+        p = _ranges(p_start.index_select(0, state[c0:c1]), pc[c0:c1], here)
+        t_next = t_l[c0:c1].index_select(0, of_l) + 1
+        q = prog.col_of_state.reshape(-1).index_select(0, t_next * prog.K + p_succ.index_select(0, p)).long()
+        q = torch.where((t_next == n) & (q >= 0), torch.zeros_like(q), q)      # (a sequence end: its one column)
+        g = gl[c0:c1].index_select(0, of_l)
+        keep = q >= 0
+        if not shared:
+            keep &= liveness.live.reshape(-1).index_select(0, ((g % B) * (n + 1) + t_next) * W + q.clamp(min = 0)) != 0
+        g, q, i, x = g[keep] - g0, q[keep], icol[c0:c1].index_select(0, of_l)[keep], of_pair.index_select(0, p[keep]).long()
+        del of_l, p, keep, t_next
+        counts = torch.bincount(g * S + x, minlength = Gc * S).view(Gc, S)
+        order = torch.argsort(-counts, dim = 1, stable = True)       # a group's sets, the longest list first
+        live_sets = (counts > 0).sum(dim = 1)
+        rank = torch.empty_like(order).scatter_(1, order, every_set.expand(Gc, S))
+        by = torch.argsort(_sort_key(g * S + rank.reshape(-1).index_select(0, g * S + x), Gc * S), stable = True)
+        pair_i.append(i.index_select(0, by).to(torch.int32))
+        pair_q.append(q.index_select(0, by).to(torch.int32))
+        lens.append(torch.gather(counts, 1, order)[every_set[None, :] < live_sets[:, None]])
+        rows_of.append(live_sets)
+        ranks.append(torch.where(counts > 0, rank, -1).to(torch.int32))
+        del g, q, i, x, counts, order, rank, by
+        g0 = g1
+    del state, pc, gl, t_l, icol
+    pair_i, pair_q, lens, rows_of = torch.cat(pair_i), torch.cat(pair_q), torch.cat(lens), torch.cat(rows_of)
+    if pair_i.numel() == 0:
+        return None
     lptr = torch.zeros(lens.numel() + 1, dtype = torch.int64, device = dev)
     lptr[1:] = torch.cumsum(lens, dim = 0)
     grp = torch.arange(N, device = dev) // B if shared else torch.arange(N, device = dev)
@@ -178,8 +203,8 @@ def set_weight_lists(prog, liveness, col_pos: torch.Tensor, col_K: torch.Tensor,
     off = torch.zeros(N + 1, dtype = torch.int64, device = dev)
     off[1:] = torch.cumsum(count * col_K, dim = 0)
     return SetWeights(count = count.to(torch.int32).contiguous(), first = (torch.cumsum(rows_of, dim = 0) - rows_of).index_select(0, grp).contiguous(), off = off, lptr = lptr,
-                      pair_i = i.index_select(0, by).to(torch.int32).contiguous(), pair_q = q.index_select(0, by).to(torch.int32).contiguous(), grp = grp.contiguous(),
-                      rank = torch.where(counts > 0, rank, -1).to(torch.int32).contiguous(), most = int(rows_of.max()), size = int(off[-1]), S = S, pairs = total)
+                      pair_i = pair_i.contiguous(), pair_q = pair_q.contiguous(), grp = grp.contiguous(), rank = torch.cat(ranks).contiguous(), most = int(rows_of.max()),
+                      size = int(off[-1]), S = S, pairs = total)
 
 
 @triton_jit

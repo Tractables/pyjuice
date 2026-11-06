@@ -3,6 +3,7 @@ The class weights through the pairs' class sets (kernels/score/set_weights.py) a
 pairs, set by set; the conditionals are the classes' own up to rounding on every kind of circuit, evidence and storage; a decoder session stays within strong_check's
 bars of the float64 reference; where the rule takes them, and what falls back to the classes' walks, to the bit.
 """
+import dataclasses
 import importlib.util
 import os
 from fractions import Fraction
@@ -115,6 +116,13 @@ def test_a_classs_live_pairs_are_those_of_the_sets_it_is_in(storage, observed, b
         CO.conditional(cc.backend, x, masks[observed], precision = "fp32", storage = storage)
         (prog, lv, col_pos, col_K, *_), sw = calls[0]
         assert sw is not None and (lv is None) == (observed == "none")       # (nothing observed: no liveness to read, whatever the storage)
+        for chunk in (1, max(sw.pairs // 3, 1)):                             # (a group a chunk, or a few: the same lists)
+            with monkeypatch.context() as m:
+                m.setattr(SW, "SET_WEIGHT_CHUNK", chunk)
+                other = lists(*calls[0][0])
+            for f in dataclasses.fields(sw):
+                a, b = getattr(sw, f.name), getattr(other, f.name)
+                assert torch.equal(a, b) and a.dtype == b.dtype if isinstance(a, torch.Tensor) else a == b, (f.name, chunk)
         C, W = prog.C, prog.W
         cls_ptr, cls_col, cls_succ = prog.class_lists()
         cls_ptr = cls_ptr.view(n, C + 1)
@@ -230,6 +238,12 @@ def test_lists_past_their_bounds_fall_back_to_the_classes_walks(bound, value, bu
         monkeypatch.setattr(SW, bound, pairs)                             # (as many by the host's count as the bound: counted on the device, and taken)
         assert lists(*args, [Fraction(pairs, args[4] * max(cc.backend.program().succ.max_pairs, 1))]) is not None
         value = 1 << 62
+    if bound == "SET_WEIGHT_PAIRS_MOST":                                  # (past it, as many as a share of the memory left holds: all of these, or none)
+        taken.clear()
+        monkeypatch.setattr(SW, bound, value)
+        CO.conditional(cc.backend, x, masks["half"], precision = "fp32")
+        assert taken
+        monkeypatch.setattr(SW, "SET_WEIGHT_MEMORY_SHARE", 0.0)
     taken.clear()
     monkeypatch.setattr(SW, bound, value)
     assert torch.equal(CO.conditional(cc.backend, x, masks["half"], precision = "fp32"), want) and not taken
