@@ -17,6 +17,7 @@ from pyjuice.constraints.inference.dfa_exact.kernels import live as LV
 from pyjuice.constraints.inference.dfa_exact.kernels import score as S
 from pyjuice.constraints.inference.dfa_exact.kernels.score import set_weights as SW
 from pyjuice.constraints.inference.dfa_exact.kernels.transitions import host as H
+from pyjuice.constraints.inference.dfa_exact.kernels.transitions import tables as TT
 from pyjuice.constraints.inference.dfa_exact.queries import conditional as CO
 
 
@@ -443,6 +444,54 @@ def test_the_hosts_count_takes_the_most_live_columns_of_a_position(storage, buil
                 uneven += max(counts) != min(counts)
                 not_the_first += max(counts) != counts[0]
     assert pruned > 0 and uneven > 0 and not_the_first > 0 and (every > 0) == (storage == "dense"), (pruned, uneven, not_the_first, every)
+
+
+@cuda_only
+@pytest.mark.parametrize("storage", ["dense", "compact"])
+def test_an_automaton_of_no_lists_by_class_takes_the_sets_for_every_query(storage, build_pc, monkeypatch):
+    """An automaton whose lists by class would have more entries than the tables' int32 pointers reach (to the last entry: here the bound the rule reads is
+    lowered, and asking for those lists raises as it would): every query goes through the sets at the default rule -- one of a single target too, far below
+    the least size of a query elsewhere, and one the CUDA kernels would take --, the lists by class never asked for; the answers the classes' walks' of the
+    same automaton with pointers enough, up to rounding. With the sets off, the error as it was."""
+    V, n, B = 12, 8, 3
+    pc = build_pc("hmm", n, V)
+    monkeypatch.setattr(H, "HOST_ENTRIES", 0)
+    dfa = automaton(1, V)
+    x, masks = evidence(dfa, n, V, B, 1)
+    one = torch.zeros(B, n, dtype = torch.bool, device = DEV)
+    one[:, n // 2] = True
+    queries = [(masks["half"], one), (masks["half"], None), (masks["none"], None), (masks["scattered"], None)]
+    taken = taken_by(monkeypatch)
+    cc = jc.compile(dfa, pc)
+    prog = cc.backend.program()
+    entries = int(TT.boundary_groups(prog._tr).class_columns.sum())
+    assert not SW.no_lists_by_class(prog) and not SW.set_weights_always(prog)
+    monkeypatch.setattr(SW, "SET_WEIGHTS", False)
+    want = [CO.conditional(cc.backend, x, missing, targets = targets, precision = "fp32", storage = storage).clone() for missing, targets in queries]
+    monkeypatch.setattr(SW, "SET_WEIGHTS", True)
+    CO.conditional(cc.backend, x, masks["half"], targets = one, precision = "fp32", storage = storage)
+    assert not taken                                                         # (with lists by class to walk: a query so small is theirs)
+    def too_many(self):
+        raise RuntimeError(f"{entries} transition entries are more than the tables' int32 pointers can reach")
+
+    for most, none in ((entries, False), (entries - 1, True)):               # (to the last entry)
+        monkeypatch.setattr(SW, "TT", types.SimpleNamespace(TABLE_ENTRIES_MOST = most))
+        other = jc.compile(dfa, pc).backend
+        prog = other.program()
+        assert SW.no_lists_by_class(prog) == none
+        assert SW.set_weights_always(prog) == none and SW.set_weights_apply(prog, object(), object()) == none and SW.set_weights_apply(prog, None, None) == none
+        if not none:
+            continue
+        monkeypatch.setattr(TT.BoundaryGroups, "class_lists", too_many)
+        for (missing, targets), walked in zip(queries, want):
+            taken.clear()
+            got = CO.conditional(other, x, missing, targets = targets, precision = "fp32", storage = storage)
+            finite = ~torch.isinf(walked)
+            assert taken and prog._class_lists is None, "a query fell back to the lists by class"
+            assert torch.equal(torch.isinf(got), ~finite) and float((got[finite] - walked[finite]).abs().max()) <= 1e-4
+        monkeypatch.setattr(SW, "SET_WEIGHTS", False)
+        with pytest.raises(RuntimeError, match = "int32 pointers"):
+            CO.conditional(other, x, masks["half"], targets = one, precision = "fp32", storage = storage)
 
 
 @cuda_only

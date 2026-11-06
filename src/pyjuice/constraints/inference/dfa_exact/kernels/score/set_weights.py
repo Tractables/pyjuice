@@ -29,6 +29,7 @@ from pyjuice.utils.util import host_cdiv, host_next_power_of_2
 from ..common import IDENTITY, NODE_TILE, _block_ptr, _exit_width, _interval, _logaddexp_tile, _tile_rows, available_memory, grid_chunks, pdl_launch, tensor
 from ..prod.launches import _lse_step_one_exp, _lse_value
 from ..prod_top_down.launches import _once, _out_flows_ptr, _parent_base
+from ..transitions import tables as TT
 from ..transitions.tables import BoundaryGroups, _ranges, _sort_key, boundary_groups
 from .class_weight_kernels import CLASS_WEIGHT_CUDA, CLASS_WEIGHT_CUDA_CLASSES, CLASS_WEIGHT_CUDA_SMEM, _cw_block_input_term, _cw_input_block_term
 
@@ -85,18 +86,29 @@ class SetWeights:
     pairs: int = 0
 
 
+def no_lists_by_class(prog) -> bool:
+    """Whether the lists by class of ``prog``'s tables would have more entries than their int32 pointers reach
+    (:data:`~..transitions.tables.TABLE_ENTRIES_MOST`: :meth:`~..transitions.tables.BoundaryGroups.class_lists` raises): no kernel can walk a class's list then, so
+    the class sets are the one way to the class weights, for every query, however small. Counted once (it asks the device), kept with the program."""
+    kept = getattr(prog, "_no_lists_by_class", None)
+    if kept is None:
+        kept = prog._no_lists_by_class = int(boundary_groups(prog._tr).class_columns.sum()) > TT.TABLE_ENTRIES_MOST
+    return kept
+
+
 def set_weights_apply(prog, liveness, compact) -> bool:
     """Whether a query of ``prog`` takes its class weights through the class sets: never while a CUDA graph is captured (the lists are the query's own), nor on tables made
-    on the host (a small automaton), nor a query the CUDA kernels take (:func:`~.class_weight_kernels._class_weight_cuda`: compact values under pruning, few classes, and
-    boundaries whose rows fit a CTA's shared memory: left as they are; past that width they decline, and the walk is Triton's); else by what the automaton's lists hold
-    (:data:`SET_WEIGHT_MIN_RATIO`, :data:`SET_WEIGHT_MIN_ENTRIES`). Host values alone.
+    on the host (a small automaton); always where the lists by class cannot be made (:func:`no_lists_by_class`); else not a query the CUDA kernels take
+    (:func:`~.class_weight_kernels._class_weight_cuda`: compact values under pruning, few classes, and boundaries whose rows fit a CTA's shared memory: left as they
+    are; past that width they decline, and the walk is Triton's), and by what the automaton's lists hold (:data:`SET_WEIGHT_MIN_RATIO`,
+    :data:`SET_WEIGHT_MIN_ENTRIES`). Host values alone, but for that count, made once.
 
     MEASURED GPT-2's vocabulary, HMM-64, 64 positions, batch 2, every automaton of the corpus on the device's tables forced through the sets, a prefix, scattered tokens, one
     target or nothing observed: of the queries this takes, 41 of 41 faster, 49.5 -> 20.2 s in all, and no faster query left out; with the width at 8,192, where the CUDA kernels
     still fit, 6 of 47 slower (K 11,845 with nothing observed: 65 -> 156 ms)."""
     if not SET_WEIGHTS or torch.cuda.is_current_stream_capturing() or not isinstance(boundary_groups(prog._tr), BoundaryGroups):
         return False
-    if SET_WEIGHTS == "force":
+    if SET_WEIGHTS == "force" or no_lists_by_class(prog):
         return True
     if CLASS_WEIGHT_CUDA and liveness is not None and compact is not None and prog.C <= CLASS_WEIGHT_CUDA_CLASSES and 8 * prog.W <= CLASS_WEIGHT_CUDA_SMEM:
         return False                                                 # (a destination's rows at both boundaries, 4 bytes a column: what a CTA stages)
@@ -229,12 +241,14 @@ def set_weight_lists(prog, liveness, col_pos: torch.Tensor, col_K: torch.Tensor,
     The :class:`SetWeights` of a query's target columns (``col_pos`` int64 [N / B], every block of ``B`` columns' position; ``col_K`` int64 [N], the floats of a row),
     from its :class:`~..live.Liveness` (None: every column live), or None where they are too many (:data:`SET_WEIGHT_PAIRS_MOST` and the memory left,
     :data:`SET_WEIGHT_RANKS_MOST`) or
-    there are none, or too few to be worth the lists (:data:`SET_WEIGHT_PAIRS_LEAST`): first by the host's count, where it has one -- ``most_columns``, per target
+    there are none, or too few to be worth the lists (:data:`SET_WEIGHT_PAIRS_LEAST`; none too few where there are no lists by class to fall back to:
+    :func:`no_lists_by_class`): first by the host's count, where it has one -- ``most_columns``, per target
     position the most live columns of any sample there, each of at most the tables' most pairs --, so that a query of few live columns asks nothing of the device. A
     group's live columns, their states' pairs (:attr:`~..transitions.tables.BoundaryGroups.pairs`), those whose successor is a live column of the next boundary; by
     group, set, then column: a stable sort, a chunk of groups at a time (:data:`SET_WEIGHT_CHUNK`). It waits for the device, for how many pairs there are.
     """
-    if most_columns is not None and B * sum(most_columns) * max(prog.succ.max_pairs, 1) < SET_WEIGHT_PAIRS_LEAST:
+    least = 0 if no_lists_by_class(prog) else SET_WEIGHT_PAIRS_LEAST
+    if most_columns is not None and B * sum(most_columns) * max(prog.succ.max_pairs, 1) < least:
         return None
     groups = boundary_groups(prog._tr)
     n, W, dev = prog.n, prog.W, prog.dev
@@ -263,7 +277,7 @@ def set_weight_lists(prog, liveness, col_pos: torch.Tensor, col_K: torch.Tensor,
     state = prog.state_id.reshape(-1).index_select(0, t_l * W + icol).long()
     pc = p_count.index_select(0, state)
     total = int(pc.sum())
-    if total == 0 or total < SET_WEIGHT_PAIRS_LEAST:
+    if total == 0 or total < least:
         return None
     if total > SET_WEIGHT_PAIRS_MOST and (dev.type != "cuda" or 8 * total > SET_WEIGHT_MEMORY_SHARE * available_memory(dev)):
         return None

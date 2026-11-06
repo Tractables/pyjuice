@@ -27,5 +27,6 @@ from .tables import ScoreTables, score_tables
 from .class_weight_kernels import ClassWeightLaunch, class_weight_launch
 from .class_rows import ClassWeightRows, class_weight_rows
 from .class_weights import class_weight_walk, run_class_weights
-from .set_weights import combine_set_weights, most_live_columns, set_weight_lists, set_weight_rows, set_weights_always, set_weights_apply
+from .set_weights import (combine_set_weights, most_live_columns, no_lists_by_class, set_weight_lists, set_weight_rows, set_weights_always,
+                          set_weights_apply)
 from .group import score_group
