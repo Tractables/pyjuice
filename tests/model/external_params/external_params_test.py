@@ -7,7 +7,7 @@ from pyjuice.nodes import multiply, summate, inputs, LowRankSumParams
 import pytest
 
 
-def _build_hmm(external, seed = 0, seq_length = 4, num_latents = 8, num_emits = 5, rank = 3):
+def _build_hmm(external, seed = 0, seq_length = 4, num_latents = 8, num_emits = 5, rank = 3, corrected = True):
     """
     A homogeneous-HMM-shaped PC whose transition either does or does not take external parameters.
     Built at one seed so the two variants are directly comparable.
@@ -15,7 +15,7 @@ def _build_hmm(external, seed = 0, seq_length = 4, num_latents = 8, num_emits = 
 
     torch.manual_seed(seed)
 
-    ext = dict(external_params = LowRankSumParams(rank = rank)) if external else dict()
+    ext = dict(external_params = LowRankSumParams(rank = rank, apply_z_correction = corrected)) if external else dict()
 
     with juice.set_block_size(num_latents):
 
@@ -47,17 +47,20 @@ def _colsums(pc, ns):
     return pc.get_node_params(ns).sum(dim = 2).sum(dim = 0)
 
 
-def test_external_params_pc_matches_plain():
+@pytest.mark.parametrize("corrected", [False, True])
+def test_external_params_pc_matches_plain(corrected):
     """
     An external parameterization must not change the `params` / `param_flows` setup at all: the layer
     inherits `SumLayer`'s compilation, so with no external tensors supplied the PC is the plain one,
-    bit for bit.
+    bit for bit -- up to the M-step where the parameterization keeps a denominator flow (`corrected`): that one is
+    the conditional update, whose denominator of such a pass is `theta` times the node's flow, the standard step to
+    rounding.
     """
 
     device = torch.device("cuda:0")
 
     root_plain, trans_plain = _build_hmm(external = False)
-    root_ext, trans_ext = _build_hmm(external = True)
+    root_ext, trans_ext = _build_hmm(external = True, corrected = corrected)
 
     pc_plain = juice.compile(root_plain).to(device)
     pc_ext = juice.compile(root_ext).to(device)
@@ -94,15 +97,21 @@ def test_external_params_pc_matches_plain():
     pc_plain.mini_batch_em(step_size = 0.5, pseudocount = 0.01)
     pc_ext.mini_batch_em(step_size = 0.5, pseudocount = 0.01)
 
-    assert torch.equal(pc_plain.params, pc_ext.params)
+    if corrected:
+        assert torch.allclose(pc_plain.params, pc_ext.params, rtol = 1e-5, atol = 1e-7)
+    else:
+        assert torch.equal(pc_plain.params, pc_ext.params)
     assert torch.all(torch.abs(_colsums(pc_ext, trans_ext) - 1.0) < 1e-5)
 
 
+@pytest.mark.parametrize("corrected", [False, True])
 @pytest.mark.parametrize("optimizer", ["FullBatchEM", "MiniBatchEM", "Anemone"])
-def test_external_params_em_optimizers(optimizer):
+def test_external_params_em_optimizers(optimizer, corrected):
     """
     The EM-family optimizers consume `param_flows` and normalize `params`; neither depends on how the
-    effective parameters are formed, so an external node trains exactly like a plain one.
+    effective parameters are formed, so an external node given no tensors trains exactly like a plain one -- to
+    rounding where its parameterization keeps a denominator flow (`corrected`), the conditional M-step then being
+    the standard one, a pseudocount of 0 (`FullBatchEM`) included.
 
     This matters for Anemone in particular: its `step_size_rescaling` evaluates top-down probabilities
     assuming the PC is normalized, which holds because the shared parameters stay child-normalized.
@@ -120,7 +129,7 @@ def test_external_params_em_optimizers(optimizer):
                                        niters_per_update = 2, pseudocount = 1e-6)
 
     root_plain, _ = _build_hmm(external = False)
-    root_ext, trans_ext = _build_hmm(external = True)
+    root_ext, trans_ext = _build_hmm(external = True, corrected = corrected)
 
     pc_plain = juice.compile(root_plain).to(device)
     pc_ext = juice.compile(root_ext).to(device)
@@ -140,8 +149,12 @@ def test_external_params_em_optimizers(optimizer):
             opt.step()
             lls_list.append(lls.mean().item())
 
-    assert lls_plain == lls_ext
-    assert torch.equal(pc_plain.params, pc_ext.params)
+    if corrected:
+        assert all(abs(a - b) < 1e-4 for a, b in zip(lls_plain, lls_ext)), (lls_plain, lls_ext)
+        assert torch.allclose(pc_plain.params, pc_ext.params, rtol = 1e-3, atol = 1e-6)
+    else:
+        assert lls_plain == lls_ext
+        assert torch.equal(pc_plain.params, pc_ext.params)
 
     # The shared parameters stay child-normalized throughout, which is what makes the correction's
     # normalizer independent of them -- and hence the EM update exact
@@ -194,7 +207,8 @@ def test_external_params_node_accessors():
 
 
 if __name__ == "__main__":
-    test_external_params_pc_matches_plain()
-    for optimizer in ["FullBatchEM", "MiniBatchEM", "Anemone"]:
-        test_external_params_em_optimizers(optimizer)
+    for corrected in [False, True]:
+        test_external_params_pc_matches_plain(corrected)
+        for optimizer in ["FullBatchEM", "MiniBatchEM", "Anemone"]:
+            test_external_params_em_optimizers(optimizer, corrected)
     test_external_params_node_accessors()

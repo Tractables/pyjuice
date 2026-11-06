@@ -31,8 +31,8 @@ class ExternalParamsSumNodes(SumNodes):
                            external_params = LowRankSumParams(rank = 16))
         pc = juice.compile(root_ns)
 
-        lls = pc(x, sum_external_params = {ns: (U, V)})
-        pc.backward(x, sum_external_params_grad = {ns: (dU, dV)})
+        lls = pc(x, sum_external_params = {ns: (A, B)})          # A [batch, nodes, 16], B [batch, 16, children]
+        pc.backward(x, sum_external_params_grad = {ns: (dA, dB)})
 
     The shared parameters continue to train through the ordinary EM / gradient path, unchanged.
 

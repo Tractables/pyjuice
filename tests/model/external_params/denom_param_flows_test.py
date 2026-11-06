@@ -100,7 +100,8 @@ def _fminus(pc, ns):
 
 def test_request_signal_defaults_false_on_descriptors():
     assert ExternalSumParams.requests_denom_param_flows is False
-    assert LowRankSumParams(rank = 4).requests_denom_param_flows is False
+    assert LowRankSumParams(rank = 4).requests_denom_param_flows is True      # correction on by default
+    assert LowRankSumParams(rank = 4, apply_z_correction = False).requests_denom_param_flows is False
     assert BlockScaleSumParams().requests_denom_param_flows is True           # correction on by default
 
 

@@ -15,7 +15,7 @@ class EchoParams(ExternalSumParams):
     """
     A minimal parameterization used to exercise the machinery end to end.
 
-    It consumes two tensors shaped like `LowRankSumParams`', perturbs `node_mars` by a value derived
+    It consumes two tensors per node vector, one row per edge block, perturbs `node_mars` by a value derived
     from the first of them (so the forward provably *read* what was staged), and writes a known
     function of both into the gradient buffers (so the backward provably *wrote* where the caller
     reads). That makes every hop of the transfer -- caller -> staging buffer -> hook -> gradient
@@ -532,17 +532,23 @@ def test_lowrank_params_reaches_kernels():
     pc, root_ns, trans_ns = _compiled(LowRankSumParams(rank = RANK))
 
     data = torch.randint(0, 5, [batch_size, 4]).to(device)
-    tensors = _make_tensors(pc, batch_size)
+    torch.manual_seed(5)
+    tensors = {ns: tuple(0.3 * torch.randn(shape, device = device)
+                         for shape in ns.external_params.tensor_shapes(ns, batch_size))
+               for ns in pc.external_params_nodes}
+    assert len(tensors) == 3
 
     lls = pc(data, sum_external_params = tensors)
 
     assert torch.all(torch.isfinite(lls))
+    assert float((lls - pc(data)).abs().max()) > 1e-3               # (the factors were read: not the plain values)
 
-    # ... from the staged values, held in the kernels' storage order
-    perm = trans_ns.external_params.storage_perm()
+    # ... from the staged values: this parameterization declares no storage order, so the caller's is kept
+    assert trans_ns.external_params.storage_perm() is None
+    pc(data, sum_external_params = tensors)
     for ns, ns_tensors in tensors.items():
         for staged_tensor, tensor in zip(pc._staged_external_params[ns], ns_tensors):
-            assert torch.equal(staged_tensor, tensor.permute(perm))
+            assert torch.equal(staged_tensor, tensor)
 
 
 if __name__ == "__main__":

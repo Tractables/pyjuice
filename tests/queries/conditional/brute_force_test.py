@@ -203,8 +203,7 @@ def test_extern_product_categorical():
 @pytest.mark.parametrize("external, block_size, B", [
     # BlockScale's backward refuses precision = "fp32", so it runs at the default precision
     ("blockscale", 4, 8), ("blockscale", 16, 16),
-    # LowRank's backward runs from block_size 16 and batch 16
-    ("lowrank", 16, 16), ("lowrank", 32, 24),
+    ("lowrank", 4, 8), ("lowrank", 16, 16), ("lowrank", 32, 24),
 ])
 def test_external_sum_params(external, block_size, B, categorical_path):
     torch.manual_seed(0)

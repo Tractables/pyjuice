@@ -161,10 +161,6 @@ def test_a_replayed_forward_hands_its_own_state_to_the_backward(kind):
     """The gated forward leaves its `log Z` on the layer for the backward. A replay runs no Python, so after
     forwards at batch 32 and 16 a replayed batch-32 forward left batch 16's state for the next backward;
     the circuit now restores what the recording left."""
-    if kind == "lowrank":
-        from pyjuice.nodes.external_params.kernels.c import is_available
-        if not is_available():
-            pytest.skip("the low-rank backward needs the CUDA extension")
     device = torch.device("cuda:0")
     pc, ns = _gated_pc(device, kind)
     (xa, ea), (xb, eb) = _gated_inputs(ns, 32, device, 1), _gated_inputs(ns, 16, device, 2)

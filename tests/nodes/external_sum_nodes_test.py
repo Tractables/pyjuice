@@ -9,13 +9,19 @@ import pytest
 
 def test_lowrank_sum_params():
     """
-    The descriptor is pure configuration: a rank, plus the signature that layer grouping keys on.
+    The descriptor is pure configuration: a rank and a form, plus the signature that layer grouping keys on.
     """
 
     ext_params = LowRankSumParams(rank = 5)
 
-    assert ext_params.rank == 5
-    assert ext_params.get_signature() == "LowRank_r5"
+    assert ext_params.rank == 5 and ext_params.form == "exp_sum"
+    assert ext_params.get_signature() == "LowRank_exp_sum_r5"
+
+    # ... and so are the form, the tying of the tensors and whether the denominator flow is kept
+    assert LowRankSumParams(rank = 5, form = "sum_exp").get_signature() == "LowRank_sum_exp_r5"
+    assert LowRankSumParams(rank = 5, form = "sum_exp") != ext_params
+    assert LowRankSumParams(rank = 5, tie_external = True) != ext_params
+    assert LowRankSumParams(rank = 5, apply_z_correction = False) != ext_params
 
     # The rank is baked into the signature, so nodes of different rank never share a compiled layer
     assert LowRankSumParams(rank = 8).get_signature() != ext_params.get_signature()
@@ -41,17 +47,17 @@ def test_external_sum_nodes():
         # A subclass of `SumNodes`, so everything that treats it as a sum node keeps working
         assert isinstance(ns, ExternalParamsSumNodes) and isinstance(ns, SumNodes)
         assert ns.is_sum() and ns.num_node_blocks == 2 and ns.block_size == block_size
-        assert ns.get_external_signature() == "LowRank_r5"
+        assert ns.get_external_signature() == "LowRank_exp_sum_r5"
 
         # `summate` without a descriptor is untouched
         assert type(plain_ns) is SumNodes
 
-        # The low-rank factors are indexed per edge block, matching the block-sparse parameter layout
+        # The low-rank factors are indexed by node and by child, whatever blocks the node vector is stored in
         batch_size, rank = 3, 5
-        shape_U, shape_V = ns.external_params.tensor_shapes(ns, batch_size = batch_size)
+        shape_A, shape_B = ns.external_params.tensor_shapes(ns, batch_size = batch_size)
 
-        assert shape_U == (batch_size, ns.edge_ids.size(1), ns.ch_block_size, rank)
-        assert shape_V == (batch_size, ns.edge_ids.size(1), ns.block_size, rank)
+        assert shape_A == (batch_size, ns.num_nodes, rank)
+        assert shape_B == (batch_size, rank, ns.num_ch_nodes)
 
         # The descriptor is what makes the node an `ExternalParamsSumNodes`, so it cannot be omitted
         with pytest.raises(AssertionError):

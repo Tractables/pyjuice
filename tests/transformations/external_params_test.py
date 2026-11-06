@@ -61,14 +61,14 @@ def test_external_params_preserved_by_transformations():
 
     assert len(new_nss) == 1 and new_nss[0].external_params.rank == 5
 
-    ## deepcopy that re-blocks: the tensor layout must follow the new blocks ##
+    ## deepcopy that re-blocks: the factors are per node and per child, so their layout does not follow the blocks ##
 
     root_ns, ns = _build_pc(block_size = 4)
     new_nss = _external_nodes(deepcopy(root_ns, max_block_size = 2))
 
     assert len(new_nss) == 1 and new_nss[0].block_size == 2
-    assert new_nss[0].external_params.tensor_shapes(new_nss[0], batch_size = 3)[1] == \
-        (3, new_nss[0].edge_ids.size(1), 2, 5)
+    assert new_nss[0].external_params.tensor_shapes(new_nss[0], batch_size = 3) == \
+        ns.external_params.tensor_shapes(ns, batch_size = 3) == ((3, 8, 5), (3, 5, 8))
 
     ## blockify / unblockify ##
 
@@ -94,8 +94,9 @@ def test_external_params_preserved_by_transformations():
 
     assert len(new_nss) == 1 and new_nss[0].external_params.rank == 5
     assert new_nss[0].edge_ids.size(1) < ns.edge_ids.size(1)
-    assert new_nss[0].external_params.tensor_shapes(new_nss[0], batch_size = 3)[0][1] == \
-        new_nss[0].edge_ids.size(1)
+    # (a pruned edge block has no parameters, here or shared: the factors keep their shapes)
+    assert new_nss[0].external_params.tensor_shapes(new_nss[0], batch_size = 3) == \
+        ns.external_params.tensor_shapes(ns, batch_size = 3)
 
     ## merge ##
 

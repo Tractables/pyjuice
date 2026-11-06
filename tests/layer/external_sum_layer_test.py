@@ -54,7 +54,7 @@ def test_external_sum_layer_compilation():
     ext_layers = _external_layers(pc)
 
     assert len(ext_layers) == 2
-    assert sorted([layer.external_signature for layer in ext_layers]) == ["LowRank_r3", "LowRank_r5"]
+    assert sorted([layer.external_signature for layer in ext_layers]) == ["LowRank_exp_sum_r3", "LowRank_exp_sum_r5"]
 
     for layer in ext_layers:
         assert len(layer.nodes) == 1
@@ -203,17 +203,20 @@ def test_register_external_buffers():
         layer.register_external_buffers("too_many", [torch.zeros([1], dtype = torch.long)] * 3)
 
 
-def test_external_sum_layer_without_external_tensors():
+@pytest.mark.parametrize("corrected", [False, True])
+def test_external_sum_layer_without_external_tensors(corrected):
     """
     Given no external tensors the layer is a plain sum layer: the hooks are skipped, so a PC with an
-    external node computes exactly what the same PC built with `summate` would.
+    external node computes exactly what the same PC built with `summate` would -- bit for bit where the
+    parameterization keeps no denominator flow. Where it does, the M-step is the conditional one, whose denominator
+    of such a pass is `theta` times the node's flow: the standard step to rounding.
     """
 
     device = torch.device("cuda:0")
 
     def build(external):
         torch.manual_seed(430)
-        ext = dict(external_params = LowRankSumParams(rank = 3)) if external else dict()
+        ext = dict(external_params = LowRankSumParams(rank = 3, apply_z_correction = corrected)) if external else dict()
         with juice.set_block_size(4):
             ni0 = inputs(0, num_node_blocks = 3, dist = dists.Categorical(num_cats = 5))
             ns = summate(multiply(ni0), num_node_blocks = 2, **ext)
@@ -247,7 +250,10 @@ def test_external_sum_layer_without_external_tensors():
     pc_plain.mini_batch_em(step_size = 0.5, pseudocount = 0.01)
     pc_ext.mini_batch_em(step_size = 0.5, pseudocount = 0.01)
 
-    assert torch.equal(pc_plain.params, pc_ext.params)
+    if corrected:
+        assert torch.allclose(pc_plain.params, pc_ext.params, rtol = 1e-5, atol = 1e-7)
+    else:
+        assert torch.equal(pc_plain.params, pc_ext.params)
 
 
 def test_external_sum_layer_tensor_validation():
@@ -274,16 +280,17 @@ def test_external_sum_layer_tensor_validation():
     num_edge_blocks = ns.edge_ids.size(1)
 
     data = torch.randint(0, 5, [batch_size, 1]).to(device)
-    U = torch.full([batch_size, num_edge_blocks, 4, rank], -6.0, device = device)
-    V = torch.full([batch_size, num_edge_blocks, 4, rank], -6.0, device = device)
+    A = 0.3 * torch.randn([batch_size, ns.num_nodes, rank], device = device)
+    B = 0.3 * torch.randn([batch_size, rank, ns.num_ch_nodes], device = device)
 
     bad_inputs = [
-        (U[:,:,:,:rank-1].contiguous(), V),          # wrong rank
-        (U[:batch_size//2].contiguous(), V),         # wrong batch size
-        (U.double(), V),                             # wrong dtype
-        (U.transpose(1, 2), V),                      # non-contiguous
-        (U.cpu(), V.cpu()),                          # wrong device
-        (U,),                                        # wrong number of tensors
+        (A[:,:,:rank-1].contiguous(), B),            # wrong rank
+        (A[:batch_size//2].contiguous(), B),         # wrong batch size
+        (A.double(), B),                             # wrong dtype
+        (B.transpose(1, 2), A.transpose(1, 2)),      # the factors swapped (and non-contiguous)
+        (A, B.transpose(1, 2)),                      # the second factor child-major
+        (A.cpu(), B.cpu()),                          # wrong device
+        (A,),                                        # wrong number of tensors
     ]
     for tensors in bad_inputs:
         with pytest.raises(AssertionError):
@@ -291,13 +298,13 @@ def test_external_sum_layer_tensor_validation():
 
     # A key naming a node without an external parameterization would otherwise be a silent no-op
     with pytest.raises(AssertionError):
-        pc(data, sum_external_params = {n: (U, V)})
+        pc(data, sum_external_params = {n: (A, B)})
 
     with pytest.raises(AssertionError):
-        pc(data, sum_external_params = (U, V))
+        pc(data, sum_external_params = (A, B))
 
     # The layout the descriptor declares is the one that is accepted
-    assert torch.all(torch.isfinite(pc(data, sum_external_params = {ns: (U, V)})))
+    assert torch.all(torch.isfinite(pc(data, sum_external_params = {ns: (A, B)})))
 
 
 def test_external_sum_layer_unsupported_settings():
@@ -325,28 +332,35 @@ def test_external_sum_layer_unsupported_settings():
     num_edge_blocks = ns.edge_ids.size(1)
 
     data = torch.randint(0, 5, [batch_size, 1]).to(device)
-    U = torch.full([batch_size, num_edge_blocks, 4, rank], -6.0, device = device)
-    V = torch.full([batch_size, num_edge_blocks, 4, rank], -6.0, device = device)
+    A = 0.3 * torch.randn([batch_size, ns.num_nodes, rank], device = device)
+    B = 0.3 * torch.randn([batch_size, rank, ns.num_ch_nodes], device = device)
 
     # Without external tensors every setting is fair game -- the layer is a plain sum layer
     pc(data, propagation_alg = "MPE")
     pc(data)
     pc.backward(data, allow_modify_flows = True, logspace_flows = False)
 
-    with pytest.raises(AssertionError):
-        pc(data, sum_external_params = {ns: (U, V)}, propagation_alg = "MPE")
+    # (the tensors themselves are accepted: what is refused below is the setting)
+    assert torch.all(torch.isfinite(pc(data, sum_external_params = {ns: (A, B)})))
 
+    with pytest.raises(AssertionError, match = "propagation"):
+        pc(data, sum_external_params = {ns: (A, B)}, propagation_alg = "MPE")
+
+    # A backward follows the forward it reads: one that was given no external parameters refuses them
     pc(data)
+    with pytest.raises(AssertionError, match = "forward pass did not receive"):
+        pc.backward(data, sum_external_params = {ns: (A, B)})
 
     # `allow_modify_flows` consumes `node_flows` in place, so the flows the external gradients are
     # built from would be gone by the time they are needed
-    with pytest.raises(AssertionError):
-        pc.backward(data, sum_external_params = {ns: (U, V)},
-                    allow_modify_flows = True, logspace_flows = False)
+    pc(data, sum_external_params = {ns: (A, B)})
+    with pytest.raises(AssertionError, match = "allow_modify_flows"):
+        pc.backward(data, allow_modify_flows = True, logspace_flows = False)
 
     # `negate_pflows` belongs to the unnormalized partition pass of the gradient-based optimizers
-    with pytest.raises(AssertionError):
-        pc.backward(data, sum_external_params = {ns: (U, V)}, negate_pflows = True)
+    pc(data, sum_external_params = {ns: (A, B)})
+    with pytest.raises(AssertionError, match = "negate_pflows"):
+        pc.backward(data, allow_modify_flows = False, negate_pflows = True)
 
 
 def test_external_sum_layer_grad_buffers():
@@ -374,41 +388,45 @@ def test_external_sum_layer_grad_buffers():
     num_edge_blocks = ns.edge_ids.size(1)
 
     data = torch.randint(0, 5, [batch_size, 1]).to(device)
-    U = torch.full([batch_size, num_edge_blocks, 4, rank], -6.0, device = device)
-    V = torch.full([batch_size, num_edge_blocks, 4, rank], -6.0, device = device)
+    A = 0.3 * torch.randn([batch_size, ns.num_nodes, rank], device = device)
+    B = 0.3 * torch.randn([batch_size, rank, ns.num_ch_nodes], device = device)
 
-    pc(data, sum_external_params = {ns: (U, V)})
-
-    # The backward kernels are not implemented yet; the gradient buffers are still set up first
-    with pytest.raises(NotImplementedError):
-        pc.backward(data)
+    pc(data, sum_external_params = {ns: (A, B)})
+    pc.backward(data, allow_modify_flows = False)
 
     # The gradients are PC-owned views laid out exactly like the supplied tensors, allocated and
-    # zeroed once per backward so that the layers can accumulate into them. They are views rather
-    # than contiguous tensors, since the buffer holds them in the kernels' axis order.
-    dU, dV = pc.get_external_params_grad(ns)
+    # zeroed once per backward so that the layers can accumulate into them.
+    dA, dB = pc.get_external_params_grad(ns)
 
-    assert dU.size() == U.size() and dV.size() == V.size()
-    assert torch.all(dU == 0.0) and torch.all(dV == 0.0)
+    assert dA.size() == A.size() and dB.size() == B.size()
+    assert float(dA.abs().max()) > 0.0 and float(dB.abs().max()) > 0.0
+    first = (dA.clone(), dB.clone())
+
+    # Zeroed once per backward: a second one leaves the same gradients, not twice them
+    pc.backward(data, allow_modify_flows = False)
+    dA, dB = pc.get_external_params_grad(ns)
+    assert torch.allclose(dA, first[0], rtol = 1e-5, atol = 1e-7) and torch.allclose(dB, first[1], rtol = 1e-5, atol = 1e-7)
 
     # The caller MAY supply destinations of their own -- `{ns: buffers}` or `{group: buffers}`, in
     # exactly the shape the forward takes the parameters -- and the gradients are copied into them
-    # once the backward is done. Accepted and validated here; this parameterization still has no
-    # backward kernels, so the same `NotImplementedError` is what comes back.
-    with pytest.raises(NotImplementedError):
-        pc.backward(data, sum_external_params_grad = {ns: (dU.clone(), dV.clone())})
+    # once the backward is done, over whatever they held.
+    dst = (torch.full_like(A, 7.0), torch.full_like(B, 7.0))
+    pc.backward(data, allow_modify_flows = False, sum_external_params_grad = {ns: dst})
+    assert torch.allclose(dst[0], first[0], rtol = 1e-5, atol = 1e-7) and torch.allclose(dst[1], first[1], rtol = 1e-5, atol = 1e-7)
 
     # ...but the shape is checked before any of that, so a mis-shaped destination is caught outright
     # rather than being silently filled with the wrong thing.
     with pytest.raises(AssertionError):
-        pc.backward(data, sum_external_params_grad = {ns: (dU.clone()[:, :-1], dV.clone())})
+        pc.backward(data, allow_modify_flows = False,
+                    sum_external_params_grad = {ns: (dst[0].clone()[:, :-1], dst[1].clone())})
 
 
 if __name__ == "__main__":
     test_external_sum_layer_compilation()
     test_external_node_info()
     test_register_external_buffers()
-    test_external_sum_layer_without_external_tensors()
+    for corrected in [False, True]:
+        test_external_sum_layer_without_external_tensors(corrected)
     test_external_sum_layer_tensor_validation()
     test_external_sum_layer_unsupported_settings()
     test_external_sum_layer_grad_buffers()
