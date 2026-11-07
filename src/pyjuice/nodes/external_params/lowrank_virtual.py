@@ -307,8 +307,7 @@ def _normalizer(mod, copies, node_flows, params, denom_param_flows, want_denom, 
     dtype = torch.bfloat16 if precision != "fp32" and work >= GEMM_BF16_WORK else torch.float32
     Ut = torch.empty(M, rows, dtype = dtype, device = node_flows.device)      # (transposed: the lanes over the samples)
     Vt = torch.empty(N, rows, dtype = dtype, device = node_flows.device)
-    shift = torch.empty(rows, device = node_flows.device)
-    mod.lowrank_normalizer_operands(Ut, Vt, shift, node_flows, [fa for _, _, (fa, _), _, _ in copies],
+    mod.lowrank_normalizer_operands(Ut, Vt, node_flows, [fa for _, _, (fa, _), _, _ in copies],
                                     [lz for _, _, _, lz, _ in copies], [fb for _, _, (_, fb), _, _ in copies],
                                     [info.nid_start for _, info, _, _, _ in copies], M, K)
     if want_denom:

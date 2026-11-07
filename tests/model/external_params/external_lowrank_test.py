@@ -1115,49 +1115,73 @@ def test_the_normalizer_products_shift_large_factors(monkeypatch):
 
 
 @needs_virtual
-def test_the_normalizer_operands_follow_their_formulas_and_a_node_without_mass_gives_zeros():
-    """The kernel's contract, checked directly: `Vt[j, (c, r, b)] = exp(B_c[r, j, b] - shift)` with the shift the row's
+@pytest.mark.parametrize("M, N, K, B, copies", [(3, 300, 2, 37, 2),     # children past one warp's share, samples past one block's
+                                                (5, 3, 3, 4, 70)])      # few children, copies past one launch's
+def test_the_normalizer_operands_and_gradients_follow_their_formulas(M, N, K, B, copies):
+    """The kernels' contract, checked directly. `Vt[j, (c, r, b)] = exp(B_c[r, j, b] - shift)` with the shift the row's
     largest `B_c[r, :, b]`, and `Ut[i, (c, r, b)] = exp(lf_c[i, b] + A_c[i, r, b] - log Z_c[i, b] + shift)`; a node
     without flow (`lf = -inf`) gives 0 -- also where it has no mass at all (factors of -inf, `log Z = -inf`, so its
-    value and its flow are -inf: `-inf - -inf` would be NaN). Two copies, the second's rows after the first's; float32
-    and bfloat16 operands."""
+    value and its flow are -inf: `-inf - -inf` would be NaN). The gradients: `dB_c[r, j, b] -= Vt * Gt` on the copy's
+    rows, a copy without a buffer skipped. float32 and bfloat16 operands."""
     import pyjuice.nodes.external_params.lowrank_virtual as lowrank_virtual
 
     mod, dev = lowrank_virtual._module(), torch.device("cuda")
-    M, N, K, B, copies = 3, 300, 2, 37, 2                                      # children past one chunk, samples past one warp
     g = torch.Generator(device = "cpu").manual_seed(7)
     fa = [(torch.randn(M, K, B, generator = g) * 3).to(dev) for _ in range(copies)]
     fb = [(torch.randn(K, N, B, generator = g) * 3).to(dev) for _ in range(copies)]
     lz = [(torch.randn(M, B, generator = g) * 3).to(dev) for _ in range(copies)]
     node_flows = (torch.randn(2 + copies * M, B, generator = g) - 1.0).to(dev)        # log flows, the copies' rows below 2
-    nid0 = [2, 2 + M]
+    nid0 = [2 + c * M for c in range(copies)]
     node_flows[nid0[0] + 1, 2] = -float("inf")                                        # copy 0, node 1, sample 2: no flow
-    lz[1][0, 4] = -float("inf")                                                       # copy 1, node 0, sample 4: no mass
-    fa[1][0, :, 4] = -float("inf")
-    node_flows[nid0[1] + 0, 4] = -float("inf")                                        # (so no flow either)
+    lz[1][0, 3] = -float("inf")                                                       # copy 1, node 0, sample 3: no mass
+    fa[1][0, :, 3] = -float("inf")
+    node_flows[nid0[1] + 0, 3] = -float("inf")                                        # (so no flow either)
 
     rows = copies * B * K
     for dtype in (torch.float32, torch.bfloat16):
+        tol = dict(rtol = 1e-5, atol = 1e-6) if dtype is torch.float32 else dict(rtol = 1e-2, atol = 1e-3)
         Ut = torch.full((M, rows), float("nan"), dtype = dtype, device = dev)
         Vt = torch.full((N, rows), float("nan"), dtype = dtype, device = dev)
-        shift = torch.full((rows,), float("nan"), device = dev)
-        mod.lowrank_normalizer_operands(Ut, Vt, shift, node_flows, fa, lz, fb, nid0, M, K)
+        mod.lowrank_normalizer_operands(Ut, Vt, node_flows, fa, lz, fb, nid0, M, K)
         torch.cuda.synchronize()
         for c in range(copies):
+            lf = node_flows[nid0[c]:nid0[c] + M]                                      # [M, B]
             for r in range(K):
                 row = c * B * K + r * B + torch.arange(B, device = dev)
                 sh = fb[c][r].max(dim = 0).values                                     # [B]
-                assert torch.equal(shift[row], sh)
-                want_v = torch.exp(fb[c][r] - sh)                                     # [N, B]
-                lf = node_flows[nid0[c]:nid0[c] + M]                                  # [M, B]
+                assert torch.allclose(Vt[:, row].float(), torch.exp(fb[c][r] - sh), **tol), f"V: copy {c}, rank {r}"
+                assert torch.equal(Vt[:, row].float().max(dim = 0).values, torch.ones(B, device = dev)), "not shifted"
                 want_u = torch.exp(lf + fa[c][:, r] - lz[c] + sh)
                 want_u = torch.where(torch.isneginf(lf) | torch.isneginf(lz[c]), torch.zeros_like(want_u), want_u)
-                tol = dict(rtol = 1e-5, atol = 1e-6) if dtype is torch.float32 else dict(rtol = 1e-2, atol = 1e-3)
-                assert torch.allclose(Vt[:, row].float(), want_v, **tol)
-                assert torch.allclose(Ut[:, row].float(), want_u, **tol)
+                assert torch.allclose(Ut[:, row].float(), want_u, **tol), f"U: copy {c}, rank {r}"
         assert torch.isfinite(Ut.float()).all() and torch.isfinite(Vt.float()).all()
-        assert float(Ut[1, 0 * B * K + 0 * B + 2]) == 0.0 and float(Ut[1, 0 * B * K + 1 * B + 2]) == 0.0
-        assert float(Ut[0, 1 * B * K + 0 * B + 4]) == 0.0 and float(Ut[0, 1 * B * K + 1 * B + 4]) == 0.0
+        assert all(float(Ut[1, r * B + 2]) == 0.0 for r in range(K))
+        assert all(float(Ut[0, 1 * B * K + r * B + 3]) == 0.0 for r in range(K))
+
+        # Each copy its own buffer, one with none...
+        Gt = torch.randn(N, rows, generator = g).to(dev)
+        before = [(torch.randn(K, N, B, generator = g)).to(dev) for _ in range(copies)]
+        grads = [t.clone() for t in before]
+        passed = [None if c == 1 else grads[c] for c in range(copies)]
+        mod.lowrank_normalizer_grads(passed, Vt, Gt, B, K)
+        torch.cuda.synchronize()
+        assert torch.equal(grads[1], before[1]), "a copy without a buffer was written"
+        for c in range(copies):
+            if c == 1:
+                continue
+            for r in range(K):
+                row = c * B * K + r * B + torch.arange(B, device = dev)
+                assert torch.allclose(grads[c][r], before[c][r] - Vt[:, row].float() * Gt[:, row], rtol = 1e-5, atol = 1e-5)
+        # ... and every copy one buffer (`tie_external`): all the subtractions land, none lost to another
+        one = before[0].clone()
+        mod.lowrank_normalizer_grads([one] * copies, Vt, Gt, B, K)
+        torch.cuda.synchronize()
+        want = before[0].double()
+        for c in range(copies):
+            for r in range(K):
+                row = c * B * K + r * B + torch.arange(B, device = dev)
+                want[r] -= (Vt[:, row].float() * Gt[:, row]).double()
+        assert torch.allclose(one.double(), want, rtol = 1e-3, atol = 1e-3)
 
 
 @needs_virtual

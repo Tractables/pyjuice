@@ -295,79 +295,67 @@ inline __device__ float as_float(__nv_bfloat16 x) { return __bfloat162float(x); 
 inline __device__ void store_as(float* p, float v) { *p = v; }
 inline __device__ void store_as(__nv_bfloat16* p, float v) { *p = __float2bfloat16(v); }
 
-// The normalizer half's operands, stored TRANSPOSED for the lanes' sake: `Ut` [M, rows], `Vt` [N, rows], a copy's
-// rows `row0 + r B + b` -- adjacent threads adjacent samples, every access consecutive. First each row's shift, the
-// largest of its `B[r, :, b]`: a block of 32 lanes (consecutive samples: one line a load) times 8 warps (every 8th
-// child of a chunk of `SHIFT_CHUNK` children) writes the chunk's largest, a second kernel takes the largest over
-// the chunks (a serial thread a row, as before, was 130 us a launch at 4096 children: a quarter of the backward)...
-constexpr int SHIFT_CHUNK = 256;
+// The normalizer half's operands, stored TRANSPOSED for the lanes' sake: `Ut` [M, rows], `Vt` [N, rows], a copy's rows
+// `(copy, r, b)` -- adjacent lanes adjacent samples, every access consecutive. ONE launch for all the copies of a node
+// vector: their tensors go BY VALUE in the launch's parameters (as the staging transpose's pairs: nothing to upload,
+// nothing kept by address), `blockIdx.z` picks a copy. A block is a copy's rank's 32 samples, `WARPS` warps of 32 lanes over
+// every `WARPS`th child or node: first each lane's shift, the largest of its `B[r, :, b]`, the warps' reduced in shared memory;
+// then `Vt[j, row] = exp(B[r, j, b] - shift)` and `Ut[i, row] = f_b[i] exp(A[i, r, b] - log Z_b[i] + shift)` (0 where the
+// node has no flow). At most COPIES_PER_LAUNCH copies a launch (2 KB of parameters), more in as many launches.
+constexpr int COPIES_PER_LAUNCH = 64;
+// The blocks' warps: these kernels are bound by the latency of a warp's loads, one child after another
+constexpr int WARPS = 32;
+constexpr int OPERAND_THREADS = WARPS * 32;
+struct NormalizerCopies { long long rows[COPIES_PER_LAUNCH * 4]; };             // a copy's A, log Z, B and first node row
 
-__global__ void normalizer_rowmax_partial_kernel(float* __restrict__ part, const float* __restrict__ fb, int N,
-                                                 int B, int K) {
-    // grid (ceil(B / 32), K, chunks), 256 threads; `part` [chunks, K B]
+template <typename TO>
+__global__ void normalizer_operands_kernel(const NormalizerCopies copies, TO* __restrict__ Ut, TO* __restrict__ Vt,
+                                           long rows, long row0, const float* __restrict__ node_flows, int M, int N,
+                                           int B, int K) {
+    const long long* c = copies.rows + 4 * blockIdx.z;
+    const float* fa = reinterpret_cast<const float*>(c[0]);
+    const float* lz = reinterpret_cast<const float*>(c[1]);
+    const float* fb = reinterpret_cast<const float*>(c[2]);
+    const long nid0 = (long)c[3];
     const int lane = threadIdx.x & 31, w = threadIdx.x >> 5;
-    const int b = blockIdx.x * 32 + lane, r = blockIdx.y, c = blockIdx.z;
-    __shared__ float red[8][32];
+    const int r = blockIdx.y, b = blockIdx.x * 32 + lane;
+    __shared__ float most[WARPS][32];
+
+    const float* brow = fb + (long)r * N * B + b;
     float m = -INFINITY;
-    if (b < B) {
-        const int j0 = c * SHIFT_CHUNK, j1 = min(N, j0 + SHIFT_CHUNK);
-        const float* src = fb + (long)r * N * B + b;
-        for (int j = j0 + w; j < j1; j += 8) m = fmaxf(m, src[(long)j * B]);
-    }
-    red[w][lane] = m;
+    if (b < B) for (int j = w; j < N; j += WARPS) m = fmaxf(m, brow[(long)j * B]);
+    most[w][lane] = m;
     __syncthreads();
-    if (w == 0 && b < B) {
-        for (int i = 1; i < 8; i++) m = fmaxf(m, red[i][lane]);
-        part[((long)c * K + r) * B + b] = m;
-    }
-}
+    if (b >= B) return;
+    float sh = most[0][lane];
+    for (int i = 1; i < WARPS; i++) sh = fmaxf(sh, most[i][lane]);
 
-__global__ void normalizer_rowmax_kernel(float* __restrict__ shift, long row0, const float* __restrict__ part,
-                                         int rows_c, int chunks) {
-    const int t = blockIdx.x * blockDim.x + threadIdx.x;                // r B + b
-    if (t >= rows_c) return;
-    float m = -INFINITY;
-    for (int c = 0; c < chunks; c++) m = fmaxf(m, part[(long)c * rows_c + t]);
-    shift[row0 + t] = m;
-}
-
-// ... then `Vt[j, row] = exp(B[r, j, b] - shift)` over the first `N K B` threads and `Ut[i, row] = f_b[i] exp(A[i,
-// r, b] - log Z_b[i] + shift)` (0 where the node has no flow) over the next `M K B`
-template <typename TO>
-__global__ void normalizer_fill_kernel(TO* __restrict__ Ut, TO* __restrict__ Vt, long rows, long row0,
-                                       const float* __restrict__ shift, const float* __restrict__ node_flows,
-                                       long nid0, const float* __restrict__ fa, const float* __restrict__ lz,
-                                       const float* __restrict__ fb, int M, int N, int B, int K) {
-    const long t = (long)blockIdx.x * blockDim.x + threadIdx.x;
-    if (t >= (long)(N + M) * K * B) return;
-    const int b = (int)(t % B);
-    const long q = t / B;
-    const int r = (int)(q % K);
-    const long which = q / K;                                           // a child j, or N + a node i
-    const long row = row0 + (long)r * B + b;
-    const float sh = shift[row];
-    if (which < N) {
-        store_as(Vt + which * rows + row, expf(fb[((long)r * N + which) * B + b] - sh));
-    } else {
-        const long i = which - N;
+    const long row = row0 + (long)blockIdx.z * K * B + (long)r * B + b;
+    for (int j = w; j < N; j += WARPS) store_as(Vt + (long)j * rows + row, expf(brow[(long)j * B] - sh));
+    for (int i = w; i < M; i += WARPS) {
         const float lf = node_flows[(nid0 + i) * (long)B + b];
-        const float z = lz[i * (long)B + b];
+        const float z = lz[(long)i * B + b];
         const bool live = (lf > -INFINITY) && (z < INFINITY);
-        store_as(Ut + i * rows + row, live ? expf(lf + fa[(i * (long)K + r) * B + b] - z + sh) : 0.0f);
+        store_as(Ut + (long)i * rows + row, live ? expf(lf + fa[((long)i * K + r) * B + b] - z + sh) : 0.0f);
     }
 }
 
-// dB[r, j, b] -= Vt[j, row] * Gt[j, row], row = row0 + r B + b: a copy's normalizer part off its gradient
+// dB[r, j, b] -= Vt[j, row] * Gt[j, row]: every copy's normalizer part off its gradient, one launch, the same blocks. A
+// copy's buffer by value, 0 where it has none, no two copies of a launch sharing one (see the launcher).
+struct NormalizerGrads { long long at[COPIES_PER_LAUNCH]; };
+
 template <typename TO>
-__global__ void normalizer_grads_kernel(float* __restrict__ grad_b, const TO* __restrict__ Vt,
+__global__ void normalizer_grads_kernel(const NormalizerGrads grads, const TO* __restrict__ Vt,
                                         const float* __restrict__ Gt, long rows, long row0, int N, int B, int K) {
-    const long t = (long)blockIdx.x * blockDim.x + threadIdx.x;        // (r, j, b), b fastest: dB's own order
-    if (t >= (long)K * N * B) return;
-    const int b = (int)(t % B);
-    const long q = t / B;
-    const int j = (int)(q % N), r = (int)(q / N);
-    const long at = (long)j * rows + row0 + (long)r * B + b;
-    grad_b[t] -= as_float(Vt[at]) * Gt[at];
+    float* grad_b = reinterpret_cast<float*>(grads.at[blockIdx.z]);
+    const int lane = threadIdx.x & 31, w = threadIdx.x >> 5;
+    const int r = blockIdx.y, b = blockIdx.x * 32 + lane;
+    if (grad_b == nullptr || b >= B) return;
+    const long row = row0 + (long)blockIdx.z * K * B + (long)r * B + b;
+    for (int j = w; j < N; j += WARPS) {
+        const long at = (long)j * rows + row;
+        grad_b[((long)r * N + j) * B + b] -= as_float(Vt[at]) * Gt[at];
+    }
 }
 
 void check(const torch::Tensor& t, const char* name, torch::ScalarType st, long numel) {
@@ -577,31 +565,29 @@ void lowrank_backward_pre_fused(torch::Tensor vemd, torch::Tensor table, int64_t
 namespace {
 
 template <typename TO>
-void normalizer_launch(torch::Tensor& Ut, torch::Tensor& Vt, torch::Tensor& shift, torch::Tensor& node_flows,
-                       std::vector<torch::Tensor>& fa, std::vector<torch::Tensor>& lz, std::vector<torch::Tensor>& fb,
-                       std::vector<int64_t>& nid0, int64_t M, int64_t K) {
+void normalizer_launch(torch::Tensor& Ut, torch::Tensor& Vt, torch::Tensor& node_flows, std::vector<torch::Tensor>& fa,
+                       std::vector<torch::Tensor>& lz, std::vector<torch::Tensor>& fb, std::vector<int64_t>& nid0,
+                       int64_t M, int64_t K) {
     const int B = node_flows.size(1), N = Vt.size(0);
-    const long rows = Ut.size(1);
+    const long rows = Ut.size(1), P = (long)fa.size();
     auto stream = at::cuda::getCurrentCUDAStream();
-    const int chunks = (N + SHIFT_CHUNK - 1) / SHIFT_CHUNK;
-    torch::Tensor part = torch::empty({(long)chunks * K * B}, node_flows.options());
-    long row0 = 0;
-    for (size_t c = 0; c < fa.size(); c++) {
-        check(fa[c], "A", torch::kFloat32, (long)B * M * K); check(lz[c], "lz", torch::kFloat32, (long)B * M);
-        check(fb[c], "B", torch::kFloat32, (long)B * K * N);
-        TORCH_CHECK(nid0[c] >= 0 && node_flows.size(0) >= nid0[c] + M, "lowrank mixture: a copy's node rows");
-        normalizer_rowmax_partial_kernel<<<dim3((B + 31) / 32, (int)K, chunks), 256, 0, stream>>>(
-            part.data_ptr<float>(), fb[c].data_ptr<float>(), N, B, (int)K);
+    for (long p0 = 0; p0 < P; p0 += COPIES_PER_LAUNCH) {
+        const int n = (int)std::min<long>(COPIES_PER_LAUNCH, P - p0);
+        NormalizerCopies copies;
+        for (int i = 0; i < n; i++) {
+            const long c = p0 + i;
+            check(fa[c], "A", torch::kFloat32, (long)B * M * K); check(lz[c], "lz", torch::kFloat32, (long)B * M);
+            check(fb[c], "B", torch::kFloat32, (long)B * K * N);
+            TORCH_CHECK(nid0[c] >= 0 && node_flows.size(0) >= nid0[c] + M, "lowrank mixture: a copy's node rows");
+            copies.rows[4 * i] = (long long)fa[c].data_ptr<float>();
+            copies.rows[4 * i + 1] = (long long)lz[c].data_ptr<float>();
+            copies.rows[4 * i + 2] = (long long)fb[c].data_ptr<float>();
+            copies.rows[4 * i + 3] = (long long)nid0[c];
+        }
+        normalizer_operands_kernel<TO><<<dim3((B + 31) / 32, (int)K, n), OPERAND_THREADS, 0, stream>>>(
+            copies, static_cast<TO*>(Ut.data_ptr()), static_cast<TO*>(Vt.data_ptr()), rows, p0 * K * B,
+            node_flows.data_ptr<float>(), (int)M, N, B, (int)K);
         C10_CUDA_KERNEL_LAUNCH_CHECK();
-        normalizer_rowmax_kernel<<<grid_of((long)K * B), THREADS, 0, stream>>>(
-            shift.data_ptr<float>(), row0, part.data_ptr<float>(), (int)(K * B), chunks);
-        C10_CUDA_KERNEL_LAUNCH_CHECK();
-        normalizer_fill_kernel<TO><<<grid_of((long)(N + M) * K * B), THREADS, 0, stream>>>(
-            static_cast<TO*>(Ut.data_ptr()), static_cast<TO*>(Vt.data_ptr()), rows, row0, shift.data_ptr<float>(),
-            node_flows.data_ptr<float>(), (long)nid0[c], fa[c].data_ptr<float>(), lz[c].data_ptr<float>(),
-            fb[c].data_ptr<float>(), (int)M, N, B, (int)K);
-        C10_CUDA_KERNEL_LAUNCH_CHECK();
-        row0 += (long)B * K;
     }
 }
 
@@ -609,37 +595,47 @@ template <typename TO>
 void normalizer_grads_launch(std::vector<c10::optional<torch::Tensor>>& grads, torch::Tensor& Vt, torch::Tensor& Gt,
                              int64_t B, int64_t K) {
     const int N = Vt.size(0);
-    const long rows = Vt.size(1), n = (long)B * K * N;
+    const long rows = Vt.size(1), P = (long)grads.size();
     auto stream = at::cuda::getCurrentCUDAStream();
-    for (size_t c = 0; c < grads.size(); c++) {
-        if (!grads[c].has_value()) continue;
-        check(*grads[c], "grad B", torch::kFloat32, n);
-        normalizer_grads_kernel<TO><<<grid_of(n), THREADS, 0, stream>>>(
-            grads[c]->data_ptr<float>(), static_cast<const TO*>(Vt.data_ptr()), Gt.data_ptr<float>(), rows,
-            (long)c * B * K, N, (int)B, (int)K);
+    for (long p0 = 0; p0 < P; ) {
+        NormalizerGrads at_copy;
+        int n = 0;
+        for (; n < COPIES_PER_LAUNCH && p0 + n < P; n++) {
+            const c10::optional<torch::Tensor>& g = grads[p0 + n];
+            if (g.has_value()) check(*g, "grad B", torch::kFloat32, (long)B * K * N);
+            const long long where = g.has_value() ? (long long)g->data_ptr<float>() : 0;
+            // A buffer two copies share (`tie_external`) takes their subtractions a launch each: in one launch they
+            // would race (load, subtract, store), the kernel's blocks being unordered
+            bool shared = false;
+            for (int i = 0; i < n && where != 0; i++) shared = shared || at_copy.at[i] == where;
+            if (shared) break;
+            at_copy.at[n] = where;
+        }
+        normalizer_grads_kernel<TO><<<dim3((unsigned)((B + 31) / 32), (unsigned)K, (unsigned)n), OPERAND_THREADS, 0, stream>>>(
+            at_copy, static_cast<const TO*>(Vt.data_ptr()), Gt.data_ptr<float>(), rows, p0 * K * B, N, (int)B, (int)K);
         C10_CUDA_KERNEL_LAUNCH_CHECK();
+        p0 += n;
     }
 }
 
 }  // namespace
 
 // The normalizer half's operands of a node vector's copies, transposed: `Ut` [M, copies B K] and `Vt` [N, copies B K],
-// float32 or bfloat16 (as allocated), `shift` [copies B K] float32 scratch; from each copy's node flows (rows
+// float32 or bfloat16 (as allocated); from each copy's node flows (rows
 // `nid0[c]` on), factors and kept `log Z`
-void lowrank_normalizer_operands(torch::Tensor Ut, torch::Tensor Vt, torch::Tensor shift, torch::Tensor node_flows,
+void lowrank_normalizer_operands(torch::Tensor Ut, torch::Tensor Vt, torch::Tensor node_flows,
                                  std::vector<torch::Tensor> fa, std::vector<torch::Tensor> lz,
                                  std::vector<torch::Tensor> fb, std::vector<int64_t> nid0, int64_t M, int64_t K) {
     check(node_flows, "node_flows", torch::kFloat32, -1);
     const long rows = (long)fa.size() * node_flows.size(1) * K;
-    check(shift, "shift", torch::kFloat32, rows);
     TORCH_CHECK(Ut.is_cuda() && Ut.is_contiguous() && Vt.is_cuda() && Vt.is_contiguous()
                 && Ut.scalar_type() == Vt.scalar_type() && Ut.dim() == 2 && Vt.dim() == 2 && Ut.size(1) == rows
                 && Vt.size(1) == rows && Ut.size(0) == M && fa.size() == lz.size() && fa.size() == fb.size()
                 && fa.size() == nid0.size(), "lowrank mixture: the normalizer operands do not match the copies");
     if (rows == 0) return;
     if (Ut.scalar_type() == torch::kBFloat16)
-        normalizer_launch<__nv_bfloat16>(Ut, Vt, shift, node_flows, fa, lz, fb, nid0, M, K);
-    else if (Ut.scalar_type() == torch::kFloat32) normalizer_launch<float>(Ut, Vt, shift, node_flows, fa, lz, fb, nid0, M, K);
+        normalizer_launch<__nv_bfloat16>(Ut, Vt, node_flows, fa, lz, fb, nid0, M, K);
+    else if (Ut.scalar_type() == torch::kFloat32) normalizer_launch<float>(Ut, Vt, node_flows, fa, lz, fb, nid0, M, K);
     else TORCH_CHECK(false, "lowrank mixture: the normalizer operands must be float32 or bfloat16");
 }
 
