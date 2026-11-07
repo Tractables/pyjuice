@@ -39,6 +39,11 @@
 // the caller's (cuBLAS, bf16 operands with fp32 accumulation or fp32), `normalizer_grads` takes `V * (U theta)` off
 // each copy's `dB`.
 //
+// THE DATA HALF'S PARAMETER FLOWS are one product too, where a layer's product layer is fused in (its children's values
+// are at hand at the pass's end, from `node_mars`): with `U[v, i] = f_b[i] exp(A_b[i, r]) / S_b[i]` and `V[v, j] = c_b[j]
+// exp(B_b[r, j])` (`data_operands`, the shift likewise), `F+ = theta * (U^T V)`. The node vector's other flows, those of
+// the elements, need the layer above's and stay the plain kernels' on the virtual columns.
+//
 // Layouts: the circuit's buffers `[rows, batch]`, batch innermost; the virtual ones `[rows, columns]`, a sample's K
 // ranks adjacent from column `b K` of a half; the factors AS STAGED, batch innermost too -- `A [M, K, batch]`,
 // `B [K, N, batch]` (`LowRankSumParams.storage_shapes`: the staging copy is the transpose from the caller's
@@ -331,12 +336,72 @@ __global__ void normalizer_operands_kernel(const NormalizerCopies copies, TO* __
     for (int i = 1; i < WARPS; i++) sh = fmaxf(sh, most[i][lane]);
 
     const long row = row0 + (long)blockIdx.z * K * B + (long)r * B + b;
-    for (int j = w; j < N; j += WARPS) store_as(Vt + (long)j * rows + row, expf(brow[(long)j * B] - sh));
+    for (int j = w; j < N; j += WARPS) {
+        const float v = brow[(long)j * B];
+        store_as(Vt + (long)j * rows + row, v > -INFINITY ? expf(v - sh) : 0.0f);       // (-inf: a rank with no mass here)
+    }
     for (int i = w; i < M; i += WARPS) {
         const float lf = node_flows[(nid0 + i) * (long)B + b];
         const float z = lz[(long)i * B + b];
         const bool live = (lf > -INFINITY) && (z < INFINITY);
         store_as(Ut + (long)i * rows + row, live ? expf(lf + fa[((long)i * K + r) * B + b] - z + sh) : 0.0f);
+    }
+}
+
+// The data half's operands, for the copies whose product layer is fused in (their parameter flows are one product at the
+// pass's end): `Ut[i, row] = f_b[i] exp(A[i, r, b]) / S_b[i] exp(shift)`, `Vt[j, row] = c_b[j] exp(B[r, j, b]) exp(-shift)`,
+// the shift the row's largest log of `c_b[j] exp(B[r, j, b])`, `c_b[j]` the value of the product at child `j`, formed from
+// its two children's node values -- which, unlike `element_mars`, the layers below have not overwritten at the pass's end.
+// `S_b[i]`: `node_mars` holds `log S - log Z`. The same blocks as the normalizer's. (A child no edge reaches: 0.)
+struct DataCopies { long long rows[COPIES_PER_LAUNCH * 7]; };   // A, log Z, B, first node row, children's rows, table, first
+
+template <typename TO>
+__global__ void data_operands_kernel(const DataCopies copies, TO* __restrict__ Ut, TO* __restrict__ Vt, long rows,
+                                     long row0, const float* __restrict__ node_flows,
+                                     const float* __restrict__ node_mars, int M, int N, int B, int K) {
+    const long long* c = copies.rows + 7 * blockIdx.z;
+    const float* fa = reinterpret_cast<const float*>(c[0]);
+    const float* lz = reinterpret_cast<const float*>(c[1]);
+    const float* fb = reinterpret_cast<const float*>(c[2]);
+    const long nid0 = (long)c[3];
+    const int64_t* eid = reinterpret_cast<const int64_t*>(c[4]);
+    const int32_t* table = reinterpret_cast<const int32_t*>(c[5]);
+    const long first = (long)c[6];
+    const int lane = threadIdx.x & 31, w = threadIdx.x >> 5;
+    const int r = blockIdx.y, b = blockIdx.x * 32 + lane;
+    __shared__ float most[WARPS][32];
+
+    const float* brow = fb + (long)r * N * B + b;
+    float m = -INFINITY;
+    if (b < B) {
+        for (int j = w; j < N; j += WARPS) {
+            const long e = eid[j];
+            if (e < 0) continue;
+            const int32_t* ch = table + (e - first) * 2;
+            m = fmaxf(m, node_mars[(long)ch[0] * B + b] + node_mars[(long)ch[1] * B + b] + brow[(long)j * B]);
+        }
+    }
+    most[w][lane] = m;
+    __syncthreads();
+    if (b >= B) return;
+    float sh = most[0][lane];
+    for (int i = 1; i < WARPS; i++) sh = fmaxf(sh, most[i][lane]);
+
+    const long row = row0 + (long)blockIdx.z * K * B + (long)r * B + b;
+    for (int j = w; j < N; j += WARPS) {
+        const long e = eid[j];
+        float v = -INFINITY;
+        if (e >= 0) {
+            const int32_t* ch = table + (e - first) * 2;
+            v = node_mars[(long)ch[0] * B + b] + node_mars[(long)ch[1] * B + b] + brow[(long)j * B];
+        }
+        store_as(Vt + (long)j * rows + row, v > -INFINITY ? expf(v - sh) : 0.0f);
+    }
+    for (int i = w; i < M; i += WARPS) {
+        const float lf = node_flows[(nid0 + i) * (long)B + b];
+        const float ls = node_mars[(nid0 + i) * (long)B + b] + lz[(long)i * B + b];     // log S = log n + log Z
+        const bool live = (lf > -INFINITY) && (ls > -INFINITY);
+        store_as(Ut + (long)i * rows + row, live ? expf(lf + fa[((long)i * K + r) * B + b] - ls + sh) : 0.0f);
     }
 }
 
@@ -592,6 +657,36 @@ void normalizer_launch(torch::Tensor& Ut, torch::Tensor& Vt, torch::Tensor& node
 }
 
 template <typename TO>
+void data_operands_launch(torch::Tensor& Ut, torch::Tensor& Vt, torch::Tensor& node_flows, torch::Tensor& node_mars,
+                          std::vector<torch::Tensor>& fa, std::vector<torch::Tensor>& lz,
+                          std::vector<torch::Tensor>& fb, std::vector<int64_t>& nid0, std::vector<torch::Tensor>& eid,
+                          std::vector<torch::Tensor>& table, std::vector<int64_t>& first, int64_t M, int64_t K) {
+    const int B = node_flows.size(1), N = Vt.size(0);
+    const long rows = Ut.size(1), P = (long)fa.size();
+    auto stream = at::cuda::getCurrentCUDAStream();
+    for (long p0 = 0; p0 < P; p0 += COPIES_PER_LAUNCH) {
+        const int n = (int)std::min<long>(COPIES_PER_LAUNCH, P - p0);
+        DataCopies copies;
+        for (int i = 0; i < n; i++) {
+            const long c = p0 + i;
+            check(fa[c], "A", torch::kFloat32, (long)B * M * K); check(lz[c], "lz", torch::kFloat32, (long)B * M);
+            check(fb[c], "B", torch::kFloat32, (long)B * K * N); check(eid[c], "eid", torch::kInt64, N);
+            check(table[c], "table", torch::kInt32, -1);
+            TORCH_CHECK(nid0[c] >= 0 && node_flows.size(0) >= nid0[c] + M, "lowrank mixture: a copy's node rows");
+            long long* row = copies.rows + 7 * i;
+            row[0] = (long long)fa[c].data_ptr<float>(); row[1] = (long long)lz[c].data_ptr<float>();
+            row[2] = (long long)fb[c].data_ptr<float>(); row[3] = (long long)nid0[c];
+            row[4] = (long long)eid[c].data_ptr<int64_t>(); row[5] = (long long)table[c].data_ptr<int32_t>();
+            row[6] = (long long)first[c];
+        }
+        data_operands_kernel<TO><<<dim3((B + 31) / 32, (int)K, n), OPERAND_THREADS, 0, stream>>>(
+            copies, static_cast<TO*>(Ut.data_ptr()), static_cast<TO*>(Vt.data_ptr()), rows, p0 * K * B,
+            node_flows.data_ptr<float>(), node_mars.data_ptr<float>(), (int)M, N, B, (int)K);
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+    }
+}
+
+template <typename TO>
 void normalizer_grads_launch(std::vector<c10::optional<torch::Tensor>>& grads, torch::Tensor& Vt, torch::Tensor& Gt,
                              int64_t B, int64_t K) {
     const int N = Vt.size(0);
@@ -639,6 +734,27 @@ void lowrank_normalizer_operands(torch::Tensor Ut, torch::Tensor Vt, torch::Tens
     else TORCH_CHECK(false, "lowrank mixture: the normalizer operands must be float32 or bfloat16");
 }
 
+// The data half's operands of the copies whose product layer is fused in, as `lowrank_normalizer_operands`'s: `eid` each
+// copy's children's element rows, `table` / `first` its product layer's children table and first element row
+void lowrank_data_operands(torch::Tensor Ut, torch::Tensor Vt, torch::Tensor node_flows, torch::Tensor node_mars,
+                           std::vector<torch::Tensor> fa, std::vector<torch::Tensor> lz, std::vector<torch::Tensor> fb,
+                           std::vector<int64_t> nid0, std::vector<torch::Tensor> eid, std::vector<torch::Tensor> table,
+                           std::vector<int64_t> first, int64_t M, int64_t K) {
+    check(node_flows, "node_flows", torch::kFloat32, -1); check(node_mars, "node_mars", torch::kFloat32, node_flows.numel());
+    const long rows = (long)fa.size() * node_flows.size(1) * K;
+    TORCH_CHECK(Ut.is_cuda() && Ut.is_contiguous() && Vt.is_cuda() && Vt.is_contiguous()
+                && Ut.scalar_type() == Vt.scalar_type() && Ut.dim() == 2 && Vt.dim() == 2 && Ut.size(1) == rows
+                && Vt.size(1) == rows && Ut.size(0) == M && fa.size() == lz.size() && fa.size() == fb.size()
+                && fa.size() == nid0.size() && fa.size() == eid.size() && fa.size() == table.size()
+                && fa.size() == first.size(), "lowrank mixture: the data operands do not match the copies");
+    if (rows == 0) return;
+    if (Ut.scalar_type() == torch::kBFloat16)
+        data_operands_launch<__nv_bfloat16>(Ut, Vt, node_flows, node_mars, fa, lz, fb, nid0, eid, table, first, M, K);
+    else if (Ut.scalar_type() == torch::kFloat32)
+        data_operands_launch<float>(Ut, Vt, node_flows, node_mars, fa, lz, fb, nid0, eid, table, first, M, K);
+    else TORCH_CHECK(false, "lowrank mixture: the data operands must be float32 or bfloat16");
+}
+
 // Each copy's `dB` [K, N, B] minus `Vt * Gt` on its rows (`Gt` [N, copies B K] float32: `theta^T U`); None: a copy
 // without a gradient
 void lowrank_normalizer_grads(std::vector<c10::optional<torch::Tensor>> grads, torch::Tensor Vt, torch::Tensor Gt,
@@ -668,5 +784,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "`lowrank_collapse_bw` with the element flows written as their two children's node flows");
     m.def("lowrank_normalizer_operands", &lowrank_normalizer_operands,
           "the normalizer half's U^T and V^T of a node vector's copies, for the two matrix products");
+    m.def("lowrank_data_operands", &lowrank_data_operands,
+          "the data half's U^T and V^T of the copies whose product layer is fused in, for F+ as one matrix product");
     m.def("lowrank_normalizer_grads", &lowrank_normalizer_grads, "each copy's dLL/dB minus V * (U theta) on its rows");
 }

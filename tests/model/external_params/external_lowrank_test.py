@@ -1136,6 +1136,7 @@ def test_the_normalizer_operands_and_gradients_follow_their_formulas(M, N, K, B,
     lz[1][0, 3] = -float("inf")                                                       # copy 1, node 0, sample 3: no mass
     fa[1][0, :, 3] = -float("inf")
     node_flows[nid0[1] + 0, 3] = -float("inf")                                        # (so no flow either)
+    fb[0][1, :, 1] = -float("inf")                                                    # copy 0, rank 1, sample 1: no mass
 
     rows = copies * B * K
     for dtype in (torch.float32, torch.bfloat16):
@@ -1149,8 +1150,9 @@ def test_the_normalizer_operands_and_gradients_follow_their_formulas(M, N, K, B,
             for r in range(K):
                 row = c * B * K + r * B + torch.arange(B, device = dev)
                 sh = fb[c][r].max(dim = 0).values                                     # [B]
-                assert torch.allclose(Vt[:, row].float(), torch.exp(fb[c][r] - sh), **tol), f"V: copy {c}, rank {r}"
-                assert torch.equal(Vt[:, row].float().max(dim = 0).values, torch.ones(B, device = dev)), "not shifted"
+                want_v = torch.where(torch.isneginf(fb[c][r]), torch.zeros_like(fb[c][r]), torch.exp(fb[c][r] - sh))
+                assert torch.allclose(Vt[:, row].float(), want_v, **tol), f"V: copy {c}, rank {r}"
+                assert torch.equal(Vt[:, row].float().max(dim = 0).values, torch.isfinite(sh).float()), "not shifted"
                 want_u = torch.exp(lf + fa[c][:, r] - lz[c] + sh)
                 want_u = torch.where(torch.isneginf(lf) | torch.isneginf(lz[c]), torch.zeros_like(want_u), want_u)
                 assert torch.allclose(Ut[:, row].float(), want_u, **tol), f"U: copy {c}, rank {r}"
@@ -1658,10 +1660,13 @@ def test_the_backward_with_the_product_layer_fused_in(name, offered, forward, mo
         passes = [_passes(pc, sums, data, ext) for _ in range(3)]
         assert (len(fused) > 0) == (which == "fused" and offered)
         for got in passes:
-            for k in ("flows", "fp", "fm"):
+            for k in ("flows", "fm"):
                 assert torch.equal(got[k], first[k]), k
             for k in ("dA", "dB"):
                 assert all(torch.equal(a, b) for a, b in zip(got[k], first[k])), k
+            # (the parameter flows: one matrix product where the layer is fused, the plain kernels' before it decided)
+            assert torch.equal(got["fp"], passes[0]["fp"])
+            assert torch.allclose(got["fp"], first["fp"], rtol = 1e-4, atol = 1e-6)
         # Other data next: the products' values and flows the last pass left in the circuit's buffers are not these
         torch.manual_seed(24)
         other = torch.randint(0, NUM_CATS, (batch, pc.num_vars), device = dev)
@@ -1674,10 +1679,185 @@ def test_the_backward_with_the_product_layer_fused_in(name, offered, forward, mo
             monkeypatch.setattr(lowrank_virtual, "ENABLED", True)
             assert torch_pass["path"] == {dict}
             _same(out[which], torch_pass, rtol = 2e-4, atol = 2e-5)
-    for k in ("flows", "fp", "fm"):
+    for k in ("flows", "fm"):
         assert torch.equal(out["fused"][k], out["unfused"][k]), k
+    assert torch.allclose(out["fused"]["fp"], out["unfused"]["fp"], rtol = 1e-4, atol = 1e-6)
     for k in ("dA", "dB"):
         assert all(torch.equal(a, b) for a, b in zip(out["fused"][k], out["unfused"][k])), k
+
+
+def _force_fused_backward(monkeypatch):
+    """The circuit hands every product layer it can to the sum layer above in the backward, whatever its tuner would
+    choose (it decides at its second backward)."""
+    import pyjuice.layer.kernels.autotune as autotune
+
+    pick = autotune.pick
+
+    def forced(key, cands, bench, **kw):
+        return "fused" if key[0] == "prod_stream_fusion_bk" else pick(key, cands, bench, **kw)
+
+    monkeypatch.setattr(autotune, "pick", forced)
+
+
+@needs_virtual
+@pytest.mark.parametrize("name,sources,fused_copies", [("hmm_tied", 1, 2), ("two_chains", 2, 4), ("hmm_side", 1, 2)])
+@pytest.mark.parametrize("operands", ["fp32", "bf16"])
+def test_the_parameter_flows_of_fused_layers_are_one_matrix_product(name, sources, fused_copies, operands, monkeypatch):
+    """Where the product layer below is fused in, a layer's plain backward adds no parameter flows: all the fused copies
+    of a source are one matrix product at the pass's end, `theta * (U^T V)` over their rows -- `F+` within rounding of
+    the plain kernels' on the same forward and of the torch passes', with `F-`, the gradients and the node flows
+    untouched; a layer not fused keeps its plain kernel."""
+    import pyjuice.nodes.external_params.lowrank_virtual as lowrank_virtual
+    from pyjuice.layer.sum_layer import SumLayer
+
+    _force_fused_backward(monkeypatch)
+    if operands == "bf16":
+        monkeypatch.setattr(lowrank_virtual, "GEMM_BF16_WORK", 0)
+    rtol = 2e-4 if operands == "fp32" else 6e-3
+
+    real, calls = lowrank_virtual._module, []
+
+    class Counted:
+        def __getattr__(self, attr):
+            fn = getattr(real(), attr)
+            if attr != "lowrank_data_operands":
+                return fn
+
+            def counted(Ut, Vt, *args):
+                calls.append((Ut.size(1), Ut.dtype))
+                return fn(Ut, Vt, *args)
+            return counted
+
+    counted = Counted()
+    monkeypatch.setattr(lowrank_virtual, "_module", lambda: counted)
+    plain, with_flows = SumLayer.backward, []
+
+    def plain_counted(self, node_flows, *args, **kwargs):
+        if node_flows.size(1) == batch * rank:                   # (a virtual batch's: the root's and a plain sum's keep theirs)
+            with_flows.append(kwargs.get("param_flows") is not None)
+        return plain(self, node_flows, *args, **kwargs)
+
+    monkeypatch.setattr(SumLayer, "backward", plain_counted)
+
+    rank, batch = 2, 5
+    pc, sums, _, _, _, _ = _pair(name, "sum_exp", rank = rank)
+    dev = pc.params.device
+    torch.manual_seed(31)
+    data = torch.randint(0, NUM_CATS, (batch, pc.num_vars), device = dev)
+    ext = {a: _factors(a, rank, batch, dev, seed = 210 + i) for i, a in enumerate(sums)}
+    unfused = _passes(pc, sums, data, ext)                       # (the circuit decides at its second backward)
+    assert calls == []
+    with_flows.clear()
+    got = _passes(pc, sums, data, ext)
+    dtype = torch.float32 if operands == "fp32" else torch.bfloat16
+    assert len(calls) == sources and sum(r for r, _ in calls) == fused_copies * batch * rank, calls
+    assert all(t == dtype for _, t in calls), calls
+    assert with_flows == [False, False, True], with_flows         # (a layer's plain backward, the deepest's not fused)
+
+    assert torch.allclose(got["fp"], unfused["fp"], rtol = rtol, atol = 1e-5), \
+        f"{float(((got['fp'] - unfused['fp']).abs() / unfused['fp'].abs().clamp_min(1e-5)).max())}"
+    assert torch.equal(got["flows"], unfused["flows"]) and torch.equal(got["mars"], unfused["mars"])
+    monkeypatch.setattr(lowrank_virtual, "ENABLED", False)
+    ref = _passes(pc, sums, data, ext)
+    assert ref["path"] == {dict}
+    assert torch.allclose(got["fp"], ref["fp"], rtol = rtol, atol = 1e-5)
+
+
+@needs_virtual
+def test_the_parameter_flows_of_copies_in_several_flow_blocks(monkeypatch):
+    """Tied copies in one layer past `max_tied_ns_per_parflow_block` have flow blocks of their own, summed before the
+    parameters read them. The product lands in the first's: the EM step takes the parameters where the torch passes do."""
+    import pyjuice.nodes.external_params.lowrank_virtual as lowrank_virtual
+
+    _force_fused_backward(monkeypatch)
+    rank, batch, dev, K = 2, 5, torch.device("cuda:0"), 8
+    out = dict()
+    for arm in ("virtual", "torch"):
+        monkeypatch.setattr(lowrank_virtual, "ENABLED", arm == "virtual")
+        torch.manual_seed(0)
+        with juice.set_block_size(K):
+            sums, parts = [], []
+            for t in range(4):                                    # one layer of tied sums over two inputs each
+                m = multiply(*[inputs(2 * t + v, num_node_blocks = 1, dist = dists.Categorical(num_cats = NUM_CATS))
+                               for v in range(2)])
+                ns = summate(m, num_node_blocks = 1, external_params = LowRankSumParams(rank = rank, form = "sum_exp")) \
+                    if not sums else sums[0].duplicate(m, tie_params = True)
+                sums.append(ns)
+            root = summate(multiply(*sums), num_node_blocks = 1, block_size = 1)
+        torch.manual_seed(0)
+        root.init_parameters(perturbation = 2.0)
+        pc = juice.compile(root, verbose = False, max_tied_ns_per_parflow_block = 2).to(dev)
+        assert len({a._param_flow_range for a in sums}) > 1, "one flow block: nothing is tested"
+        torch.manual_seed(3)
+        data = torch.randint(0, NUM_CATS, (batch, pc.num_vars), device = dev)
+        ext = {a: _factors(a, rank, batch, dev, seed = 230 + i) for i, a in enumerate(sums)}
+        for _ in range(3):                                        # (the circuit decides at its second backward)
+            _passes(pc, sums, data, ext)
+            pc.mini_batch_em(step_size = 0.5, pseudocount = 1e-6)
+        out[arm] = pc.params.clone()
+    assert torch.allclose(out["virtual"], out["torch"], rtol = 1e-3, atol = 1e-5)
+
+
+@needs_virtual
+@pytest.mark.parametrize("M, N, K, B, copies", [(3, 300, 2, 37, 2),     # children past one warp's share, samples past a block's
+                                                (5, 3, 3, 4, 70)])      # few children, copies past one launch's
+def test_the_data_operands_follow_their_formulas(M, N, K, B, copies):
+    """The kernel's contract, checked directly. With `v[r, j, b] = c_b[j] + B[r, j, b]`, `c_b[j]` the sum of the node values
+    of the product's two children and the shift the row's largest `v`: `Vt[j, (c, r, b)] = exp(v[r, j, b] - shift)`, and
+    `Ut[i, (c, r, b)] = exp(lf[i, b] + A[i, r, b] - log S[i, b] + shift)`, `log S = node_mars + log Z`. A child no edge
+    reaches, a child without mass: 0. A node without flow or mass: 0. A rank with no mass at a sample: zeros, no NaN. float32
+    and bfloat16 operands."""
+    import pyjuice.nodes.external_params.lowrank_virtual as lowrank_virtual
+
+    mod, dev = lowrank_virtual._module(), torch.device("cuda")
+    g = torch.Generator(device = "cpu").manual_seed(11)
+    children = 13                                                      # the rows children stand in
+    fa = [(torch.randn(M, K, B, generator = g) * 2).to(dev) for _ in range(copies)]
+    fb = [(torch.randn(K, N, B, generator = g) * 2).to(dev) for _ in range(copies)]
+    lz = [(torch.randn(M, B, generator = g) * 2).to(dev) for _ in range(copies)]
+    rows = children + copies * M
+    node_flows = (torch.randn(rows, B, generator = g) - 1.0).to(dev)
+    node_mars = (torch.randn(rows, B, generator = g) - 3.0).to(dev)
+    nid0 = [children + c * M for c in range(copies)]
+    first, elements = 5, N + 7
+    table = torch.randint(0, children, (elements, 2), generator = g, dtype = torch.int32).to(dev)
+    eids = [(first + torch.randperm(elements, generator = g)[:N]).to(dev) for _ in range(copies)]
+    eids[0][1] = -1                                                    # copy 0, child 1: no edge reaches it
+    node_mars[int(table[int(eids[1][0]) - first, 0]), 2] = -float("inf")   # a child without mass (and whatever shares its row)
+    node_flows[nid0[0] + 1, 2] = -float("inf")                         # copy 0, node 1, sample 2: no flow
+    node_mars[nid0[1] + 0, 3] = -float("inf")                          # copy 1, node 0, sample 3: no mass
+    fb[0][1, :, 1] = -float("inf")                                     # copy 0, rank 1, sample 1: the rank has no mass
+
+    total = copies * B * K
+    for dtype in (torch.float32, torch.bfloat16):
+        tol = dict(rtol = 1e-5, atol = 1e-6) if dtype is torch.float32 else dict(rtol = 1e-2, atol = 1e-3)
+        Ut = torch.full((M, total), float("nan"), dtype = dtype, device = dev)
+        Vt = torch.full((N, total), float("nan"), dtype = dtype, device = dev)
+        mod.lowrank_data_operands(Ut, Vt, node_flows, node_mars, fa, lz, fb, nid0, eids, [table] * copies,
+                                  [first] * copies, M, K)
+        torch.cuda.synchronize()
+        assert torch.isfinite(Ut.float()).all() and torch.isfinite(Vt.float()).all()
+        for c in range(copies):
+            has = eids[c] >= 0
+            at = (eids[c].clamp_min(first) - first).long()
+            cv = node_mars[table[at, 0].long()] + node_mars[table[at, 1].long()]    # [N, B]
+            cv = torch.where(has[:, None], cv, torch.full_like(cv, -float("inf")))
+            lf = node_flows[nid0[c]:nid0[c] + M]
+            ls = node_mars[nid0[c]:nid0[c] + M] + lz[c]
+            for r in range(K):
+                row = c * B * K + r * B + torch.arange(B, device = dev)
+                v = cv + fb[c][r]                                              # [N, B]
+                sh = v.max(dim = 0).values                                     # [B]
+                want_v = torch.where(torch.isneginf(v), torch.zeros_like(v), torch.exp(v - sh))
+                assert torch.allclose(Vt[:, row].float(), want_v, **tol), f"V: copy {c}, rank {r}"
+                want_u = torch.exp(lf + fa[c][:, r] - ls + sh)
+                dead = torch.isneginf(lf) | torch.isneginf(ls)
+                want_u = torch.where(dead, torch.zeros_like(want_u), want_u)
+                assert torch.allclose(Ut[:, row].float(), want_u, **tol), f"U: copy {c}, rank {r}"
+        assert all(float(Ut[1, r * B + 2]) == 0.0 for r in range(K))
+        assert all(float(Ut[0, B * K + r * B + 3]) == 0.0 for r in range(K))
+        assert float(Vt[1, :B * K].abs().max()) == 0.0
+        assert float(Vt[:, B + 1].abs().max()) == 0.0 and float(Ut[:, B + 1].abs().max()) == 0.0
 
 
 def test_refusals():
