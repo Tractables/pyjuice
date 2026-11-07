@@ -13,9 +13,11 @@ The node's normalizer reads no child values and tied copies share the parameters
 at all. For a node vector and every tied copy of it the pass was given, before the first of them runs, each rank's
 normalizer is ONE matrix product over the rows `(copy, rank, sample)` (`_normalizers`).
 
-The virtual buffers are as tall as the circuit's own (the plain kernels address rows by their ids), `K` times as wide,
-and shared by every layer: scratch, rewritten by each layer's pass. What a layer's backward needs of its forward --
-`log Z` and each rank's share of the two sums -- is kept per node vector, on the layer.
+The virtual buffers are `K` times as wide as the circuit's and scratch, rewritten by each layer's pass. The element ones
+are as tall as the circuit's (whose element rows every product layer reuses: one layer's worth); the NODE ones are one
+layer's -- a few dummy rows, then the layer's nodes --, the plain kernels run on the layer's TWIN (`_twin`): a plain
+`SumLayer` of its compiled tables, the node rows shifted to match, its caches its own. What a layer's backward needs of
+its forward -- `log Z` and each rank's share of the two sums -- is kept per node vector, on the layer.
 
 The backward's normalizer half reads no child values and tied copies share the parameters: it is not run through
 the plain kernels at all. For a node vector and every tied copy of it in the pass, at the pass's end, it is TWO MATRIX
@@ -34,6 +36,7 @@ rescaling of it), the virtual buffers within `VIRTUAL_BYTES_MOST`. Every other c
 from __future__ import annotations
 
 import weakref
+from typing import Optional
 
 import torch
 
@@ -64,20 +67,73 @@ def _columns(layer, node_mars: torch.Tensor) -> int:
     return node_mars.size(1) * layer.parameterization.rank
 
 
-def _bytes(node_mars: torch.Tensor, element_mars: torch.Tensor, cols: int) -> int:
-    """Every family of `_buffers` at once: the forward's values; the backward's (flows, values, zeros)."""
-    hn, he = node_mars.size(0), element_mars.size(0)
-    return 4 * (cols * (hn + he) + cols * (2 * hn + 2 * he))
+def _bytes(node_rows: int, element_mars: torch.Tensor, cols: int) -> int:
+    """Every family of `_buffers` a layer's pass takes at once: the forward's values; the backward's (flows, values,
+    zeros) -- the node rows the layer's (`_twin`), the element rows the circuit's."""
+    return 4 * cols * (3 * node_rows + 3 * element_mars.size(0))
 
 
 def serves(desc, layer, node_mars: torch.Tensor, element_mars: torch.Tensor) -> bool:
     """Whether this layer's pass at this batch goes through the virtual batch."""
     if not ENABLED or desc.form != "sum_exp" or not node_mars.is_cuda or node_mars.dtype != torch.float32:
         return False
-    if not _disjoint(desc, layer, node_mars.device) \
-            or _bytes(node_mars, element_mars, _columns(layer, node_mars)) > VIRTUAL_BYTES_MOST:
+    if _module() is None or not _disjoint(desc, layer, node_mars.device):
         return False
-    return _module() is not None
+    rows = _twin(layer)[0]._layer_nid_range[1]
+    return _bytes(rows, element_mars, _columns(layer, node_mars)) <= VIRTUAL_BYTES_MOST
+
+
+def note_compiled(layer) -> None:
+    """`LowRank.compile`'s: which attributes of the layer, as compilation leaves it, are caches -- an empty container or
+    None: the twin gets a fresh one -- and which are its compiled tables and settings, which the twin shares."""
+    caches, compiled = dict(), []
+    for k, v in layer.__dict__.items():
+        if v is None or (isinstance(v, (dict, list, set)) and len(v) == 0):
+            caches[k] = type(v)
+        else:
+            compiled.append(k)
+    layer.__dict__["_lr_compiled"] = (tuple(compiled), caches)
+
+
+def _twin(layer):
+    """`(twin, shift)`: the layer's TWIN, on which the virtual batch runs the plain kernels -- a plain `SumLayer` with
+    the layer's compiled tables and settings (shared), caches of its own (fresh: what the layer's would hold is derived
+    from other node rows), and node ids `shift` rows lower: each id of the layer's own nodes, `nids` and `parids`
+    alike; a dummy id, below the layer's rows, unchanged -- so the virtual node buffers hold the dummy rows `[0, nd)`,
+    then the layer's nodes, a node's row there its row in the circuit's less `shift`. `nd` covers every dummy block the
+    tables name, one block at least, a multiple of 32. Made when first asked for, on the tables' device; dropped with
+    the layer's device caches (`LowRank.drop_device_caches`)."""
+    hit = layer.__dict__.get("_lrv_twin")
+    if hit is not None:
+        return hit
+    from pyjuice.layer.sum_layer import SumLayer
+    import torch.nn as nn
+
+    compiled, caches = layer.__dict__["_lr_compiled"]
+    twin = SumLayer.__new__(SumLayer)
+    own = twin.__dict__
+    for k in compiled:
+        if k in layer.__dict__:
+            own[k] = layer.__dict__[k]
+    for k, kind in caches.items():
+        own[k] = kind()
+
+    lo, hi = layer._layer_nid_range
+    nids, parids = list(layer.partitioned_nids), list(layer.partitioned_parids)
+    if not all(bool(((t >= lo) & (t < hi)).all()) for t in nids) or not all(bool((t < hi).all()) for t in parids):
+        raise RuntimeError("LowRank: a sum layer's tables name nodes past its own rows.")
+    extent = max((int(t[t < lo].max()) + layer.block_size for t in parids if bool((t < lo).any())), default = 0)
+    nd = -(-max(32, layer.block_size, extent) // 32) * 32
+    shift = lo - nd
+    lists = type(layer.partitioned_nids)
+    shifted = lambda ts, dummies: lists([nn.Parameter((torch.where(t >= lo, t - shift, t) if dummies else t - shift)
+                                                      .contiguous(), requires_grad = False) for t in ts])
+    modules = type(layer._modules)(layer._modules)
+    modules["partitioned_nids"], modules["partitioned_parids"] = shifted(nids, False), shifted(parids, True)
+    own["_modules"] = modules
+    own["_layer_nid_range"] = (lo - shift, hi - shift)
+    hit = layer.__dict__["_lrv_twin"] = (twin, shift)
+    return hit
 
 
 def _disjoint(desc, layer, device) -> bool:
@@ -97,24 +153,35 @@ _FAMILIES = {
 }
 
 
-def _buffers(node_mars: torch.Tensor, element_mars: torch.Tensor, cols: int, family: str) -> dict:
+def _buffers(node_mars: torch.Tensor, element_mars: torch.Tensor, cols: int, family: str,
+             node_rows: Optional[tuple] = None) -> dict:
     """The virtual buffers beside `node_mars` for `cols` columns a half, of one family (allocated when first asked
-    for). Kept ON that tensor: a circuit's rows are its own -- which are dummies, which a layer's --, and it makes
-    another buffer when its batch changes, these gone with the old one."""
+    for): the element ones as tall as `element_mars`, one set per (family, columns) -- the layer below writes the next
+    layer's (`_link`) --, the node ones for a layer's twin's rows (`_twin`: `node_rows` its `_layer_nid_range`, the
+    dummy rows before it; None: the element ones only), one set per (family, columns, rows): the layers whose dummy rows
+    and nodes lie alike take turns, none writing another's dummy rows. One dict a key, the element ones in it the
+    same tensors whatever the rows (one lookup a call: the pass is host-bound at small shapes). Kept ON that tensor:
+    a circuit's rows are its own -- which are dummies, which a layer's --, and it makes another buffer when its batch
+    changes, these gone with the old one."""
     store = node_mars.__dict__.get("_lowrank_virtual")
     if store is None:
         store = node_mars.__dict__["_lowrank_virtual"] = dict()
-    made = store.get((family, cols))
+    key = (family, cols, node_rows)
+    made = store.get(key)
     if made is None:
-        # Filled once, as the circuit fills its own: the plain kernels pad a ragged row's edges with the circuit's
-        # DUMMY rows -- the first elements, of value 0 (-inf), the first nodes, of flow 0 -- which nothing here ever
-        # writes. (Node values: 0, which the backward's stand-ins are throughout.)
+        # Filled once, as the circuit fills its own: the plain kernels pad a ragged row's edges with DUMMY rows -- the
+        # first elements, of value 0 (-inf), the first nodes, of flow 0 -- which nothing here ever writes. (Node
+        # values: 0, which the backward's stand-ins are throughout.)
         made, dev = dict(), node_mars.device
-        for name, (nodes, width) in _FAMILIES[family].items():
-            shape = (node_mars.size(0) if nodes else element_mars.size(0), width * cols)
+        if node_rows is not None:
+            made.update(_buffers(node_mars, element_mars, cols, family))
+        for name, (of_nodes, width) in _FAMILIES[family].items():
+            if of_nodes != (node_rows is not None):
+                continue
+            shape = (node_rows[1] if of_nodes else element_mars.size(0), width * cols)
             zero = name in ("vnm", "zero")
             made[name] = torch.zeros(shape, device = dev) if zero else torch.full(shape, -float("inf"), device = dev)
-        store[(family, cols)] = made
+        store[key] = made
     return made
 
 
@@ -286,7 +353,8 @@ def forward(desc, layer, ns_tensors, node_mars, element_mars, params, kwargs, st
 
     mod, K, batch, dev = _module(), desc.rank, node_mars.size(1), node_mars.device
     cols = batch * K
-    bufs = _buffers(node_mars, element_mars, cols, "fw")
+    twin, shift = _twin(layer)
+    bufs = _buffers(node_mars, element_mars, cols, "fw", twin._layer_nid_range)
     st = _pass(kwargs)
 
     # The virtual child values: written already where the layer below took them along with its collapse. The mark it
@@ -309,7 +377,7 @@ def forward(desc, layer, ns_tensors, node_mars, element_mars, params, kwargs, st
     if stream_children is not None:
         _link(desc, layer, ran, stream_children, dev)
 
-    SumLayer.forward(layer, bufs["vnm"], bufs["vem"], params, precision = kwargs.get("precision", "auto"))
+    SumLayer.forward(twin, bufs["vnm"], bufs["vem"], params, precision = kwargs.get("precision", "auto"))
 
     # The node values -- and, in the same launch, the virtual child values of the layer above (`_link`)
     nxt = _above(layer, kwargs, node_mars, element_mars)
@@ -317,7 +385,7 @@ def forward(desc, layer, ns_tensors, node_mars, element_mars, params, kwargs, st
         for info, (fa, _) in ns_tensors:
             z = _normalizers(desc, layer, info, st, kwargs, params, batch, dev)
             mod.lowrank_collapse(node_mars, bufs["vnm"], fa, *_state(layer, info, batch, dev), z["log_z"], z["row"][info.ns],
-                                 info.nid_start, info.ns.num_nodes, K)
+                                 info.nid_start, info.nid_start - shift, info.ns.num_nodes, K)
     else:
         above, tensors, bufa = nxt
         link, adesc = layer.__dict__["_lrv_link"], above.parameterization
@@ -329,10 +397,11 @@ def forward(desc, layer, ns_tensors, node_mars, element_mars, params, kwargs, st
             lzr, row0 = z["log_z"], z["row"][info.ns]
             if at is None:
                 mod.lowrank_collapse(node_mars, bufs["vnm"], fa, *_state(layer, info, batch, dev), lzr, row0,
-                                     info.nid_start, info.ns.num_nodes, K)
+                                     info.nid_start, info.nid_start - shift, info.ns.num_nodes, K)
             else:
                 mod.lowrank_collapse_expand(node_mars, bufs["vnm"], fa, *_state(layer, info, batch, dev), lzr, row0,
-                                            info.nid_start, info.ns.num_nodes, K, bufa["vem"], link["table"],
+                                            info.nid_start, info.nid_start - shift, info.ns.num_nodes, K, bufa["vem"],
+                                            link["table"],
                                             link["first"], tensors[at][1], geo(at), adesc.rank)
         for at in link["rest"]:
             mod.lowrank_expand_fused(bufa["vem"], node_mars, link["table"], link["first"], tensors[at][1], geo(at),
@@ -405,7 +474,8 @@ def backward(desc, layer, ns_tensors, ns_grad_tensors, node_flows, element_flows
 
     mod, K, batch, dev = _module(), desc.rank, node_mars.size(1), node_mars.device
     cols = batch * K
-    bufs = _buffers(node_mars, element_mars, cols, "bw")
+    twin, shift = _twin(layer)
+    bufs = _buffers(node_mars, element_mars, cols, "bw", twin._layer_nid_range)
     precision = kwargs.get("precision", "auto")
     want_denom = param_flows is not None and denom_param_flows is not None and desc.apply_z_correction
 
@@ -426,15 +496,15 @@ def backward(desc, layer, ns_tensors, ns_grad_tensors, node_flows, element_flows
         grad_a = None if grads is None else grads[0]
         if stream_children is None:
             mod.lowrank_backward_pre(bufs["vem_d"], element_mars, fb, rows, bufs["vnf_d"], node_flows, node_mars, fa,
-                                     *state, grad_a, info.nid_start, info.ns.num_nodes, K)
+                                     *state, grad_a, info.nid_start, info.nid_start - shift, info.ns.num_nodes, K)
         else:
             mod.lowrank_backward_pre_fused(bufs["vem_d"], stream_children[0], stream_children[1], fb, rows,
                                            bufs["vnf_d"], node_flows, node_mars, fa, *state,
-                                           grad_a, info.nid_start, info.ns.num_nodes, K)
+                                           grad_a, info.nid_start, info.nid_start - shift, info.ns.num_nodes, K)
 
     # (the parameter flows: one matrix product at the pass's end where the product layer is fused in: its children's
     # values are still at hand then)
-    SumLayer.backward(layer, bufs["vnf_d"], bufs["vef_d"], bufs["zero"], bufs["vem_d"], params,
+    SumLayer.backward(twin, bufs["vnf_d"], bufs["vef_d"], bufs["zero"], bufs["vem_d"], params,
                       param_flows = param_flows if stream_children is None else None, logspace_flows = True,
                       precision = precision)
 

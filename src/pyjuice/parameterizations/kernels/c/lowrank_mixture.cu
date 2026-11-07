@@ -47,7 +47,10 @@
 // the elements, need the layer above's and stay the plain kernels' on the virtual columns.
 //
 // Layouts: the circuit's buffers `[rows, batch]`, batch innermost; the virtual ones `[rows, columns]`, a sample's K
-// ranks adjacent from column `b K` of a half; the factors AS STAGED, batch innermost too -- `A [M, K, batch]`,
+// ranks adjacent from column `b K` of a half -- the element ones as tall as the circuit's, the node ones one LAYER's
+// (its rows after a few dummy rows, the plain kernels given the layer's tables shifted to match: `nid0` is a node
+// vector's first row in the circuit's buffers, `vn0` in the virtual ones); the factors AS STAGED, batch innermost too
+// -- `A [M, K, batch]`,
 // `B [K, N, batch]` (`LowRank.storage_shapes`: the staging copy is the transpose from the caller's
 // `[batch, M, K]` and `[batch, K, N]`), the gradients the same way; per-node state `[M, batch]` and `[M, K, batch]`.
 // One thread a (row, sample), adjacent threads adjacent samples, its K ranks in a loop: every access of a warp is to
@@ -113,13 +116,13 @@ inline __device__ float lse_with(const float* __restrict__ a, long sa, const flo
 __global__ void collapse_kernel(float* __restrict__ node_mars, const float* __restrict__ vnm, long cols,
                                 const float* __restrict__ fa, float* __restrict__ lz, float* __restrict__ lrn,
                                 float* __restrict__ lrz, const float* __restrict__ lzr, long rows, long row0, long nid0,
-                                int M, int B, int K) {
+                                long vn0, int M, int B, int K) {
     const long t = (long)blockIdx.x * blockDim.x + threadIdx.x;
     if (t >= (long)M * B) return;
     const int b = (int)(t % B);
     const int i = (int)(t / B);
 
-    const float* yd = vnm + (nid0 + i) * cols + (long)b * K;            // the virtual node values
+    const float* yd = vnm + (vn0 + i) * cols + (long)b * K;             // the virtual node values
     const float* yz = lzr + (long)i * rows + row0 + b;                  // the log normalizers: r at a stride of B
     const long at = (long)i * K * B + b;                                // A[i, r, b]: r at a stride of B
     const float* a = fa + at;
@@ -144,7 +147,7 @@ __global__ void collapse_kernel(float* __restrict__ node_mars, const float* __re
 __global__ void collapse_expand_kernel(float* node_mars, const float* __restrict__ vnm, long cols,
                                        const float* __restrict__ fa, float* __restrict__ lz, float* __restrict__ lrn,
                                        float* __restrict__ lrz, const float* __restrict__ lzr, long rows, long row0,
-                                       long nid0, int M, int K,
+                                       long nid0, long vn0, int M, int K,
                                        float* __restrict__ vem, long cw, const int32_t* __restrict__ table, long first,
                                        const float* __restrict__ fb, const int64_t* __restrict__ eid, int N, int KC,
                                        int B) {
@@ -152,7 +155,7 @@ __global__ void collapse_expand_kernel(float* node_mars, const float* __restrict
     if (t < (long)M * B) {
         const int b = (int)(t % B);
         const int i = (int)(t / B);
-        const float* yd = vnm + (nid0 + i) * cols + (long)b * K;
+        const float* yd = vnm + (vn0 + i) * cols + (long)b * K;
         const float* yz = lzr + (long)i * rows + row0 + b;
         const long at = (long)i * K * B + b;
         const float* a = fa + at;
@@ -178,7 +181,7 @@ __global__ void collapse_expand_kernel(float* node_mars, const float* __restrict
     for (int k = 0; k < 2; k++) {
         const long row = ch[k];
         if (row >= nid0 && row < nid0 + M) {                            // one of the nodes collapsed in this launch
-            const float* yd = vnm + row * cols + (long)b * K;
+            const float* yd = vnm + (row - nid0 + vn0) * cols + (long)b * K;
             const float* yz = lzr + (row - nid0) * rows + row0 + b;
             const float* a = fa + (row - nid0) * (long)K * B + b;
             const float ls = lse_with(a, B, yd, 1, K);
@@ -199,7 +202,7 @@ __global__ void collapse_expand_kernel(float* node_mars, const float* __restrict
 template <bool GRAD>
 inline __device__ void expand_bw_at(long t, float* vnfd, const float* node_flows, const float* node_mars,
                                     const float* fa, const float* lz, const float* lrn, const float* lrz,
-                                    float* grad_a, long nid0, int M, int B, int K) {
+                                    float* grad_a, long nid0, long vn0, int M, int B, int K) {
     const int b = (int)(t % B);
     const int i = (int)(t / B);
 
@@ -208,7 +211,7 @@ inline __device__ void expand_bw_at(long t, float* vnfd, const float* node_flows
     const float lf = node_flows[row * B + b];
     const float z = lz[(long)i * B + b];
     const float ls = node_mars[row * B + b] + z;                        // log S = log n + log Z
-    float* outd = vnfd + (row * (long)B + b) * K;
+    float* outd = vnfd + ((vn0 + i) * (long)B + b) * K;
     const bool live = (lf > -INFINITY) && (ls > -INFINITY);
     for (int r = 0; r < K; r++) outd[r] = live ? lf + fa[at + r * B] - ls : -INFINITY;
 
@@ -228,13 +231,13 @@ __global__ void backward_pre_kernel(float* vd, long cd, const float* vals, const
                                     float* __restrict__ vnfd, const float* __restrict__ node_flows,
                                     const float* node_mars, const float* __restrict__ fa,
                                     const float* __restrict__ lz, const float* __restrict__ lrn,
-                                    const float* __restrict__ lrz, float* __restrict__ grad_a, long nid0, int M,
-                                    int B, int K) {
+                                    const float* __restrict__ lrz, float* __restrict__ grad_a, long nid0, long vn0,
+                                    int M, int B, int K) {
     const long t = (long)blockIdx.x * blockDim.x + threadIdx.x;
     if (t < (long)N * B) {
         expand_at<FUSED>(t, vd, cd, vals, table, first, fb, eid, N, B, K);
     } else if (t - (long)N * B < (long)M * B) {
-        expand_bw_at<GRAD>(t - (long)N * B, vnfd, node_flows, node_mars, fa, lz, lrn, lrz, grad_a, nid0, M, B, K);
+        expand_bw_at<GRAD>(t - (long)N * B, vnfd, node_flows, node_mars, fa, lz, lrn, lrz, grad_a, nid0, vn0, M, B, K);
     }
 }
 
@@ -482,14 +485,15 @@ namespace {
 
 void check_collapse(const torch::Tensor& node_mars, const torch::Tensor& vnm, const torch::Tensor& fa,
                     const torch::Tensor& lz, const torch::Tensor& lrn, const torch::Tensor& lrz,
-                    const torch::Tensor& lzr, int64_t row0, int64_t nid0, int64_t M, int64_t K) {
+                    const torch::Tensor& lzr, int64_t row0, int64_t nid0, int64_t vn0, int64_t M, int64_t K) {
     const int B = node_mars.size(1);
     check(node_mars, "node_mars", torch::kFloat32, -1); check(vnm, "vnm", torch::kFloat32, -1);
     check(fa, "A", torch::kFloat32, (long)B * M * K); check(lz, "lz", torch::kFloat32, (long)B * M);
     check(lrn, "lrn", torch::kFloat32, (long)B * M * K); check(lrz, "lrz", torch::kFloat32, (long)B * M * K);
     check(lzr, "log Z", torch::kFloat32, -1);
-    TORCH_CHECK(vnm.size(0) >= nid0 + M && vnm.size(1) == (long)B * K && node_mars.size(0) >= nid0 + M,
-                "lowrank mixture: the node rows ", nid0, " + ", M, " do not fit the buffers");
+    TORCH_CHECK(nid0 >= 0 && vn0 >= 0 && vnm.size(0) >= vn0 + M && vnm.size(1) == (long)B * K &&
+                node_mars.size(0) >= nid0 + M,
+                "lowrank mixture: the node rows ", nid0, " + ", M, " (virtual ", vn0, ") do not fit the buffers");
     TORCH_CHECK(lzr.dim() == 2 && lzr.size(0) == M && row0 >= 0 && row0 + (long)B * K <= lzr.size(1),
                 "lowrank mixture: the log normalizers do not hold this copy's rows");
 }
@@ -498,15 +502,15 @@ void check_collapse(const torch::Tensor& node_mars, const torch::Tensor& vnm, co
 
 // `lzr` [M, rows]: each rank's log normalizer, this copy's rows from `row0` on (`lowrank_z_log`)
 void lowrank_collapse(torch::Tensor node_mars, torch::Tensor vnm, torch::Tensor fa, torch::Tensor lz,
-                      torch::Tensor lrn, torch::Tensor lrz, torch::Tensor lzr, int64_t row0, int64_t nid0, int64_t M,
-                      int64_t K) {
-    check_collapse(node_mars, vnm, fa, lz, lrn, lrz, lzr, row0, nid0, M, K);
+                      torch::Tensor lrn, torch::Tensor lrz, torch::Tensor lzr, int64_t row0, int64_t nid0, int64_t vn0,
+                      int64_t M, int64_t K) {
+    check_collapse(node_mars, vnm, fa, lz, lrn, lrz, lzr, row0, nid0, vn0, M, K);
     const int B = node_mars.size(1);
     if (M == 0 || B == 0) return;
     collapse_kernel<<<grid_of((long)M * B), THREADS, 0, at::cuda::getCurrentCUDAStream()>>>(
         node_mars.data_ptr<float>(), vnm.data_ptr<float>(), (long)vnm.size(1), fa.data_ptr<float>(),
         lz.data_ptr<float>(), lrn.data_ptr<float>(), lrz.data_ptr<float>(), lzr.data_ptr<float>(), (long)lzr.size(1),
-        (long)row0, (long)nid0, (int)M, B, (int)K);
+        (long)row0, (long)nid0, (long)vn0, (int)M, B, (int)K);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
@@ -515,9 +519,9 @@ void lowrank_collapse(torch::Tensor node_mars, torch::Tensor vnm, torch::Tensor 
 // node vector's are taken from the collapse itself, every other one from `node_mars`.
 void lowrank_collapse_expand(torch::Tensor node_mars, torch::Tensor vnm, torch::Tensor fa, torch::Tensor lz,
                              torch::Tensor lrn, torch::Tensor lrz, torch::Tensor lzr, int64_t row0, int64_t nid0,
-                             int64_t M, int64_t K, torch::Tensor vem, torch::Tensor table, int64_t first,
+                             int64_t vn0, int64_t M, int64_t K, torch::Tensor vem, torch::Tensor table, int64_t first,
                              torch::Tensor fb, torch::Tensor eid, int64_t KC) {
-    check_collapse(node_mars, vnm, fa, lz, lrn, lrz, lzr, row0, nid0, M, K);
+    check_collapse(node_mars, vnm, fa, lz, lrn, lrz, lzr, row0, nid0, vn0, M, K);
     const int B = node_mars.size(1), N = eid.size(0);
     check(vem, "vem", torch::kFloat32, -1); check(table, "children", torch::kInt32, -1);
     check(fb, "B", torch::kFloat32, (long)B * KC * N); check(eid, "eid", torch::kInt64, N);
@@ -528,7 +532,8 @@ void lowrank_collapse_expand(torch::Tensor node_mars, torch::Tensor vnm, torch::
     collapse_expand_kernel<<<grid_of((long)(M + N) * B), THREADS, 0, at::cuda::getCurrentCUDAStream()>>>(
         node_mars.data_ptr<float>(), vnm.data_ptr<float>(), (long)vnm.size(1), fa.data_ptr<float>(),
         lz.data_ptr<float>(), lrn.data_ptr<float>(), lrz.data_ptr<float>(), lzr.data_ptr<float>(), (long)lzr.size(1),
-        (long)row0, (long)nid0, (int)M, (int)K, vem.data_ptr<float>(), (long)vem.size(1), table.data_ptr<int32_t>(),
+        (long)row0, (long)nid0, (long)vn0, (int)M, (int)K, vem.data_ptr<float>(), (long)vem.size(1),
+        table.data_ptr<int32_t>(),
         (long)first, fb.data_ptr<float>(), eid.data_ptr<int64_t>(), N, (int)KC, B);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
@@ -582,7 +587,8 @@ template <bool FUSED>
 void backward_pre_launch(torch::Tensor& vemd, const float* vals, long rows, const int32_t* table, long first,
                          torch::Tensor& fb, torch::Tensor& eid, torch::Tensor& vnfd, torch::Tensor& node_flows,
                          torch::Tensor& node_mars, torch::Tensor& fa, torch::Tensor& lz, torch::Tensor& lrn,
-                         torch::Tensor& lrz, c10::optional<torch::Tensor>& grad_a, int64_t nid0, int64_t M, int64_t K) {
+                         torch::Tensor& lrz, c10::optional<torch::Tensor>& grad_a, int64_t nid0, int64_t vn0,
+                         int64_t M, int64_t K) {
     const int B = node_mars.size(1), N = eid.size(0);
     check(vemd, "vem (data)", torch::kFloat32, -1); check(fb, "B", torch::kFloat32, (long)B * K * N);
     check(eid, "eid", torch::kInt64, N);
@@ -593,8 +599,9 @@ void backward_pre_launch(torch::Tensor& vemd, const float* vals, long rows, cons
     const long w = (long)B * K;
     TORCH_CHECK(vemd.size(0) >= rows && vemd.size(1) == w, "lowrank mixture: the virtual element buffer does not hold ",
                 w, " columns of ", rows, " rows");
-    TORCH_CHECK(vnfd.size(0) >= nid0 + M && vnfd.size(1) == w && node_flows.size(1) == B,
-                "lowrank mixture: the node rows ", nid0, " + ", M, " do not fit the buffers");
+    TORCH_CHECK(nid0 >= 0 && vn0 >= 0 && vnfd.size(0) >= vn0 + M && vnfd.size(1) == w && node_flows.size(1) == B &&
+                node_flows.size(0) >= nid0 + M && node_mars.size(0) >= nid0 + M,
+                "lowrank mixture: the node rows ", nid0, " + ", M, " (virtual ", vn0, ") do not fit the buffers");
     if (grad_a.has_value()) check(*grad_a, "grad A", torch::kFloat32, (long)B * M * K);
     if ((N == 0 && M == 0) || B == 0) return;
     auto stream = at::cuda::getCurrentCUDAStream();
@@ -604,7 +611,7 @@ void backward_pre_launch(torch::Tensor& vemd, const float* vals, long rows, cons
         vemd.data_ptr<float>(), (long)vemd.size(1), vals, table, first, fb.data_ptr<float>(),                       \
         eid.data_ptr<int64_t>(), N, vnfd.data_ptr<float>(), node_flows.data_ptr<float>(),                           \
         node_mars.data_ptr<float>(), fa.data_ptr<float>(), lz.data_ptr<float>(), lrn.data_ptr<float>(),             \
-        lrz.data_ptr<float>(), PTR, (long)nid0, (int)M, B, (int)K)
+        lrz.data_ptr<float>(), PTR, (long)nid0, (long)vn0, (int)M, B, (int)K)
     if (grad_a.has_value()) { LOWRANK_PRE(true, grad_a->data_ptr<float>()); }
     else { LOWRANK_PRE(false, nullptr); }
 #undef LOWRANK_PRE
@@ -618,22 +625,22 @@ void backward_pre_launch(torch::Tensor& vemd, const float* vals, long rows, cons
 void lowrank_backward_pre(torch::Tensor vemd, torch::Tensor element_mars, torch::Tensor fb, torch::Tensor eid,
                           torch::Tensor vnfd, torch::Tensor node_flows, torch::Tensor node_mars, torch::Tensor fa,
                           torch::Tensor lz, torch::Tensor lrn, torch::Tensor lrz, c10::optional<torch::Tensor> grad_a,
-                          int64_t nid0, int64_t M, int64_t K) {
+                          int64_t nid0, int64_t vn0, int64_t M, int64_t K) {
     check(element_mars, "element_mars", torch::kFloat32, -1);
     TORCH_CHECK(element_mars.size(1) == node_mars.size(1), "lowrank mixture: element and node values of two batches");
     backward_pre_launch<false>(vemd, element_mars.data_ptr<float>(), element_mars.size(0), nullptr, 0, fb, eid, vnfd,
-                               node_flows, node_mars, fa, lz, lrn, lrz, grad_a, nid0, M, K);
+                               node_flows, node_mars, fa, lz, lrn, lrz, grad_a, nid0, vn0, M, K);
 }
 
 // ... with the product layer below fused in: the element values read from their two children's node values
 void lowrank_backward_pre_fused(torch::Tensor vemd, torch::Tensor table, int64_t first, torch::Tensor fb,
                                 torch::Tensor eid, torch::Tensor vnfd, torch::Tensor node_flows,
                                 torch::Tensor node_mars, torch::Tensor fa, torch::Tensor lz, torch::Tensor lrn,
-                                torch::Tensor lrz, c10::optional<torch::Tensor> grad_a, int64_t nid0, int64_t M,
-                                int64_t K) {
+                                torch::Tensor lrz, c10::optional<torch::Tensor> grad_a, int64_t nid0, int64_t vn0,
+                                int64_t M, int64_t K) {
     const long rows = check_children(table, first);
     backward_pre_launch<true>(vemd, node_mars.data_ptr<float>(), rows, table.data_ptr<int32_t>(), (long)first, fb,
-                              eid, vnfd, node_flows, node_mars, fa, lz, lrn, lrz, grad_a, nid0, M, K);
+                              eid, vnfd, node_flows, node_mars, fa, lz, lrn, lrz, grad_a, nid0, vn0, M, K);
 }
 
 namespace {

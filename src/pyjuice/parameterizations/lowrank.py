@@ -229,10 +229,16 @@ class LowRank(SumParameterization):
                 f"parameters. Supply all of them (a registered group is the convenient way), or none."
             )
 
+    def compile(self, layer) -> None:
+        """What the virtual batch's twin of the layer is made from (`lowrank_virtual._twin`), noted while the layer is
+        as compilation left it: which of its attributes are caches -- every empty container and every None then --
+        and which are its compiled tables and settings."""
+        lowrank_virtual.note_compiled(layer)
+
     def drop_device_caches(self, layer) -> None:
         super().drop_device_caches(layer)
         for name in ("_lr_geometry", "_lr_state", "_lr_denom_offsets", "_lrv_state", "_lrv_disjoint", "_lrv_link",
-                     "_lrv_want", "_lrv_wasted"):
+                     "_lrv_want", "_lrv_wasted", "_lrv_twin"):
             layer.__dict__.pop(name, None)
 
     # ------------------------------------------------------------------ forward

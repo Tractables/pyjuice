@@ -920,18 +920,122 @@ def test_the_virtual_buffers_stay_what_the_plain_kernels_expect(monkeypatch):
     _same(got, want, rtol = 2e-4, atol = 2e-5)
 
     families = pc.node_mars._lowrank_virtual                         # (kept on the circuit's own buffer)
-    assert set(families) == {(f, batch * rank) for f in ("fw", "bw")}
-    bufs = {name: buf for family in families.values() for name, buf in family.items()}
+    layers = list({id(l): l for l in (pc.external_params_nodes[a] for a in sums)}.values())
+    ranges = {lowrank_virtual._twin(l)[0]._layer_nid_range for l in layers}
+    cols = batch * rank
+    assert set(families) == {(f, cols, r) for f in ("fw", "bw") for r in [None, *ranges]}
+    bufs = {name: buf for (_, _, r), family in families.items() if r is None for name, buf in family.items()}
     layer = pc.external_params_nodes[sums[0]]
     kids = layer.parameterization._geometry(layer, layer.parameterization._info(layer, sums[0]), dev)["kids"]
     other = torch.ones(pc.element_mars.size(0), dtype = torch.bool, device = dev)
     other[kids] = False
     for name in ("vem", "vem_d", "vef_d"):
         assert bool(torch.isneginf(bufs[name][other]).all()), name
-    nodes = torch.ones(pc.node_mars.size(0), dtype = torch.bool, device = dev)
-    nodes[slice(*sums[0]._output_ind_range)] = False
-    assert bool(torch.isneginf(bufs["vnf_d"][nodes]).all())
-    assert float(bufs["zero"].abs().sum()) == 0.0
+    for (f, _, r), family in families.items():                       # the node ones: one layer's rows, dummies first
+        if r is None:
+            continue
+        nodes = ("vnm",) if f == "fw" else ("vnf_d", "zero")
+        assert all(family[name].size(0) == r[1] < pc.node_mars.size(0) for name in nodes)
+        assert all(family[name] is buf for name, buf in families[(f, cols, None)].items())   # (the element ones: one set)
+        if f == "bw":
+            assert bool(torch.isneginf(family["vnf_d"][:r[0]]).all())
+            assert float(family["zero"].abs().sum()) == 0.0
+
+
+@needs_virtual
+@pytest.mark.parametrize("name", ["sparse", "hmm_tied"])
+def test_the_plain_kernels_run_on_a_twin_of_the_layer_one_layer_tall(name, monkeypatch):
+    """The virtual batch runs the plain kernels on the layer's twin (`_twin`): a plain `SumLayer` whose node ids are the
+    layer's `shift` rows lower -- its own nodes from row `nd` on, a dummy id as it is, inside the dummy rows --, every
+    other table the layer's own tensor, its caches its own. The torch passes' result; after the layer's device caches
+    are dropped a new twin, the same result."""
+    import pyjuice.parameterizations.lowrank_virtual as lowrank_virtual
+    from pyjuice.layer.sum_layer import SumLayer
+
+    rank, batch = 2, 5
+    pc, sums, _, _, _, _ = _pair(name, "sum_exp", rank = rank)
+    dev = pc.params.device
+    torch.manual_seed(51)
+    data = torch.randint(0, NUM_CATS, (batch, pc.num_vars), device = dev)
+    ext = {a: _factors(a, rank, batch, dev, seed = 280 + i) for i, a in enumerate(sums)}
+    monkeypatch.setattr(lowrank_virtual, "ENABLED", False)
+    want = _passes(pc, sums, data, ext)
+    monkeypatch.setattr(lowrank_virtual, "ENABLED", True)
+    got = _passes(pc, sums, data, ext)
+    assert got["path"] == {tuple}
+    _same(got, want, rtol = 2e-4, atol = 2e-5)
+
+    dummies = 0
+    for layer in {id(l): l for l in (pc.external_params_nodes[a] for a in sums)}.values():
+        twin, shift = lowrank_virtual._twin(layer)
+        lo, hi = layer._layer_nid_range
+        nd = twin._layer_nid_range[0]
+        assert type(twin) is SumLayer and twin._layer_nid_range == (lo - shift, hi - shift)
+        assert nd % 32 == 0 and nd >= max(32, layer.block_size)
+        for t, u in zip(layer.partitioned_nids, twin.partitioned_nids):
+            assert torch.equal(u, t - shift)
+        for t, u in zip(layer.partitioned_parids, twin.partitioned_parids):
+            assert torch.equal(u, torch.where(t >= lo, t - shift, t))
+            assert bool((u[t < lo] + layer.block_size <= nd).all())        # (a dummy block inside the dummy rows)
+            dummies += int((t < lo).sum())
+        for table in ("partitioned_cids", "partitioned_pids", "partitioned_pfids", "partitioned_chids",
+                      "partitioned_parpids"):
+            assert getattr(twin, table) is getattr(layer, table)
+        caches = [k for k, v in twin.__dict__.items() if k.startswith("_cached_") and isinstance(v, dict)]
+        assert caches and all(twin.__dict__[k] is not layer.__dict__[k] for k in caches)
+        assert any(twin.__dict__[k] for k in caches)                       # (the twin's passes filled its own)
+    if name == "sparse":
+        assert dummies > 0                                                 # (what this structure is here for)
+
+    layer = pc.external_params_nodes[sums[0]]
+    old = lowrank_virtual._twin(layer)[0]
+    layer._drop_device_caches()
+    assert "_lrv_twin" not in layer.__dict__
+    again = _passes(pc, sums, data, ext)
+    assert lowrank_virtual._twin(layer)[0] is not old
+    _same(again, got, rtol = 1e-6, atol = 1e-7)
+
+
+@needs_virtual
+def test_the_node_buffers_of_two_layers_are_shared_only_where_their_rows_lie_alike():
+    """`_buffers` keys a layer's node buffers by its twin's rows, the dummy rows included: two layers of one height
+    whose dummy rows differ never share one (one would write the other's dummy rows); the element ones, one per family
+    and width, are the same for both -- the layer below writes the next layer's."""
+    import pyjuice.parameterizations.lowrank_virtual as lowrank_virtual
+
+    dev = torch.device("cuda:0")
+    node_mars, element_mars = torch.zeros(1000, 3, device = dev), torch.zeros(200, 3, device = dev)
+    a = lowrank_virtual._buffers(node_mars, element_mars, 6, "bw", (32, 128))
+    b = lowrank_virtual._buffers(node_mars, element_mars, 6, "bw", (64, 128))
+    c = lowrank_virtual._buffers(node_mars, element_mars, 6, "bw", (32, 128))
+    assert a["vnf_d"] is not b["vnf_d"] and a["zero"] is not b["zero"] and a["vnf_d"] is c["vnf_d"]
+    assert a["vef_d"] is b["vef_d"] and a["vem_d"] is b["vem_d"]
+    assert a["vnf_d"].shape == (128, 6) and a["vef_d"].shape == (200, 6)
+    assert bool(torch.isneginf(a["vnf_d"]).all()) and float(a["zero"].abs().sum()) == 0.0
+    f = lowrank_virtual._buffers(node_mars, element_mars, 6, "fw")
+    assert set(f) == {"vem"}
+    assert f["vem"] is lowrank_virtual._buffers(node_mars, element_mars, 6, "fw", (32, 128))["vem"]
+
+
+@needs_virtual
+def test_a_twin_refuses_tables_past_the_layers_rows():
+    """The twin shifts the layer's own node ids and keeps the dummies; a table naming a node past the layer's rows --
+    neither -- is refused, not shifted into another row."""
+    import pyjuice.parameterizations.lowrank_virtual as lowrank_virtual
+
+    pc, sums, _, _, _, _ = _pair("hmm_tied", "sum_exp", rank = 2)
+    layer = pc.external_params_nodes[sums[0]]
+    layer.__dict__.pop("_lrv_twin", None)
+    real = layer._modules["partitioned_parids"]
+    bad = real[0].clone()
+    bad.view(-1)[0] = layer._layer_nid_range[1]                              # (the first node after the layer's)
+    layer._modules["partitioned_parids"] = type(real)([torch.nn.Parameter(bad, requires_grad = False), *list(real)[1:]])
+    try:
+        with pytest.raises(RuntimeError, match = "past its own rows"):
+            lowrank_virtual._twin(layer)
+    finally:
+        layer._modules["partitioned_parids"] = real
+    assert "_lrv_twin" not in layer.__dict__ and lowrank_virtual._twin(layer)[0] is not None
 
 
 @needs_virtual
@@ -949,12 +1053,13 @@ def test_the_virtual_batch_across_batch_sizes_and_its_bound(monkeypatch):
         data = torch.randint(0, NUM_CATS, (batch, pc.num_vars), device = dev)
         ext = {a: _factors(a, rank, batch, dev, seed = 70 + i) for i, a in enumerate(sums)}
         got = _passes(pc, sums, data, ext)
-        assert got["path"] == {tuple} and {c for _, c in pc.node_mars._lowrank_virtual} == {batch * rank}
+        assert got["path"] == {tuple} and {c for _, c, _ in pc.node_mars._lowrank_virtual} == {batch * rank}
         if batch in out:
             _same(got, out[batch], rtol = 1e-6, atol = 1e-7)
         out[batch] = got
 
-    need = lowrank_virtual._bytes(pc.node_mars, pc.element_mars, 7 * rank)
+    rows = lowrank_virtual._twin(pc.external_params_nodes[sums[0]])[0]._layer_nid_range[1]     # (a layer's: all alike)
+    need = lowrank_virtual._bytes(rows, pc.element_mars, 7 * rank)
     monkeypatch.setattr(lowrank_virtual, "VIRTUAL_BYTES_MOST", need - 1)
     torch.manual_seed(7)
     data = torch.randint(0, NUM_CATS, (7, pc.num_vars), device = dev)
@@ -1532,7 +1637,8 @@ def test_nothing_is_written_for_a_layer_above_that_keeps_its_torch_passes(monkey
     pc(data, sum_external_params = ext)
     assert sorted(merged) == [2, 3]
 
-    need = lambda rank: lowrank_virtual._bytes(pc.node_mars, pc.element_mars, batch * rank)
+    rows = lowrank_virtual._twin(pc.external_params_nodes[sums[0]])[0]._layer_nid_range[1]     # (a layer's: all alike)
+    need = lambda rank: lowrank_virtual._bytes(rows, pc.element_mars, batch * rank)
     monkeypatch.setattr(lowrank_virtual, "VIRTUAL_BYTES_MOST", (need(2) + need(3)) // 2)
     merged.clear()
     bound = _passes(pc, sums, data, ext)
