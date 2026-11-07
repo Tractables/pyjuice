@@ -794,6 +794,8 @@ class ExternalParamsSumLayer(SumLayer):
         """`SumLayer._bk_fusion_ready`, a gated call's by the parameterization's records (`_stream_fusion_bk`)."""
         if not self.__dict__.get("_bk_gated_call", False):
             return super()._bk_fusion_ready(batch_size, dtype, op, param_flows)
+        if getattr(self.external_params, "stream_fusion_bk", None) is not None:   # (its own answer, asked every call)
+            return self._stream_fusion_bk(batch_size, dtype, op, param_flows)
         memo = self.__dict__.setdefault("_bk_fusion_ready_g", {})
         key = (batch_size, dtype, op, param_flows)
         hit = memo.get(key)
@@ -802,13 +804,17 @@ class ExternalParamsSumLayer(SumLayer):
         return hit
 
     def _stream_fusion_bk(self, batch_size: int, dtype: torch.dtype, op: bool, param_flows: bool) -> bool:
-        """`SumLayer._stream_fusion_bk` for this layer's last kind of call: a gated one's by the records its
-        parameterization's backward keeps (`_bk_stream_parts_g`: its element flows on the split kernel; with parameter
-        flows `_bk_par_deferred_g`, deferred), the plain one's by the standard backward's."""
+        """`SumLayer._stream_fusion_bk` for this layer's last kind of call: a gated one's by its parameterization --
+        what it answers itself where it makes the backward's flows (`ExternalSumParams.stream_fusion_bk`), else the
+        records its backward keeps of the standard kernels (`_bk_stream_parts_g`: its element flows on the split
+        kernel; with parameter flows `_bk_par_deferred_g`, deferred) --, the plain one's by the standard backward's."""
         if not self.__dict__.get("_bk_gated_call", False):
             return super()._stream_fusion_bk(batch_size, dtype, op, param_flows)
         if not getattr(self.external_params, "fuses_stream_children", False):
             return False
+        own = getattr(self.external_params, "stream_fusion_bk", None)
+        if own is not None:
+            return bool(own(self, batch_size, dtype, op, param_flows))
         parts = self.__dict__.get("_bk_stream_parts_g", {}).get((batch_size, dtype, op))
         if not parts or not all(parts.get(pid) for pid in range(self.num_bk_partitions)):
             return False

@@ -209,7 +209,8 @@ class LowRankSumParams(ExternalSumParams):
 
     def drop_device_caches(self, layer) -> None:
         super().drop_device_caches(layer)
-        for name in ("_lr_geometry", "_lr_state", "_lr_denom_offsets", "_lrv_state", "_lrv_disjoint"):
+        for name in ("_lr_geometry", "_lr_state", "_lr_denom_offsets", "_lrv_state", "_lrv_disjoint", "_lrv_link",
+                     "_lrv_want", "_lrv_wasted"):
             layer.__dict__.pop(name, None)
         lowrank_virtual.drop_device_caches()
 
@@ -220,6 +221,14 @@ class LowRankSumParams(ExternalSumParams):
         below (``children``) to this layer's forward: taken where the forward goes through the mixture's virtual batch,
         whose `expand` then reads each product's value from its two children."""
         return (children,) if lowrank_virtual.fuses(self, layer, children) else None
+
+    def stream_fusion_bk(self, layer, batch_size: int, dtype, op: bool, param_flows: bool) -> bool:
+        """What `ExternalParamsSumLayer._stream_fusion_bk` asks, for the circuit's decision and at every backward
+        handed the product group below (`_bk_stream_children`: its forward and backward not run): taken where this
+        layer's last forward went through the virtual batch (a backward at another batch size than that forward's is
+        refused whatever this says), whose backward then reads each product's value from its two children and writes
+        its flow as theirs."""
+        return isinstance(layer.__dict__.get("_lr_state"), tuple) and lowrank_virtual.fuses_bk()
 
     def forward(self, layer, ns_info, tensors, node_mars, element_mars, params, **kwargs) -> None:
         raise NotImplementedError("`LowRankSumParams` is served by `forward_layer`.")
@@ -326,8 +335,10 @@ class LowRankSumParams(ExternalSumParams):
         dev = node_flows.device
         state = layer._lr_state
         if isinstance(state, tuple):
+            # (with the product group below, where the layer handed it over: `stream_fusion_bk` said so in this call)
             return lowrank_virtual.backward(self, layer, ns_tensors, ns_grad_tensors, node_flows, element_flows,
-                                            node_mars, element_mars, params, param_flows, denom_param_flows, kwargs)
+                                            node_mars, element_mars, params, param_flows, denom_param_flows, kwargs,
+                                            stream_children = layer.__dict__.get("_bk_stream_children"))
         geos = [self._geometry(layer, ns_info, dev) for ns_info, _ in ns_tensors]
         for geo in geos:
             element_flows[geo["kids"], :] = -float("inf")

@@ -26,6 +26,7 @@ from pyjuice.nodes import LowRankSumParams, BlockScaleSumParams
 
 NUM_CATS = 6
 FORMS = ("exp_sum", "sum_exp")
+OTHER_KIND = dict(apply_z_correction = False)       # (another parameterization: a layer of its own)
 
 
 # ---------------------------------------------------------------------------------------------- structures
@@ -34,9 +35,11 @@ def _ext(external, rank, form, **kw):
     return dict(external_params = LowRankSumParams(rank = rank, form = form, **kw)) if external else dict()
 
 
-def _hmm(external, rank = 3, form = "exp_sum", seq_length = 4, num_latents = 8, tied = True, tie_plain = False, **kw):
+def _hmm(external, rank = 3, form = "exp_sum", seq_length = 4, num_latents = 8, tied = True, tie_plain = False,
+         ranks = None, **kw):
     """An HMM; its transitions carry the factors. `tied`: one transition matrix (the plain twin is untied whatever
-    A is, to take every position's effective parameters, unless `tie_plain`)."""
+    A is, to take every position's effective parameters, unless `tie_plain`). `ranks`: untied, the transitions'
+    ranks from the deepest up."""
     with juice.set_block_size(num_latents):
         ni = inputs(seq_length - 1, num_node_blocks = 1, dist = dists.Categorical(num_cats = NUM_CATS))
         sums, cur = [], ni
@@ -45,7 +48,8 @@ def _hmm(external, rank = 3, form = "exp_sum", seq_length = 4, num_latents = 8, 
             if sums and tied and (external or tie_plain):
                 ns = sums[0].duplicate(cur, tie_params = True)
             else:
-                ns = summate(cur, num_node_blocks = 1, **_ext(external, rank, form, **kw))
+                ns = summate(cur, num_node_blocks = 1,
+                             **_ext(external, rank if ranks is None else ranks[len(sums)], form, **kw))
             sums.append(ns)
             cur = multiply(cx, ns)
         root = summate(cur, num_node_blocks = 1, block_size = 1)
@@ -93,9 +97,10 @@ def _two_disjoint(external, rank = 2, form = "exp_sum", **kw):
     return top, [n1, n2]
 
 
-def _two_chains(external, rank = 2, form = "exp_sum", seq_length = 4, num_latents = 4, **kw):
+def _two_chains(external, rank = 2, form = "exp_sum", seq_length = 4, num_latents = 4, second = None, **kw):
     """Two tied HMMs side by side, over variables of their own: every layer holds a transition of each, every
-    transition tied to its chain's others."""
+    transition tied to its chain's others. `second`: what the second chain's factors are built with besides -- another
+    parameterization then, so every layer group holds a layer of each chain."""
     tops, sums = [], []
     with juice.set_block_size(num_latents):
         for chain in range(2):
@@ -105,7 +110,7 @@ def _two_chains(external, rank = 2, form = "exp_sum", seq_length = 4, num_latent
             for var in range(seq_length - 2, -1, -1):
                 cx = ni.duplicate(first + var, tie_params = True)
                 ns = mine[0].duplicate(cur, tie_params = True) if mine and external else \
-                    summate(cur, num_node_blocks = 1, **_ext(external, rank, form, **kw))
+                    summate(cur, num_node_blocks = 1, **_ext(external, rank, form, **dict(kw, **(second or {}) if chain else {})))
                 mine.append(ns)
                 cur = multiply(cx, ns)
             tops.append(summate(cur, num_node_blocks = 1))
@@ -114,13 +119,19 @@ def _two_chains(external, rank = 2, form = "exp_sum", seq_length = 4, num_latent
     return root, sums
 
 
-def _hmm_side(external, rank = 2, form = "exp_sum", seq_length = 4, num_latents = 8, **kw):
+def _hmm_side(external, rank = 2, form = "exp_sum", seq_length = 4, num_latents = 8, side = None, side_first = True,
+              **kw):
     """A tied HMM with a plain sum over one more variable beside it, joined at the top: that sum's product stands in
     the lowest product layer, before the chain's, so the deepest transition's children are other element rows than
-    the other transitions'."""
+    the other transitions'. `side`: that sum carries factors too, built with these besides (another
+    parameterization: a layer of its own in the deepest transition's layer group), and is the last of the sums
+    returned; `side_first`: built before the chain or after it."""
+    def beside():
+        return summate(multiply(inputs(seq_length, num_node_blocks = 1, dist = dists.Categorical(num_cats = NUM_CATS))),
+                       num_node_blocks = 1, **(_ext(external, rank, form, **dict(kw, **side)) if side is not None else {}))
+
     with juice.set_block_size(num_latents):
-        side = summate(multiply(inputs(seq_length, num_node_blocks = 1, dist = dists.Categorical(num_cats = NUM_CATS))),
-                       num_node_blocks = 1)
+        other = beside() if side_first else None
         ni = inputs(seq_length - 1, num_node_blocks = 1, dist = dists.Categorical(num_cats = NUM_CATS))
         sums, cur = [], ni
         for var in range(seq_length - 2, -1, -1):
@@ -128,9 +139,13 @@ def _hmm_side(external, rank = 2, form = "exp_sum", seq_length = 4, num_latents 
             ns = sums[0].duplicate(cur, tie_params = True) if sums and external else \
                 summate(cur, num_node_blocks = 1, **_ext(external, rank, form, **kw))
             sums.append(ns)
-            cur = multiply(side, cx, ns) if var == 0 else multiply(cx, ns)
+            if var == 0:
+                other = other if side_first else beside()
+                cur = multiply(other, cx, ns)
+            else:
+                cur = multiply(cx, ns)
         root = summate(cur, num_node_blocks = 1, block_size = 1)
-    return root, sums
+    return root, sums + ([other] if side is not None else [])
 
 
 def _unreached(external, rank = 2, form = "exp_sum", **kw):
@@ -149,19 +164,69 @@ def _unreached(external, rank = 2, form = "exp_sum", **kw):
     return top, [n1, n2]
 
 
+def _fan_in(external, rank = 2, form = "exp_sum", **kw):
+    """Two sums of one layer over products of their own, and above them ONE sum over products of each: its children's
+    children lie in both."""
+    with juice.set_block_size(4):
+        a, b = ([inputs(v, num_node_blocks = 2, dist = dists.Categorical(num_cats = NUM_CATS)) for v in range(3)]
+                for _ in range(2))
+        n1 = summate(multiply(a[0], a[1]), num_node_blocks = 2, **_ext(external, rank, form, **kw))
+        n2 = summate(multiply(b[0], b[1]), num_node_blocks = 2, **_ext(external, rank, form, **kw))
+        top = summate(multiply(n1, a[2]), multiply(n2, b[2]), num_node_blocks = 2,
+                      **_ext(external, rank, form, **kw))
+        root = summate(multiply(top, inputs(3, num_node_blocks = 2, dist = dists.Categorical(num_cats = NUM_CATS))),
+                       num_node_blocks = 1, block_size = 1)
+    return root, [n1, n2, top]
+
+
+def _fan_out(external, rank = 2, form = "exp_sum", **kw):
+    """One sum, and above it TWO sums of one layer, each over products of it of its own."""
+    with juice.set_block_size(4):
+        ins = [inputs(v, num_node_blocks = 2, dist = dists.Categorical(num_cats = NUM_CATS)) for v in range(4)]
+        low = summate(multiply(ins[0], ins[1]), num_node_blocks = 2, **_ext(external, rank, form, **kw))
+        n1 = summate(multiply(low, ins[2]), num_node_blocks = 2, **_ext(external, rank, form, **kw))
+        n2 = summate(multiply(low, ins[3]), num_node_blocks = 2, **_ext(external, rank, form, **kw))
+        root = summate(multiply(n1, ins[3].duplicate(3, tie_params = False)),
+                       multiply(n2, ins[2].duplicate(2, tie_params = False)), num_node_blocks = 1, block_size = 1)
+    return root, [low, n1, n2]
+
+
+def _beside(external, rank = 2, form = "exp_sum", seq_length = 4, num_latents = 8, flip = False, **kw):
+    """A tied HMM and, at the depth of its middle transition, a sum with factors of ANOTHER parameterization over a
+    plain sum of two more variables: a layer of its own in that transition's layer group, over children no layer with
+    factors computes. `flip`: the two joined at the top in the other order."""
+    with juice.set_block_size(num_latents):
+        ni = inputs(seq_length - 1, num_node_blocks = 1, dist = dists.Categorical(num_cats = NUM_CATS))
+        sums, cur = [], ni
+        for var in range(seq_length - 2, -1, -1):
+            cx = ni.duplicate(var, tie_params = True)
+            ns = sums[0].duplicate(cur, tie_params = True) if sums and external else \
+                summate(cur, num_node_blocks = 1, **_ext(external, rank, form, **kw))
+            sums.append(ns)
+            cur = multiply(cx, ns)
+        chain = summate(cur, num_node_blocks = 1)
+        extra = [inputs(seq_length + v, num_node_blocks = 1, dist = dists.Categorical(num_cats = NUM_CATS))
+                 for v in range(3)]
+        low = summate(multiply(extra[0], extra[1]), num_node_blocks = 1)
+        side = summate(multiply(low, extra[2]), num_node_blocks = 1, **_ext(external, rank, form, **dict(kw, **OTHER_KIND)))
+        root = summate(multiply(side, chain) if flip else multiply(chain, side), num_node_blocks = 1, block_size = 1)
+    return root, sums + [side]
+
+
 STRUCTURES = dict(hmm_tied = lambda **kw: _hmm(tied = True, **kw),
                   hmm_untied = lambda **kw: _hmm(tied = False, **kw),
                   sparse = _sparse, shared_children = _shared_children, unreached = _unreached,
-                  two_disjoint = _two_disjoint, two_chains = _two_chains, hmm_side = _hmm_side)
+                  two_disjoint = _two_disjoint, two_chains = _two_chains, hmm_side = _hmm_side, fan_in = _fan_in,
+                  fan_out = _fan_out)
 
 
 def _pair(name, form, seed = 0, prepare = None, **kw):
     """`(pc_a, sums_a, pc_b, sums_b)`: the circuit with factors and its plain twin, the same shared parameters.
-    `prepare(root)`: applied to both before they are compiled."""
+    `name`: a structure's, or its builder. `prepare(root)`: applied to both before they are compiled."""
     out = []
     for external in (True, False):
         torch.manual_seed(seed)
-        root, sums = STRUCTURES[name](external = external, form = form, **kw)
+        root, sums = (STRUCTURES[name] if isinstance(name, str) else name)(external = external, form = form, **kw)
         torch.manual_seed(seed)
         root.init_parameters(perturbation = 2.0)
         if prepare is not None:
@@ -568,6 +633,45 @@ def test_without_the_denominator_flow(form):
     assert not _close(after, before)
 
 
+@pytest.mark.parametrize("form", FORMS)
+@pytest.mark.parametrize("supplied", ["none", "the_corrected", "the_other"])
+def test_a_layer_without_the_denominator_flow_beside_one_with_it(form, supplied):
+    """Two chains, the first's factors with the denominator flow and the second's without: the circuit has the buffer,
+    the second chain's layers no part of it. A backward that supplies nothing for a layer accumulates that layer's
+    denominator only where its parameterization keeps one (it raised for the other before: the buffer was taken for
+    every layer's); the first chain's `F-` then has its `F+`'s sum per node -- the node's flow -- supplied or not,
+    and the conditional step leaves normalized, finite parameters."""
+    rank, batch = 2, 6
+    pc, sums, _, _, _, _ = _pair("two_chains", form, rank = rank, second = OTHER_KIND)
+    dev = pc.params.device
+    first = [a for a in sums if a.external_params.apply_z_correction]
+    second = [a for a in sums if not a.external_params.apply_z_correction]
+    assert len(first) == len(second) == 3
+    torch.manual_seed(13)
+    data = torch.randint(0, NUM_CATS, (batch, pc.num_vars), device = dev)
+    given = dict(none = [], the_corrected = first, the_other = second)[supplied]
+    ext = _own_factors(given, batch, dev, 300)
+    lls = pc(data, **(dict(sum_external_params = ext) if ext else {}))
+    pc.init_param_flows(flows_memory = 0.0)
+    pc.backward(data, allow_modify_flows = False, logspace_flows = True)
+    assert torch.isfinite(lls).all()
+
+    src = _source(first[0])
+    sources = [(pc.external_params_nodes[a], a) for a in first]
+    fm = src.external_params.materialize_denom_flows(src, pc.params, pc.denom_param_flows, sources)
+    E = src.edge_ids.size(1)
+    fm = _dense(src, fm.reshape(E, src.ch_block_size, src.block_size).permute(0, 2, 1))
+    ranges = {tuple(a._param_flow_range): a for a in first}          # (tied copies may share a range of the flows)
+    fp = _dense(src, sum(_flows(pc, a) for a in ranges.values()))
+    assert float(fp.sum()) > 0 and _close(fm.sum(dim = 1), fp.sum(dim = 1), rtol = 1e-4, atol = 1e-5)
+    assert all(not hasattr(pc.external_params_nodes[a], "denom_flow_slices") for a in second)
+
+    pc.mini_batch_em(step_size = 0.5, pseudocount = 0.1)
+    for a in (first[0], second[0]):
+        theta = _dense(_source(a), pc.get_node_params(_source(a)))
+        assert torch.isfinite(theta).all() and _close(theta.sum(dim = 1), torch.ones_like(theta.sum(dim = 1)), rtol = 1e-5)
+
+
 # ---------------------------------------------------------------- the low-rank scale that is a BlockScale gate
 
 GATE_T, GATE_L, GATE_BS = 5, 16, 4
@@ -699,10 +803,12 @@ def _passes(pc, sums, data, ext, param_flows = True):
 def _denominators(pc, sums):
     """`F-` of every source node vector as the M-step reads it: summed over its copies, whichever of their slices
     of the buffer holds what."""
-    desc, out = sums[0].external_params, []
+    out = []
     for src in dict.fromkeys(_source(a) for a in sums):
-        sources = [(pc.external_params_nodes[a], a) for a in sums if _source(a) is src]
-        out.append(desc.materialize_denom_flows(src, pc.params, pc.denom_param_flows, sources).clone())
+        desc = src.external_params
+        if desc.apply_z_correction:
+            sources = [(pc.external_params_nodes[a], a) for a in sums if _source(a) is src]
+            out.append(desc.materialize_denom_flows(src, pc.params, pc.denom_param_flows, sources).clone())
     return torch.cat(out)
 
 
@@ -719,7 +825,8 @@ def _same(x, y, rtol, atol):
 @needs_virtual
 @pytest.mark.parametrize("name,served", [("hmm_tied", True), ("hmm_untied", True), ("sparse", True),
                                          ("two_disjoint", True), ("two_chains", True), ("hmm_side", True),
-                                         ("shared_children", False), ("unreached", False)])
+                                         ("fan_in", True), ("fan_out", True), ("shared_children", False),
+                                         ("unreached", False)])
 @pytest.mark.parametrize("rank,batch", [(1, 3), (3, 5), (4, 1)])
 def test_the_virtual_batch_is_the_torch_pass(name, served, rank, batch, monkeypatch):
     """`sum_exp` through the plain kernels on (sample, rank) columns against its torch passes: the same values, flows,
@@ -1145,6 +1252,324 @@ def test_the_forward_with_the_product_layer_fused_in(name, offered, monkeypatch)
     assert torch.equal(out["fused"][0], out["unfused"][0]) and torch.equal(out["fused"][2], out["unfused"][2])
     assert not torch.equal(out["fused"][0], out["fused"][2])
     _same(out["fused"][1], out["unfused"][1], rtol = 1e-6, atol = 1e-7)
+
+
+def _calls(own = 0, own_fused = 0, merged = 0, collapse = 0):
+    out = dict(lowrank_expand = own, lowrank_expand_fused = own_fused, lowrank_collapse_expand = merged,
+               lowrank_collapse = collapse)
+    return {k: v for k, v in out.items() if v}
+
+
+AHEAD = dict(
+    # case -> (the structure, how it is built, a forward's calls once the layers know each other): the deepest
+    # layer's own `expand` (products of one child: not handed over), the top layer's collapse alone
+    hmm_tied = ("hmm_tied", dict(), _calls(own = 1, merged = 2, collapse = 1)),
+    hmm_untied = ("hmm_untied", dict(), _calls(own = 1, merged = 2, collapse = 1)),
+    hmm_side = ("hmm_side", dict(), _calls(own = 1, merged = 2, collapse = 1)),
+    two_chains = ("two_chains", dict(), _calls(own = 2, merged = 4, collapse = 2)),
+    # one node vector above two of a layer: its `expand` after both collapses, from the layer below's call
+    fan_in = ("fan_in", dict(), _calls(own_fused = 3, collapse = 3)),
+    # two node vectors above one: the first in its launch, the second's `expand` after it
+    fan_out = ("fan_out", dict(), _calls(own_fused = 2, merged = 1, collapse = 2)),
+    # ranks of their own (2 under 3 under 2): the launch writes the layer above's columns, not its own
+    two_ranks = ("hmm_untied", dict(ranks = (2, 3, 2)), _calls(own = 1, merged = 2, collapse = 1)),
+    # two layers with factors in every layer group, one buffer: each overwrites what the other was left -- given up
+    two_kinds = ("two_chains", dict(second = OTHER_KIND), _calls(own = 2, own_fused = 4, collapse = 6)),
+    # a layer with factors beside the deepest transition's, run before it: nothing between the transitions
+    side = ("hmm_side", dict(side = OTHER_KIND), _calls(own = 2, merged = 2, collapse = 2)),
+    # one beside the middle transition, over children of no layer with factors: run before or after it, it comes
+    # between a transition and the one above -- that pair gives up, the other pair keeps its launch
+    beside = (_beside, dict(), _calls(own = 1, own_fused = 2, merged = 1, collapse = 3)),
+    beside_flip = (_beside, dict(flip = True), _calls(own = 1, own_fused = 2, merged = 1, collapse = 3)),
+)
+
+
+def _own_factors(sums, batch, dev, seed):
+    return {a: _factors(a, a.external_params.rank, batch, dev, seed = seed + i) for i, a in enumerate(sums)}
+
+
+@needs_virtual
+@pytest.mark.parametrize("case", sorted(AHEAD))
+def test_a_collapse_takes_the_next_layers_expand_along(case, monkeypatch):
+    """A layer whose nodes are the children of the next layer's products writes that layer's virtual child values in
+    the launch of its own collapse, once that layer was handed the product group between (the circuit's fused
+    forward, its choice forced here after its trials): the bits of the forward in which every layer expands its own
+    -- values, and through the backward the flows, both parameter flows and the gradients (the collapse's kept
+shares) --, on other data, at another batch size (the trials there run every layer several times: the launches
+    stay), and where the last node vector's layer is given no factors (nothing is written for it). A node vector of the next
+    layer whose children lie in two of this layer's is expanded after both collapses (`fan_in`), as is the second of
+    two over one (`fan_out`); where another layer with factors writes the buffer in between, the values left there
+    are not read, and are no longer written after the second time (`two_kinds`, `beside` -- a layer under the one
+    below, run again by the circuit's trials, is not "in between")."""
+    import pyjuice.layer.kernels.autotune as autotune
+    import pyjuice.nodes.external_params.lowrank_virtual as lowrank_virtual
+
+    name, kw, want = AHEAD[case]
+    pick = autotune.pick
+
+    def forced(key, cands, bench, **k):
+        if key[0] == "prod_stream_fusion":
+            for trial in ("fused", "unfused", "fused", "fused"):
+                bench(trial)
+            return "fused"
+        return "unfused" if key[0] == "prod_stream_fusion_bk" else pick(key, cands, bench, **k)
+
+    monkeypatch.setattr(autotune, "pick", forced)
+    real = lowrank_virtual._module
+    counts = dict()
+
+    class Counted:
+        def __getattr__(self, attr):
+            fn = getattr(real(), attr)
+            if attr not in ("lowrank_collapse_expand", "lowrank_expand_fused", "lowrank_expand", "lowrank_collapse"):
+                return fn
+
+            def counted(*args):
+                counts[attr] = counts.get(attr, 0) + 1
+                return fn(*args)
+            return counted
+
+    counted = Counted()
+    monkeypatch.setattr(lowrank_virtual, "_module", lambda: counted)
+
+    def forward_calls(pc, x, ext):
+        pc(x, sum_external_params = ext)                         # (the circuit's trials, if any, in this one)
+        counts.clear()
+        pc(x, sum_external_params = ext)
+        return dict(counts)
+
+    batch = 5
+    out = dict()
+    for linked in (True, False):
+        monkeypatch.setattr(lowrank_virtual, "LINK_TRIES", 64 if linked else 0)
+        pc, sums, _, _, _, _ = _pair(name, "sum_exp", rank = 2, **kw)
+        dev = pc.params.device
+        torch.manual_seed(27)
+        data = torch.randint(0, NUM_CATS, (batch, pc.num_vars), device = dev)
+        other = torch.randint(0, NUM_CATS, (batch, pc.num_vars), device = dev)
+        ext = _own_factors(sums, batch, dev, 190)
+        passes, seen = [], []
+        for x in (data, data, other, data, data, data):               # (other data right after the layers linked)
+            passes.append(_passes(pc, sums, x, ext))
+        seen.append(forward_calls(pc, data, ext))
+        # Another batch size: the circuit decides again, running every layer several times
+        small = torch.randint(0, NUM_CATS, (3, pc.num_vars), device = dev)
+        ext3 = _own_factors(sums, 3, dev, 230)
+        for _ in range(3):
+            passes.append(_passes(pc, sums, small, ext3))
+        seen.append(forward_calls(pc, small, ext3))
+        # The last node vector's layer without factors: a plain one in this pass
+        given = [a for a in sums if pc.external_params_nodes[a] is not pc.external_params_nodes[sums[-1]]]
+        part = {a: ext[a] for a in given}
+        passes.append(_passes(pc, given, data, part))
+        seen.append(forward_calls(pc, data, part))
+        passes.append(_passes(pc, sums, data, ext))
+        out[linked] = (passes, seen)
+        if case == "fan_in" and linked:
+            link = pc.external_params_nodes[sums[0]].__dict__["_lrv_link"]
+            assert link["pairs"] == dict() and link["rest"] == [0]
+    assert all("lowrank_collapse_expand" not in c for c in out[False][1])
+    assert out[True][1][0] == want and out[True][1][1] == want, out[True][1]
+    for a, b in zip(out[True][0], out[False][0]):
+        for k in ("lls", "mars", "flows", "fp", "fm"):
+            assert torch.equal(a[k], b[k]), k
+        for k in ("dA", "dB"):
+            assert all(torch.equal(x, y) for x, y in zip(a[k], b[k])), k
+    assert not torch.equal(out[True][0][1]["lls"], out[True][0][2]["lls"])
+
+
+@needs_virtual
+def test_nothing_is_written_for_a_layer_above_that_keeps_its_torch_passes(monkeypatch):
+    """A layer whose virtual buffers would pass the bound keeps its torch passes; the layer below it then writes
+    nothing for it. Ranks 2 under 3 under 2, the bound between the two ranks' needs, set after the layers know
+    each other."""
+    import pyjuice.layer.kernels.autotune as autotune
+    import pyjuice.nodes.external_params.lowrank_virtual as lowrank_virtual
+
+    pick = autotune.pick
+    monkeypatch.setattr(autotune, "pick", lambda key, cands, bench, **k: "fused" if key[0] == "prod_stream_fusion"
+                        else "unfused" if key[0] == "prod_stream_fusion_bk" else pick(key, cands, bench, **k))
+    real = lowrank_virtual._module
+    merged = []
+
+    class Counted:
+        def __getattr__(self, attr):
+            fn = getattr(real(), attr)
+            if attr != "lowrank_collapse_expand":
+                return fn
+
+            def counted(*args):
+                merged.append(args[-1])                              # (the rank written for)
+                return fn(*args)
+            return counted
+
+    counted = Counted()
+    monkeypatch.setattr(lowrank_virtual, "_module", lambda: counted)
+
+    batch = 5
+    pc, sums, _, _, _, _ = _pair("hmm_untied", "sum_exp", rank = 2, ranks = (2, 3, 2))
+    dev = pc.params.device
+    torch.manual_seed(33)
+    data = torch.randint(0, NUM_CATS, (batch, pc.num_vars), device = dev)
+    ext = _own_factors(sums, batch, dev, 250)
+    for _ in range(4):
+        free = _passes(pc, sums, data, ext)
+    merged.clear()
+    pc(data, sum_external_params = ext)
+    assert sorted(merged) == [2, 3]
+
+    need = lambda rank: lowrank_virtual._bytes(pc.node_mars, pc.element_mars, batch * rank)
+    monkeypatch.setattr(lowrank_virtual, "VIRTUAL_BYTES_MOST", (need(2) + need(3)) // 2)
+    merged.clear()
+    bound = _passes(pc, sums, data, ext)
+    paths = [type(pc.external_params_nodes[a].__dict__["_lr_state"]) for a in sums]
+    assert paths == [tuple, dict, tuple] and merged == []
+    _same(bound, free, rtol = 2e-4, atol = 2e-5)
+
+
+@needs_virtual
+@pytest.mark.parametrize("between", [False, True])
+def test_child_values_left_by_the_layer_below_are_read_only_if_nothing_wrote_since(between, monkeypatch):
+    """The layers run by hand, on the pass's staged tensors: a transition, then the one above it, which finds its
+    virtual child values written and launches no `expand`; with another layer with factors run in between -- its
+    `expand` writes the same rows of the buffer -- the one above expands its own again. The circuit's node values
+    either way."""
+    import pyjuice.layer.kernels.autotune as autotune
+    import pyjuice.nodes.external_params.lowrank_virtual as lowrank_virtual
+
+    pick = autotune.pick
+    monkeypatch.setattr(autotune, "pick", lambda key, cands, bench, **k: "fused" if key[0] == "prod_stream_fusion"
+                        else "unfused" if key[0] == "prod_stream_fusion_bk" else pick(key, cands, bench, **k))
+    real = lowrank_virtual._module
+    expands = []
+
+    class Counted:
+        def __getattr__(self, attr):
+            fn = getattr(real(), attr)
+            if attr not in ("lowrank_expand", "lowrank_expand_fused"):
+                return fn
+
+            def counted(*args):
+                expands.append(attr)
+                return fn(*args)
+            return counted
+
+    counted = Counted()
+    monkeypatch.setattr(lowrank_virtual, "_module", lambda: counted)
+
+    rank, batch = 2, 5
+    pc, sums, _, _, _, _ = _pair("hmm_side", "sum_exp", rank = rank, side = OTHER_KIND)
+    dev = pc.params.device
+    torch.manual_seed(31)
+    data = torch.randint(0, NUM_CATS, (batch, pc.num_vars), device = dev)
+    ext = {a: _factors(a, rank, batch, dev, seed = 210 + i) for i, a in enumerate(sums)}
+    for _ in range(4):
+        lls = pc(data, sum_external_params = ext)
+    want = pc.node_mars.clone()
+
+    layer = {a: pc.external_params_nodes[a] for a in sums}
+    low, up, side = layer[sums[0]], layer[sums[1]], layer[sums[-1]]
+    assert low.__dict__["_lrv_link"]["above"]() is up and side is not low
+    group = lambda lay: next(i for i, g in enumerate(pc.inner_layer_groups) if any(l is lay for l in g.layers))
+    assert group(side) == group(low) and group(up) == group(low) + 2
+    kwargs = dict(sum_external_params = pc._staged_external_params)
+    products = lambda lay: pc.inner_layer_groups[group(lay) - 1].forward(pc.node_mars, pc.element_mars)
+
+    products(low)
+    low.forward(pc.node_mars, pc.element_mars, pc.params, **kwargs)
+    if between:
+        side.forward(pc.node_mars, pc.element_mars, pc.params, **kwargs)
+    products(up)
+    expands.clear()
+    up.forward(pc.node_mars, pc.element_mars, pc.params, **kwargs)
+    assert expands == (["lowrank_expand"] if between else [])
+    rows = slice(*up._layer_nid_range)
+    assert torch.equal(pc.node_mars[rows], want[rows])
+    # (the rows that layer writes are the ones the upper transition's children stand in)
+    kids = lambda lay: lay.external_params._geometry(lay, lay.external_node_infos[0], dev)["rows"]
+    assert set(kids(side).tolist()) == set(kids(up).tolist())
+
+
+@needs_virtual
+@pytest.mark.parametrize("name,offered", [("hmm_tied", True), ("two_chains", True), ("hmm_side", True),
+                                          ("two_disjoint", False), ("sparse", False)])
+@pytest.mark.parametrize("forward", ["unfused", "fused"])
+def test_the_backward_with_the_product_layer_fused_in(name, offered, forward, monkeypatch):
+    """Where the circuit leaves the product layer below to this layer's backward (its tuner's choice, forced here, after
+    its trials on scratch flows), the virtual batch reads every product's value from its two children and writes the
+    product's flow as theirs: the bits of the backward between a product layer's recompute and its own backward --
+    node flows, both parameter flows, the gradients --, pass after pass, on other data too, whichever way the forward
+    went; and a layer that does not go through the virtual batch after all is given the products' values and its
+    element flows are written as the children's. Products of two children, each the child of that one product
+    (`sparse`: three children; `two_disjoint`: an input the child of two products -- never handed over)."""
+    import pyjuice.layer.kernels.autotune as autotune
+    import pyjuice.nodes.external_params.lowrank_virtual as lowrank_virtual
+
+    pick = autotune.pick
+    choice = ["fused"]
+
+    def forced(key, cands, bench, **kw):
+        if key[0] == "prod_stream_fusion":
+            return forward
+        if key[0] == "prod_stream_fusion_bk":
+            count = len(fused)
+            for trial in ("fused", "unfused", "fused"):       # (the circuit's trials: this pass's layers, other flows)
+                bench(trial)
+            del fused[count:]
+            return choice[0]
+        return pick(key, cands, bench, **kw)
+
+    monkeypatch.setattr(autotune, "pick", forced)
+    fused = []
+    real = lowrank_virtual._module
+    collapse = real().lowrank_collapse_bw_fused
+
+    class Counted:
+        def __getattr__(self, attr):
+            return getattr(real(), attr)
+
+        def lowrank_collapse_bw_fused(self, *args):
+            fused.append(1)
+            return collapse(*args)
+
+    counted = Counted()
+    monkeypatch.setattr(lowrank_virtual, "_module", lambda: counted)
+
+    rank, batch = 2, 5
+    out = dict()
+    for which in ("fused", "unfused"):
+        choice[0] = which
+        pc, sums, _, _, _, _ = _pair(name, "sum_exp", rank = rank)
+        dev = pc.params.device
+        torch.manual_seed(23)
+        data = torch.randint(0, NUM_CATS, (batch, pc.num_vars), device = dev)
+        ext = {a: _factors(a, rank, batch, dev, seed = 170 + i) for i, a in enumerate(sums)}
+        fused.clear()
+        first = _passes(pc, sums, data, ext)                     # (the circuit decides at its second backward)
+        assert not fused
+        passes = [_passes(pc, sums, data, ext) for _ in range(3)]
+        assert (len(fused) > 0) == (which == "fused" and offered)
+        for got in passes:
+            for k in ("flows", "fp", "fm"):
+                assert torch.equal(got[k], first[k]), k
+            for k in ("dA", "dB"):
+                assert all(torch.equal(a, b) for a, b in zip(got[k], first[k])), k
+        # Other data next: the products' values and flows the last pass left in the circuit's buffers are not these
+        torch.manual_seed(24)
+        other = torch.randint(0, NUM_CATS, (batch, pc.num_vars), device = dev)
+        out[which] = _passes(pc, sums, other, ext)
+        assert not torch.equal(out[which]["flows"], first["flows"])
+        if which == "fused":
+            # ... and the torch passes, handed the product layer the same way
+            monkeypatch.setattr(lowrank_virtual, "ENABLED", False)
+            torch_pass = _passes(pc, sums, other, ext)
+            monkeypatch.setattr(lowrank_virtual, "ENABLED", True)
+            assert torch_pass["path"] == {dict}
+            _same(out[which], torch_pass, rtol = 2e-4, atol = 2e-5)
+    for k in ("flows", "fp", "fm"):
+        assert torch.equal(out["fused"][k], out["unfused"][k]), k
+    for k in ("dA", "dB"):
+        assert all(torch.equal(a, b) for a, b in zip(out["fused"][k], out["unfused"][k])), k
 
 
 def test_refusals():
