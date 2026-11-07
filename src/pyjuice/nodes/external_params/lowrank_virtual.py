@@ -2,17 +2,20 @@
 `LowRankSumParams`' "sum_exp" form on a VIRTUAL BATCH: the plain sum-layer kernels do the work.
 
 The mixture scale `g_b[i, j] = sum_r exp(A_b[i, r]) exp(B_b[r, j])` is, per rank, a rescaling of the children by
-`exp(B_b[r, :])` followed by a plain sum node, so each (sample, rank) pair becomes two columns of a virtual batch -- one
-for the node's unnormalized value, one for its normalizer -- and the layer's own forward and backward run on it as
-they stand: the shared parameters are read once for all the columns, every kernel, tuning and launch plan of the plain
-layer applies, and the pass stays in the regime where its cost barely depends on the batch (MEASURED, a tied HMM of
-1024 latents and 31 layers, forward / backward: batch 16 0.64 / 1.20 ms, 128 0.53 / 1.23, 256 0.60 / 1.63). What is
-specific to the parameterization is elementwise and lives in `kernels/c/lowrank_mixture.cu`, whose header has the
-formulas.
+`exp(B_b[r, :])` followed by a plain sum node, so each (sample, rank) pair becomes a column of a virtual batch for the
+node's unnormalized value, and the layer's own forward and backward run on it as they stand: the shared parameters are
+read once for all the columns, every kernel, tuning and launch plan of the plain layer applies, and the pass stays in
+the regime where its cost barely depends on the batch (MEASURED, a tied HMM of 1024 latents and 31 layers, forward /
+backward: batch 16 0.64 / 1.20 ms, 128 0.53 / 1.23, 256 0.60 / 1.63). What is specific to the parameterization is
+elementwise and lives in `kernels/c/lowrank_mixture.cu`, whose header has the formulas.
 
-The virtual buffers are as tall as the circuit's own (the plain kernels address rows by their ids), `K` or `2 K`
-times as wide, and shared by every layer: scratch, rewritten by each layer's pass. What a layer's backward needs of
-its forward -- `log Z` and each rank's share of the two sums -- is kept per node vector, on the layer.
+The node's normalizer reads no child values and tied copies share the parameters: it is not run through the plain kernels
+at all. For a node vector and every tied copy of it the pass was given, before the first of them runs, each rank's
+normalizer is ONE matrix product over the rows `(copy, rank, sample)` (`_normalizers`).
+
+The virtual buffers are as tall as the circuit's own (the plain kernels address rows by their ids), `K` times as wide,
+and shared by every layer: scratch, rewritten by each layer's pass. What a layer's backward needs of its forward --
+`log Z` and each rank's share of the two sums -- is kept per node vector, on the layer.
 
 The backward's normalizer half reads no child values and tied copies share the parameters: it is not run through
 the plain kernels at all. For a node vector and every tied copy of it in the pass, at the pass's end, it is TWO MATRIX
@@ -45,9 +48,16 @@ GEMM_BF16_WORK = 1 << 28
 _EXTERNAL_PARAMS_KWARG = "sum_external_params"
 
 
+_MODULE = None
+
+
 def _module():
-    from .kernels.c import get_lowrank_module
-    return get_lowrank_module()
+    """The extension, or None. (Kept: a `from ... import` is 1.7 us, and a pass asks about 60 times.)"""
+    global _MODULE
+    if _MODULE is None:
+        from .kernels.c import get_lowrank_module
+        _MODULE = get_lowrank_module()
+    return _MODULE
 
 
 def _columns(layer, node_mars: torch.Tensor) -> int:
@@ -55,10 +65,9 @@ def _columns(layer, node_mars: torch.Tensor) -> int:
 
 
 def _bytes(node_mars: torch.Tensor, element_mars: torch.Tensor, cols: int) -> int:
-    """Every family of `_buffers` at once: the forward's two halves side by side; the backward's data half (flows,
-    values, zeros)."""
+    """Every family of `_buffers` at once: the forward's values; the backward's (flows, values, zeros)."""
     hn, he = node_mars.size(0), element_mars.size(0)
-    return 4 * (2 * cols * (hn + he) + cols * (2 * hn + 2 * he))
+    return 4 * (cols * (hn + he) + cols * (2 * hn + 2 * he))
 
 
 def serves(desc, layer, node_mars: torch.Tensor, element_mars: torch.Tensor) -> bool:
@@ -83,7 +92,7 @@ def _disjoint(desc, layer, device) -> bool:
 
 # The families of virtual buffers: name -> (rows of nodes (True) or elements, columns in units of a half)
 _FAMILIES = {
-    "fw": dict(vnm = (True, 2), vem = (False, 2)),
+    "fw": dict(vnm = (True, 1), vem = (False, 1)),
     "bw": dict(vnf_d = (True, 1), vem_d = (False, 1), vef_d = (False, 1), zero = (True, 1)),
 }
 
@@ -138,6 +147,16 @@ def _pass(kwargs) -> dict:
 
 def _source(ns):
     return ns.get_source_ns() if ns.is_tied() else ns
+
+
+def _dtype(precision, work: int):
+    """The operands of the pass's matrix products: bf16 (fp32 accumulation) under the default precision where the work
+    is `GEMM_BF16_WORK` or more, fp32 else."""
+    return torch.bfloat16 if precision != "fp32" and work >= GEMM_BF16_WORK else torch.float32
+
+
+def _product(a, b, dtype):
+    return torch.mm(a, b, out_dtype = torch.float32) if dtype is torch.bfloat16 else torch.mm(a, b)
 
 
 def fuses(desc, layer, children) -> bool:
@@ -211,6 +230,38 @@ def _link(desc, layer, ran, stream_children, device) -> None:
                                        rest = rest)
 
 
+def _v_rows(mod, fbs, N, K, batch, dtype, dev) -> tuple:
+    """`(V^T [N, rows], each row's shift)`: `exp(B - shift)`, the rows `(copy, rank, sample)`, the shift the row's largest
+    `B`."""
+    rows = len(fbs) * batch * K
+    Vt = torch.empty(N, rows, dtype = dtype, device = dev)
+    shift = torch.empty(rows, device = dev)
+    mod.lowrank_z_operand(Vt, shift, fbs, batch, K)
+    return Vt, shift
+
+
+def _normalizers(desc, layer, info, st, kwargs, params, batch, dev) -> dict:
+    """What a pass keeps of a node vector's source, made when the first of its copies runs. For every tied copy the pass
+    was given, each rank's normalizer is ONE matrix product `theta @ exp(B - shift)` over the rows `(copy, rank, sample)`,
+    `log_z`, the plain kernels then never seeing the normalizer half; `row`: each copy's first row. The product's operands
+    are the backward's too: `V`, `shift` and `theta`, and `fb`, the factors."""
+    source = _source(info.ns)
+    zs = st.setdefault("z", dict())
+    hit = zs.get(source)
+    if hit is None or info.ns not in hit["row"]:
+        copies = [(c, t[1]) for c, t in kwargs[_EXTERNAL_PARAMS_KWARG].items() if _source(c) is source]
+        K, mod, geo = desc.rank, _module(), desc._geometry(layer, info, dev)
+        fbs = [fb for _, fb in copies]
+        dtype = _dtype(kwargs.get("precision", "auto"), len(copies) * batch * K * geo["M"] * geo["N"])
+        Vt, shift = _v_rows(mod, fbs, geo["N"], K, batch, dtype, dev)
+        theta = desc._dense_params(geo, params)
+        Zt = _product(theta.to(dtype), Vt, dtype)
+        mod.lowrank_z_log(Zt, shift)
+        hit = zs[source] = dict(log_z = Zt, row = {c: at * batch * K for at, (c, _) in enumerate(copies)}, V = Vt,
+                                shift = shift, dtype = dtype, fb = fbs, theta = theta)
+    return hit
+
+
 def _above(layer, kwargs, node_mars, element_mars):
     """`(the layer above, its node vectors' tensors, its forward buffers)` where this layer's collapse takes that
     layer's `expand` along in this pass (`_link`): that layer goes through the virtual batch at this batch too, on
@@ -251,10 +302,9 @@ def forward(desc, layer, ns_tensors, node_mars, element_mars, params, kwargs, st
         for info, (_, fb) in ns_tensors:
             rows = desc._geometry(layer, info, dev)["rows"]
             if stream_children is None:
-                mod.lowrank_expand(bufs["vem"], 0, bufs["vem"], cols, element_mars, fb, rows, rows, K)
+                mod.lowrank_expand(bufs["vem"], element_mars, fb, rows, K)
             else:                                                       # (the product layer's forward was not run)
-                mod.lowrank_expand_fused(bufs["vem"], 0, bufs["vem"], cols, node_mars, stream_children[0],
-                                         stream_children[1], fb, rows, rows, K)
+                mod.lowrank_expand_fused(bufs["vem"], node_mars, stream_children[0], stream_children[1], fb, rows, K)
     ran = node_mars.__dict__.setdefault("_lowrank_layers", dict())      # (the layers through here on these buffers)
     if stream_children is not None:
         _link(desc, layer, ran, stream_children, dev)
@@ -265,8 +315,9 @@ def forward(desc, layer, ns_tensors, node_mars, element_mars, params, kwargs, st
     nxt = _above(layer, kwargs, node_mars, element_mars)
     if nxt is None:
         for info, (fa, _) in ns_tensors:
-            mod.lowrank_collapse(node_mars, bufs["vnm"], fa, *_state(layer, info, batch, dev), info.nid_start,
-                                 info.ns.num_nodes, K)
+            z = _normalizers(desc, layer, info, st, kwargs, params, batch, dev)
+            mod.lowrank_collapse(node_mars, bufs["vnm"], fa, *_state(layer, info, batch, dev), z["log_z"], z["row"][info.ns],
+                                 info.nid_start, info.ns.num_nodes, K)
     else:
         above, tensors, bufa = nxt
         link, adesc = layer.__dict__["_lrv_link"], above.external_params
@@ -274,17 +325,18 @@ def forward(desc, layer, ns_tensors, node_mars, element_mars, params, kwargs, st
         geo = lambda at: adesc._geometry(above, infos[at], dev)["rows"]
         for info, (fa, _) in ns_tensors:
             at = link["pairs"].get(info.nid_start)
+            z = _normalizers(desc, layer, info, st, kwargs, params, batch, dev)
+            lzr, row0 = z["log_z"], z["row"][info.ns]
             if at is None:
-                mod.lowrank_collapse(node_mars, bufs["vnm"], fa, *_state(layer, info, batch, dev), info.nid_start,
-                                     info.ns.num_nodes, K)
+                mod.lowrank_collapse(node_mars, bufs["vnm"], fa, *_state(layer, info, batch, dev), lzr, row0,
+                                     info.nid_start, info.ns.num_nodes, K)
             else:
-                mod.lowrank_collapse_expand(node_mars, bufs["vnm"], fa, *_state(layer, info, batch, dev),
+                mod.lowrank_collapse_expand(node_mars, bufs["vnm"], fa, *_state(layer, info, batch, dev), lzr, row0,
                                             info.nid_start, info.ns.num_nodes, K, bufa["vem"], link["table"],
                                             link["first"], tensors[at][1], geo(at), adesc.rank)
         for at in link["rest"]:
-            rows = geo(at)
-            mod.lowrank_expand_fused(bufa["vem"], 0, bufa["vem"], batch * adesc.rank, node_mars, link["table"],
-                                     link["first"], tensors[at][1], rows, rows, adesc.rank)
+            mod.lowrank_expand_fused(bufa["vem"], node_mars, link["table"], link["first"], tensors[at][1], geo(at),
+                                     adesc.rank)
         st["ahead"] = (above, layer)
 
     for info, _ in ns_tensors:
@@ -294,31 +346,26 @@ def forward(desc, layer, ns_tensors, node_mars, element_mars, params, kwargs, st
     return None
 
 
-def _end_of_pass(mod, copies, node_flows, node_mars, params, param_flows, denom_param_flows, want_denom, want_grads,
-                 precision, batch) -> None:
+def _end_of_pass(mod, z, copies, node_flows, node_mars, param_flows, denom_param_flows, want_denom, want_grads, precision,
+                 batch) -> None:
     """What a node vector and its copies in the pass owe at the pass's end, as matrix products over the rows `(copy,
-    sample, rank)` (`kernels/c/lowrank_mixture.cu`'s header has them), of cuBLAS: bf16 operands (fp32 accumulation) under
+    rank, sample)` (`kernels/c/lowrank_mixture.cu`'s header has them), of cuBLAS: bf16 operands (fp32 accumulation) under
     the default precision where the work is `GEMM_BF16_WORK` or more, fp32 else.
 
     The normalizer half: `W = U^T V` into the denominator statistic (the first copy's slice: `materialize_denom_flows`
-    sums the copies'), `V * (U theta)` off each copy's `dB`. The data half: `F+ = theta * (U^T V)` for the copies whose
-    product layer was fused in (`copies`' last entry; another's plain backward has added its flows), into the first of
-    them's flow block: the blocks of a source's copies are summed before the parameters read them, as those of the
-    plain kernels. (`copies`: one source's, of one parameterization: its rank, its denominator or none.)"""
+    sums the copies'), `V * (U theta)` off each copy's `dB`, `V` and the rows the forward's (`z`, `_normalizers`). The data
+    half: `F+ = theta * (U^T V)` for the copies whose product layer was fused in (`copies`' last entry; another's plain
+    backward has added its flows), into the first of them's flow block: the blocks of a source's copies are summed before
+    the parameters read them, as those of the plain kernels. (`copies`: one source's, of one parameterization: its rank,
+    its denominator or none.)"""
     layer0, info0, _, _, _, _ = copies[0]
     desc, K = layer0.external_params, layer0.external_params.rank
     dev = node_flows.device
     geo = desc._geometry(layer0, info0, dev)
     M, N = geo["M"], geo["N"]
     fp = [] if param_flows is None else [c for c in copies if c[5] is not None]
-    work = len(copies) * batch * K * M * N
-    dtype = torch.bfloat16 if precision != "fp32" and work >= GEMM_BF16_WORK else torch.float32
-    theta = None
-    if fp or want_grads:
-        theta = desc._dense_params(geo, params)
-
-    def product(a, b):
-        return torch.mm(a, b, out_dtype = torch.float32) if dtype is torch.bfloat16 else torch.mm(a, b)
+    dtype = _dtype(precision, len(z["fb"]) * batch * K * M * N)
+    theta = z["theta"]
 
     if fp:
         rows = len(fp) * batch * K
@@ -329,23 +376,23 @@ def _end_of_pass(mod, copies, node_flows, node_mars, params, param_flows, denom_
                                   [desc._geometry(layer, info, dev)["rows"] for layer, info, _, _, _, _ in fp],
                                   [sc[0] for _, _, _, _, _, sc in fp], [sc[1] for _, _, _, _, _, sc in fp], M, K)
         start = fp[0][1].ns._param_flow_range
-        param_flows[start[0]:start[1]].index_add_(0, geo["local"], (theta * product(Ud, Vd.t())).reshape(-1)[geo["flat"]])
+        param_flows[start[0]:start[1]].index_add_(0, geo["local"], (theta * _product(Ud, Vd.t(), dtype)).reshape(-1)[geo["flat"]])
 
     if not (want_denom or want_grads):
         return
-    rows = len(copies) * batch * K
-    Ut = torch.empty(M, rows, dtype = dtype, device = dev)                    # (transposed: the lanes over the samples)
-    Vt = torch.empty(N, rows, dtype = dtype, device = dev)
-    mod.lowrank_normalizer_operands(Ut, Vt, node_flows, [fa for _, _, (fa, _), _, _, _ in copies],
-                                    [lz for _, _, _, lz, _, _ in copies], [fb for _, _, (_, fb), _, _, _ in copies],
-                                    [info.nid_start for _, info, _, _, _, _ in copies], M, K)
+    Vt, shift = (z["V"], z["shift"]) if dtype is z["dtype"] else _v_rows(mod, z["fb"], N, K, batch, dtype, dev)
+    # (a copy the forward was given that did not come through here: no rows of U, so nothing of it in the products)
+    Ut = (torch.empty if len(copies) == len(z["row"]) else torch.zeros)(M, Vt.size(1), dtype = dtype, device = dev)
+    row0 = [z["row"][info.ns] for _, info, _, _, _, _ in copies]
+    mod.lowrank_u_operand(Ut, shift, node_flows, [fa for _, _, (fa, _), _, _, _ in copies],
+                          [lz for _, _, _, lz, _, _ in copies], [info.nid_start for _, info, _, _, _, _ in copies], row0, M, K)
     if want_denom:
         off = desc._denom_offsets(layer0)[id(info0.ns)][0]
         size = info0.ns._param_flow_range[1] - info0.ns._param_flow_range[0]
-        denom_param_flows[off:off + size].index_add_(0, geo["local"], product(Ut, Vt.t()).reshape(-1)[geo["flat"]])
+        denom_param_flows[off:off + size].index_add_(0, geo["local"], _product(Ut, Vt.t(), dtype).reshape(-1)[geo["flat"]])
     if want_grads:
-        Gt = product(theta.t().to(dtype), Ut)                                # [N, rows]: (U theta)^T
-        mod.lowrank_normalizer_grads([None if grads is None else grads[1] for _, _, _, _, grads, _ in copies], Vt, Gt,
+        Gt = _product(theta.t().to(dtype), Ut, dtype)                        # [N, rows]: (U theta)^T
+        mod.lowrank_normalizer_grads([None if grads is None else grads[1] for _, _, _, _, grads, _ in copies], row0, Vt, Gt,
                                      batch, K)
 
 
@@ -369,17 +416,20 @@ def backward(desc, layer, ns_tensors, ns_grad_tensors, node_flows, element_flows
     if flows is None or flows() is not node_flows or any(info.ns in st["done"] for info, _ in ns_tensors):
         st.update(done = set(), norm = dict(), flows = weakref.ref(node_flows))
 
-    # The data half: the virtual child values and node flows (and dA), the plain backward (F+), the element flows (and
-    # dB's data part)
+    # The data half: the virtual child values and node flows (and dA), the plain backward, the element flows (and dB's
+    # data part)
+    vectors = []
     for (info, (fa, fb)), grads in zip(ns_tensors, ns_grad_tensors):
         rows = desc._geometry(layer, info, dev)["rows"]
+        state = _state(layer, info, batch, dev)
+        vectors.append((info, fa, fb, grads, rows, state))
         grad_a = None if grads is None else grads[0]
         if stream_children is None:
             mod.lowrank_backward_pre(bufs["vem_d"], element_mars, fb, rows, bufs["vnf_d"], node_flows, node_mars, fa,
-                                     *_state(layer, info, batch, dev), grad_a, info.nid_start, info.ns.num_nodes, K)
+                                     *state, grad_a, info.nid_start, info.ns.num_nodes, K)
         else:
             mod.lowrank_backward_pre_fused(bufs["vem_d"], stream_children[0], stream_children[1], fb, rows,
-                                           bufs["vnf_d"], node_flows, node_mars, fa, *_state(layer, info, batch, dev),
+                                           bufs["vnf_d"], node_flows, node_mars, fa, *state,
                                            grad_a, info.nid_start, info.ns.num_nodes, K)
 
     # (the parameter flows: one matrix product at the pass's end where the product layer is fused in: its children's
@@ -388,16 +438,14 @@ def backward(desc, layer, ns_tensors, ns_grad_tensors, node_flows, element_flows
                       param_flows = param_flows if stream_children is None else None, logspace_flows = True,
                       precision = precision)
 
-    for (info, (fa, fb)), grads in zip(ns_tensors, ns_grad_tensors):
-        rows = desc._geometry(layer, info, dev)["rows"]
+    for info, fa, fb, grads, rows, state in vectors:
         grad_b = None if grads is None else grads[1]
         if stream_children is None:
             mod.lowrank_collapse_bw(element_flows, bufs["vef_d"], rows, grad_b, K)
         else:
             mod.lowrank_collapse_bw_fused(node_flows, bufs["vef_d"], rows, stream_children[0], stream_children[1],
                                           grad_b, K)
-        st["norm"].setdefault(_source(info.ns), []).append((layer, info, (fa, fb), _state(layer, info, batch, dev)[0], grads,
-                                                            stream_children))
+        st["norm"].setdefault(_source(info.ns), []).append((layer, info, (fa, fb), state[0], grads, stream_children))
         st["done"].add(info.ns)
 
     # The pass's last node vector: every source's products, all of its copies at once (each source's own
@@ -407,7 +455,7 @@ def backward(desc, layer, ns_tensors, ns_grad_tensors, node_flows, element_flows
             own = copies[0][0].external_params
             denom = param_flows is not None and denom_param_flows is not None and own.apply_z_correction
             grads = any(c[4] is not None for c in copies)
-            _end_of_pass(mod, copies, node_flows, node_mars, params, param_flows, denom_param_flows, denom, grads,
+            _end_of_pass(mod, st["z"][src], copies, node_flows, node_mars, param_flows, denom_param_flows, denom, grads,
                          precision, batch)
         st["norm"] = dict()
 

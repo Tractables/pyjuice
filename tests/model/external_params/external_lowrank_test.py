@@ -989,12 +989,12 @@ def _normalizer_calls(monkeypatch):
     class Counted:
         def __getattr__(self, attr):
             fn = getattr(real(), attr)
-            if attr != "lowrank_normalizer_operands":
+            if attr != "lowrank_u_operand":
                 return fn
 
-            def counted(Ut, Vt, *args):                              # (`Ut` [M, rows]: the rows are the copies')
+            def counted(Ut, *args):                                  # (`Ut` [M, rows]: the rows are the copies')
                 calls.append((Ut.size(1), Ut.dtype))
-                return fn(Ut, Vt, *args)
+                return fn(Ut, *args)
             return counted
 
     counted = Counted()
@@ -1143,13 +1143,17 @@ def test_the_normalizer_operands_and_gradients_follow_their_formulas(M, N, K, B,
         tol = dict(rtol = 1e-5, atol = 1e-6) if dtype is torch.float32 else dict(rtol = 1e-2, atol = 1e-3)
         Ut = torch.full((M, rows), float("nan"), dtype = dtype, device = dev)
         Vt = torch.full((N, rows), float("nan"), dtype = dtype, device = dev)
-        mod.lowrank_normalizer_operands(Ut, Vt, node_flows, fa, lz, fb, nid0, M, K)
+        shift = torch.full((rows,), float("nan"), device = dev)
+        row0 = [c * B * K for c in range(copies)]
+        mod.lowrank_z_operand(Vt, shift, fb, B, K)
+        mod.lowrank_u_operand(Ut, shift, node_flows, fa, lz, nid0, row0, M, K)
         torch.cuda.synchronize()
         for c in range(copies):
             lf = node_flows[nid0[c]:nid0[c] + M]                                      # [M, B]
             for r in range(K):
                 row = c * B * K + r * B + torch.arange(B, device = dev)
                 sh = fb[c][r].max(dim = 0).values                                     # [B]
+                assert torch.equal(shift[row], sh), f"shift: copy {c}, rank {r}"
                 want_v = torch.where(torch.isneginf(fb[c][r]), torch.zeros_like(fb[c][r]), torch.exp(fb[c][r] - sh))
                 assert torch.allclose(Vt[:, row].float(), want_v, **tol), f"V: copy {c}, rank {r}"
                 assert torch.equal(Vt[:, row].float().max(dim = 0).values, torch.isfinite(sh).float()), "not shifted"
@@ -1165,7 +1169,7 @@ def test_the_normalizer_operands_and_gradients_follow_their_formulas(M, N, K, B,
         before = [(torch.randn(K, N, B, generator = g)).to(dev) for _ in range(copies)]
         grads = [t.clone() for t in before]
         passed = [None if c == 1 else grads[c] for c in range(copies)]
-        mod.lowrank_normalizer_grads(passed, Vt, Gt, B, K)
+        mod.lowrank_normalizer_grads(passed, row0, Vt, Gt, B, K)
         torch.cuda.synchronize()
         assert torch.equal(grads[1], before[1]), "a copy without a buffer was written"
         for c in range(copies):
@@ -1176,7 +1180,7 @@ def test_the_normalizer_operands_and_gradients_follow_their_formulas(M, N, K, B,
                 assert torch.allclose(grads[c][r], before[c][r] - Vt[:, row].float() * Gt[:, row], rtol = 1e-5, atol = 1e-5)
         # ... and every copy one buffer (`tie_external`): all the subtractions land, none lost to another
         one = before[0].clone()
-        mod.lowrank_normalizer_grads([one] * copies, Vt, Gt, B, K)
+        mod.lowrank_normalizer_grads([one] * copies, row0, Vt, Gt, B, K)
         torch.cuda.synchronize()
         want = before[0].double()
         for c in range(copies):
@@ -1858,6 +1862,122 @@ def test_the_data_operands_follow_their_formulas(M, N, K, B, copies):
         assert all(float(Ut[0, B * K + r * B + 3]) == 0.0 for r in range(K))
         assert float(Vt[1, :B * K].abs().max()) == 0.0
         assert float(Vt[:, B + 1].abs().max()) == 0.0 and float(Ut[:, B + 1].abs().max()) == 0.0
+
+
+@needs_virtual
+def test_a_backward_at_another_precision_than_its_forward(monkeypatch):
+    """The forward's operands are the backward's where their dtype is what the backward's precision asks for. A backward at
+    fp32 after a forward whose products took bf16 operands makes its own `V`, and gives the torch passes' to fp32's rounding
+    of what the forward left."""
+    import pyjuice.nodes.external_params.lowrank_virtual as lowrank_virtual
+
+    rank, batch = 2, 5
+    pc, sums, _, _, _, _ = _pair("hmm_tied", "sum_exp", rank = rank)
+    dev = pc.params.device
+    torch.manual_seed(37)
+    data = torch.randint(0, NUM_CATS, (batch, pc.num_vars), device = dev)
+    ext = {a: _factors(a, rank, batch, dev, seed = 250 + i) for i, a in enumerate(sums)}
+    monkeypatch.setattr(lowrank_virtual, "ENABLED", False)
+    want = _passes(pc, sums, data, ext)
+    monkeypatch.setattr(lowrank_virtual, "ENABLED", True)
+
+    monkeypatch.setattr(lowrank_virtual, "GEMM_BF16_WORK", 0)
+    made, real = [], lowrank_virtual._v_rows
+
+    def counted(mod, fbs, N, K, batch, dtype, dev):
+        made.append(dtype)
+        return real(mod, fbs, N, K, batch, dtype, dev)
+
+    monkeypatch.setattr(lowrank_virtual, "_v_rows", counted)
+    grads = {a: (torch.zeros_like(ext[a][0]), torch.zeros_like(ext[a][1])) for a in sums}
+    pc(data, sum_external_params = ext)
+    assert made == [torch.bfloat16]
+    pc.precision = "fp32"                                       # (the circuit's, read by each pass as it runs)
+    pc.init_param_flows(flows_memory = 0.0)
+    pc.backward(data, allow_modify_flows = False, logspace_flows = True, sum_external_params_grad = grads)
+    pc.precision = "auto"
+    assert made == [torch.bfloat16, torch.float32], made
+    # (the node values are the bf16 product's: the flows read them)
+    assert torch.allclose(_denominators(pc, sums), want["fm"], rtol = 2e-2, atol = 1e-3)
+    assert torch.allclose(pc.param_flows, want["fp"], rtol = 2e-2, atol = 1e-3)
+    for k, a in enumerate(sums):
+        assert torch.allclose(grads[a][1], want["dB"][k], rtol = 2e-2, atol = 1e-3)
+    # ... and one of the default precision keeps the forward's
+    pc(data, sum_external_params = ext)
+    made.clear()
+    pc.init_param_flows(flows_memory = 0.0)
+    pc.backward(data, allow_modify_flows = False, logspace_flows = True, sum_external_params_grad = grads)
+    assert made == [], made
+
+
+@needs_virtual
+def test_a_tied_copy_that_does_not_go_through_the_virtual_batch(monkeypatch):
+    """Tied copies in a layer the virtual batch does not serve (two node vectors sharing a child) keep the torch passes, a
+    copy of theirs in another layer goes through it: the forward's products hold rows for all of them, the rows of those
+    that did not come through are no part of the backward's -- the torch passes' flows and gradients, all told."""
+    import pyjuice.nodes.external_params.lowrank_virtual as lowrank_virtual
+
+    rank, batch, dev, K = 2, 5, torch.device("cuda:0"), 8
+    def build():
+        torch.manual_seed(0)
+        with juice.set_block_size(K):
+            leaf = lambda v: inputs(v, num_node_blocks = 1, dist = dists.Categorical(num_cats = NUM_CATS))
+            below = summate(multiply(leaf(0), leaf(1)), num_node_blocks = 1)
+            s0 = summate(multiply(below, leaf(2)), num_node_blocks = 1,
+                         external_params = LowRankSumParams(rank = rank, form = "sum_exp"))
+            shared = multiply(leaf(3), leaf(4))
+            s1, s2 = s0.duplicate(shared, tie_params = True), s0.duplicate(shared, tie_params = True)
+            mix = summate(multiply(s1), multiply(s2), num_node_blocks = 1)        # (the two over one scope: mixed)
+            root = summate(multiply(s0, mix), num_node_blocks = 1, block_size = 1)
+        torch.manual_seed(0)
+        root.init_parameters(perturbation = 2.0)
+        return juice.compile(root, verbose = False).to(dev), [s0, s1, s2]
+
+    out = dict()
+    for arm in ("virtual", "torch"):
+        monkeypatch.setattr(lowrank_virtual, "ENABLED", arm == "virtual")
+        pc, sums = build()
+        torch.manual_seed(41)
+        data = torch.randint(0, NUM_CATS, (batch, pc.num_vars), device = dev)
+        ext = {a: _factors(a, rank, batch, dev, seed = 260 + i) for i, a in enumerate(sums)}
+        out[arm] = got = _passes(pc, sums, data, ext)
+        kinds = [type(pc.external_params_nodes[a].__dict__["_lr_state"]) for a in sums]
+        assert kinds == ([tuple, dict, dict] if arm == "virtual" else [dict, dict, dict]), kinds
+    _same(out["virtual"], out["torch"], rtol = 2e-4, atol = 2e-5)
+
+
+@needs_virtual
+def test_a_backward_that_wants_neither_the_denominator_nor_gradients_makes_no_normalizer(monkeypatch):
+    """Without the denominator statistic (`apply_z_correction = False`) and without the factors' gradients
+    (`compute_external_grads = False`) the normalizer half has nothing to write: the pass's end makes none of its
+    operands, and the flows are the torch passes'. With the gradients (the default) it does, once a source."""
+    import pyjuice.nodes.external_params.lowrank_virtual as lowrank_virtual
+
+    rank, batch = 2, 5
+    pc, sums, _, _, _, _ = _pair("hmm_tied", "sum_exp", rank = rank, apply_z_correction = False)
+    dev = pc.params.device
+    torch.manual_seed(43)
+    data = torch.randint(0, NUM_CATS, (batch, pc.num_vars), device = dev)
+    ext = {a: _factors(a, rank, batch, dev, seed = 270 + i) for i, a in enumerate(sums)}
+
+    def flows(**kw):
+        pc(data, sum_external_params = ext)
+        pc.init_param_flows(flows_memory = 0.0)
+        pc.backward(data, allow_modify_flows = False, logspace_flows = True, **kw)
+        return pc.param_flows.clone(), pc.node_flows.clone()
+
+    monkeypatch.setattr(lowrank_virtual, "ENABLED", False)
+    want = flows(compute_external_grads = False)
+    monkeypatch.setattr(lowrank_virtual, "ENABLED", True)
+    norm = _normalizer_calls(monkeypatch)
+    got = flows(compute_external_grads = False)
+    assert {type(pc.external_params_nodes[a].__dict__["_lr_state"]) for a in sums} == {tuple}
+    assert norm == [], norm
+    for g, w in zip(got, want):
+        assert torch.allclose(g, w, rtol = 2e-4, atol = 2e-5)
+
+    flows()
+    assert len(norm) == 1, norm
 
 
 def test_refusals():
