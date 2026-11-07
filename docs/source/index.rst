@@ -22,6 +22,7 @@ API
 
 - :doc:`pyjuice <python-api/pyjuice>`
 - :doc:`pyjuice.nodes <python-api/nodes>`
+- :doc:`pyjuice.parameterizations <python-api/parameterizations>`
 - :doc:`pyjuice.TensorCircuit <python-api/tensorcircuit>`
 - :doc:`pyjuice.queries <python-api/queries>`
 - :doc:`pyjuice.optim <python-api/optim>`
@@ -34,6 +35,7 @@ API
 
    python-api/pyjuice
    python-api/nodes
+   python-api/parameterizations
    python-api/tensorcircuit
    python-api/queries
    python-api/optim

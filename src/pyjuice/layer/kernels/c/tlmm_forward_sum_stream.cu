@@ -3,7 +3,7 @@
 //
 //     node_mars[n, b] = log sum_c params[n, c] exp(element_mars[c, b])
 //
-// The regular copy of the BlockScale forward stream (nodes/external_params/kernels/c/blockscale_forward_stream.cu),
+// The regular copy of the BlockScale forward stream (parameterizations/kernels/c/blockscale_forward_stream.cu),
 // without gates and the normalizer. The other kernels walk a node block's edge tiles serially, each tile under its own
 // stabilizer, merging the running sums tile by tile (MEASURED HMM-4096 B128: 128 thread blocks on 188 SMs, a tile every
 // ~1600 cycles, the forward at a quarter of its compute floor). Here:

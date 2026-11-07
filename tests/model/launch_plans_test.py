@@ -21,11 +21,11 @@ import torch
 
 import pyjuice as juice
 import pyjuice.utils.launch_plans as lp
-from pyjuice.nodes import BlockScaleSumParams
+from pyjuice.parameterizations import BlockScale
 from pyjuice.layer import deferred_par as dpar
 from pyjuice.utils.launch_plans import LaunchPlans
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "external_params"))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "parameterizations"))
 from blockscale_ele_backward_prepass_test import _hmm, _topology, _two, PAD, CATS  # noqa: E402
 from blockscale_ele_backward_stream_test import _tied_hmm                          # noqa: E402
 
@@ -175,7 +175,7 @@ def _instance(builder, dt, seed = 0):
 
 def _inputs(gated, V, B, seed):
     g = torch.Generator(device = "cpu").manual_seed(seed)
-    phi = {ns: (torch.randn(ns.external_params.tensor_shapes(ns, B)[0], generator = g) * 2.0).to(DEV)
+    phi = {ns: (torch.randn(ns.parameterization.tensor_shapes(ns, B)[0], generator = g) * 2.0).to(DEV)
            for ns in gated}
     x = torch.randint(0, CATS, (B, V), generator = g).to(DEV)
     return phi, x
@@ -226,13 +226,13 @@ def _layer_keys(layer):
 def _count_full_paths(monkeypatch):
     """`[n]`: how many gated backwards take the full path (`pre_backward_layer`) from now on."""
     n = [0]
-    real = BlockScaleSumParams.pre_backward_layer
+    real = BlockScale.pre_backward_layer
 
     def counted(self, *args, **kwargs):
         n[0] += 1
         return real(self, *args, **kwargs)
 
-    monkeypatch.setattr(BlockScaleSumParams, "pre_backward_layer", counted)
+    monkeypatch.setattr(BlockScale, "pre_backward_layer", counted)
     return n
 
 
@@ -414,7 +414,7 @@ def build(dev):
 
 def step(pc, gated, V, dev):
     g = torch.Generator(device = "cpu").manual_seed(1)
-    phi = {ns: (torch.randn(ns.external_params.tensor_shapes(ns, 128)[0], generator = g) * 2.0).to(dev)
+    phi = {ns: (torch.randn(ns.parameterization.tensor_shapes(ns, 128)[0], generator = g) * 2.0).to(dev)
            for ns in gated}
     x = torch.randint(0, CATS, (128, V), generator = g).to(dev)
     pc(x, sum_external_params = phi)
@@ -448,7 +448,7 @@ def test_a_real_device_move_replans_on_the_new_device():
     env = dict(os.environ)
     env["CUDA_VISIBLE_DEVICES"] = ",".join(_two_gpus())
     env.pop("PYJUICE_TEST_GPU_POOL", None)
-    env["LP_TESTS"] = os.path.join(os.path.dirname(os.path.abspath(__file__)), "external_params")
+    env["LP_TESTS"] = os.path.join(os.path.dirname(os.path.abspath(__file__)), "parameterizations")
     proc = subprocess.run([sys.executable, "-c", _MOVE_CHILD], capture_output = True, text = True, timeout = 900,
                           env = env)
     assert proc.returncode == 0 and "CHILD_OK" in proc.stdout, (

@@ -15,7 +15,7 @@ from pyjuice.nodes import CircuitNodes
 from pyjuice.layer import StagedExternalParams, EXTERNAL_PARAMS_KWARG, EXTERNAL_PARAMS_GRAD_KWARG, \
                           EXTERNAL_PARAMS_BUFFER_KWARG, EXTERNAL_PARAMS_GRAD_BUFFER_KWARG
 from pyjuice.layer.external_sum_layer import validate_external_tensors
-from pyjuice.nodes.external_params.external_params import ExternalSumParams
+from pyjuice.parameterizations.base import SumParameterization
 
 
 def _staging_transpose_fn():
@@ -28,13 +28,13 @@ def _staging_transpose_fn():
     whole GROUP hands this a flat destination, the per-node path hands it a storage-shaped one, and the
     fallback only ever handled the second.
     """
-    from pyjuice.nodes.external_params.kernels.c import get_module
+    from pyjuice.parameterizations.kernels.c import get_module
     mod = get_module()
     if mod is not None:
         return mod.staging_transpose
 
     try:
-        from pyjuice.nodes.external_params.kernels.staging import staging_transpose_triton
+        from pyjuice.parameterizations.kernels.staging import staging_transpose_triton
         return staging_transpose_triton
     except Exception:
         return None
@@ -50,7 +50,7 @@ def _staged_transposes_batched(fn, fast: list) -> bool:
     every call (a head's output, new gradient buffers) costs no more than one with stable ones, and what the
     backward launches never depends on where the allocator put them.
     """
-    from pyjuice.nodes.external_params.kernels.c import get_module
+    from pyjuice.parameterizations.kernels.c import get_module
     mod = get_module()
     batched = getattr(mod, "staging_transpose_batched", None) if mod is not None else None
     if batched is None or fn is not mod.staging_transpose:
@@ -181,7 +181,7 @@ class _ExternalParamsMixin:
             if hit is not None and hit[0] is views:
                 src, flat = hit[1], hit[2]
             else:
-                src = ns.external_params.from_storage(ns, views)
+                src = ns.parameterization.from_storage(ns, views)
                 rotates, _ = self._ext_ns_static(ns)
                 # the storage views as `[N, B]`, the transpose's source (None where the layout is not that rotation)
                 flat = tuple(v.view(-1, v.size(-1)) for v in views) if rotates else None
@@ -230,24 +230,24 @@ class _ExternalParamsMixin:
             return layout
 
         # Two passes so that a node may share another node's slots (see
-        # `ExternalSumParams.storage_owner`): allocate for the owners first, then alias the rest onto
+        # `SumParameterization.storage_owner`): allocate for the owners first, then alias the rest onto
         # them. Aliased nodes still appear in the map, so the layers and kernels need no special case --
         # they look up their own `ns` and simply find the same memory.
         offset = 0
         ns2slots = dict()
         for ns in self.external_params_nodes:
-            if ns.external_params.storage_owner(ns) is not ns:
+            if ns.parameterization.storage_owner(ns) is not ns:
                 continue
 
             slots = []
-            for shape in ns.external_params.storage_shapes(ns, batch_size):
+            for shape in ns.parameterization.storage_shapes(ns, batch_size):
                 slots.append((offset, tuple(shape)))
                 offset += math.prod(shape)
 
             ns2slots[ns] = slots
 
         for ns in self.external_params_nodes:
-            owner = ns.external_params.storage_owner(ns)
+            owner = ns.parameterization.storage_owner(ns)
             if owner is not ns:
                 assert owner in ns2slots, \
                     f"`storage_owner` of {ns} is not itself an external-parameter node of this circuit."
@@ -342,12 +342,12 @@ class _ExternalParamsMixin:
         for ns in nodes:
             assert ns in self.external_params_nodes, \
                 f"External-parameter group '{name}' contains a node this PC did not compile with an " \
-                f"external parameterization. Construct it with `pyjuice.summate(..., external_params = ...)`."
+                f"external parameterization. Construct it with `pyjuice.summate(..., parameterization = ...)`."
             if id(ns) in seen:
                 raise AssertionError(f"External-parameter group '{name}' lists the same node twice.")
             seen.add(id(ns))
 
-        sigs = {ns.external_params.get_signature() for ns in nodes}
+        sigs = {ns.parameterization.get_signature() for ns in nodes}
         assert len(sigs) == 1, \
             f"External-parameter group '{name}' mixes parameterizations {sigs}; one concatenated " \
             f"tensor cannot serve nodes whose layouts differ."
@@ -355,7 +355,7 @@ class _ExternalParamsMixin:
         # Members that SHARE storage (a tied node and its copies) are fed once, by the owner. Handing
         # such a pair two different slices is a contradiction, and silently letting one win would apply
         # the wrong gate to the other -- so it is rejected here rather than resolved arbitrarily.
-        owners = [ns.external_params.storage_owner(ns) for ns in nodes]
+        owners = [ns.parameterization.storage_owner(ns) for ns in nodes]
         if len(set(id(o) for o in owners)) != len(owners):
             raise AssertionError(
                 f"External-parameter group '{name}' contains nodes that share one external tensor "
@@ -365,7 +365,7 @@ class _ExternalParamsMixin:
 
         # Shapes must agree everywhere except along `dim`. Checked once, at registration, on a nominal
         # batch of 1: the shapes are affine in the batch, so the comparison holds for every batch.
-        shapes = [ns.external_params.tensor_shapes(ns, 1) for ns in nodes]
+        shapes = [ns.parameterization.tensor_shapes(ns, 1) for ns in nodes]
         n_slots = len(shapes[0])
         assert all(len(sh) == n_slots for sh in shapes), \
             f"External-parameter group '{name}' mixes nodes with different numbers of tensors."
@@ -416,10 +416,10 @@ class _ExternalParamsMixin:
         if dim != 1 or len(nodes) < 2:
             return None
 
-        ep = nodes[0].external_params
+        ep = nodes[0].parameterization
         perm = ep.storage_perm()
         if not (perm is not None
-                and type(ep).to_storage is ExternalSumParams.to_storage
+                and type(ep).to_storage is SumParameterization.to_storage
                 and tuple(perm) == tuple(range(1, len(perm))) + (0,)):
             return None
 
@@ -463,7 +463,7 @@ class _ExternalParamsMixin:
         if dim != 1 or not all(self._ext_ns_static(ns) == (True, ns) for ns in nodes):
             return None
         _, ns2slots = self._external_params_layout(batch_size)
-        shapes_of = [ns.external_params.tensor_shapes(ns, batch_size) for ns in nodes]
+        shapes_of = [ns.parameterization.tensor_shapes(ns, batch_size) for ns in nodes]
         cat_shapes, to_buffer, to_caller, max_n = [], [], [], 0
         elem = 4                                    # (float32: the buffer's, and what `launch`'s callers check)
         for slot in range(len(shapes_of[0])):
@@ -495,7 +495,7 @@ class _ExternalParamsMixin:
         between the caller and `buffer` that way -- contiguous fp32 of exactly the concatenation's shape, the extension
         built --, else None: the per-node path takes it, and what is wrong with it, if anything, is said there."""
         fn = _staging_transpose_fn()
-        from pyjuice.nodes.external_params.kernels.c import get_module
+        from pyjuice.parameterizations.kernels.c import get_module
         mod = get_module()
         batched = getattr(mod, "staging_transpose_batched", None) if mod is not None else None
         if batched is None or fn is not mod.staging_transpose or not buffer.is_cuda:
@@ -542,7 +542,7 @@ class _ExternalParamsMixin:
 
             if torch.is_tensor(tensors):
                 tensors = (tensors,)
-            n_slots = len(nodes[0].external_params.tensor_shapes(nodes[0], batch_size))
+            n_slots = len(nodes[0].parameterization.tensor_shapes(nodes[0], batch_size))
             assert len(tensors) == n_slots, \
                 f"External-parameter group '{key}' expects {n_slots} concatenated tensor(s), got " \
                 f"{len(tensors)}."
@@ -551,7 +551,7 @@ class _ExternalParamsMixin:
             for slot, cat in enumerate(tensors):
                 assert torch.is_tensor(cat), \
                     f"External-parameter group '{key}', slot {slot}: expected a tensor, got {type(cat)}."
-                sizes = [ns.external_params.tensor_shapes(ns, batch_size)[slot] for ns in nodes]
+                sizes = [ns.parameterization.tensor_shapes(ns, batch_size)[slot] for ns in nodes]
                 axis = dim % len(sizes[0])
                 want = list(sizes[0])
                 want[axis] = sum(int(s[axis]) for s in sizes)
@@ -690,7 +690,7 @@ class _ExternalParamsMixin:
         dsts, srcs, fast = [], [], list(group_fast)
         for ns, tensors in ns2tensors.items():
             tensors = validate_external_tensors(
-                ns, ns.external_params, tensors, batch_size, device, require_contiguous = False
+                ns, ns.parameterization, tensors, batch_size, device, require_contiguous = False
             )
 
             # The staging buffer may hold the tensors in a different LAYOUT than the caller uses --
@@ -713,7 +713,7 @@ class _ExternalParamsMixin:
                         srcs.append(tensor.permute(*range(1, tensor.dim()), 0))
                 continue
 
-            tensors = ns.external_params.to_storage(ns, tensors)
+            tensors = ns.parameterization.to_storage(ns, tensors)
 
             dsts.extend(views[ns])
             srcs.extend(tensors)
@@ -724,7 +724,7 @@ class _ExternalParamsMixin:
         # exactly the set that was staged.
         #
         # Membership is by STORAGE GROUP, not by node: when several nodes share one set of tensors (see
-        # `ExternalSumParams.storage_owner`) the caller supplies them once, and every node in that group
+        # `SumParameterization.storage_owner`) the caller supplies them once, and every node in that group
         # is staged. Comparing node-by-node would keep only the one that was named and silently turn the
         # rest into plain sum layers -- correct-looking output with the correction applied to one
         # timestep out of many.
@@ -745,9 +745,9 @@ class _ExternalParamsMixin:
         memo = self.__dict__.setdefault("_ext_ns_static_memo", {})
         hit = memo.get(ns)
         if hit is None:
-            ep = ns.external_params
+            ep = ns.parameterization
             perm = ep.storage_perm()
-            rotates = (perm is not None and type(ep).to_storage is ExternalSumParams.to_storage
+            rotates = (perm is not None and type(ep).to_storage is SumParameterization.to_storage
                        and tuple(perm) == tuple(range(1, len(perm))) + (0,))
             hit = memo[ns] = (rotates, ep.storage_owner(ns))
         return hit
@@ -806,7 +806,7 @@ class _ExternalParamsMixin:
                     continue
                 assert ns in self.external_params_nodes, \
                     f"`{kwarg_name}` contains a node that this PC did not compile with an external " \
-                    f"parameterization: {ns}. Construct it with `pyjuice.summate(..., external_params = ...)`."
+                    f"parameterization: {ns}. Construct it with `pyjuice.summate(..., parameterization = ...)`."
 
     def _take_whole_grad_groups(self, dsts: dict, batch_size: int) -> dict:
         """The destinations that are whole groups going back in one launch (`_group_batched`) noted for the end of the
@@ -866,7 +866,7 @@ class _ExternalParamsMixin:
                 assert ns in self._staged_external_params, \
                     f"`{EXTERNAL_PARAMS_GRAD_KWARG}` names {ns}, which was not given external " \
                     f"parameters in the forward pass."
-                validate_external_tensors(ns, ns.external_params, tensors, batch_size,
+                validate_external_tensors(ns, ns.parameterization, tensors, batch_size,
                                           self.external_params.device, require_contiguous = False)
             self._external_grad_dsts = dsts
             compute_external_grads = True          # asking for them is asking for them
@@ -927,9 +927,9 @@ class _ExternalParamsMixin:
         # default (`compute_external_grads = True`): a parameterization that computes the element and
         # parameter flows but not its own gradient would otherwise either break every backward or hand
         # back a plausible-looking tensor of zeros.
-        if not ns.external_params.computes_external_grads:
+        if not ns.parameterization.computes_external_grads:
             raise NotImplementedError(
-                f"`{ns.external_params.get_signature()}` does not compute gradients with respect to "
+                f"`{ns.parameterization.get_signature()}` does not compute gradients with respect to "
                 f"its own parameters yet. The element and parameter flows it contributes ARE computed, "
                 f"so `pc.backward()` and the EM optimizers work; only this read is unavailable."
             )
@@ -938,4 +938,4 @@ class _ExternalParamsMixin:
 
         # Stored in the kernels' layout; hand them back in the caller's, so they line up
         # element-for-element with the tensors that were supplied.
-        return ns.external_params.from_storage(ns, grad_tensors)
+        return ns.parameterization.from_storage(ns, grad_tensors)

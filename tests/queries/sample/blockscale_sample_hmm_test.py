@@ -1,5 +1,5 @@
 """
-End-to-end conditional sampling from a gated HMM -- the model `BlockScaleSumParams` exists for.
+End-to-end conditional sampling from a gated HMM -- the model `BlockScale` exists for.
 
 Every transition of a `SEQ_LEN`-step chain carries a per-sample gate, and all of them are supplied as
 ONE tensor through a registered group, which is how a router head would actually feed them. That is
@@ -42,7 +42,8 @@ import torch
 
 import pyjuice as juice
 import pyjuice.nodes.distributions as dists
-from pyjuice.nodes import inputs, multiply, summate, BlockScaleSumParams
+from pyjuice.nodes import inputs, multiply, summate
+from pyjuice.parameterizations import BlockScale
 
 
 cuda_only = pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs a GPU")
@@ -63,7 +64,7 @@ def _build(seed = 0):
             emit = inputs(t, num_node_blocks = 1, dist = dists.Categorical(num_cats = NUM_EMITS))
             emits.append(emit)
             ns = summate(multiply(ns, emit), num_node_blocks = 1,
-                         external_params = BlockScaleSumParams(ch_block_size = GATE_CBS))
+                         parameterization = BlockScale(ch_block_size = GATE_CBS))
             transitions.append(ns)
         root = summate(multiply(ns), num_node_blocks = 1, block_size = 1)
 

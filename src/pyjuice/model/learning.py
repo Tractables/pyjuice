@@ -155,7 +155,7 @@ class _LearningMixin:
                 ps, pe = ns._param_range
                 # Below fp32 the update also takes the stored range where it was written since the master copy was
                 # last stored, and stores its result there (`stored`): in its own passes, not a sync and a copy around
-                ns.external_params.compute_em_correction(
+                ns.parameterization.compute_em_correction(
                     ns, params, self.param_flows, denom_param_flows,
                     step_size, pseudocount, keep_zero_params, denom_sources = sources,
                     out = params[ps:pe], stored = None if params is self.params else self.params.data[ps:pe])
@@ -263,7 +263,7 @@ class _LearningMixin:
         # PC keeps it `None` and pays nothing.
         #
         # Its size is `num_denom_flows`, fixed at compile by the requesting parameterizations, NOT
-        # `pflow_shape`: the denominator is not a `param_flows` mirror. `BlockScaleSumParams` keeps the
+        # `pflow_shape`: the denominator is not a `param_flows` mirror. `BlockScale` keeps the
         # gate-space contraction `W[node, gate]` instead, which is `gate_cbs` times smaller (MEASURED
         # 64x at a 1024-state gated HMM, 128x at 2048) and reconstructs `F-` at M-step time. Scaling
         # still commutes with the reconstruction because `F- = theta * W` is linear in `W`.
@@ -315,7 +315,7 @@ class _LearningMixin:
         # reduced too -- otherwise a DDP M-step would divide by a partial `F-`. It stays a single
         # collective even though its layout is the parameterization's own: the PC keeps every requesting
         # layer's slices in ONE flat tensor, and a gate-space accumulator sums over samples like any
-        # other flow. (`BlockScaleSumParams` also makes this the CHEAPER reduce of the two, since `W` is
+        # other flow. (`BlockScale` also makes this the CHEAPER reduce of the two, since `W` is
         # `gate_cbs` times smaller than the param-flow mirror it replaced.)
         if getattr(self, "denom_param_flows", None) is not None:
             tensors.append(self.denom_param_flows)

@@ -16,7 +16,8 @@ import torch
 
 import pyjuice as juice
 import pyjuice.nodes.distributions as dists
-from pyjuice.nodes import inputs, multiply, summate, BlockScaleSumParams, LowRankSumParams
+from pyjuice.nodes import inputs, multiply, summate
+from pyjuice.parameterizations import BlockScale, LowRank
 
 
 cuda_only = pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs a GPU")
@@ -82,11 +83,11 @@ def _chain(dist_fn, seq_length, num_latents, external = None, block_size = 4, pr
                 emit = inputs(t, num_node_blocks = num_latents // block_size, dist = dist_fn())
             ext = dict()
             if external == "blockscale":
-                ext = dict(external_params = BlockScaleSumParams(ch_block_size = block_size))
+                ext = dict(parameterization = BlockScale(ch_block_size = block_size))
             elif external == "lowrank":
-                ext = dict(external_params = LowRankSumParams(rank = 4))
+                ext = dict(parameterization = LowRank(rank = 4))
             elif external == "lowrank_sum_exp":
-                ext = dict(external_params = LowRankSumParams(rank = 4, form = "sum_exp"))
+                ext = dict(parameterization = LowRank(rank = 4, form = "sum_exp"))
             chain = summate(multiply(chain, emit), num_node_blocks = num_latents // block_size, **ext)
             transitions.append(chain)
         root = summate(multiply(chain), num_node_blocks = 1, block_size = 1)
@@ -219,7 +220,7 @@ def test_external_sum_params(external, block_size, B, categorical_path):
     g = torch.Generator(device = DEV).manual_seed(5)
     params = dict()
     for ns in transitions:
-        shapes = ns.external_params.tensor_shapes(ns, B)
+        shapes = ns.parameterization.tensor_shapes(ns, B)
         tensors = tuple(torch.randn(s, device = DEV, generator = g) * 0.5 - 0.5 for s in shapes)
         params[ns] = tensors if len(tensors) > 1 else tensors[0]
     targets = [1, 3]

@@ -364,7 +364,7 @@ def _unsupported_reason(ns, kind: str) -> Optional[str]:
             supported = ", ".join(t.__name__ for t in distributions.SUPPORTED)
             return f"input distribution {type(ns.dist).__name__} (supported: {supported})"
         return None
-    ext = getattr(ns, "external_params", None) if kind == "sum" else None
+    ext = getattr(ns, "parameterization", None) if kind == "sum" else None
     if ext is not None:
         module = external_params.lookup(ext)
         if module is None:

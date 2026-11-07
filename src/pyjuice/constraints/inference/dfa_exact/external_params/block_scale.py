@@ -1,5 +1,5 @@
 """
-Sum nodes gated per sample (:class:`pyjuice.nodes.external_params.BlockScaleSumParams`) under a constraint.
+Sum nodes gated per sample (:class:`pyjuice.parameterizations.BlockScale`) under a constraint.
 
 A gated sum node ``n`` of sample ``b`` weighs child ``c`` by ``theta[n, c] phi_b[g(n, c)] / Z_b[n]``, ``g(n, c)`` the
 gate of ``n``'s node block and ``c``'s child gate, ``Z_b[n] = sum_c theta[n, c] phi_b[g(n, c)]`` -- the library's
@@ -37,7 +37,7 @@ class Cells:
     """
     Where every gated node group's gates are in a session's rows of them (:func:`cells`).
 
-    :ivar base: storage owner (see ``BlockScaleSumParams.storage_owner``) -> its first cell
+    :ivar base: storage owner (see ``BlockScale.storage_owner``) -> its first cell
     :ivar shape: storage owner -> ``(node gates, child gates)``
     :ivar size: the cells of a row
     :ivar layers: the gated sum layers, by gated layer index (the PC's order)
@@ -54,13 +54,13 @@ def cells(pc) -> Cells:
     base, shape, size, layers = {}, {}, 0, []
     for lg in pc.inner_layer_groups:
         for layer in lg.layers if lg.is_sum() else ():
-            if getattr(layer, "external_params", None) is None:
+            if getattr(layer, "parameterization", None) is None:
                 continue
             layers.append(layer)
             for ns in layer.nodes:
-                owner = ns.external_params.storage_owner(ns)
+                owner = ns.parameterization.storage_owner(ns)
                 if owner not in base:
-                    _, Nk, Ck = ns.external_params.tensor_shapes(owner, 1)[0]
+                    _, Nk, Ck = ns.parameterization.tensor_shapes(owner, 1)[0]
                     base[owner], shape[owner] = size, (Nk, Ck)
                     size += Nk * Ck
     return Cells(base, shape, size, layers)
@@ -81,15 +81,15 @@ def edge_tables(layout: Cells, layer, nids: torch.Tensor, cids: torch.Tensor, el
     nid_h = nids.cpu().long().numpy()
     K = nid_h.size
     row, cbs, ck = np.zeros(K, dtype = np.int64), np.ones(K, dtype = np.int64), np.zeros(K, dtype = np.int64)
-    node_gates = {ns.external_params.gate_sizes(ns)[0] for ns in nodes}
+    node_gates = {ns.parameterization.gate_sizes(ns)[0] for ns in nodes}
     assert len(node_gates) == 1, node_gates          # a layer's nodes share their block size and gate signature
     groups = np.searchsorted(starts, nid_h, side = "right") - 1
     places = []
     for at in np.unique(groups).tolist():            # (every node group's node blocks together)
         ks = np.nonzero(groups == at)[0]
         ns = nodes[at]
-        owner = ns.external_params.storage_owner(ns)
-        gate_bs, gate_cbs = ns.external_params.gate_sizes(ns)
+        owner = ns.parameterization.storage_owner(ns)
+        gate_bs, gate_cbs = ns.parameterization.gate_sizes(ns)
         ck[ks] = layout.shape[owner][1]
         row[ks] = layout.base[owner] + (nid_h[ks] - starts[at]) // gate_bs * ck[ks]
         cbs[ks] = gate_cbs
@@ -277,15 +277,15 @@ def session_inputs(pc, layout: Cells, value) -> SessionGates:
                 raise AssertionError(f"`sum_external_params` names a node group with no external parameters in this "
                                      f"PC: {key}.")
         given = pc._expand_external_params_groups(dict(value), batch)
-        given = {ns: validate_external_tensors(ns, ns.external_params, t, batch, pc.params.device,
+        given = {ns: validate_external_tensors(ns, ns.parameterization, t, batch, pc.params.device,
                                                require_contiguous = False)[0] for ns, t in given.items()}
     except AssertionError as e:
         raise ValueError(str(e)) from None
-    owners = {ns.external_params.storage_owner(ns): t for ns, t in given.items()}
+    owners = {ns.parameterization.storage_owner(ns): t for ns, t in given.items()}
     layers = np.zeros(len(layout.layers), dtype = bool)
     gated = []
     for k, layer in enumerate(layout.layers):
-        on = [ns.external_params.storage_owner(ns) in owners for ns in layer.nodes]
+        on = [ns.parameterization.storage_owner(ns) in owners for ns in layer.nodes]
         if any(on) and not all(on):
             raise NotImplementedError(f"`sum_external_params` gates {sum(on)} of the {len(on)} gated node groups of a "
                                       f"sum layer: as in the library, a layer's nodes are gated all or none.")
@@ -326,10 +326,10 @@ def log_normalizers(pc, layout: Cells, gates: SessionGates) -> torch.Tensor:
     out = torch.zeros(gates.batch, pc.num_nodes, dtype = torch.float32, device = dev)
     groups = {}                         # the node groups of one parameter table and gate sizes: one sigma, one pass
     for ns in gates.nodes:
-        groups.setdefault((ns.get_source_ns(), ns.external_params.gate_sizes(ns)), []).append(ns)
+        groups.setdefault((ns.get_source_ns(), ns.parameterization.gate_sizes(ns)), []).append(ns)
     for (_, (gate_bs, gate_cbs)), members in groups.items():
         lsig = _log_gate_sums(pc, members[0], gate_cbs)                         # [nodes, Ck] float64
-        Nk, Ck = layout.shape[members[0].external_params.storage_owner(members[0])]
+        Nk, Ck = layout.shape[members[0].parameterization.storage_owner(members[0])]
         N = members[0].num_nodes
         node = torch.arange(N, device = dev)
         top = lsig.max(dim = 1).values
@@ -341,7 +341,7 @@ def log_normalizers(pc, layout: Cells, gates: SessionGates) -> torch.Tensor:
         step = max(1, LOGZ_CHUNK // (gates.batch * Nk * Ck))
         for k in range(0, len(members), step):
             chunk = members[k:k + step]
-            cells = torch.tensor([layout.base[ns.external_params.storage_owner(ns)] for ns in chunk], device = dev)
+            cells = torch.tensor([layout.base[ns.parameterization.storage_owner(ns)] for ns in chunk], device = dev)
             lphi = gates.values[:, cells[:, None] + torch.arange(Nk * Ck, device = dev)[None, :]]
             lphi = lphi.view(gates.batch * len(chunk), Nk, Ck)                    # (sample, member) major
             m = lphi.max(dim = 2, keepdim = True).values

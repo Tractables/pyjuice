@@ -14,7 +14,8 @@ import torch
 import pyjuice as juice
 import pyjuice.nodes.distributions as dists
 from pyjuice.layer.sum_layer import SumLayer
-from pyjuice.nodes import inputs, multiply, summate, BlockScaleSumParams
+from pyjuice.nodes import inputs, multiply, summate
+from pyjuice.parameterizations import BlockScale
 
 DEV = torch.device("cuda:0")
 cuda_only = pytest.mark.skipif(not torch.cuda.is_available(), reason = "requires a GPU")
@@ -179,18 +180,18 @@ def test_external_parameters_keep_the_accumulating_hooks(monkeypatch):
     torch.manual_seed(0)
     with juice.set_block_size(64):
         ni = [inputs(v, num_node_blocks = 2, dist = dists.Categorical(num_cats = 8)) for v in range(2)]
-        ns = summate(multiply(*ni), num_node_blocks = 2, external_params = BlockScaleSumParams(ch_block_size = 64))
+        ns = summate(multiply(*ni), num_node_blocks = 2, parameterization = BlockScale(ch_block_size = 64))
         root = summate(multiply(ns), num_node_blocks = 1, block_size = 1)
     root.init_parameters(perturbation = 2.0)
     pc = juice.compile(root, verbose = False).to(DEV)
     x = torch.randint(0, 8, (64, 2), device = DEV)
     g = torch.Generator().manual_seed(0)
-    phi = {ns: torch.randn(ns.external_params.tensor_shapes(ns, 64)[0], generator = g).to(DEV)}
+    phi = {ns: torch.randn(ns.parameterization.tensor_shapes(ns, 64)[0], generator = g).to(DEV)}
     ref = _reference(pc, x, monkeypatch, sum_external_params = phi)
     _stale(pc)
     got = _run(pc, x, sum_external_params = phi)
     flags, zero = _plan(pc)
-    gated = [l for l in _sums(pc) if getattr(l, "external_params", None) is not None]
+    gated = [l for l in _sums(pc) if getattr(l, "parameterization", None) is not None]
     assert gated and all(not f for l in gated for f in l.__dict__["_pf_store_flags"].values())
     assert torch.equal(got, ref)
 

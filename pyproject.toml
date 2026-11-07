@@ -55,7 +55,7 @@ readme = {file = "README.md"}
 # Nested kernel packages also need their sources and headers for runtime compilation.
 "pyjuice.layer.kernels.c.input_layers" = ["*.cu"]
 "pyjuice.nodes.distributions.c_kernels" = ["*.cu"]
-"pyjuice.nodes.external_params.kernels.c" = ["*.cu", "*.cuh"]
+"pyjuice.parameterizations.kernels.c" = ["*.cu", "*.cuh"]
 "pyjuice.constraints.inference.dfa_exact.kernels.c" = ["*.cu", "*.cuh"]
 "pyjuice.utils.c" = ["*.cpp"]
 

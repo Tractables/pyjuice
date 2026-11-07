@@ -1,5 +1,5 @@
 // A tied group's parameter flows, deferred to one contraction (`pyjuice.layer.deferred_par`): a regular sum layer's,
-// or a `BlockScaleSumParams` layer's with its gates (`gated`: log phi from the gate table and `ext`; a regular layer's
+// or a `BlockScale` layer's with its gates (`gated`: log phi from the gate table and `ext`; a regular layer's
 // log phi is 0 and the two are unread) -- with fp16 operands: the contraction of the TF32-operand kernels it replaced
 // (fp32 slots, mma m16n8k8 TF32; until 4f535bfd), its operands at half the bytes and its MMAs at twice the rate. The
 // capture and the flush:

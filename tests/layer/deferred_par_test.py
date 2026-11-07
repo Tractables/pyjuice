@@ -7,7 +7,7 @@ slots hold (flushes during the pass); the deferral an accumulation (two backward
 one); what keeps the per-step kernels (a layer callback, an untied HMM, a small group, fp32-level dots); the deferred
 flows against the per-step kernels'; a CUDA graph replaying it to the bit; and a backward that raised leaving nothing --
 to the next backward, nor alive after its circuit.
-The gated layers' copy of these: tests/model/external_params/blockscale_par_deferred_test.py. Skipped where the CUDA
+The gated layers' copy of these: tests/model/parameterizations/blockscale_par_deferred_test.py. Skipped where the CUDA
 kernels cannot build.
 """
 import pytest

@@ -33,7 +33,8 @@ import torch
 
 import pyjuice as juice
 import pyjuice.nodes.distributions as dists
-from pyjuice.nodes import inputs, multiply, summate, BlockScaleSumParams
+from pyjuice.nodes import inputs, multiply, summate
+from pyjuice.parameterizations import BlockScale
 
 
 cuda_only = pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs a GPU")
@@ -66,7 +67,7 @@ def _build(gated = False, seed = 0):
     # the implicit pairing: block j of i0 with block j of i1, which is what makes the root's chosen
     # child index equal to the input node index the frontier reports
     pairs = multiply(i0, i1)
-    kwargs = {"external_params": BlockScaleSumParams(ch_block_size = 1)} if gated else {}
+    kwargs = {"parameterization": BlockScale(ch_block_size = 1)} if gated else {}
     root = summate(pairs, edge_ids = torch.stack([torch.zeros(NUM_LATENTS, dtype = torch.long),
                                                   torch.arange(NUM_LATENTS)]),
                    num_node_blocks = 1, block_size = 1, **kwargs)
@@ -325,8 +326,8 @@ def test_a_group_gate_supplied_per_step_steers_each_draw():
     pc.register_external_params_group("tr", [root])
     batch = 2048
 
-    num_node_gates = root.num_nodes // root.external_params.gate_sizes(root)[0]
-    num_ch_gates = root.num_ch_nodes // root.external_params.gate_sizes(root)[1]
+    num_node_gates = root.num_nodes // root.parameterization.gate_sizes(root)[0]
+    num_ch_gates = root.num_ch_nodes // root.parameterization.gate_sizes(root)[1]
     assert num_ch_gates == NUM_LATENTS, "one gate per child, so a one-hot gate pins the draw"
 
     evidence, tokens, observed = _evidence(pc, batch)
@@ -355,8 +356,8 @@ def test_gates_handed_to_the_conditional_draw_are_ignored():
     pc.register_external_params_group("tr", [root])
     batch = 4096
 
-    num_node_gates = root.num_nodes // root.external_params.gate_sizes(root)[0]
-    num_ch_gates = root.num_ch_nodes // root.external_params.gate_sizes(root)[1]
+    num_node_gates = root.num_nodes // root.parameterization.gate_sizes(root)[0]
+    num_ch_gates = root.num_ch_nodes // root.parameterization.gate_sizes(root)[1]
 
     def one_hot(target):
         g = torch.full([batch, num_node_gates, num_ch_gates], -30.0, device = pc.device)
@@ -410,8 +411,8 @@ def test_a_gated_conditional_draw_matches_the_GATED_posterior():
     pc.register_external_params_group("tr", [root])
     batch = 30_000
 
-    num_node_gates = root.num_nodes // root.external_params.gate_sizes(root)[0]
-    num_ch_gates = root.num_ch_nodes // root.external_params.gate_sizes(root)[1]
+    num_node_gates = root.num_nodes // root.parameterization.gate_sizes(root)[0]
+    num_ch_gates = root.num_ch_nodes // root.parameterization.gate_sizes(root)[1]
     assert num_ch_gates == NUM_LATENTS and num_node_gates == 1
 
     # one soft gate per pattern, so rows sharing a pattern share a posterior
@@ -449,7 +450,7 @@ def test_the_soft_gate_is_not_effectively_one_hot():
     pc.register_external_params_group("tr", [root])
     batch = 4096
 
-    num_ch_gates = root.num_ch_nodes // root.external_params.gate_sizes(root)[1]
+    num_ch_gates = root.num_ch_nodes // root.parameterization.gate_sizes(root)[1]
     torch.manual_seed(11)
     per_pattern = torch.randn([NUM_PATTERNS, num_ch_gates], device = pc.device) * 1.2
     pattern = _pattern_of(batch, pc.device)

@@ -1,5 +1,5 @@
 """
-Ancestral sampling from a `BlockScaleSumParams` sum layer, conditional and unconditional.
+Ancestral sampling from a `BlockScale` sum layer, conditional and unconditional.
 
 **How a draw is made observable.** Every test builds the same shape: two variables, a gated sum node
 over `multiply(i0, i1)`, and a root. The drawn child is read off the sampler's FRONTIER --
@@ -55,7 +55,8 @@ import torch
 
 import pyjuice as juice
 import pyjuice.nodes.distributions as dists
-from pyjuice.nodes import inputs, multiply, summate, BlockScaleSumParams, LowRankSumParams
+from pyjuice.nodes import inputs, multiply, summate
+from pyjuice.parameterizations import BlockScale, LowRank
 from pyjuice.layer.external_sum_layer import ExternalParamsSumLayer
 
 
@@ -83,8 +84,8 @@ def _build(block_size = 4, gate_bs = None, gate_cbs = 2, n_ch_blocks = 4, n_node
         i0 = inputs(0, num_node_blocks = n_ch_blocks, dist = dists.Categorical(num_cats = K))
         i1 = inputs(1, num_node_blocks = n_ch_blocks, dist = dists.Categorical(num_cats = K))
         ns = summate(multiply(i0, i1), num_node_blocks = n_node_blocks, edge_ids = edge_ids,
-                     external_params = BlockScaleSumParams(block_size = gate_bs,
-                                                           ch_block_size = gate_cbs))
+                     parameterization = BlockScale(block_size = gate_bs,
+                                                   ch_block_size = gate_cbs))
         root = summate(multiply(ns), num_node_blocks = 1, block_size = 1)
 
     root.init_parameters(perturbation = 2.0)
@@ -129,8 +130,8 @@ def _gated_layer(pc):
 
 
 def _gate_shape(ns):
-    return ns.num_nodes // ns.external_params.gate_sizes(ns)[0], \
-           ns.num_ch_nodes // ns.external_params.gate_sizes(ns)[1]
+    return ns.num_nodes // ns.parameterization.gate_sizes(ns)[0], \
+           ns.num_ch_nodes // ns.parameterization.gate_sizes(ns)[1]
 
 
 # --------------------------------------------------------------------------------- the oracle
@@ -146,7 +147,7 @@ def _exact_for_node(pc, ns, node_id, log_phi, log_ev = None):
     layer = _gated_layer(pc)
     info = layer.external_node_infos[0]
     bs, cbs = ns.block_size, ns.ch_block_size
-    gate_bs, gate_cbs = ns.external_params.gate_sizes(ns)
+    gate_bs, gate_cbs = ns.parameterization.gate_sizes(ns)
     n_child_gates = cbs // gate_cbs
 
     row = None
@@ -557,7 +558,7 @@ def test_an_ungated_forward_makes_the_following_draw_ungated():
     This used to raise instead: the staged tensors were never dropped, so the draw found an earlier
     forward's gate at an unrelated batch size. Read at a matching batch they would have been in
     bounds and plausible, which is why the mismatch is now made unreachable rather than merely
-    detected. See `tests/model/external_params/external_params_staging_test.py`.
+    detected. See `tests/model/parameterizations/external_params_staging_test.py`.
     """
     pc, ns, _, K = _build(seed = 13)
     Nk, Ck = _gate_shape(ns)
@@ -598,9 +599,9 @@ def test_partial_supply_is_refused():
     with juice.set_block_size(K):
         n = [inputs(v, num_node_blocks = 1, dist = dists.Categorical(num_cats = 4)) for v in range(2)]
         s0 = summate(multiply(n[0], n[1]), num_node_blocks = 1,
-                     external_params = BlockScaleSumParams(ch_block_size = gcbs))
+                     parameterization = BlockScale(ch_block_size = gcbs))
         s1 = summate(multiply(n[0], n[1]), num_node_blocks = 1,
-                     external_params = BlockScaleSumParams(ch_block_size = gcbs))
+                     parameterization = BlockScale(ch_block_size = gcbs))
         root = summate(multiply(s0), multiply(s1), num_node_blocks = 1, block_size = 1)
     root.init_parameters(perturbation = 2.0)
     pc = juice.compile(root, verbose = False).to(dev)
@@ -609,14 +610,14 @@ def test_partial_supply_is_refused():
     if len(layer.external_node_infos) < 2:
         pytest.skip("this build did not place both gated nodes on one layer")
 
-    g1 = torch.randn(s1.external_params.tensor_shapes(s1, 32)[0], device = dev) * 0.5
+    g1 = torch.randn(s1.parameterization.tensor_shapes(s1, 32)[0], device = dev) * 0.5
     with pytest.raises(NotImplementedError, match = "Partial supply"):
         juice.queries.sample(pc, num_samples = 32, sum_external_params = {s1: g1})
 
 
 @cuda_only
 def test_a_parameterization_without_a_sampler_refuses_rather_than_ignoring_its_parameters():
-    """`LowRankSumParams` has no `sample_layer`. Drawing with the shared-parameter kernel would
+    """`LowRank` has no `sample_layer`. Drawing with the shared-parameter kernel would
     ignore the per-sample parameters and quietly return samples from a different distribution, so
     the base class raises instead."""
     dev = torch.device("cuda:0")
@@ -626,13 +627,13 @@ def test_a_parameterization_without_a_sampler_refuses_rather_than_ignoring_its_p
         i0 = inputs(0, num_node_blocks = 2, dist = dists.Categorical(num_cats = 4))
         i1 = inputs(1, num_node_blocks = 2, dist = dists.Categorical(num_cats = 4))
         ns = summate(multiply(i0, i1), num_node_blocks = 1,
-                     external_params = LowRankSumParams(rank = 2))
+                     parameterization = LowRank(rank = 2))
         root = summate(multiply(ns), num_node_blocks = 1, block_size = 1)
     root.init_parameters(perturbation = 2.0)
     pc = juice.compile(root, verbose = False).to(dev)
 
     tensors = tuple(torch.randn(shape, device = dev) * 0.1
-                    for shape in ns.external_params.tensor_shapes(ns, 32))
+                    for shape in ns.parameterization.tensor_shapes(ns, 32))
     with pytest.raises(NotImplementedError, match = "does not implement ancestral sampling"):
         juice.queries.sample(pc, num_samples = 32, sum_external_params = {ns: tensors})
 

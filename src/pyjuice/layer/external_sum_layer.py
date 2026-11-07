@@ -6,7 +6,7 @@ import torch
 import torch.nn as nn
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from pyjuice.nodes import ExternalParamsSumNodes
+from pyjuice.nodes import ParameterizedSumNodes
 from pyjuice.utils import launch_plans
 from pyjuice.utils.launch_plans import LaunchPlans
 from pyjuice.utils.parameter_list import FastParamList
@@ -101,12 +101,12 @@ class StagedExternalParams(dict):
     pass
 
 
-def validate_external_tensors(ns, external_params, tensors: Any, batch_size: int, device,
+def validate_external_tensors(ns, parameterization, tensors: Any, batch_size: int, device,
                               require_contiguous: bool = True) -> Tuple:
     """
     Check externally supplied tensors against the layout the parameterization declares.
 
-    Driven entirely by `external_params.tensor_shapes`, so it holds for any parameterization without
+    Driven entirely by `parameterization.tensor_shapes`, so it holds for any parameterization without
     the layer knowing what the tensors mean.
 
     :param require_contiguous: whether the tensors must already be contiguous. False when they are
@@ -116,12 +116,12 @@ def validate_external_tensors(ns, external_params, tensors: Any, batch_size: int
     """
     # The declared shapes are a function of the node and the batch size: computed once per pair (~1-2 us a call, and
     # every forward and backward validates each node's tensors), cached on the parameterization next to the node.
-    shape_cache = external_params.__dict__.setdefault("_tensor_shapes_cache", {})
+    shape_cache = parameterization.__dict__.setdefault("_tensor_shapes_cache", {})
     hit = shape_cache.get((id(ns), batch_size))
     if hit is not None and hit[0] is ns:
         shapes = hit[1]
     else:
-        shapes = external_params.tensor_shapes(ns, batch_size)
+        shapes = parameterization.tensor_shapes(ns, batch_size)
         if len(shape_cache) >= 256:
             shape_cache.clear()
         shape_cache[(id(ns), batch_size)] = (ns, shapes)
@@ -130,10 +130,10 @@ def validate_external_tensors(ns, external_params, tensors: Any, batch_size: int
         tensors = (tensors,)
 
     assert isinstance(tensors, (tuple, list)), \
-        f"External parameters of `{external_params.get_signature()}` should be given as a tuple of " \
+        f"External parameters of `{parameterization.get_signature()}` should be given as a tuple of " \
         f"{len(shapes)} tensors, got {type(tensors)}."
     assert len(tensors) == len(shapes), \
-        f"`{external_params.get_signature()}` expects {len(shapes)} external tensors, got {len(tensors)}."
+        f"`{parameterization.get_signature()}` expects {len(shapes)} external tensors, got {len(tensors)}."
 
     for idx, (tensor, shape) in enumerate(zip(tensors, shapes)):
         assert torch.is_tensor(tensor), f"External tensor {idx} should be a `torch.Tensor`."
@@ -158,7 +158,7 @@ class ExternalParamsSumLayer(SumLayer):
     `nids` / `cids` / `pids` and the shared-parameter kernels are exactly those of a standard sum
     layer. What this class adds is the translation between the compiled layout and the caller's
     per-`ns` layout (:class:`ExternalNodeInfo`), and the hooks that hand control to the node's
-    :class:`~pyjuice.nodes.external_params.ExternalSumParams` descriptor at the three points where an
+    :class:`~pyjuice.parameterizations.SumParameterization` descriptor at the three points where an
     external parameterization has to act:
 
     * after the shared forward, to turn the shared-parameter node values into the effective ones;
@@ -179,13 +179,13 @@ class ExternalParamsSumLayer(SumLayer):
     a plain `SumLayer`: the hooks are skipped entirely.
     """
 
-    def __init__(self, nodes: Sequence[ExternalParamsSumNodes], *args, **kwargs) -> None:
+    def __init__(self, nodes: Sequence[ParameterizedSumNodes], *args, **kwargs) -> None:
 
         super(ExternalParamsSumLayer, self).__init__(nodes, *args, **kwargs)
 
         for ns in self.nodes:
-            assert isinstance(ns, ExternalParamsSumNodes), \
-                f"`ExternalParamsSumLayer` only accepts `ExternalParamsSumNodes`, got {type(ns)}."
+            assert isinstance(ns, ParameterizedSumNodes), \
+                f"`ExternalParamsSumLayer` only accepts `ParameterizedSumNodes`, got {type(ns)}."
 
         signatures = set([ns.get_external_signature() for ns in self.nodes])
         assert len(signatures) == 1, \
@@ -193,7 +193,7 @@ class ExternalParamsSumLayer(SumLayer):
 
         # One descriptor governs the whole layer. It is stateless configuration, and the signature it
         # is grouped by covers everything the kernels specialize on, so any node's descriptor will do.
-        self.external_params = self.nodes[0].external_params
+        self.parameterization = self.nodes[0].parameterization
         self.external_signature = signatures.pop()
 
         self._compile_external_node_info()
@@ -201,31 +201,31 @@ class ExternalParamsSumLayer(SumLayer):
         # Compile-time preparation specific to the parameterization. It registers whatever tensors its
         # kernels need through `register_external_buffers` / `register_external_buffer`, so they are
         # owned and moved by this layer rather than by the (shared, stateless) descriptor.
-        self.external_params.compile(self)
+        self.parameterization.compile(self)
 
     @property
     def requests_denom_param_flows(self) -> bool:
         """Delegated to the descriptor: a gated M-step may need the denominator flow `F-`."""
-        return self.external_params.requests_denom_param_flows
+        return self.parameterization.requests_denom_param_flows
 
     @property
     def cuda_graph_safe(self) -> bool:
         """Delegated to the descriptor: only a parameterization that declares it is captured."""
-        return self.external_params.cuda_graph_safe
+        return self.parameterization.cuda_graph_safe
 
     def cuda_graph_state(self):
         """Delegated to the descriptor, which owns what its forward hands to its backward."""
-        return self.external_params.cuda_graph_state(self)
+        return self.parameterization.cuda_graph_state(self)
 
     def restore_cuda_graph_state(self, state) -> None:
-        self.external_params.restore_cuda_graph_state(self, state)
+        self.parameterization.restore_cuda_graph_state(self, state)
 
     def _drop_device_caches(self) -> None:
         """The sum layer's own, and every parameterization's of the layer's node groups."""
         super()._drop_device_caches()
         for name in ("_bk_stream_parts_g", "_bk_par_deferred_g", "_bk_fusion_ready_g"):
             self.__dict__.pop(name, None)
-        for params in {id(ns.external_params): ns.external_params for ns in self.nodes}.values():
+        for params in {id(ns.parameterization): ns.parameterization for ns in self.nodes}.values():
             params.drop_device_caches(self)
 
     def assign_denom_flow_offsets(self, base: int) -> int:
@@ -236,11 +236,11 @@ class ExternalParamsSumLayer(SumLayer):
         Called once at compile time by the PC, which lays the layers out end to end so the whole
         denominator is ONE flat tensor -- that is what lets `init_param_flows` scale it and
         `sync_param_flows` all-reduce it with a single op, exactly as for `param_flows`. The sizes come
-        from the descriptor (:func:`ExternalSumParams.denom_flow_sizes`), which owns the layout inside
+        from the descriptor (:func:`SumParameterization.denom_flow_sizes`), which owns the layout inside
         each slice; the layer only owns where the slices sit. Leaves `self.denom_flow_slices` --
         `(offset, size)` per forward partition -- for the descriptor's kernels to slice with.
         """
-        sizes = list(self.external_params.denom_flow_sizes(self))
+        sizes = list(self.parameterization.denom_flow_sizes(self))
         assert len(sizes) == self.num_fw_partitions, \
             f"`denom_flow_sizes` returned {len(sizes)} sizes for {self.num_fw_partitions} forward " \
             f"partitions of {self}."
@@ -372,7 +372,7 @@ class ExternalParamsSumLayer(SumLayer):
         self.ext_slots, self.ext_max_n_eblks, self.ext_unit_bases = None, None, None
 
         for ns in self.nodes:
-            if any([shape[-1] != 1 for shape in ns.external_params.storage_shapes(ns, 1)]):
+            if any([shape[-1] != 1 for shape in ns.parameterization.storage_shapes(ns, 1)]):
                 return None
 
         # Per-batch base of every node's storage slots, in the staging buffer's node order. Taking the
@@ -385,14 +385,14 @@ class ExternalParamsSumLayer(SumLayer):
         # be holding there -- correct-looking whenever a previous run had left the same factors behind.
         unit_base, ns2unit, owner2unit = 0, dict(), dict()
         for ns in self.nodes:
-            owner = ns.external_params.storage_owner(ns)
+            owner = ns.parameterization.storage_owner(ns)
 
             if owner in owner2unit:
                 ns2unit[ns] = owner2unit[owner]
                 continue
 
             slots = []
-            for shape in ns.external_params.storage_shapes(ns, 1):
+            for shape in ns.parameterization.storage_shapes(ns, 1):
                 slots.append(unit_base)
                 unit_base += int(torch.tensor(shape).prod())
 
@@ -409,8 +409,8 @@ class ExternalParamsSumLayer(SumLayer):
 
         # NOT `n_slots`: that name is taken below for the child-block count within `cids`, and shadowing
         # it here silently truncated the table list.
-        n_ext_slots = len(self.nodes[0].external_params.storage_shapes(self.nodes[0], 1))
-        assert all(len(ns.external_params.storage_shapes(ns, 1)) == n_ext_slots for ns in self.nodes), \
+        n_ext_slots = len(self.nodes[0].parameterization.storage_shapes(self.nodes[0], 1))
+        assert all(len(ns.parameterization.storage_shapes(ns, 1)) == n_ext_slots for ns in self.nodes), \
             "All nodes of a layer must declare the same number of external storage slots."
 
         tables = [[] for _ in range(n_ext_slots)]
@@ -467,11 +467,11 @@ class ExternalParamsSumLayer(SumLayer):
                 # something OTHER than one contiguous entry per edge block -- a dense grid indexed by
                 # (node block, child block), say -- supplies its own map, which is what keeps staging a
                 # permute instead of a gather.
-                offsets = ns.external_params.storage_offsets(ns)
+                offsets = ns.parameterization.storage_offsets(ns)
                 for slot in range(n_ext_slots):
                     off = offsets[slot].cpu()[eblks] if offsets is not None else None
                     if off is None:
-                        shape = ns.external_params.storage_shapes(ns, 1)[slot]
+                        shape = ns.parameterization.storage_shapes(ns, 1)[slot]
                         stride = 1
                         for d in shape[1:-1]:
                             stride *= int(d)
@@ -502,7 +502,7 @@ class ExternalParamsSumLayer(SumLayer):
                 FastParamList([nn.Parameter(tensor.contiguous(), requires_grad = False) for tensor in tensors]))
 
     @property
-    def external_nodes(self) -> List[ExternalParamsSumNodes]:
+    def external_nodes(self) -> List[ParameterizedSumNodes]:
         """
         The nodes of this layer that take external parameters, i.e. all of them.
         """
@@ -536,7 +536,7 @@ class ExternalParamsSumLayer(SumLayer):
                 continue
 
             if not pre_validated:
-                tensors = validate_external_tensors(ns_info.ns, self.external_params, tensors,
+                tensors = validate_external_tensors(ns_info.ns, self.parameterization, tensors,
                                                     batch_size, device)
 
             resolved.append((ns_info, tensors))
@@ -564,7 +564,7 @@ class ExternalParamsSumLayer(SumLayer):
         if isinstance(ns2grads, StagedExternalParams):
             return grad_tensors
 
-        return validate_external_tensors(ns_info.ns, self.external_params, grad_tensors, batch_size, device)
+        return validate_external_tensors(ns_info.ns, self.parameterization, grad_tensors, batch_size, device)
 
     def _assert_supported(self, propagation_alg: str, is_backward: bool, **kwargs) -> None:
         """
@@ -595,7 +595,7 @@ class ExternalParamsSumLayer(SumLayer):
         descriptor then turns the values it wrote into the effective ones. Whole partitions only (no
         `partition_runs`): the descriptors' passes cover every node of the layer. `op_params`: the circuit's bf16
         copy of shared fp32 parameters (`SumLayer.forward`), for the standard forward and for a descriptor that takes
-        it (`ExternalSumParams.reads_param_operands`).
+        it (`SumParameterization.reads_param_operands`).
         """
 
         if kwargs.get("partition_runs") is not None:
@@ -607,15 +607,15 @@ class ExternalParamsSumLayer(SumLayer):
         # values itself and takes them (`fuses_stream_children`), else its values formed here for what reads them
         sc = kwargs.pop("stream_children", None)
         gated = len(ns_tensors) > 0
-        takes = gated and self.external_params.replaces_shared_forward and \
-            getattr(self.external_params, "fuses_stream_children", False)
+        takes = gated and self.parameterization.replaces_shared_forward and \
+            getattr(self.parameterization, "fuses_stream_children", False)
         if sc is not None and gated and not takes:
             form_elements(element_mars, node_mars, sc)
 
         # Some parameterizations compute the node values themselves, in which case the standard forward
         # would be redundant work whose result is thrown away. It still has to run when nothing was
         # supplied for this layer, since then the layer IS a plain sum layer.
-        if not gated or not self.external_params.replaces_shared_forward:
+        if not gated or not self.parameterization.replaces_shared_forward:
             super(ExternalParamsSumLayer, self).forward(
                 node_mars, element_mars, params, propagation_alg = propagation_alg, op_params = op_params,
                 **(dict(kwargs, stream_children = sc) if sc is not None and not gated else kwargs)
@@ -626,11 +626,11 @@ class ExternalParamsSumLayer(SumLayer):
 
         self._assert_supported(propagation_alg, is_backward = False, **kwargs)
 
-        if op_params is not None and self.external_params.reads_param_operands:
+        if op_params is not None and self.parameterization.reads_param_operands:
             kwargs = dict(kwargs, op_params = op_params)
         if takes and sc is not None:
             kwargs = dict(kwargs, stream_children = sc)
-        self.external_params.forward_layer(
+        self.parameterization.forward_layer(
             self, ns_tensors, node_mars, element_mars, params,
             propagation_alg = propagation_alg, **kwargs
         )
@@ -642,7 +642,7 @@ class ExternalParamsSumLayer(SumLayer):
         the parameterization's, where it forms the node values with the product fused (`stream_fusion_plan`, a gated
         call), else the plain layer's (a call supplying nothing for this layer) -- None where neither applies. What the
         circuit's decision asks (`TensorCircuit._stream_fusion_groups`); a call without one forms the values itself."""
-        fn = getattr(self.external_params, "stream_fusion_plan", None)
+        fn = getattr(self.parameterization, "stream_fusion_plan", None)
         plan = None if fn is None else fn(self, fast_key, children)
         return plan if plan is not None else SumLayer._stream_fusion(self, fast_key, children)
 
@@ -657,7 +657,7 @@ class ExternalParamsSumLayer(SumLayer):
         add the external contribution to the child flows and write the per-sample gradients. Whole
         partitions only, as the forward. `op_params`: as `SumLayer.backward`'s -- the element kernels whose products
         are bf16 read it, the descriptor's among them (`SumLayer._bk_copy`), for a descriptor that takes it
-        (`ExternalSumParams.reads_param_operands`).
+        (`SumParameterization.reads_param_operands`).
         """
 
         if kwargs.get("partition_runs") is not None:
@@ -689,8 +689,8 @@ class ExternalParamsSumLayer(SumLayer):
         # backward as without the tables, and the element flows written as the children's node flows after. Set
         # before this layer's plan is looked up: its launchers read it (`_bk_stream_children`)
         fallback = None
-        if sc is not None and not (getattr(self.external_params, "fuses_stream_children", False) and self._bk_fusion_ready(
-                node_flows.size(1), params.dtype, op_params is not None and self.external_params.reads_param_operands
+        if sc is not None and not (getattr(self.parameterization, "fuses_stream_children", False) and self._bk_fusion_ready(
+                node_flows.size(1), params.dtype, op_params is not None and self.parameterization.reads_param_operands
                 and self.__dict__.get("_reads_param_operands", False), param_flows is not None)):
             form_elements(element_mars, node_mars, sc)
             fallback, sc = sc, None
@@ -698,7 +698,7 @@ class ExternalParamsSumLayer(SumLayer):
 
         # The copy this call's element flows may read, set before this layer's plan is looked up: its element
         # launchers read it (`SumLayer._bk_copy`), replayed with `params`
-        if not self.external_params.reads_param_operands:
+        if not self.parameterization.reads_param_operands:
             op_params = None
         op = op_params if op_params is not None and self.__dict__.get("_reads_param_operands", False) else None
         self.__dict__["_bk_op_params"] = op
@@ -719,7 +719,7 @@ class ExternalParamsSumLayer(SumLayer):
         deferred_par.join_side(node_mars.device)
 
         # A launch plan of the rest (`pyjuice.utils.launch_plans`) where the parameterization keeps one
-        # (`ExternalSumParams.backward_plan`): the two hooks and the standard backward between them are host work
+        # (`SumParameterization.backward_plan`): the two hooks and the standard backward between them are host work
         # around a few launches -- MEASURED (a tied gated HMM-2048 x4, B 64, bf16) 52 us a layer. The checks above
         # run every call. Recorded under the parameterization's tag, its sites reached from the standard backward's
         # converted ones -- which records itself as usual, inside, and fails this recording if it comes out short.
@@ -739,10 +739,10 @@ class ExternalParamsSumLayer(SumLayer):
         elif LaunchPlans.nested():
             LaunchPlans.fail()                     # (a recording around this call cannot capture what it launches)
 
-        with (LaunchPlans.record(self.external_params.BACKWARD_PLAN_TAG) if pkey is not None
+        with (LaunchPlans.record(self.parameterization.BACKWARD_PLAN_TAG) if pkey is not None
               else contextlib.nullcontext()) as rec:
             try:
-                self.external_params.pre_backward_layer(
+                self.parameterization.pre_backward_layer(
                     self, ns_tensors, node_flows, element_flows, node_mars, element_mars, params,
                     param_flows = param_flows, propagation_alg = propagation_alg, **kwargs
                 )
@@ -750,14 +750,14 @@ class ExternalParamsSumLayer(SumLayer):
                 # Shared-parameter flows -- the standard kernels, untouched. Skipped entirely when the
                 # parameterization owns the flows: its effective parameters vary per edge block, and the
                 # standard kernels would sum the parents together before any correction could separate them.
-                if not self.external_params.replaces_shared_backward:
+                if not self.parameterization.replaces_shared_backward:
                     super(ExternalParamsSumLayer, self).backward(
                         node_flows, element_flows, node_mars, element_mars, params,
                         param_flows = param_flows, propagation_alg = propagation_alg, op_params = op,
                         **(dict(kwargs, stream_children = sc) if sc is not None else kwargs)
                     )
 
-                self.external_params.post_backward_layer(
+                self.parameterization.post_backward_layer(
                     self, ns_tensors, ns_grad_tensors,
                     node_flows, element_flows, node_mars, element_mars, params,
                     param_flows = param_flows, denom_param_flows = denom_param_flows,
@@ -782,19 +782,19 @@ class ExternalParamsSumLayer(SumLayer):
     def _accumulate_ungated_denom(self, node_flows: torch.Tensor, denom_param_flows: torch.Tensor,
                                   logspace_flows: bool) -> None:
         """The denominator flow of a backward that supplied nothing for this layer (see `backward`), through
-        :func:`ExternalSumParams.accumulate_denom_top_down`: it takes a value per node of the circuit, here the
+        :func:`SumParameterization.accumulate_denom_top_down`: it takes a value per node of the circuit, here the
         layer's node flows summed over the batch."""
         sid, eid = self._layer_nid_range
         flows = node_flows[sid:eid]
         per_node = torch.zeros(node_flows.size(0), dtype = torch.float32, device = node_flows.device)
         per_node[sid:eid] = (flows.exp() if logspace_flows else flows).sum(dim = 1)
-        self.external_params.accumulate_denom_top_down(self, per_node, denom_param_flows, 1.0)
+        self.parameterization.accumulate_denom_top_down(self, per_node, denom_param_flows, 1.0)
 
     def _bk_fusion_ready(self, batch_size: int, dtype: torch.dtype, op: bool, param_flows: bool) -> bool:
         """`SumLayer._bk_fusion_ready`, a gated call's by the parameterization's records (`_stream_fusion_bk`)."""
         if not self.__dict__.get("_bk_gated_call", False):
             return super()._bk_fusion_ready(batch_size, dtype, op, param_flows)
-        if getattr(self.external_params, "stream_fusion_bk", None) is not None:   # (its own answer, asked every call)
+        if getattr(self.parameterization, "stream_fusion_bk", None) is not None:   # (its own answer, asked every call)
             return self._stream_fusion_bk(batch_size, dtype, op, param_flows)
         memo = self.__dict__.setdefault("_bk_fusion_ready_g", {})
         key = (batch_size, dtype, op, param_flows)
@@ -805,14 +805,14 @@ class ExternalParamsSumLayer(SumLayer):
 
     def _stream_fusion_bk(self, batch_size: int, dtype: torch.dtype, op: bool, param_flows: bool) -> bool:
         """`SumLayer._stream_fusion_bk` for this layer's last kind of call: a gated one's by its parameterization --
-        what it answers itself where it makes the backward's flows (`ExternalSumParams.stream_fusion_bk`), else the
+        what it answers itself where it makes the backward's flows (`SumParameterization.stream_fusion_bk`), else the
         records its backward keeps of the standard kernels (`_bk_stream_parts_g`: its element flows on the split
         kernel; with parameter flows `_bk_par_deferred_g`, deferred) --, the plain one's by the standard backward's."""
         if not self.__dict__.get("_bk_gated_call", False):
             return super()._stream_fusion_bk(batch_size, dtype, op, param_flows)
-        if not getattr(self.external_params, "fuses_stream_children", False):
+        if not getattr(self.parameterization, "fuses_stream_children", False):
             return False
-        own = getattr(self.external_params, "stream_fusion_bk", None)
+        own = getattr(self.parameterization, "stream_fusion_bk", None)
         if own is not None:
             return bool(own(self, batch_size, dtype, op, param_flows))
         parts = self.__dict__.get("_bk_stream_parts_g", {}).get((batch_size, dtype, op))
@@ -833,14 +833,14 @@ class ExternalParamsSumLayer(SumLayer):
         `(key, launchers expected)` of this call's backward plan, or `(None, 0)`: not planned. The layer's part of the
         key -- what the standard backward decides from, as its own plans take it (`SumLayer.backward`: the batch,
         device, dtypes and flags by value, the other arguments by name), in the regime they plan -- and the
-        parameterization's (`ExternalSumParams.backward_plan`), where it plans this call.
+        parameterization's (`SumParameterization.backward_plan`), where it plans this call.
         """
         if (not launch_plans.ENABLED or kwargs.get("compute_children") is not None
                 or kwargs.get("allow_modify_flows", False) or kwargs.get("pflow_temperature", 1.0) != 1.0
                 or kwargs.get("temper_eflow", False) or "force_use_bf16" in kwargs or "force_use_fp32" in kwargs):
             return None, 0
-        own = self.external_params.backward_plan(self, ns_tensors, ns_grad_tensors, node_mars, param_flows,
-                                                 denom_param_flows, kwargs)
+        own = self.parameterization.backward_plan(self, ns_tensors, ns_grad_tensors, node_mars, param_flows,
+                                                  denom_param_flows, kwargs)
         if own is None:
             return None, 0
         key = ("external_backward", own[0], node_flows.size(1), node_flows.device, node_flows.dtype, params.dtype,
@@ -860,7 +860,7 @@ class ExternalParamsSumLayer(SumLayer):
         validation for already-staged views, which is exactly the case this can arise in.
         """
         for ns_info, tensors in ns_tensors:
-            shapes = self.external_params.storage_shapes(ns_info.ns, num_samples)
+            shapes = self.parameterization.storage_shapes(ns_info.ns, num_samples)
             for tensor, shape in zip(tensors, shapes):
                 if tuple(tensor.size()) == tuple(shape):
                     continue
@@ -897,7 +897,7 @@ class ExternalParamsSumLayer(SumLayer):
             return False
 
         self._check_staged_batch(ns_tensors, node_samples.size(1))
-        self.external_params.sample_layer(
+        self.parameterization.sample_layer(
             self, ns_tensors, node_mars, element_mars, params, node_samples, element_samples,
             rows, erows, seed_ptr, conditional = conditional, **kwargs
         )
@@ -931,7 +931,7 @@ class ExternalParamsSumLayer(SumLayer):
 
         self._check_staged_batch(ns_tensors, num_samples)
 
-        self.external_params.sample_layer_pairs(
+        self.parameterization.sample_layer_pairs(
             self, ns_tensors, node_mars, element_mars, params, node_samples, element_samples,
             ind_target, ind_n, ind_b, conditional = conditional,
             rnd = rnd, rnd_offset = rnd_offset, **kwargs
@@ -942,4 +942,4 @@ class ExternalParamsSumLayer(SumLayer):
     def __repr__(self):
         return f"ExternalParamsSumLayer(nid_range=({self._layer_nid_range[0]}, {self._layer_nid_range[1]}), " \
                f"num_nodes={self.num_nodes}, num_edges={self.num_edges}, " \
-               f"external_params={self.external_signature})"
+               f"parameterization={self.external_signature})"

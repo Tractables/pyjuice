@@ -159,7 +159,7 @@ class TensorCircuit(_BuildMixin, _CudaGraphsMixin, _ExternalParamsMixin, _Learni
         self.node_flows = None
         self.element_flows = None
         self.param_flows = None
-        # Denominator flow buffer (see `ExternalSumParams.requests_denom_param_flows`): a second
+        # Denominator flow buffer (see `SumParameterization.requests_denom_param_flows`): a second
         # accumulator, allocated only when some layer requests it. `None` on an ordinary PC, which then
         # pays nothing. Its LAYOUT belongs to the requesting parameterization -- it is NOT a
         # `param_flows` mirror and is not addressed by `pfids` -- so the PC only owns the flat tensor
@@ -358,7 +358,7 @@ class TensorCircuit(_BuildMixin, _CudaGraphsMixin, _ExternalParamsMixin, _Learni
     def _param_operand_plan(self) -> tuple:
         """``(groups, ranges)``: the inner sum layer groups whose every layer reads only parameters that several sum
         nodes share (a tied node's source and its copies) and is a plain sum layer or an external-parameter one whose
-        parameterization takes the copy (`ExternalSumParams.reads_param_operands`), at offsets the bf16 kernels' 16-byte
+        parameterization takes the copy (`SumParameterization.reads_param_operands`), at offsets the bf16 kernels' 16-byte
         loads can take, each such layer marked (`SumLayer._reads_param_operands`), and those parameters' ranges -- what
         `_param_operands` copies. Shared ranges only: there one copy serves every layer that reads them, while an unshared
         parameter would be copied (6 bytes) for one read (4). Built once, from the structure, with each group's size for
@@ -390,7 +390,7 @@ class TensorCircuit(_BuildMixin, _CudaGraphsMixin, _ExternalParamsMixin, _Learni
             marked = []
             for layer in group:
                 takes = type(layer) is SumLayer or (isinstance(layer, ExternalParamsSumLayer)
-                                                   and layer.external_params.reads_param_operands)
+                                                   and layer.parameterization.reads_param_operands)
                 srcs = [source(ns) for ns in layer.nodes] if takes else None
                 ok = srcs is not None and all(readers.get(s, 0) >= 2 for s in srcs) and aligned(layer)
                 layer.__dict__["_reads_param_operands"] = ok
@@ -402,7 +402,7 @@ class TensorCircuit(_BuildMixin, _CudaGraphsMixin, _ExternalParamsMixin, _Learni
                 # (the parameters its layers read a sample -- their mean -- and the least its parameterizations
                 # take the copy from: `_param_operand_groups`)
                 sizes[id(group)] = (sum(layer.num_edges for layer in group) / len(group),
-                                    max(getattr(getattr(layer, "external_params", None), "param_operands_min_edges", 0)
+                                    max(getattr(getattr(layer, "parameterization", None), "param_operands_min_edges", 0)
                                         for layer in group))
         self.__dict__["_param_operand_sizes_"] = sizes
         plan = self.__dict__["_param_operand_plan_"] = (frozenset(id(g) for g in groups), tuple(sorted(ranges)))
@@ -417,7 +417,7 @@ class TensorCircuit(_BuildMixin, _CudaGraphsMixin, _ExternalParamsMixin, _Learni
         where it applies; none: no copy made): those whose layers read enough parameters for the batch to make them
         GPU-bound -- the parameters such a layer reads a sample (their mean over the group) times the batch at least
         `_COPY_MIN_WORK` -- and at least what their parameterizations take it from
-        (`ExternalSumParams.param_operands_min_edges`). The kernels reading the copy are faster, but it costs host time
+        (`SumParameterization.param_operands_min_edges`). The kernels reading the copy are faster, but it costs host time
         (made by every forward, handed through the layers), which a host-bound step pays in full while the GPU's
         savings hide behind the host; a layer's GPU time grows with that work, its host time does not. A rule, not a
         measurement of the caller's steps: every pass at a batch size computes with the same kernels -- the stream
@@ -505,7 +505,7 @@ class TensorCircuit(_BuildMixin, _CudaGraphsMixin, _ExternalParamsMixin, _Learni
         for k in range(len(groups) - 1):
             prod, sumg = groups[k], groups[k + 1]
             if not (prod.is_prod() and sumg.is_sum() and all(
-                    type(layer) is SumLayer or getattr(getattr(layer, "external_params", None), "fuses_stream_children",
+                    type(layer) is SumLayer or getattr(getattr(layer, "parameterization", None), "fuses_stream_children",
                                                        False) for layer in sumg)):
                 continue
             opts = dict(sum_opts, op_params = op) if (op is not None and id(sumg) in op_groups) else sum_opts
@@ -578,7 +578,7 @@ class TensorCircuit(_BuildMixin, _CudaGraphsMixin, _ExternalParamsMixin, _Learni
         for k in range(len(groups) - 1):
             prod, sumg = groups[k], groups[k + 1]
             if not (prod.is_prod() and sumg.is_sum() and all(
-                    type(layer) is SumLayer or getattr(getattr(layer, "external_params", None), "fuses_stream_children",
+                    type(layer) is SumLayer or getattr(getattr(layer, "parameterization", None), "fuses_stream_children",
                                                        False) for layer in sumg)):
                 continue
             table = tables[k]

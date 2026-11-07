@@ -2,6 +2,7 @@ import pyjuice.graph
 import pyjuice.nodes
 import pyjuice.distributions
 import pyjuice.layer
+import pyjuice.parameterizations
 import pyjuice.structures
 import pyjuice.optim
 import pyjuice.transformations

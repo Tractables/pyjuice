@@ -50,9 +50,9 @@ def _gates(pc, B, seed = 0):
     g = torch.Generator().manual_seed(seed)
     out = {}
     for ns in pc.external_params_nodes:
-        owner = ns.external_params.storage_owner(ns)
+        owner = ns.parameterization.storage_owner(ns)
         if owner not in out:
-            out[owner] = (torch.randn(ns.external_params.tensor_shapes(owner, B)[0], generator = g) * 2.0).to(DEV)
+            out[owner] = (torch.randn(ns.parameterization.tensor_shapes(owner, B)[0], generator = g) * 2.0).to(DEV)
     return out
 
 

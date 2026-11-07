@@ -4,7 +4,7 @@
 //
 //     element_flows[m, b] = emars[m, b] + log sum_e params[m, e] exp(lf[e, b]),   lf = node_flows - node_mars
 //
-// The regular copy of the BlockScale element stream (nodes/external_params/kernels/c/blockscale_ele_backward_stream.cu),
+// The regular copy of the BlockScale element stream (parameterizations/kernels/c/blockscale_ele_backward_stream.cu),
 // without gates, gradients and pieces. The other kernels walk an element block's parent tiles serially under a
 // stabilizer each, merging tile by tile. Here:
 //   pre-pass  per (group, split, PB columns): an element block's parents are cut into `split` contiguous ranges of

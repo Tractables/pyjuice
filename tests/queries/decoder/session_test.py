@@ -24,7 +24,8 @@ import pyjuice.nodes.distributions as dists
 import pyjuice.queries.decoder.session as session
 from pyjuice.layer import InputLayer, SumLayer
 from pyjuice.layer.kernels import autotune
-from pyjuice.nodes import inputs, multiply, summate, BlockScaleSumParams, LowRankSumParams
+from pyjuice.nodes import inputs, multiply, summate
+from pyjuice.parameterizations import BlockScale, LowRank
 
 
 cuda_only = pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs a GPU")
@@ -41,9 +42,9 @@ def _chain(dist_fn, V, num_latents, block_size, external = None):
             emit = inputs(t, num_node_blocks = num_latents // block_size, dist = dist_fn())
             ext = dict()
             if external == "blockscale":
-                ext = dict(external_params = BlockScaleSumParams(ch_block_size = block_size))
+                ext = dict(parameterization = BlockScale(ch_block_size = block_size))
             elif external == "lowrank":
-                ext = dict(external_params = LowRankSumParams(rank = 4))
+                ext = dict(parameterization = LowRank(rank = 4))
             chain = summate(multiply(chain, emit), num_node_blocks = num_latents // block_size, **ext)
             transitions.append(chain)
         root = summate(multiply(chain), num_node_blocks = 1, block_size = 1)
@@ -93,7 +94,7 @@ def _model(kind):
     g = torch.Generator(device = DEV).manual_seed(2)
     params = dict()
     for ns in transitions:
-        shapes = ns.external_params.tensor_shapes(ns, 16)
+        shapes = ns.parameterization.tensor_shapes(ns, 16)
         tensors = tuple(torch.randn(s, device = DEV, generator = g) * 0.5 - 0.5 for s in shapes)
         params[ns] = tensors if len(tensors) > 1 else tensors[0]
     return pc, 5, 16, dict(sum_external_params = params), False

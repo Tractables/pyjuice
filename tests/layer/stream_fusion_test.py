@@ -236,7 +236,8 @@ def test_no_fusion_for_a_pass_of_another_regime(fused_preferred):
 def _gated_hmm(T = 5, L = 4096, C = 16):
     """A tied chain of BlockScale-gated sum layers (an HMM's transitions, node blocks of 1024, gates of 32) and its gated
     nodes, bf16 parameters."""
-    from pyjuice.nodes import inputs, multiply, summate, BlockScaleSumParams
+    from pyjuice.nodes import inputs, multiply, summate
+    from pyjuice.parameterizations import BlockScale
     torch.manual_seed(0)
     nodes = []
     with juice.set_block_size(1024):
@@ -246,7 +247,7 @@ def _gated_hmm(T = 5, L = 4096, C = 16):
             emit = inputs(t, num_node_blocks = L // 1024, dist = dists.Categorical(num_cats = C))
             if first is None:
                 chain = first = summate(multiply(chain, emit), num_node_blocks = L // 1024,
-                                        external_params = BlockScaleSumParams(ch_block_size = 32))
+                                        parameterization = BlockScale(ch_block_size = 32))
             else:
                 chain = first.duplicate(multiply(chain, emit), tie_params = True)
             nodes.append(chain)
@@ -277,7 +278,7 @@ def test_gated_layers_fused_compute_the_unfused_bits(fused_preferred, split_forw
     (pc, nodes), (pc2, nodes2) = _gated_hmm(), _gated_hmm()
     _unfused(pc2)
     g = torch.Generator().manual_seed(2)
-    gates = [torch.randn(n.external_params.tensor_shapes(n, B)[0], generator = g).to(DEV) * 0.5 - 0.5 for n in nodes]
+    gates = [torch.randn(n.parameterization.tensor_shapes(n, B)[0], generator = g).to(DEV) * 0.5 - 0.5 for n in nodes]
     x = torch.randint(0, C, (B, T), device = DEV)
     with torch.no_grad():
         for _ in range(3):
@@ -303,7 +304,7 @@ def test_gated_training_steps_fused_compute_the_unfused_bits(fused_preferred, sp
     (pc, nodes), (pc2, nodes2) = _gated_hmm(), _gated_hmm()
     _unfused(pc2)
     g = torch.Generator().manual_seed(2)
-    gates = [torch.randn(n.external_params.tensor_shapes(n, B)[0], generator = g).to(DEV) * 0.5 - 0.5 for n in nodes]
+    gates = [torch.randn(n.parameterization.tensor_shapes(n, B)[0], generator = g).to(DEV) * 0.5 - 0.5 for n in nodes]
     x = torch.randint(0, C, (B, T), device = DEV)
     for step in range(4):
         with torch.no_grad():
@@ -355,7 +356,7 @@ def test_gated_backward_off_the_split_kernel_fuses_nothing(fused_preferred, monk
     (pc, nodes), (pc2, nodes2) = _gated_hmm(), _gated_hmm()
     _unfused(pc2)
     g = torch.Generator().manual_seed(2)
-    gates = [torch.randn(n.external_params.tensor_shapes(n, B)[0], generator = g).to(DEV) * 0.5 - 0.5 for n in nodes]
+    gates = [torch.randn(n.parameterization.tensor_shapes(n, B)[0], generator = g).to(DEV) * 0.5 - 0.5 for n in nodes]
     x = torch.randint(0, C, (B, T), device = DEV)
     _gated_steps(pc, nodes, gates, x, 3, B)
     _gated_steps(pc2, nodes2, gates, x, 3, B)
@@ -375,7 +376,7 @@ def test_gated_fused_backward_whose_deferral_declines_computes_the_unfused_bits(
     (pc, nodes), (pc2, nodes2) = _gated_hmm(), _gated_hmm()
     _unfused(pc2)
     g = torch.Generator().manual_seed(2)
-    gates = [torch.randn(n.external_params.tensor_shapes(n, B)[0], generator = g).to(DEV) * 0.5 - 0.5 for n in nodes]
+    gates = [torch.randn(n.parameterization.tensor_shapes(n, B)[0], generator = g).to(DEV) * 0.5 - 0.5 for n in nodes]
     x = torch.randint(0, C, (B, T), device = DEV)
     _gated_steps(pc, nodes, gates, x, 2, B)
     _gated_steps(pc2, nodes2, gates, x, 2, B)

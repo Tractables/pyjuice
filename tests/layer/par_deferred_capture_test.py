@@ -316,7 +316,8 @@ def _mixed_hmm(T = 6, gated_steps = 3, B = 128):
     -- which that layer's backward shifts by log Z."""
     import pyjuice as juice
     import pyjuice.nodes.distributions as dists
-    from pyjuice.nodes import inputs, multiply, summate, BlockScaleSumParams
+    from pyjuice.nodes import inputs, multiply, summate
+    from pyjuice.parameterizations import BlockScale
     torch.manual_seed(0)
     gated, esrc, gsrc, rsrc = [], None, None, None
     with juice.set_block_size(1024):
@@ -330,7 +331,7 @@ def _mixed_hmm(T = 6, gated_steps = 3, B = 128):
             if t <= gated_steps:
                 if gsrc is None:
                     ns = gsrc = summate(prod, num_node_blocks = 4,
-                                        external_params = BlockScaleSumParams(ch_block_size = 32))
+                                        parameterization = BlockScale(ch_block_size = 32))
                 else:
                     ns = gsrc.duplicate(prod, tie_params = True)
                 gated.append(ns)
@@ -341,7 +342,7 @@ def _mixed_hmm(T = 6, gated_steps = 3, B = 128):
         root = summate(multiply(ns), num_node_blocks = 1, block_size = 1)
     root.init_parameters(perturbation = 2.0)
     pc = juice.compile(root, verbose = False, param_dtype = torch.bfloat16).to(DEV)
-    phi = {n: torch.randn(n.external_params.tensor_shapes(n, B)[0], device = DEV) for n in gated}
+    phi = {n: torch.randn(n.parameterization.tensor_shapes(n, B)[0], device = DEV) for n in gated}
     return pc, phi, torch.randint(0, 32, (B, T), device = DEV)
 
 
@@ -479,7 +480,7 @@ def test_a_gated_layer_below_joins_the_side_stream_first(monkeypatch):
     fused too: BlockScale's split kernels steered) stay on the main stream, and the groups' flows are the main stream's
     to the bit -- the side stream held back."""
     import pyjuice.layer.kernels.c as ck
-    import pyjuice.nodes.external_params.kernels.shift_logz as sl
+    import pyjuice.parameterizations.kernels.shift_logz as sl
     from pyjuice.layer import deferred_par as dpar
     monkeypatch.setattr(dpar, "MIN_FLOWS", 1 << 20)
     _steer_fused(monkeypatch)

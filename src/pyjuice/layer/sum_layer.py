@@ -904,7 +904,7 @@ class SumLayer(Layer, nn.Module):
         itself: the block-sparse mode with the plain element-flow kernel (tiles of at least 8), LL propagation
         without tempering, no external parameterization (whose backward owns the element flows)."""
         if propagation_alg != "LL" or temper_eflow or params_dim != 1 \
-                or getattr(self, "external_params", None) is not None:    # an external-parameter layer
+                or getattr(self, "parameterization", None) is not None:    # an external-parameter layer
             return [False] * self.num_bk_partitions
         out = []
         for partition_id in range(self.num_bk_partitions):
@@ -3050,7 +3050,7 @@ class SumLayer(Layer, nn.Module):
         another `mode` are never capable."""
         out = []
         alg_id = self.propagation_alg_mapping[propagation_alg]
-        if getattr(self, "external_params", None) is not None or (mode is not None and mode != "block_sparse"):
+        if getattr(self, "parameterization", None) is not None or (mode is not None and mode != "block_sparse"):
             return [(self.param_flow_slot_ranges(p), False) for p in range(self.num_bk_partitions)]
         for partition_id in range(self.num_bk_partitions):
             ranges = self.param_flow_slot_ranges(partition_id)
@@ -3832,7 +3832,7 @@ class SumLayer(Layer, nn.Module):
         # The EXTERNAL hook is offered before `_par_flow_collision_free` is consulted, unlike the
         # shared-parameter kernel below it. That predicate decides whether THIS layer's own kernel may
         # use its non-atomic write; an external parameterization owns its write and decides for itself
-        # (`BlockScaleSumParams` picks a padding mask and/or an atomic accumulate from the same
+        # (`BlockScale` picks a padding mask and/or an atomic accumulate from the same
         # information). Leaving the hook behind the test meant the two things that defeat it --
         # parameter tying, and the padding of a ragged layer -- made the gated backward RAISE at
         # batch < 16 rather than be served, even though the descriptor could serve it. A homogeneous

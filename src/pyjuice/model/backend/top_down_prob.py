@@ -327,7 +327,7 @@ def eval_top_down_probs(pc, update_pflow: bool = True, scale: float = 1.0, pc_is
     denom_param_flows = getattr(pc, "denom_param_flows", None) if update_pflow else None
 
     # The denominator's own layout is generally a COMPRESSED form of `F-` (gate space, for
-    # `BlockScaleSumParams`), and the top-down term can only be expressed there when it is `theta[n,c]`
+    # `BlockScale`), and the top-down term can only be expressed there when it is `theta[n,c]`
     # times a factor with no child index. A normalized PC's term is exactly that; an unnormalized one's
     # carries `exp(cmars[c] - nmars[n])` per child and is not. Refuse rather than write a denominator
     # that does not match its numerator.
@@ -378,11 +378,11 @@ def eval_top_down_probs(pc, update_pflow: bool = True, scale: float = 1.0, pc_is
                         # ONLY layers that actually accumulate the denominator, and through their own
                         # parameterization -- the buffer is NOT a `param_flows` mirror, so the generic
                         # param-flow kernel cannot write it. The hook adds the same term in whatever
-                        # layout the parameterization keeps (for `BlockScaleSumParams`, a rank-one
+                        # layout the parameterization keeps (for `BlockScale`, a rank-one
                         # update of `W[node, gate]`).
                         if denom_param_flows is not None and \
                                 getattr(layer, "requests_denom_param_flows", False):
-                            layer.external_params.accumulate_denom_top_down(
+                            layer.parameterization.accumulate_denom_top_down(
                                 layer, node_flows, denom_param_flows, hyperparameters[0])
 
     if not hasattr(pc, "_tdp_cudagraph"):

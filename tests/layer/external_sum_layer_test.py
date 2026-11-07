@@ -2,7 +2,8 @@ import pyjuice as juice
 import torch
 
 import pyjuice.nodes.distributions as dists
-from pyjuice.nodes import multiply, summate, inputs, LowRankSumParams, ExternalSumParams
+from pyjuice.nodes import multiply, summate, inputs
+from pyjuice.parameterizations import LowRank, SumParameterization
 from pyjuice.layer import SumLayer, ExternalParamsSumLayer, ExternalNodeInfo
 
 import pytest
@@ -32,8 +33,8 @@ def test_external_sum_layer_compilation():
 
         ms = multiply(ni0, ni1)
 
-        ns_ext = summate(ms, num_node_blocks = 2, external_params = LowRankSumParams(rank = 3))
-        ns_ext2 = summate(ms, num_node_blocks = 2, external_params = LowRankSumParams(rank = 5))
+        ns_ext = summate(ms, num_node_blocks = 2, parameterization = LowRank(rank = 3))
+        ns_ext2 = summate(ms, num_node_blocks = 2, parameterization = LowRank(rank = 5))
         ns_plain = summate(ms, num_node_blocks = 2)
 
         n = summate(multiply(ns_ext), multiply(ns_ext2), multiply(ns_plain),
@@ -58,7 +59,7 @@ def test_external_sum_layer_compilation():
 
     for layer in ext_layers:
         assert len(layer.nodes) == 1
-        assert isinstance(layer.external_params, LowRankSumParams)
+        assert isinstance(layer.parameterization, LowRank)
 
     # The PC records which nodes take external parameters, so a bad kwarg key can be rejected
     assert set(pc.external_params_nodes) == {ns_ext, ns_ext2}
@@ -81,7 +82,7 @@ def test_external_node_info():
                 ms = multiply(ni0)
 
                 ns = summate(ms, num_node_blocks = 2, edge_ids = edge_ids,
-                             external_params = LowRankSumParams(rank = 3))
+                             parameterization = LowRank(rank = 3))
                 n = summate(multiply(ns), num_node_blocks = 1, block_size = 1)
 
             n.init_parameters(perturbation = 2.0)
@@ -142,7 +143,7 @@ def test_register_external_buffers():
 
     device = torch.device("cuda:0")
 
-    class _RecordingParams(ExternalSumParams):
+    class _RecordingParams(SumParameterization):
         """A parameterization that only compiles a per-`ns` index and a layer-wide one."""
 
         def __init__(self):
@@ -168,7 +169,7 @@ def test_register_external_buffers():
 
         ni0 = inputs(0, num_node_blocks = 2, dist = dists.Categorical(num_cats = 5))
 
-        ns0 = summate(multiply(ni0), num_node_blocks = 2, external_params = ext_params)
+        ns0 = summate(multiply(ni0), num_node_blocks = 2, parameterization = ext_params)
         # A tied duplicate shares the descriptor, and lands in its OWN layer (different depth)
         ns1 = ns0.duplicate(multiply(ns0), tie_params = True)
 
@@ -183,7 +184,7 @@ def test_register_external_buffers():
 
     # One descriptor instance, two layers -- and each layer holds its own compiled tensors
     assert len(ext_layers) == 2
-    assert all([layer.external_params is ext_params for layer in ext_layers])
+    assert all([layer.parameterization is ext_params for layer in ext_layers])
     assert len(ext_params.compiled_layers) == 2
 
     for layer in ext_layers:
@@ -216,7 +217,7 @@ def test_external_sum_layer_without_external_tensors(corrected):
 
     def build(external):
         torch.manual_seed(430)
-        ext = dict(external_params = LowRankSumParams(rank = 3, apply_z_correction = corrected)) if external else dict()
+        ext = dict(parameterization = LowRank(rank = 3, apply_z_correction = corrected)) if external else dict()
         with juice.set_block_size(4):
             ni0 = inputs(0, num_node_blocks = 3, dist = dists.Categorical(num_cats = 5))
             ns = summate(multiply(ni0), num_node_blocks = 2, **ext)
@@ -268,7 +269,7 @@ def test_external_sum_layer_tensor_validation():
     with juice.set_block_size(4):
 
         ni0 = inputs(0, num_node_blocks = 3, dist = dists.Categorical(num_cats = 5))
-        ns = summate(multiply(ni0), num_node_blocks = 2, external_params = LowRankSumParams(rank = rank))
+        ns = summate(multiply(ni0), num_node_blocks = 2, parameterization = LowRank(rank = rank))
         n = summate(multiply(ns), num_node_blocks = 1, block_size = 1)
 
     n.init_parameters(perturbation = 2.0)
@@ -320,7 +321,7 @@ def test_external_sum_layer_unsupported_settings():
     with juice.set_block_size(4):
 
         ni0 = inputs(0, num_node_blocks = 3, dist = dists.Categorical(num_cats = 5))
-        ns = summate(multiply(ni0), num_node_blocks = 2, external_params = LowRankSumParams(rank = rank))
+        ns = summate(multiply(ni0), num_node_blocks = 2, parameterization = LowRank(rank = rank))
         n = summate(multiply(ns), num_node_blocks = 1, block_size = 1)
 
     n.init_parameters(perturbation = 2.0)
@@ -376,7 +377,7 @@ def test_external_sum_layer_grad_buffers():
     with juice.set_block_size(4):
 
         ni0 = inputs(0, num_node_blocks = 3, dist = dists.Categorical(num_cats = 5))
-        ns = summate(multiply(ni0), num_node_blocks = 2, external_params = LowRankSumParams(rank = rank))
+        ns = summate(multiply(ni0), num_node_blocks = 2, parameterization = LowRank(rank = rank))
         n = summate(multiply(ns), num_node_blocks = 1, block_size = 1)
 
     n.init_parameters(perturbation = 2.0)

@@ -1,7 +1,7 @@
 """
 A tied group's parameter flows, deferred to one contraction (kernels/c/par_deferred_fp16.cu: fp16 operands with a
 power-of-two scale per (row, slot); or its copy par_deferred_fp16_flush_ws.cu, the operand tiles loaded by a producer
-warp: the same bits, the flush's tuner picks) -- a regular sum layer's, or a `BlockScaleSumParams` layer's with its gates. A
+warp: the same bits, the flush's tuner picks) -- a regular sum layer's, or a `BlockScale` layer's with its gates. A
 step's capture takes kernels/c/par_deferred_fp16_capture.cu where its slots' layout allows (the same operands in two
 chained launches), else that module's or par_deferred_fp16_fused.cu's -- and, where the group's GPU measured it faster,
 a SIDE stream: what a capture with the product layer fused reads (its layer's flows and node values, its products'

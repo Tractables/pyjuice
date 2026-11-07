@@ -1,0 +1,123 @@
+"""
+What BlockScale's backward keeps between calls: per partition and batch, the launch plans of the log-Z gradient and of
+the denominator flow; per partition, the log-Z term's per-gate parameter sums, until the parameters change. A circuit
+that ran at other batch sizes -- its plans built there -- must give what a fresh circuit gives, on a layer of TWO
+partitions, whose sums and plans must not stand in for each other; and parameters loaded as new tensors (which start
+at the old ones' version) must not be read through the old ones' sums.
+
+Against a fresh circuit, not a reference: a stale plan launches at another batch (another grid, another `batch_size`)
+and a stale sum is another partition's or other parameters', each an error of the gradient's own size, far past what
+two circuits choosing their forks by measurement differ by.
+"""
+
+import gc
+import inspect
+
+import pytest
+import torch
+
+import pyjuice as juice
+import pyjuice.nodes.distributions as dists
+from pyjuice.nodes import inputs, multiply, summate
+from pyjuice.parameterizations import BlockScale
+from pyjuice.utils import launch_plans
+
+
+NUM_CATS = 4
+
+cuda_only = pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs a GPU")
+
+# One node block of eight child blocks and three of three: the partitioner splits the layer in two
+EDGE_IDS = torch.tensor([[0] * 8 + [1] * 3 + [2] * 3 + [3] * 3, list(range(8)) + [0, 1, 2] * 3])
+
+
+def _compile(seed = 0):
+    torch.manual_seed(seed)
+    with juice.set_block_size(32):
+        ni = [inputs(v, num_node_blocks = 8, dist = dists.Categorical(num_cats = NUM_CATS)) for v in range(2)]
+        prod = multiply(*ni)
+    ns = summate(prod, num_node_blocks = 4, edge_ids = EDGE_IDS, block_size = 64,
+                 parameterization = BlockScale(ch_block_size = 8))
+    root = summate(multiply(ns), num_node_blocks = 1, block_size = 1)
+    torch.manual_seed(seed)
+    root.init_parameters(perturbation = 2.0)
+    pc = juice.compile(root, verbose = False).to(torch.device("cuda:0"))
+    layer = [l for gg in pc.inner_layer_groups if gg.is_sum() for l in gg.layers
+             if hasattr(l, "external_node_infos")][0]
+    assert layer.num_bk_partitions == 2 and layer.num_fw_partitions == 2, "the layer is no longer split in two"
+    return pc, ns, layer
+
+
+def _inputs(ns, batch):
+    dev = torch.device("cuda:0")
+    g = torch.Generator(device = "cpu").manual_seed(batch)
+    data = torch.randint(0, NUM_CATS, [batch, 2], generator = g).to(dev)
+    phi = (torch.randn(ns.parameterization.tensor_shapes(ns, batch)[0], generator = g) * 0.7).to(dev)
+    return data, phi
+
+
+def _outputs(pc, ns, data, phi):
+    """The gate gradient, the denominator flows and the parameter flows of one backward."""
+    pc(data, sum_external_params = {ns: phi})
+    pc.backward(data, flows_memory = 0.0)
+    return (pc.get_external_params_grad(ns)[0].clone(), pc.denom_param_flows.clone(), pc.param_flows.clone())
+
+
+def _assert_close(got, ref, what):
+    for g, r, name in zip(got, ref, ("the gate gradient", "the denominator flows", "the parameter flows")):
+        d = float((g - r).abs().max() / r.abs().max().clamp_min(1e-30))
+        assert d < 1e-3, f"{what}: {name} off a fresh circuit's by {d} (relative to its largest entry)"
+
+
+@cuda_only
+def test_a_circuit_run_at_other_batches_gives_a_fresh_circuits_backward():
+    used, ns, layer = _compile()
+    for batch in (64, 8, 128, 64, 8):
+        data, phi = _inputs(ns, batch)
+        got = _outputs(used, ns, data, phi)
+        fresh, fns, _ = _compile()
+        _assert_close(got, _outputs(fresh, fns, data, phi), f"batch {batch}")
+    # ... and the sums were KEPT meanwhile, each partition's its own (one entry for the layer had them evict each
+    # other: a gather of every parameter, each backward)
+    sums = {pid: hit[2] for pid, hit in layer._bs_sigma_cache.items()}
+    assert sorted(sums) == [0, 1] and sums[0].shape != sums[1].shape
+    _outputs(used, ns, *_inputs(ns, 64))
+    assert all(layer._bs_sigma_cache[pid][2] is s for pid, s in sums.items()), "the parameter sums were recomputed"
+
+
+@cuda_only
+def test_parameters_loaded_as_new_tensors_are_summed_anew():
+    used, ns, layer = _compile(seed = 0)
+    data, phi = _inputs(ns, 64)
+    _outputs(used, ns, data, phi)                              # the sums of seed 0's parameters, kept
+    version = used.params._version
+    other, ons, _ = _compile(seed = 1)
+    # (`state_dict`'s tensors share the other circuit's version counter, which its compile moved as far as this one's)
+    used.load_state_dict(other.state_dict(), assign = True)
+    assert used.params._version == version and not torch.equal(used.params, _compile(seed = 0)[0].params), \
+        "the case is OTHER parameters at an EQUAL version"
+    _assert_close(_outputs(used, ns, data, phi), _outputs(other, ons, data, phi), "after load_state_dict(assign)")
+
+
+@cuda_only
+@pytest.mark.parametrize("batch", [8, 64])
+def test_a_backward_leaves_no_reference_cycle(monkeypatch, batch):
+    """The full path of a gated layer's backward builds its launches in nested functions at every call. One of them
+    naming itself is a cycle that only Python's garbage collector frees, one per call (`_ele_triton_fn`). With plans
+    off: a plan replayed would spare the full path here."""
+    monkeypatch.setattr(launch_plans, "ENABLED", False)
+    pc, ns, _ = _compile()
+    data, phi = _inputs(ns, batch)
+    for _ in range(3):                                  # (the tuners settled)
+        _outputs(pc, ns, data, phi)
+    gc.collect()
+    gc.garbage.clear()
+    gc.set_debug(gc.DEBUG_SAVEALL)
+    try:
+        _outputs(pc, ns, data, phi)
+        gc.collect()
+        left = [o.__qualname__ for o in gc.garbage if inspect.isfunction(o) and "pyjuice" in o.__code__.co_filename]
+    finally:
+        gc.set_debug(0)
+        gc.garbage.clear()
+    assert not left, f"reference cycles left to the garbage collector: {sorted(set(left))}"

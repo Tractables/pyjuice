@@ -175,7 +175,7 @@ def _signature(order) -> str:
             item += [ns.dist.get_signature(), ns.dist.get_metadata()]
         else:
             item += [[ids[cs] for cs in ns.chs], ns.edge_ids]
-            ext = getattr(ns, "external_params", None)
+            ext = getattr(ns, "parameterization", None)
             item += [None if ext is None else ext.get_signature()]
         _hash_into(h, item)
     return h.hexdigest()

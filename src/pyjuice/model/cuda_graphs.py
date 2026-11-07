@@ -205,7 +205,7 @@ class _CudaGraphsMixin:
         captured -- the caller's own `torch.cuda.graph`, say -- where the inner layers must run eagerly
         so that they become part of the caller's graph (a nested capture fails). And not when an inner
         layer's external parameterization does not declare itself graph-safe
-        (`ExternalSumParams.cuda_graph_safe`): its per-call Python would run twice on a recording call
+        (`SumParameterization.cuda_graph_safe`): its per-call Python would run twice on a recording call
         and never on a replay.
         """
         if self.device.type != "cuda" or torch.cuda.is_current_stream_capturing():
@@ -213,7 +213,7 @@ class _CudaGraphsMixin:
         unsafe = self.__dict__.get("_cuda_graph_unsafe")
         if unsafe is None:
             unsafe = self.__dict__["_cuda_graph_unsafe"] = sorted({
-                type(layer.external_params).__name__ for layer_group in self.inner_layer_groups
+                type(layer.parameterization).__name__ for layer_group in self.inner_layer_groups
                 for layer in layer_group if not layer.cuda_graph_safe})
         if unsafe:
             if record:
@@ -359,7 +359,7 @@ class _CudaGraphsMixin:
         for layer_group in self.inner_layer_groups:
             for layer in layer_group:
                 collect(layer.__dict__, 4)
-                descriptor = layer.__dict__.get("external_params")
+                descriptor = layer.__dict__.get("parameterization")
                 if descriptor is not None:
                     collect(descriptor.__dict__, 4)
 

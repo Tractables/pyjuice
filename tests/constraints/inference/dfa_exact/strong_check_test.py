@@ -41,7 +41,7 @@ import torch
 import pyjuice as juice
 import pyjuice.constraints as jc
 import pyjuice.nodes.distributions as dists
-from pyjuice.nodes import BlockScaleSumParams
+from pyjuice.parameterizations import BlockScale
 from pyjuice.nodes.distributions import Categorical, SoftEvidenceCategorical
 
 #: the largest |difference| from the reference (log space) per precision, of the marginals (and the conditional rows'
@@ -184,14 +184,14 @@ class Float64Reference:
         """float64 [B or 1, nodes, children's nodes]: a sum node group's weights, under external parameters sample
         ``b``'s weights times its gates ``phi_b[n // node gate, c // child gate]``, normalized per node."""
         W = self.sum_weights(ns)
-        ext = getattr(ns, "external_params", None)
+        ext = getattr(ns, "parameterization", None)
         if self.gates is None or ext is None:
             return W[None]
         lphi = self.gates.get(ns, self.gates.get(ext.storage_owner(ns)))
         if lphi is None:
             return W[None]
         lphi = (lphi[0] if isinstance(lphi, (tuple, list)) else lphi).to(self.dev, F64)
-        if not isinstance(ext, BlockScaleSumParams):
+        if not isinstance(ext, BlockScale):
             raise NotImplementedError(f"the reference reads BlockScale external parameters, got {type(ext).__name__}")
         ng, cg = ext.gate_sizes(ns)
         rows = torch.arange(ns.num_nodes, device = self.dev) // ng
@@ -479,16 +479,16 @@ def codpula_pc(n, latents, V, gated = True, seed = 0, block = 32, gate = None):
     """A Codpula circuit: a GeneralizedHMM of ``latents`` in blocks of ``block`` over ``V`` tokens, its inputs
     SoftEvidenceCategorical, its transition sums under BlockScale external parameters (one gate per pair of blocks, or
     ``gate``: its node and child gate sizes)."""
-    from pyjuice.nodes.external_sum_nodes import ExternalParamsSumNodes
+    from pyjuice.nodes.parameterized_sum_nodes import ParameterizedSumNodes
     torch.manual_seed(seed)
     ns = juice.structures.GeneralizedHMM(seq_length = n, num_latents = latents, block_size = block,
                                          input_dist = dists.SoftEvidenceCategorical(num_cats = V))
     if gated:
         for s in ns:
             if s.is_sum() and s.num_nodes == latents:
-                s.__class__ = ExternalParamsSumNodes
-                s.external_params = BlockScaleSumParams(ch_block_size = block) if gate is None else \
-                    BlockScaleSumParams(block_size = gate[0], ch_block_size = gate[1])
+                s.__class__ = ParameterizedSumNodes
+                s.parameterization = BlockScale(ch_block_size = block) if gate is None else \
+                    BlockScale(block_size = gate[0], ch_block_size = gate[1])
     ns.init_parameters(perturbation = 2.0)
     return juice.compile(ns, verbose = False).to(DEV)
 
@@ -540,7 +540,7 @@ def soft_inputs(pc, B, n, V, K = None, gates = True, seed = 0, data = None, boos
         kw["categorical_evidence_logp"] = torch.log_softmax(top.values, dim = -1).gather(2, order).to(DEV)
         kw["soft_evidence_cat_ids"] = ids.to(DEV)
     if gates and pc.external_params_nodes:
-        kw["sum_external_params"] = {s: (torch.randn(s.external_params.tensor_shapes(s, B)[0], generator = g) * 2)
+        kw["sum_external_params"] = {s: (torch.randn(s.parameterization.tensor_shapes(s, B)[0], generator = g) * 2)
                                      .to(DEV) for s in pc.external_params_nodes}
     return kw
 

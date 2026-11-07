@@ -11,8 +11,10 @@ from .nodes import CircuitNodes
 from .input_nodes import InputNodes
 from .prod_nodes import ProdNodes
 from .sum_nodes import SumNodes
-from .external_sum_nodes import ExternalParamsSumNodes
-from .external_params import ExternalSumParams
+from .parameterized_sum_nodes import ParameterizedSumNodes
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from pyjuice.parameterizations import SumParameterization
 from .distributions import Distribution
 from pyjuice.graph import RegionGraph
 
@@ -124,7 +126,7 @@ def multiply(nodes1: ProdNodesChs, *args, edge_ids: Optional[Tensor] = None, spa
 def summate(nodes1: SumNodesChs, *args, num_node_blocks: int = 0, num_nodes: int = 0,
             edge_ids: Optional[Tensor] = None, block_size: int = 0,
             sum_edge_ids_constructor: Optional[Callable] = None,
-            external_params: Optional[ExternalSumParams] = None, **kwargs) -> SumNodes:
+            parameterization: Optional[SumParameterization] = None, **kwargs) -> SumNodes:
     """
     Construct a vector of sum nodes given a list of children PCs defined on the same sets of variables.
 
@@ -153,15 +155,19 @@ def summate(nodes1: SumNodesChs, *args, num_node_blocks: int = 0, num_nodes: int
     :param sum_edge_ids_constructor: optional helper functions to create special edge patterns (e.g., block-sparse)
     :type sum_edge_ids_constructor: Callable
 
-    :param external_params: if set, construct an :class:`~pyjuice.nodes.ExternalParamsSumNodes` instead -- a sum
-                            node whose effective parameters are the shared parameters modified by per-sample
-                            tensors supplied through the `sum_external_params` forward kwarg. The descriptor
-                            (e.g. :class:`~pyjuice.nodes.external_params.LowRankSumParams`) defines the
-                            modification and the tensor layout
-    :type external_params: Optional[ExternalSumParams]
+    :param parameterization: if set, construct a :class:`~pyjuice.nodes.ParameterizedSumNodes` instead -- a sum
+                             node whose effective parameters are the shared parameters modified by per-sample
+                             tensors supplied through the `sum_external_params` forward kwarg. The descriptor
+                             (e.g. :class:`~pyjuice.parameterizations.LowRank`) defines the
+                             modification and the tensor layout
+    :type parameterization: Optional[SumParameterization]
 
     :returns: an `SumNodes` object (a subclass of `CircuitNodes`)
     """
+
+    if "external_params" in kwargs:     # (the other keywords go unread: this one would leave a plain sum, without a word)
+        raise TypeError("`summate` takes the rule a sum node's parameters follow as `parameterization`, "
+                        "formerly `external_params`.")
 
     assert block_size == 0 or block_size & (block_size - 1) == 0, "`block_size` must be a power of 2."
 
@@ -197,9 +203,9 @@ def summate(nodes1: SumNodesChs, *args, num_node_blocks: int = 0, num_nodes: int
             assert nodes.scope == scope, "Children of a `SumNodes` should have the same scope."
         chs.append(nodes)
 
-    if external_params is not None:
-        return ExternalParamsSumNodes(num_node_blocks, chs, edge_ids, block_size = block_size,
-                                      external_params = external_params, **kwargs)
+    if parameterization is not None:
+        return ParameterizedSumNodes(num_node_blocks, chs, edge_ids, block_size = block_size,
+                                     parameterization = parameterization, **kwargs)
 
     return SumNodes(num_node_blocks, chs, edge_ids, block_size = block_size, **kwargs)
 

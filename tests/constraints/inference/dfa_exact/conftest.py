@@ -140,7 +140,7 @@ def node_weights(cc, ns, inputs, B):
     under tied gates)."""
     W = sum_weights(cc.pc, ns)
     gates = None if inputs is None else inputs.get("sum_external_params")
-    ext = getattr(ns, "external_params", None)
+    ext = getattr(ns, "parameterization", None)
     if gates is None or ext is None:
         return W
     if any(isinstance(k, str) for k in gates):
@@ -693,17 +693,17 @@ PC_KINDS = {
 def gate_sums(root, child_gate = lambda ns: ns.ch_block_size, tie_external = False, which = lambda ns: True,
               node_gate = lambda ns: ns.block_size):
     """Every sum node group of the circuit under ``root`` that ``which`` picks made gated, before it is compiled: a
-    :class:`BlockScaleSumParams` with ``node_gate(ns)`` nodes per node gate (default: one per node block) and
+    :class:`BlockScale` with ``node_gate(ns)`` nodes per node gate (default: one per node block) and
     ``child_gate(ns)`` children per child gate."""
-    from pyjuice.nodes import BlockScaleSumParams
-    from pyjuice.nodes.external_sum_nodes import ExternalParamsSumNodes
+    from pyjuice.parameterizations import BlockScale
+    from pyjuice.nodes.parameterized_sum_nodes import ParameterizedSumNodes
     for ns in root:
         if ns.is_sum() and which(ns):
-            ns.__class__ = ExternalParamsSumNodes
+            ns.__class__ = ParameterizedSumNodes
             node = node_gate(ns)
-            ns.external_params = BlockScaleSumParams(block_size = None if node == ns.block_size else node,
-                                                     ch_block_size = child_gate(ns), tie_external = tie_external)
-            ns.external_params.validate_ns(ns)
+            ns.parameterization = BlockScale(block_size = None if node == ns.block_size else node,
+                                             ch_block_size = child_gate(ns), tie_external = tie_external)
+            ns.parameterization.validate_ns(ns)
     return root
 
 

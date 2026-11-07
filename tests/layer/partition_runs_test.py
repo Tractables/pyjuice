@@ -24,7 +24,7 @@ import pyjuice.nodes.distributions as dists
 from pyjuice.layer import ExternalParamsSumLayer
 from pyjuice.layer import prod_layer as PL
 from pyjuice.layer import sum_layer as SL
-from pyjuice.nodes import LowRankSumParams
+from pyjuice.parameterizations import LowRank
 
 DEV = torch.device("cuda:0")
 NAN = float("nan")
@@ -429,7 +429,7 @@ def test_a_dense_partition_of_several_child_groups_takes_no_runs(monkeypatch):
 def test_what_takes_no_runs():
     with juice.set_block_size(4):
         ni0 = juice.inputs(0, num_node_blocks = 3, dist = dists.Categorical(num_cats = 5))
-        ns = juice.summate(juice.multiply(ni0), num_node_blocks = 2, external_params = LowRankSumParams(rank = 3))
+        ns = juice.summate(juice.multiply(ni0), num_node_blocks = 2, parameterization = LowRank(rank = 3))
         root = juice.summate(juice.multiply(ns), num_node_blocks = 1, block_size = 1)
     root.init_parameters()
     pc = juice.compile(root, verbose = False).to(DEV)
