@@ -2340,3 +2340,54 @@ def test_em_correction_preserves_tiny_positive_parameters(fused, keep, monkeypat
         assert bool((actual[zeroed] == 0).all())
     else:
         assert bool((actual[zeroed] > 0).all())
+
+
+def _build_corrected_beside_uncorrected(kind, seed = 0):
+    """A sum whose parameterization keeps the denominator flow, and one above a plain sum whose parameterization does
+    not (a depth of its own: BlockScale's signature does not tell the two apart): the circuit's buffer is the first's
+    alone. `kind = None`: all plain."""
+    torch.manual_seed(seed)
+    make = {None: None,
+            "blockscale": lambda corr: BlockScaleSumParams(ch_block_size = 2, apply_z_correction = corr),
+            "lowrank": lambda corr: LowRankSumParams(rank = 2, form = "sum_exp", apply_z_correction = corr)}[kind]
+    ext = lambda corr: dict() if make is None else dict(external_params = make(corr))
+    with juice.set_block_size(4):
+        i = [inputs(v, num_node_blocks = 2, dist = dists.Categorical(num_cats = NUM_CATS)) for v in range(5)]
+        a = summate(multiply(i[0], i[1]), num_node_blocks = 2, **ext(True))
+        low = summate(multiply(i[2], i[3]), num_node_blocks = 2)
+        b = summate(multiply(low, i[4]), num_node_blocks = 2, **ext(False))
+        root = summate(multiply(a, b), num_node_blocks = 1, block_size = 1)
+    root.init_parameters(perturbation = 2.0)
+    return root, a, b, low
+
+
+@cuda_only
+@pytest.mark.parametrize("kind", ["blockscale", "lowrank"])
+@pytest.mark.parametrize("rescale", [False, True], ids = ["mini_batch", "anemone"])
+def test_ungated_backward_beside_a_parameterization_without_the_denominator(kind, rescale):
+    """The circuit's denominator buffer may be there for another layer's parameterization: a backward that supplies
+    nothing accumulates a layer's `theta * node flow` only where that layer's own keeps a denominator. (It took the
+    buffer for every layer's: the one without it was asked for its slices.) Every sum then takes the standard EM
+    step, as the plain circuit's."""
+    dev = torch.device("cuda:0")
+    torch.manual_seed(15)
+    x = torch.randint(0, NUM_CATS, [64, 5], device = dev)
+    r_plain, *plain = _build_corrected_beside_uncorrected(None)
+    r_ext, *ext = _build_corrected_beside_uncorrected(kind)
+    pc_plain = juice.compile(r_plain, verbose = False).to(dev)
+    pc_ext = juice.compile(r_ext, verbose = False).to(dev)
+    a, b, _ = ext
+    layer = {ns: pc_ext.external_params_nodes[ns] for ns in (a, b)}
+    assert layer[a] is not layer[b] and layer[a].requests_denom_param_flows and not layer[b].requests_denom_param_flows
+    for n0, n1 in zip(plain, ext):
+        assert torch.equal(pc_plain.get_node_params(n0), pc_ext.get_node_params(n1))
+    for pc in (pc_plain, pc_ext):
+        pc(x)
+        pc.backward(x, logspace_flows = True, flows_memory = 0.0)
+    assert pc_ext.denom_param_flows is not None and float(pc_ext.denom_param_flows.abs().sum()) > 0
+    for pc in (pc_plain, pc_ext):
+        pc.mini_batch_em(step_size = 0.5, pseudocount = 0.1, step_size_rescaling = rescale)
+    for n0, n1 in zip(plain, ext):
+        got, want = pc_ext.get_node_params(n1), pc_plain.get_node_params(n0)
+        assert bool(torch.isfinite(got).all())
+        assert torch.allclose(got, want, rtol = 1e-4, atol = 1e-6), (got - want).abs().max().item()

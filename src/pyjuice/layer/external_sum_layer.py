@@ -679,7 +679,8 @@ class ExternalParamsSumLayer(SumLayer):
             # -- the top-down term's form, the batch's node flows in place of `P_td`. Without it the M-step divided
             # these flows by `pseudocount * theta` alone: a damped step all but ignored its step size, and a
             # full-batch one (pseudocount 0) overflowed to nan.
-            if param_flows is not None and denom_param_flows is not None:
+            # (Where THIS layer's parameterization keeps one: the circuit's buffer may be there for another's.)
+            if param_flows is not None and denom_param_flows is not None and self.requests_denom_param_flows:
                 self._accumulate_ungated_denom(node_flows, denom_param_flows, kwargs.get("logspace_flows", False))
             return out
 
