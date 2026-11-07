@@ -27,10 +27,10 @@ def _set_attrs(layer, **attrs) -> None:
 
 def _grad_kwargs():
     """`(EXTERNAL_PARAMS_GRAD_KWARG, EXTERNAL_PARAMS_GRAD_BUFFER_KWARG)`, imported once (a module-level import would
-    be circular: `external_sum_layer` imports the parameterizations)."""
+    be circular: `parameterized_sum_layer` imports the parameterizations)."""
     global _GRAD_KWARGS
     if _GRAD_KWARGS is None:
-        from pyjuice.layer.external_sum_layer import EXTERNAL_PARAMS_GRAD_KWARG, EXTERNAL_PARAMS_GRAD_BUFFER_KWARG
+        from pyjuice.layer.parameterized_sum_layer import EXTERNAL_PARAMS_GRAD_KWARG, EXTERNAL_PARAMS_GRAD_BUFFER_KWARG
         _GRAD_KWARGS = (EXTERNAL_PARAMS_GRAD_KWARG, EXTERNAL_PARAMS_GRAD_BUFFER_KWARG)
     return _GRAD_KWARGS
 
@@ -661,7 +661,7 @@ class _BackwardMixin:
                 plan = _build_ele_plan(ctx)
                 cache[key] = plan
             # (whether a gated call's element flows here take the split kernel, which the product layer below fuses
-            # into: `ExternalParamsSumLayer._stream_fusion_bk`)
+            # into: `ParameterizedSumLayer._stream_fusion_bk`)
             kind = plan["kind"]
             ready = (isinstance(kind, tuple) and kind[0] == "eles"
                      and _mod("c").get_ele_stream_fused_module() is not None)

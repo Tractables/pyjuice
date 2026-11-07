@@ -367,7 +367,7 @@ class TensorCircuit(_BuildMixin, _CudaGraphsMixin, _ExternalParamsMixin, _Learni
         if plan is not None:
             return plan
         from pyjuice.layer.sum_layer import SumLayer
-        from pyjuice.layer.external_sum_layer import ExternalParamsSumLayer
+        from pyjuice.layer.parameterized_sum_layer import ParameterizedSumLayer
 
         def source(ns):
             return ns.get_source_ns() if ns.is_tied() else ns
@@ -389,7 +389,7 @@ class TensorCircuit(_BuildMixin, _CudaGraphsMixin, _ExternalParamsMixin, _Learni
                 continue
             marked = []
             for layer in group:
-                takes = type(layer) is SumLayer or (isinstance(layer, ExternalParamsSumLayer)
+                takes = type(layer) is SumLayer or (isinstance(layer, ParameterizedSumLayer)
                                                    and layer.parameterization.reads_param_operands)
                 srcs = [source(ns) for ns in layer.nodes] if takes else None
                 ok = srcs is not None and all(readers.get(s, 0) >= 2 for s in srcs) and aligned(layer)

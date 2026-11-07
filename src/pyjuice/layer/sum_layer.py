@@ -493,7 +493,7 @@ class SumLayer(Layer, nn.Module):
 
         # Optional interception of the two CUDA backward kernels by an external parameterization.
         # `None` on every plain layer, so the fast paths below are unchanged for them. When set (by
-        # `ExternalParamsSumLayer` for the duration of one backward), the hook is called INSTEAD of the
+        # `ParameterizedSumLayer` for the duration of one backward), the hook is called INSTEAD of the
         # vanilla kernel with the very same operands plus the partition id -- which is what lets a
         # parameterization reuse this class's whole table derivation (partitioning, edge trimming,
         # `parids` reconstruction) rather than reimplement it. A hook that cannot be reached because
@@ -1014,7 +1014,7 @@ class SumLayer(Layer, nn.Module):
         # where the decisions below read nothing but what the key holds (`kwargs` by name: their values are read by
         # the tempered kernels alone). A converted site adds one launcher per partition and kind of flow; any other
         # leaves the count short, and the call is not planned -- nor the recording around it, if one is open (a gated
-        # layer's, `ExternalParamsSumLayer.backward`, whose own sites this call's converted ones reach): so does a
+        # layer's, `ParameterizedSumLayer.backward`, whose own sites this call's converted ones reach): so does a
         # call in another regime, which records nothing.
         #
         # `defer_param_flows` (the circuit's backward sets it when no layer callback sees the flows between layers): a

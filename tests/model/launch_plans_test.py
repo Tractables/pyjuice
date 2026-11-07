@@ -5,7 +5,7 @@ The module: a plan is kept only with exactly the launchers expected and none fai
 (nor looked up then), never with plans off; a raising call leaves no recording open; recordings are per thread and
 tagged (a launcher goes to the innermost recording of its tag only; `nested`); a bounded store; `clear`. The layers: a
 gated layer's planned backward -- the launchers an earlier call with this signature recorded, the parameterization's
-hooks and the standard backward between them replayed whole (`ExternalParamsSumLayer.backward`) -- gives the full
+hooks and the standard backward between them replayed whole (`ParameterizedSumLayer.backward`) -- gives the full
 path's element and node flows to the bit and its parameter flows and gate gradients within their atomics' rounding,
 launching the same GPU kernels, over gated HMMs (bf16 and fp32 parameters, tied gates, a ragged layer, two gated nodes
 in one layer, batches below 16), with and without gate gradients, deferred parameter flows (a tied group deferring),
@@ -219,7 +219,7 @@ def _clear_plans(pc):
 
 
 def _layer_keys(layer):
-    """The keys of a gated layer's plans of its whole backward (`ExternalParamsSumLayer._backward_plan_key`)."""
+    """The keys of a gated layer's plans of its whole backward (`ParameterizedSumLayer._backward_plan_key`)."""
     return [k for k in LaunchPlans.of(layer).plans if k[0] == "external_backward"]
 
 

@@ -41,7 +41,7 @@ class ExternalNodeInfo():
     always refers to `ns.edge_ids[:, e]`.
 
     This is also where a parameterization's *own* compile-time tensors are reached from: whatever it
-    registers through :func:`ExternalParamsSumLayer.register_external_buffers` becomes an attribute
+    registers through :func:`ParameterizedSumLayer.register_parameterization_buffers` becomes an attribute
     here alongside the generic ones, so a kernel only ever needs the `ns_info` it is handed.
 
     Attributes:
@@ -80,7 +80,7 @@ class ExternalNodeInfo():
 
         self.max_n_eblks = int(torch.bincount(ns.edge_ids[0,:], minlength = ns.num_node_blocks).max())
 
-        # Names of the buffers attached by `ExternalParamsSumLayer.register_external_buffers`
+        # Names of the buffers attached by `ParameterizedSumLayer.register_parameterization_buffers`
         self.buffer_names = []
 
     def __repr__(self):
@@ -149,10 +149,11 @@ def validate_external_tensors(ns, parameterization, tensors: Any, batch_size: in
     return tuple(tensors)
 
 
-class ExternalParamsSumLayer(SumLayer):
+class ParameterizedSumLayer(SumLayer):
     """
-    A sum layer whose effective parameters are the shared parameters modified by per-sample tensors
-    supplied externally at call time.
+    A sum layer of :class:`~pyjuice.nodes.ParameterizedSumNodes`, externally parameterized: its effective
+    parameters are the shared parameters modified, by the rule of the nodes' parameterization, by per-sample
+    tensors -- the external parameters -- supplied at call time (`sum_external_params`).
 
     Compilation is inherited from :class:`~pyjuice.layer.SumLayer` unchanged -- the edge partitions,
     `nids` / `cids` / `pids` and the shared-parameter kernels are exactly those of a standard sum
@@ -171,7 +172,7 @@ class ExternalParamsSumLayer(SumLayer):
     difference that the descriptor REPLACES the standard draw rather than correcting it -- a
     categorical draw already made under the shared parameters cannot be corrected after the fact.
 
-    All the nodes of one layer share an external signature (that is what compilation groups them by),
+    All the nodes of one layer share a parameterization signature (that is what compilation groups them by),
     so exactly one descriptor -- and one set of kernels -- applies to the whole layer. The standard
     sum-layer kernels are never branched on.
 
@@ -181,25 +182,25 @@ class ExternalParamsSumLayer(SumLayer):
 
     def __init__(self, nodes: Sequence[ParameterizedSumNodes], *args, **kwargs) -> None:
 
-        super(ExternalParamsSumLayer, self).__init__(nodes, *args, **kwargs)
+        super(ParameterizedSumLayer, self).__init__(nodes, *args, **kwargs)
 
         for ns in self.nodes:
             assert isinstance(ns, ParameterizedSumNodes), \
-                f"`ExternalParamsSumLayer` only accepts `ParameterizedSumNodes`, got {type(ns)}."
+                f"`ParameterizedSumLayer` only accepts `ParameterizedSumNodes`, got {type(ns)}."
 
-        signatures = set([ns.get_external_signature() for ns in self.nodes])
+        signatures = set([ns.get_parameterization_signature() for ns in self.nodes])
         assert len(signatures) == 1, \
-            f"All nodes of an `ExternalParamsSumLayer` must share one external signature, got {signatures}."
+            f"All nodes of a `ParameterizedSumLayer` must share one parameterization signature, got {signatures}."
 
         # One descriptor governs the whole layer. It is stateless configuration, and the signature it
         # is grouped by covers everything the kernels specialize on, so any node's descriptor will do.
         self.parameterization = self.nodes[0].parameterization
-        self.external_signature = signatures.pop()
+        self.parameterization_signature = signatures.pop()
 
         self._compile_external_node_info()
 
         # Compile-time preparation specific to the parameterization. It registers whatever tensors its
-        # kernels need through `register_external_buffers` / `register_external_buffer`, so they are
+        # kernels need through `register_parameterization_buffers` / `register_parameterization_buffer`, so they are
         # owned and moved by this layer rather than by the (shared, stateless) descriptor.
         self.parameterization.compile(self)
 
@@ -252,7 +253,7 @@ class ExternalParamsSumLayer(SumLayer):
 
         return base
 
-    def register_external_buffers(self, name: str, tensors: Sequence[torch.Tensor]) -> None:
+    def register_parameterization_buffers(self, name: str, tensors: Sequence[torch.Tensor]) -> None:
         """
         Register one compile-time tensor per `ns`, in `self.external_node_infos` order, under `name`.
 
@@ -272,7 +273,7 @@ class ExternalParamsSumLayer(SumLayer):
         :type tensors: Sequence[torch.Tensor]
         """
         assert len(tensors) == len(self.external_node_infos), \
-            f"`register_external_buffers` expects one tensor per ns ({len(self.external_node_infos)}), " \
+            f"`register_parameterization_buffers` expects one tensor per ns ({len(self.external_node_infos)}), " \
             f"got {len(tensors)}."
         assert not hasattr(self, f"ext_{name}"), f"External buffer `{name}` is already registered."
 
@@ -285,12 +286,12 @@ class ExternalParamsSumLayer(SumLayer):
             setattr(ns_info, name, param_list[ns_info.ns_idx])
             ns_info.buffer_names.append(name)
 
-    def register_external_buffer(self, name: str, tensor: torch.Tensor) -> None:
+    def register_parameterization_buffer(self, name: str, tensor: torch.Tensor) -> None:
         """
         Register a single layer-wide compile-time tensor, exposed as `layer.ext_<name>`.
 
         Use this for data that spans the whole layer rather than one `ns`; per-`ns` data belongs in
-        :func:`register_external_buffers`. Non-tensor state (caches, autotuned choices) can simply be
+        :func:`register_parameterization_buffers`. Non-tensor state (caches, autotuned choices) can simply be
         set as a plain attribute on the layer.
         """
         assert not hasattr(self, f"ext_{name}"), f"External buffer `{name}` is already registered."
@@ -336,10 +337,10 @@ class ExternalParamsSumLayer(SumLayer):
             eblk_ids.append(curr_eblk_ids)
             par_ptr.append(curr_par_ptr)
 
-        self.register_external_buffers("par_nids", par_nids)
-        self.register_external_buffers("ch_eids", ch_eids)
-        self.register_external_buffers("eblk_ids", eblk_ids)
-        self.register_external_buffers("par_ptr", par_ptr)
+        self.register_parameterization_buffers("par_nids", par_nids)
+        self.register_parameterization_buffers("ch_eids", ch_eids)
+        self.register_parameterization_buffers("eblk_ids", eblk_ids)
+        self.register_parameterization_buffers("par_ptr", par_ptr)
 
         self._compile_partition_edge_block_ids()
 
@@ -483,16 +484,16 @@ class ExternalParamsSumLayer(SumLayer):
                 tables[slot].append(curr[slot])
 
         for slot in range(n_ext_slots):
-            self.register_external_partition_buffers(f"slot{slot}", tables[slot])
+            self.register_parameterization_partition_buffers(f"slot{slot}", tables[slot])
 
         self.ext_slots = [getattr(self, f"ext_slot{slot}") for slot in range(n_ext_slots)]
         self.ext_max_n_eblks = max_n_eblks
 
-    def register_external_partition_buffers(self, name: str, tensors: Sequence[torch.Tensor]) -> None:
+    def register_parameterization_partition_buffers(self, name: str, tensors: Sequence[torch.Tensor]) -> None:
         """
         Register one compile-time tensor per FORWARD PARTITION, exposed as `layer.ext_<name>[pid]`.
 
-        The per-partition counterpart of :func:`register_external_buffers`: for tensors laid out like
+        The per-partition counterpart of :func:`register_parameterization_buffers`: for tensors laid out like
         `nids` / `cids` rather than per `ns`.
         """
         assert getattr(self, f"ext_{name}", None) is None, \
@@ -616,7 +617,7 @@ class ExternalParamsSumLayer(SumLayer):
         # would be redundant work whose result is thrown away. It still has to run when nothing was
         # supplied for this layer, since then the layer IS a plain sum layer.
         if not gated or not self.parameterization.replaces_shared_forward:
-            super(ExternalParamsSumLayer, self).forward(
+            super(ParameterizedSumLayer, self).forward(
                 node_mars, element_mars, params, propagation_alg = propagation_alg, op_params = op_params,
                 **(dict(kwargs, stream_children = sc) if sc is not None and not gated else kwargs)
             )
@@ -669,7 +670,7 @@ class ExternalParamsSumLayer(SumLayer):
 
         if len(ns_tensors) == 0:
             # Nothing supplied for this layer -> it is a plain sum layer
-            out = super(ExternalParamsSumLayer, self).backward(
+            out = super(ParameterizedSumLayer, self).backward(
                 node_flows, element_flows, node_mars, element_mars, params,
                 param_flows = param_flows, propagation_alg = propagation_alg, op_params = op_params,
                 **(dict(kwargs, stream_children = sc) if sc is not None else kwargs)
@@ -751,7 +752,7 @@ class ExternalParamsSumLayer(SumLayer):
                 # parameterization owns the flows: its effective parameters vary per edge block, and the
                 # standard kernels would sum the parents together before any correction could separate them.
                 if not self.parameterization.replaces_shared_backward:
-                    super(ExternalParamsSumLayer, self).backward(
+                    super(ParameterizedSumLayer, self).backward(
                         node_flows, element_flows, node_mars, element_mars, params,
                         param_flows = param_flows, propagation_alg = propagation_alg, op_params = op,
                         **(dict(kwargs, stream_children = sc) if sc is not None else kwargs)
@@ -940,6 +941,6 @@ class ExternalParamsSumLayer(SumLayer):
         return True
 
     def __repr__(self):
-        return f"ExternalParamsSumLayer(nid_range=({self._layer_nid_range[0]}, {self._layer_nid_range[1]}), " \
+        return f"ParameterizedSumLayer(nid_range=({self._layer_nid_range[0]}, {self._layer_nid_range[1]}), " \
                f"num_nodes={self.num_nodes}, num_edges={self.num_edges}, " \
-               f"parameterization={self.external_signature})"
+               f"parameterization={self.parameterization_signature})"

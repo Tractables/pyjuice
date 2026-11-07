@@ -7,7 +7,7 @@ chained launches), else that module's or par_deferred_fp16_fused.cu's -- and, wh
 a SIDE stream: what a capture with the product layer fused reads (its layer's flows and node values, its products'
 children's node values) no later launch of the pass writes -- later layers write lower nodes' flows; a gated layer's
 parameterization may change its own node values in place (BlockScale shifts them by log Z), and its backward
-joins the side stream first (`join_side`, `ExternalParamsSumLayer.backward`) -- so it runs beside the next layers'
+joins the side stream first (`join_side`, `ParameterizedSumLayer.backward`) -- so it runs beside the next layers'
 chains, on the SMs their kernels leave idle, joined before the slots are flushed and as the backward's scope closes.
 
 Tied copies of a sum node -- a homogeneous HMM's steps -- write their parameter flows into ONE flow block

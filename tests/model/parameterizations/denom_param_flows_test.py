@@ -45,7 +45,7 @@ from pyjuice.layer.layer import Layer
 from pyjuice.layer.sum_layer import SumLayer
 from pyjuice.layer.prod_layer import ProdLayer
 from pyjuice.layer.input_layer import InputLayer
-from pyjuice.layer.external_sum_layer import ExternalParamsSumLayer
+from pyjuice.layer.parameterized_sum_layer import ParameterizedSumLayer
 
 
 cuda_only = pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs a GPU")
@@ -76,7 +76,7 @@ def _gate(ns, batch, device):
 
 def _ext_layer(pc):
     layers = [l for g in pc.inner_layer_groups for l in g.layers
-              if isinstance(l, ExternalParamsSumLayer)]
+              if isinstance(l, ParameterizedSumLayer)]
     assert len(layers) == 1
     return layers[0]
 
@@ -301,11 +301,11 @@ def test_mixed_gated_and_plain_sum_layers_in_one_group():
     root, ns_gated = _build_mixed()
     pc = juice.compile(root, verbose = False).to(dev)
 
-    # exactly one sum group holds BOTH a plain SumLayer and an ExternalParamsSumLayer
+    # exactly one sum group holds BOTH a plain SumLayer and an ParameterizedSumLayer
     sum_groups = [g for g in pc.inner_layer_groups if g.is_sum()]
     mixed = [g for g in sum_groups
-             if any(isinstance(l, ExternalParamsSumLayer) for l in g.layers)
-             and any(not isinstance(l, ExternalParamsSumLayer) for l in g.layers)]
+             if any(isinstance(l, ParameterizedSumLayer) for l in g.layers)
+             and any(not isinstance(l, ParameterizedSumLayer) for l in g.layers)]
     assert len(mixed) == 1, [[type(l).__name__ for l in g.layers] for g in sum_groups]
 
     x = torch.randint(0, NUM_CATS, [16, 2], device = dev)

@@ -83,19 +83,19 @@ class ParameterizedSumNodes(SumNodes):
 
         self.parameterization.validate_ns(self)
 
-    def get_external_signature(self) -> str:
+    def get_parameterization_signature(self) -> str:
         """
         Signature of the external parameterization. Sum nodes are grouped into layers by
-        (block size, external signature).
+        (block size, parameterization signature).
         """
         return self.parameterization.get_signature()
 
     def set_source_ns(self, source_ns):
         super(ParameterizedSumNodes, self).set_source_ns(source_ns)
 
-        assert self.get_external_signature() == source_ns.get_external_signature(), \
-            f"External parameterization of the source ns ({source_ns.get_external_signature()}) does " \
-            f"not match that of self ({self.get_external_signature()})."
+        assert self.get_parameterization_signature() == source_ns.get_parameterization_signature(), \
+            f"External parameterization of the source ns ({source_ns.get_parameterization_signature()}) does " \
+            f"not match that of self ({self.get_parameterization_signature()})."
 
     def _construction_kwargs(self):
         # The descriptor is stateless configuration, so rebuilt nodes share it

@@ -248,7 +248,7 @@ def test_inner_layers_never_read_an_input_only_kwarg():
     assert "categorical_evidence_logp" in names
 
     src = pathlib.Path(juice.__file__).parent
-    files = [src / "layer" / f for f in ("sum_layer.py", "prod_layer.py", "external_sum_layer.py",
+    files = [src / "layer" / f for f in ("sum_layer.py", "prod_layer.py", "parameterized_sum_layer.py",
                                          "layer.py", "layer_group.py")]
     files += sorted((src / "layer" / "kernels").rglob("*.py")) + sorted((src / "parameterizations").rglob("*.py"))
 

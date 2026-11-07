@@ -269,7 +269,7 @@ def _above(layer, kwargs, node_mars, element_mars):
     link = layer.__dict__.get("_lrv_link")
     if link is None:
         return None
-    from pyjuice.layer.external_sum_layer import StagedExternalParams
+    from pyjuice.layer.parameterized_sum_layer import StagedExternalParams
     above, staged = link["above"](), kwargs[_EXTERNAL_PARAMS_KWARG]
     if above is None or not isinstance(staged, StagedExternalParams) or link["table"].device != node_mars.device \
             or above.__dict__.get("_lrv_wasted", 0) >= WASTED_MOST \

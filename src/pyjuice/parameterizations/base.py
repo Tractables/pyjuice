@@ -268,7 +268,7 @@ class SumParameterization():
         `layer` is built.
 
         By this point the layer has built the generic per-`ns` metadata -- one
-        :class:`~pyjuice.layer.external_sum_layer.ExternalNodeInfo` per `ns` in
+        :class:`~pyjuice.layer.parameterized_sum_layer.ExternalNodeInfo` per `ns` in
         `layer.external_node_infos`, giving the mapping from the node's `edge_ids` columns to global
         node and element ids -- which is usually the starting point for anything further.
 
@@ -278,11 +278,11 @@ class SumParameterization():
 
             def compile(self, layer):
                 tables = [build_table(ns_info) for ns_info in layer.external_node_infos]
-                layer.register_external_buffers("edge_table", tables)   # -> ns_info.edge_table
+                layer.register_parameterization_buffers("edge_table", tables)   # -> ns_info.edge_table
 
-        :func:`~pyjuice.layer.ExternalParamsSumLayer.register_external_buffers` takes one tensor per
+        :func:`~pyjuice.layer.ParameterizedSumLayer.register_parameterization_buffers` takes one tensor per
         `ns` and exposes it as an attribute of that `ns_info`;
-        :func:`~pyjuice.layer.ExternalParamsSumLayer.register_external_buffer` takes a single
+        :func:`~pyjuice.layer.ParameterizedSumLayer.register_parameterization_buffer` takes a single
         layer-wide tensor. Either way the layer owns the storage, so `.to(device)` moves it and
         `state_dict` sees it. Non-tensor state (caches, autotuned choices) can be set as a plain
         attribute on `layer`.
@@ -293,7 +293,7 @@ class SumParameterization():
                compiles last. The descriptor is stateless configuration.
 
         :param layer: the layer that compiled these nodes
-        :type layer: ExternalParamsSumLayer
+        :type layer: ParameterizedSumLayer
         """
         pass
 
@@ -308,7 +308,7 @@ class SumParameterization():
         expressing its effect as a correction to what they produced.
 
         :param layer: the layer being evaluated
-        :type layer: ExternalParamsSumLayer
+        :type layer: ParameterizedSumLayer
 
         :param ns_info: compiled metadata for the `ns` these tensors belong to
         :type ns_info: ExternalNodeInfo
@@ -366,7 +366,7 @@ class SumParameterization():
         standard backward and :func:`post_backward_layer` --, or None (the default): every call takes the full path.
 
         A parameterization that plans returns in `key` everything those three decide from at this call beyond what
-        the layer's own key holds (`ExternalParamsSumLayer.backward`: the batch, dtypes, device and flags) -- the
+        the layer's own key holds (`ParameterizedSumLayer.backward`: the batch, dtypes, device and flags) -- the
         state its forward left, its own options --, and in `launchers` how many launchers its launch sites add with
         `BACKWARD_PLAN_TAG` on the full path: one per unit of work, each taking `(node_flows, element_flows,
         node_mars, element_mars, params, param_flows, denom_param_flows, kwargs)` -- `kwargs` the backward's, its

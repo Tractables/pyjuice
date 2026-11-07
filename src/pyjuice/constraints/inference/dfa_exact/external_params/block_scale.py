@@ -261,7 +261,7 @@ def sample_minor(gates: SessionGates) -> torch.Tensor:
 
 def session_inputs(pc, layout: Cells, value) -> SessionGates:
     """``sum_external_params`` of a decoder session, checked against the PC (see the module docstring), in its rows."""
-    from pyjuice.layer.external_sum_layer import validate_external_tensors
+    from pyjuice.layer.parameterized_sum_layer import validate_external_tensors
     if not isinstance(value, dict) or len(value) == 0:
         raise ValueError(f"`sum_external_params` must be a non-empty dict of node groups (or registered groups of them) "
                          f"to their gates, got {type(value).__name__}.")

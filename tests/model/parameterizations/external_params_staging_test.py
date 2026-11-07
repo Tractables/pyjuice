@@ -40,7 +40,7 @@ class EchoParams(SumParameterization):
 
     def compile(self, layer):
         self.calls["compile"] += 1
-        layer.register_external_buffers(
+        layer.register_parameterization_buffers(
             "eblk_par", [ns_info.ns.edge_ids[0,:].clone() for ns_info in layer.external_node_infos]
         )
 

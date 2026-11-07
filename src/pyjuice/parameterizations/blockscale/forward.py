@@ -531,7 +531,7 @@ class _ForwardMixin:
         """The split forward's `cbase` per partition (`blockscale_forward_stream_fused.cu`) for a gated forward of
         ``fast_key``'s shape (`SumLayer.forward`'s: the batch, the parameters' dtype, the precision, the bf16 copy
         given) over the product group below (``children``), or None where its settled fork is not the split forward
-        (or none settled yet): what `ExternalParamsSumLayer._stream_fusion` asks for the circuit's decision."""
+        (or none settled yet): what `ParameterizedSumLayer._stream_fusion` asks for the circuit's decision."""
         batch, _, _, op = fast_key
         entry = layer.__dict__.get("_bs_fw_plans", {}).get(batch if not op else (batch, "operands"))
         if entry is None:

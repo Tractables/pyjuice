@@ -341,7 +341,7 @@ def _gated_steps(pc, nodes, gates, x, steps, B):
 @cuda_only
 def test_gated_backward_off_the_split_kernel_fuses_nothing(fused_preferred, monkeypatch):
     """Gated element flows steered to another fork than the split kernel: no product backward fused
-    (`ExternalParamsSumLayer._stream_fusion_bk`), the node flows of a circuit never fusing."""
+    (`ParameterizedSumLayer._stream_fusion_bk`), the node flows of a circuit never fusing."""
     _needs_stream()
     import pyjuice.layer.kernels.c as ck
     real = ck.autotune

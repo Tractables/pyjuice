@@ -904,7 +904,7 @@ def test_a_failed_backward_does_not_leave_the_kernels_installed():
     The failure is INJECTED rather than found in a shape, because every shape that used to raise here
     has since been implemented (`block_size = 32`, then ragged below batch 16). Tying the test to
     whichever shape happens to be unsupported meant rewriting it each time the envelope moved, and it
-    was never the point: what is under test is the `finally` in `ExternalParamsSumLayer.backward`, and
+    was never the point: what is under test is the `finally` in `ParameterizedSumLayer.backward`, and
     injecting the raise exercises it directly and permanently."""
     pc, root, ns, data, phi, _ = _run(256, 128, 8, 64, scale = 1.0)
 

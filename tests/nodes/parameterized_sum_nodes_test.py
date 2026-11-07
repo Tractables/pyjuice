@@ -48,7 +48,7 @@ def test_parameterized_sum_nodes():
         # A subclass of `SumNodes`, so everything that treats it as a sum node keeps working
         assert isinstance(ns, ParameterizedSumNodes) and isinstance(ns, SumNodes)
         assert ns.is_sum() and ns.num_node_blocks == 2 and ns.block_size == block_size
-        assert ns.get_external_signature() == "LowRank_exp_sum_r5"
+        assert ns.get_parameterization_signature() == "LowRank_exp_sum_r5"
 
         # `summate` without a descriptor is untouched
         assert type(plain_ns) is SumNodes

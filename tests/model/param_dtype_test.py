@@ -510,7 +510,7 @@ def test_blockscale_gate_gradients_at_bf16(B):
     (`_sigma`) -- in fp32 whatever the storage (MEASURED: summed in bf16, the gradients came out 0.4-0.5% off). The bf16
     circuits: one compiled so, one that ran its gated passes at fp32 first and was then converted (`set_param_dtype`
     drops the plans and sums built for the old tensor, whose version a new one restarts)."""
-    from pyjuice.layer.external_sum_layer import EXTERNAL_PARAMS_GRAD_KWARG
+    from pyjuice.layer.parameterized_sum_layer import EXTERNAL_PARAMS_GRAD_KWARG
     pc32, pc16, gates = _blockscale_pair(B)
     pc_conv = juice.compile(pc32.root_ns, verbose = False, param_dtype = BF16).to(DEV).set_param_dtype(torch.float32)
     x = torch.randint(0, 8, (B, 6), device = DEV)
@@ -580,7 +580,7 @@ def test_codpula_dual_flows_at_bf16(gated, B):
     sum parameters through the master copy, `params` its rounding). MEASURED on CoDD's PC (32 x 1024, blocks of 32, real
     LLaDA evidence): bf16 vs fp32 flows 2e-6..2.5e-5, the gate gradient 2.6-4.7e-4, the parameters after EM 1e-4 of
     their largest; two fp32 runs 1e-7."""
-    from pyjuice.layer.external_sum_layer import EXTERNAL_PARAMS_GRAD_KWARG
+    from pyjuice.layer.parameterized_sum_layer import EXTERNAL_PARAMS_GRAD_KWARG
     pc32, pc16, gated_ns = _codpula_pair(gated)
     V, C, K = 6, 300, 24
 

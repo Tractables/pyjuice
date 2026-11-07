@@ -57,7 +57,7 @@ import pyjuice as juice
 import pyjuice.nodes.distributions as dists
 from pyjuice.nodes import inputs, multiply, summate
 from pyjuice.parameterizations import BlockScale, LowRank
-from pyjuice.layer.external_sum_layer import ExternalParamsSumLayer
+from pyjuice.layer.parameterized_sum_layer import ParameterizedSumLayer
 
 
 cuda_only = pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs a GPU")
@@ -126,7 +126,7 @@ def _pin_root(pc, ele_idx):
 
 
 def _gated_layer(pc):
-    return [l for g in pc.inner_layer_groups for l in g if isinstance(l, ExternalParamsSumLayer)][0]
+    return [l for g in pc.inner_layer_groups for l in g if isinstance(l, ParameterizedSumLayer)][0]
 
 
 def _gate_shape(ns):

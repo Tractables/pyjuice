@@ -4,7 +4,7 @@ import torch
 import pyjuice.nodes.distributions as dists
 from pyjuice.nodes import multiply, summate, inputs
 from pyjuice.parameterizations import LowRank, SumParameterization
-from pyjuice.layer import SumLayer, ExternalParamsSumLayer, ExternalNodeInfo
+from pyjuice.layer import SumLayer, ParameterizedSumLayer, ExternalNodeInfo
 
 import pytest
 
@@ -15,12 +15,12 @@ def _sum_layers(pc):
 
 
 def _external_layers(pc):
-    return [layer for layer in _sum_layers(pc) if isinstance(layer, ExternalParamsSumLayer)]
+    return [layer for layer in _sum_layers(pc) if isinstance(layer, ParameterizedSumLayer)]
 
 
-def test_external_sum_layer_compilation():
+def test_parameterized_sum_layer_compilation():
     """
-    Sum nodes are grouped into layers by (block size, external signature): a layer compiles one set
+    Sum nodes are grouped into layers by (block size, parameterization signature): a layer compiles one set
     of kernels, so nodes whose effective parameters are formed differently must not share one.
     """
 
@@ -45,17 +45,18 @@ def test_external_sum_layer_compilation():
     pc = juice.compile(n)
     pc.to(device)
 
-    # The three same-depth, same-block-size nodes land in three layers: one per external signature,
+    # The three same-depth, same-block-size nodes land in three layers: one per parameterization signature,
     # plus the plain one. They coexist in a single layer group.
     layer_types = [type(layer).__name__ for layer_group in pc.inner_layer_groups
                    if layer_group.is_sum() and layer_group.num_layers == 3 for layer in layer_group.layers]
 
-    assert sorted(layer_types) == ["ExternalParamsSumLayer", "ExternalParamsSumLayer", "SumLayer"]
+    assert sorted(layer_types) == ["ParameterizedSumLayer", "ParameterizedSumLayer", "SumLayer"]
 
     ext_layers = _external_layers(pc)
 
     assert len(ext_layers) == 2
-    assert sorted([layer.external_signature for layer in ext_layers]) == ["LowRank_exp_sum_r3", "LowRank_exp_sum_r5"]
+    assert sorted([layer.parameterization_signature for layer in ext_layers]) == \
+        ["LowRank_exp_sum_r3", "LowRank_exp_sum_r5"]
 
     for layer in ext_layers:
         assert len(layer.nodes) == 1
@@ -134,7 +135,7 @@ def test_external_node_info():
             assert ns_info.max_n_eblks == max_n_eblks
 
 
-def test_register_external_buffers():
+def test_register_parameterization_buffers():
     """
     A parameterization compiles its own indices through the layer, not onto itself: one descriptor
     instance is shared by every node built with it -- tied duplicates in other layers included -- so
@@ -158,10 +159,10 @@ def test_register_external_buffers():
         def compile(self, layer):
             self.compiled_layers.append(layer)
 
-            layer.register_external_buffers(
+            layer.register_parameterization_buffers(
                 "eblk_par", [ns_info.ns.edge_ids[0,:].clone() for ns_info in layer.external_node_infos]
             )
-            layer.register_external_buffer("num_ns", torch.tensor([len(layer.nodes)], dtype = torch.long))
+            layer.register_parameterization_buffer("num_ns", torch.tensor([len(layer.nodes)], dtype = torch.long))
 
     ext_params = _RecordingParams()
 
@@ -198,14 +199,14 @@ def test_register_external_buffers():
     layer = ext_layers[0]
 
     with pytest.raises(AssertionError):
-        layer.register_external_buffers("eblk_par", [torch.zeros([1], dtype = torch.long)])   # duplicate name
+        layer.register_parameterization_buffers("eblk_par", [torch.zeros([1], dtype = torch.long)])   # duplicate name
 
     with pytest.raises(AssertionError):
-        layer.register_external_buffers("too_many", [torch.zeros([1], dtype = torch.long)] * 3)
+        layer.register_parameterization_buffers("too_many", [torch.zeros([1], dtype = torch.long)] * 3)
 
 
 @pytest.mark.parametrize("corrected", [False, True])
-def test_external_sum_layer_without_external_tensors(corrected):
+def test_parameterized_sum_layer_without_external_tensors(corrected):
     """
     Given no external tensors the layer is a plain sum layer: the hooks are skipped, so a PC with an
     external node computes exactly what the same PC built with `summate` would -- bit for bit where the
@@ -228,7 +229,7 @@ def test_external_sum_layer_without_external_tensors(corrected):
 
     pc_plain, pc_ext = build(False), build(True)
 
-    assert isinstance(_external_layers(pc_ext)[0], ExternalParamsSumLayer)
+    assert isinstance(_external_layers(pc_ext)[0], ParameterizedSumLayer)
     assert len(_external_layers(pc_plain)) == 0
 
     # Identical parameter layout
@@ -257,7 +258,7 @@ def test_external_sum_layer_without_external_tensors(corrected):
         assert torch.equal(pc_plain.params, pc_ext.params)
 
 
-def test_external_sum_layer_tensor_validation():
+def test_parameterized_sum_layer_tensor_validation():
     """
     The external tensors are checked at call time, against the layout the descriptor declares.
     """
@@ -308,7 +309,7 @@ def test_external_sum_layer_tensor_validation():
     assert torch.all(torch.isfinite(pc(data, sum_external_params = {ns: (A, B)})))
 
 
-def test_external_sum_layer_unsupported_settings():
+def test_parameterized_sum_layer_unsupported_settings():
     """
     Settings an external parameterization cannot be combined with must fail loudly, and only when
     external tensors are actually supplied.
@@ -364,7 +365,7 @@ def test_external_sum_layer_unsupported_settings():
         pc.backward(data, allow_modify_flows = False, negate_pflows = True)
 
 
-def test_external_sum_layer_grad_buffers():
+def test_parameterized_sum_layer_grad_buffers():
     """
     Gradient buffers are zeroed once per `pc.backward`, before any layer runs, so that several nodes
     can share one buffer and have their gradients accumulated into it.
@@ -423,11 +424,11 @@ def test_external_sum_layer_grad_buffers():
 
 
 if __name__ == "__main__":
-    test_external_sum_layer_compilation()
+    test_parameterized_sum_layer_compilation()
     test_external_node_info()
-    test_register_external_buffers()
+    test_register_parameterization_buffers()
     for corrected in [False, True]:
-        test_external_sum_layer_without_external_tensors(corrected)
-    test_external_sum_layer_tensor_validation()
-    test_external_sum_layer_unsupported_settings()
-    test_external_sum_layer_grad_buffers()
+        test_parameterized_sum_layer_without_external_tensors(corrected)
+    test_parameterized_sum_layer_tensor_validation()
+    test_parameterized_sum_layer_unsupported_settings()
+    test_parameterized_sum_layer_grad_buffers()

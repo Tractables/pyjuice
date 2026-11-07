@@ -41,7 +41,7 @@ def test_external_sum_params_io():
     # so losing it would silently recompile the PC differently
     assert isinstance(new_ns.parameterization, LowRank)
     assert new_ns.parameterization.rank == 5
-    assert new_ns.get_external_signature() == ns.get_external_signature()
+    assert new_ns.get_parameterization_signature() == ns.get_parameterization_signature()
 
     assert new_ns.num_node_blocks == ns.num_node_blocks and new_ns.block_size == ns.block_size
     assert torch.all(new_ns.edge_ids == ns.edge_ids)

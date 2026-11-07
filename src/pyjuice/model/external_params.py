@@ -14,7 +14,7 @@ from typing import Optional, Sequence
 from pyjuice.nodes import CircuitNodes
 from pyjuice.layer import StagedExternalParams, EXTERNAL_PARAMS_KWARG, EXTERNAL_PARAMS_GRAD_KWARG, \
                           EXTERNAL_PARAMS_BUFFER_KWARG, EXTERNAL_PARAMS_GRAD_BUFFER_KWARG
-from pyjuice.layer.external_sum_layer import validate_external_tensors
+from pyjuice.layer.parameterized_sum_layer import validate_external_tensors
 from pyjuice.parameterizations.base import SumParameterization
 
 

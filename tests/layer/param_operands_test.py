@@ -141,27 +141,27 @@ def _gates(gated, B):
 
 
 def _gated_rows(pc):
-    from pyjuice.layer.external_sum_layer import ExternalParamsSumLayer
+    from pyjuice.layer.parameterized_sum_layer import ParameterizedSumLayer
     return [layer._layer_nid_range for group in pc.inner_layer_groups if group.is_sum() for layer in group
-            if isinstance(layer, ExternalParamsSumLayer)]
+            if isinstance(layer, ParameterizedSumLayer)]
 
 
 @cuda_only
 def test_external_parameter_layers_are_marked_if_their_parameterization_takes_it(monkeypatch):
     """A tied gated chain: its layers take the copy (`SumParameterization.reads_param_operands`, BlockScale's); a
     parameterization that does not declare it leaves its layers unmarked."""
-    from pyjuice.layer.external_sum_layer import ExternalParamsSumLayer
+    from pyjuice.layer.parameterized_sum_layer import ParameterizedSumLayer
     from pyjuice.parameterizations import BlockScale
     root, _ = _gated_chain(L = 128)
     pc = juice.compile(root, verbose = False).to(DEV)
     pc._param_operand_plan()
     gated = [layer for group in pc.inner_layer_groups if group.is_sum() for layer in group
-             if isinstance(layer, ExternalParamsSumLayer)]
+             if isinstance(layer, ParameterizedSumLayer)]
     assert gated and all(layer.__dict__.get("_reads_param_operands") for layer in gated)
     monkeypatch.setattr(BlockScale, "reads_param_operands", False)
     pc2 = juice.compile(root, verbose = False).to(DEV)
     pc2._param_operand_plan()
-    assert not any(isinstance(layer, ExternalParamsSumLayer) for layer in _marked(pc2))
+    assert not any(isinstance(layer, ParameterizedSumLayer) for layer in _marked(pc2))
 
 
 # ---------------------------------------------------------------------------------------------------------------------

@@ -238,13 +238,13 @@ class LowRank(SumParameterization):
     # ------------------------------------------------------------------ forward
 
     def stream_fusion_plan(self, layer, fast_key: tuple, children) -> Optional[tuple]:
-        """What `ExternalParamsSumLayer._stream_fusion` asks for the circuit's decision to leave the product group
+        """What `ParameterizedSumLayer._stream_fusion` asks for the circuit's decision to leave the product group
         below (``children``) to this layer's forward: taken where the forward goes through the mixture's virtual batch,
         whose `expand` then reads each product's value from its two children."""
         return (children,) if lowrank_virtual.fuses(self, layer, children) else None
 
     def stream_fusion_bk(self, layer, batch_size: int, dtype, op: bool, param_flows: bool) -> bool:
-        """What `ExternalParamsSumLayer._stream_fusion_bk` asks, for the circuit's decision and at every backward
+        """What `ParameterizedSumLayer._stream_fusion_bk` asks, for the circuit's decision and at every backward
         handed the product group below (`_bk_stream_children`: its forward and backward not run): taken where this
         layer's last forward went through the virtual batch (a backward at another batch size than that forward's is
         refused whatever this says), whose backward then reads each product's value from its two children and writes

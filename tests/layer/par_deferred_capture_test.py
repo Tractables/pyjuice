@@ -476,7 +476,7 @@ def test_a_backward_that_raised_joined_its_side_captures(monkeypatch):
 def test_a_gated_layer_below_joins_the_side_stream_first(monkeypatch):
     """A regular tied layer above a gated one captures from the gated layer's node values, which that layer's backward
     shifts by log Z in place (its parameterization's `pre_backward_layer`): no capture is left on the side stream at
-    any such shift (`ExternalParamsSumLayer.backward` joins it first), the gated layers' own captures (their products
+    any such shift (`ParameterizedSumLayer.backward` joins it first), the gated layers' own captures (their products
     fused too: BlockScale's split kernels steered) stay on the main stream, and the groups' flows are the main stream's
     to the bit -- the side stream held back."""
     import pyjuice.layer.kernels.c as ck
