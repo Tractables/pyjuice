@@ -69,12 +69,14 @@ void staging_transpose(torch::Tensor dst, torch::Tensor src, int64_t B, int64_t 
 }
 
 // Several transposes in ONE launch -- a forward's staging of every node's tensors, a backward's gradients written
-// back --: pair `blockIdx.z` reads its `(src address, dst address, B, N)` from the launch's PARAMETERS (by value: no
-// table on the device, so nothing to upload or to cache by the pairs' addresses -- a caller handing fresh tensors
-// every call, a router head's output or new gradient buffers, cost an upload a call), a block past its pair's tiles
-// returns (the grid spans the largest pair). At most PAIRS_PER_LAUNCH pairs a launch (2 KB of parameters), more in
-// as many launches. MEASURED (a tied gated HMM-2048 x4: 15 nodes' gates a forward): one call per pair was most of
-// the staging's 83 us of host time.
+// back --: pair `blockIdx.z` reads its `(src address, dst address, B | N << 32, src stride | dst stride << 32)` from the
+// launch's PARAMETERS (by value: no table on the device, so nothing to upload or to cache by the pairs' addresses -- a
+// caller handing fresh tensors every call, a router head's output or new gradient buffers, cost an upload a call), a
+// block past its pair's tiles returns (the grid spans the largest pair). `dst[n * dst stride + b] = src[b * src stride
+// + n]`: a side need not be contiguous, only its rows -- so a member's slot of a group's concatenated tensor, a run in
+// every sample, needs no view of its own. At most PAIRS_PER_LAUNCH pairs a launch (2 KB of parameters), more in as many
+// launches. MEASURED (a tied gated HMM-2048 x4: 15 nodes' gates a forward): one call per pair was most of the
+// staging's 83 us of host time.
 constexpr int PAIRS_PER_LAUNCH = 64;
 struct TransposePairs { long long rows[PAIRS_PER_LAUNCH * 4]; };
 
@@ -82,26 +84,28 @@ __global__ void staging_transpose_batched_kernel(const TransposePairs pairs) {
     const long long* t = pairs.rows + 4 * blockIdx.z;
     const float* src = reinterpret_cast<const float*>(t[0]);
     float* dst = reinterpret_cast<float*>(t[1]);
-    const int B = (int)t[2], N = (int)t[3];
+    const int B = (int)(t[2] & 0xffffffffLL), N = (int)(t[2] >> 32);
+    const int src_stride = (int)(t[3] & 0xffffffffLL), dst_stride = (int)(t[3] >> 32);
     const int n0 = blockIdx.x * 32, b0 = blockIdx.y * 32;
     if (n0 >= N || b0 >= B) return;                     // (the whole block: no barrier is left waiting)
     __shared__ float tile[32][33];
     const int tx = threadIdx.x, ty = threadIdx.y;
     for (int i = 0; i < 32; i += 8) {
         const int b = b0 + ty + i, n = n0 + tx;
-        if (b < B && n < N) tile[ty + i][tx] = src[(long)b * N + n];
+        if (b < B && n < N) tile[ty + i][tx] = src[(long)b * src_stride + n];
     }
     __syncthreads();
     for (int i = 0; i < 32; i += 8) {
         const int n = n0 + ty + i, b = b0 + tx;
-        if (n < N && b < B) dst[(long)n * B + b] = tile[tx][ty + i];
+        if (n < N && b < B) dst[(long)n * dst_stride + b] = tile[tx][ty + i];
     }
 }
 
-// `dst_p[n, b] = src_p[b, n]` for every pair p of `rows` (flat: src address, dst address, B, N per pair -- contiguous
-// float32 tensors of B * N elements each, which the caller guarantees) -- `max_b` / `max_n` the largest B and N.
+// `dst_p[n * dst stride + b] = src_p[b * src stride + n]` for every pair p of `rows` (flat: src address, dst address,
+// B | N << 32, src stride | dst stride << 32 per pair -- float32, which the caller guarantees, a stride of N or B being
+// a contiguous tensor's) -- `max_b` / `max_n` the largest B and N.
 void staging_transpose_batched(const std::vector<int64_t>& rows, int64_t max_b, int64_t max_n) {
-    TORCH_CHECK(rows.size() % 4 == 0, "staging_transpose_batched: 4 entries a pair (src, dst, B, N)");
+    TORCH_CHECK(rows.size() % 4 == 0, "staging_transpose_batched: 4 entries a pair (src, dst, sizes, strides)");
     const long P = (long)rows.size() / 4;
     if (P == 0 || max_b == 0 || max_n == 0) return;
     dim3 block(32, 8);

@@ -17,7 +17,7 @@ import torch
 import pyjuice as juice
 import pyjuice.nodes.distributions as dists
 from pyjuice.nodes import inputs, multiply, summate
-from pyjuice.nodes import BlockScaleSumParams, LowRankSumParams
+from pyjuice.nodes import BlockScaleSumParams, LowRankSumParams, ExternalSumParams
 
 
 NUM_CATS = 4
@@ -326,6 +326,283 @@ def test_a_contiguous_group_stages_in_one_copy():
     ll_r = pc(data_, sum_external_params = {"rev": torch.cat(list(reversed(gates)), dim = 1)}).clone()
     ll_p = pc(data_, sum_external_params = dict(zip(trans, gates))).clone()
     assert torch.equal(ll_g, ll_p) and torch.equal(ll_r, ll_p)
+
+
+def _counting_staging(monkeypatch):
+    """The launches of the batched transpose (the pairs of each) and the generic copies from here on."""
+    from pyjuice.nodes.external_params.kernels.c import get_module
+    mod = get_module()
+    if mod is None or not hasattr(mod, "staging_transpose_batched"):
+        pytest.skip("the CUDA extension did not build")
+    calls = dict(batched = [], copies = 0)
+    real_batched, real_copy = mod.staging_transpose_batched, torch._foreach_copy_
+
+    def batched(rows, max_b, max_n):
+        calls["batched"].append(len(rows) // 4)
+        return real_batched(rows, max_b, max_n)
+
+    def copy(dsts, srcs):
+        calls["copies"] += 1
+        return real_copy(dsts, srcs)
+
+    monkeypatch.setattr(mod, "staging_transpose_batched", batched)
+    monkeypatch.setattr(torch, "_foreach_copy_", copy)
+    return calls
+
+
+def _lowrank_chain(T = 4, K = 8, rank = 3, form = "sum_exp"):
+    """A chain of `T` sums under LowRank (two tensors a node, whose slots alternate in the buffer)."""
+    torch.manual_seed(0)
+    with juice.set_block_size(K):
+        ns = inputs(0, num_node_blocks = 2, dist = dists.Categorical(num_cats = NUM_CATS))
+        members = []
+        for t in range(1, T + 1):
+            emit = inputs(t, num_node_blocks = 2, dist = dists.Categorical(num_cats = NUM_CATS))
+            ns = summate(multiply(ns, emit), num_node_blocks = 2,
+                         external_params = LowRankSumParams(rank = rank, form = form))
+            members.append(ns)
+        root = summate(multiply(ns), num_node_blocks = 1, block_size = 1)
+    torch.manual_seed(0)
+    root.init_parameters(perturbation = 2.0)
+    return root, members
+
+
+def _factors(members, batch, dev, seed):
+    g = torch.Generator(device = "cpu").manual_seed(seed)
+    return [tuple((0.3 * torch.randn(sh, generator = g)).to(dev) for sh in m.external_params.tensor_shapes(m, batch))
+            for m in members]
+
+
+def _cats(factors):
+    return tuple(torch.cat(slot, dim = 1) for slot in zip(*factors))
+
+
+@cuda_only
+@pytest.mark.parametrize("form", ["sum_exp", "exp_sum"])
+def test_a_group_of_several_tensors_goes_in_one_launch_each_way(monkeypatch, form):
+    """A member's slot is one run in every sample of the concatenated tensor: every slot of every member goes to the
+    buffer in one launch of the batched transpose, no view of a member made, and back to the caller's gradient tensors
+    the same way -- bit for bit what the per-node form stages and computes, through one PC. A backward with no
+    destinations after one with them writes nothing into them."""
+    dev, batch, T = torch.device("cuda:0"), 40, 4                  # (a batch not a multiple of 32)
+    root, members = _lowrank_chain(T = T, form = form)
+    pc = juice.compile(root, verbose = False).to(dev)
+    pc.register_external_params_group("tr", members)
+    data = torch.randint(0, NUM_CATS, [batch, T + 1], device = dev)
+    factors = _factors(members, batch, dev, 5)
+
+    ll_p = pc(data, sum_external_params = dict(zip(members, factors))).clone()
+    staged_p = pc.external_params.clone()
+    pc.backward(data, flows_memory = 0.0)
+    grads_p = [tuple(g.clone() for g in pc.get_external_params_grad(m)) for m in members]
+
+    calls = _counting_staging(monkeypatch)
+    cats = _cats(factors)
+    ll_g = pc(data, sum_external_params = {"tr": cats}).clone()
+    assert calls == dict(batched = [2 * T], copies = 0), calls
+    assert torch.equal(pc.external_params, staged_p) and torch.equal(ll_g, ll_p)
+
+    calls.update(batched = [], copies = 0)
+    grads = tuple(torch.full_like(c, float("nan")) for c in cats)
+    pc.backward(data, flows_memory = 0.0, sum_external_params_grad = {"tr": grads})
+    torch.cuda.synchronize()
+    assert calls == dict(batched = [2 * T], copies = 0), calls
+    for slot, got in enumerate(grads):
+        assert torch.equal(got, torch.cat([g[slot] for g in grads_p], dim = 1)), f"slot {slot}"
+    assert float(grads[0].abs().max()) > 0.0
+    assert pc._external_grad_groups is None, "the caller's tensors are let go"
+
+    kept = tuple(g.clone() for g in grads)
+    pc(data, sum_external_params = {"tr": tuple(0.5 * c for c in cats)})
+    pc.backward(data, flows_memory = 0.0)
+    torch.cuda.synchronize()
+    assert all(torch.equal(a, b) for a, b in zip(grads, kept)), "a backward with no destinations wrote into the last's"
+
+
+@cuda_only
+def test_a_group_in_one_launch_at_other_batches_and_where_the_buffer_moved(monkeypatch):
+    """What is kept of a group is per batch size and holds no address: other batches -- one large enough to move the
+    staging buffer -- and fresh tensors each call stage what they should, in one launch each, gradients coming back too."""
+    dev, T = torch.device("cuda:0"), 3
+    root, members = _lowrank_chain(T = T)
+    pc = juice.compile(root, verbose = False).to(dev)
+    pc.register_external_params_group("tr", members)
+    calls = _counting_staging(monkeypatch)
+    for seed, batch in enumerate((40, 8, 1024, 8, 40)):
+        data = torch.randint(0, NUM_CATS, [batch, T + 1], device = dev)
+        factors = _factors(members, batch, dev, 100 + seed)
+        calls.update(batched = [], copies = 0)
+        pc(data, sum_external_params = {"tr": _cats(factors)})
+        assert calls == dict(batched = [2 * T], copies = 0), f"batch {batch}: {calls}"
+        for m, tensors in zip(members, factors):
+            for staged, t in zip(pc._staged_external_params[m], tensors):
+                assert torch.equal(staged, t.permute(1, 2, 0)), f"batch {batch}"
+        grads = tuple(torch.empty_like(c) for c in _cats(factors))
+        pc.backward(data, flows_memory = 0.0, sum_external_params_grad = {"tr": grads})
+        torch.cuda.synchronize()
+        for slot, got in enumerate(grads):
+            want = torch.cat([pc.get_external_params_grad(m)[slot] for m in members], dim = 1)
+            assert torch.equal(got, want), f"batch {batch}, slot {slot}"
+
+
+@cuda_only
+def test_a_group_whose_members_differ_along_the_group_axis_in_one_launch(monkeypatch):
+    """Members of different node counts: the runs have their own lengths, the grid spans the longest, the other
+    pair's extra blocks return."""
+    dev, batch, K, rank = torch.device("cuda:0"), 40, 8, 3
+    torch.manual_seed(0)
+    with juice.set_block_size(K):
+        n = [inputs(v, num_node_blocks = 2, dist = dists.Categorical(num_cats = NUM_CATS)) for v in range(4)]
+        s0 = summate(multiply(n[0], n[1]), num_node_blocks = 1, external_params = LowRankSumParams(rank = rank))
+        s1 = summate(multiply(n[2], n[3]), num_node_blocks = 3, external_params = LowRankSumParams(rank = rank))
+        top = multiply(s0, s1, edge_ids = torch.tensor([[0, 0], [0, 1], [0, 2]]))
+        root = summate(top, num_node_blocks = 1, block_size = 1)
+    torch.manual_seed(0)
+    root.init_parameters(perturbation = 2.0)
+    pc = juice.compile(root, verbose = False).to(dev)
+    pc.register_external_params_group("two", [s0, s1])
+    data = torch.randint(0, NUM_CATS, [batch, 4], device = dev)
+    factors = _factors([s0, s1], batch, dev, 7)
+    assert factors[0][0].size(1) != factors[1][0].size(1)
+
+    ll_p = pc(data, sum_external_params = {s0: factors[0], s1: factors[1]}).clone()
+    staged_p = pc.external_params.clone()
+    pc.backward(data, flows_memory = 0.0)
+    want = tuple(torch.cat([pc.get_external_params_grad(m)[slot] for m in (s0, s1)], dim = 1) for slot in range(2))
+
+    calls = _counting_staging(monkeypatch)
+    cats = _cats(factors)
+    assert torch.equal(pc(data, sum_external_params = {"two": cats}), ll_p)
+    assert torch.equal(pc.external_params, staged_p) and calls == dict(batched = [4], copies = 0), calls
+    grads = tuple(torch.empty_like(c) for c in cats)
+    pc.backward(data, flows_memory = 0.0, sum_external_params_grad = {"two": grads})
+    torch.cuda.synchronize()
+    assert all(torch.equal(a, b) for a, b in zip(grads, want))
+
+
+@cuda_only
+def test_a_group_of_one_tensor_a_node_out_of_the_buffers_order_in_one_launch(monkeypatch):
+    """Members that are not adjacent in the group's order are not one transpose, but they are one launch."""
+    dev, batch = torch.device("cuda:0"), 40
+    root, s0, s1 = _two_gated()
+    pc = juice.compile(root, verbose = False).to(dev)
+    data = torch.randint(0, NUM_CATS, [batch, 3], device = dev)
+    g0, g1 = _gates(s0, batch, dev, 11), _gates(s1, batch, dev, 12)
+    ll_p = pc(data, sum_external_params = {s0: g0, s1: g1}).clone()
+    staged_p = pc.external_params.clone()
+    pc.backward(data, flows_memory = 0.0)
+    want = torch.cat([pc.get_external_params_grad(s1)[0], pc.get_external_params_grad(s0)[0]], dim = 1)
+
+    pc.register_external_params_group("rev", [s1, s0])
+    calls = _counting_staging(monkeypatch)
+    cat = torch.cat([g1, g0], dim = 1)
+    assert torch.equal(pc(data, sum_external_params = {"rev": cat}), ll_p)
+    assert torch.equal(pc.external_params, staged_p) and calls == dict(batched = [2], copies = 0), calls
+    got = torch.empty_like(cat)
+    pc.backward(data, flows_memory = 0.0, sum_external_params_grad = {"rev": got})
+    torch.cuda.synchronize()
+    assert torch.equal(got, want)
+
+
+class _CallersOrder(ExternalSumParams):
+    """Two tensors a node, stored in the caller's order (`storage_perm` None): not a transpose, whatever it holds."""
+
+    def get_signature(self):
+        return "CallersOrder"
+
+    def tensor_shapes(self, ns, batch_size):
+        return ((batch_size, ns.num_nodes, 2), (batch_size, 3, ns.num_ch_nodes))
+
+    def forward(self, layer, ns_info, tensors, node_mars, element_mars, params, **kwargs):
+        pass
+
+    def pre_backward(self, layer, ns_info, tensors, node_flows, element_flows, node_mars, element_mars, params, **kwargs):
+        pass
+
+    def post_backward(self, layer, ns_info, tensors, grad_tensors, node_flows, element_flows, node_mars, element_mars,
+                      params, param_flows = None, **kwargs):
+        pass
+
+
+@cuda_only
+def test_a_group_stored_in_the_callers_order_goes_the_per_node_way(monkeypatch):
+    """Only storage that is the caller's with the batch moved to the end is a transpose: any other stays a copy."""
+    dev, batch = torch.device("cuda:0"), 40
+    torch.manual_seed(0)
+    with juice.set_block_size(8):
+        n = [inputs(v, num_node_blocks = 1, dist = dists.Categorical(num_cats = NUM_CATS)) for v in range(3)]
+        s0 = summate(multiply(n[0], n[1]), num_node_blocks = 1, external_params = _CallersOrder())
+        s1 = summate(multiply(s0, n[2]), num_node_blocks = 1, external_params = _CallersOrder())
+        root = summate(multiply(s1), num_node_blocks = 1, block_size = 1)
+    root.init_parameters(perturbation = 2.0)
+    pc = juice.compile(root, verbose = False).to(dev)
+    pc.register_external_params_group("two", [s0, s1])
+    data = torch.randint(0, NUM_CATS, [batch, 3], device = dev)
+    factors = _factors([s0, s1], batch, dev, 3)
+    calls = _counting_staging(monkeypatch)
+    pc(data, sum_external_params = {"two": _cats(factors)})
+    assert calls["batched"] == [] and calls["copies"] == 1, calls
+    for m, tensors in zip((s0, s1), factors):
+        for staged, t in zip(pc._staged_external_params[m], tensors):
+            assert torch.equal(staged, t)
+
+
+@cuda_only
+def test_what_a_group_in_one_launch_does_not_take_goes_the_per_node_way(monkeypatch):
+    """Tensors that are not contiguous fp32 of the concatenation's exact shape, on the buffer's device, are the per-node
+    path's: which stages what it can, and says what is wrong with the rest. So does a node named twice, among
+    the gradients' destinations as among the tensors, a group member that got no external parameters, and a group mixed
+    with the nodes it leaves out."""
+    dev, batch, T = torch.device("cuda:0"), 40, 4
+    root, members = _lowrank_chain(T = T)
+    pc = juice.compile(root, verbose = False).to(dev)
+    pc.register_external_params_group("tr", members)
+    pc.register_external_params_group("head", members[:2])
+    data = torch.randint(0, NUM_CATS, [batch, T + 1], device = dev)
+    factors = _factors(members, batch, dev, 9)
+    cats = _cats(factors)
+    pc(data, sum_external_params = dict(zip(members, factors)))
+    staged_p = pc.external_params.clone()
+    calls = _counting_staging(monkeypatch)
+
+    # not contiguous: every other row of a taller tensor
+    def spaced(c):
+        big = torch.empty(2 * c.size(0), *c.shape[1:], device = dev)
+        big[::2] = c
+        return big[::2]
+    pc(data, sum_external_params = {"tr": tuple(spaced(c) for c in cats)})
+    assert calls["batched"] == [] and calls["copies"] == 1 and torch.equal(pc.external_params, staged_p), calls
+
+    # a group with the nodes it leaves out, in one dict
+    calls.update(batched = [], copies = 0)
+    pc(data, sum_external_params = {"head": _cats(factors[:2]), **dict(zip(members[2:], factors[2:]))})
+    assert calls["batched"] == [4, 4] and torch.equal(pc.external_params, staged_p), calls
+
+    # another dtype, another device: refused, never read as float32 bytes or through a host address
+    with pytest.raises(AssertionError, match = "float32"):
+        pc(data, sum_external_params = {"tr": tuple(c.double() for c in cats)})
+    with pytest.raises(AssertionError, match = "is on"):
+        pc(data, sum_external_params = {"tr": tuple(c.cpu() for c in cats)})
+
+    # the slots the wrong way round: right rank, wrong extents
+    with pytest.raises(AssertionError, match = "concatenation"):
+        pc(data, sum_external_params = {"tr": cats[::-1]})
+    with pytest.raises(AssertionError, match = "expects 2 concatenated"):
+        pc(data, sum_external_params = {"tr": cats[0]})
+    with pytest.raises(AssertionError, match = "both directly and through group"):
+        pc(data, sum_external_params = {"tr": cats, members[0]: factors[0]})
+
+    # the gradients' destinations
+    pc(data, sum_external_params = {"tr": cats})
+    grads = tuple(torch.empty_like(c) for c in cats)
+    with pytest.raises(AssertionError, match = "both directly and through group"):
+        pc.backward(data, flows_memory = 0.0, sum_external_params_grad = {"tr": grads, members[0]: factors[0]})
+    pc(data, sum_external_params = dict(zip(members[:3], factors[:3])))
+    with pytest.raises(AssertionError, match = "not given external"):
+        pc.backward(data, flows_memory = 0.0, sum_external_params_grad = {"tr": grads})
+    pc(data, sum_external_params = {"tr": cats})
+    with pytest.raises(AssertionError, match = "shape"):
+        pc.backward(data, flows_memory = 0.0, sum_external_params_grad = {"tr": grads[::-1]})
 
 
 @cuda_only

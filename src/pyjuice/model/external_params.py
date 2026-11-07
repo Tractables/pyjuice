@@ -64,10 +64,45 @@ def _staged_transposes_batched(fn, fast: list) -> bool:
             return False
         batch = src.size(0)
         n = src.numel() // max(batch, 1)
-        rows += (src.data_ptr(), dst.data_ptr(), batch, n)
+        rows += (src.data_ptr(), dst.data_ptr(), batch | n << 32, n | batch << 32)
         max_b, max_n = max(max_b, batch), max(max_n, n)
     batched(rows, max_b, max_n)
     return True
+
+
+class _GroupRows:
+    """
+    What staging a whole group takes where it is not one transpose -- several tensors a node (their slots alternate in
+    the buffer), or members that are not adjacent: a transpose a member's slot, all of them in one launch of the
+    extension's batched transpose. A member's slot is one run in every sample of the caller's concatenation, and that
+    is all the transpose needs of it, so the group is neither split into views nor validated a node at a time, which
+    with the generic copies of those strided views was the staging's cost (MEASURED, LowRank, a tied HMM of 1024
+    latents and 31 layers, batch 16: 0.36 ms of the forward's 1.3 ms of host time). Sizes and offsets only, for one
+    batch size; the addresses are the call's.
+    """
+    __slots__ = ("shapes", "to_buffer", "to_caller", "max_n")
+
+    def __init__(self, shapes, to_buffer, to_caller, max_n):
+        self.shapes = shapes                # per slot: the shape of the concatenated tensor
+        self.to_buffer = to_buffer          # per slot: per member `(offset in it, offset in the buffer, sizes, strides)`
+        self.to_caller = to_caller          # ... the other way round (sizes and strides swapped)
+        self.max_n = max_n                  # the most elements a member's slot holds in a sample
+
+    def launch(self, batched, tensors, buffer, to_buffer: bool) -> None:
+        """The transposes between the concatenated `tensors` and `buffer`, whichever way, in one launch."""
+        rows, at = [], buffer.data_ptr()
+        if to_buffer:
+            for cat, slot in zip(tensors, self.to_buffer):
+                base = cat.data_ptr()
+                for offset, slot_offset, sizes, strides in slot:
+                    rows += (base + offset, at + slot_offset, sizes, strides)
+            batched(rows, self.shapes[0][0], self.max_n)
+        else:
+            for cat, slot in zip(tensors, self.to_caller):
+                base = cat.data_ptr()
+                for offset, slot_offset, sizes, strides in slot:
+                    rows += (at + slot_offset, base + offset, sizes, strides)
+            batched(rows, self.max_n, self.shapes[0][0])
 
 
 def _staged_copy(plain_d: list, plain_s: list, fast: list) -> None:
@@ -121,6 +156,12 @@ class _ExternalParamsMixin:
         between the two, so this is the exact inverse of what staging does on the forward, batched into
         one `_foreach_copy_` rather than one op per node.
         """
+        groups = self.__dict__.get("_external_grad_groups")
+        if groups:
+            for batched, rows, cats in groups:
+                rows.launch(batched, cats, self.external_params_grad, to_buffer = False)
+            self._external_grad_groups = None
+
         dsts = getattr(self, "_external_grad_dsts", None)
         if not dsts:
             return None
@@ -409,6 +450,70 @@ class _ExternalParamsMixin:
         start = (base.data_ptr() - buf.data_ptr()) // elem
         return buf.narrow(0, start, total), cat
 
+    def _group_rows(self, name: str, batch_size: int) -> Optional[_GroupRows]:
+        """The group's :class:`_GroupRows` at `batch_size`, or None where its members do not lend themselves: another
+        axis than the first after the batch, storage that is not the caller's with the batch moved to the end, slots
+        shared with another node. Kept per group and batch size (the layout depends on nothing else)."""
+        memo = self.__dict__.setdefault("_ext_group_rows", {})
+        key = (name, batch_size)
+        if key in memo:
+            return memo[key]
+        memo[key] = None
+        nodes, dim = self.external_params_groups[name]
+        if dim != 1 or not all(self._ext_ns_static(ns) == (True, ns) for ns in nodes):
+            return None
+        _, ns2slots = self._external_params_layout(batch_size)
+        shapes_of = [ns.external_params.tensor_shapes(ns, batch_size) for ns in nodes]
+        cat_shapes, to_buffer, to_caller, max_n = [], [], [], 0
+        elem = 4                                    # (float32: the buffer's, and what `launch`'s callers check)
+        for slot in range(len(shapes_of[0])):
+            sizes = [tuple(shapes[slot]) for shapes in shapes_of]
+            if not all(len(sz) >= 2 and sz[0] == batch_size and sz[2:] == sizes[0][2:] for sz in sizes):
+                return None
+            inner = math.prod(sizes[0][2:])
+            total = sum(sz[1] for sz in sizes) * inner
+            if batch_size == 0 or total >= 1 << 31:
+                return None
+            rows_in, rows_out, run = [], [], 0
+            for ns, sz in zip(nodes, sizes):
+                offset, shape = ns2slots[ns][slot]
+                n = sz[1] * inner
+                if math.prod(shape) != batch_size * n:
+                    return None
+                rows_in.append((run * elem, offset * elem, batch_size | n << 32, total | batch_size << 32))
+                rows_out.append((run * elem, offset * elem, n | batch_size << 32, batch_size | total << 32))
+                run += n
+                max_n = max(max_n, n)
+            cat_shapes.append((batch_size, sum(sz[1] for sz in sizes)) + sizes[0][2:])
+            to_buffer.append(rows_in)
+            to_caller.append(rows_out)
+        memo[key] = _GroupRows(cat_shapes, to_buffer, to_caller, max_n)
+        return memo[key]
+
+    def _group_batched(self, name: str, tensors, batch_size: int, buffer: torch.Tensor):
+        """`(the batched transpose, the group's rows, its tensors)` where the group's concatenated `tensors` can go
+        between the caller and `buffer` that way -- contiguous fp32 of exactly the concatenation's shape, the extension
+        built --, else None: the per-node path takes it, and what is wrong with it, if anything, is said there."""
+        fn = _staging_transpose_fn()
+        from pyjuice.nodes.external_params.kernels.c import get_module
+        mod = get_module()
+        batched = getattr(mod, "staging_transpose_batched", None) if mod is not None else None
+        if batched is None or fn is not mod.staging_transpose or not buffer.is_cuda:
+            return None
+        rows = self._group_rows(name, batch_size)
+        if rows is None:
+            return None
+        if torch.is_tensor(tensors):
+            tensors = (tensors,)
+        if not isinstance(tensors, (tuple, list)) or len(tensors) != len(rows.shapes):
+            return None
+        device = buffer.device
+        for cat, shape in zip(tensors, rows.shapes):
+            if not (torch.is_tensor(cat) and cat.dtype == torch.float32 and cat.device == device
+                    and cat.is_contiguous() and tuple(cat.size()) == shape):
+                return None
+        return batched, rows, tensors
+
     def _expand_external_params_groups(self, ns2tensors: dict, batch_size: int) -> dict:
         """
         Replace every group-name key with one entry per member, holding a VIEW of the caller's tensor.
@@ -563,6 +668,13 @@ class _ExternalParamsMixin:
                 group_fast.append(whole)
                 group_done.update(self.external_params_groups[key][0])
                 fast_keys.add(key)
+                continue
+            taken = self._group_batched(key, tensors, batch_size, self.__dict__[name])
+            if taken is not None:
+                batched, rows, cats = taken
+                rows.launch(batched, cats, self.__dict__[name], to_buffer = True)
+                group_done.update(self.external_params_groups[key][0])
+                fast_keys.add(key)
 
         # A group staged wholesale is dropped BEFORE the expansion: splitting it into T views and
         # validating each, only for the loop below to skip them, was most of what was left of the cost.
@@ -696,6 +808,32 @@ class _ExternalParamsMixin:
                     f"`{kwarg_name}` contains a node that this PC did not compile with an external " \
                     f"parameterization: {ns}. Construct it with `pyjuice.summate(..., external_params = ...)`."
 
+    def _take_whole_grad_groups(self, dsts: dict, batch_size: int) -> dict:
+        """The destinations that are whole groups going back in one launch (`_group_batched`) noted for the end of the
+        backward (`_external_grad_groups`); what is left of `dsts` returned for the per-node path. Nothing is taken where
+        a node is named twice, or a group's member got no external parameters: the per-node path says so."""
+        if not any(isinstance(k, str) for k in dsts):
+            return dsts
+        seen = {k for k in dsts if not isinstance(k, str)}
+        for key in dsts:
+            if isinstance(key, str):
+                members = self.external_params_groups[key][0] if key in self.external_params_groups else ()
+                if any(ns in seen or ns not in self._staged_external_params for ns in members):
+                    return dsts
+                seen.update(members)
+        taken, rest = [], dict()
+        for key, tensors in dsts.items():
+            whole = None
+            if isinstance(key, str) and key in self.external_params_groups:
+                whole = self._group_batched(key, tensors, batch_size, self.external_params)    # (its device: the gradient
+                                                                                                # buffer is allocated next)
+            if whole is None:
+                rest[key] = tensors
+            else:
+                taken.append(whole)
+        self._external_grad_groups = taken or None
+        return rest
+
     def _init_external_params_grads(self, kwargs: dict, batch_size: int, compute_external_grads: bool) -> None:
         """
         Allocate and zero the gradient buffer for the staged external parameters, and hand the layers
@@ -714,6 +852,7 @@ class _ExternalParamsMixin:
         # keeps working either way.
         dsts = kwargs.pop(EXTERNAL_PARAMS_GRAD_KWARG, None)
         self._external_grad_dsts = None
+        self._external_grad_groups = None
         if dsts is not None:
             assert isinstance(dsts, dict), \
                 f"`{EXTERNAL_PARAMS_GRAD_KWARG}` should be a dict mapping nodes (or group names) to " \
@@ -721,6 +860,7 @@ class _ExternalParamsMixin:
             assert self._staged_external_params is not None, \
                 f"`{EXTERNAL_PARAMS_GRAD_KWARG}` was given, but the forward pass received no external " \
                 f"parameters."
+            dsts = self._take_whole_grad_groups(dsts, batch_size)
             dsts = self._expand_external_params_groups(dsts, batch_size)
             for ns, tensors in dsts.items():
                 assert ns in self._staged_external_params, \
