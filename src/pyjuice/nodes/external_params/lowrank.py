@@ -129,7 +129,29 @@ class LowRankSumParams(ExternalSumParams):
     # ------------------------------------------------------------------ layout
 
     def tensor_shapes(self, ns, batch_size: int):
+        """What the caller hands over: `A [B, M, K]`, `B [B, K, N]`."""
         return ((batch_size, ns.num_nodes, self.rank), (batch_size, self.rank, ns.num_ch_nodes))
+
+    def storage_shapes(self, ns, batch_size: int):
+        """Stored with the batch innermost -- `A [M, K, B]`, `B [K, N, B]` --, as the circuit's own buffers are: the
+        kernels' threads run over the samples, and read consecutive addresses from every tensor alike. The staging
+        copy is the transpose (`storage_perm`), the gradients come back the same way."""
+        return ((ns.num_nodes, self.rank, batch_size), (self.rank, ns.num_ch_nodes, batch_size))
+
+    def storage_perm(self):
+        return (1, 2, 0)
+
+    def storage_offsets(self, ns):
+        """Where an edge block's entries begin in each slot, in per-batch units (the layer's tables; the passes here
+        address the slots by their own geometry): `A` at the node block's first node, `B` at the child block's first
+        child."""
+        nb, cb = ns.edge_ids[0].long(), ns.edge_ids[1].long()
+        return (nb * (ns.block_size * self.rank), cb * ns.ch_block_size)
+
+    @staticmethod
+    def _as_given(tensors):
+        """The staged `(A [M, K, B], B [K, N, B])` as the caller's `(A [B, M, K], B [B, K, N])`: views."""
+        return tensors[0].permute(2, 0, 1), tensors[1].permute(2, 0, 1)
 
     def _geometry(self, layer, ns_info, device):
         """
@@ -248,7 +270,8 @@ class LowRankSumParams(ExternalSumParams):
             form_elements(element_mars, node_mars, children)
 
         state = layer.__dict__["_lr_state"] = dict()
-        for ns_info, (A, Bm) in ns_tensors:
+        for ns_info, tensors in ns_tensors:
+            A, Bm = self._as_given(tensors)
             geo = self._geometry(layer, ns_info, node_mars.device)
             theta = self._dense_params(geo, params)
             lc = self._child_values(geo, element_mars)
@@ -344,7 +367,8 @@ class LowRankSumParams(ExternalSumParams):
 
         want_denom = param_flows is not None and denom_param_flows is not None and self.apply_z_correction
 
-        for (ns_info, (A, Bm)), grads, geo in zip(ns_tensors, ns_grad_tensors, geos):
+        for (ns_info, tensors), grads, geo in zip(ns_tensors, ns_grad_tensors, geos):
+            A, Bm = self._as_given(tensors)
             theta = self._dense_params(geo, params)
             lc = self._child_values(geo, element_mars)
             rows = slice(ns_info.nid_start, ns_info.nid_end)
@@ -365,9 +389,9 @@ class LowRankSumParams(ExternalSumParams):
             if want_denom:
                 off = self._denom_offsets(layer)[id(ns_info.ns)][0]
                 denom_param_flows.index_add_(0, off + geo["local"], Fm.reshape(-1)[geo["flat"]].to(denom_param_flows.dtype))
-            if grads is not None:
-                grads[0].add_(dA)
-                grads[1].add_(dB)
+            if grads is not None:                                   # (the buffers as stored: batch innermost)
+                grads[0].add_(dA.permute(1, 2, 0))
+                grads[1].add_(dB.permute(1, 2, 0))
 
         return None
 

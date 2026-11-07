@@ -992,9 +992,9 @@ def _normalizer_calls(monkeypatch):
             if attr != "lowrank_normalizer_operands":
                 return fn
 
-            def counted(U, V, *args):
-                calls.append((U.size(0), U.dtype))
-                return fn(U, V, *args)
+            def counted(Ut, Vt, *args):                              # (`Ut` [M, rows]: the rows are the copies')
+                calls.append((Ut.size(1), Ut.dtype))
+                return fn(Ut, Vt, *args)
             return counted
 
     counted = Counted()
@@ -1097,8 +1097,8 @@ def test_the_normalizer_products_with_fewer_copies_and_without_some_gradients(mo
 
 @needs_virtual
 def test_the_normalizer_products_shift_large_factors(monkeypatch):
-    """Factors whose entries reach +-60: `exp(B)` alone would overflow fp32; shifted by each row's largest entry, the
-    products are the torch passes' (which work in float64)."""
+    """Factors whose entries pass 89: `exp(B)` alone overflows fp32 (past 88.7); shifted by each row's largest entry,
+    the products are the torch passes' (which work in float64)."""
     import pyjuice.nodes.external_params.lowrank_virtual as lowrank_virtual
 
     rank, batch = 2, 4
@@ -1106,12 +1106,58 @@ def test_the_normalizer_products_shift_large_factors(monkeypatch):
     dev = pc.params.device
     torch.manual_seed(21)
     data = torch.randint(0, NUM_CATS, (batch, pc.num_vars), device = dev)
-    ext = {a: _factors(a, rank, batch, dev, spread = 20.0, seed = 300 + i) for i, a in enumerate(sums)}
-    assert max(float(B.abs().max()) for _, B in ext.values()) > 50
+    ext = {a: _factors(a, rank, batch, dev, spread = 40.0, seed = 300 + i) for i, a in enumerate(sums)}
+    assert max(float(B.max()) for _, B in ext.values()) > 89
     got = _passes(pc, sums, data, ext)
     assert got["path"] == {tuple} and all(torch.isfinite(t).all() for t in (got["fp"], got["fm"], *got["dB"]))
     monkeypatch.setattr(lowrank_virtual, "ENABLED", False)
     _same(got, _passes(pc, sums, data, ext), rtol = 1e-3, atol = 1e-4)
+
+
+@needs_virtual
+def test_the_normalizer_operands_follow_their_formulas_and_a_node_without_mass_gives_zeros():
+    """The kernel's contract, checked directly: `Vt[j, (c, r, b)] = exp(B_c[r, j, b] - shift)` with the shift the row's
+    largest `B_c[r, :, b]`, and `Ut[i, (c, r, b)] = exp(lf_c[i, b] + A_c[i, r, b] - log Z_c[i, b] + shift)`; a node
+    without flow (`lf = -inf`) gives 0 -- also where it has no mass at all (factors of -inf, `log Z = -inf`, so its
+    value and its flow are -inf: `-inf - -inf` would be NaN). Two copies, the second's rows after the first's; float32
+    and bfloat16 operands."""
+    import pyjuice.nodes.external_params.lowrank_virtual as lowrank_virtual
+
+    mod, dev = lowrank_virtual._module(), torch.device("cuda")
+    M, N, K, B, copies = 3, 300, 2, 37, 2                                      # children past one chunk, samples past one warp
+    g = torch.Generator(device = "cpu").manual_seed(7)
+    fa = [(torch.randn(M, K, B, generator = g) * 3).to(dev) for _ in range(copies)]
+    fb = [(torch.randn(K, N, B, generator = g) * 3).to(dev) for _ in range(copies)]
+    lz = [(torch.randn(M, B, generator = g) * 3).to(dev) for _ in range(copies)]
+    node_flows = (torch.randn(2 + copies * M, B, generator = g) - 1.0).to(dev)        # log flows, the copies' rows below 2
+    nid0 = [2, 2 + M]
+    node_flows[nid0[0] + 1, 2] = -float("inf")                                        # copy 0, node 1, sample 2: no flow
+    lz[1][0, 4] = -float("inf")                                                       # copy 1, node 0, sample 4: no mass
+    fa[1][0, :, 4] = -float("inf")
+    node_flows[nid0[1] + 0, 4] = -float("inf")                                        # (so no flow either)
+
+    rows = copies * B * K
+    for dtype in (torch.float32, torch.bfloat16):
+        Ut = torch.full((M, rows), float("nan"), dtype = dtype, device = dev)
+        Vt = torch.full((N, rows), float("nan"), dtype = dtype, device = dev)
+        shift = torch.full((rows,), float("nan"), device = dev)
+        mod.lowrank_normalizer_operands(Ut, Vt, shift, node_flows, fa, lz, fb, nid0, M, K)
+        torch.cuda.synchronize()
+        for c in range(copies):
+            for r in range(K):
+                row = c * B * K + r * B + torch.arange(B, device = dev)
+                sh = fb[c][r].max(dim = 0).values                                     # [B]
+                assert torch.equal(shift[row], sh)
+                want_v = torch.exp(fb[c][r] - sh)                                     # [N, B]
+                lf = node_flows[nid0[c]:nid0[c] + M]                                  # [M, B]
+                want_u = torch.exp(lf + fa[c][:, r] - lz[c] + sh)
+                want_u = torch.where(torch.isneginf(lf) | torch.isneginf(lz[c]), torch.zeros_like(want_u), want_u)
+                tol = dict(rtol = 1e-5, atol = 1e-6) if dtype is torch.float32 else dict(rtol = 1e-2, atol = 1e-3)
+                assert torch.allclose(Vt[:, row].float(), want_v, **tol)
+                assert torch.allclose(Ut[:, row].float(), want_u, **tol)
+        assert torch.isfinite(Ut.float()).all() and torch.isfinite(Vt.float()).all()
+        assert float(Ut[1, 0 * B * K + 0 * B + 2]) == 0.0 and float(Ut[1, 0 * B * K + 1 * B + 2]) == 0.0
+        assert float(Ut[0, 1 * B * K + 0 * B + 4]) == 0.0 and float(Ut[0, 1 * B * K + 1 * B + 4]) == 0.0
 
 
 @needs_virtual
@@ -1142,6 +1188,12 @@ def test_a_backward_after_one_that_stopped_midway(monkeypatch):
     a whole one: the torch passes' flows and gradients, one plain backward a layer, one pair of products."""
     import pyjuice.nodes.external_params.lowrank_virtual as lowrank_virtual
     from pyjuice.layer.sum_layer import SumLayer
+
+    # (no trials of the circuit's tuner: one that raised would be a candidate dropped, not the backward stopping)
+    import pyjuice.layer.kernels.autotune as autotune
+    pick = autotune.pick
+    monkeypatch.setattr(autotune, "pick", lambda key, cands, bench, **kw:
+                        "fused" if key[0] == "prod_stream_fusion_bk" else pick(key, cands, bench, **kw))
 
     rank, batch = 2, 4
     pc, sums, _, _, _, _ = _pair("hmm_tied", "sum_exp", rank = rank, seq_length = 6)

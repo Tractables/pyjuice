@@ -40,9 +40,11 @@
 // each copy's `dB`.
 //
 // Layouts: the circuit's buffers `[rows, batch]`, batch innermost; the virtual ones `[rows, columns]`, a sample's K
-// ranks adjacent from column `b K` of a half; the factors as staged, `A [batch, M, K]`, `B [batch, K, N]`; per-node
-// state `[batch, M]` and `[batch, M, K]`. One thread a (row, sample), its K ranks in a loop: every read and write of
-// the virtual buffers and of `A` is K adjacent floats.
+// ranks adjacent from column `b K` of a half; the factors AS STAGED, batch innermost too -- `A [M, K, batch]`,
+// `B [K, N, batch]` (`LowRankSumParams.storage_shapes`: the staging copy is the transpose from the caller's
+// `[batch, M, K]` and `[batch, K, N]`), the gradients the same way; per-node state `[M, batch]` and `[M, K, batch]`.
+// One thread a (row, sample), adjacent threads adjacent samples, its K ranks in a loop: every access of a warp is to
+// consecutive addresses, for the circuit's buffers, the virtual ones, the factors and the state alike.
 
 #include <torch/extension.h>
 #include <vector>
@@ -81,14 +83,15 @@ inline __device__ void expand_at(long t, float* vd, long cd, long od, float* vz,
         c = vals[e * B + b];
     }
     float* outd = vd + e * cd + od + (long)b * K;
-    const float* src = fb + (long)b * K * N + j;
+    const float* src = fb + (long)j * B + b;                            // B[r, j, b]: r at a stride of N B
+    const long sr = (long)N * B;
     if (vz == nullptr) {                                                // (the backward: the data half alone)
-        for (int r = 0; r < K; r++) outd[r] = c + src[(long)r * N];
+        for (int r = 0; r < K; r++) outd[r] = c + src[r * sr];
         return;
     }
     float* outz = vz + ez * cz + oz + (long)b * K;
     for (int r = 0; r < K; r++) {
-        const float v = src[(long)r * N];
+        const float v = src[r * sr];
         outd[r] = c + v;
         outz[r] = v;
     }
@@ -102,12 +105,13 @@ __global__ void expand_kernel(float* vd, long cd, long od, float* vz, long cz, l
     if (t < (long)N * B) expand_at<FUSED>(t, vd, cd, od, vz, cz, oz, vals, table, first, fb, eid, eidz, N, B, K);
 }
 
-inline __device__ float lse_with(const float* __restrict__ a, const float* __restrict__ y, int K) {
+// logsumexp_r (a[r sa] + y[r]): `a` the factor's K ranks at a stride of `sa` (the batch), `y` K adjacent values
+inline __device__ float lse_with(const float* __restrict__ a, long sa, const float* __restrict__ y, int K) {
     float m = -INFINITY;
-    for (int r = 0; r < K; r++) m = fmaxf(m, a[r] + y[r]);
+    for (int r = 0; r < K; r++) m = fmaxf(m, a[r * sa] + y[r]);
     if (!(m > -INFINITY)) return -INFINITY;
     float s = 0.0f;
-    for (int r = 0; r < K; r++) s += expf(a[r] + y[r] - m);
+    for (int r = 0; r < K; r++) s += expf(a[r * sa] + y[r] - m);
     return m + logf(s);
 }
 
@@ -121,17 +125,17 @@ __global__ void collapse_kernel(float* __restrict__ node_mars, const float* __re
 
     const float* yd = vnm + (nid0 + i) * cols + (long)b * K;            // the data half's virtual node values
     const float* yz = yd + (long)B * K;                                 // the normalizer half's
-    const long at = ((long)b * M + i) * K;
+    const long at = (long)i * K * B + b;                                // A[i, r, b]: r at a stride of B
     const float* a = fa + at;
-    const float ls = lse_with(a, yd, K);
-    const float z = lse_with(a, yz, K);
+    const float ls = lse_with(a, B, yd, K);
+    const float z = lse_with(a, B, yz, K);
     node_mars[(nid0 + i) * B + b] = (ls > -INFINITY) ? ls - z : -INFINITY;
-    lz[(long)b * M + i] = z;
+    lz[(long)i * B + b] = z;
 
     // log of each rank's share of S and of Z: what the backward splits the node's flow by
     for (int r = 0; r < K; r++) {
-        lrn[at + r] = (ls > -INFINITY) ? a[r] + yd[r] - ls : -INFINITY;
-        lrz[at + r] = (z > -INFINITY) ? a[r] + yz[r] - z : -INFINITY;
+        lrn[at + r * B] = (ls > -INFINITY) ? a[r * B] + yd[r] - ls : -INFINITY;
+        lrz[at + r * B] = (z > -INFINITY) ? a[r * B] + yz[r] - z : -INFINITY;
     }
 }
 
@@ -153,15 +157,15 @@ __global__ void collapse_expand_kernel(float* node_mars, const float* __restrict
         const int i = (int)(t / B);
         const float* yd = vnm + (nid0 + i) * cols + (long)b * K;
         const float* yz = yd + (long)B * K;
-        const long at = ((long)b * M + i) * K;
+        const long at = (long)i * K * B + b;
         const float* a = fa + at;
-        const float ls = lse_with(a, yd, K);
-        const float z = lse_with(a, yz, K);
+        const float ls = lse_with(a, B, yd, K);
+        const float z = lse_with(a, B, yz, K);
         node_mars[(nid0 + i) * B + b] = (ls > -INFINITY) ? ls - z : -INFINITY;
-        lz[(long)b * M + i] = z;
+        lz[(long)i * B + b] = z;
         for (int r = 0; r < K; r++) {
-            lrn[at + r] = (ls > -INFINITY) ? a[r] + yd[r] - ls : -INFINITY;
-            lrz[at + r] = (z > -INFINITY) ? a[r] + yz[r] - z : -INFINITY;
+            lrn[at + r * B] = (ls > -INFINITY) ? a[r * B] + yd[r] - ls : -INFINITY;
+            lrz[at + r * B] = (z > -INFINITY) ? a[r * B] + yz[r] - z : -INFINITY;
         }
         return;
     }
@@ -179,9 +183,9 @@ __global__ void collapse_expand_kernel(float* node_mars, const float* __restrict
         if (row >= nid0 && row < nid0 + M) {                            // one of the nodes collapsed in this launch
             const float* yd = vnm + row * cols + (long)b * K;
             const float* yz = yd + (long)B * K;
-            const float* a = fa + ((long)b * M + (row - nid0)) * K;
-            const float ls = lse_with(a, yd, K);
-            const float z = lse_with(a, yz, K);
+            const float* a = fa + (row - nid0) * (long)K * B + b;
+            const float ls = lse_with(a, B, yd, K);
+            const float z = lse_with(a, B, yz, K);
             v[k] = (ls > -INFINITY) ? ls - z : -INFINITY;
         } else {
             v[k] = node_mars[row * B + b];
@@ -190,9 +194,10 @@ __global__ void collapse_expand_kernel(float* node_mars, const float* __restrict
     const float c = v[0] + v[1];
     float* outd = vem + e * cw + (long)b * KC;
     float* outz = outd + (long)B * KC;
-    const float* src = fb + (long)b * KC * N + j;
+    const float* src = fb + (long)j * B + b;                            // the layer above's B[r, j, b]
+    const long sr = (long)N * B;
     for (int r = 0; r < KC; r++) {
-        const float w = src[(long)r * N];
+        const float w = src[r * sr];
         outd[r] = c + w;
         outz[r] = w;
     }
@@ -208,21 +213,22 @@ inline __device__ void expand_bw_at(long t, float* vnfd, float* vnfz, long cz, l
     const int i = (int)(t / B);
 
     const long row = nid0 + i;
-    const long at = ((long)b * M + i) * K;
+    const long at = (long)i * K * B + b;                                // A[i, r, b]: r at a stride of B
     const float lf = node_flows[row * B + b];
-    const float z = lz[(long)b * M + i];
+    const float z = lz[(long)i * B + b];
     const float ls = node_mars[row * B + b] + z;                        // log S = log n + log Z
     float* outd = vnfd + (row * (long)B + b) * K;
     const bool live = (lf > -INFINITY) && (ls > -INFINITY);
-    for (int r = 0; r < K; r++) outd[r] = live ? lf + fa[at + r] - ls : -INFINITY;
+    for (int r = 0; r < K; r++) outd[r] = live ? lf + fa[at + r * B] - ls : -INFINITY;
     if (vnfz != nullptr) {                                              // (the normalizer half, where it is wanted)
         float* outz = vnfz + (nid0z + i) * cz + oz + (long)b * K;
-        for (int r = 0; r < K; r++) outz[r] = live ? lf + fa[at + r] - z : -INFINITY;
+        for (int r = 0; r < K; r++) outz[r] = live ? lf + fa[at + r * B] - z : -INFINITY;
     }
 
     if (GRAD && live) {
         // dLL / dA[i, r] = f * (the rank's share of S - its share of Z)
-        for (int r = 0; r < K; r++) grad_a[at + r] += expf(lf + lrn[at + r]) - expf(lf + lrz[at + r]);
+        for (int r = 0; r < K; r++)
+            grad_a[at + r * B] += expf(lf + lrn[at + r * B]) - expf(lf + lrz[at + r * B]);
     }
 }
 
@@ -279,8 +285,8 @@ __global__ void collapse_bw_kernel(float* __restrict__ flows, const float* __res
 
     if (GRAD) {
         // dLL / dB[r, j] += the data half's virtual element flow (the normalizer half's comes off at the pass's end)
-        float* g = grad_b + (long)b * K * N + j;
-        for (int r = 0; r < K; r++) g[(long)r * N] += expf(f[r]);
+        float* g = grad_b + (long)j * B + b;
+        for (int r = 0; r < K; r++) g[(long)r * N * B] += expf(f[r]);
     }
 }
 
@@ -289,49 +295,79 @@ inline __device__ float as_float(__nv_bfloat16 x) { return __bfloat162float(x); 
 inline __device__ void store_as(float* p, float v) { *p = v; }
 inline __device__ void store_as(__nv_bfloat16* p, float v) { *p = __float2bfloat16(v); }
 
-// The normalizer half's operands of one copy, rows `row0 + b K + r` of `U` [rows, M] and `V` [rows, N]: one block a
-// row -- the row's shift `max_j B_b[r, j]` by a block reduction, then V = exp(B - shift), U = f exp(A - log Z + shift)
-// (0 where the node has no flow)
-template <typename TO>
-__global__ void normalizer_rows_kernel(TO* __restrict__ U, TO* __restrict__ V, long row0,
-                                       const float* __restrict__ node_flows, long nid0, const float* __restrict__ fa,
-                                       const float* __restrict__ lz, const float* __restrict__ fb, int M, int N,
-                                       int B, int K) {
-    __shared__ float part[THREADS / 32];
-    const int v = blockIdx.x;                                           // b K + r
-    const int b = v / K, r = v % K;
-    const float* brow = fb + ((long)b * K + r) * N;
+// The normalizer half's operands, stored TRANSPOSED for the lanes' sake: `Ut` [M, rows], `Vt` [N, rows], a copy's
+// rows `row0 + r B + b` -- adjacent threads adjacent samples, every access consecutive. First each row's shift, the
+// largest of its `B[r, :, b]`: a block of 32 lanes (consecutive samples: one line a load) times 8 warps (every 8th
+// child of a chunk of `SHIFT_CHUNK` children) writes the chunk's largest, a second kernel takes the largest over
+// the chunks (a serial thread a row, as before, was 130 us a launch at 4096 children: a quarter of the backward)...
+constexpr int SHIFT_CHUNK = 256;
+
+__global__ void normalizer_rowmax_partial_kernel(float* __restrict__ part, const float* __restrict__ fb, int N,
+                                                 int B, int K) {
+    // grid (ceil(B / 32), K, chunks), 256 threads; `part` [chunks, K B]
+    const int lane = threadIdx.x & 31, w = threadIdx.x >> 5;
+    const int b = blockIdx.x * 32 + lane, r = blockIdx.y, c = blockIdx.z;
+    __shared__ float red[8][32];
     float m = -INFINITY;
-    for (int j = threadIdx.x; j < N; j += blockDim.x) m = fmaxf(m, brow[j]);
-    for (int o = 16; o > 0; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffff, m, o));
-    if ((threadIdx.x & 31) == 0) part[threadIdx.x >> 5] = m;
-    __syncthreads();
-    if (threadIdx.x < 32) {
-        m = (threadIdx.x < blockDim.x / 32) ? part[threadIdx.x] : -INFINITY;
-        for (int o = 16; o > 0; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffff, m, o));
-        if (threadIdx.x == 0) part[0] = m;
+    if (b < B) {
+        const int j0 = c * SHIFT_CHUNK, j1 = min(N, j0 + SHIFT_CHUNK);
+        const float* src = fb + (long)r * N * B + b;
+        for (int j = j0 + w; j < j1; j += 8) m = fmaxf(m, src[(long)j * B]);
     }
+    red[w][lane] = m;
     __syncthreads();
-    const float shift = part[0];
-    TO* vrow = V + (row0 + v) * (long)N;
-    for (int j = threadIdx.x; j < N; j += blockDim.x) store_as(vrow + j, expf(brow[j] - shift));
-    TO* urow = U + (row0 + v) * (long)M;
-    for (int i = threadIdx.x; i < M; i += blockDim.x) {
-        const float lf = node_flows[(nid0 + i) * (long)B + b];
-        const float z = lz[(long)b * M + i];
-        const bool live = (lf > -INFINITY) && (z < INFINITY);
-        store_as(urow + i, live ? expf(lf + fa[((long)b * M + i) * K + r] - z + shift) : 0.0f);
+    if (w == 0 && b < B) {
+        for (int i = 1; i < 8; i++) m = fmaxf(m, red[i][lane]);
+        part[((long)c * K + r) * B + b] = m;
     }
 }
 
-// dB_b[r, j] -= V[row0 + b K + r, j] * G[row0 + b K + r, j]: a copy's normalizer part off its gradient
+__global__ void normalizer_rowmax_kernel(float* __restrict__ shift, long row0, const float* __restrict__ part,
+                                         int rows_c, int chunks) {
+    const int t = blockIdx.x * blockDim.x + threadIdx.x;                // r B + b
+    if (t >= rows_c) return;
+    float m = -INFINITY;
+    for (int c = 0; c < chunks; c++) m = fmaxf(m, part[(long)c * rows_c + t]);
+    shift[row0 + t] = m;
+}
+
+// ... then `Vt[j, row] = exp(B[r, j, b] - shift)` over the first `N K B` threads and `Ut[i, row] = f_b[i] exp(A[i,
+// r, b] - log Z_b[i] + shift)` (0 where the node has no flow) over the next `M K B`
 template <typename TO>
-__global__ void normalizer_grads_kernel(float* __restrict__ grad_b, const TO* __restrict__ V,
-                                        const float* __restrict__ G, long row0, long n, int N) {
+__global__ void normalizer_fill_kernel(TO* __restrict__ Ut, TO* __restrict__ Vt, long rows, long row0,
+                                       const float* __restrict__ shift, const float* __restrict__ node_flows,
+                                       long nid0, const float* __restrict__ fa, const float* __restrict__ lz,
+                                       const float* __restrict__ fb, int M, int N, int B, int K) {
     const long t = (long)blockIdx.x * blockDim.x + threadIdx.x;
-    if (t >= n) return;
-    const long at = row0 * (long)N + t;
-    grad_b[t] -= as_float(V[at]) * G[at];
+    if (t >= (long)(N + M) * K * B) return;
+    const int b = (int)(t % B);
+    const long q = t / B;
+    const int r = (int)(q % K);
+    const long which = q / K;                                           // a child j, or N + a node i
+    const long row = row0 + (long)r * B + b;
+    const float sh = shift[row];
+    if (which < N) {
+        store_as(Vt + which * rows + row, expf(fb[((long)r * N + which) * B + b] - sh));
+    } else {
+        const long i = which - N;
+        const float lf = node_flows[(nid0 + i) * (long)B + b];
+        const float z = lz[i * (long)B + b];
+        const bool live = (lf > -INFINITY) && (z < INFINITY);
+        store_as(Ut + i * rows + row, live ? expf(lf + fa[(i * (long)K + r) * B + b] - z + sh) : 0.0f);
+    }
+}
+
+// dB[r, j, b] -= Vt[j, row] * Gt[j, row], row = row0 + r B + b: a copy's normalizer part off its gradient
+template <typename TO>
+__global__ void normalizer_grads_kernel(float* __restrict__ grad_b, const TO* __restrict__ Vt,
+                                        const float* __restrict__ Gt, long rows, long row0, int N, int B, int K) {
+    const long t = (long)blockIdx.x * blockDim.x + threadIdx.x;        // (r, j, b), b fastest: dB's own order
+    if (t >= (long)K * N * B) return;
+    const int b = (int)(t % B);
+    const long q = t / B;
+    const int j = (int)(q % N), r = (int)(q / N);
+    const long at = (long)j * rows + row0 + (long)r * B + b;
+    grad_b[t] -= as_float(Vt[at]) * Gt[at];
 }
 
 void check(const torch::Tensor& t, const char* name, torch::ScalarType st, long numel) {
@@ -541,70 +577,82 @@ void lowrank_backward_pre_fused(torch::Tensor vemd, torch::Tensor table, int64_t
 namespace {
 
 template <typename TO>
-void normalizer_launch(torch::Tensor& U, torch::Tensor& V, torch::Tensor& node_flows,
+void normalizer_launch(torch::Tensor& Ut, torch::Tensor& Vt, torch::Tensor& shift, torch::Tensor& node_flows,
                        std::vector<torch::Tensor>& fa, std::vector<torch::Tensor>& lz, std::vector<torch::Tensor>& fb,
                        std::vector<int64_t>& nid0, int64_t M, int64_t K) {
-    const int B = node_flows.size(1), N = V.size(1);
+    const int B = node_flows.size(1), N = Vt.size(0);
+    const long rows = Ut.size(1);
     auto stream = at::cuda::getCurrentCUDAStream();
+    const int chunks = (N + SHIFT_CHUNK - 1) / SHIFT_CHUNK;
+    torch::Tensor part = torch::empty({(long)chunks * K * B}, node_flows.options());
     long row0 = 0;
     for (size_t c = 0; c < fa.size(); c++) {
         check(fa[c], "A", torch::kFloat32, (long)B * M * K); check(lz[c], "lz", torch::kFloat32, (long)B * M);
         check(fb[c], "B", torch::kFloat32, (long)B * K * N);
         TORCH_CHECK(nid0[c] >= 0 && node_flows.size(0) >= nid0[c] + M, "lowrank mixture: a copy's node rows");
-        normalizer_rows_kernel<TO><<<B * (int)K, THREADS, 0, stream>>>(
-            static_cast<TO*>(U.data_ptr()), static_cast<TO*>(V.data_ptr()), row0, node_flows.data_ptr<float>(),
-            (long)nid0[c],
-            fa[c].data_ptr<float>(), lz[c].data_ptr<float>(), fb[c].data_ptr<float>(), (int)M, N, B, (int)K);
+        normalizer_rowmax_partial_kernel<<<dim3((B + 31) / 32, (int)K, chunks), 256, 0, stream>>>(
+            part.data_ptr<float>(), fb[c].data_ptr<float>(), N, B, (int)K);
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+        normalizer_rowmax_kernel<<<grid_of((long)K * B), THREADS, 0, stream>>>(
+            shift.data_ptr<float>(), row0, part.data_ptr<float>(), (int)(K * B), chunks);
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+        normalizer_fill_kernel<TO><<<grid_of((long)(N + M) * K * B), THREADS, 0, stream>>>(
+            static_cast<TO*>(Ut.data_ptr()), static_cast<TO*>(Vt.data_ptr()), rows, row0, shift.data_ptr<float>(),
+            node_flows.data_ptr<float>(), (long)nid0[c], fa[c].data_ptr<float>(), lz[c].data_ptr<float>(),
+            fb[c].data_ptr<float>(), (int)M, N, B, (int)K);
         C10_CUDA_KERNEL_LAUNCH_CHECK();
         row0 += (long)B * K;
     }
 }
 
 template <typename TO>
-void normalizer_grads_launch(std::vector<c10::optional<torch::Tensor>>& grads, torch::Tensor& V, torch::Tensor& G,
+void normalizer_grads_launch(std::vector<c10::optional<torch::Tensor>>& grads, torch::Tensor& Vt, torch::Tensor& Gt,
                              int64_t B, int64_t K) {
-    const int N = V.size(1);
-    const long n = (long)B * K * N;
+    const int N = Vt.size(0);
+    const long rows = Vt.size(1), n = (long)B * K * N;
     auto stream = at::cuda::getCurrentCUDAStream();
     for (size_t c = 0; c < grads.size(); c++) {
         if (!grads[c].has_value()) continue;
         check(*grads[c], "grad B", torch::kFloat32, n);
         normalizer_grads_kernel<TO><<<grid_of(n), THREADS, 0, stream>>>(
-            grads[c]->data_ptr<float>(), static_cast<const TO*>(V.data_ptr()), G.data_ptr<float>(), (long)c * B * K, n,
-            N);
+            grads[c]->data_ptr<float>(), static_cast<const TO*>(Vt.data_ptr()), Gt.data_ptr<float>(), rows,
+            (long)c * B * K, N, (int)B, (int)K);
         C10_CUDA_KERNEL_LAUNCH_CHECK();
     }
 }
 
 }  // namespace
 
-// The normalizer half's operands of a node vector's copies: `U` [copies B K, M] and `V` [copies B K, N], float32 or
-// bfloat16 (as allocated), from each copy's node flows (rows `nid0[c]` on), factors and kept `log Z`
-void lowrank_normalizer_operands(torch::Tensor U, torch::Tensor V, torch::Tensor node_flows,
+// The normalizer half's operands of a node vector's copies, transposed: `Ut` [M, copies B K] and `Vt` [N, copies B K],
+// float32 or bfloat16 (as allocated), `shift` [copies B K] float32 scratch; from each copy's node flows (rows
+// `nid0[c]` on), factors and kept `log Z`
+void lowrank_normalizer_operands(torch::Tensor Ut, torch::Tensor Vt, torch::Tensor shift, torch::Tensor node_flows,
                                  std::vector<torch::Tensor> fa, std::vector<torch::Tensor> lz,
                                  std::vector<torch::Tensor> fb, std::vector<int64_t> nid0, int64_t M, int64_t K) {
     check(node_flows, "node_flows", torch::kFloat32, -1);
-    TORCH_CHECK(U.is_cuda() && U.is_contiguous() && V.is_cuda() && V.is_contiguous() && U.scalar_type() == V.scalar_type()
-                && U.dim() == 2 && V.dim() == 2 && U.size(0) == V.size(0) && U.size(1) == M
-                && U.size(0) == (long)fa.size() * node_flows.size(1) * K
-                && fa.size() == lz.size() && fa.size() == fb.size() && fa.size() == nid0.size(),
-                "lowrank mixture: the normalizer operands do not match the copies");
-    if (U.numel() == 0 && V.numel() == 0) return;
-    if (U.scalar_type() == torch::kBFloat16) normalizer_launch<__nv_bfloat16>(U, V, node_flows, fa, lz, fb, nid0, M, K);
-    else if (U.scalar_type() == torch::kFloat32) normalizer_launch<float>(U, V, node_flows, fa, lz, fb, nid0, M, K);
+    const long rows = (long)fa.size() * node_flows.size(1) * K;
+    check(shift, "shift", torch::kFloat32, rows);
+    TORCH_CHECK(Ut.is_cuda() && Ut.is_contiguous() && Vt.is_cuda() && Vt.is_contiguous()
+                && Ut.scalar_type() == Vt.scalar_type() && Ut.dim() == 2 && Vt.dim() == 2 && Ut.size(1) == rows
+                && Vt.size(1) == rows && Ut.size(0) == M && fa.size() == lz.size() && fa.size() == fb.size()
+                && fa.size() == nid0.size(), "lowrank mixture: the normalizer operands do not match the copies");
+    if (rows == 0) return;
+    if (Ut.scalar_type() == torch::kBFloat16)
+        normalizer_launch<__nv_bfloat16>(Ut, Vt, shift, node_flows, fa, lz, fb, nid0, M, K);
+    else if (Ut.scalar_type() == torch::kFloat32) normalizer_launch<float>(Ut, Vt, shift, node_flows, fa, lz, fb, nid0, M, K);
     else TORCH_CHECK(false, "lowrank mixture: the normalizer operands must be float32 or bfloat16");
 }
 
-// Each copy's `dB` [B, K, N] minus `V * G` on its rows (`G` [copies B K, N] float32: `U theta`); None: a copy without
-// a gradient
-void lowrank_normalizer_grads(std::vector<c10::optional<torch::Tensor>> grads, torch::Tensor V, torch::Tensor G,
+// Each copy's `dB` [K, N, B] minus `Vt * Gt` on its rows (`Gt` [N, copies B K] float32: `theta^T U`); None: a copy
+// without a gradient
+void lowrank_normalizer_grads(std::vector<c10::optional<torch::Tensor>> grads, torch::Tensor Vt, torch::Tensor Gt,
                               int64_t B, int64_t K) {
-    check(G, "U theta", torch::kFloat32, V.numel());
-    TORCH_CHECK(V.is_cuda() && V.is_contiguous() && V.dim() == 2 && G.dim() == 2 && G.size(1) == V.size(1)
-                && V.size(0) == (long)grads.size() * B * K, "lowrank mixture: `V` does not match the copies");
-    if (V.scalar_type() == torch::kBFloat16) normalizer_grads_launch<__nv_bfloat16>(grads, V, G, B, K);
-    else if (V.scalar_type() == torch::kFloat32) normalizer_grads_launch<float>(grads, V, G, B, K);
-    else TORCH_CHECK(false, "lowrank mixture: `V` must be float32 or bfloat16");
+    check(Gt, "theta^T U", torch::kFloat32, Vt.numel());
+    TORCH_CHECK(Vt.is_cuda() && Vt.is_contiguous() && Vt.dim() == 2 && Gt.dim() == 2 && Gt.size(0) == Vt.size(0)
+                && Vt.size(1) == (long)grads.size() * B * K, "lowrank mixture: `Vt` does not match the copies");
+    if (Vt.scalar_type() == torch::kBFloat16) normalizer_grads_launch<__nv_bfloat16>(grads, Vt, Gt, B, K);
+    else if (Vt.scalar_type() == torch::kFloat32) normalizer_grads_launch<float>(grads, Vt, Gt, B, K);
+    else TORCH_CHECK(false, "lowrank mixture: `Vt` must be float32 or bfloat16");
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -623,6 +671,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("lowrank_collapse_bw_fused", &lowrank_collapse_bw_fused,
           "`lowrank_collapse_bw` with the element flows written as their two children's node flows");
     m.def("lowrank_normalizer_operands", &lowrank_normalizer_operands,
-          "the normalizer half's U and V of a node vector's copies, for the two matrix products");
+          "the normalizer half's U^T and V^T of a node vector's copies, for the two matrix products");
     m.def("lowrank_normalizer_grads", &lowrank_normalizer_grads, "each copy's dLL/dB minus V * (U theta) on its rows");
 }

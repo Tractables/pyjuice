@@ -109,15 +109,15 @@ def _buffers(node_mars: torch.Tensor, element_mars: torch.Tensor, cols: int, fam
 
 
 def _state(layer, info, batch: int, device) -> tuple:
-    """`(log Z [B, M], each rank's log share of S [B, M, K], of Z [B, M, K])` of one node vector: written by its
-    forward, read by its backward."""
+    """`(log Z [M, B], each rank's log share of S [M, K, B], of Z [M, K, B])` of one node vector -- batch innermost,
+    as the factors are stored: written by its forward, read by its backward."""
     states = layer.__dict__.setdefault("_lrv_state", {})
     key = id(info.ns)
     hit = states.get(key)
     M, K = info.ns.num_nodes, layer.external_params.rank
-    if hit is None or hit[0].size(0) != batch or hit[0].device != device:
-        hit = states[key] = (torch.empty(batch, M, device = device), torch.empty(batch, M, K, device = device),
-                             torch.empty(batch, M, K, device = device))
+    if hit is None or hit[0].size(1) != batch or hit[0].device != device:
+        hit = states[key] = (torch.empty(M, batch, device = device), torch.empty(M, K, batch, device = device),
+                             torch.empty(M, K, batch, device = device))
     return hit
 
 
@@ -305,20 +305,22 @@ def _normalizer(mod, copies, node_flows, params, denom_param_flows, want_denom, 
     M, N, rows = geo["M"], geo["N"], len(copies) * batch * K
     work = rows * M * N
     dtype = torch.bfloat16 if precision != "fp32" and work >= GEMM_BF16_WORK else torch.float32
-    U = torch.empty(rows, M, dtype = dtype, device = node_flows.device)
-    V = torch.empty(rows, N, dtype = dtype, device = node_flows.device)
-    mod.lowrank_normalizer_operands(U, V, node_flows, [fa for _, _, (fa, _), _, _ in copies],
+    Ut = torch.empty(M, rows, dtype = dtype, device = node_flows.device)      # (transposed: the lanes over the samples)
+    Vt = torch.empty(N, rows, dtype = dtype, device = node_flows.device)
+    shift = torch.empty(rows, device = node_flows.device)
+    mod.lowrank_normalizer_operands(Ut, Vt, shift, node_flows, [fa for _, _, (fa, _), _, _ in copies],
                                     [lz for _, _, _, lz, _ in copies], [fb for _, _, (_, fb), _, _ in copies],
                                     [info.nid_start for _, info, _, _, _ in copies], M, K)
     if want_denom:
-        W = torch.mm(U.t(), V, out_dtype = torch.float32) if dtype is torch.bfloat16 else torch.mm(U.t(), V)
+        W = torch.mm(Ut, Vt.t(), out_dtype = torch.float32) if dtype is torch.bfloat16 else torch.mm(Ut, Vt.t())
         off = desc._denom_offsets(layer0)[id(info0.ns)][0]
         size = info0.ns._param_flow_range[1] - info0.ns._param_flow_range[0]
         denom_param_flows[off:off + size].index_add_(0, geo["local"], W.reshape(-1)[geo["flat"]])
     if want_grads:
         theta = desc._dense_params(geo, params)
-        G = torch.mm(U, theta.to(dtype), out_dtype = torch.float32) if dtype is torch.bfloat16 else torch.mm(U, theta)
-        mod.lowrank_normalizer_grads([None if grads is None else grads[1] for _, _, _, _, grads in copies], V, G,
+        Gt = torch.mm(theta.t().to(dtype), Ut, out_dtype = torch.float32) if dtype is torch.bfloat16 \
+            else torch.mm(theta.t(), Ut)                                     # [N, rows]: (U theta)^T
+        mod.lowrank_normalizer_grads([None if grads is None else grads[1] for _, _, _, _, grads in copies], Vt, Gt,
                                      batch, K)
 
 

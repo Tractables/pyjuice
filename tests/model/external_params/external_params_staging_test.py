@@ -543,12 +543,14 @@ def test_lowrank_params_reaches_kernels():
     assert torch.all(torch.isfinite(lls))
     assert float((lls - pc(data)).abs().max()) > 1e-3               # (the factors were read: not the plain values)
 
-    # ... from the staged values: this parameterization declares no storage order, so the caller's is kept
-    assert trans_ns.external_params.storage_perm() is None
+    # ... from the staged values: this parameterization stores the caller's tensors with the batch innermost (its
+    # `storage_perm`), the staging copy's fast form
+    perm = trans_ns.external_params.storage_perm()
+    assert perm == (1, 2, 0)
     pc(data, sum_external_params = tensors)
     for ns, ns_tensors in tensors.items():
         for staged_tensor, tensor in zip(pc._staged_external_params[ns], ns_tensors):
-            assert torch.equal(staged_tensor, tensor)
+            assert torch.equal(staged_tensor, tensor.permute(*perm))
 
 
 if __name__ == "__main__":
