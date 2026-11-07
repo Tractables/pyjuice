@@ -444,8 +444,7 @@ def _end_of_pass(mod, z, copies, node_flows, node_mars, param_flows, denom_param
                                   [info.nid_start for _, info, _, _, _, _ in fp],
                                   [desc._geometry(layer, info, dev)["rows"] for layer, info, _, _, _, _ in fp],
                                   [sc[0] for _, _, _, _, _, sc in fp], [sc[1] for _, _, _, _, _, sc in fp], M, K)
-        start = fp[0][1].ns._param_flow_range
-        param_flows[start[0]:start[1]].index_add_(0, geo["local"], (theta * _product(Ud, Vd.t(), dtype)).reshape(-1)[geo["flat"]])
+        desc._scatter_add(geo, param_flows, fp[0][1].ns._param_flow_range[0], _product(Ud, Vd.t(), dtype), theta)
 
     if not (want_denom or want_grads):
         return
@@ -456,9 +455,8 @@ def _end_of_pass(mod, z, copies, node_flows, node_mars, param_flows, denom_param
     mod.lowrank_u_operand(Ut, shift, node_flows, [fa for _, _, (fa, _), _, _, _ in copies],
                           [lz for _, _, _, lz, _, _ in copies], [info.nid_start for _, info, _, _, _, _ in copies], row0, M, K)
     if want_denom:
-        off = desc._denom_offsets(layer0)[id(info0.ns)][0]
-        size = info0.ns._param_flow_range[1] - info0.ns._param_flow_range[0]
-        denom_param_flows[off:off + size].index_add_(0, geo["local"], _product(Ut, Vt.t(), dtype).reshape(-1)[geo["flat"]])
+        desc._scatter_add(geo, denom_param_flows, desc._denom_offsets(layer0)[id(info0.ns)][0],
+                          _product(Ut, Vt.t(), dtype))
     if want_grads:
         Gt = _product(theta.t().to(dtype), Ut, dtype)                        # [N, rows]: (U theta)^T
         mod.lowrank_normalizer_grads([None if grads is None else grads[1] for _, _, _, _, grads, _ in copies], row0, Vt, Gt,

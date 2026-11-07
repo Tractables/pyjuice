@@ -1038,6 +1038,93 @@ def test_a_twin_refuses_tables_past_the_layers_rows():
     assert "_lrv_twin" not in layer.__dict__ and lowrank_virtual._twin(layer)[0] is not None
 
 
+def _grid_reference(ns, M, N, device):
+    """The node vector's `(cell i * N + j, its parameter's local index)` per stored parameter, from its edge blocks and
+    its source's parameter ids -- what the gather and the scatter use, built here on its own."""
+    src = ns.get_source_ns() if ns.is_tied() else ns
+    bs, cbs = ns.block_size, ns.ch_block_size
+    nb, cb = ns.edge_ids[0].to(device).long(), ns.edge_ids[1].to(device).long()
+    m, c = torch.arange(bs, device = device), torch.arange(cbs, device = device)
+    rows = (nb[:, None, None] * bs + m[None, None, :]).expand(-1, cbs, -1)
+    cols = (cb[:, None, None] * cbs + c[None, :, None]).expand(-1, -1, bs)
+    pid = src._param_ids.to(device).long()[:, None, None] + (c[:, None] * bs + m[None, :])[None]
+    return (rows * N + cols).reshape(-1), (pid - src._param_range[0]).reshape(-1), src._param_range[0]
+
+
+@pytest.mark.parametrize("name", ["hmm_tied", "hmm_untied", "sparse"])
+def test_a_block_major_node_vector_reads_and_writes_its_parameters_as_a_strided_grid(name):
+    """Where a node vector's parameters lie block-major in one run -- every cell's edge block in its place, node block
+    by node block, each in child order -- its dense `theta` is a strided copy of the run and a grid's values go onto
+    its parameters' slots as one strided add, no `[M N]` index table made; a node vector that is not (ragged) keeps the
+    gather and the scatter. Both against the cells and slots built here from the edge blocks and the parameter ids."""
+    pc, sums, _, _, _, _ = _pair(name, "sum_exp", rank = 2)
+    dev = pc.params.device
+    for k, a in enumerate(sums):
+        layer = pc.external_params_nodes[a]
+        desc = a.parameterization
+        geo = desc._geometry(layer, desc._info(layer, a), dev)
+        M, N = geo["M"], geo["N"]
+        flat, local, p0 = _grid_reference(a, M, N, dev)
+        if name == "sparse":
+            assert geo["grid"] is None and torch.equal(geo["flat"], flat) and torch.equal(geo["local"], local)
+        else:
+            assert geo["grid"] is not None and "flat" not in geo and "pid" not in geo, k
+
+        want = torch.zeros(M * N, device = dev)
+        want[flat] = pc.params[p0 + local].float()
+        assert torch.equal(desc._dense_params(geo, pc.params), want.view(M, N))
+
+        g = torch.Generator(device = "cpu").manual_seed(k)
+        values, times = torch.randn(M, N, generator = g).to(dev), torch.rand(M, N, generator = g).to(dev)
+        size = a._param_flow_range[1] - a._param_flow_range[0]
+        before = torch.randn(size + 7, generator = g).to(dev)
+        for base, extra in ((0, None), (7, times)):
+            got, ref = before.clone(), before.clone()
+            desc._scatter_add(geo, got, base, values, extra)
+            v = values if extra is None else values * extra
+            ref.index_add_(0, base + local, v.reshape(-1)[flat])
+            assert torch.allclose(got, ref, rtol = 1e-6, atol = 1e-6) and \
+                (extra is not None or torch.equal(got, ref)), (k, base)
+
+
+@pytest.mark.parametrize("listing,grid", [(((1, 0, 1, 0), (0, 0, 1, 1)), True), (((0, 0, 1, 1), (1, 0, 1, 0)), False),
+                                          (((0, 0, 1), (0, 1, 0)), False)])
+def test_the_grid_is_read_where_the_parameters_lie_block_major_however_the_edges_are_listed(listing, grid):
+    """Edge blocks out of block-major order. Compilation lays a node block's parameters out in the order its edge
+    blocks are listed, node block by node block: every node block with every child block, listed node block 1 first,
+    child-major, they still lie block-major -- the grid, its run from the least id, not the first edge block's --;
+    with each node block's children reversed they do not -- read as one run, the grid would take other cells --, and
+    the gather and the scatter stay; nor where a cell has no edge block, the others a block-major prefix (the run
+    read as the grid would reach past the node vector's parameters). Each against the cells and slots built from the
+    edge blocks and the parameter ids."""
+    dev = torch.device("cuda:0")
+    with juice.set_block_size(4):
+        prod = multiply(inputs(0, num_node_blocks = 2, dist = dists.Categorical(num_cats = NUM_CATS)),
+                        inputs(1, num_node_blocks = 2, dist = dists.Categorical(num_cats = NUM_CATS)))
+        ns = summate(prod, num_node_blocks = 2, edge_ids = torch.tensor(listing),
+                     parameterization = LowRank(rank = 2, form = "sum_exp"))
+        root = summate(multiply(ns), num_node_blocks = 1, block_size = 1)
+    root.init_parameters(perturbation = 2.0)
+    pc = juice.compile(root, verbose = False).to(dev)
+    layer = pc.external_params_nodes[ns]
+    desc = ns.parameterization
+    geo = desc._geometry(layer, desc._info(layer, ns), dev)
+    M, N = geo["M"], geo["N"]
+    flat, local, p0 = _grid_reference(ns, M, N, dev)
+    if grid:
+        assert geo["grid"] is not None and "flat" not in geo and int(ns._param_ids[0]) != p0 + geo["grid"][0]
+    else:
+        assert geo["grid"] is None and torch.equal(geo["flat"], flat) and torch.equal(geo["local"], local)
+    want = torch.zeros(M * N, device = dev)
+    want[flat] = pc.params[p0 + local].float()
+    assert torch.equal(desc._dense_params(geo, pc.params), want.view(M, N))
+    values = torch.randn(M, N, device = dev)
+    got, ref = torch.zeros(local.numel() + 3, device = dev), torch.zeros(local.numel() + 3, device = dev)
+    desc._scatter_add(geo, got, 3, values)
+    ref.index_add_(0, 3 + local, values.reshape(-1)[flat])
+    assert torch.equal(got, ref)
+
+
 @needs_virtual
 def test_the_virtual_batch_across_batch_sizes_and_its_bound(monkeypatch):
     """Forwards at two batch sizes in turn, each followed by its backward: the buffers follow the batch. Past

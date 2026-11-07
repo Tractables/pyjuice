@@ -157,6 +157,10 @@ class LowRank(SumParameterization):
         """
         What ties a node vector's dense `[M, N]` grid to the circuit's buffers, built once per (layer, node vector):
 
+        * `grid` -- `(off, Mb, Nb, cbs, bs)` where the node vector's parameters lie BLOCK-MAJOR in one run: every
+          cell's edge block in its place, node block by node block, each in child order (however the edge blocks
+          are listed), the run from `off` on in its source's range (`p0` in `params`) -- the grid is then a strided
+          view of the run (`_dense_params`, `_scatter_add`), and the tables below are not made; else None, and
         * `flat`, `row`, `pid`, `pfid`, `local` -- for every stored parameter, its cell of the grid (`i * N + j`),
           its node `i`, its index in `params` and in `param_flows`, and its place in the node vector's own range of
           either. An edge block `e` holds `[ch_block_size, block_size]`, child then node, from `_param_ids[e]` on;
@@ -168,7 +172,7 @@ class LowRank(SumParameterization):
         """
         cache = layer.__dict__.setdefault("_lr_geometry", {})
         hit = cache.get(id(ns_info.ns))
-        if hit is not None and hit["flat"].device == device:
+        if hit is not None and hit["eid"].device == device:
             return hit
 
         ns = ns_info.ns
@@ -180,11 +184,15 @@ class LowRank(SumParameterization):
         m = torch.arange(bs, device = device)
         c = torch.arange(cbs, device = device)
 
-        rows = (nb[:, None, None] * bs + m[None, None, :]).expand(-1, cbs, -1)   # [E, cbs, bs]
-        cols = (cb[:, None, None] * cbs + c[None, :, None]).expand(-1, -1, bs)
-        within = (c[:, None] * bs + m[None, :]).reshape(-1)                 # [cbs * bs]
-        pid = (src._param_ids.to(device = device, dtype = torch.long)[:, None] + within[None, :]).reshape(-1)
-        local = pid - src._param_range[0]
+        pids0 = src._param_ids.to(device = device, dtype = torch.long)
+        E, Mb, Nb = nb.numel(), M // bs, N // cbs
+        grid = None
+        if E == Mb * Nb and E > 0:
+            # (each edge block at its cell's place from the run's first id: the ids are distinct, so then the cells
+            # are, and every cell is reached)
+            base = int(pids0.min())
+            if bool(torch.equal(pids0, base + (nb * Nb + cb) * (cbs * bs))):
+                grid = (base - src._param_range[0], Mb, Nb, cbs, bs)
 
         eid = torch.full((N,), -1, dtype = torch.long, device = device)
         ch_eids = ns_info.ch_eids.to(device = device, dtype = torch.long)
@@ -192,9 +200,17 @@ class LowRank(SumParameterization):
 
         has = eid >= 0
         reached = torch.nonzero(has).reshape(-1)
-        geo = dict(M = M, N = N, flat = (rows * N + cols).reshape(-1), row = rows.reshape(-1), pid = pid,
-                   local = local, pfid = ns._param_flow_range[0] + local, eid = eid.clamp(min = 0), has = has,
-                   cols = reached, kids = eid[reached], full = reached.numel() == N, rows = eid.contiguous())
+        geo = dict(M = M, N = N, grid = grid, p0 = None if grid is None else src._param_range[0] + grid[0],
+                   eid = eid.clamp(min = 0), has = has, cols = reached, kids = eid[reached],
+                   full = reached.numel() == N, rows = eid.contiguous())
+        if grid is None:
+            rows = (nb[:, None, None] * bs + m[None, None, :]).expand(-1, cbs, -1)   # [E, cbs, bs]
+            cols = (cb[:, None, None] * cbs + c[None, :, None]).expand(-1, -1, bs)
+            within = (c[:, None] * bs + m[None, :]).reshape(-1)                 # [cbs * bs]
+            pid = (pids0[:, None] + within[None, :]).reshape(-1)
+            local = pid - src._param_range[0]
+            geo.update(flat = (rows * N + cols).reshape(-1), row = rows.reshape(-1), pid = pid, local = local,
+                       pfid = ns._param_flow_range[0] + local)
         cache[id(ns)] = geo
         return geo
 
@@ -207,10 +223,35 @@ class LowRank(SumParameterization):
 
     @staticmethod
     def _dense_params(geo, params) -> torch.Tensor:
-        """The node vector's shared parameters on its `[M, N]` grid, float32, 0 where it has none."""
-        theta = torch.zeros(geo["M"] * geo["N"], dtype = torch.float32, device = params.device)
+        """The node vector's shared parameters on its `[M, N]` grid, float32, 0 where it has none: one strided copy of
+        their run where they lie block-major (`grid`), a gather and a scatter else."""
+        M, N, grid = geo["M"], geo["N"], geo["grid"]
+        if grid is not None:
+            _, Mb, Nb, cbs, bs = grid
+            theta = torch.empty(Mb, bs, Nb, cbs, dtype = torch.float32, device = params.device)
+            theta.copy_(params[geo["p0"]:geo["p0"] + M * N].view(Mb, Nb, cbs, bs).permute(0, 3, 1, 2))
+            return theta.view(M, N)
+        theta = torch.zeros(M * N, dtype = torch.float32, device = params.device)
         theta[geo["flat"]] = params[geo["pid"]].float()
-        return theta.view(geo["M"], geo["N"])
+        return theta.view(M, N)
+
+    @staticmethod
+    def _scatter_add(geo, dst: torch.Tensor, base: int, values: torch.Tensor, times: Optional[torch.Tensor] = None):
+        """`dst[base + local] += (values * times)[flat]`: a grid's values (`[M, N]`, times another's) onto the slots of
+        the node vector's stored parameters in a range of `dst` from `base` on (its flows', its denominators'): one
+        strided add where they lie block-major (`grid`), a gather and an `index_add_` else."""
+        grid = geo["grid"]
+        if grid is None:
+            v = values if times is None else values * times
+            dst.index_add_(0, base + geo["local"], v.reshape(-1)[geo["flat"]].to(dst.dtype))
+            return
+        off, Mb, Nb, cbs, bs = grid
+        out = dst[base + off:base + off + geo["M"] * geo["N"]].view(Mb, Nb, cbs, bs)
+        perm = lambda t: t.view(Mb, bs, Nb, cbs).permute(0, 2, 3, 1)
+        if times is None:
+            out.add_(perm(values))
+        else:
+            out.addcmul_(perm(values), perm(times))
 
     @staticmethod
     def _child_values(geo, element_mars) -> torch.Tensor:
@@ -391,10 +432,10 @@ class LowRank(SumParameterization):
                                                      lef.t()[geo["cols"], :].to(element_flows.dtype))
 
             if param_flows is not None:
-                param_flows.index_add_(0, geo["pfid"], Fp.reshape(-1)[geo["flat"]].to(param_flows.dtype))
+                self._scatter_add(geo, param_flows, ns_info.ns._param_flow_range[0], Fp)
             if want_denom:
                 off = self._denom_offsets(layer)[id(ns_info.ns)][0]
-                denom_param_flows.index_add_(0, off + geo["local"], Fm.reshape(-1)[geo["flat"]].to(denom_param_flows.dtype))
+                self._scatter_add(geo, denom_param_flows, off, Fm)
             if grads is not None:                                   # (the buffers as stored: batch innermost)
                 grads[0].add_(dA.permute(1, 2, 0))
                 grads[1].add_(dB.permute(1, 2, 0))
@@ -506,7 +547,12 @@ class LowRank(SumParameterization):
             top += denom_param_flows[td:td + ns.num_nodes]
             geo = self._geometry(layer, self._info(layer, member), denom_param_flows.device)
         if geo is not None:
-            total.index_add_(0, geo["local"], top[geo["row"]])
+            grid = geo["grid"]
+            if grid is None:
+                total.index_add_(0, geo["local"], top[geo["row"]])
+            else:                                                   # (each parameter its node's top-down term)
+                off, Mb, Nb, cbs, bs = grid
+                total[off:off + geo["M"] * geo["N"]].view(Mb, Nb, cbs, bs).add_(top.view(Mb, 1, 1, bs))
             ps, pe = (ns.get_source_ns() if ns.is_tied() else ns)._param_range
             total.mul_(params[ps:pe].to(total.dtype))
         return total
