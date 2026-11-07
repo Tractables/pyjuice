@@ -128,7 +128,9 @@ __global__ void collapse_kernel(float* __restrict__ node_mars, const float* __re
     const float* a = fa + at;
     const float ls = lse_with(a, B, yd, 1, K);
     const float z = lse_with(a, B, yz, B, K);
-    node_mars[(nid0 + i) * B + b] = (ls > -INFINITY) ? ls - z : -INFINITY;
+    // (Z = 0, a node whose parameters are all 0: no mass, -inf. The plain kernels give such a row's virtual values
+    // -FLT_MAX, not -inf, so `ls` alone does not tell it: `ls - z` would be +inf.)
+    node_mars[(nid0 + i) * B + b] = (ls > -INFINITY && z > -INFINITY) ? ls - z : -INFINITY;
     lz[(long)i * B + b] = z;
 
     // log of each rank's share of S and of Z: what the backward splits the node's flow by
@@ -161,7 +163,7 @@ __global__ void collapse_expand_kernel(float* node_mars, const float* __restrict
         const float* a = fa + at;
         const float ls = lse_with(a, B, yd, 1, K);
         const float z = lse_with(a, B, yz, B, K);
-        node_mars[(nid0 + i) * B + b] = (ls > -INFINITY) ? ls - z : -INFINITY;
+        node_mars[(nid0 + i) * B + b] = (ls > -INFINITY && z > -INFINITY) ? ls - z : -INFINITY;
         lz[(long)i * B + b] = z;
         for (int r = 0; r < K; r++) {
             lrn[at + r * B] = (ls > -INFINITY) ? a[r * B] + yd[r] - ls : -INFINITY;
@@ -186,7 +188,7 @@ __global__ void collapse_expand_kernel(float* node_mars, const float* __restrict
             const float* a = fa + (row - nid0) * (long)K * B + b;
             const float ls = lse_with(a, B, yd, 1, K);
             const float z = lse_with(a, B, yz, B, K);
-            v[k] = (ls > -INFINITY) ? ls - z : -INFINITY;
+            v[k] = (ls > -INFINITY && z > -INFINITY) ? ls - z : -INFINITY;
         } else {
             v[k] = node_mars[row * B + b];
         }

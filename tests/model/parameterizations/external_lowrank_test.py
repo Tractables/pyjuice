@@ -1125,6 +1125,69 @@ def test_the_grid_is_read_where_the_parameters_lie_block_major_however_the_edges
     assert torch.equal(got, ref)
 
 
+@pytest.mark.parametrize("form", ["exp_sum", "sum_exp"])
+def test_a_node_whose_parameters_are_all_zero_has_no_mass(form, monkeypatch):
+    """A node every shared parameter of which is 0 has no mass whatever its factors: the value -inf (as a plain sum
+    node's), not `log S - log Z = -inf - -inf`; the circuit's values, flows, denominators and gradients finite
+    elsewhere and, for the mixture form, the virtual batch's the torch passes' -- its collapse, where the plain
+    kernels give the node's virtual values -FLT_MAX, by itself and with the layer above's `expand` taken along
+    (`collapse_expand`: the product layers fused in, the layers linked by the passes before)."""
+    import pyjuice.layer.kernels.autotune as autotune
+    import pyjuice.parameterizations.lowrank_virtual as lowrank_virtual
+
+    pick = autotune.pick
+    monkeypatch.setattr(autotune, "pick", lambda key, cands, bench, **k: "fused" if key[0] == "prod_stream_fusion"
+                        else "unfused" if key[0] == "prod_stream_fusion_bk" else pick(key, cands, bench, **k))
+    real, merged = lowrank_virtual._module, []
+
+    class Counted:
+        def __getattr__(self, attr):
+            fn = getattr(real(), attr)
+            if attr != "lowrank_collapse_expand":
+                return fn
+
+            def counted(*args):
+                merged.append(attr)
+                return fn(*args)
+            return counted
+
+    counted = Counted()
+    monkeypatch.setattr(lowrank_virtual, "_module", lambda: counted)
+
+    rank, batch, dead = 2, 6, 1                                             # (`dead`: a node of the tied transition)
+    out = dict()
+    for arm in ("torch", "virtual") if form == "sum_exp" else ("torch",):
+        # (a circuit each: the first passes decide the product layers' fusion, which the virtual batch's link needs)
+        monkeypatch.setattr(lowrank_virtual, "ENABLED", arm == "virtual")
+        pc, sums, _, _, _, _ = _pair("hmm_tied", form, rank = rank)
+        dev = pc.params.device
+        a = sums[0]
+        layer = pc.external_params_nodes[a]
+        desc = a.parameterization
+        geo = desc._geometry(layer, desc._info(layer, a), dev)
+        flat, local, p0 = _grid_reference(a, geo["M"], geo["N"], dev)
+        with torch.no_grad():
+            pc.params[p0 + local[flat // geo["N"] == dead]] = 0.0
+        torch.manual_seed(57)
+        data = torch.randint(0, NUM_CATS, (batch, pc.num_vars), device = dev)
+        ext = {s: _factors(s, rank, batch, dev, seed = 300 + i) for i, s in enumerate(sums)}
+        for k in range(3):                                                  # (linked from the third on)
+            merged.clear()
+            got = out[arm, k] = _passes(pc, sums, data, ext)
+            for s in sums:
+                info = desc._info(pc.external_params_nodes[s], s)
+                assert bool(torch.isneginf(got["mars"][info.nid_start + dead]).all()), (arm, k, "the dead node's value")
+            for key in ("lls", "fp", "fm"):
+                assert bool(torch.isfinite(got[key]).all()), (arm, k, key)
+            assert not bool(torch.isnan(got["mars"]).any()) and not bool(torch.isnan(got["flows"]).any()), (arm, k)
+            assert all(bool(torch.isfinite(g).all()) for g in got["dA"] + got["dB"]), (arm, k)
+        if arm == "virtual":
+            assert merged, "the linked collapse not taken"
+    if form == "sum_exp":
+        for k in range(3):
+            _same(out["virtual", k], out["torch", k], rtol = 2e-4, atol = 2e-5)
+
+
 @needs_virtual
 def test_the_virtual_batch_across_batch_sizes_and_its_bound(monkeypatch):
     """Forwards at two batch sizes in turn, each followed by its backward: the buffers follow the batch. Past

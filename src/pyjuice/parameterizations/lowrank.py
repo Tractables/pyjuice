@@ -346,7 +346,8 @@ class LowRank(SumParameterization):
             lw += ltheta[None, :, :]
             lz.append(torch.logsumexp(lw, dim = 2))
             lw += lc[s:e, None, :]
-            ln.append(torch.logsumexp(lw, dim = 2) - lz[-1])
+            ls = torch.logsumexp(lw, dim = 2)
+            ln.append(torch.where(ls > -float("inf"), ls - lz[-1], ls))     # (no mass: 0, not 0 / 0)
         return torch.cat(ln, dim = 0), torch.cat(lz, dim = 0)
 
     @staticmethod
@@ -369,7 +370,7 @@ class LowRank(SumParameterization):
         _, sb, yb = self._mixture_terms(Bm, None, theta64)
         ls = torch.logsumexp(At.double() + yc.log() + sc, dim = 1)           # [B, M]
         lz = torch.logsumexp(At.double() + yb.log() + sb, dim = 1)
-        return (ls - lz).float(), lz.float()
+        return torch.where(ls > -float("inf"), ls - lz, ls).float(), lz.float()    # (no mass: 0, not 0 / 0)
 
     # ------------------------------------------------------------------ backward
 
