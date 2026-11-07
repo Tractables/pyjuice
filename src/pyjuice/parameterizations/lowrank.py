@@ -90,6 +90,10 @@ class LowRank(SumParameterization):
     #: A forward may be handed the product layer below, its own forward not run (`stream_fusion_plan`): the mixture's
     #: virtual batch reads the products' values from their children, every other pass forms them first
     fuses_stream_children = True
+    #: The virtual batch's plain kernels take the circuit's bf16 copy of tied fp32 parameters
+    #: (`TensorCircuit._param_operands`), as a plain layer's do: its forward `op_params`, its backward the layer's
+    #: per-call copy (`_bk_op_params`), handed to the layer's twin (`lowrank_virtual`). The torch passes read `params`.
+    reads_param_operands = True
 
     def __init__(self, rank: int, form: str = "exp_sum", apply_z_correction: bool = True, tie_external: bool = False):
         super(LowRank, self).__init__()

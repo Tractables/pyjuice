@@ -1189,6 +1189,52 @@ def test_a_node_whose_parameters_are_all_zero_has_no_mass(form, monkeypatch):
 
 
 @needs_virtual
+def test_the_virtual_batch_hands_the_circuits_bf16_copy_to_the_plain_kernels(monkeypatch):
+    """Where the circuit makes its bf16 copy of tied fp32 parameters (`TensorCircuit._param_operands`, forced here),
+    the virtual batch's plain kernels are handed it through the layer's twin, as a plain layer's are -- the forward's
+    `op_params`, the backward's per-call copy --, the twin marked for it at every call (made here before the circuit
+    marked the layers, so its mark is the one each call carries over); the values, flows and gradients within bf16's
+    rounding of the torch passes', which read the fp32 parameters."""
+    import pyjuice.parameterizations.lowrank_virtual as lowrank_virtual
+    from pyjuice.layer.sum_layer import SumLayer
+
+    rank, batch = 2, 16                                          # (the copy is made from batch 16 on)
+    pc, sums, _, _, _, _ = _pair("hmm_tied", "sum_exp", rank = rank)
+    dev = pc.params.device
+    layers = list({id(l): l for l in (pc.external_params_nodes[a] for a in sums)}.values())
+    twins = {id(lowrank_virtual._twin(l)[0]) for l in layers}             # (before the circuit's first pass)
+    torch.manual_seed(53)
+    data = torch.randint(0, NUM_CATS, (batch, pc.num_vars), device = dev)
+    ext = {a: _factors(a, rank, batch, dev, seed = 290 + i) for i, a in enumerate(sums)}
+    monkeypatch.setattr(lowrank_virtual, "ENABLED", False)
+    want = _passes(pc, sums, data, ext)
+    monkeypatch.setattr(lowrank_virtual, "ENABLED", True)
+
+    calls, real_fw, real_bw = [], SumLayer.forward, SumLayer.backward
+
+    def fw(self, *args, op_params = None, **kwargs):
+        calls.append(("fw", self, op_params, self.__dict__.get("_reads_param_operands", False)))
+        return real_fw(self, *args, op_params = op_params, **kwargs)
+
+    def bw(self, *args, op_params = None, **kwargs):
+        calls.append(("bw", self, op_params, self.__dict__.get("_reads_param_operands", False)))
+        return real_bw(self, *args, op_params = op_params, **kwargs)
+
+    monkeypatch.setattr(SumLayer, "forward", fw)
+    monkeypatch.setattr(SumLayer, "backward", bw)
+    monkeypatch.setattr(pc, "_param_operands_force", True, raising = False)
+    got = _passes(pc, sums, data, ext)
+    assert got["path"] == {tuple}
+    assert all(l.__dict__.get("_reads_param_operands") for l in layers)
+    assert {id(lowrank_virtual._twin(l)[0]) for l in layers} == twins
+    seen = [(kind, op, marked) for kind, layer, op, marked in calls if id(layer) in twins]
+    assert {kind for kind, _, _ in seen} == {"fw", "bw"}
+    assert all(op is not None and op.dtype == torch.bfloat16 and marked for _, op, marked in seen), \
+        [(k, op is not None, marked) for k, op, marked in seen]
+    _same(got, want, rtol = 2e-2, atol = 1e-3)
+
+
+@needs_virtual
 def test_the_virtual_batch_across_batch_sizes_and_its_bound(monkeypatch):
     """Forwards at two batch sizes in turn, each followed by its backward: the buffers follow the batch. Past
     `VIRTUAL_BYTES_MOST` the torch passes take the layer, with the same result."""

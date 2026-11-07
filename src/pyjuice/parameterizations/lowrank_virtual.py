@@ -377,7 +377,11 @@ def forward(desc, layer, ns_tensors, node_mars, element_mars, params, kwargs, st
     if stream_children is not None:
         _link(desc, layer, ran, stream_children, dev)
 
-    SumLayer.forward(twin, bufs["vnm"], bufs["vem"], params, precision = kwargs.get("precision", "auto"))
+    # (the circuit's bf16 copy of the tied parameters, where the circuit marked the layer for it: the plain kernels'
+    # operands, as for a plain layer)
+    twin.__dict__["_reads_param_operands"] = layer.__dict__.get("_reads_param_operands", False)
+    SumLayer.forward(twin, bufs["vnm"], bufs["vem"], params, precision = kwargs.get("precision", "auto"),
+                     op_params = kwargs.get("op_params"))
 
     # The node values -- and, in the same launch, the virtual child values of the layer above (`_link`)
     nxt = _above(layer, kwargs, node_mars, element_mars)
@@ -502,9 +506,10 @@ def backward(desc, layer, ns_tensors, ns_grad_tensors, node_flows, element_flows
 
     # (the parameter flows: one matrix product at the pass's end where the product layer is fused in: its children's
     # values are still at hand then)
+    twin.__dict__["_reads_param_operands"] = layer.__dict__.get("_reads_param_operands", False)
     SumLayer.backward(twin, bufs["vnf_d"], bufs["vef_d"], bufs["zero"], bufs["vem_d"], params,
                       param_flows = param_flows if stream_children is None else None, logspace_flows = True,
-                      precision = precision)
+                      precision = precision, op_params = layer.__dict__.get("_bk_op_params"))
 
     for info, fa, fb, grads, rows, state in vectors:
         grad_b = None if grads is None else grads[1]
