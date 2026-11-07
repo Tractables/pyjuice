@@ -90,10 +90,17 @@ class LowRank(_ForwardMixin, _BackwardMixin, _DenominatorsMixin, SumParameteriza
     #: A forward may be handed the product layer below, its own forward not run (`stream_fusion_plan`): the mixture's
     #: virtual batch reads the products' values from their children, every other pass forms them first
     fuses_stream_children = True
-    #: The virtual batch's plain kernels take the circuit's bf16 copy of tied fp32 parameters
-    #: (`TensorCircuit._param_operands`), as a plain layer's do: its forward `op_params`, its backward the layer's
-    #: per-call copy (`_bk_op_params`), handed to the layer's twin (`lowrank.virtual`). The torch passes read `params`.
-    reads_param_operands = True
+    @property
+    def reads_param_operands(self) -> bool:
+        """The virtual batch's plain kernels take the circuit's bf16 copy of tied fp32 parameters
+        (`TensorCircuit._param_operands`), as a plain layer's do: its forward `op_params`, its backward the layer's
+        per-call copy (`_bk_op_params`), handed to the layer's twin (`lowrank.virtual`) -- the mixture form's, the
+        `exp_sum` form's torch passes reading `params`."""
+        return self.form == "sum_exp"
+
+    def param_operand_columns(self, batch_size: int) -> int:
+        """The mixture form's plain kernels run on `rank` columns a sample (the virtual batch)."""
+        return batch_size * self.rank if self.form == "sum_exp" else batch_size
 
     def __init__(self, rank: int, form: str = "exp_sum", apply_z_correction: bool = True, tie_external: bool = False):
         super(LowRank, self).__init__()

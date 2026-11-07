@@ -85,6 +85,12 @@ class SumParameterization():
     #: kernels on the copy whose host cost only a large layer's GPU savings repay. 0 -- the default -- adds none.
     param_operands_min_edges: int = 0
 
+    def param_operand_columns(self, batch_size: int) -> int:
+        """The columns this parameterization's kernels on that copy run at, for a pass of `batch_size` samples -- what
+        the circuit's rule on the copy reckons a layer's work with, and its least columns (16: below them the kernels
+        are fp32 in every mode; `TensorCircuit._param_operand_groups`): the batch itself, unless its kernels widen it."""
+        return batch_size
+
     #: The backward counterpart. `False` -- the default -- means the standard element-flow and
     #: param-flow kernels run and the descriptor corrects what they wrote. A parameterization whose
     #: effective parameters vary PER EDGE BLOCK cannot be served that way: the standard kernels sum

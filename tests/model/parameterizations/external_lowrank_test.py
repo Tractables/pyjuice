@@ -1198,7 +1198,7 @@ def test_the_virtual_batch_hands_the_circuits_bf16_copy_to_the_plain_kernels(mon
     import pyjuice.parameterizations.lowrank.virtual as lowrank_virtual
     from pyjuice.layer.sum_layer import SumLayer
 
-    rank, batch = 2, 16                                          # (the copy is made from batch 16 on)
+    rank, batch = 2, 16                                          # (forced: made from 16 virtual columns on)
     pc, sums, _, _, _, _ = _pair("hmm_tied", "sum_exp", rank = rank)
     dev = pc.params.device
     layers = list({id(l): l for l in (pc.external_params_nodes[a] for a in sums)}.values())
@@ -1232,6 +1232,115 @@ def test_the_virtual_batch_hands_the_circuits_bf16_copy_to_the_plain_kernels(mon
     assert all(op is not None and op.dtype == torch.bfloat16 and marked for _, op, marked in seen), \
         [(k, op is not None, marked) for k, op, marked in seen]
     _same(got, want, rtol = 2e-2, atol = 1e-3)
+
+
+@needs_virtual
+def test_the_rule_on_the_copy_reckons_the_virtual_columns(monkeypatch):
+    """The circuit's rule on its bf16 copy (`TensorCircuit._param_operand_groups`, not forced) reckons a mixture-form
+    layer's work, and the 16 columns it takes the copy from, on the columns its plain kernels run at -- `rank` a
+    sample (`LowRank.param_operand_columns`) --, not the batch: rank 4 at batch 4 is 16 columns, given the copy where
+    the layer's parameters times 16 reach `_COPY_MIN_WORK` (set here), the batch alone below it; batch 3 (12 columns)
+    never; the work's bound kept (16 columns short of a threshold of 32, batch 8 reaching it). The twins are handed
+    the copy, the values, flows and gradients within bf16's rounding of the torch passes'. The `exp_sum` form's
+    layers, whose torch passes read `params`, are not marked. A group of a plain layer and a mixture-form one takes
+    the least of their columns, the plain layer's batch: none of its layers handed the copy at batch 4, both at 16.
+    Forced (`_param_operands_force`), the copy goes to no group below 16 columns either: the columns' least kept."""
+    import pyjuice.model.tensorcircuit as tcm
+    import pyjuice.parameterizations.lowrank.virtual as lowrank_virtual
+    from pyjuice.layer.sum_layer import SumLayer
+
+    monkeypatch.setattr(tcm.TensorCircuit, "_param_operands_force", None)
+    rank = 4
+    pc, sums, _, _, _, _ = _pair("hmm_tied", "sum_exp", rank = rank)
+    dev = pc.params.device
+    groups, _ = pc._param_operand_plan()
+    sizes = pc.__dict__["_param_operand_sizes_"]
+    assert groups and set(sizes) == set(groups)
+    edges = max(e for e, _, _ in sizes.values())
+    layers = list({id(l): l for l in (pc.external_params_nodes[a] for a in sums)}.values())
+    assert all(l.__dict__.get("_reads_param_operands") for l in layers)
+
+    seen, real_fw = [], SumLayer.forward
+
+    def fw(self, *args, op_params = None, **kwargs):
+        seen.append((self, op_params))
+        return real_fw(self, *args, op_params = op_params, **kwargs)
+
+    monkeypatch.setattr(SumLayer, "forward", fw)
+
+    def run(batch):
+        torch.manual_seed(60 + batch)
+        data = torch.randint(0, NUM_CATS, (batch, pc.num_vars), device = dev)
+        ext = {a: _factors(a, rank, batch, dev, seed = 310 + i) for i, a in enumerate(sums)}
+        monkeypatch.setattr(lowrank_virtual, "ENABLED", False)
+        want = _passes(pc, sums, data, ext)
+        monkeypatch.setattr(lowrank_virtual, "ENABLED", True)
+        seen.clear()
+        got = _passes(pc, sums, data, ext)
+        assert got["path"] == {tuple}
+        twins = {id(lowrank_virtual._twin(l)[0]) for l in layers}
+        ops = [op for layer, op in seen if id(layer) in twins]
+        assert ops, batch
+        made = pc.__dict__["_param_operands_made"]
+        assert all((op is not None) is made for op in ops), batch
+        if made:
+            assert all(op.dtype == torch.bfloat16 for op in ops)
+            _same(got, want, rtol = 2e-2, atol = 1e-3)
+        else:
+            _same(got, want, rtol = 2e-4, atol = 2e-5)
+        return made
+
+    monkeypatch.setattr(tcm, "_COPY_MIN_WORK", edges * 16)
+    assert edges * 4 < tcm._COPY_MIN_WORK                                # (the batch alone: below it)
+    assert run(4) and pc._param_operand_groups(4) == groups
+    assert not run(3) and pc._param_operands(3) is None and not pc._param_operand_groups(3)
+    pc.__dict__.pop("_param_operand_rule_")                               # (the rule again, at another threshold)
+    monkeypatch.setattr(tcm, "_COPY_MIN_WORK", edges * 32)
+    assert not run(4) and pc._param_operands(4) is not None              # (16 columns: it applies, not given)
+    assert run(8)
+
+    pc_e, sums_e, _, _, _, _ = _pair("hmm_tied", "exp_sum", rank = rank)
+    assert not pc_e._param_operand_plan()[0] and pc_e._param_operands(64) is None
+    assert not any(pc_e.external_params_nodes[a].__dict__.get("_reads_param_operands") for a in sums_e)
+
+    # (two tied chains side by side, the first's transitions mixture-form, the second's plain: a layer of each a group)
+    from pyjuice.layer.parameterized_sum_layer import ParameterizedSumLayer
+    torch.manual_seed(0)
+    tops, sums_m = [], []
+    with juice.set_block_size(8):
+        for chain in range(2):
+            ni = inputs(chain * 4 + 3, num_node_blocks = 1, dist = dists.Categorical(num_cats = NUM_CATS))
+            mine, cur = [], ni
+            for var in range(2, -1, -1):
+                cx = ni.duplicate(chain * 4 + var, tie_params = True)
+                ns = mine[0].duplicate(cur, tie_params = True) if mine else \
+                    summate(cur, num_node_blocks = 1, **(_ext(True, rank, "sum_exp") if chain == 0 else {}))
+                mine.append(ns)
+                cur = multiply(cx, ns)
+            tops.append(summate(cur, num_node_blocks = 1))
+            sums_m += mine if chain == 0 else []
+        root = summate(multiply(*tops), num_node_blocks = 1, block_size = 1)
+    root.init_parameters(perturbation = 2.0)
+    pc_m = juice.compile(root, verbose = False).to(dev)
+    monkeypatch.setattr(tcm, "_COPY_MIN_WORK", 1)
+    groups_m, _ = pc_m._param_operand_plan()
+    mixed = [g for g in pc_m.inner_layer_groups if id(g) in groups_m and any(type(l) is SumLayer for l in g)
+             and any(isinstance(l, ParameterizedSumLayer) for l in g)]
+    assert mixed
+    for batch, given in ((4, False), (16, True)):
+        assert all((id(g) in pc_m._param_operand_groups(batch)) is given for g in mixed), batch
+        data = torch.randint(0, NUM_CATS, (batch, pc_m.num_vars), device = dev)
+        ext = {a: _factors(a, rank, batch, dev, seed = 330 + i) for i, a in enumerate(sums_m)}
+        seen.clear()
+        with torch.no_grad():
+            pc_m(data, sum_external_params = ext)
+        twins = {id(lowrank_virtual._twin(l)[0]) for g in mixed for l in g if isinstance(l, ParameterizedSumLayer)}
+        plain = {id(l) for g in mixed for l in g if type(l) is SumLayer}
+        ops = [op for layer, op in seen if id(layer) in twins | plain]
+        assert {id(layer) for layer, _ in seen} >= twins | plain and all((op is not None) is given for op in ops), batch
+    monkeypatch.setattr(pc_m, "_param_operands_force", True, raising = False)
+    for batch, given in ((4, False), (16, True)):
+        assert all((id(g) in pc_m._param_operand_groups(batch)) is given for g in mixed), ("forced", batch)
 
 
 @needs_virtual

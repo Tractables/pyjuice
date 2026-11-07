@@ -49,6 +49,13 @@ def _calls_its_forward(module: nn.Module) -> bool:
 # 2^29: HMM-2048 B 128 -9.9%, HMM-4096 B 32 -7.1%; 2^31: HMM-4096 B 128 -38%).
 _COPY_MIN_WORK = 1 << 28
 
+
+def _operand_columns(readers, batch_size: int) -> int:
+    """The columns a layer group's kernels on the bf16 copy run at, the least over its layers': the batch for a plain
+    layer's, what its parameterization widens it to for another (`readers`: the layers' parameterizations, None for a
+    plain layer; `SumParameterization.param_operand_columns`)."""
+    return min(batch_size if p is None else p.param_operand_columns(batch_size) for p in readers)
+
 # The forward options a fused product forward serves (`_stream_fusion_groups`): the plain regime's, and the external
 # parameters' (a gated layer whose parameterization takes the fused forward, `fuses_stream_children`)
 _STREAM_FUSION_FW_OPTS = frozenset(("precision", "pflow_temperature", "sum_external_params",
@@ -403,7 +410,9 @@ class TensorCircuit(_BuildMixin, _CudaGraphsMixin, _ExternalParamsMixin, _Learni
                 # take the copy from: `_param_operand_groups`)
                 sizes[id(group)] = (sum(layer.num_edges for layer in group) / len(group),
                                     max(getattr(getattr(layer, "parameterization", None), "param_operands_min_edges", 0)
-                                        for layer in group))
+                                        for layer in group),
+                                    tuple({id(p): p for p in (getattr(layer, "parameterization", None)
+                                                              for layer in group)}.values()))
         self.__dict__["_param_operand_sizes_"] = sizes
         plan = self.__dict__["_param_operand_plan_"] = (frozenset(id(g) for g in groups), tuple(sorted(ranges)))
         return plan
@@ -415,25 +424,39 @@ class TensorCircuit(_BuildMixin, _CudaGraphsMixin, _ExternalParamsMixin, _Learni
     def _param_operand_groups(self, batch_size: int) -> frozenset:
         """The groups (`_param_operand_plan`'s, by id) a pass at this batch size gives the bf16 copy (`_param_operands`,
         where it applies; none: no copy made): those whose layers read enough parameters for the batch to make them
-        GPU-bound -- the parameters such a layer reads a sample (their mean over the group) times the batch at least
-        `_COPY_MIN_WORK` -- and at least what their parameterizations take it from
-        (`SumParameterization.param_operands_min_edges`). The kernels reading the copy are faster, but it costs host time
-        (made by every forward, handed through the layers), which a host-bound step pays in full while the GPU's
-        savings hide behind the host; a layer's GPU time grows with that work, its host time does not. A rule, not a
-        measurement of the caller's steps: every pass at a batch size computes with the same kernels -- the stream
-        kernels' bf16 products among them --, the first as the rest, as the kernels' own tuning keeps them (a
-        measurement would switch them while it measures). `_param_operands_force` overrides it."""
-        groups = self._param_operand_plan()[0]
+        GPU-bound -- the parameters such a layer reads a sample (their mean over the group) times the columns its
+        kernels run at at least `_COPY_MIN_WORK`, those columns 16 at least -- and at least what their parameterizations
+        take it from (`SumParameterization.param_operands_min_edges`). The columns: the least over the group's layers --
+        the batch for a plain layer, what a parameterization widens it to for another
+        (`SumParameterization.param_operand_columns`: LowRank's virtual batch, `rank` columns a sample) --, so no layer
+        is handed the copy below 16 columns of its own (a plain layer's small-batch kernels read it too). The kernels
+        reading the copy are faster, but it costs host time (made by every forward, handed through the layers), which a
+        host-bound step pays in full while the GPU's savings hide behind the host; a layer's GPU time grows with that
+        work, its host time does not. A rule, not a measurement of the caller's steps: every pass at a batch size
+        computes with the same kernels -- the stream kernels' bf16 products among them --, the first as the rest, as the
+        kernels' own tuning keeps them (a measurement would switch them while it measures). `_param_operands_force`
+        overrides it (the columns' least kept)."""
         force = self._param_operands_force
-        if force is not None:
-            return groups if force else frozenset()
-        cache = self.__dict__.setdefault("_param_operand_groups_", {})
-        taken = cache.get(batch_size)
-        if taken is None:
-            taken = cache[batch_size] = frozenset(
-                g for g, (edges, least) in self.__dict__["_param_operand_sizes_"].items()
-                if edges >= least and edges * batch_size >= _COPY_MIN_WORK)
-        return taken
+        if force is False:
+            return frozenset()
+        wide, taken = self._param_operand_rule(batch_size)
+        return wide if force else taken
+
+    def _param_operand_rule(self, batch_size: int) -> tuple:
+        """``(wide, taken)`` at this batch size, groups by id: those of the plan whose kernels run at 16 columns at
+        least (`_operand_columns`), and those of them the rule gives the copy (`_param_operand_groups`). Once a batch
+        size."""
+        cache = self.__dict__.setdefault("_param_operand_rule_", {})
+        hit = cache.get(batch_size)
+        if hit is None:
+            self._param_operand_plan()
+            cols = {g: _operand_columns(readers, batch_size)
+                    for g, (_, _, readers) in self.__dict__["_param_operand_sizes_"].items()}
+            wide = frozenset(g for g, c in cols.items() if c >= 16)
+            hit = cache[batch_size] = (wide, frozenset(
+                g for g, (edges, least, _) in self.__dict__["_param_operand_sizes_"].items()
+                if g in wide and edges >= least and edges * cols[g] >= _COPY_MIN_WORK))
+        return hit
 
     def _param_operands(self, batch_size: int, refresh: Optional[bool] = True) -> Optional[torch.Tensor]:
         """The bf16 copy of the fp32 parameters several sum layers share (`_param_operand_plan`), for those layers'
@@ -441,17 +464,18 @@ class TensorCircuit(_BuildMixin, _CudaGraphsMixin, _ExternalParamsMixin, _Learni
         line with `params` by every forward that takes it (`_param_operand_groups`), inside its pass -- a graph recorded
         from it copies them too; never keyed on a version counter, which a write through `params.data` does not move --,
         and read by the backward that follows: the parameters its forward computed the node values with
-        (`_param_operands_made`); a backward whose forward made none (another precision, a batch below 16) makes it
-        before its pass. None where it does not apply: another
-        precision, below batch 16 (fp32 kernels in every mode), parameters stored below fp32 (the kernels read them as
-        they are), no such layer. ``refresh = False``: the buffer made, nothing copied (before a pass: a capture
-        allocates nothing); ``None``: copied unless the last forward made the copy in this buffer (the backward, before
-        its pass)."""
+        (`_param_operands_made`); a backward whose forward made none (another precision, fewer than 16 columns) makes it
+        before its pass. None where it does not apply: another precision, no layer group of the plan whose kernels run
+        at 16 columns at least at this batch size (fp32 kernels in every mode below them; a group's columns: the
+        batch's, or what its parameterizations widen it to, `_param_operand_rule`), parameters stored below fp32 (the
+        kernels read them as they are), no such layer. ``refresh = False``: the buffer made, nothing copied (before a
+        pass: a capture allocates nothing); ``None``: copied unless the last forward made the copy in this buffer (the
+        backward, before its pass)."""
         p = self.params
-        if self.precision != "auto" or batch_size < 16 or p.dtype != torch.float32 or not p.is_cuda:
+        if self.precision != "auto" or p.dtype != torch.float32 or not p.is_cuda:
             return None
-        groups, ranges = self._param_operand_plan()
-        if not groups:
+        ranges = self._param_operand_plan()[1]
+        if not self._param_operand_rule(batch_size)[0]:
             return None
         op = self.__dict__.get("_param_operands_")
         if op is None or op.device != p.device or op.numel() != p.numel():
