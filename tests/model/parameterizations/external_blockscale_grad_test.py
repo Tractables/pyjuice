@@ -33,7 +33,7 @@ cuda_only = pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs a 
 def _cute_available():
     if not torch.cuda.is_available():
         return False
-    from pyjuice.parameterizations.kernels.c import get_cute_module
+    from pyjuice.parameterizations.blockscale.kernels.c import get_cute_module
     try:
         return get_cute_module() is not None
     except Exception:
@@ -190,7 +190,7 @@ def test_every_fork_computes_the_same_gradient():
     layer = [l for gg in pc.inner_layer_groups if gg.is_sum() for l in gg.layers
              if hasattr(l, "external_node_infos")][0]
 
-    from pyjuice.parameterizations.kernels.c import get_ele_prepass_module
+    from pyjuice.parameterizations.blockscale.kernels.c import get_ele_prepass_module
     elep = get_ele_prepass_module()
     # (the pre-pass fork's configs too, where its extension builds)
     pre = [("elep", int(c)) for c in elep.fitting_configs(128, 64, 8, 2)] if elep is not None else []

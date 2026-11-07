@@ -21,7 +21,7 @@ DTYPES = {"fp32": torch.float32, "bf16": torch.bfloat16}
 def _modules():
     if not torch.cuda.is_available():
         return None, None
-    from pyjuice.parameterizations.kernels.c import get_sb_module, get_sb_bt_module
+    from pyjuice.parameterizations.blockscale.kernels.c import get_sb_module, get_sb_bt_module
     try:
         return get_sb_module(), get_sb_bt_module()
     except Exception:
@@ -89,7 +89,7 @@ def test_every_config_matches_the_per_sample_kernel(shape, dtype, monkeypatch):
     pc, gated, T, V = _ghmm(L, 5, gcb, dt)
     force = _Force(ck.autotune)
     monkeypatch.setattr(ck, "autotune", force)
-    from pyjuice.parameterizations.kernels.c import get_sb_bt_module
+    from pyjuice.parameterizations.blockscale.kernels.c import get_sb_bt_module
     n_cfg = len(get_sb_bt_module().blockscale_sb_bt_configs())
     for B in (1, 3, 8, 16, 33):
         torch.manual_seed(B)

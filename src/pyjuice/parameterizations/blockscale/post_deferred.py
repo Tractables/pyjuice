@@ -200,7 +200,7 @@ class _FormTrials:
 
 def _launch_layer(owner, m, node_mars, grad_ext, W) -> None:
     """The partition's own launch, as `_post_fused` makes it (its outputs given)."""
-    from ..kernels.blockscale_post_backward import _bs_post_backward_kernel
+    from .kernels.blockscale_post_backward import _bs_post_backward_kernel
     grid, consts, shares = m["plan"]
     log_z = m["log_z"]
     if shares is not None:
@@ -240,7 +240,7 @@ def _forms(m0) -> list:
 def _launch_deferred(members, tabs, node_mars, grad_ext, ws, form = None) -> None:
     """The deferred kernels over every member (their outputs given: ``ws`` by each `W`'s address), in their own form
     (``form`` None) or one of `_forms`."""
-    from ..kernels.blockscale_post_backward_deferred import _bs_post_deferred_grad_kernel, _bs_post_deferred_w_kernel
+    from .kernels.blockscale_post_backward_deferred import _bs_post_deferred_grad_kernel, _bs_post_deferred_w_kernel
     m0 = members[0]
     grid, consts, _ = m0["plan"]
     rows, bs_ = m0["rows"], consts["BLOCK_SIZE_M"]
@@ -263,7 +263,7 @@ def _launch_deferred(members, tabs, node_mars, grad_ext, ws, form = None) -> Non
     gargs = (m0["node_flows"], node_mars, t["lz"], t["sg"] if want_grad else t["lz"], m0["ext"], t["gate"], t["nids"],
              t["ext_base"], log_z0 if grad_ext is None else grad_ext)
     if ngt:
-        from ..kernels.blockscale_post_backward_deferred_wide import _bs_post_deferred_grad_wide_kernel
+        from .kernels.blockscale_post_backward_deferred_wide import _bs_post_deferred_grad_wide_kernel
         wide = {k: v for k, v in common.items() if k != "USE_DOT"}
         wide.update(TILE_B = tb, num_warps = 4)
         _bs_post_deferred_grad_wide_kernel[(len(members) * rows,

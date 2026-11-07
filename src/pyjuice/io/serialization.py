@@ -3,9 +3,17 @@ from __future__ import annotations
 import torch
 import pickle
 import io
+from functools import partial
+from typing import Sequence
+
+from pyjuice.nodes import CircuitNodes, InputNodes, ProdNodes, SumNodes, ParameterizedSumNodes, inputs, multiply, summate
 
 
 _RENAMED = {"ExternalSumParams": "SumParameterization", "BlockScaleSumParams": "BlockScale", "LowRankSumParams": "LowRank"}
+# the modules that held them since: the base class's module renamed, LowRank's class module beside its package
+_MOVED = {"pyjuice.parameterizations.external_params": "pyjuice.parameterizations.sum_parameterization",
+          "pyjuice.parameterizations.base": "pyjuice.parameterizations.sum_parameterization",
+          "pyjuice.parameterizations.lowrank": "pyjuice.parameterizations.low_rank"}
 
 
 class _Unpickler(pickle.Unpickler):
@@ -13,17 +21,14 @@ class _Unpickler(pickle.Unpickler):
     def find_class(self, module, name):
         if module.startswith("pyjuice.nodes.external_params"):
             module = "pyjuice.parameterizations" + module[len("pyjuice.nodes.external_params"):]
-            if module == "pyjuice.parameterizations.external_params":
-                module = "pyjuice.parameterizations.base"
+        module = _MOVED.get(module, module)
         return super().find_class(module, _RENAMED.get(name, name))
 
 
 def _load_parameterization(data: bytes):
     return _Unpickler(io.BytesIO(data)).load()
-from functools import partial
-from typing import Sequence
 
-from pyjuice.nodes import CircuitNodes, InputNodes, ProdNodes, SumNodes, ParameterizedSumNodes, inputs, multiply, summate
+
 
 
 def serialize_nodes(root_ns: CircuitNodes):

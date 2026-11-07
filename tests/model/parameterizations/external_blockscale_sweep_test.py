@@ -34,7 +34,7 @@ cuda_only = pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs a 
 def _cute_available():
     if not torch.cuda.is_available():
         return False
-    from pyjuice.parameterizations.kernels.c import get_cute_module
+    from pyjuice.parameterizations.blockscale.kernels.c import get_cute_module
     try:
         return get_cute_module() is not None
     except Exception:
@@ -171,7 +171,7 @@ def test_sweep_small_batch(num_latents, block_size, gate_cbs, batch, monkeypatch
     """The plain-CUDA forks. These are fp32 throughout, so the bar is far tighter -- the tensor-core small-batch twins
     (`test_sweep_small_batch_tensor_cores`, `test_sweep_small_batch_high_precision`) taken out, as if their extensions
     had not built."""
-    import pyjuice.parameterizations.kernels.c as bs_c
+    import pyjuice.parameterizations.blockscale.kernels.c as bs_c
     monkeypatch.setattr(bs_c, "get_sb_mma_module", lambda: None)
     monkeypatch.setattr(bs_c, "get_sb_ele_mma_module", lambda: None)
     _check(num_latents, block_size, gate_cbs, batch, tol_val = 1e-5, tol_ef = 1e-5, tol_pf = 1e-4)

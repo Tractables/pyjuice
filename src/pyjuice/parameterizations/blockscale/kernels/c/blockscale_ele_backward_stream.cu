@@ -1,14 +1,3 @@
-// The `BlockScale` element-flow stream backward (blockscale_ele_backward_stream.cu: a pre-pass, a split
-// GEMM, a merge with the gate gradient) with the PRODUCT LAYER BELOW FUSED into its merge: the merge forms each
-// element's value as the sum of that product's two child node values -- what the product layer's forward recomputes
-// into `element_mars` before the sum layer's backward (one fp32 add) -- for its flow and its gate-gradient terms, and
-// writes the element's flow straight into its two children's node flows: what the product layer's backward writes for
-// a child of one parent element (log-space flows, -inf before: logaddexp(-inf, f) = f). `ctab` int32 [elements past
-// `first_row`, 2] gives each element's two child node rows; the caller verifies that every child has no other parent
-// (the circuit's decision). The same bits as the product forward, the element stream and the product backward one
-// after the other; the pre-pass and the GEMM are that module's, copied unchanged (a new module: the kernels training
-// runs stay as they are). What the stream module's header says of the rest holds here:
-//
 // The `BlockScale` element-flow backward (bf16 parameters) as a pre-pass, a split GEMM and a merge -- what
 // the pre-pass element kernel (blockscale_ele_backward_prepass.cu) computes, not to its bits:
 //
@@ -50,7 +39,7 @@
 // Scratch: one allocation per call (inside a CUDA graph capture, from its pool).
 
 #include <torch/extension.h>
-#include "../../../layer/kernels/c/param_load.cuh"   // `param_ptr<TP>`: the stored dtype
+#include "../../../../layer/kernels/c/param_load.cuh"   // `param_ptr<TP>`: the stored dtype
 #include <cuda_bf16.h>
 #include <c10/cuda/CUDAStream.h>
 #include <c10/cuda/CUDAException.h>
@@ -99,7 +88,7 @@ __device__ __forceinline__ void mbar_wait(uint64_t* bar, int phase) {
 // Thread (part, b) takes the piece's 32-parent chunks part, part + PARTS, ...: lf in registers, the piece's max in
 // shared memory, the exponentials split into hi + lo. A piece past PARTS chunks loads its later chunks twice.
 template <int NT, int PB>
-__global__ void __launch_bounds__(NT) bs_elesf_prepass_kernel(
+__global__ void __launch_bounds__(NT) bs_eles_prepass_kernel(
         const float* nf, const float* nm, const long* __restrict__ ebase,
         const int* __restrict__ pc_k0, const int* __restrict__ pc_k1, const int* __restrict__ grep,
         __nv_bfloat16* __restrict__ uh, __nv_bfloat16* __restrict__ ul, float* __restrict__ mp, int batch, int knt,
@@ -178,7 +167,7 @@ using AtomB = decltype(composition(Swizzle<3, 3, 3>{}, Layout<Shape<_64, _8>, St
 
 // ---------------- split GEMM: a block per (batch tile, child tile, range) ----------------
 template <int BM, int BN, int WM, int WN, int PW, int ST, int KT>
-__global__ void __launch_bounds__((WM * WN + PW) * 32) bs_elesf_gemm_kernel(
+__global__ void __launch_bounds__((WM * WN + PW) * 32) bs_eles_gemm_kernel(
         const bfloat16_t* __restrict__ params, const long* __restrict__ pbase, const bfloat16_t* __restrict__ uh,
         const bfloat16_t* __restrict__ ul, const int* __restrict__ pc_k0, const int* __restrict__ pc_k1,
         const int* __restrict__ sp_lo, const int* __restrict__ sp_hi, const int* __restrict__ ugrp,
@@ -339,9 +328,8 @@ __device__ __forceinline__ void rs_round(float* v, int lane, int ofs) {
 // chunks in order; after one barrier, per (piece, gate row, column) the gate row's sums in order, a run's pieces in
 // order by its first. MEASURED against a shuffle tree with a filled table (HMM-4096 x4, gate width 64, 4 pieces):
 // 24.2 -> 15.7 us at B 512, 8.2 -> 5.9 at B 128 -- the registers for 4 blocks an SM, 3x fewer shuffles.
-__global__ void __launch_bounds__(256, 4) bs_elesf_merge_kernel(
-        float* __restrict__ nflows, const float* __restrict__ nmars, const int* __restrict__ ctab, long first_row,
-        const float* part,
+__global__ void __launch_bounds__(256, 4) bs_eles_merge_kernel(
+        float* __restrict__ ef, const float* __restrict__ emars, const float* part,
         const float* mp, const float* __restrict__ ext, const int* __restrict__ pc_gate,
         const long* __restrict__ chids, const int* __restrict__ ugrp, float* __restrict__ grad, int batch, int BSM,
         int gc, int R, long ext_base, int npc, long rows_total, int wgrad) {
@@ -358,10 +346,7 @@ __global__ void __launch_bounds__(256, 4) bs_elesf_merge_kernel(
     for (int m0 = mb; m0 < mb + R; m0 += 64) {
         const int m = m0 + mi, r = m / gc;
         const long row = (long)eb * BSM + m;
-        const int* ct = ctab + (eoff + m - first_row) * 2;
-        const long c0 = ct[0], c1 = ct[1];
-        const float4 x0 = *(const float4*)&nmars[c0 * batch + b], x1 = *(const float4*)&nmars[c1 * batch + b];
-        const float4 E = make_float4(x0.x + x1.x, x0.y + x1.y, x0.z + x1.z, x0.w + x1.w);
+        const float4 E = *(const float4*)&emars[(eoff + m) * (long)batch + b];
         float T[4] = {-INFINITY, -INFINITY, -INFINITY, -INFINITY}, S[4] = {0.f, 0.f, 0.f, 0.f};
         for (int p0 = 0; p0 < npc; p0 += PQ) {
             float4 L[PQ], M[PQ], lp[PQ];
@@ -425,9 +410,7 @@ __global__ void __launch_bounds__(256, 4) bs_elesf_merge_kernel(
         float o[4];
         CUTE_UNROLL
         for (int c = 0; c < 4; c++) o[c] = (T[c] == -INFINITY) ? -INFINITY : (&E.x)[c] + T[c] + __logf(S[c]);
-        const float4 ov = make_float4(o[0], o[1], o[2], o[3]);
-        *(float4*)&nflows[c0 * batch + b] = ov;
-        *(float4*)&nflows[c1 * batch + b] = ov;
+        *(float4*)&ef[(eoff + m) * (long)batch + b] = make_float4(o[0], o[1], o[2], o[3]);
     }
     if (!wgrad) return;
     __syncthreads();
@@ -465,7 +448,7 @@ static void launch_gemm(const bfloat16_t* params, const long* pbase, const bfloa
     constexpr int STAGE = (KT * BM * 2 + 2 * KT * BN * 2 + 1023) / 1024 * 1024;
     constexpr int SMEM = ST * STAGE + 2 * ST * 8;
     static_assert(SMEM <= 101376, "a config past sm_120's 99 KB of shared memory a block");
-    auto kernel = bs_elesf_gemm_kernel<BM, BN, WM, WN, PW, ST, KT>;
+    auto kernel = bs_eles_gemm_kernel<BM, BN, WM, WN, PW, ST, KT>;
     static bool attr_set[64] = {};
     int dev = 0;
     C10_CUDA_CHECK(cudaGetDevice(&dev));
@@ -520,8 +503,8 @@ int64_t max_pieces() { return PMAX; }
 // as ONE int32 tensor (one argument, not seven: the call's host time is what a host-bound backward pays) -- per element
 // block the pieces' first and end k-steps and gates [neb, PMAX] each, the ranges' first and end pieces [neb, split]
 // each, its group [neb], each group's first element block [ngrp]; `cfg` = config id * 64 + split.
-void blockscale_ele_backward_stream_fused(torch::Tensor node_flows, torch::Tensor node_mars, torch::Tensor ctab,
-                                    int64_t first_row, torch::Tensor params, torch::Tensor ext,
+void blockscale_ele_backward_stream(torch::Tensor element_flows, torch::Tensor element_mars, torch::Tensor node_flows,
+                                    torch::Tensor node_mars, torch::Tensor params, torch::Tensor ext,
                                     torch::Tensor chids, torch::Tensor ebase, torch::Tensor pbase,
                                     torch::Tensor grad_ext, int64_t batch, int64_t block_size, int64_t cs_block_size,
                                     int64_t knt, int64_t gate_cbs, int64_t ext_base, int64_t write_grad, int64_t cfg,
@@ -546,19 +529,18 @@ void blockscale_ele_backward_stream_fused(torch::Tensor node_flows, torch::Tenso
     const int* tb = tables.data_ptr<int>();
     const int *pc_k0 = tb, *pc_k1 = pc_k0 + neb * PMAX, *pc_gate = pc_k1 + neb * PMAX, *sp_lo = pc_gate + neb * PMAX;
     const int *sp_hi = sp_lo + neb * split, *ugrp = sp_hi + neb * split, *grep = ugrp + neb;
-    TORCH_CHECK(ctab.is_contiguous() && ctab.scalar_type() == torch::kInt32 && ctab.dim() == 2 && ctab.size(1) == 2 &&
-                node_flows.is_contiguous() && node_mars.is_contiguous() && ext.is_contiguous(),
-                "blockscale element stream fused: contiguous tensors, ctab int32 [rows, 2]");
+    TORCH_CHECK(element_flows.is_contiguous() && element_mars.is_contiguous() && node_flows.is_contiguous() &&
+                node_mars.is_contiguous() && ext.is_contiguous(), "blockscale element stream: contiguous tensors");
     TORCH_CHECK(reinterpret_cast<uintptr_t>(ext.data_ptr()) % 16 == 0, "the gate parameters 16-byte aligned");
     TORCH_CHECK(!write_grad || grad_ext.numel() > 0, "write_grad without a gradient buffer");
-    const at::cuda::OptionalCUDAGuard guard(node_flows.device());
+    const at::cuda::OptionalCUDAGuard guard(element_flows.device());
     const auto* pp = reinterpret_cast<const bfloat16_t*>(param_ptr<__nv_bfloat16>(params));
     const long rows_total = (long)neb * cs_block_size;
     // scratch, ONE allocation: u hi and lo bf16 [groups, knt * 64, B], M [groups, PMAX, B], partials [PMAX, rows, B]
     const long n_u = (long)ngrp * knt * BK * batch;
     const long o_mp = 4 * n_u, o_part = o_mp + 4L * ngrp * PMAX * batch;
     torch::Tensor scratch = torch::empty({o_part + 4L * npc * rows_total * batch},
-                                         node_mars.options().dtype(torch::kUInt8));
+                                         element_mars.options().dtype(torch::kUInt8));
     char* base = reinterpret_cast<char*>(scratch.data_ptr());
     auto* uh = reinterpret_cast<__nv_bfloat16*>(base);
     auto* ul = uh + n_u;
@@ -566,7 +548,7 @@ void blockscale_ele_backward_stream_fused(torch::Tensor node_flows, torch::Tenso
     auto* part = reinterpret_cast<float*>(base + o_part);
     cudaStream_t st = c10::cuda::getCurrentCUDAStream();
     {
-#define P_(NT, PB) launch_pdl(bs_elesf_prepass_kernel<NT, PB>, dim3(ngrp * (int)npc * ((int)batch / PB)), dim3(NT), 0, st, \
+#define P_(NT, PB) launch_pdl(bs_eles_prepass_kernel<NT, PB>, dim3(ngrp * (int)npc * ((int)batch / PB)), dim3(NT), 0, st, \
             node_flows.data_ptr<float>(), node_mars.data_ptr<float>(), ebase.data_ptr<long>(), pc_k0, pc_k1, grep, uh, \
             ul, mp, (int)batch, (int)knt, kt_sh, (int)npc)
         if (batch >= 256) P_(512, 16); else P_(256, 8);
@@ -585,9 +567,8 @@ void blockscale_ele_backward_stream_fused(torch::Tensor node_flows, torch::Tenso
         const int R = gate_cbs > 64 ? (int)gate_cbs : 64;
         const long nblk = (long)neb * (cs_block_size / R) * (batch / 16);
         TORCH_CHECK(nblk < (1L << 31), "blockscale element stream: a merge grid past 2^31 blocks");
-        launch_pdl(bs_elesf_merge_kernel, dim3((unsigned)nblk), dim3(256), 0, st,
-            node_flows.data_ptr<float>(), node_mars.data_ptr<float>(), ctab.data_ptr<int>(), (long)first_row, part, mp,
-            ext.data_ptr<float>(), pc_gate,
+        launch_pdl(bs_eles_merge_kernel, dim3((unsigned)nblk), dim3(256), 0, st,
+            element_flows.data_ptr<float>(), element_mars.data_ptr<float>(), part, mp, ext.data_ptr<float>(), pc_gate,
             chids.data_ptr<long>(), ugrp, write_grad ? grad_ext.data_ptr<float>() : nullptr, (int)batch,
             (int)cs_block_size, (int)gate_cbs, R, (long)ext_base, (int)npc, rows_total, (int)write_grad);
         C10_CUDA_KERNEL_LAUNCH_CHECK();
@@ -595,7 +576,7 @@ void blockscale_ele_backward_stream_fused(torch::Tensor node_flows, torch::Tenso
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("blockscale_ele_backward_stream_fused", &blockscale_ele_backward_stream_fused,
+    m.def("blockscale_ele_backward_stream", &blockscale_ele_backward_stream,
           "the block-scale element-flow backward (and d LL / d log phi) as a pre-pass, a split GEMM and a merge");
     m.def("configs", &configs, "(BM, BN, KT) per config id");
     m.def("fitting_configs", &fitting_configs, "the config ids that serve a layer (cs_block_size, batch, gate_cbs)");

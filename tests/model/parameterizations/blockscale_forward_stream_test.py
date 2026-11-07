@@ -17,7 +17,7 @@ import pyjuice.nodes.distributions as dists
 from pyjuice.nodes import inputs, multiply, summate
 from pyjuice.parameterizations import BlockScale
 import pyjuice.layer.kernels.c as ck
-import pyjuice.parameterizations.kernels.c as ext_c
+import pyjuice.parameterizations.blockscale.kernels.c as ext_c
 from pyjuice.parameterizations.blockscale.forward import _ForwardMixin
 from pyjuice.parameterizations.blockscale.common import _buffer_kwarg
 

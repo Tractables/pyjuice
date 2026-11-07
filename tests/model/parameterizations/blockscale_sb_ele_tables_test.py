@@ -21,7 +21,7 @@ DTYPES = {"fp32": torch.float32, "bf16": torch.bfloat16}
 def _sb_module():
     if not torch.cuda.is_available():
         return None
-    from pyjuice.parameterizations.kernels.c import get_sb_bw_module
+    from pyjuice.parameterizations.blockscale.kernels.c import get_sb_bw_module
     try:
         return get_sb_bw_module()
     except Exception:

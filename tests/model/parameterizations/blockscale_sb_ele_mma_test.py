@@ -35,7 +35,7 @@ TOL = {"bf16": 2.5e-3, "fp32": 1e-4, "hp": 1e-4}
 def _ext():
     if not torch.cuda.is_available():
         return None
-    import pyjuice.parameterizations.kernels.c as ext_c
+    import pyjuice.parameterizations.blockscale.kernels.c as ext_c
     try:
         return ext_c if ext_c.get_sb_ele_mma_module() is not None else None
     except Exception:

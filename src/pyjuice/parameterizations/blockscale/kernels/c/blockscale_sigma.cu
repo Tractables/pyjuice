@@ -14,7 +14,7 @@
 // dividing num_edges, `sigma` fp32 [rows * block_size, n_gates] and contiguous.
 
 #include <torch/extension.h>
-#include "../../../layer/kernels/c/param_load.cuh"   // `ParamLoad<TP>`, `param_ptr<TP>`: the stored dtype
+#include "../../../../layer/kernels/c/param_load.cuh"   // `ParamLoad<TP>`, `param_ptr<TP>`: the stored dtype
 #include <cuda_bf16.h>
 #include <c10/cuda/CUDAStream.h>
 #include <c10/cuda/CUDAException.h>

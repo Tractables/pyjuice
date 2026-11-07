@@ -15,7 +15,7 @@ from pyjuice.nodes import CircuitNodes
 from pyjuice.layer import StagedExternalParams, EXTERNAL_PARAMS_KWARG, EXTERNAL_PARAMS_GRAD_KWARG, \
                           EXTERNAL_PARAMS_BUFFER_KWARG, EXTERNAL_PARAMS_GRAD_BUFFER_KWARG
 from pyjuice.layer.parameterized_sum_layer import validate_external_tensors
-from pyjuice.parameterizations.base import SumParameterization
+from pyjuice.parameterizations.sum_parameterization import SumParameterization
 
 
 def _staging_transpose_fn():

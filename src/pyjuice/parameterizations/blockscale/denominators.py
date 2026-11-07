@@ -231,7 +231,7 @@ class _DenominatorsMixin:
             M-step does not: it consumes `F-` into a fresh parameter tensor). Pass `out` to opt out.
         """
         import triton
-        from ..kernels.blockscale_backward import _bs_triton_denom_scatter_kernel
+        from .kernels.blockscale_backward import _bs_triton_denom_scatter_kernel
 
         pfs, pfe = ns._param_flow_range
         size = pfe - pfs
@@ -353,7 +353,7 @@ class _DenominatorsMixin:
         pids = layer.partitioned_pids[pid].to(torch.int64)
         rows, num_edges = pids.shape
         n_gates = num_edges // gate_cbs
-        from ..kernels.c import get_sigma_module
+        from .kernels.c import get_sigma_module
         mod = (get_sigma_module() if params.is_cuda and params.dtype in (torch.float32, torch.bfloat16)
                and num_edges % gate_cbs == 0 else None)
         if mod is not None:

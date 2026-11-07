@@ -44,7 +44,7 @@ cuda_only = pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs a 
 def _cute_available():
     if not torch.cuda.is_available():
         return False
-    from pyjuice.parameterizations.kernels.c import get_cute_module
+    from pyjuice.parameterizations.blockscale.kernels.c import get_cute_module
     try:
         return get_cute_module() is not None
     except Exception:
@@ -755,28 +755,29 @@ def test_the_whole_path_runs_without_any_cuda_extension():
     CUDA-only -- and this pins both.
     """
     import pyjuice.parameterizations.kernels.c as ck
+    import pyjuice.parameterizations.blockscale.kernels.c as bk
 
     num_latents, block_size, gate_cbs, batch = 256, 128, 8, 128
-    accessors = ["get_module", "get_ele_bw_module", "get_sb_bw_module", "get_par_bw_module",
-                 "get_cute_module", "get_sb_module"]
+    accessors = [(ck, "get_module"), (bk, "get_ele_bw_module"), (bk, "get_sb_bw_module"), (bk, "get_par_bw_module"),
+                 (bk, "get_cute_module"), (bk, "get_sb_module")]
 
     pc, root, ns, data, phi, lls = _run(num_latents, block_size, gate_cbs, batch, scale = 1.5)
     pc.backward(data, flows_memory = 0.0)
     ns.update_param_flows(pc.param_flows)
     with_cuda_lls, with_cuda_pf = lls.detach().double(), ns.get_param_flows().double()
 
-    saved = {n: getattr(ck, n) for n in accessors}
+    saved = {(m, n): getattr(m, n) for m, n in accessors}
     try:
-        for n in accessors:
-            setattr(ck, n, lambda: None)
+        for m, n in accessors:
+            setattr(m, n, lambda: None)
         # A fresh circuit: the forks are chosen (and cached) per layer at the first pass.
         pc2, _, ns2, data2, phi2, lls2 = _run(num_latents, block_size, gate_cbs, batch, scale = 1.5)
         pc2.backward(data2, flows_memory = 0.0)
         ns2.update_param_flows(pc2.param_flows)
         triton_lls, triton_pf = lls2.detach().double(), ns2.get_param_flows().double()
     finally:
-        for n, f in saved.items():
-            setattr(ck, n, f)
+        for (m, n), f in saved.items():
+            setattr(m, n, f)
 
     ref_ef, ref_pf = _flow_reference(pc, ns, phi, gate_cbs, batch)
     d_pf = float(((triton_pf.to(ref_pf.device) - ref_pf).abs() / ref_pf.clamp(min = 1e-30)).max())

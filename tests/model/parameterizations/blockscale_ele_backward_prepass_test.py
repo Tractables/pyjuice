@@ -28,7 +28,7 @@ CATS = 16
 def _module():
     if not torch.cuda.is_available():
         return None
-    from pyjuice.parameterizations.kernels.c import get_ele_prepass_module
+    from pyjuice.parameterizations.blockscale.kernels.c import get_ele_prepass_module
     try:
         return get_ele_prepass_module()
     except Exception:

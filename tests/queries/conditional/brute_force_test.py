@@ -208,7 +208,7 @@ def test_extern_product_categorical():
     # BlockScale's backward refuses precision = "fp32", so it runs at the default precision
     ("blockscale", 4, 8), ("blockscale", 16, 16),
     ("lowrank", 4, 8), ("lowrank", 16, 16), ("lowrank", 32, 24),
-    # (the mixture form: through the plain kernels on a virtual batch, `lowrank_virtual`)
+    # (the mixture form: through the plain kernels on a virtual batch, `lowrank.virtual`)
     ("lowrank_sum_exp", 4, 8), ("lowrank_sum_exp", 16, 16), ("lowrank_sum_exp", 32, 24),
 ])
 def test_external_sum_params(external, block_size, B, categorical_path):

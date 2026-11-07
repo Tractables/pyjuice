@@ -23,7 +23,7 @@
 // rather than per (child, batch).
 
 #include <torch/extension.h>
-#include "../../../layer/kernels/c/param_load.cuh"   // `ParamLoad<TP>`: the parameters in their stored dtype
+#include "../../../../layer/kernels/c/param_load.cuh"   // `ParamLoad<TP>`: the parameters in their stored dtype
 #include <cuda_fp16.h>
 #include <cuda.h>
 #include <c10/cuda/CUDAStream.h>

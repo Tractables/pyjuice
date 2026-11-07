@@ -302,7 +302,7 @@ def test_every_gated_fork_reads_what_its_products_take(kind, monkeypatch):
     parameters to bf16 (the CuTe fork, its pre-pass copy, the tensor-core small-batch one) read the copy, the fp32 ones
     (the per-sample and batch-tiled small-batch forks) the fp32 parameters -- every one the same node values to the
     bit. Batch 64 for the first two, 32 for the small-batch forks."""
-    import pyjuice.parameterizations.kernels.c as bk
+    import pyjuice.parameterizations.blockscale.kernels.c as bk
     getter, name = _FORKS[kind]
     mod = getattr(bk, getter)()
     if mod is None:
@@ -334,7 +334,7 @@ def test_every_gated_fork_reads_what_its_products_take(kind, monkeypatch):
 def test_the_gated_layers_take_the_split_forward_on_the_copy(monkeypatch):
     """On fp32 parameters BlockScale's split forward (bf16 parameters only) is not among the forward's candidates; on
     the copy it is."""
-    import pyjuice.parameterizations.kernels.c as bk
+    import pyjuice.parameterizations.blockscale.kernels.c as bk
     if bk.get_stream_module() is None:
         pytest.skip("no split forward on this toolchain")
     root, gated = _gated_chain()
@@ -360,7 +360,7 @@ def test_a_tied_gated_layer_computes_what_its_bf16_twin_computes(kind, monkeypat
     """The fp32 circuit's gated layers on the copy and a circuit storing the same parameters' rounding in bf16, each fork
     forced in both: their node values to the bit -- the split forward's `sigma` summed from the copy, as from the stored
     values."""
-    import pyjuice.parameterizations.kernels.c as bk
+    import pyjuice.parameterizations.blockscale.kernels.c as bk
     if kind == "stream" and bk.get_stream_module() is None:
         pytest.skip("no split forward on this toolchain")
     root, gated = _gated_chain()
@@ -588,7 +588,7 @@ def test_the_gated_element_kinds_read_what_their_products_take(kind, monkeypatch
     (bf16 parameters only) is given the copy; the fp16 kinds (the CuTe fork, its pre-pass copy) and the tensor-core
     small-batch one (fp32 parameters as bf16 hi + lo halves) the fp32 parameters. Batch 64, 32 for the small-batch
     kind."""
-    import pyjuice.parameterizations.kernels.c as bk
+    import pyjuice.parameterizations.blockscale.kernels.c as bk
     getter, name = _GATED_ELE[kind]
     mod = getattr(bk, getter)()
     if mod is None:
@@ -611,7 +611,7 @@ def test_the_gated_element_kinds_read_what_their_products_take(kind, monkeypatch
 def test_the_split_element_backwards_tuning_times_it_on_the_copy(monkeypatch):
     """The split element backward's (tile, split) choice (`_eles_code`: `autotune.pick`, its cache emptied, its trials
     run) times the kernel on the copy, as it will run: every call, the trials' among them, given bf16 parameters."""
-    import pyjuice.parameterizations.kernels.c as bk
+    import pyjuice.parameterizations.blockscale.kernels.c as bk
     import pyjuice.layer.kernels.c as ck
     from pyjuice.parameterizations import BlockScale
     mod = bk.get_ele_stream_module()
@@ -694,7 +694,7 @@ def test_the_gate_gradient_sums_sigma_from_what_the_forward_summed(kind, monkeyp
     it computed -- else, as without the copy, from the fp32 parameters (the pre-pass fork's `log Z` its own
     products')."""
     from pyjuice.parameterizations import BlockScale
-    import pyjuice.parameterizations.kernels.c as bk
+    import pyjuice.parameterizations.blockscale.kernels.c as bk
     if kind == "stream" and bk.get_stream_module() is None:
         pytest.skip("no split forward on this toolchain")
     root, gated = _gated_chain(L = 512)

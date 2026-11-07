@@ -1,3 +1,3 @@
-from .base import SumParameterization
-from .lowrank import LowRank
+from .sum_parameterization import SumParameterization
+from .low_rank import LowRank
 from .block_scale import BlockScale

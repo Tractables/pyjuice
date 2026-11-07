@@ -56,6 +56,8 @@ readme = {file = "README.md"}
 "pyjuice.layer.kernels.c.input_layers" = ["*.cu"]
 "pyjuice.nodes.distributions.c_kernels" = ["*.cu"]
 "pyjuice.parameterizations.kernels.c" = ["*.cu", "*.cuh"]
+"pyjuice.parameterizations.blockscale.kernels.c" = ["*.cu", "*.cuh"]
+"pyjuice.parameterizations.lowrank.kernels.c" = ["*.cu", "*.cuh"]
 "pyjuice.constraints.inference.dfa_exact.kernels.c" = ["*.cu", "*.cuh"]
 "pyjuice.utils.c" = ["*.cpp"]
 

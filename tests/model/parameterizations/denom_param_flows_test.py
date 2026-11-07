@@ -39,8 +39,8 @@ import pyjuice as juice
 import pyjuice.nodes.distributions as dists
 from pyjuice.nodes import inputs, multiply, summate
 from pyjuice.parameterizations import BlockScale
-from pyjuice.parameterizations.base import SumParameterization
-from pyjuice.parameterizations.lowrank import LowRank
+from pyjuice.parameterizations.sum_parameterization import SumParameterization
+from pyjuice.parameterizations.low_rank import LowRank
 from pyjuice.layer.layer import Layer
 from pyjuice.layer.sum_layer import SumLayer
 from pyjuice.layer.prod_layer import ProdLayer

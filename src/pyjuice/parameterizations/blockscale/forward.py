@@ -17,7 +17,7 @@ from .common import _buffer_kwarg
 
 
 def _stream_fused_module():
-    from ..kernels.c import get_stream_fused_module
+    from .kernels.c import get_stream_fused_module
     return get_stream_fused_module()
 
 
@@ -78,8 +78,9 @@ class _ForwardMixin:
         All three are collected here and the choice is MEASURED, so where they overlap the faster one
         wins rather than the one that happened to be checked first.
         """
-        from ..kernels.c import get_cute_module, get_sb_module, get_sb_bt_module, get_sb_mma_module, get_prepass_module, get_stream_module
-        from ..kernels import c as ck_ext
+        from .kernels.c import (get_cute_module, get_sb_module, get_sb_bt_module, get_sb_mma_module, get_prepass_module,
+                                get_stream_module)
+        from .kernels import c as ck_ext
         import pyjuice.layer.kernels.c as ck
 
         # NEITHER CUDA extension is required any more. The CuTe forward needs nvcc, CUTLASS and
@@ -374,7 +375,7 @@ class _ForwardMixin:
             return run
 
         def _tri_runner(tcalls):
-            from ..kernels.blockscale_forward import _bs_triton_fw_kernel
+            from .kernels.blockscale_forward import _bs_triton_fw_kernel
 
             def run():
                 for _ in range(REPEATS):
@@ -632,7 +633,7 @@ class _ForwardMixin:
         if mod == "triton":
             # The portable fallback: `calls` are kwarg dicts rather than positional tuples, since
             # this kernel takes its tiling as constexprs rather than a config id.
-            from ..kernels.blockscale_forward import _bs_triton_fw_kernel
+            from .kernels.blockscale_forward import _bs_triton_fw_kernel
             for c in calls:
                 _bs_triton_fw_kernel[c["grid"]](
                     node_mars = node_mars, element_mars = element_mars, mparams = params,

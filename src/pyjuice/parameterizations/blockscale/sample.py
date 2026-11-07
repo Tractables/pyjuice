@@ -23,7 +23,7 @@ class _SampleMixin:
         share `_gate_weights`, so they cannot disagree about what an edge weighs -- addressed by
         (frontier row, tile of samples) instead of by a list of selected pairs.
         """
-        from ..kernels.blockscale_sample import bs_scoped_sum_layer
+        from .kernels.blockscale_sample import bs_scoped_sum_layer
 
         external_params = kwargs.get(_buffer_kwarg(), None)
         if external_params is None:
@@ -95,7 +95,7 @@ class _SampleMixin:
         nothing measurable and would cost the property that makes this reviewable -- that it is the
         shared-parameter sampler plus a gate.
         """
-        from ..kernels.blockscale_sample import bs_sample_sum_layer
+        from .kernels.blockscale_sample import bs_sample_sum_layer
 
         external_params = kwargs.get(_buffer_kwarg(), None)
         if external_params is None:

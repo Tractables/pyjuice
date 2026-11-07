@@ -444,7 +444,7 @@ def test_the_side_streams_W_waits_for_the_pass_and_the_pass_for_it(monkeypatch):
     either end (`torch.cuda._sleep`) -- the main stream just before the fork, the node flows `W` reads written there
     last (poisoned before the sleep, put back after it); the side stream before `W` -- the backward's denominator flows,
     read on the main stream with nothing synchronized, are the unhurried run's to the bit."""
-    import pyjuice.parameterizations.kernels.blockscale_post_backward_deferred as kd
+    import pyjuice.parameterizations.blockscale.kernels.blockscale_post_backward_deferred as kd
     monkeypatch.setattr(autotune, "_CACHE", {})
     _forced(monkeypatch, 2)
     pc, gated, phi, x = _circuit(64)

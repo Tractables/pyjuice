@@ -38,7 +38,7 @@
 // layer raises `NotImplementedError` outside all of that rather than falling back to something slower.
 
 #include <torch/extension.h>
-#include "../../../layer/kernels/c/param_load.cuh"   // `ParamLoad<TP>`: the parameters in their stored dtype
+#include "../../../../layer/kernels/c/param_load.cuh"   // `ParamLoad<TP>`: the parameters in their stored dtype
 #include <cuda_bf16.h>
 #include <cuda.h>
 #include <c10/cuda/CUDAStream.h>

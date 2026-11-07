@@ -475,7 +475,7 @@ def test_blockscale_em_at_bf16_keeps_a_write_between_steps(fold, monkeypatch):
     from x -- the master copy's check in the update's own passes (a range past the L2: forced here) or a pass of its
     own -- against an fp32 twin given the same write; and `params` is the master copy's rounding after each step. The
     write is not uniform within a node's children (x1.5 / x0.5 alternating), so a renormalization cannot undo it."""
-    from pyjuice.parameterizations.base import SumParameterization
+    from pyjuice.parameterizations.sum_parameterization import SumParameterization
     monkeypatch.setattr(SumParameterization, "_fold_master", staticmethod(lambda params, n: fold))
     B = 64
     pc32, pc16, gates = _blockscale_pair(B)

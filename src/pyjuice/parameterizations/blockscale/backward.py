@@ -58,13 +58,15 @@ def _rows(chids: torch.Tensor, cbs: int) -> torch.Tensor:
     return (chids.long()[:, None] + torch.arange(cbs, device = chids.device)[None, :]).reshape(-1)
 
 
-def _mod(name: str):
-    """The module `..kernels.<name>`, imported on first use and then looked up (an import statement a call costs
-    ~0.5 us; read attributes off the module, so a test replacing one still takes effect)."""
-    m = _MODS.get(name)
+def _mod(name: str, shared: bool = False):
+    """BlockScale's module `.kernels.<name>` -- the parameterizations' shared `kernels.<name>` with `shared` --,
+    imported on first use and then looked up (an import statement a call costs ~0.5 us; read attributes off the
+    module, so a test replacing one still takes effect)."""
+    m = _MODS.get((name, shared))
     if m is None:
         import importlib
-        m = _MODS[name] = importlib.import_module(f"pyjuice.parameterizations.kernels.{name}")
+        m = _MODS[(name, shared)] = importlib.import_module(
+            f"pyjuice.parameterizations.{'' if shared else 'blockscale.'}kernels.{name}")
     return m
 
 
@@ -80,7 +82,7 @@ def _deferred_par():
 
 def _shift_logz():
     """`kernels.shift_logz.shift_logz` (read off its module each call)."""
-    return _mod("shift_logz").shift_logz
+    return _mod("shift_logz", shared = True).shift_logz
 
 
 _NO_GRAD = {}
@@ -971,7 +973,7 @@ class _BackwardMixin:
                         no_grad if grad is None else grad, gp, scr, batch, blk, cbs, ne64, gate_cbs, ext_base, code)
 
             elif isinstance(kind, tuple) and kind[0] == "blocks":
-                from ..kernels.blockscale_backward_blocks import _bs_triton_ele_blocks_kernel, _bs_blocks_merge_kernel
+                from .kernels.blockscale_backward_blocks import _bs_triton_ele_blocks_kernel, _bs_blocks_merge_kernel
                 (eb_t, pb_t), gb, splits = plan["blocks"], plan["gate_tile"], kind[1]
                 bb, tm, tl_dot = ctx["BLOCK_B"], ctx["TILE_SIZE_M"], ctx["TL_DOT"]
                 steps = eb_t.size(1)
@@ -1034,7 +1036,7 @@ class _BackwardMixin:
             """`_ele_fn`'s launch of the Triton fork, which two of its other forks fall back to. A function of its own:
             `_ele_fn` calling itself made it a reference cycle (the function, the cell of itself in its closure), one per
             call left to Python's garbage collector -- MEASURED: 1550 a step of a joint CoDD2.0 training."""
-            from ..kernels.blockscale_backward import _bs_triton_ele_kernel
+            from .kernels.blockscale_backward import _bs_triton_ele_kernel
             chids = ctx["chids"]
             batch, blk, cbs = ctx["batch_size"], ctx["block_size"], ctx["cs_block_size"]
             knt = ctx["K_NUM_TILES"]
@@ -1103,7 +1105,7 @@ class _BackwardMixin:
             """`_par_hook`'s launch as a function of the call's tensors -- `(param_flows, node_flows, node_mars,
             element_mars, params, ext)` --, everything else fixed by `ctx`: a tied step's flows into its group's slots
             where they defer (`_deferrer`), else the CuTe or the Triton fork, picked by measuring once."""
-            from ..kernels.blockscale_backward import _bs_triton_par_kernel
+            from .kernels.blockscale_backward import _bs_triton_par_kernel
 
             batch, blk, ne = ctx["batch_size"], ctx["block_size"], ctx["num_edges"]
             nbase, cbase, pbase, fbase = ctx["nbase"], ctx["cbase"], ctx["pbase"], ctx["fbase"]
@@ -1270,7 +1272,7 @@ class _BackwardMixin:
             write must be masked, colliding written slots that need an atomic, or (the common case)
             neither.
             """
-            from ..kernels.blockscale_backward import _bs_triton_par_kernel
+            from .kernels.blockscale_backward import _bs_triton_par_kernel
             gb, grid = layer.ext_slots[0][ctx["partition_id"]], ctx["grid"]
             # The UNCONDITIONAL fallback, so it must check too: a shape `_par_hook` refuses arrives
             # here anyway, and would apply one gate row to a whole node block silently.
@@ -1394,7 +1396,7 @@ class _BackwardMixin:
         ~1.2x, re-reading the `node_flows`, `node_mars` and parameters the element kernel already holds in registers.
         The log-Z term shares no operand with that kernel, so it runs here. Do not re-split without re-measuring.
         """
-        from ..kernels.blockscale_post_backward import _bs_post_backward_kernel
+        from .kernels.blockscale_post_backward import _bs_post_backward_kernel
         from .post_deferred import try_defer as try_defer_post
 
         bs_, gate_cbs, batch = state["block_size"], state["gate_cbs"], state["batch_size"]
@@ -1457,7 +1459,7 @@ class _BackwardMixin:
         through scratch node rows (`nids` of their own)."""
         import triton
         from pyjuice.layer.kernels import autotune
-        from ..kernels.blockscale_post_backward import _bs_post_backward_kernel
+        from .kernels.blockscale_post_backward import _bs_post_backward_kernel
         from .denominators import _sm_count
 
         bs_, gate_cbs, batch = state["block_size"], state["gate_cbs"], state["batch_size"]

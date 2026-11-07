@@ -9,7 +9,7 @@ from .blockscale.backward import _BackwardMixin
 from .blockscale.denominators import _DenominatorsMixin
 from .blockscale.forward import _ForwardMixin
 from .blockscale.sample import _SampleMixin
-from .base import SumParameterization
+from .sum_parameterization import SumParameterization
 
 
 class BlockScale(_ForwardMixin, _BackwardMixin, _SampleMixin, _DenominatorsMixin, SumParameterization):

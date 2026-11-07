@@ -14,7 +14,7 @@ import pyjuice as juice
 import pyjuice.nodes.distributions as dists
 from pyjuice.nodes import inputs, multiply, summate
 from pyjuice.parameterizations import BlockScale
-import pyjuice.parameterizations.kernels.c as ext_c
+import pyjuice.parameterizations.blockscale.kernels.c as ext_c
 
 
 cuda_only = pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs a GPU")

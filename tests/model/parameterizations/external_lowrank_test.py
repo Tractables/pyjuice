@@ -573,7 +573,7 @@ def test_top_down_term_reaches_both_flows(form):
 def test_a_batch_in_chunks_is_the_batch(monkeypatch):
     """`exp_sum` holds `[samples, M, N]` for a bounded number of cells and takes a larger batch in chunks of
     samples: the same values, flows and gradients, here two samples at a time with a last chunk of one."""
-    import pyjuice.parameterizations.lowrank as lowrank
+    import pyjuice.parameterizations.lowrank.forward as lowrank_forward
 
     rank, batch = 3, 7
     pc_a, sums_a, _, _, _, _ = _pair("sparse", "exp_sum", rank = rank)
@@ -591,7 +591,7 @@ def test_a_batch_in_chunks_is_the_batch(monkeypatch):
 
     whole = run()
     a = sums_a[0]
-    monkeypatch.setattr(lowrank, "LOWRANK_CHUNK_CELLS", 2 * a.num_nodes * a.num_ch_nodes)
+    monkeypatch.setattr(lowrank_forward, "LOWRANK_CHUNK_CELLS", 2 * a.num_nodes * a.num_ch_nodes)
     assert a.parameterization._chunks(batch, a.num_nodes * a.num_ch_nodes) == [(0, 2), (2, 4), (4, 6), (6, 7)]
     chunked = run()
     for x, y in zip(whole[:4], chunked[:4]):
@@ -719,7 +719,7 @@ def test_a_blockscale_gate_as_factors_trains_as_blockscale(form, virtual, moment
     is what tells how the denominator flow is kept: averaged over steps as `F-`, it carries the parameters of past
     steps (3e-2 from BlockScale's after 16 steps, measured); kept free of them, as BlockScale's is, it is the same
     update. The gate's gradient is the factors', summed over a gate's children."""
-    import pyjuice.parameterizations.lowrank_virtual as lowrank_virtual
+    import pyjuice.parameterizations.lowrank.virtual as lowrank_virtual
 
     if virtual and not _virtual_available():
         pytest.skip("the low-rank mixture's CUDA extension is not built")
@@ -777,10 +777,10 @@ def test_the_denominator_statistic_is_free_of_the_parameters(form):
     assert not torch.allclose(after, before, rtol = 1e-2)
 
 
-# ---------------------------------------------------------------- "sum_exp" on the virtual batch (`lowrank_virtual`)
+# ---------------------------------------------------------------- "sum_exp" on the virtual batch (`lowrank.virtual`)
 
 def _virtual_available():
-    from pyjuice.parameterizations.kernels.c import get_lowrank_module
+    from pyjuice.parameterizations.lowrank.kernels.c import get_lowrank_module
     return torch.cuda.is_available() and get_lowrank_module() is not None
 
 
@@ -832,7 +832,7 @@ def test_the_virtual_batch_is_the_torch_pass(name, served, rank, batch, monkeypa
     """`sum_exp` through the plain kernels on (sample, rank) columns against its torch passes: the same values, flows,
     denominators and gradients -- taken where no child of a layer is shared by two of its node vectors, and the torch
     passes kept where one is."""
-    import pyjuice.parameterizations.lowrank_virtual as lowrank_virtual
+    import pyjuice.parameterizations.lowrank.virtual as lowrank_virtual
 
     pc, sums, _, _, _, _ = _pair(name, "sum_exp", rank = rank)
     dev = pc.params.device
@@ -863,7 +863,7 @@ def test_the_virtual_batch_on_tensor_core_shapes(precision, rtol, monkeypatch):
     """A tied HMM of 128 latents in blocks of 32 at batch 24: the shapes the plain layer's tensor-core kernels take,
     whose products are bf16 at the default precision -- within their tolerance of the torch passes there, and close at
     `precision = "fp32"`."""
-    import pyjuice.parameterizations.lowrank_virtual as lowrank_virtual
+    import pyjuice.parameterizations.lowrank.virtual as lowrank_virtual
 
     rank, batch = 4, 24
     torch.manual_seed(0)
@@ -900,7 +900,7 @@ def test_the_virtual_buffers_stay_what_the_plain_kernels_expect(monkeypatch):
     """The plain kernels pad a ragged row's edges with the circuit's dummy rows: the virtual buffers hold -inf there
     (zero value, zero flow) from their allocation on, whatever memory they were given; the stand-in node values of
     the backward stay 0. A pass over them after the torch passes dirtied the allocator is the torch passes' result."""
-    import pyjuice.parameterizations.lowrank_virtual as lowrank_virtual
+    import pyjuice.parameterizations.lowrank.virtual as lowrank_virtual
 
     rank, batch = 3, 6
     pc, sums, _, _, _, _ = _pair("sparse", "sum_exp", rank = rank)
@@ -949,7 +949,7 @@ def test_the_plain_kernels_run_on_a_twin_of_the_layer_one_layer_tall(name, monke
     layer's `shift` rows lower -- its own nodes from row `nd` on, a dummy id as it is, inside the dummy rows --, every
     other table the layer's own tensor, its caches its own. The torch passes' result; after the layer's device caches
     are dropped a new twin, the same result."""
-    import pyjuice.parameterizations.lowrank_virtual as lowrank_virtual
+    import pyjuice.parameterizations.lowrank.virtual as lowrank_virtual
     from pyjuice.layer.sum_layer import SumLayer
 
     rank, batch = 2, 5
@@ -1001,7 +1001,7 @@ def test_the_node_buffers_of_two_layers_are_shared_only_where_their_rows_lie_ali
     """`_buffers` keys a layer's node buffers by its twin's rows, the dummy rows included: two layers of one height
     whose dummy rows differ never share one (one would write the other's dummy rows); the element ones, one per family
     and width, are the same for both -- the layer below writes the next layer's."""
-    import pyjuice.parameterizations.lowrank_virtual as lowrank_virtual
+    import pyjuice.parameterizations.lowrank.virtual as lowrank_virtual
 
     dev = torch.device("cuda:0")
     node_mars, element_mars = torch.zeros(1000, 3, device = dev), torch.zeros(200, 3, device = dev)
@@ -1021,7 +1021,7 @@ def test_the_node_buffers_of_two_layers_are_shared_only_where_their_rows_lie_ali
 def test_a_twin_refuses_tables_past_the_layers_rows():
     """The twin shifts the layer's own node ids and keeps the dummies; a table naming a node past the layer's rows --
     neither -- is refused, not shifted into another row."""
-    import pyjuice.parameterizations.lowrank_virtual as lowrank_virtual
+    import pyjuice.parameterizations.lowrank.virtual as lowrank_virtual
 
     pc, sums, _, _, _, _ = _pair("hmm_tied", "sum_exp", rank = 2)
     layer = pc.external_params_nodes[sums[0]]
@@ -1133,7 +1133,7 @@ def test_a_node_whose_parameters_are_all_zero_has_no_mass(form, monkeypatch):
     kernels give the node's virtual values -FLT_MAX, by itself and with the layer above's `expand` taken along
     (`collapse_expand`: the product layers fused in, the layers linked by the passes before)."""
     import pyjuice.layer.kernels.autotune as autotune
-    import pyjuice.parameterizations.lowrank_virtual as lowrank_virtual
+    import pyjuice.parameterizations.lowrank.virtual as lowrank_virtual
 
     pick = autotune.pick
     monkeypatch.setattr(autotune, "pick", lambda key, cands, bench, **k: "fused" if key[0] == "prod_stream_fusion"
@@ -1195,7 +1195,7 @@ def test_the_virtual_batch_hands_the_circuits_bf16_copy_to_the_plain_kernels(mon
     `op_params`, the backward's per-call copy --, the twin marked for it at every call (made here before the circuit
     marked the layers, so its mark is the one each call carries over); the values, flows and gradients within bf16's
     rounding of the torch passes', which read the fp32 parameters."""
-    import pyjuice.parameterizations.lowrank_virtual as lowrank_virtual
+    import pyjuice.parameterizations.lowrank.virtual as lowrank_virtual
     from pyjuice.layer.sum_layer import SumLayer
 
     rank, batch = 2, 16                                          # (the copy is made from batch 16 on)
@@ -1238,7 +1238,7 @@ def test_the_virtual_batch_hands_the_circuits_bf16_copy_to_the_plain_kernels(mon
 def test_the_virtual_batch_across_batch_sizes_and_its_bound(monkeypatch):
     """Forwards at two batch sizes in turn, each followed by its backward: the buffers follow the batch. Past
     `VIRTUAL_BYTES_MOST` the torch passes take the layer, with the same result."""
-    import pyjuice.parameterizations.lowrank_virtual as lowrank_virtual
+    import pyjuice.parameterizations.lowrank.virtual as lowrank_virtual
 
     rank = 2
     pc, sums, _, _, _, _ = _pair("hmm_tied", "sum_exp", rank = rank)
@@ -1283,7 +1283,7 @@ def _plain_backwards(monkeypatch):
 
 def _normalizer_calls(monkeypatch):
     """Counts the calls of the normalizer half's operand kernel, with the rows of each (copies x batch x rank)."""
-    import pyjuice.parameterizations.lowrank_virtual as lowrank_virtual
+    import pyjuice.parameterizations.lowrank.virtual as lowrank_virtual
 
     real, calls = lowrank_virtual._module, []
 
@@ -1312,7 +1312,7 @@ def test_the_normalizer_half_is_two_products_over_all_the_copies(operands, monke
     normalizer part. The torch passes' result,
     with fp32 operands and with bf16 ones (`GEMM_BF16_WORK` forced to 0); a second backward of the same forward the
     same again, nothing left over from the first."""
-    import pyjuice.parameterizations.lowrank_virtual as lowrank_virtual
+    import pyjuice.parameterizations.lowrank.virtual as lowrank_virtual
 
     rank, batch = 2, 4
     pc, sums, _, _, _, _ = _pair("hmm_tied", "sum_exp", rank = rank, seq_length = 6)
@@ -1360,7 +1360,7 @@ def test_the_normalizer_half_is_two_products_over_all_the_copies(operands, monke
 def test_the_normalizer_products_with_fewer_copies_and_without_some_gradients(monkeypatch):
     """A pass that gives factors to some copies only, and one that asks for the gradients of some: the products run
     over the copies in the pass, the gradients reach the buffers given; the torch passes' result."""
-    import pyjuice.parameterizations.lowrank_virtual as lowrank_virtual
+    import pyjuice.parameterizations.lowrank.virtual as lowrank_virtual
 
     rank, batch = 2, 4
     pc, sums, _, _, _, _ = _pair("hmm_tied", "sum_exp", rank = rank, seq_length = 6)
@@ -1400,7 +1400,7 @@ def test_the_normalizer_products_with_fewer_copies_and_without_some_gradients(mo
 def test_the_normalizer_products_shift_large_factors(monkeypatch):
     """Factors whose entries pass 89: `exp(B)` alone overflows fp32 (past 88.7); shifted by each row's largest entry,
     the products are the torch passes' (which work in float64)."""
-    import pyjuice.parameterizations.lowrank_virtual as lowrank_virtual
+    import pyjuice.parameterizations.lowrank.virtual as lowrank_virtual
 
     rank, batch = 2, 4
     pc, sums, _, _, _, _ = _pair("hmm_tied", "sum_exp", rank = rank)
@@ -1424,7 +1424,7 @@ def test_the_normalizer_operands_and_gradients_follow_their_formulas(M, N, K, B,
     without flow (`lf = -inf`) gives 0 -- also where it has no mass at all (factors of -inf, `log Z = -inf`, so its
     value and its flow are -inf: `-inf - -inf` would be NaN). The gradients: `dB_c[r, j, b] -= Vt * Gt` on the copy's
     rows, a copy without a buffer skipped. float32 and bfloat16 operands."""
-    import pyjuice.parameterizations.lowrank_virtual as lowrank_virtual
+    import pyjuice.parameterizations.lowrank.virtual as lowrank_virtual
 
     mod, dev = lowrank_virtual._module(), torch.device("cuda")
     g = torch.Generator(device = "cpu").manual_seed(7)
@@ -1495,7 +1495,7 @@ def test_the_normalizer_operands_and_gradients_follow_their_formulas(M, N, K, B,
 def test_copies_in_layers_of_several_node_vectors(monkeypatch):
     """Two tied chains side by side: every layer holds two node vectors, each with copies in the pass. One plain
     backward a layer (the data half of both), the normalizer products once a source: two."""
-    import pyjuice.parameterizations.lowrank_virtual as lowrank_virtual
+    import pyjuice.parameterizations.lowrank.virtual as lowrank_virtual
 
     rank, batch = 2, 4
     pc, sums, _, _, _, _ = _pair("two_chains", "sum_exp", rank = rank)
@@ -1517,7 +1517,7 @@ def test_a_backward_after_one_that_stopped_midway(monkeypatch):
     """A backward that raised after some copies were noted for the normalizer products leaves them noted. The next
     backward of the same forward starts over -- the first node vector seen again resets what the pass keeps -- and is
     a whole one: the torch passes' flows and gradients, one plain backward a layer, one pair of products."""
-    import pyjuice.parameterizations.lowrank_virtual as lowrank_virtual
+    import pyjuice.parameterizations.lowrank.virtual as lowrank_virtual
     from pyjuice.layer.sum_layer import SumLayer
 
     # (no trials of the circuit's tuner: one that raised would be a candidate dropped, not the backward stopping)
@@ -1570,7 +1570,7 @@ def test_nodes_no_child_of_which_is_possible(form, monkeypatch):
     """A node block that reaches one child block, impossible for some samples (an input of probability 0): its
     nodes' values are -inf there and they carry no flow -- finite flows and gradients everywhere, the materialized
     circuit's, through the virtual batch and the torch passes alike."""
-    import pyjuice.parameterizations.lowrank_virtual as lowrank_virtual
+    import pyjuice.parameterizations.lowrank.virtual as lowrank_virtual
 
     def impossible(root):
         for ns in root:
@@ -1617,7 +1617,7 @@ def test_the_forward_with_the_product_layer_fused_in(name, offered, monkeypatch)
     products' values, forward after forward; and a layer that does not go through the virtual batch after all forms
     the products' values itself. Products of two children only (`sparse`: three, never handed over)."""
     import pyjuice.layer.kernels.autotune as autotune
-    import pyjuice.parameterizations.lowrank_virtual as lowrank_virtual
+    import pyjuice.parameterizations.lowrank.virtual as lowrank_virtual
 
     pick = autotune.pick
     choice = ["fused"]
@@ -1717,7 +1717,7 @@ shares) --, on other data, at another batch size (the trials there run every lay
     are not read, and are no longer written after the second time (`two_kinds`, `beside` -- a layer under the one
     below, run again by the circuit's trials, is not "in between")."""
     import pyjuice.layer.kernels.autotune as autotune
-    import pyjuice.parameterizations.lowrank_virtual as lowrank_virtual
+    import pyjuice.parameterizations.lowrank.virtual as lowrank_virtual
 
     name, kw, want = AHEAD[case]
     pick = autotune.pick
@@ -1799,7 +1799,7 @@ def test_nothing_is_written_for_a_layer_above_that_keeps_its_torch_passes(monkey
     nothing for it. Ranks 2 under 3 under 2, the bound between the two ranks' needs, set after the layers know
     each other."""
     import pyjuice.layer.kernels.autotune as autotune
-    import pyjuice.parameterizations.lowrank_virtual as lowrank_virtual
+    import pyjuice.parameterizations.lowrank.virtual as lowrank_virtual
 
     pick = autotune.pick
     monkeypatch.setattr(autotune, "pick", lambda key, cands, bench, **k: "fused" if key[0] == "prod_stream_fusion"
@@ -1851,7 +1851,7 @@ def test_child_values_left_by_the_layer_below_are_read_only_if_nothing_wrote_sin
     `expand` writes the same rows of the buffer -- the one above expands its own again. The circuit's node values
     either way."""
     import pyjuice.layer.kernels.autotune as autotune
-    import pyjuice.parameterizations.lowrank_virtual as lowrank_virtual
+    import pyjuice.parameterizations.lowrank.virtual as lowrank_virtual
 
     pick = autotune.pick
     monkeypatch.setattr(autotune, "pick", lambda key, cands, bench, **k: "fused" if key[0] == "prod_stream_fusion"
@@ -1919,7 +1919,7 @@ def test_the_backward_with_the_product_layer_fused_in(name, offered, forward, mo
     element flows are written as the children's. Products of two children, each the child of that one product
     (`sparse`: three children; `two_disjoint`: an input the child of two products -- never handed over)."""
     import pyjuice.layer.kernels.autotune as autotune
-    import pyjuice.parameterizations.lowrank_virtual as lowrank_virtual
+    import pyjuice.parameterizations.lowrank.virtual as lowrank_virtual
 
     pick = autotune.pick
     choice = ["fused"]
@@ -2013,7 +2013,7 @@ def test_the_parameter_flows_of_fused_layers_are_one_matrix_product(name, source
     of a source are one matrix product at the pass's end, `theta * (U^T V)` over their rows -- `F+` within rounding of
     the plain kernels' on the same forward and of the torch passes', with `F-`, the gradients and the node flows
     untouched; a layer not fused keeps its plain kernel."""
-    import pyjuice.parameterizations.lowrank_virtual as lowrank_virtual
+    import pyjuice.parameterizations.lowrank.virtual as lowrank_virtual
     from pyjuice.layer.sum_layer import SumLayer
 
     _force_fused_backward(monkeypatch)
@@ -2073,7 +2073,7 @@ def test_the_parameter_flows_of_fused_layers_are_one_matrix_product(name, source
 def test_the_parameter_flows_of_copies_in_several_flow_blocks(monkeypatch):
     """Tied copies in one layer past `max_tied_ns_per_parflow_block` have flow blocks of their own, summed before the
     parameters read them. The product lands in the first's: the EM step takes the parameters where the torch passes do."""
-    import pyjuice.parameterizations.lowrank_virtual as lowrank_virtual
+    import pyjuice.parameterizations.lowrank.virtual as lowrank_virtual
 
     _force_fused_backward(monkeypatch)
     rank, batch, dev, K = 2, 5, torch.device("cuda:0"), 8
@@ -2113,7 +2113,7 @@ def test_the_data_operands_follow_their_formulas(M, N, K, B, copies):
     `Ut[i, (c, r, b)] = exp(lf[i, b] + A[i, r, b] - log S[i, b] + shift)`, `log S = node_mars + log Z`. A child no edge
     reaches, a child without mass: 0. A node without flow or mass: 0. A rank with no mass at a sample: zeros, no NaN. float32
     and bfloat16 operands."""
-    import pyjuice.parameterizations.lowrank_virtual as lowrank_virtual
+    import pyjuice.parameterizations.lowrank.virtual as lowrank_virtual
 
     mod, dev = lowrank_virtual._module(), torch.device("cuda")
     g = torch.Generator(device = "cpu").manual_seed(11)
@@ -2171,7 +2171,7 @@ def test_a_backward_at_another_precision_than_its_forward(monkeypatch):
     """The forward's operands are the backward's where their dtype is what the backward's precision asks for. A backward at
     fp32 after a forward whose products took bf16 operands makes its own `V`, and gives the torch passes' to fp32's rounding
     of what the forward left."""
-    import pyjuice.parameterizations.lowrank_virtual as lowrank_virtual
+    import pyjuice.parameterizations.lowrank.virtual as lowrank_virtual
 
     rank, batch = 2, 5
     pc, sums, _, _, _, _ = _pair("hmm_tied", "sum_exp", rank = rank)
@@ -2217,7 +2217,7 @@ def test_a_tied_copy_that_does_not_go_through_the_virtual_batch(monkeypatch):
     """Tied copies in a layer the virtual batch does not serve (two node vectors sharing a child) keep the torch passes, a
     copy of theirs in another layer goes through it: the forward's products hold rows for all of them, the rows of those
     that did not come through are no part of the backward's -- the torch passes' flows and gradients, all told."""
-    import pyjuice.parameterizations.lowrank_virtual as lowrank_virtual
+    import pyjuice.parameterizations.lowrank.virtual as lowrank_virtual
 
     rank, batch, dev, K = 2, 5, torch.device("cuda:0"), 8
     def build():
@@ -2253,7 +2253,7 @@ def test_a_backward_that_wants_neither_the_denominator_nor_gradients_makes_no_no
     """Without the denominator statistic (`apply_z_correction = False`) and without the factors' gradients
     (`compute_external_grads = False`) the normalizer half has nothing to write: the pass's end makes none of its
     operands, and the flows are the torch passes'. With the gradients (the default) it does, once a source."""
-    import pyjuice.parameterizations.lowrank_virtual as lowrank_virtual
+    import pyjuice.parameterizations.lowrank.virtual as lowrank_virtual
 
     rank, batch = 2, 5
     pc, sums, _, _, _, _ = _pair("hmm_tied", "sum_exp", rank = rank, apply_z_correction = False)

@@ -196,7 +196,7 @@ def test_dual_flow_em_takes_the_flows_to_the_master_copy(path, monkeypatch):
     """BlockScale's z-correction: the conditional M-step `theta <- normalize(theta * F+ / F-)` on `F+` taken to the
     master copy's values (`F- = theta * W` from the copy itself) -- the master copy's check in the update's own passes
     (a range past the L2: forced), in a pass of its own (the shared kernels' `ROUNDED`), and the generic torch form."""
-    from pyjuice.parameterizations.base import SumParameterization
+    from pyjuice.parameterizations.sum_parameterization import SumParameterization
     monkeypatch.setattr(SumParameterization, "_fold_master", staticmethod(lambda params, n: path == "fused_passes"))
     if path == "torch":
         monkeypatch.setattr(SumParameterization, "_fused_em_correction", lambda self, *a, **k: None)

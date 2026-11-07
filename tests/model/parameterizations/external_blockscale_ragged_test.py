@@ -376,7 +376,7 @@ def test_both_forward_forks_actually_serve_a_padded_shape(monkeypatch):
     # somewhere, which is the actual coverage question. The CuTe fork's pre-pass copy is left out (as if
     # its extension had not built): it takes the CuTe fork's shapes where it is faster, and its own
     # padded coverage is blockscale_forward_prepass_test.py's.
-    import pyjuice.parameterizations.kernels.c as bs_c
+    import pyjuice.parameterizations.blockscale.kernels.c as bs_c
     monkeypatch.setattr(bs_c, "get_prepass_module", lambda: None)
     seen = {}
     for name in NONDENSE:
@@ -480,7 +480,7 @@ def test_the_triton_param_flows_are_unbiased(name, batch, monkeypatch):
     a bias every bar on the largest error above lets through. Its TF32 dot truncated both operands (the tensor cores
     drop an fp32's low 13 bits): MEASURED -6.4e-4 .. -6.9e-4 on every topology here at either batch; rounded to TF32
     first (`_tf32_rna`, as the element kernel's), -5e-6 .. +3.5e-5."""
-    import pyjuice.parameterizations.kernels.blockscale_backward as kb
+    import pyjuice.parameterizations.blockscale.kernels.blockscale_backward as kb
     launches, real = [], kb._bs_triton_par_kernel
 
     class Spy:
@@ -593,7 +593,7 @@ def test_ragged_small_batch_computes_correct_param_flows(name, monkeypatch):
     The bar here is TIGHT -- ~1e-4 rather than the fp16 dot's ~1e-3 -- because at this batch the
     small-batch fork is pure fp32, so a real defect has nowhere to hide -- the tensor-core small-batch forward (bf16
     operands, its own tests) taken out, as if its extension had not built."""
-    import pyjuice.parameterizations.kernels.c as bs_c
+    import pyjuice.parameterizations.blockscale.kernels.c as bs_c
     monkeypatch.setattr(bs_c, "get_sb_mma_module", lambda: None)
     gate_cbs, batch = 8, 8
     pc, root, ns, layer, data, phi = _run(name, batch = batch, gate_cbs = gate_cbs)
@@ -792,7 +792,7 @@ def test_the_portable_triton_forward_serves_every_topology(name, batch):
     Checked against the MATERIALIZED-PC oracle rather than against the CUDA forks, so a shared
     misunderstanding between them cannot pass."""
     gate_cbs = 8
-    import pyjuice.parameterizations.kernels.c as _kc
+    import pyjuice.parameterizations.blockscale.kernels.c as _kc
     saved = _kc.get_cute_module, _kc.get_sb_module, _kc.get_prepass_module
     _kc.get_cute_module = lambda: None
     _kc.get_sb_module = lambda: None

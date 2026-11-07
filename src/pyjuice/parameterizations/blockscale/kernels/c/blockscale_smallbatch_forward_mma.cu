@@ -29,7 +29,7 @@
 // (~2^-16 a term), within fewer stages where the lo halves do not fit (`FwSmem`).
 
 #include <torch/extension.h>
-#include "../../../layer/kernels/c/param_load.cuh"
+#include "../../../../layer/kernels/c/param_load.cuh"
 #include <cuda_bf16.h>
 #include <c10/cuda/CUDAStream.h>
 #include <c10/cuda/CUDAException.h>

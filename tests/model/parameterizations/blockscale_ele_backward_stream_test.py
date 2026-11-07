@@ -34,7 +34,7 @@ from blockscale_ele_backward_prepass_test import (_hmm, _topology, _two, _instan
 def _module():
     if not torch.cuda.is_available():
         return None
-    from pyjuice.parameterizations.kernels.c import get_ele_stream_module
+    from pyjuice.parameterizations.blockscale.kernels.c import get_ele_stream_module
     try:
         return get_ele_stream_module()
     except Exception:
