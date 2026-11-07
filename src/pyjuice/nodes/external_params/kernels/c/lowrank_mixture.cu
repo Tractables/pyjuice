@@ -18,23 +18,26 @@
 //                                      - logsumexp_r(A_b[node, r] + vnm_norm[node, b K + r])            (log Z)
 //
 // and backward, with the virtual node values taken as 0 (a virtual node's flow is then the sum of its edges' flows
-// whatever its value was):
+// whatever its value was), the DATA half alone through the plain kernels:
 //
-//     expand_bw     data:        vnf[node, b K + r] = log f_b[node] + A_b[node, r] - log S_b[node]
-//                   normalizer:  vnf[node, b K + r] = log f_b[node] + A_b[node, r] - log Z_b[node]
-//     (plain backward on each half: virtual element flows `vef` -- stored, whatever the buffer held --; the data
-//      half's parameter flows are `F+`, the normalizer half's are the denominator flow `F-`, kept divided by the
-//      parameters: `take`)
-//     collapse_bw   element_flows[child, b] = logsumexp_r vef_data[child, b K + r]
+//     expand_bw     vnf[node, b K + r] = log f_b[node] + A_b[node, r] - log S_b[node]
+//     (plain backward: virtual element flows `vef` -- stored, whatever the buffer held --; the parameter flows `F+`)
+//     collapse_bw   element_flows[child, b] = logsumexp_r vef[child, b K + r]
 //
 // with the factors' gradients beside: `dA` from the two responsibilities the forward kept (each rank's share of S and
-// of Z), `dB` from the virtual element flows, data minus normalizer.
+// of Z), the data half's part of `dB` from the virtual element flows.
 //
-// THE NORMALIZER HALF OF SEVERAL TIED COPIES IN ONE LAUNCH. It reads no child values, and tied copies share the
-// parameters, so the backward's normalizer columns of several copies can be the columns of ONE plain backward: that
-// of a "host" copy, the others' columns written into the host's rows at their own column offsets (`expand` and
-// `expand_bw` take the normalizer half's rows and offset apart from the data half's; `sub_b` reads a copy's part of
-// the result back). The data half stays each layer's own: it reads the layer's children.
+// THE NORMALIZER HALF reads no child values: for a node vector and all of its tied copies at once, at the end of the
+// pass, it is two matrix products over the rows `v = (copy, sample, rank)`,
+//
+//     U[v, i] = f_b[i] exp(A_b[i, r]) / Z_b[i]        V[v, j] = exp(B_b[r, j])
+//     W = U^T V             (the denominator statistic, `F- = theta * W`, free of the parameters)
+//     dB[v, j] -= V[v, j] * (U theta)[v, j]           (the normalizer half's part of dLL / dB)
+//
+// `normalizer_operands` writes U and V -- row `v` shifted by `max_j B_b[r, :]`, the shift multiplying U's row and
+// dividing V's, so V <= 1 and U stays within fp32 (log f + A - log Z + max B <= -log theta_min); the products are
+// the caller's (cuBLAS, bf16 operands with fp32 accumulation or fp32), `normalizer_grads` takes `V * (U theta)` off
+// each copy's `dB`.
 //
 // Layouts: the circuit's buffers `[rows, batch]`, batch innermost; the virtual ones `[rows, columns]`, a sample's K
 // ranks adjacent from column `b K` of a half; the factors as staged, `A [batch, M, K]`, `B [batch, K, N]`; per-node
@@ -68,7 +71,7 @@ inline __device__ void expand_at(long t, float* vd, long cd, long od, float* vz,
     const int j = (int)(t / B);
     const long e = eid[j];
     if (e < 0) return;                                                  // a child no edge reaches
-    const long ez = eidz[j];
+    const long ez = (vz == nullptr) ? 0 : eidz[j];
 
     float c;
     if (FUSED) {
@@ -78,8 +81,12 @@ inline __device__ void expand_at(long t, float* vd, long cd, long od, float* vz,
         c = vals[e * B + b];
     }
     float* outd = vd + e * cd + od + (long)b * K;
-    float* outz = vz + ez * cz + oz + (long)b * K;
     const float* src = fb + (long)b * K * N + j;
+    if (vz == nullptr) {                                                // (the backward: the data half alone)
+        for (int r = 0; r < K; r++) outd[r] = c + src[(long)r * N];
+        return;
+    }
+    float* outz = vz + ez * cz + oz + (long)b * K;
     for (int r = 0; r < K; r++) {
         const float v = src[(long)r * N];
         outd[r] = c + v;
@@ -206,11 +213,11 @@ inline __device__ void expand_bw_at(long t, float* vnfd, float* vnfz, long cz, l
     const float z = lz[(long)b * M + i];
     const float ls = node_mars[row * B + b] + z;                        // log S = log n + log Z
     float* outd = vnfd + (row * (long)B + b) * K;
-    float* outz = vnfz + (nid0z + i) * cz + oz + (long)b * K;
     const bool live = (lf > -INFINITY) && (ls > -INFINITY);
-    for (int r = 0; r < K; r++) {
-        outd[r] = live ? lf + fa[at + r] - ls : -INFINITY;
-        outz[r] = live ? lf + fa[at + r] - z : -INFINITY;
+    for (int r = 0; r < K; r++) outd[r] = live ? lf + fa[at + r] - ls : -INFINITY;
+    if (vnfz != nullptr) {                                              // (the normalizer half, where it is wanted)
+        float* outz = vnfz + (nid0z + i) * cz + oz + (long)b * K;
+        for (int r = 0; r < K; r++) outz[r] = live ? lf + fa[at + r] - z : -INFINITY;
     }
 
     if (GRAD && live) {
@@ -219,36 +226,33 @@ inline __device__ void expand_bw_at(long t, float* vnfd, float* vnfz, long cz, l
     }
 }
 
-// A layer's backward before its plain calls, ONE launch: the first `N B` threads `expand` (the virtual child values:
-// the data half's into `vd`, the normalizer half's into `vz` at column `oz`), the `M B` after them `expand_bw` (the
-// virtual node flows, the normalizer half's into `vnfz` at the same column). Neither reads what the other writes.
+// A layer's backward before its plain calls, ONE launch: the first `N B` threads `expand` (the virtual child values
+// of the data half), the `M B` after them `expand_bw` (the virtual node flows of the data half, `dA`). Neither reads
+// what the other writes.
 template <bool GRAD, bool FUSED>
-__global__ void backward_pre_kernel(float* vd, long cd, float* vz, long cz, long oz, const float* vals,
-                                    const int32_t* __restrict__ table, long first, const float* __restrict__ fb,
-                                    const int64_t* __restrict__ eid, const int64_t* __restrict__ eidz, int N,
-                                    float* __restrict__ vnfd, float* vnfz, long czn, long nid0z,
-                                    const float* __restrict__ node_flows, const float* node_mars,
-                                    const float* __restrict__ fa, const float* __restrict__ lz,
-                                    const float* __restrict__ lrn, const float* __restrict__ lrz,
-                                    float* __restrict__ grad_a, long nid0, int M, int B, int K) {
+__global__ void backward_pre_kernel(float* vd, long cd, const float* vals, const int32_t* __restrict__ table,
+                                    long first, const float* __restrict__ fb, const int64_t* __restrict__ eid, int N,
+                                    float* __restrict__ vnfd, const float* __restrict__ node_flows,
+                                    const float* node_mars, const float* __restrict__ fa,
+                                    const float* __restrict__ lz, const float* __restrict__ lrn,
+                                    const float* __restrict__ lrz, float* __restrict__ grad_a, long nid0, int M,
+                                    int B, int K) {
     const long t = (long)blockIdx.x * blockDim.x + threadIdx.x;
     if (t < (long)N * B) {
-        expand_at<FUSED>(t, vd, cd, 0, vz, cz, oz, vals, table, first, fb, eid, eidz, N, B, K);
+        expand_at<FUSED>(t, vd, cd, 0, nullptr, 0, 0, vals, table, first, fb, eid, nullptr, N, B, K);
     } else if (t - (long)N * B < (long)M * B) {
-        expand_bw_at<GRAD>(t - (long)N * B, vnfd, vnfz, czn, oz, nid0z, node_flows, node_mars, fa, lz, lrn, lrz,
+        expand_bw_at<GRAD>(t - (long)N * B, vnfd, nullptr, 0, 0, 0, node_flows, node_mars, fa, lz, lrn, lrz,
                            grad_a, nid0, M, B, K);
     }
 }
 
-// GRAD 0: the element flows alone; 1: and the data half's part of dLL / dB; 2: and the normalizer half's too (read
-// from `vefz`, this layer's rows, columns as the data half's). FUSED: the product layer below fused in -- `flows` are
-// the NODE flows, and an element's flow is written as its two children's (`table[e - first]`): what the product
-// layer's backward writes for children of one parent element each, which is then not launched.
-template <int GRAD, bool FUSED>
+// GRAD: and the data half's part of dLL / dB. FUSED: the product layer below fused in -- `flows` are the NODE flows,
+// and an element's flow is written as its two children's (`table[e - first]`): what the product layer's backward
+// writes for children of one parent element each, which is then not launched.
+template <bool GRAD, bool FUSED>
 __global__ void collapse_bw_kernel(float* __restrict__ flows, const float* __restrict__ vefd,
-                                   const float* __restrict__ vefz, const int64_t* __restrict__ eid,
-                                   float* __restrict__ grad_b, const int32_t* __restrict__ table, long first,
-                                   int N, int B, int K) {
+                                   const int64_t* __restrict__ eid, float* __restrict__ grad_b,
+                                   const int32_t* __restrict__ table, long first, int N, int B, int K) {
     const long t = (long)blockIdx.x * blockDim.x + threadIdx.x;
     if (t >= (long)N * B) return;
     const int b = (int)(t % B);
@@ -274,43 +278,60 @@ __global__ void collapse_bw_kernel(float* __restrict__ flows, const float* __res
     }
 
     if (GRAD) {
-        // dLL / dB[r, j] = the data half's virtual element flow - the normalizer half's
+        // dLL / dB[r, j] += the data half's virtual element flow (the normalizer half's comes off at the pass's end)
         float* g = grad_b + (long)b * K * N + j;
-        if (GRAD == 2) {
-            const float* fz = vefz + (e * (long)B + b) * K;
-            for (int r = 0; r < K; r++) g[(long)r * N] += expf(f[r]) - expf(fz[r]);
-        } else {
-            for (int r = 0; r < K; r++) g[(long)r * N] += expf(f[r]);
-        }
+        for (int r = 0; r < K; r++) g[(long)r * N] += expf(f[r]);
     }
 }
 
-// dLL / dB[b, r, j] -= exp(vefz[eidz[j], oz + b K + r]): a copy's normalizer part, from the host's rows
-__global__ void sub_b_kernel(float* __restrict__ grad_b, const float* __restrict__ vefz, long cz, long oz,
-                             const int64_t* __restrict__ eidz, int N, int B, int K) {
-    const long t = (long)blockIdx.x * blockDim.x + threadIdx.x;
-    if (t >= (long)N * B) return;
-    const int b = (int)(t % B);
-    const int j = (int)(t / B);
-    const long e = eidz[j];
-    if (e < 0) return;
-    const float* fz = vefz + e * cz + oz + (long)b * K;
-    float* g = grad_b + (long)b * K * N + j;
-    for (int r = 0; r < K; r++) g[(long)r * N] -= expf(fz[r]);
-}
-
-// dst += src / theta; src = 0: the normalizer half's parameter flows -- `theta * W`, the plain kernels' -- taken into
-// the denominator's statistic `W`, which is kept free of the parameters (a parameter of 0 has no flow: nothing)
 inline __device__ float as_float(float x) { return x; }
 inline __device__ float as_float(__nv_bfloat16 x) { return __bfloat162float(x); }
+inline __device__ void store_as(float* p, float v) { *p = v; }
+inline __device__ void store_as(__nv_bfloat16* p, float v) { *p = __float2bfloat16(v); }
 
-template <typename TP>
-__global__ void take_kernel(float* __restrict__ dst, float* __restrict__ src, const TP* __restrict__ theta, long n) {
+// The normalizer half's operands of one copy, rows `row0 + b K + r` of `U` [rows, M] and `V` [rows, N]: one block a
+// row -- the row's shift `max_j B_b[r, j]` by a block reduction, then V = exp(B - shift), U = f exp(A - log Z + shift)
+// (0 where the node has no flow)
+template <typename TO>
+__global__ void normalizer_rows_kernel(TO* __restrict__ U, TO* __restrict__ V, long row0,
+                                       const float* __restrict__ node_flows, long nid0, const float* __restrict__ fa,
+                                       const float* __restrict__ lz, const float* __restrict__ fb, int M, int N,
+                                       int B, int K) {
+    __shared__ float part[THREADS / 32];
+    const int v = blockIdx.x;                                           // b K + r
+    const int b = v / K, r = v % K;
+    const float* brow = fb + ((long)b * K + r) * N;
+    float m = -INFINITY;
+    for (int j = threadIdx.x; j < N; j += blockDim.x) m = fmaxf(m, brow[j]);
+    for (int o = 16; o > 0; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffff, m, o));
+    if ((threadIdx.x & 31) == 0) part[threadIdx.x >> 5] = m;
+    __syncthreads();
+    if (threadIdx.x < 32) {
+        m = (threadIdx.x < blockDim.x / 32) ? part[threadIdx.x] : -INFINITY;
+        for (int o = 16; o > 0; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffff, m, o));
+        if (threadIdx.x == 0) part[0] = m;
+    }
+    __syncthreads();
+    const float shift = part[0];
+    TO* vrow = V + (row0 + v) * (long)N;
+    for (int j = threadIdx.x; j < N; j += blockDim.x) store_as(vrow + j, expf(brow[j] - shift));
+    TO* urow = U + (row0 + v) * (long)M;
+    for (int i = threadIdx.x; i < M; i += blockDim.x) {
+        const float lf = node_flows[(nid0 + i) * (long)B + b];
+        const float z = lz[(long)b * M + i];
+        const bool live = (lf > -INFINITY) && (z < INFINITY);
+        store_as(urow + i, live ? expf(lf + fa[((long)b * M + i) * K + r] - z + shift) : 0.0f);
+    }
+}
+
+// dB_b[r, j] -= V[row0 + b K + r, j] * G[row0 + b K + r, j]: a copy's normalizer part off its gradient
+template <typename TO>
+__global__ void normalizer_grads_kernel(float* __restrict__ grad_b, const TO* __restrict__ V,
+                                        const float* __restrict__ G, long row0, long n, int N) {
     const long t = (long)blockIdx.x * blockDim.x + threadIdx.x;
     if (t >= n) return;
-    const float th = as_float(theta[t]);
-    if (th > 0.0f) dst[t] += src[t] / th;
-    src[t] = 0.0f;
+    const long at = row0 * (long)N + t;
+    grad_b[t] -= as_float(V[at]) * G[at];
 }
 
 void check(const torch::Tensor& t, const char* name, torch::ScalarType st, long numel) {
@@ -418,8 +439,7 @@ namespace {
 
 template <bool FUSED>
 void collapse_bw_launch(torch::Tensor& flows, torch::Tensor& vefd, torch::Tensor& eid,
-                        c10::optional<torch::Tensor>& vefz, c10::optional<torch::Tensor>& grad_b,
-                        const int32_t* table, long first, int64_t K) {
+                        c10::optional<torch::Tensor>& grad_b, const int32_t* table, long first, int64_t K) {
     const int B = flows.size(1), N = eid.size(0);
     check(flows, "flows", torch::kFloat32, -1); check(vefd, "vef (data)", torch::kFloat32, -1);
     check(eid, "eid", torch::kInt64, N);
@@ -427,22 +447,15 @@ void collapse_bw_launch(torch::Tensor& flows, torch::Tensor& vefd, torch::Tensor
     if (N == 0 || B == 0) return;
     auto stream = at::cuda::getCurrentCUDAStream();
     const int grid = grid_of((long)N * B);
-    if (!grad_b.has_value()) {
-        collapse_bw_kernel<0, FUSED><<<grid, THREADS, 0, stream>>>(
-            flows.data_ptr<float>(), vefd.data_ptr<float>(), nullptr, eid.data_ptr<int64_t>(), nullptr, table, first,
-            N, B, (int)K);
-    } else {
+    if (grad_b.has_value()) {
         check(*grad_b, "grad B", torch::kFloat32, (long)B * K * N);
-        if (vefz.has_value()) {
-            check(*vefz, "vef (normalizer)", torch::kFloat32, vefd.numel());
-            collapse_bw_kernel<2, FUSED><<<grid, THREADS, 0, stream>>>(
-                flows.data_ptr<float>(), vefd.data_ptr<float>(), vefz->data_ptr<float>(), eid.data_ptr<int64_t>(),
-                grad_b->data_ptr<float>(), table, first, N, B, (int)K);
-        } else {
-            collapse_bw_kernel<1, FUSED><<<grid, THREADS, 0, stream>>>(
-                flows.data_ptr<float>(), vefd.data_ptr<float>(), nullptr, eid.data_ptr<int64_t>(),
-                grad_b->data_ptr<float>(), table, first, N, B, (int)K);
-        }
+        collapse_bw_kernel<true, FUSED><<<grid, THREADS, 0, stream>>>(
+            flows.data_ptr<float>(), vefd.data_ptr<float>(), eid.data_ptr<int64_t>(), grad_b->data_ptr<float>(),
+            table, first, N, B, (int)K);
+    } else {
+        collapse_bw_kernel<false, FUSED><<<grid, THREADS, 0, stream>>>(
+            flows.data_ptr<float>(), vefd.data_ptr<float>(), eid.data_ptr<int64_t>(), nullptr, table, first, N, B,
+            (int)K);
     }
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
@@ -450,61 +463,48 @@ void collapse_bw_launch(torch::Tensor& flows, torch::Tensor& vefd, torch::Tensor
 }  // namespace
 
 void lowrank_collapse_bw(torch::Tensor element_flows, torch::Tensor vefd, torch::Tensor eid,
-                         c10::optional<torch::Tensor> vefz, c10::optional<torch::Tensor> grad_b, int64_t K) {
+                         c10::optional<torch::Tensor> grad_b, int64_t K) {
     TORCH_CHECK(vefd.size(0) >= element_flows.size(0), "lowrank mixture: `vef` does not match the element flows");
-    collapse_bw_launch<false>(element_flows, vefd, eid, vefz, grad_b, nullptr, 0, K);
+    collapse_bw_launch<false>(element_flows, vefd, eid, grad_b, nullptr, 0, K);
 }
 
 // ... with the product layer below fused in: the element flows written as their two children's NODE flows
 void lowrank_collapse_bw_fused(torch::Tensor node_flows, torch::Tensor vefd, torch::Tensor eid, torch::Tensor table,
-                               int64_t first, c10::optional<torch::Tensor> vefz, c10::optional<torch::Tensor> grad_b,
-                               int64_t K) {
+                               int64_t first, c10::optional<torch::Tensor> grad_b, int64_t K) {
     check(table, "children", torch::kInt32, -1);
     TORCH_CHECK(table.dim() == 2 && table.size(1) == 2, "lowrank mixture: products of two children only");
     TORCH_CHECK(vefd.size(0) >= first + table.size(0), "lowrank mixture: `vef` does not hold the products' rows");
-    collapse_bw_launch<true>(node_flows, vefd, eid, vefz, grad_b, table.data_ptr<int32_t>(), (long)first, K);
-}
-
-void lowrank_sub_b(torch::Tensor grad_b, torch::Tensor vefz, int64_t oz, torch::Tensor eidz, int64_t B, int64_t K) {
-    const int N = eidz.size(0);
-    check(grad_b, "grad B", torch::kFloat32, (long)B * K * N); check(vefz, "vef (normalizer)", torch::kFloat32, -1);
-    check(eidz, "eid (normalizer)", torch::kInt64, N);
-    TORCH_CHECK(oz >= 0 && oz + (long)B * K <= vefz.size(1), "lowrank mixture: `vef` does not hold the columns at ", oz);
-    if (N == 0 || B == 0) return;
-    sub_b_kernel<<<grid_of((long)N * B), THREADS, 0, at::cuda::getCurrentCUDAStream()>>>(
-        grad_b.data_ptr<float>(), vefz.data_ptr<float>(), (long)vefz.size(1), (long)oz, eidz.data_ptr<int64_t>(),
-        N, (int)B, (int)K);
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    collapse_bw_launch<true>(node_flows, vefd, eid, grad_b, table.data_ptr<int32_t>(), (long)first, K);
 }
 
 namespace {
 
 // `vals`: the element values, or with a table of children (FUSED) the node values the products' are read from
 template <bool FUSED>
-void backward_pre_launch(torch::Tensor& vemd, torch::Tensor& vemz, int64_t oz, const float* vals, long rows,
-                         const int32_t* table, long first, torch::Tensor& fb, torch::Tensor& eid, torch::Tensor& eidz,
-                         torch::Tensor& vnfd, torch::Tensor& vnfz, int64_t nid0z, torch::Tensor& node_flows,
+void backward_pre_launch(torch::Tensor& vemd, const float* vals, long rows, const int32_t* table, long first,
+                         torch::Tensor& fb, torch::Tensor& eid, torch::Tensor& vnfd, torch::Tensor& node_flows,
                          torch::Tensor& node_mars, torch::Tensor& fa, torch::Tensor& lz, torch::Tensor& lrn,
                          torch::Tensor& lrz, c10::optional<torch::Tensor>& grad_a, int64_t nid0, int64_t M, int64_t K) {
     const int B = node_mars.size(1), N = eid.size(0);
-    check_expand(vemd, 0, vemz, oz, fb, eid, eidz, rows, B, N, K);
-    check(vnfd, "vnf (data)", torch::kFloat32, -1); check(vnfz, "vnf (normalizer)", torch::kFloat32, -1);
-    check(node_flows, "node_flows", torch::kFloat32, -1); check(node_mars, "node_mars", torch::kFloat32, -1);
+    check(vemd, "vem (data)", torch::kFloat32, -1); check(fb, "B", torch::kFloat32, (long)B * K * N);
+    check(eid, "eid", torch::kInt64, N);
+    check(vnfd, "vnf (data)", torch::kFloat32, -1); check(node_flows, "node_flows", torch::kFloat32, -1);
+    check(node_mars, "node_mars", torch::kFloat32, -1);
     check(fa, "A", torch::kFloat32, (long)B * M * K); check(lz, "lz", torch::kFloat32, (long)B * M);
     check(lrn, "lrn", torch::kFloat32, (long)B * M * K); check(lrz, "lrz", torch::kFloat32, (long)B * M * K);
-    const long czn = vnfz.size(1), w = (long)B * K;
-    TORCH_CHECK(vnfd.size(0) >= nid0 + M && vnfd.size(1) == w && vnfz.size(0) >= nid0z + M && nid0z >= 0
-                && oz + w <= czn && node_flows.size(1) == B,
-                "lowrank mixture: the node rows ", nid0, " / ", nid0z, " + ", M, " do not fit the buffers");
+    const long w = (long)B * K;
+    TORCH_CHECK(vemd.size(0) >= rows && vemd.size(1) == w, "lowrank mixture: the virtual element buffer does not hold ",
+                w, " columns of ", rows, " rows");
+    TORCH_CHECK(vnfd.size(0) >= nid0 + M && vnfd.size(1) == w && node_flows.size(1) == B,
+                "lowrank mixture: the node rows ", nid0, " + ", M, " do not fit the buffers");
     if (grad_a.has_value()) check(*grad_a, "grad A", torch::kFloat32, (long)B * M * K);
     if ((N == 0 && M == 0) || B == 0) return;
     auto stream = at::cuda::getCurrentCUDAStream();
     const int grid = grid_of((long)(N + M) * B);
 #define LOWRANK_PRE(GRAD, PTR)                                                                                      \
     backward_pre_kernel<GRAD, FUSED><<<grid, THREADS, 0, stream>>>(                                                 \
-        vemd.data_ptr<float>(), (long)vemd.size(1), vemz.data_ptr<float>(), (long)vemz.size(1), (long)oz, vals,     \
-        table, first, fb.data_ptr<float>(), eid.data_ptr<int64_t>(), eidz.data_ptr<int64_t>(), N,                   \
-        vnfd.data_ptr<float>(), vnfz.data_ptr<float>(), czn, (long)nid0z, node_flows.data_ptr<float>(),             \
+        vemd.data_ptr<float>(), (long)vemd.size(1), vals, table, first, fb.data_ptr<float>(),                       \
+        eid.data_ptr<int64_t>(), N, vnfd.data_ptr<float>(), node_flows.data_ptr<float>(),                           \
         node_mars.data_ptr<float>(), fa.data_ptr<float>(), lz.data_ptr<float>(), lrn.data_ptr<float>(),             \
         lrz.data_ptr<float>(), PTR, (long)nid0, (int)M, B, (int)K)
     if (grad_a.has_value()) { LOWRANK_PRE(true, grad_a->data_ptr<float>()); }
@@ -515,60 +515,97 @@ void backward_pre_launch(torch::Tensor& vemd, torch::Tensor& vemz, int64_t oz, c
 
 }  // namespace
 
-// A layer's backward before its plain calls: `expand` (the virtual child values, the data half's into `vemd`, the
-// normalizer half's into `vemz` at column `oz`) and `expand_bw` (the virtual node flows, and dLL / dA from the
-// responsibilities the forward kept), one launch
-void lowrank_backward_pre(torch::Tensor vemd, torch::Tensor vemz, int64_t oz, torch::Tensor element_mars,
-                          torch::Tensor fb, torch::Tensor eid, torch::Tensor eidz,
-                          torch::Tensor vnfd, torch::Tensor vnfz, int64_t nid0z,
-                          torch::Tensor node_flows, torch::Tensor node_mars, torch::Tensor fa, torch::Tensor lz,
-                          torch::Tensor lrn, torch::Tensor lrz, c10::optional<torch::Tensor> grad_a,
+// A layer's backward before its plain calls: the data half's virtual child values (`vemd`) and virtual node flows
+// (`vnfd`), and dLL / dA from the responsibilities the forward kept, one launch
+void lowrank_backward_pre(torch::Tensor vemd, torch::Tensor element_mars, torch::Tensor fb, torch::Tensor eid,
+                          torch::Tensor vnfd, torch::Tensor node_flows, torch::Tensor node_mars, torch::Tensor fa,
+                          torch::Tensor lz, torch::Tensor lrn, torch::Tensor lrz, c10::optional<torch::Tensor> grad_a,
                           int64_t nid0, int64_t M, int64_t K) {
     check(element_mars, "element_mars", torch::kFloat32, -1);
     TORCH_CHECK(element_mars.size(1) == node_mars.size(1), "lowrank mixture: element and node values of two batches");
-    backward_pre_launch<false>(vemd, vemz, oz, element_mars.data_ptr<float>(), element_mars.size(0), nullptr, 0, fb,
-                               eid, eidz, vnfd, vnfz, nid0z, node_flows, node_mars, fa, lz, lrn, lrz, grad_a, nid0, M,
-                               K);
+    backward_pre_launch<false>(vemd, element_mars.data_ptr<float>(), element_mars.size(0), nullptr, 0, fb, eid, vnfd,
+                               node_flows, node_mars, fa, lz, lrn, lrz, grad_a, nid0, M, K);
 }
 
 // ... with the product layer below fused in: the element values read from their two children's node values
-void lowrank_backward_pre_fused(torch::Tensor vemd, torch::Tensor vemz, int64_t oz, torch::Tensor table, int64_t first,
-                                torch::Tensor fb, torch::Tensor eid, torch::Tensor eidz,
-                                torch::Tensor vnfd, torch::Tensor vnfz, int64_t nid0z,
-                                torch::Tensor node_flows, torch::Tensor node_mars, torch::Tensor fa, torch::Tensor lz,
-                                torch::Tensor lrn, torch::Tensor lrz, c10::optional<torch::Tensor> grad_a,
-                                int64_t nid0, int64_t M, int64_t K) {
+void lowrank_backward_pre_fused(torch::Tensor vemd, torch::Tensor table, int64_t first, torch::Tensor fb,
+                                torch::Tensor eid, torch::Tensor vnfd, torch::Tensor node_flows,
+                                torch::Tensor node_mars, torch::Tensor fa, torch::Tensor lz, torch::Tensor lrn,
+                                torch::Tensor lrz, c10::optional<torch::Tensor> grad_a, int64_t nid0, int64_t M,
+                                int64_t K) {
     const long rows = check_children(table, first);
-    backward_pre_launch<true>(vemd, vemz, oz, node_mars.data_ptr<float>(), rows, table.data_ptr<int32_t>(),
-                              (long)first, fb, eid, eidz, vnfd, vnfz, nid0z, node_flows, node_mars, fa, lz, lrn, lrz,
-                              grad_a, nid0, M, K);
+    backward_pre_launch<true>(vemd, node_mars.data_ptr<float>(), rows, table.data_ptr<int32_t>(), (long)first, fb,
+                              eid, vnfd, node_flows, node_mars, fa, lz, lrn, lrz, grad_a, nid0, M, K);
 }
 
-// `lowrank_sub_b` for the copies a host holds, copy `s` at column `s * B * K` (None: a copy without gradients)
-void lowrank_sub_b_hosted(std::vector<c10::optional<torch::Tensor>> grads, torch::Tensor vefz, torch::Tensor eidz,
-                          int64_t B, int64_t K) {
-    for (size_t s = 0; s < grads.size(); s++)
-        if (grads[s].has_value()) lowrank_sub_b(*grads[s], vefz, (int64_t)s * B * K, eidz, B, K);
-}
+namespace {
 
-void lowrank_take(torch::Tensor dst, torch::Tensor src, torch::Tensor theta) {
-    check(dst, "dst", torch::kFloat32, src.numel()); check(src, "src", torch::kFloat32, -1);
-    TORCH_CHECK(theta.is_cuda() && theta.is_contiguous() && theta.numel() == src.numel(),
-                "lowrank mixture: the parameters of the flows taken: ", theta.numel(), " for ", src.numel());
-    const long n = src.numel();
-    if (n == 0) return;
+template <typename TO>
+void normalizer_launch(torch::Tensor& U, torch::Tensor& V, torch::Tensor& node_flows,
+                       std::vector<torch::Tensor>& fa, std::vector<torch::Tensor>& lz, std::vector<torch::Tensor>& fb,
+                       std::vector<int64_t>& nid0, int64_t M, int64_t K) {
+    const int B = node_flows.size(1), N = V.size(1);
     auto stream = at::cuda::getCurrentCUDAStream();
-    if (theta.scalar_type() == torch::kBFloat16) {
-        take_kernel<__nv_bfloat16><<<grid_of(n), THREADS, 0, stream>>>(
-            dst.data_ptr<float>(), src.data_ptr<float>(), (const __nv_bfloat16*)theta.data_ptr(), n);
-    } else {
-        TORCH_CHECK(theta.scalar_type() == torch::kFloat32, "lowrank mixture: parameters in fp32 or bf16");
-        take_kernel<float><<<grid_of(n), THREADS, 0, stream>>>(
-            dst.data_ptr<float>(), src.data_ptr<float>(), theta.data_ptr<float>(), n);
+    long row0 = 0;
+    for (size_t c = 0; c < fa.size(); c++) {
+        check(fa[c], "A", torch::kFloat32, (long)B * M * K); check(lz[c], "lz", torch::kFloat32, (long)B * M);
+        check(fb[c], "B", torch::kFloat32, (long)B * K * N);
+        TORCH_CHECK(nid0[c] >= 0 && node_flows.size(0) >= nid0[c] + M, "lowrank mixture: a copy's node rows");
+        normalizer_rows_kernel<TO><<<B * (int)K, THREADS, 0, stream>>>(
+            static_cast<TO*>(U.data_ptr()), static_cast<TO*>(V.data_ptr()), row0, node_flows.data_ptr<float>(),
+            (long)nid0[c],
+            fa[c].data_ptr<float>(), lz[c].data_ptr<float>(), fb[c].data_ptr<float>(), (int)M, N, B, (int)K);
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+        row0 += (long)B * K;
     }
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
+template <typename TO>
+void normalizer_grads_launch(std::vector<c10::optional<torch::Tensor>>& grads, torch::Tensor& V, torch::Tensor& G,
+                             int64_t B, int64_t K) {
+    const int N = V.size(1);
+    const long n = (long)B * K * N;
+    auto stream = at::cuda::getCurrentCUDAStream();
+    for (size_t c = 0; c < grads.size(); c++) {
+        if (!grads[c].has_value()) continue;
+        check(*grads[c], "grad B", torch::kFloat32, n);
+        normalizer_grads_kernel<TO><<<grid_of(n), THREADS, 0, stream>>>(
+            grads[c]->data_ptr<float>(), static_cast<const TO*>(V.data_ptr()), G.data_ptr<float>(), (long)c * B * K, n,
+            N);
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+    }
+}
+
+}  // namespace
+
+// The normalizer half's operands of a node vector's copies: `U` [copies B K, M] and `V` [copies B K, N], float32 or
+// bfloat16 (as allocated), from each copy's node flows (rows `nid0[c]` on), factors and kept `log Z`
+void lowrank_normalizer_operands(torch::Tensor U, torch::Tensor V, torch::Tensor node_flows,
+                                 std::vector<torch::Tensor> fa, std::vector<torch::Tensor> lz,
+                                 std::vector<torch::Tensor> fb, std::vector<int64_t> nid0, int64_t M, int64_t K) {
+    check(node_flows, "node_flows", torch::kFloat32, -1);
+    TORCH_CHECK(U.is_cuda() && U.is_contiguous() && V.is_cuda() && V.is_contiguous() && U.scalar_type() == V.scalar_type()
+                && U.dim() == 2 && V.dim() == 2 && U.size(0) == V.size(0) && U.size(1) == M
+                && U.size(0) == (long)fa.size() * node_flows.size(1) * K
+                && fa.size() == lz.size() && fa.size() == fb.size() && fa.size() == nid0.size(),
+                "lowrank mixture: the normalizer operands do not match the copies");
+    if (U.numel() == 0 && V.numel() == 0) return;
+    if (U.scalar_type() == torch::kBFloat16) normalizer_launch<__nv_bfloat16>(U, V, node_flows, fa, lz, fb, nid0, M, K);
+    else if (U.scalar_type() == torch::kFloat32) normalizer_launch<float>(U, V, node_flows, fa, lz, fb, nid0, M, K);
+    else TORCH_CHECK(false, "lowrank mixture: the normalizer operands must be float32 or bfloat16");
+}
+
+// Each copy's `dB` [B, K, N] minus `V * G` on its rows (`G` [copies B K, N] float32: `U theta`); None: a copy without
+// a gradient
+void lowrank_normalizer_grads(std::vector<c10::optional<torch::Tensor>> grads, torch::Tensor V, torch::Tensor G,
+                              int64_t B, int64_t K) {
+    check(G, "U theta", torch::kFloat32, V.numel());
+    TORCH_CHECK(V.is_cuda() && V.is_contiguous() && V.dim() == 2 && G.dim() == 2 && G.size(1) == V.size(1)
+                && V.size(0) == (long)grads.size() * B * K, "lowrank mixture: `V` does not match the copies");
+    if (V.scalar_type() == torch::kBFloat16) normalizer_grads_launch<__nv_bfloat16>(grads, V, G, B, K);
+    else if (V.scalar_type() == torch::kFloat32) normalizer_grads_launch<float>(grads, V, G, B, K);
+    else TORCH_CHECK(false, "lowrank mixture: `V` must be float32 or bfloat16");
+}
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("lowrank_expand", &lowrank_expand, "virtual child values: element values + B, a column per (sample, rank)");
@@ -577,14 +614,15 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("lowrank_collapse", &lowrank_collapse, "node values from the virtual ones: logsumexp over ranks with A, - log Z");
     m.def("lowrank_collapse_expand", &lowrank_collapse_expand,
           "`lowrank_collapse` of a node vector and `lowrank_expand_fused` of the next layer's, one launch");
-    m.def("lowrank_collapse_bw", &lowrank_collapse_bw, "element flows from the virtual ones (and their part of dLL/dB)");
-    m.def("lowrank_sub_b", &lowrank_sub_b, "a copy's normalizer part of dLL/dB, from the host's virtual element flows");
-    m.def("lowrank_take", &lowrank_take, "dst += src / theta, src = 0");
+    m.def("lowrank_collapse_bw", &lowrank_collapse_bw,
+          "element flows from the virtual ones (and the data half's part of dLL/dB)");
     m.def("lowrank_backward_pre", &lowrank_backward_pre,
           "the backward's virtual child values and virtual node flows (and dLL/dA from the kept responsibilities)");
     m.def("lowrank_backward_pre_fused", &lowrank_backward_pre_fused,
           "`lowrank_backward_pre` with the element values read from their two children's node values");
     m.def("lowrank_collapse_bw_fused", &lowrank_collapse_bw_fused,
           "`lowrank_collapse_bw` with the element flows written as their two children's node flows");
-    m.def("lowrank_sub_b_hosted", &lowrank_sub_b_hosted, "`lowrank_sub_b` for every copy a host holds");
+    m.def("lowrank_normalizer_operands", &lowrank_normalizer_operands,
+          "the normalizer half's U and V of a node vector's copies, for the two matrix products");
+    m.def("lowrank_normalizer_grads", &lowrank_normalizer_grads, "each copy's dLL/dB minus V * (U theta) on its rows");
 }

@@ -212,7 +212,6 @@ class LowRankSumParams(ExternalSumParams):
         for name in ("_lr_geometry", "_lr_state", "_lr_denom_offsets", "_lrv_state", "_lrv_disjoint", "_lrv_link",
                      "_lrv_want", "_lrv_wasted"):
             layer.__dict__.pop(name, None)
-        lowrank_virtual.drop_device_caches()
 
     # ------------------------------------------------------------------ forward
 

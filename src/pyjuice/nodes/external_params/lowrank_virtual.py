@@ -14,13 +14,13 @@ The virtual buffers are as tall as the circuit's own (the plain kernels address 
 times as wide, and shared by every layer: scratch, rewritten by each layer's pass. What a layer's backward needs of
 its forward -- `log Z` and each rank's share of the two sums -- is kept per node vector, on the layer.
 
-The backward's normalizer half reads no child values, and tied copies share the parameters: where a layer holds one
-node vector and other copies of it are in the pass, their normalizer columns are written into the rows of one of them
-(the HOST, the first of every `COLUMNS_MOST` columns' worth) at their own column offsets, and one plain backward of the
-host's layer gives the denominator flow and the gradients' normalizer part of all of them -- flushed when the columns
-are full and when the pass's last copy has run. (What a pass is: the staged tensors of one forward, on which the
-copies that went through here are noted.) MEASURED, the same HMM, batch 16, rank 4: 31 such calls 1.3 ms, 4 calls of
-8 copies each 0.3 ms.
+The backward's normalizer half reads no child values and tied copies share the parameters: it is not run through
+the plain kernels at all. For a node vector and every tied copy of it in the pass, at the pass's end, it is TWO MATRIX
+PRODUCTS over the rows `(copy, sample, rank)` (`kernels/c/lowrank_mixture.cu`'s header has them): `W = U^T V`, the
+denominator statistic of all the copies at once, and `U theta`, whose product with `V` is the normalizer half's part
+of the factors' gradients -- cuBLAS, bf16 operands with fp32 accumulation under the default precision where the
+product is large, fp32 else or asked for. (What a pass is: the staged tensors of one forward, on which the copies
+that went through here are noted.) MEASURED, the same HMM, batch 16, rank 4: ...
 
 Served: CUDA, the extension built, no child of the layer shared by two of its node vectors (each would want its own
 rescaling of it), the virtual buffers within `VIRTUAL_BYTES_MOST`. Every other case keeps the torch passes of
@@ -37,15 +37,11 @@ import torch
 ENABLED = True
 #: The most bytes the virtual buffers may take; a pass that would need more keeps the torch passes
 VIRTUAL_BYTES_MOST = 4 << 30
-#: The most columns of a host's normalizer half: as many tied copies' as fit share one plain backward. The plain
-#: layer's cost is nearly flat in the batch up to here.
-COLUMNS_MOST = 512
+#: The normalizer half's matrix products take bf16 operands (fp32 accumulation) from this many multiply-adds on, under
+#: the default precision (the plain kernels' own rule for their operands: `TensorCircuit._COPY_MIN_WORK`)
+GEMM_BF16_WORK = 1 << 28
 
 _EXTERNAL_PARAMS_KWARG = "sum_external_params"
-
-# Per device: a zeroed stand-in for the parameter flows. (The virtual buffers are kept on the circuit's buffer of node
-# values itself, `_buffers`.)
-_FLOW_SCRATCH = dict()
 
 
 def _module():
@@ -57,16 +53,11 @@ def _columns(layer, node_mars: torch.Tensor) -> int:
     return node_mars.size(1) * layer.external_params.rank
 
 
-def _host_columns(cols: int) -> int:
-    """The width of a host's normalizer buffers for `cols` columns a copy: whole copies, at least one."""
-    return max(1, COLUMNS_MOST // cols) * cols
-
-
 def _bytes(node_mars: torch.Tensor, element_mars: torch.Tensor, cols: int) -> int:
     """Every family of `_buffers` at once: the forward's two halves side by side; the backward's data half (flows,
-    values, zeros); the normalizer half a layer of its own, and a host's."""
-    hn, he, wide = node_mars.size(0), element_mars.size(0), _host_columns(cols)
-    return 4 * (2 * cols * (hn + he) + cols * (2 * hn + 2 * he) + cols * (hn + 2 * he) + wide * (2 * hn + 2 * he))
+    values, zeros)."""
+    hn, he = node_mars.size(0), element_mars.size(0)
+    return 4 * (2 * cols * (hn + he) + cols * (2 * hn + 2 * he))
 
 
 def serves(desc, layer, node_mars: torch.Tensor, element_mars: torch.Tensor) -> bool:
@@ -93,8 +84,6 @@ def _disjoint(desc, layer, device) -> bool:
 _FAMILIES = {
     "fw": dict(vnm = (True, 2), vem = (False, 2)),
     "bw": dict(vnf_d = (True, 1), vem_d = (False, 1), vef_d = (False, 1), zero = (True, 1)),
-    "bw_z": dict(vnf_z = (True, 1), vem_z = (False, 1), vef_z = (False, 1)),
-    "bw_host": dict(vnf_h = (True, 0), vem_h = (False, 0), vef_h = (False, 0), zero_h = (True, 0)),
 }
 
 
@@ -112,24 +101,11 @@ def _buffers(node_mars: torch.Tensor, element_mars: torch.Tensor, cols: int, fam
         # writes. (Node values: 0, which the backward's stand-ins are throughout.)
         made, dev = dict(), node_mars.device
         for name, (nodes, width) in _FAMILIES[family].items():
-            shape = (node_mars.size(0) if nodes else element_mars.size(0), width * cols if width else _host_columns(cols))
-            zero = name in ("vnm", "zero", "zero_h")
+            shape = (node_mars.size(0) if nodes else element_mars.size(0), width * cols)
+            zero = name in ("vnm", "zero")
             made[name] = torch.zeros(shape, device = dev) if zero else torch.full(shape, -float("inf"), device = dev)
-        made["used"] = dict()                                           # (a host's rows: the columns written last)
         store[(family, cols)] = made
     return made
-
-
-def _flow_scratch(param_flows: torch.Tensor) -> torch.Tensor:
-    """A zeroed tensor shaped like the parameter flows, for the normalizer half's: zero again when handed back."""
-    hit = _FLOW_SCRATCH.get(param_flows.device)
-    if hit is None or hit.shape != param_flows.shape or hit.dtype != param_flows.dtype:
-        hit = _FLOW_SCRATCH[param_flows.device] = torch.zeros_like(param_flows)
-    return hit
-
-
-def drop_device_caches() -> None:
-    _FLOW_SCRATCH.clear()
 
 
 def _state(layer, info, batch: int, device) -> tuple:
@@ -147,14 +123,15 @@ def _state(layer, info, batch: int, device) -> tuple:
 
 def _pass(kwargs) -> dict:
     """What is kept of a PASS: `ran`, the node vectors whose forward went through here; of its backward `done`, the
-    ones whose backward has, `copies`, per source of tied copies, how many of them ran, and `pending`, per source, a
-    host and the copies written into it so far. Kept on the staged tensors of the forward, which every layer of the
-    pass and of its backward is handed. A layer's forward may run more than once on them -- the circuit times its
-    fused forward on the live pass (`TensorCircuit._stream_fusion_groups`) -- so `ran` is a set that only grows."""
+    ones whose backward has, and `norm`, per source of tied copies, what the normalizer half needs of each copy that
+    ran (its layer, node vector, factors, kept `log Z`, gradient buffers). Kept on the staged tensors of the forward,
+    which every layer of the pass and of its backward is handed. A layer's forward may run more than once on them --
+    the circuit times its fused forward on the live pass (`TensorCircuit._stream_fusion_groups`) -- so `ran` is a set
+    that only grows."""
     staged = kwargs[_EXTERNAL_PARAMS_KWARG]
     st = staged.__dict__.get("_lowrank_pass")
     if st is None:
-        st = staged.__dict__["_lowrank_pass"] = dict(ran = dict(), done = set(), pending = dict(), copies = dict())
+        st = staged.__dict__["_lowrank_pass"] = dict(ran = dict(), done = set(), norm = dict())
     return st
 
 
@@ -316,47 +293,33 @@ def forward(desc, layer, ns_tensors, node_mars, element_mars, params, kwargs, st
     return None
 
 
-def _take_denominators(mod, desc, layer, infos, scratch, denom_param_flows, params) -> None:
-    """The normalizer half's parameter flows, accumulated in `scratch` by a plain backward of `layer` -- `F-`, with
-    the parameters of this pass in it --, into the layer's denominator statistic `W = F- / theta` (its node vectors'
-    own slices, which lie as their parameter flows do, as their parameters do); `scratch` zero again."""
-    offsets, taken = desc._denom_offsets(layer), set()
-    for info in infos:
-        pfs, pfe = info.ns._param_flow_range
-        if (pfs, pfe) in taken:                                         # (tied copies of one layer writing one range)
-            continue
-        taken.add((pfs, pfe))
-        off = offsets[id(info.ns)][0]
-        ps, pe = _source(info.ns)._param_range
-        mod.lowrank_take(denom_param_flows[off:off + pfe - pfs], scratch[pfs:pfe], params[ps:pe])
-
-
-def _flush(mod, desc, group, bufs, cols, K, batch, params, param_flows, denom_param_flows, want_denom, precision) -> None:
-    """One plain backward of the host's layer over the normalizer columns of the copies written into its rows: its
-    parameter flows are the copies' `F-` summed (`W`, once divided by the parameters), its element flows their
-    gradients' normalizer part."""
-    from pyjuice.layer.sum_layer import SumLayer
-
-    layer, info, rows = group["host"]
-    members = group["members"]
-    used = len(members) * cols
-    # Columns past the copies written this time may hold an earlier pass's: no flow there
-    dirty = bufs["used"].get(info.nid_start, 0)
-    if dirty > used:
-        bufs["vnf_h"][info.nid_start:info.nid_end, used:dirty] = -float("inf")
-    bufs["used"][info.nid_start] = used
-
-    want_grads = any(grads is not None for grads in members)
-    if want_denom or want_grads:
-        scratch = _flow_scratch(param_flows) if want_denom else None
-        SumLayer.backward(layer, bufs["vnf_h"], bufs["vef_h"], bufs["zero_h"], bufs["vem_h"], params,
-                          param_flows = scratch, logspace_flows = True, precision = precision)
-        if want_denom:
-            _take_denominators(mod, desc, layer, [info], scratch, denom_param_flows, params)
-        if want_grads:
-            mod.lowrank_sub_b_hosted([None if grads is None else grads[1] for grads in members], bufs["vef_h"], rows,
+def _normalizer(mod, copies, node_flows, params, denom_param_flows, want_denom, want_grads, precision, batch) -> None:
+    """The normalizer half of a node vector and its copies in the pass, at the pass's end: `W = U^T V` into the
+    denominator statistic (the first copy's slice: `materialize_denom_flows` sums the copies'), `V * (U theta)` off
+    each copy's `dB`. The products through cuBLAS, bf16 operands (fp32 accumulation) under the default precision
+    where the work is `GEMM_BF16_WORK` or more, fp32 else. (`copies`: one source's, of one parameterization: its rank,
+    its denominator or none.)"""
+    layer0, info0, _, _, _ = copies[0]
+    desc, K = layer0.external_params, layer0.external_params.rank
+    geo = desc._geometry(layer0, info0, node_flows.device)
+    M, N, rows = geo["M"], geo["N"], len(copies) * batch * K
+    work = rows * M * N
+    dtype = torch.bfloat16 if precision != "fp32" and work >= GEMM_BF16_WORK else torch.float32
+    U = torch.empty(rows, M, dtype = dtype, device = node_flows.device)
+    V = torch.empty(rows, N, dtype = dtype, device = node_flows.device)
+    mod.lowrank_normalizer_operands(U, V, node_flows, [fa for _, _, (fa, _), _, _ in copies],
+                                    [lz for _, _, _, lz, _ in copies], [fb for _, _, (_, fb), _, _ in copies],
+                                    [info.nid_start for _, info, _, _, _ in copies], M, K)
+    if want_denom:
+        W = torch.mm(U.t(), V, out_dtype = torch.float32) if dtype is torch.bfloat16 else torch.mm(U.t(), V)
+        off = desc._denom_offsets(layer0)[id(info0.ns)][0]
+        size = info0.ns._param_flow_range[1] - info0.ns._param_flow_range[0]
+        denom_param_flows[off:off + size].index_add_(0, geo["local"], W.reshape(-1)[geo["flat"]])
+    if want_grads:
+        theta = desc._dense_params(geo, params)
+        G = torch.mm(U, theta.to(dtype), out_dtype = torch.float32) if dtype is torch.bfloat16 else torch.mm(U, theta)
+        mod.lowrank_normalizer_grads([None if grads is None else grads[1] for _, _, _, _, grads in copies], V, G,
                                      batch, K)
-    return None
 
 
 def backward(desc, layer, ns_tensors, ns_grad_tensors, node_flows, element_flows, node_mars, element_mars, params,
@@ -371,96 +334,50 @@ def backward(desc, layer, ns_tensors, ns_grad_tensors, node_flows, element_flows
     bufs = _buffers(node_mars, element_mars, cols, "bw")
     precision = kwargs.get("precision", "auto")
     want_denom = param_flows is not None and denom_param_flows is not None and desc.apply_z_correction
-    flush = lambda group, hosted: _flush(mod, desc, group, hosted, cols, K, batch, params, param_flows,
-                                         denom_param_flows, want_denom, precision)
 
     # Another backward of the same pass: a node vector's again, or one into other flows -- the circuit times its fused
     # backward on scratch flows before the pass's own (`TensorCircuit._stream_fusion_bk_groups`)
     st = _pass(kwargs)
     flows = st.get("flows")
     if flows is None or flows() is not node_flows or any(info.ns in st["done"] for info, _ in ns_tensors):
-        st.update(done = set(), pending = dict(), flows = weakref.ref(node_flows))
+        st.update(done = set(), norm = dict(), flows = weakref.ref(node_flows))
 
-    def pre(vemz, oz, fb, rows, rows_z, vnfz, nid0z, fa, state, grad_a, info):
+    # The data half: the virtual child values and node flows (and dA), the plain backward (F+), the element flows (and
+    # dB's data part)
+    for (info, (fa, fb)), grads in zip(ns_tensors, ns_grad_tensors):
+        rows = desc._geometry(layer, info, dev)["rows"]
+        grad_a = None if grads is None else grads[0]
         if stream_children is None:
-            mod.lowrank_backward_pre(bufs["vem_d"], vemz, oz, element_mars, fb, rows, rows_z, bufs["vnf_d"], vnfz,
-                                     nid0z, node_flows, node_mars, fa, *state, grad_a, info.nid_start,
-                                     info.ns.num_nodes, K)
+            mod.lowrank_backward_pre(bufs["vem_d"], element_mars, fb, rows, bufs["vnf_d"], node_flows, node_mars, fa,
+                                     *_state(layer, info, batch, dev), grad_a, info.nid_start, info.ns.num_nodes, K)
         else:
-            mod.lowrank_backward_pre_fused(bufs["vem_d"], vemz, oz, stream_children[0], stream_children[1], fb, rows,
-                                           rows_z, bufs["vnf_d"], vnfz, nid0z, node_flows, node_mars, fa, *state,
+            mod.lowrank_backward_pre_fused(bufs["vem_d"], stream_children[0], stream_children[1], fb, rows,
+                                           bufs["vnf_d"], node_flows, node_mars, fa, *_state(layer, info, batch, dev),
                                            grad_a, info.nid_start, info.ns.num_nodes, K)
 
-    def collapse(rows, vefz, grad_b):
+    SumLayer.backward(layer, bufs["vnf_d"], bufs["vef_d"], bufs["zero"], bufs["vem_d"], params,
+                      param_flows = param_flows, logspace_flows = True, precision = precision)
+
+    for (info, (fa, fb)), grads in zip(ns_tensors, ns_grad_tensors):
+        rows = desc._geometry(layer, info, dev)["rows"]
+        grad_b = None if grads is None else grads[1]
         if stream_children is None:
-            mod.lowrank_collapse_bw(element_flows, bufs["vef_d"], rows, vefz, grad_b, K)
+            mod.lowrank_collapse_bw(element_flows, bufs["vef_d"], rows, grad_b, K)
         else:
             mod.lowrank_collapse_bw_fused(node_flows, bufs["vef_d"], rows, stream_children[0], stream_children[1],
-                                          vefz, grad_b, K)
-    if not st["done"]:                                                  # a backward's first: its copies per source
-        copies = st["copies"] = dict()
-        for ns in st["ran"]:
-            copies[_source(ns)] = copies.get(_source(ns), 0) + 1
-
-    # A layer of one node vector with other copies in the pass: its normalizer half goes to a host's rows
-    capacity = _host_columns(cols) // cols
-    hosted = None
-    if len(ns_tensors) == 1 and len(layer.external_node_infos) == 1 and capacity > 1 \
-            and st["copies"].get(_source(ns_tensors[0][0].ns), 0) > 1:
-        info, (fa, fb) = ns_tensors[0]
-        grads = ns_grad_tensors[0]
-        geo = desc._geometry(layer, info, dev)
-        hosted = _buffers(node_mars, element_mars, cols, "bw_host")
-        src = _source(info.ns)
-        group = st["pending"].get(src)
-        if group is None:
-            group = st["pending"][src] = dict(host = (layer, info, geo["rows"]), members = [])
-        _, host, host_rows = group["host"]
-        at = len(group["members"]) * cols
-        pre(hosted["vem_h"], at, fb, geo["rows"], host_rows, hosted["vnf_h"], host.nid_start, fa,
-            _state(layer, info, batch, dev), None if grads is None else grads[0], info)
-        group["members"].append(grads)
-
-        # The data half: the layer's element flows, a column per rank, and `F+`
-        SumLayer.backward(layer, bufs["vnf_d"], bufs["vef_d"], bufs["zero"], bufs["vem_d"], params,
-                          param_flows = param_flows, logspace_flows = True, precision = precision)
-        collapse(geo["rows"], None, None if grads is None else grads[1])
-
+                                          grad_b, K)
+        st["norm"].setdefault(_source(info.ns), []).append((layer, info, (fa, fb), _state(layer, info, batch, dev)[0], grads))
         st["done"].add(info.ns)
-        if len(group["members"]) == capacity:
-            flush(st["pending"].pop(src), hosted)
-    else:
-        bufz = _buffers(node_mars, element_mars, cols, "bw_z")
-        want_grads = any(grads is not None for grads in ns_grad_tensors)
-        for (info, (fa, fb)), grads in zip(ns_tensors, ns_grad_tensors):
-            rows = desc._geometry(layer, info, dev)["rows"]
-            pre(bufz["vem_z"], 0, fb, rows, rows, bufz["vnf_z"], info.nid_start, fa, _state(layer, info, batch, dev),
-                None if grads is None else grads[0], info)
 
-        SumLayer.backward(layer, bufs["vnf_d"], bufs["vef_d"], bufs["zero"], bufs["vem_d"], params,
-                          param_flows = param_flows, logspace_flows = True, precision = precision)
-
-        # The normalizer half: its parameter flows are `F-`, its element flows the gradient of `B`'s other term
-        if want_denom or want_grads:
-            scratch = _flow_scratch(param_flows) if want_denom else None
-            SumLayer.backward(layer, bufz["vnf_z"], bufz["vef_z"], bufs["zero"], bufz["vem_z"], params,
-                              param_flows = scratch, logspace_flows = True, precision = precision)
-            if want_denom:
-                _take_denominators(mod, desc, layer, [info for info, _ in ns_tensors], scratch, denom_param_flows,
-                                   params)
-
-        for (info, _), grads in zip(ns_tensors, ns_grad_tensors):
-            rows = desc._geometry(layer, info, dev)["rows"]
-            if grads is None:
-                collapse(rows, None, None)
-            else:
-                collapse(rows, bufz["vef_z"], grads[1])
-            st["done"].add(info.ns)
-
-    # The pass's last node vector: every host still holding copies
-    if len(st["done"]) == len(st["ran"]) and st["pending"]:
-        hosted = hosted if hosted is not None else _buffers(node_mars, element_mars, cols, "bw_host")
-        for src in list(st["pending"]):
-            flush(st["pending"].pop(src), hosted)
+    # The pass's last node vector: the normalizer half of every source, all of its copies at once (each source's own
+    # parameterization: its rank, whether it keeps a denominator)
+    if len(st["done"]) == len(st["ran"]):
+        for src, copies in st.pop("norm").items():
+            own = copies[0][0].external_params
+            denom = param_flows is not None and denom_param_flows is not None and own.apply_z_correction
+            grads = any(g is not None for _, _, _, _, g in copies)
+            if denom or grads:
+                _normalizer(mod, copies, node_flows, params, denom_param_flows, denom, grads, precision, batch)
+        st["norm"] = dict()
 
     return None

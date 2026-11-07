@@ -899,8 +899,7 @@ def test_the_virtual_batch_on_tensor_core_shapes(precision, rtol, monkeypatch):
 def test_the_virtual_buffers_stay_what_the_plain_kernels_expect(monkeypatch):
     """The plain kernels pad a ragged row's edges with the circuit's dummy rows: the virtual buffers hold -inf there
     (zero value, zero flow) from their allocation on, whatever memory they were given; the stand-in node values of
-    the backward stay 0 and the stand-in parameter flows are handed back zeroed. A pass over them after the torch
-    passes dirtied the allocator is the torch passes' result."""
+    the backward stay 0. A pass over them after the torch passes dirtied the allocator is the torch passes' result."""
     import pyjuice.nodes.external_params.lowrank_virtual as lowrank_virtual
 
     rank, batch = 3, 6
@@ -921,19 +920,18 @@ def test_the_virtual_buffers_stay_what_the_plain_kernels_expect(monkeypatch):
     _same(got, want, rtol = 2e-4, atol = 2e-5)
 
     families = pc.node_mars._lowrank_virtual                         # (kept on the circuit's own buffer)
-    assert set(families) == {(f, batch * rank) for f in ("fw", "bw", "bw_z")}   # one node vector, no copy: no host
-    bufs = {name: buf for family in families.values() for name, buf in family.items() if name != "used"}
+    assert set(families) == {(f, batch * rank) for f in ("fw", "bw")}
+    bufs = {name: buf for family in families.values() for name, buf in family.items()}
     layer = pc.external_params_nodes[sums[0]]
     kids = layer.external_params._geometry(layer, layer.external_params._info(layer, sums[0]), dev)["kids"]
     other = torch.ones(pc.element_mars.size(0), dtype = torch.bool, device = dev)
     other[kids] = False
-    for name in ("vem", "vem_d", "vem_z", "vef_d", "vef_z"):
+    for name in ("vem", "vem_d", "vef_d"):
         assert bool(torch.isneginf(bufs[name][other]).all()), name
     nodes = torch.ones(pc.node_mars.size(0), dtype = torch.bool, device = dev)
     nodes[slice(*sums[0]._output_ind_range)] = False
-    assert bool(torch.isneginf(bufs["vnf_d"][nodes]).all()) and bool(torch.isneginf(bufs["vnf_z"][nodes]).all())
+    assert bool(torch.isneginf(bufs["vnf_d"][nodes]).all())
     assert float(bufs["zero"].abs().sum()) == 0.0
-    assert float(lowrank_virtual._FLOW_SCRATCH[dev].abs().sum()) == 0.0
 
 
 @needs_virtual
@@ -982,13 +980,37 @@ def _plain_backwards(monkeypatch):
     return calls
 
 
+def _normalizer_calls(monkeypatch):
+    """Counts the calls of the normalizer half's operand kernel, with the rows of each (copies x batch x rank)."""
+    import pyjuice.nodes.external_params.lowrank_virtual as lowrank_virtual
+
+    real, calls = lowrank_virtual._module, []
+
+    class Counted:
+        def __getattr__(self, attr):
+            fn = getattr(real(), attr)
+            if attr != "lowrank_normalizer_operands":
+                return fn
+
+            def counted(U, V, *args):
+                calls.append((U.size(0), U.dtype))
+                return fn(U, V, *args)
+            return counted
+
+    counted = Counted()
+    monkeypatch.setattr(lowrank_virtual, "_module", lambda: counted)
+    return calls
+
+
 @needs_virtual
-@pytest.mark.parametrize("most,hosts", [(1, 5), (2, 3), (3, 2), (5, 1), (40, 1)])
-def test_tied_copies_share_a_host_for_the_normalizer_half(most, hosts, monkeypatch):
-    """Five tied copies, one a layer: their backward's normalizer columns go into the rows of a host, as many copies
-    as `COLUMNS_MOST` holds, and one plain backward a host gives the denominator flow and the gradients' normalizer
-    part -- flushed when a host is full and at the pass's last copy. The torch passes' result, however they are
-    split."""
+@pytest.mark.parametrize("operands", ["fp32", "bf16"])
+def test_the_normalizer_half_is_two_products_over_all_the_copies(operands, monkeypatch):
+    """Five tied copies, one a layer: each layer's backward runs the plain backward once, on its data half, and at the
+    pass's end ONE pair of matrix products over the five copies' rows gives the denominator statistic (written into
+    the slice of the first copy the backward met, the topmost; the others' hold nothing) and the gradients'
+    normalizer part. The torch passes' result,
+    with fp32 operands and with bf16 ones (`GEMM_BF16_WORK` forced to 0); a second backward of the same forward the
+    same again, nothing left over from the first."""
     import pyjuice.nodes.external_params.lowrank_virtual as lowrank_virtual
 
     rank, batch = 2, 4
@@ -998,46 +1020,45 @@ def test_tied_copies_share_a_host_for_the_normalizer_half(most, hosts, monkeypat
     torch.manual_seed(13)
     data = torch.randint(0, NUM_CATS, (batch, pc.num_vars), device = dev)
     ext = {a: _factors(a, rank, batch, dev, seed = 80 + i) for i, a in enumerate(sums)}
+    if operands == "bf16":
+        monkeypatch.setattr(lowrank_virtual, "GEMM_BF16_WORK", 0)
+    tol = dict(rtol = 2e-4, atol = 2e-5) if operands == "fp32" else dict(rtol = 1e-2, atol = 1e-3)
 
     cols = batch * rank
-    monkeypatch.setattr(lowrank_virtual, "COLUMNS_MOST", most * cols)
-    calls = _plain_backwards(monkeypatch)
+    plain, norm = _plain_backwards(monkeypatch), _normalizer_calls(monkeypatch)
     got = _passes(pc, sums, data, ext)
     assert got["path"] == {tuple}
-    gated = [c for c in calls if c != batch]                         # (the root's layer runs at the batch itself)
-    assert gated.count(cols) == (10 if most == 1 else 5)             # every layer's data half (and, unhosted, its own)
-    if most > 1:
-        assert gated.count(min(most, 40) * cols) == hosts and len(gated) == 5 + hosts
-        # ... each host's slice of the denominator flow holding its copies' sum, the others' nothing
-        desc = sums[0].external_params
-        held = [float(pc.denom_param_flows[slice(o, o + sums[0].num_edges)].abs().sum()) > 0
-                for o in (desc._denom_offsets(pc.external_params_nodes[a])[id(a)][0] for a in sums)]
-        assert sum(held) == hosts
+    assert [c for c in plain if c != batch] == [cols] * 5             # (the root's layer runs at the batch itself)
+    assert norm == [(5 * cols, torch.float32 if operands == "fp32" else torch.bfloat16)]
+    desc = sums[0].external_params
+    held = [float(pc.denom_param_flows[slice(o, o + sums[0].num_edges)].abs().sum()) > 0
+            for o in (desc._denom_offsets(pc.external_params_nodes[a])[id(a)][0] for a in sums)]
+    assert held == [False, False, False, False, True]                # (the top transition's: the backward's first)
 
-    calls.clear()
+    plain.clear()
     monkeypatch.setattr(lowrank_virtual, "ENABLED", False)
     want = _passes(pc, sums, data, ext)
-    assert not [c for c in calls if c != batch]
-    _same(got, want, rtol = 2e-4, atol = 2e-5)
+    assert not [c for c in plain if c != batch]
+    _same(got, want, **tol)
 
-    # A second backward of the same forward: the same again, nothing left over from the first
+    # A second backward of the same forward: the same again
     monkeypatch.setattr(lowrank_virtual, "ENABLED", True)
     grads = {a: (torch.zeros_like(ext[a][0]), torch.zeros_like(ext[a][1])) for a in sums}
     pc(data, sum_external_params = ext)
     for _ in range(2):
         pc.init_param_flows(flows_memory = 0.0)
         pc.backward(data, allow_modify_flows = False, logspace_flows = True, sum_external_params_grad = grads)
-        assert torch.allclose(pc.param_flows, want["fp"], rtol = 2e-4, atol = 2e-5)
-        assert torch.allclose(_denominators(pc, sums), want["fm"], rtol = 2e-4, atol = 2e-5)
+        assert torch.allclose(pc.param_flows, want["fp"], **tol)
+        assert torch.allclose(_denominators(pc, sums), want["fm"], **tol)
         for k, a in enumerate(sums):
-            assert torch.allclose(grads[a][0], want["dA"][k], rtol = 2e-4, atol = 2e-5)
-            assert torch.allclose(grads[a][1], want["dB"][k], rtol = 2e-4, atol = 2e-5)
+            assert torch.allclose(grads[a][0], want["dA"][k], **tol)
+            assert torch.allclose(grads[a][1], want["dB"][k], **tol)
 
 
 @needs_virtual
-def test_a_host_holding_fewer_copies_than_the_pass_before(monkeypatch):
-    """A host's rows keep the columns an earlier pass wrote. A pass that gives it fewer copies -- here two of the five
-    transitions left without factors -- must not read them: the columns past its copies carry no flow."""
+def test_the_normalizer_products_with_fewer_copies_and_without_some_gradients(monkeypatch):
+    """A pass that gives factors to some copies only, and one that asks for the gradients of some: the products run
+    over the copies in the pass, the gradients reach the buffers given; the torch passes' result."""
     import pyjuice.nodes.external_params.lowrank_virtual as lowrank_virtual
 
     rank, batch = 2, 4
@@ -1046,24 +1067,57 @@ def test_a_host_holding_fewer_copies_than_the_pass_before(monkeypatch):
     torch.manual_seed(14)
     data = torch.randint(0, NUM_CATS, (batch, pc.num_vars), device = dev)
     ext = {a: _factors(a, rank, batch, dev, seed = 90 + i) for i, a in enumerate(sums)}
-    _passes(pc, sums, data, ext)                                     # five copies in one host
-
+    _passes(pc, sums, data, ext)
+    norm = _normalizer_calls(monkeypatch)
     for kept in ([0, 2, 4], [1], [3, 4]):
         few = [sums[i] for i in kept]
         sub = {a: ext[a] for a in few}
         monkeypatch.setattr(lowrank_virtual, "ENABLED", True)
+        norm.clear()
         got = _passes(pc, few, data, sub)
-        assert got["path"] == {tuple}
+        assert got["path"] == {tuple} and norm == [(len(kept) * batch * rank, torch.float32)]
         monkeypatch.setattr(lowrank_virtual, "ENABLED", False)
         want = _passes(pc, few, data, sub)
         _same(got, want, rtol = 2e-4, atol = 2e-5)
 
+    # gradients for the second and the fourth copy only
+    out = dict()
+    for enabled in (True, False):
+        monkeypatch.setattr(lowrank_virtual, "ENABLED", enabled)
+        grads = {a: (torch.zeros_like(ext[a][0]), torch.zeros_like(ext[a][1])) for a in (sums[1], sums[3])}
+        pc(data, sum_external_params = ext)
+        pc.init_param_flows(flows_memory = 0.0)
+        pc.backward(data, allow_modify_flows = False, logspace_flows = True, sum_external_params_grad = grads)
+        out[enabled] = (grads, _denominators(pc, sums))
+    for a in (sums[1], sums[3]):
+        for k in (0, 1):
+            assert torch.allclose(out[True][0][a][k], out[False][0][a][k], rtol = 2e-4, atol = 2e-5)
+    assert torch.allclose(out[True][1], out[False][1], rtol = 2e-4, atol = 2e-5)
+
 
 @needs_virtual
-def test_copies_in_layers_of_several_node_vectors_keep_their_own_normalizer_calls(monkeypatch):
-    """Two tied chains side by side: every layer holds two node vectors, each with copies in the pass. A host takes
-    the columns of one node vector a layer -- its plain backward runs the whole layer --, so these layers run their
-    own normalizer half: two plain backwards a layer, and the torch passes' result."""
+def test_the_normalizer_products_shift_large_factors(monkeypatch):
+    """Factors whose entries reach +-60: `exp(B)` alone would overflow fp32; shifted by each row's largest entry, the
+    products are the torch passes' (which work in float64)."""
+    import pyjuice.nodes.external_params.lowrank_virtual as lowrank_virtual
+
+    rank, batch = 2, 4
+    pc, sums, _, _, _, _ = _pair("hmm_tied", "sum_exp", rank = rank)
+    dev = pc.params.device
+    torch.manual_seed(21)
+    data = torch.randint(0, NUM_CATS, (batch, pc.num_vars), device = dev)
+    ext = {a: _factors(a, rank, batch, dev, spread = 20.0, seed = 300 + i) for i, a in enumerate(sums)}
+    assert max(float(B.abs().max()) for _, B in ext.values()) > 50
+    got = _passes(pc, sums, data, ext)
+    assert got["path"] == {tuple} and all(torch.isfinite(t).all() for t in (got["fp"], got["fm"], *got["dB"]))
+    monkeypatch.setattr(lowrank_virtual, "ENABLED", False)
+    _same(got, _passes(pc, sums, data, ext), rtol = 1e-3, atol = 1e-4)
+
+
+@needs_virtual
+def test_copies_in_layers_of_several_node_vectors(monkeypatch):
+    """Two tied chains side by side: every layer holds two node vectors, each with copies in the pass. One plain
+    backward a layer (the data half of both), the normalizer products once a source: two."""
     import pyjuice.nodes.external_params.lowrank_virtual as lowrank_virtual
 
     rank, batch = 2, 4
@@ -1073,41 +1127,19 @@ def test_copies_in_layers_of_several_node_vectors_keep_their_own_normalizer_call
     torch.manual_seed(15)
     data = torch.randint(0, NUM_CATS, (batch, pc.num_vars), device = dev)
     ext = {a: _factors(a, rank, batch, dev, seed = 100 + i) for i, a in enumerate(sums)}
-    calls = _plain_backwards(monkeypatch)
+    plain, norm = _plain_backwards(monkeypatch), _normalizer_calls(monkeypatch)
     got = _passes(pc, sums, data, ext)
-    assert got["path"] == {tuple} and [c for c in calls if c != batch] == [batch * rank] * 6
-    monkeypatch.setattr(lowrank_virtual, "ENABLED", False)
-    _same(got, _passes(pc, sums, data, ext), rtol = 2e-4, atol = 2e-5)
-
-
-@needs_virtual
-def test_a_host_whose_rows_are_not_its_copies(monkeypatch):
-    """The deepest transition's children stand at other element rows than the other transitions' (a product of
-    another branch precedes them in its layer): what a copy writes for the host goes to the HOST's rows."""
-    import pyjuice.nodes.external_params.lowrank_virtual as lowrank_virtual
-
-    rank, batch = 2, 4
-    pc, sums, _, _, _, _ = _pair("hmm_side", "sum_exp", rank = rank)
-    dev = pc.params.device
-    desc = sums[0].external_params
-    rows = [desc._geometry(layer, desc._info(layer, a), dev)["rows"]
-            for a, layer in ((a, pc.external_params_nodes[a]) for a in sums)]
-    assert not all(torch.equal(rows[0], r) for r in rows[1:]), "every copy's children at the same rows: nothing tested"
-    torch.manual_seed(16)
-    data = torch.randint(0, NUM_CATS, (batch, pc.num_vars), device = dev)
-    ext = {a: _factors(a, rank, batch, dev, seed = 110 + i) for i, a in enumerate(sums)}
-    calls = _plain_backwards(monkeypatch)
-    got = _passes(pc, sums, data, ext)
-    assert got["path"] == {tuple} and len([c for c in calls if c not in (batch, batch * rank)]) == 1    # one host
+    assert got["path"] == {tuple} and [c for c in plain if c != batch] == [batch * rank] * 3
+    assert sorted(norm) == [(3 * batch * rank, torch.float32)] * 2
     monkeypatch.setattr(lowrank_virtual, "ENABLED", False)
     _same(got, _passes(pc, sums, data, ext), rtol = 2e-4, atol = 2e-5)
 
 
 @needs_virtual
 def test_a_backward_after_one_that_stopped_midway(monkeypatch):
-    """A backward that raised after some copies were written into a host leaves them there. The next backward of
-    the same forward starts over -- the first node vector seen again resets what the pass keeps -- and is a whole
-    one: the torch passes' flows and gradients, and as few plain backwards as the first time."""
+    """A backward that raised after some copies were noted for the normalizer products leaves them noted. The next
+    backward of the same forward starts over -- the first node vector seen again resets what the pass keeps -- and is
+    a whole one: the torch passes' flows and gradients, one plain backward a layer, one pair of products."""
     import pyjuice.nodes.external_params.lowrank_virtual as lowrank_virtual
     from pyjuice.layer.sum_layer import SumLayer
 
@@ -1137,12 +1169,12 @@ def test_a_backward_after_one_that_stopped_midway(monkeypatch):
         with pytest.raises(RuntimeError, match = "stopped"):
             pc.backward(data, allow_modify_flows = False, logspace_flows = True, sum_external_params_grad = grads)
 
-    calls = _plain_backwards(monkeypatch)
+    calls, norm = _plain_backwards(monkeypatch), _normalizer_calls(monkeypatch)
     for _ in range(2):
-        calls.clear()
+        calls.clear(); norm.clear()
         pc.init_param_flows(flows_memory = 0.0)
         pc.backward(data, allow_modify_flows = False, logspace_flows = True, sum_external_params_grad = grads)
-        assert len([c for c in calls if c != batch]) == 5 + 1       # five data halves, one host
+        assert len([c for c in calls if c != batch]) == 5 and len(norm) == 1      # five data halves, one pair
         assert torch.allclose(pc.param_flows, want["fp"], rtol = 2e-4, atol = 2e-5)
         assert torch.allclose(_denominators(pc, sums), want["fm"], rtol = 2e-4, atol = 2e-5)
         for k, a in enumerate(sums):
