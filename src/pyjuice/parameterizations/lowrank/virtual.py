@@ -311,7 +311,9 @@ def _normalizers(desc, layer, info, st, kwargs, params, batch, dev) -> dict:
     """What a pass keeps of a node vector's source, made when the first of its copies runs. For every tied copy the pass
     was given, each rank's normalizer is ONE matrix product `theta @ exp(B - shift)` over the rows `(copy, rank, sample)`,
     `log_z`, the plain kernels then never seeing the normalizer half; `row`: each copy's first row. The product's operands
-    are the backward's too: `V`, `shift` and `theta`, and `fb`, the factors."""
+    are the backward's too: `V`, `shift` and `theta`, and `fb`, the factors. `theta` dense in the product's dtype: at
+    bf16, from the circuit's bf16 copy where the forward was handed it (`op_params`, the layer marked for it: its
+    source's range copied in this forward); else from the parameters, by one strided copy that converts."""
     source = _source(info.ns)
     zs = st.setdefault("z", dict())
     hit = zs.get(source)
@@ -321,8 +323,9 @@ def _normalizers(desc, layer, info, st, kwargs, params, batch, dev) -> dict:
         fbs = [fb for _, fb in copies]
         dtype = _dtype(kwargs.get("precision", "auto"), len(copies) * batch * K * geo["M"] * geo["N"])
         Vt, shift = _v_rows(mod, fbs, geo["N"], K, batch, dtype, dev)
-        theta = desc._dense_params(geo, params)
-        Zt = _product(theta.to(dtype), Vt, dtype)
+        op = kwargs.get("op_params")
+        theta = desc._dense_params(geo, op if op is not None and dtype is torch.bfloat16 else params, dtype)
+        Zt = _product(theta, Vt, dtype)
         mod.lowrank_z_log(Zt, shift)
         hit = zs[source] = dict(log_z = Zt, row = {c: at * batch * K for at, (c, _) in enumerate(copies)}, V = Vt,
                                 shift = shift, dtype = dtype, fb = fbs, theta = theta)
@@ -419,18 +422,18 @@ def forward(desc, layer, ns_tensors, node_mars, element_mars, params, kwargs, st
     return None
 
 
-def _end_of_pass(mod, z, copies, node_flows, node_mars, param_flows, denom_param_flows, want_denom, want_grads, precision,
-                 batch) -> None:
+def _end_of_pass(mod, z, copies, node_flows, node_mars, params, param_flows, denom_param_flows, want_denom, want_grads,
+                 precision, batch) -> None:
     """What a node vector and its copies in the pass owe at the pass's end, as matrix products over the rows `(copy,
     rank, sample)` (`kernels/c/lowrank_mixture.cu`'s header has them), of cuBLAS: bf16 operands (fp32 accumulation) under
     the default precision where the work is `GEMM_BF16_WORK` or more, fp32 else.
 
     The normalizer half: `W = U^T V` into the denominator statistic (the first copy's slice: `materialize_denom_flows`
-    sums the copies'), `V * (U theta)` off each copy's `dB`, `V` and the rows the forward's (`z`, `_normalizers`). The data
-    half: `F+ = theta * (U^T V)` for the copies whose product layer was fused in (`copies`' last entry; another's plain
-    backward has added its flows), into the first of them's flow block: the blocks of a source's copies are summed before
-    the parameters read them, as those of the plain kernels. (`copies`: one source's, of one parameterization: its rank,
-    its denominator or none.)"""
+    sums the copies'), `V * (U theta)` off each copy's `dB`, `V` and the rows the forward's (`z`, `_normalizers`). The
+    data half: `F+ = theta * (U^T V)`, `theta` read from `params` where they lie, for the copies whose product layer was
+    fused in (`copies`' last entry; another's plain backward has added its flows), into the first of them's flow block:
+    the blocks of a source's copies are summed before the parameters read them, as those of the plain kernels.
+    (`copies`: one source's, of one parameterization: its rank, its denominator or none.)"""
     layer0, info0, _, _, _, _ = copies[0]
     desc, K = layer0.parameterization, layer0.parameterization.rank
     dev = node_flows.device
@@ -438,7 +441,6 @@ def _end_of_pass(mod, z, copies, node_flows, node_mars, param_flows, denom_param
     M, N = geo["M"], geo["N"]
     fp = [] if param_flows is None else [c for c in copies if c[5] is not None]
     dtype = _dtype(precision, len(z["fb"]) * batch * K * M * N)
-    theta = z["theta"]
 
     if fp:
         rows = len(fp) * batch * K
@@ -448,7 +450,7 @@ def _end_of_pass(mod, z, copies, node_flows, node_mars, param_flows, denom_param
                                   [info.nid_start for _, info, _, _, _, _ in fp],
                                   [desc._geometry(layer, info, dev)["rows"] for layer, info, _, _, _, _ in fp],
                                   [sc[0] for _, _, _, _, _, sc in fp], [sc[1] for _, _, _, _, _, sc in fp], M, K)
-        desc._scatter_add(geo, param_flows, fp[0][1].ns._param_flow_range[0], _product(Ud, Vd.t(), dtype), theta)
+        desc._scatter_add(geo, param_flows, fp[0][1].ns._param_flow_range[0], _product(Ud, Vd.t(), dtype), params)
 
     if not (want_denom or want_grads):
         return
@@ -462,7 +464,8 @@ def _end_of_pass(mod, z, copies, node_flows, node_mars, param_flows, denom_param
         desc._scatter_add(geo, denom_param_flows, desc._denom_offsets(layer0)[id(info0.ns)][0],
                           _product(Ut, Vt.t(), dtype))
     if want_grads:
-        Gt = _product(theta.t().to(dtype), Ut, dtype)                        # [N, rows]: (U theta)^T
+        theta = z["theta"] if z["theta"].dtype == dtype else desc._dense_params(geo, params, dtype)
+        Gt = _product(theta.t(), Ut, dtype)                                  # [N, rows]: (U theta)^T
         mod.lowrank_normalizer_grads([None if grads is None else grads[1] for _, _, _, _, grads, _ in copies], row0, Vt, Gt,
                                      batch, K)
 
@@ -528,8 +531,8 @@ def backward(desc, layer, ns_tensors, ns_grad_tensors, node_flows, element_flows
             own = copies[0][0].parameterization
             denom = param_flows is not None and denom_param_flows is not None and own.apply_z_correction
             grads = any(c[4] is not None for c in copies)
-            _end_of_pass(mod, st["z"][src], copies, node_flows, node_mars, param_flows, denom_param_flows, denom, grads,
-                         precision, batch)
+            _end_of_pass(mod, st["z"][src], copies, node_flows, node_mars, params, param_flows, denom_param_flows,
+                         denom, grads, precision, batch)
         st["norm"] = dict()
 
     return None

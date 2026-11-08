@@ -233,36 +233,40 @@ class LowRank(_ForwardMixin, _BackwardMixin, _DenominatorsMixin, SumParameteriza
         raise KeyError(f"{ns} is not a node vector of this layer.")
 
     @staticmethod
-    def _dense_params(geo, params) -> torch.Tensor:
-        """The node vector's shared parameters on its `[M, N]` grid, float32, 0 where it has none: one strided copy of
-        their run where they lie block-major (`grid`), a gather and a scatter else."""
+    def _dense_params(geo, params, dtype = torch.float32) -> torch.Tensor:
+        """The node vector's shared parameters on its `[M, N]` grid, in `dtype`, 0 where it has none: one strided copy
+        of their run where they lie block-major (`grid`), converting as it copies, a gather and a scatter else.
+        `params`: the circuit's, or its bf16 copy (`TensorCircuit._param_operands`), which is indexed alike."""
         M, N, grid = geo["M"], geo["N"], geo["grid"]
         if grid is not None:
             _, Mb, Nb, cbs, bs = grid
-            theta = torch.empty(Mb, bs, Nb, cbs, dtype = torch.float32, device = params.device)
+            theta = torch.empty(Mb, bs, Nb, cbs, dtype = dtype, device = params.device)
             theta.copy_(params[geo["p0"]:geo["p0"] + M * N].view(Mb, Nb, cbs, bs).permute(0, 3, 1, 2))
             return theta.view(M, N)
-        theta = torch.zeros(M * N, dtype = torch.float32, device = params.device)
-        theta[geo["flat"]] = params[geo["pid"]].float()
+        theta = torch.zeros(M * N, dtype = dtype, device = params.device)
+        theta[geo["flat"]] = params[geo["pid"]].to(dtype)
         return theta.view(M, N)
 
     @staticmethod
-    def _scatter_add(geo, dst: torch.Tensor, base: int, values: torch.Tensor, times: Optional[torch.Tensor] = None):
-        """`dst[base + local] += (values * times)[flat]`: a grid's values (`[M, N]`, times another's) onto the slots of
-        the node vector's stored parameters in a range of `dst` from `base` on (its flows', its denominators'): one
-        strided add where they lie block-major (`grid`), a gather and an `index_add_` else."""
+    def _scatter_add(geo, dst: torch.Tensor, base: int, values: torch.Tensor, params: Optional[torch.Tensor] = None):
+        """`dst[base + local] += (values * theta)[flat]`: a grid's values (`[M, N]`; with `params`, times the node
+        vector's parameters, read from them where they lie) onto the slots of its stored parameters in a range of `dst`
+        from `base` on (its flows', its denominators'): one strided add where they lie block-major (`grid`), a gather
+        and an `index_add_` else."""
         grid = geo["grid"]
         if grid is None:
-            v = values if times is None else values * times
-            dst.index_add_(0, base + geo["local"], v.reshape(-1)[geo["flat"]].to(dst.dtype))
+            v = values.reshape(-1)[geo["flat"]]
+            if params is not None:
+                v = v * params[geo["pid"]]
+            dst.index_add_(0, base + geo["local"], v.to(dst.dtype))
             return
         off, Mb, Nb, cbs, bs = grid
         out = dst[base + off:base + off + geo["M"] * geo["N"]].view(Mb, Nb, cbs, bs)
         perm = lambda t: t.view(Mb, bs, Nb, cbs).permute(0, 2, 3, 1)
-        if times is None:
+        if params is None:
             out.add_(perm(values))
         else:
-            out.addcmul_(perm(values), perm(times))
+            out.addcmul_(perm(values), params[geo["p0"]:geo["p0"] + geo["M"] * geo["N"]].view(Mb, Nb, cbs, bs))
 
     @staticmethod
     def _child_values(geo, element_mars) -> torch.Tensor:

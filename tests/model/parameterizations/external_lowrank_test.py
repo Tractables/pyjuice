@@ -1054,9 +1054,10 @@ def _grid_reference(ns, M, N, device):
 @pytest.mark.parametrize("name", ["hmm_tied", "hmm_untied", "sparse"])
 def test_a_block_major_node_vector_reads_and_writes_its_parameters_as_a_strided_grid(name):
     """Where a node vector's parameters lie block-major in one run -- every cell's edge block in its place, node block
-    by node block, each in child order -- its dense `theta` is a strided copy of the run and a grid's values go onto
-    its parameters' slots as one strided add, no `[M N]` index table made; a node vector that is not (ragged) keeps the
-    gather and the scatter. Both against the cells and slots built here from the edge blocks and the parameter ids."""
+    by node block, each in child order -- its dense `theta` is a strided copy of the run, in fp32 or bf16, and a grid's
+    values -- times its parameters, read in place, or not -- go onto its parameters' slots as one strided add, no
+    `[M N]` index table made; a node vector that is not (ragged) keeps the gather and the scatter. Both against the
+    cells and slots built here from the edge blocks and the parameter ids."""
     pc, sums, _, _, _, _ = _pair(name, "sum_exp", rank = 2)
     dev = pc.params.device
     for k, a in enumerate(sums):
@@ -1073,18 +1074,19 @@ def test_a_block_major_node_vector_reads_and_writes_its_parameters_as_a_strided_
         want = torch.zeros(M * N, device = dev)
         want[flat] = pc.params[p0 + local].float()
         assert torch.equal(desc._dense_params(geo, pc.params), want.view(M, N))
+        assert torch.equal(desc._dense_params(geo, pc.params, torch.bfloat16), want.view(M, N).to(torch.bfloat16))
 
         g = torch.Generator(device = "cpu").manual_seed(k)
-        values, times = torch.randn(M, N, generator = g).to(dev), torch.rand(M, N, generator = g).to(dev)
+        values = torch.randn(M, N, generator = g).to(dev)
         size = a._param_flow_range[1] - a._param_flow_range[0]
         before = torch.randn(size + 7, generator = g).to(dev)
-        for base, extra in ((0, None), (7, times)):
+        for base, params in ((0, None), (7, pc.params)):
             got, ref = before.clone(), before.clone()
-            desc._scatter_add(geo, got, base, values, extra)
-            v = values if extra is None else values * extra
-            ref.index_add_(0, base + local, v.reshape(-1)[flat])
+            desc._scatter_add(geo, got, base, values, params)
+            v = values.reshape(-1)[flat] * (1.0 if params is None else pc.params[p0 + local])
+            ref.index_add_(0, base + local, v)
             assert torch.allclose(got, ref, rtol = 1e-6, atol = 1e-6) and \
-                (extra is not None or torch.equal(got, ref)), (k, base)
+                (params is not None or torch.equal(got, ref)), (k, base)
 
 
 @pytest.mark.parametrize("listing,grid", [(((1, 0, 1, 0), (0, 0, 1, 1)), True), (((0, 0, 1, 1), (1, 0, 1, 0)), False),
@@ -2278,8 +2280,8 @@ def test_the_data_operands_follow_their_formulas(M, N, K, B, copies):
 @needs_virtual
 def test_a_backward_at_another_precision_than_its_forward(monkeypatch):
     """The forward's operands are the backward's where their dtype is what the backward's precision asks for. A backward at
-    fp32 after a forward whose products took bf16 operands makes its own `V`, and gives the torch passes' to fp32's rounding
-    of what the forward left."""
+    fp32 after a forward whose products took bf16 operands makes its own `V` and `theta` (from the parameters, not the
+    forward's rounded one), and gives the torch passes' to fp32's rounding of what the forward left."""
     import pyjuice.parameterizations.lowrank.virtual as lowrank_virtual
 
     rank, batch = 2, 5
@@ -2294,20 +2296,27 @@ def test_a_backward_at_another_precision_than_its_forward(monkeypatch):
 
     monkeypatch.setattr(lowrank_virtual, "GEMM_BF16_WORK", 0)
     made, real = [], lowrank_virtual._v_rows
+    thetas, real_theta = [], LowRank._dense_params
 
     def counted(mod, fbs, N, K, batch, dtype, dev):
         made.append(dtype)
         return real(mod, fbs, N, K, batch, dtype, dev)
 
+    def theta(geo, params, dtype = torch.float32):
+        thetas.append((params.dtype, dtype, params is pc.params))
+        return real_theta(geo, params, dtype)
+
     monkeypatch.setattr(lowrank_virtual, "_v_rows", counted)
+    monkeypatch.setattr(LowRank, "_dense_params", staticmethod(theta))
     grads = {a: (torch.zeros_like(ext[a][0]), torch.zeros_like(ext[a][1])) for a in sums}
     pc(data, sum_external_params = ext)
-    assert made == [torch.bfloat16]
+    assert made == [torch.bfloat16] and thetas == [(torch.float32, torch.bfloat16, True)], thetas
     pc.precision = "fp32"                                       # (the circuit's, read by each pass as it runs)
     pc.init_param_flows(flows_memory = 0.0)
     pc.backward(data, allow_modify_flows = False, logspace_flows = True, sum_external_params_grad = grads)
     pc.precision = "auto"
     assert made == [torch.bfloat16, torch.float32], made
+    assert thetas == [(torch.float32, torch.bfloat16, True), (torch.float32, torch.float32, True)], thetas
     # (the node values are the bf16 product's: the flows read them)
     assert torch.allclose(_denominators(pc, sums), want["fm"], rtol = 2e-2, atol = 1e-3)
     assert torch.allclose(pc.param_flows, want["fp"], rtol = 2e-2, atol = 1e-3)
@@ -2316,9 +2325,56 @@ def test_a_backward_at_another_precision_than_its_forward(monkeypatch):
     # ... and one of the default precision keeps the forward's
     pc(data, sum_external_params = ext)
     made.clear()
+    thetas.clear()
     pc.init_param_flows(flows_memory = 0.0)
     pc.backward(data, allow_modify_flows = False, logspace_flows = True, sum_external_params_grad = grads)
-    assert made == [], made
+    assert made == [] and thetas == [], (made, thetas)
+
+
+@needs_virtual
+def test_the_normalizers_theta_is_made_in_its_products_dtype(monkeypatch):
+    """The forward's normalizer product and the backward's gradient read `theta` dense in their operands' dtype, made
+    once a pass: at bf16 operands (`GEMM_BF16_WORK` set to 0) from the circuit's bf16 copy where the forward was
+    handed it (forced here: its values as they are), by a copy that rounds the fp32 parameters else; at fp32 from the
+    parameters, handed the copy or not. `F+` takes its factor from the parameters. Each pass's values, flows and
+    gradients within its operands' rounding of the torch passes'. (A backward at another precision than its forward
+    makes its own: `test_a_backward_at_another_precision_than_its_forward`.)"""
+    import pyjuice.parameterizations.lowrank.virtual as lowrank_virtual
+
+    rank, batch = 2, 16
+    pc, sums, _, _, _, _ = _pair("hmm_tied", "sum_exp", rank = rank)
+    dev = pc.params.device
+    torch.manual_seed(39)
+    data = torch.randint(0, NUM_CATS, (batch, pc.num_vars), device = dev)
+    ext = {a: _factors(a, rank, batch, dev, seed = 350 + i) for i, a in enumerate(sums)}
+    monkeypatch.setattr(lowrank_virtual, "ENABLED", False)
+    want = _passes(pc, sums, data, ext)
+    monkeypatch.setattr(lowrank_virtual, "ENABLED", True)
+    monkeypatch.setattr(lowrank_virtual, "GEMM_BF16_WORK", 0)
+
+    made, real = [], LowRank._dense_params
+
+    def dense(geo, params, dtype = torch.float32):
+        made.append((params.dtype, dtype, params is pc.params))
+        return real(geo, params, dtype)
+
+    monkeypatch.setattr(LowRank, "_dense_params", staticmethod(dense))
+    for force, source in ((True, torch.bfloat16), (False, torch.float32)):
+        monkeypatch.setattr(pc, "_param_operands_force", force, raising = False)
+        made.clear()
+        got = _passes(pc, sums, data, ext)
+        assert got["path"] == {tuple} and pc.__dict__["_param_operands_made"] is force
+        assert made == [(source, torch.bfloat16, not force)], (force, made)     # (one source: the tied transition)
+        _same(got, want, rtol = 2e-2, atol = 1e-3)
+    monkeypatch.setattr(lowrank_virtual, "GEMM_BF16_WORK", 1 << 62)            # (fp32 operands)
+    for force in (True, False):
+        monkeypatch.setattr(pc, "_param_operands_force", force, raising = False)
+        made.clear()
+        got = _passes(pc, sums, data, ext)
+        assert pc.__dict__["_param_operands_made"] is force
+        assert made == [(torch.float32, torch.float32, True)], (force, made)
+        # (handed the copy, the plain kernels may read it)
+        _same(got, want, **(dict(rtol = 2e-2, atol = 1e-3) if force else dict(rtol = 2e-4, atol = 2e-5)))
 
 
 @needs_virtual
