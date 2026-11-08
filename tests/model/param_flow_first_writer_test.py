@@ -311,3 +311,78 @@ def test_colliding_slots_are_not_planned(monkeypatch):
     assert all(not f for l in tied for f in l.__dict__["_pf_store_flags"].values())
     assert sum(l.__dict__.get("_pf_fallback_resets", 0) for l in _sums(pc)) == 0
     assert torch.equal(got, ref)
+
+
+def _more_backward_partitions():
+    """S1 and S2, 8 node blocks each of 4 child blocks (one forward partition); S1's children each 8 parents, S2's one
+    (two backward partitions)."""
+    torch.manual_seed(0)
+    with juice.set_block_size(32):
+        i = [inputs(v, num_node_blocks = 4 if v < 2 else 32, dist = dists.Categorical(num_cats = 8)) for v in range(4)]
+        P, Q = multiply(i[0], i[1]), multiply(i[2], i[3])
+        S1 = summate(P, num_node_blocks = 8)
+        par = torch.arange(8).repeat_interleave(4)
+        S2 = summate(Q, num_node_blocks = 8, edge_ids = torch.stack([par, torch.arange(32)]))
+        root = summate(multiply(S1, S2), num_node_blocks = 1, block_size = 1)
+    root.init_parameters(perturbation = 2.0)
+    return juice.compile(root, verbose = False).to(DEV), 4, 8
+
+
+def _tied_below_more_forward_partitions():
+    """Layer X (blocks of 32): B (8 child blocks of 16) and A (1): two forward partitions, every child one parent (one
+    backward partition), B in the second forward partition. B's tied copy alone in a layer below; the other layers'
+    children one parent each, so no layer has more backward than forward partitions."""
+    torch.manual_seed(0)
+    with juice.set_block_size(16):
+        i = [inputs(v, num_node_blocks = 8 if v in (0, 1, 4, 5) else 1, dist = dists.Categorical(num_cats = 8))
+             for v in range(6)]
+        diag = torch.stack([torch.arange(8), torch.arange(8)])
+        Q0, Q1 = summate(i[0], num_node_blocks = 8, edge_ids = diag), summate(i[1], num_node_blocks = 8, edge_ids = diag)
+        R2, R3 = summate(i[2], num_node_blocks = 1), summate(i[3], num_node_blocks = 1)
+        B = summate(multiply(Q0, Q1), num_node_blocks = 1, block_size = 32)
+        A = summate(multiply(R2, R3), num_node_blocks = 1, block_size = 32)
+        Bt = B.duplicate(multiply(i[4], i[5]), tie_params = True)
+        root = summate(multiply(B, A, Bt), num_node_blocks = 1, block_size = 1)
+    root.init_parameters(perturbation = 2.0)
+    return juice.compile(root, verbose = False).to(DEV), 6, 8, B
+
+
+@cuda_only
+@pytest.mark.parametrize("mode", [None, "sparse"])
+def test_a_layer_of_more_backward_than_forward_partitions_is_planned_by_its_forward_ones(mode, monkeypatch):
+    """REGRESSION: the plan walked a layer's backward partitions, while the parameter flows are its forward
+    partitions' (`partitioned_pfids`): a layer of more backward than forward partitions raised (`partitioned_pfids[1]`,
+    AttributeError) at `flows_memory = 0` -- the block-sparse plan and a forced `mode`'s alike. The plan has one entry a
+    forward partition; the flows are the reference's."""
+    pc, V, C = _more_backward_partitions()
+    wide = [l for l in _sums(pc) if l.num_bk_partitions > l.num_fw_partitions]
+    assert wide, "a layer of more backward than forward partitions"
+    x = torch.randint(0, C, (64, V), device = DEV)
+    kw = {} if mode is None else dict(mode = mode)
+    ref = _reference(pc, x, monkeypatch, **kw)
+    _stale(pc)
+    got = _run(pc, x, **kw)
+    for l in wide:
+        assert len(l.__dict__["_pf_store_flags"]) == l.num_fw_partitions
+    assert torch.equal(got, ref)
+
+
+@cuda_only
+def test_a_tied_copy_below_a_layer_of_more_forward_than_backward_partitions_keeps_the_upper_flows(monkeypatch):
+    """REGRESSION: the plan walked a layer's backward partitions: of a layer with more forward ones it planned only the
+    first `num_bk_partitions` -- the others accumulated unseen, so a tied copy's partition in a lower layer, its slots
+    "untouched", STORED over the flows the upper copy had added (lost). Every forward partition is planned now; the
+    flows are the reference's."""
+    pc, V, C, B = _tied_below_more_forward_partitions()
+    assert all(l.num_bk_partitions <= l.num_fw_partitions for l in _sums(pc)), "(no layer the other mismatch)"
+    upper = [l for l in _sums(pc) if B in l.nodes][0]
+    assert upper.num_fw_partitions > upper.num_bk_partitions, (upper.num_fw_partitions, upper.num_bk_partitions)
+    pid = [p for p in range(upper.num_fw_partitions)
+           if bool(torch.isin(upper.partitioned_nids[p], torch.arange(B._output_ind_range[0], B._output_ind_range[1],
+                                                                      device = DEV)).any())]
+    assert pid and pid[0] >= upper.num_bk_partitions, "the upper copy past the backward partitions' count"
+    x = torch.randint(0, C, (64, V), device = DEV)
+    ref = _reference(pc, x, monkeypatch)
+    _stale(pc)
+    got = _run(pc, x)
+    assert torch.equal(got, ref)

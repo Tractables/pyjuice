@@ -3014,9 +3014,9 @@ class SumLayer(Layer, nn.Module):
         return TILE_SIZE_M, TILE_SIZE_K, TILE_SIZE_B
 
     def param_flow_slot_ranges(self, partition_id: int) -> np.ndarray:
-        """The `param_flows` slots a backward partition writes, as sorted disjoint `[start, end)` ranges (int64
-        [n, 2], host): every real edge block (child row not 0) writes the `block_size` slots from its `pfids` entry.
-        Computed once per partition."""
+        """The `param_flows` slots a parameter-flow partition (a forward one) writes, as sorted disjoint `[start, end)`
+        ranges (int64 [n, 2], host): every real edge block (child row not 0) writes the `block_size` slots from its
+        `pfids` entry. Computed once per partition."""
         cache = self.__dict__.setdefault("_pf_slot_ranges", {})
         ranges = cache.get(partition_id)
         if ranges is None:
@@ -3042,7 +3042,8 @@ class SumLayer(Layer, nn.Module):
 
     def param_flow_slot_plan(self, batch_size: int, pflow_temperature: float, propagation_alg: str, defer: bool,
                              mode = None):
-        """Per backward partition `(ranges, capable)`: the slots it writes (`param_flow_slot_ranges`) and whether its
+        """Per parameter-flow partition -- the forward's (`partitioned_pfids`: the parameter flows are computed over
+        them, `backward`) -- `(ranges, capable)`: the slots it writes (`param_flow_slot_ranges`) and whether its
         kernel can STORE them -- the pass's first writer of a slot then folds the buffer's reset into its write, and
         the circuit zeroes only what no storing writer covers (`TensorCircuit._plan_param_flow_stores`). Capable: the
         block-sparse regime (batch at least `_BLOCK_SPARSE_PAR_MIN_BATCH`; 16 with an external hook, which keeps the
@@ -3055,8 +3056,8 @@ class SumLayer(Layer, nn.Module):
         out = []
         alg_id = self.propagation_alg_mapping[propagation_alg]
         if getattr(self, "parameterization", None) is not None or (mode is not None and mode != "block_sparse"):
-            return [(self.param_flow_slot_ranges(p), False) for p in range(self.num_bk_partitions)]
-        for partition_id in range(self.num_bk_partitions):
+            return [(self.param_flow_slot_ranges(p), False) for p in range(self.num_fw_partitions)]
+        for partition_id in range(self.num_fw_partitions):
             ranges = self.param_flow_slot_ranges(partition_id)
             nids, cids, pids, pfids = (self.partitioned_nids[partition_id], self.partitioned_cids[partition_id],
                                        self.partitioned_pids[partition_id], self.partitioned_pfids[partition_id])
