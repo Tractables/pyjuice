@@ -120,6 +120,10 @@ CASES = [
     ("hmm1024_T9_two_slots", 1024, 1, 9, "fp32", 64, _slots_mb(1, 1024, 1024, 64, 2), 8),       # S = 2
     ("hmm1024_B608_two_slots_a_step", 1024, 1, 6, "bf16", 608, None, 5),       # W = 320, 2 slots a step
     ("hmm1024_B608_fp32_flushed", 1024, 1, 7, "fp32", 608, _slots_mb(1, 1024, 1024, 320, 5), 6),
+    # the deferral's own shapes, not the CUDA per-step kernel's (its `batch % 32`, `num_edges % 128`)
+    ("hmm1024_B16", 1024, 1, 8, "bf16", 16, None, 7),
+    ("hmm1024_fp32_B40", 1024, 1, 8, "fp32", 40, None, 7),
+    ("hmm1088x17_edges_in_64s", 1088, 17, 6, "bf16", 64, None, 5),
 ]
 
 
@@ -180,6 +184,35 @@ def test_what_keeps_the_per_step_kernels(label, monkeypatch):
         pc.backward(x, flows_memory = 0.0)
     torch.cuda.synchronize()
     assert steps == [], f"{label}: {len(steps)} steps deferred"
+
+
+@needs_kernels
+@pytest.mark.parametrize("L,nb,B", [(1024, 1, 16), (1024, 1, 40), (1088, 17, 64)])
+def test_where_only_the_deferrals_shapes_hold_the_per_step_kernel_is_the_triton_one(L, nb, B, monkeypatch):
+    """At a shape the deferral takes and the CUDA per-step kernel does not (a batch not a multiple of 32, edges in 64s
+    not 128s), a layer that does not defer -- an untied HMM's -- runs the Triton kernel (the CUDA one, which refuses
+    the shape, not even tried): its flows those of a circuit
+    whose CUDA path is off from the start, within the per-step kernels' rounding (each circuit's layers measure their
+    own kernel arms, so the two may compute in different ones: MEASURED 7e-4 of the max apart in a run beside other
+    tests' workers, 5e-7 alone)."""
+    from pyjuice.layer import sum_layer as SL
+    pc, x = _instance(L, nb, 6, "bf16", B, tied = False)
+    steps = _record(monkeypatch)
+    tried, real = [], SL.cuda_kernels.par_backward_sum
+    monkeypatch.setattr(SL.cuda_kernels, "par_backward_sum", lambda *a, **k: tried.append(1) or real(*a, **k))
+    pc(x)
+    pc.backward(x, flows_memory = 0.0)
+    torch.cuda.synchronize()
+    assert steps == [] and tried == []
+    got = pc.param_flows.clone()
+    monkeypatch.setattr(SL, "BACKWARD_PAR_FLOW_CUDA", False)
+    ref, _ = _instance(L, nb, 6, "bf16", B, tied = False)
+    ref(x)
+    ref.backward(x, flows_memory = 0.0)
+    torch.cuda.synchronize()
+    assert torch.isfinite(got).all()
+    d = float((got - ref.param_flows).abs().max() / ref.param_flows.abs().max())
+    assert d < 3e-3, f"the flows differ from the Triton kernels' by {d:.2e} of the max"
 
 
 @needs_kernels
