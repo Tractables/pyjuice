@@ -1,7 +1,8 @@
 """
 The forward of :class:`~pyjuice.parameterizations.low_rank.LowRank` (:class:`_ForwardMixin`, one of its bases): the
 forward: the circuit's fusion of the product layer below, the layer's pass -- the virtual batch (`.virtual`) where it
-serves, the torch passes of both forms else (`exp_sum` in chunks of samples).
+serves, the "exp_sum" form's fused kernels where they serve (`exp_sum_fused`), the torch passes of both forms else
+(`exp_sum` in chunks of samples).
 """
 
 from __future__ import annotations
@@ -14,6 +15,44 @@ from . import virtual as lowrank_virtual
 #: The most (sample, node, child) triples of one node vector the `exp_sum` passes hold at a time: a larger batch is
 #: taken in chunks of samples
 LOWRANK_CHUNK_CELLS = 1 << 25
+
+#: The "exp_sum" form's fused kernels (`kernels/c/lowrank_exp_sum.cu`: the scale made tile by tile, never stored) where
+#: they serve (`exp_sum_fused`); off, the torch passes
+EXP_SUM_FUSED = True
+#: ... up to this rank (the kernels' MMAs: ranks padded to 8, 16, 32 or 64)
+EXP_SUM_FUSED_RANK_MOST = 64
+#: The backward's samples split over this many CTAs a tile (0: as many as fill the GPU twice; F+ and W are then added
+#: atomically, a CTA holding them for its samples only)
+EXP_SUM_ZSPLIT = 0
+
+
+def exp_sum_bf16(kwargs) -> bool:
+    """The fused kernels' products in bf16 (the default precision) or three-term TF32 (`precision = "fp32"`)."""
+    return kwargs.get("precision", "auto") != "fp32"
+
+
+def exp_sum_module():
+    """The fused kernels' module, or None (no CUDA toolchain, a failed build: the torch passes)."""
+    from .kernels.c import get_exp_sum_module
+    return get_exp_sum_module()
+
+
+def exp_sum_fused(desc, geo, tensors, params, node_mars, element_mars) -> bool:
+    """Whether a node vector's pass goes through the "exp_sum" form's fused kernels: the form, a rank they hold, the
+    shared parameters block-major in one run (`LowRank._geometry`'s grid), the circuit's buffers fp32 on a GPU of
+    compute capability 8.0 on (the kernels' MMAs), the parameters fp32 or bf16, the staged factors fp32 and
+    contiguous, and the module built."""
+    if not (EXP_SUM_FUSED and desc.form == "exp_sum" and desc.rank <= EXP_SUM_FUSED_RANK_MOST
+            and geo["grid"] is not None and node_mars.is_cuda):
+        return False
+    if torch.cuda.get_device_capability(node_mars.device) < (8, 0):
+        return False
+    if node_mars.dtype != torch.float32 or element_mars.dtype != torch.float32 \
+            or params.dtype not in (torch.float32, torch.bfloat16):
+        return False
+    if not all(t.dtype == torch.float32 and t.is_contiguous() for t in tensors):
+        return False
+    return exp_sum_module() is not None
 
 
 class _ForwardMixin:
@@ -55,8 +94,15 @@ class _ForwardMixin:
 
         state = layer.__dict__["_lr_state"] = dict()
         for ns_info, tensors in ns_tensors:
-            A, Bm = self._as_given(tensors)
             geo = self._geometry(layer, ns_info, node_mars.device)
+            if exp_sum_fused(self, geo, tensors, params, node_mars, element_mars):
+                _, _, Nb, cbs, bs = geo["grid"]
+                lzs = exp_sum_module().exp_sum_forward(tensors[0], tensors[1], params, geo["p0"], Nb, cbs, bs,
+                                                       element_mars, geo["rows"], node_mars, ns_info.nid_start,
+                                                       geo["M"], geo["N"], self.rank, exp_sum_bf16(kwargs))
+                state[id(ns_info.ns)] = lzs.t()                 # (`[B, M]` as the torch passes keep it: a view)
+                continue
+            A, Bm = self._as_given(tensors)
             theta = self._dense_params(geo, params)
             lc = self._child_values(geo, element_mars)
 

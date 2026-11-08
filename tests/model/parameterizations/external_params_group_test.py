@@ -381,9 +381,10 @@ def _cats(factors):
 @pytest.mark.parametrize("form", ["sum_exp", "exp_sum"])
 def test_a_group_of_several_tensors_goes_in_one_launch_each_way(monkeypatch, form):
     """A member's slot is one run in every sample of the concatenated tensor: every slot of every member goes to the
-    buffer in one launch of the batched transpose, no view of a member made, and back to the caller's gradient tensors
-    the same way -- bit for bit what the per-node form stages and computes, through one PC. A backward with no
-    destinations after one with them writes nothing into them."""
+    buffer in one launch -- of the batched transpose where the storage puts the batch innermost ("sum_exp"), one
+    strided copy a slot where it is the caller's own layout ("exp_sum": `_group_strided`) --, no view of a member made,
+    and back to the caller's gradient tensors the same way -- bit for bit what the per-node form stages and computes,
+    through one PC. A backward with no destinations after one with them writes nothing into them."""
     dev, batch, T = torch.device("cuda:0"), 40, 4                  # (a batch not a multiple of 32)
     root, members = _lowrank_chain(T = T, form = form)
     pc = juice.compile(root, verbose = False).to(dev)
@@ -398,15 +399,18 @@ def test_a_group_of_several_tensors_goes_in_one_launch_each_way(monkeypatch, for
 
     calls = _counting_staging(monkeypatch)
     cats = _cats(factors)
+    one_launch = dict(batched = [2 * T] if form == "sum_exp" else [], copies = 0)    # (exp_sum: no per-node copies)
+    if form == "exp_sum":
+        assert pc._group_strided("tr", cats, batch, pc.external_params) is not None
     ll_g = pc(data, sum_external_params = {"tr": cats}).clone()
-    assert calls == dict(batched = [2 * T], copies = 0), calls
+    assert calls == one_launch, calls
     assert torch.equal(pc.external_params, staged_p) and torch.equal(ll_g, ll_p)
 
     calls.update(batched = [], copies = 0)
     grads = tuple(torch.full_like(c, float("nan")) for c in cats)
     pc.backward(data, flows_memory = 0.0, sum_external_params_grad = {"tr": grads})
     torch.cuda.synchronize()
-    assert calls == dict(batched = [2 * T], copies = 0), calls
+    assert calls == one_launch, calls
     for slot, got in enumerate(grads):
         assert torch.equal(got, torch.cat([g[slot] for g in grads_p], dim = 1)), f"slot {slot}"
     assert float(grads[0].abs().max()) > 0.0
@@ -448,13 +452,13 @@ def test_a_group_in_one_launch_at_other_batches_and_where_the_buffer_moved(monke
 @cuda_only
 def test_a_group_whose_members_differ_along_the_group_axis_in_one_launch(monkeypatch):
     """Members of different node counts: the runs have their own lengths, the grid spans the longest, the other
-    pair's extra blocks return."""
+    pair's extra blocks return (the batched transpose: a storage with the batch innermost, LowRank's "sum_exp")."""
     dev, batch, K, rank = torch.device("cuda:0"), 40, 8, 3
     torch.manual_seed(0)
     with juice.set_block_size(K):
         n = [inputs(v, num_node_blocks = 2, dist = dists.Categorical(num_cats = NUM_CATS)) for v in range(4)]
-        s0 = summate(multiply(n[0], n[1]), num_node_blocks = 1, parameterization = LowRank(rank = rank))
-        s1 = summate(multiply(n[2], n[3]), num_node_blocks = 3, parameterization = LowRank(rank = rank))
+        s0 = summate(multiply(n[0], n[1]), num_node_blocks = 1, parameterization = LowRank(rank = rank, form = "sum_exp"))
+        s1 = summate(multiply(n[2], n[3]), num_node_blocks = 3, parameterization = LowRank(rank = rank, form = "sum_exp"))
         top = multiply(s0, s1, edge_ids = torch.tensor([[0, 0], [0, 1], [0, 2]]))
         root = summate(top, num_node_blocks = 1, block_size = 1)
     torch.manual_seed(0)
@@ -525,8 +529,11 @@ class _CallersOrder(SumParameterization):
 
 
 @cuda_only
-def test_a_group_stored_in_the_callers_order_goes_the_per_node_way(monkeypatch):
-    """Only storage that is the caller's with the batch moved to the end is a transpose: any other stays a copy."""
+@pytest.mark.parametrize("order", ["buffer", "reversed"])
+def test_a_group_stored_in_the_callers_order_goes_as_one_strided_copy_a_slot(monkeypatch, order):
+    """Storage that is the caller's own layout: a group of members of one shape, their slots evenly spaced in the
+    buffer in the group's order, is one strided copy a slot (`_group_strided`: no batched transpose, no per-node
+    copies) -- the members named in the other order, the per-node way (one batched copy of every member's view)."""
     dev, batch = torch.device("cuda:0"), 40
     torch.manual_seed(0)
     with juice.set_block_size(8):
@@ -536,13 +543,17 @@ def test_a_group_stored_in_the_callers_order_goes_the_per_node_way(monkeypatch):
         root = summate(multiply(s1), num_node_blocks = 1, block_size = 1)
     root.init_parameters(perturbation = 2.0)
     pc = juice.compile(root, verbose = False).to(dev)
-    pc.register_external_params_group("two", [s0, s1])
+    members = [s0, s1]
+    _, ns2slots = pc._external_params_layout(batch)
+    if (ns2slots[s0][0][0] < ns2slots[s1][0][0]) != (order == "buffer"):
+        members = members[::-1]
+    pc.register_external_params_group("two", members)
     data = torch.randint(0, NUM_CATS, [batch, 3], device = dev)
-    factors = _factors([s0, s1], batch, dev, 3)
+    factors = _factors(members, batch, dev, 3)
     calls = _counting_staging(monkeypatch)
     pc(data, sum_external_params = {"two": _cats(factors)})
-    assert calls["batched"] == [] and calls["copies"] == 1, calls
-    for m, tensors in zip((s0, s1), factors):
+    assert calls["batched"] == [] and calls["copies"] == (0 if order == "buffer" else 1), calls
+    for m, tensors in zip(members, factors):
         for staged, t in zip(pc._staged_external_params[m], tensors):
             assert torch.equal(staged, t)
 

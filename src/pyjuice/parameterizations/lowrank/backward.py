@@ -9,6 +9,8 @@ from __future__ import annotations
 import torch
 
 from . import virtual as lowrank_virtual
+from . import forward as lowrank_forward
+from .forward import exp_sum_bf16, exp_sum_fused, exp_sum_module
 
 
 class _BackwardMixin:
@@ -58,6 +60,10 @@ class _BackwardMixin:
         want_denom = param_flows is not None and denom_param_flows is not None and self.apply_z_correction
 
         for (ns_info, tensors), grads, geo in zip(ns_tensors, ns_grad_tensors, geos):
+            denom = denom_param_flows if want_denom else None
+            if self._exp_sum_backward_fused(layer, ns_info, tensors, grads, geo, node_flows, element_flows, node_mars,
+                                            element_mars, params, param_flows, denom, exp_sum_bf16(kwargs)):
+                continue
             A, Bm = self._as_given(tensors)
             theta = self._dense_params(geo, params)
             lc = self._child_values(geo, element_mars)
@@ -79,11 +85,39 @@ class _BackwardMixin:
             if want_denom:
                 off = self._denom_offsets(layer)[id(ns_info.ns)][0]
                 self._scatter_add(geo, denom_param_flows, off, Fm)
-            if grads is not None:                                   # (the buffers as stored: batch innermost)
-                grads[0].add_(dA.permute(1, 2, 0))
-                grads[1].add_(dB.permute(1, 2, 0))
+            if grads is not None:                                   # (the buffers in the storage's layout)
+                gA, gB = self._to_stored(dA, dB)
+                grads[0].add_(gA)
+                grads[1].add_(gB)
 
         return None
+
+    def _exp_sum_backward_fused(self, layer, ns_info, tensors, grads, geo, node_flows, element_flows, node_mars,
+                                element_mars, params, param_flows, denom, bf16) -> bool:
+        """A node vector's backward through the "exp_sum" form's fused kernels, where they serve (`exp_sum_fused`, the
+        flow buffers fp32, the gradient buffers fp32 and contiguous): its element flows log-added into
+        `element_flows` (set to -inf by the caller), F+, W (with `denom`) and the gradients added into their buffers --
+        what the torch pass computes, without the `[B, M, N]` grids. False: nothing done."""
+        if not exp_sum_fused(self, geo, tensors, params, node_mars, element_mars):
+            return False
+        if node_flows.dtype != torch.float32 or element_flows.dtype != torch.float32:
+            return False
+        if grads is not None and not all(g.dtype == torch.float32 and g.is_contiguous() for g in grads):
+            return False
+        empty = torch.empty(0, dtype = torch.float32, device = node_flows.device)
+        off = geo["grid"][0]
+        _, _, Nb, cbs, bs = geo["grid"]
+        lz = layer._lr_state[id(ns_info.ns)]                    # [B, M] (the fused forward's: a view of [M, B])
+        exp_sum_module().exp_sum_backward(
+            tensors[0], tensors[1], params, geo["p0"], Nb, cbs, bs, element_mars, geo["rows"], node_flows, node_mars,
+            ns_info.nid_start, lz.t().contiguous(), element_flows,
+            param_flows if param_flows is not None else empty,
+            ns_info.ns._param_flow_range[0] + off if param_flows is not None else 0,
+            denom if denom is not None else empty,
+            self._denom_offsets(layer)[id(ns_info.ns)][0] + off if denom is not None else 0,
+            grads[0] if grads is not None else empty, grads[1] if grads is not None else empty,
+            geo["M"], geo["N"], self.rank, lowrank_forward.EXP_SUM_ZSPLIT, bf16)
+        return True
 
     @staticmethod
     def _log_ratio(a, b):

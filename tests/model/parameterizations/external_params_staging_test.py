@@ -521,16 +521,18 @@ def test_external_params_usage():
     assert torch.allclose(pc.get_external_params_grad(trans_ns)[0], U * 2.0)
 
 
-def test_lowrank_params_reaches_kernels():
+@pytest.mark.parametrize("form", ["exp_sum", "sum_exp"])
+def test_lowrank_params_reaches_kernels(form):
     """
-    The real parameterization is staged the same way, and its forward runs off the staged values.
+    The real parameterization is staged the same way, and its forward runs off the staged values -- "exp_sum" stores
+    the caller's tensors as they are, "sum_exp" with the batch innermost.
     """
 
     device = torch.device("cuda:0")
 
     batch_size = 8
 
-    pc, root_ns, trans_ns = _compiled(LowRank(rank = RANK))
+    pc, root_ns, trans_ns = _compiled(LowRank(rank = RANK, form = form))
 
     data = torch.randint(0, 5, [batch_size, 4]).to(device)
     torch.manual_seed(5)
@@ -544,14 +546,14 @@ def test_lowrank_params_reaches_kernels():
     assert torch.all(torch.isfinite(lls))
     assert float((lls - pc(data)).abs().max()) > 1e-3               # (the factors were read: not the plain values)
 
-    # ... from the staged values: this parameterization stores the caller's tensors with the batch innermost (its
-    # `storage_perm`), the staging copy's fast form
+    # ... from the staged values: "sum_exp" stores the caller's tensors with the batch innermost (its `storage_perm`),
+    # the staging copy's fast form; "exp_sum" as they are (its fused kernels take a sample's block whole)
     perm = trans_ns.parameterization.storage_perm()
-    assert perm == (1, 2, 0)
+    assert perm == ((1, 2, 0) if form == "sum_exp" else None)
     pc(data, sum_external_params = tensors)
     for ns, ns_tensors in tensors.items():
         for staged_tensor, tensor in zip(pc._staged_external_params[ns], ns_tensors):
-            assert torch.equal(staged_tensor, tensor.permute(*perm))
+            assert torch.equal(staged_tensor, tensor.permute(*perm) if perm is not None else tensor)
 
 
 if __name__ == "__main__":
@@ -565,7 +567,8 @@ if __name__ == "__main__":
     test_external_params_validation()
     test_external_params_partial_supply()
     test_external_params_usage()
-    test_lowrank_params_reaches_kernels()
+    for form in ["exp_sum", "sum_exp"]:
+        test_lowrank_params_reaches_kernels(form)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs a GPU")

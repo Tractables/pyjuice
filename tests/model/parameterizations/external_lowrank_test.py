@@ -16,6 +16,7 @@ from B's flows). Nothing of the descriptor's passes is shared with the reference
 """
 
 import pytest
+import math
 import torch
 
 import pyjuice as juice
@@ -220,9 +221,10 @@ STRUCTURES = dict(hmm_tied = lambda **kw: _hmm(tied = True, **kw),
                   fan_out = _fan_out)
 
 
-def _pair(name, form, seed = 0, prepare = None, **kw):
+def _pair(name, form, seed = 0, prepare = None, precision = "auto", **kw):
     """`(pc_a, sums_a, pc_b, sums_b)`: the circuit with factors and its plain twin, the same shared parameters.
-    `name`: a structure's, or its builder. `prepare(root)`: applied to both before they are compiled."""
+    `name`: a structure's, or its builder. `prepare(root)`: applied to both before they are compiled. `precision`:
+    both circuits'."""
     out = []
     for external in (True, False):
         torch.manual_seed(seed)
@@ -234,8 +236,8 @@ def _pair(name, form, seed = 0, prepare = None, **kw):
         out += [root, sums]
     root_a, sums_a, root_b, sums_b = out
     dev = torch.device("cuda:0")
-    pc_a = juice.compile(root_a, verbose = False).to(dev)
-    pc_b = juice.compile(root_b, verbose = False).to(dev)
+    pc_a = juice.compile(root_a, verbose = False, precision = precision).to(dev)
+    pc_b = juice.compile(root_b, verbose = False, precision = precision).to(dev)
     # The twin's other parameters are A's (tying changes what the same seed draws)
     for la, lb in zip(pc_a.input_layer_group.layers, pc_b.input_layer_group.layers):
         lb.params.copy_(la.params)
@@ -374,8 +376,11 @@ def _worst(a, b):
 @pytest.mark.parametrize("form", FORMS)
 @pytest.mark.parametrize("batch", [1, 5])
 def test_values_flows_and_gradients_are_the_materialized_circuits(name, form, batch):
+    # (exp_sum at `precision = "fp32"`: the semantics; its default precision's bf16 products against the torch passes
+    # in the fused tests below)
     rank = 3
-    pc_a, sums_a, pc_b, sums_b, root_a, root_b = _pair(name, form, rank = rank)
+    pc_a, sums_a, pc_b, sums_b, root_a, root_b = _pair(name, form, rank = rank,
+                                                       precision = "fp32" if form == "exp_sum" else "auto")
     dev = pc_a.params.device
     torch.manual_seed(1)
     data = torch.randint(0, NUM_CATS, (batch, pc_a.num_vars), device = dev)
@@ -678,7 +683,7 @@ GATE_T, GATE_L, GATE_BS = 5, 16, 4
 GATE_NK = GATE_L // GATE_BS
 
 
-def _gated_chain(desc):
+def _gated_chain(desc, precision = "auto"):
     """A tied HMM of 16 latents in blocks of 4, its transitions carrying `desc`, registered as the group "tr"."""
     torch.manual_seed(0)
     trans = []
@@ -695,7 +700,7 @@ def _gated_chain(desc):
         root = summate(cur, num_node_blocks = 1, block_size = 1)
     torch.manual_seed(0)
     root.init_parameters(perturbation = 2.0)
-    pc = juice.compile(root, verbose = False).to(torch.device("cuda:0"))
+    pc = juice.compile(root, verbose = False, precision = precision).to(torch.device("cuda:0"))
     pc.register_external_params_group("tr", trans[::-1])
     return pc, src
 
@@ -718,7 +723,8 @@ def test_a_blockscale_gate_as_factors_trains_as_blockscale(form, virtual, moment
     sample, so the same training -- the shared parameters after every Anemone step, with momentum too. The momentum
     is what tells how the denominator flow is kept: averaged over steps as `F-`, it carries the parameters of past
     steps (3e-2 from BlockScale's after 16 steps, measured); kept free of them, as BlockScale's is, it is the same
-    update. The gate's gradient is the factors', summed over a gate's children."""
+    update. The gate's gradient is the factors', summed over a gate's children. (exp_sum at `precision = "fp32"`: its
+    default precision's bf16 products are within their tolerance of the torch passes, not of BlockScale's gradient's.)"""
     import pyjuice.parameterizations.lowrank.virtual as lowrank_virtual
 
     if virtual and not _virtual_available():
@@ -726,7 +732,7 @@ def test_a_blockscale_gate_as_factors_trains_as_blockscale(form, virtual, moment
     monkeypatch.setattr(lowrank_virtual, "ENABLED", virtual)
     batch = 32
     pc_g, src_g = _gated_chain(BlockScale(block_size = GATE_BS, ch_block_size = GATE_BS))
-    pc_f, src_f = _gated_chain(LowRank(rank = GATE_NK, form = form))
+    pc_f, src_f = _gated_chain(LowRank(rank = GATE_NK, form = form), precision = "fp32" if form == "exp_sum" else "auto")
     assert torch.equal(pc_g.params, pc_f.params)
     dev = pc_g.params.device
     opts = [juice.optim.Anemone(pc, step_size = 0.5, momentum = momentum, niters_per_update = 1, pseudocount = 1e-6)
@@ -812,14 +818,25 @@ def _denominators(pc, sums):
     return torch.cat(out)
 
 
-def _same(x, y, rtol, atol):
+def _same(x, y, rtol, atol, grad_scale = None):
+    """Everything two runs left alike, to `(rtol, atol)`; the gradients, given `grad_scale`, to that share of their
+    largest entry instead (bf16 products: each term ~2^-8 off, the sums over children cancelling)."""
     for k in ("lls", "mars", "fp", "fm"):
         assert torch.allclose(x[k], y[k], rtol = rtol, atol = atol, equal_nan = True), \
             f"{k}: {float((x[k] - y[k])[torch.isfinite(x[k]) & torch.isfinite(y[k])].abs().max())}"
     assert torch.allclose(x["flows"].exp(), y["flows"].exp(), rtol = rtol, atol = atol), "node flows"
     for k in ("dA", "dB"):
         for a, b in zip(x[k], y[k]):
-            assert torch.allclose(a, b, rtol = rtol, atol = max(atol, 1e-6)), f"{k}: {float((a - b).abs().max())}"
+            if grad_scale is None:
+                assert torch.allclose(a, b, rtol = rtol, atol = max(atol, 1e-6)), f"{k}: {float((a - b).abs().max())}"
+            else:
+                worst, top = float((a - b).abs().max()), float(b.abs().max())
+                assert worst <= grad_scale * top + 1e-6, f"{k}: {worst} against {top}"
+
+
+#: The fused exp_sum kernels' tolerances against the torch passes: `precision = "fp32"` (three-term TF32) as fp32;
+#: the default (bf16 products) the same but for the gradients, a share of their largest entry
+FUSED_TOL = {"fp32": dict(rtol = 2e-4, atol = 2e-5), "auto": dict(rtol = 2e-4, atol = 2e-5, grad_scale = 2e-2)}
 
 
 @needs_virtual
@@ -2462,3 +2479,178 @@ def test_refusals():
     data = torch.randint(0, NUM_CATS, (2, pc_a.num_vars), device = dev)
     with pytest.raises(NotImplementedError, match = "Supply all"):
         pc_a(data, sum_external_params = {sums_a[0]: _factors(sums_a[0], 2, 2, dev)})
+
+
+# ---------------------------------------------------------------- "exp_sum" through its fused kernels
+
+def _fused_available():
+    from pyjuice.parameterizations.lowrank.kernels.c import get_exp_sum_module
+    return torch.cuda.is_available() and get_exp_sum_module() is not None
+
+
+needs_fused = pytest.mark.skipif(not _fused_available(), reason = "the exp_sum form's CUDA extension is not built")
+
+
+def _fused_calls(monkeypatch):
+    """Every call of the fused kernels from now on, by name (the module wrapped where both passes look it up)."""
+    import pyjuice.parameterizations.lowrank.forward as lr_forward
+    import pyjuice.parameterizations.lowrank.backward as lr_backward
+    real, calls = lr_forward.exp_sum_module(), []
+
+    class Spy:
+        def __getattr__(self, name):
+            fn = getattr(real, name)
+            return lambda *a, **k: calls.append(name) or fn(*a, **k)
+
+    spy = Spy()
+    monkeypatch.setattr(lr_forward, "exp_sum_module", lambda: spy)
+    monkeypatch.setattr(lr_backward, "exp_sum_module", lambda: spy)
+    return calls
+
+
+@needs_fused
+@pytest.mark.parametrize("precision", ["auto", "fp32"])
+@pytest.mark.parametrize("name", sorted(STRUCTURES))
+@pytest.mark.parametrize("rank,batch", [(1, 3), (3, 5), (4, 1), (8, 33), (16, 2), (24, 3), (64, 2)])
+def test_the_fused_exp_sum_is_the_torch_pass(name, rank, batch, precision, monkeypatch):
+    """`exp_sum` through its fused kernels against its torch passes: the same values, flows, denominators and
+    gradients (`FUSED_TOL`: bf16 products at the default precision, three-term TF32 at `"fp32"`), on every structure
+    -- the kernels taken for the node vectors whose parameters lie block-major in one run (`LowRank._geometry`'s grid),
+    the torch passes kept for the others."""
+    import pyjuice.parameterizations.lowrank.forward as lr_forward
+
+    pc, sums, _, _, _, _ = _pair(name, "exp_sum", rank = rank, precision = precision)
+    dev = pc.params.device
+    torch.manual_seed(9)
+    data = torch.randint(0, NUM_CATS, (batch, pc.num_vars), device = dev)
+    ext = {a: _factors(a, rank, batch, dev, seed = 50 + i) for i, a in enumerate(sums)}
+
+    calls = _fused_calls(monkeypatch)
+    got = _passes(pc, sums, data, ext)
+    gridded = 0                                            # (the node vectors whose parameters lie block-major)
+    for a in sums:
+        layer = pc.external_params_nodes[a]
+        desc = _source(a).parameterization
+        gridded += desc._geometry(layer, desc._info(layer, a), dev)["grid"] is not None
+    assert calls.count("exp_sum_forward") == gridded and calls.count("exp_sum_backward") == gridded, (calls, gridded)
+    monkeypatch.setattr(lr_forward, "EXP_SUM_FUSED", False)
+    del calls[:]
+    want = _passes(pc, sums, data, ext)
+    assert calls == []
+    _same(got, want, **FUSED_TOL[precision])
+
+    # Without parameter flows: the element flows and the gradients alone, nothing accumulated -- the gradients those
+    # of the run with them, to the bit (the same kernels' products and sums)
+    monkeypatch.setattr(lr_forward, "EXP_SUM_FUSED", True)
+    again = _passes(pc, sums, data, ext, param_flows = False)
+    assert float(again["fp"].abs().sum()) == 0.0 and float(pc.denom_param_flows.abs().sum()) == 0.0
+    assert torch.allclose(again["flows"].exp(), want["flows"].exp(), rtol = 2e-4, atol = 2e-5)
+    for k in ("dA", "dB"):
+        for a, b in zip(again[k], got[k]):
+            assert torch.allclose(a, b, rtol = 1e-5, atol = 1e-7)
+
+
+def _hmm_blocks(L, bs, T = 4):
+    """A tied HMM of `L` latents in blocks of `bs`, its transitions LowRank exp_sum's: the fused kernels' tiles (128
+    nodes by 32 children) many, ragged where `L` is not a multiple of them."""
+    def build(external, rank = 2, form = "exp_sum", **kw):
+        with juice.set_block_size(bs):
+            ni = inputs(T - 1, num_node_blocks = L // bs, dist = dists.Categorical(num_cats = NUM_CATS))
+            sums, cur = [], ni
+            for var in range(T - 2, -1, -1):
+                cx = ni.duplicate(var, tie_params = True)
+                ns = sums[0].duplicate(cur, tie_params = True) if sums and external else \
+                    summate(cur, num_node_blocks = L // bs, **_ext(external, rank, form, **kw))
+                sums.append(ns)
+                cur = multiply(cx, ns)
+            root = summate(cur, num_node_blocks = 1, block_size = 1)
+        return root, sums
+    return build
+
+
+@needs_fused
+@pytest.mark.parametrize("precision", ["auto", "fp32"])
+@pytest.mark.parametrize("L,bs,rank,batch,zsplit", [(160, 32, 3, 7, 0), (160, 32, 3, 7, 1), (300, 4, 16, 5, 0),
+                                                    (256, 64, 8, 33, 2), (72, 8, 4, 2, 0), (160, 32, 40, 3, 0),
+                                                    (256, 64, 33, 4, 1), (300, 4, 17, 2, 0)])
+def test_the_fused_exp_sum_on_many_tiles(L, bs, rank, batch, zsplit, precision, monkeypatch):
+    """The fused kernels where a node vector spans many of their tiles -- nodes past 64 and children past 32, ragged
+    where `L` is not a multiple of either, the forward's column tiles combined, the backward's partial sums over tiles
+    added, its samples split over CTAs (`EXP_SUM_ZSPLIT`: 0 the default, 1 none -- F+ and W added by the one CTA
+    holding them --, 2 two), ranks past 16 (40, 33, 17: padded to 32 and 64) -- against the torch passes, at both
+    precisions."""
+    import pyjuice.parameterizations.lowrank.forward as lr_forward
+
+    monkeypatch.setattr(lr_forward, "EXP_SUM_ZSPLIT", zsplit)
+    pc, sums, _, _, _, _ = _pair(_hmm_blocks(L, bs), "exp_sum", rank = rank, precision = precision)
+    dev = pc.params.device
+    torch.manual_seed(11)
+    data = torch.randint(0, NUM_CATS, (batch, pc.num_vars), device = dev)
+    ext = {a: _factors(a, rank, batch, dev, spread = 0.6, seed = 80 + i) for i, a in enumerate(sums)}
+    calls = _fused_calls(monkeypatch)
+    got = _passes(pc, sums, data, ext)
+    assert calls.count("exp_sum_forward") == len(sums) and calls.count("exp_sum_backward") == len(sums), calls
+    monkeypatch.setattr(lr_forward, "EXP_SUM_FUSED", False)
+    want = _passes(pc, sums, data, ext)
+    _same(got, want, **FUSED_TOL[precision])
+
+
+@needs_fused
+@pytest.mark.parametrize("precision", ["auto", "fp32"])
+@pytest.mark.parametrize("rank", [4, 24])
+def test_the_fused_exp_sum_reads_bf16_parameters(rank, precision, monkeypatch):
+    """A circuit whose parameters are bf16 (`param_dtype`): the fused kernels read them as the torch passes do (the
+    same values, widened) -- values, flows, denominators and gradients those of the torch passes."""
+    import pyjuice.parameterizations.lowrank.forward as lr_forward
+
+    torch.manual_seed(0)
+    root, sums = _hmm_blocks(160, 32)(external = True, rank = rank)
+    root.init_parameters(perturbation = 2.0)
+    pc = juice.compile(root, verbose = False, param_dtype = torch.bfloat16, precision = precision).to(torch.device("cuda:0"))
+    assert pc.params.dtype == torch.bfloat16
+    dev = pc.params.device
+    data = torch.randint(0, NUM_CATS, (6, pc.num_vars), device = dev)
+    ext = {a: _factors(a, rank, 6, dev, spread = 0.5, seed = 90 + i) for i, a in enumerate(sums)}
+    calls = _fused_calls(monkeypatch)
+    got = _passes(pc, sums, data, ext)
+    assert calls.count("exp_sum_forward") == len(sums) and calls.count("exp_sum_backward") == len(sums), calls
+    monkeypatch.setattr(lr_forward, "EXP_SUM_FUSED", False)
+    want = _passes(pc, sums, data, ext)
+    _same(got, want, **FUSED_TOL[precision])
+
+
+@needs_fused
+@pytest.mark.parametrize("precision", ["auto", "fp32"])
+@pytest.mark.parametrize("rank,batch", [(4, 3), (16, 4), (64, 2)])
+def test_the_fused_exp_sum_forward_far_below_its_shift(rank, batch, precision):
+    """The forward's S terms are Z's times the children's factors 2^(lc - mc), mc a tile's largest child value: where a
+    tile's large weights and large child values sit on different children -- rank 0 puts every other child's scale at
+    e^-95 (2^-137 of the node's largest term: flushed), every other child's value is 100 nats down (its factor
+    2^-144: flushed), so the factorized sum is 0 though S is not -- the tile is made again exactly under its own max (a
+    warp's vote). The node values and log Z against float64; the parameters all fp32 normal (the kernels flush
+    subnormals)."""
+    from pyjuice.parameterizations.lowrank.kernels.c import get_exp_sum_module
+    mod, dev = get_exp_sum_module(), torch.device("cuda:0")
+    M = N = 128
+    bs = cbs = 32
+    g = torch.Generator(device = "cpu").manual_seed(3)
+    A = 0.3 * torch.randn(batch, M, rank, generator = g)
+    Bm = 0.3 * torch.randn(batch, rank, N, generator = g)
+    A[:, :, 0] = 1.0                                       # (phi[i, j] = B[0, j] + the other ranks' small terms)
+    Bm[:, 0, 0::2] = -95.0
+    Bm[:, 0, 1::2] = 0.0
+    theta = torch.rand(M, N, generator = g).add_(0.05)
+    theta = theta / theta.sum(1, keepdim = True)
+    emars = -5.0 + torch.randn(N, batch, generator = g)
+    emars[1::2] -= 100.0
+    params = theta.view(M // bs, bs, N // cbs, cbs).permute(0, 2, 3, 1).contiguous().view(-1).to(dev)
+    nmars = torch.empty(M, batch, device = dev)
+    lzs = mod.exp_sum_forward(A.to(dev).contiguous(), Bm.to(dev).contiguous(), params, 0, N // cbs, cbs, bs,
+                              emars.to(dev).contiguous(), torch.arange(N, device = dev), nmars, 0, M, N, rank,
+                              precision != "fp32")
+    lw = torch.bmm(A.double(), Bm.double()) + theta.double().log()[None]
+    lz = torch.logsumexp(lw, 2)
+    ln = torch.logsumexp(lw + emars.t().double()[:, None, :], 2) - lz
+    worst = float((nmars.t().double().cpu() - ln).abs().max())
+    assert worst < 1e-3, worst
+    assert float((lzs.t().double().cpu() - lz).abs().max()) < 1e-3

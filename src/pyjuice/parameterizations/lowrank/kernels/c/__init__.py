@@ -46,3 +46,38 @@ def get_lowrank_module():
             "The low-rank mixture keeps its torch passes.", RuntimeWarning)
         _lowrank_module = None
     return _lowrank_module
+
+
+_exp_sum_module = None
+_exp_sum_attempted = False
+
+
+def get_exp_sum_module():
+    """The "exp_sum" form's fused passes (`lowrank_exp_sum.cu`: the scale made tile by tile, never stored), or None if
+    unavailable (warns once): the form then keeps its torch passes. Plain CUDA."""
+    global _exp_sum_module, _exp_sum_attempted
+
+    if _exp_sum_attempted:
+        return _exp_sum_module
+
+    _exp_sum_attempted = True
+
+    if not ENABLE_CUDA_KERNELS:
+        return None
+
+    flags = _compile_flags()
+    if flags is None:
+        return None
+
+    from pyjuice.utils.cuda_ext import jit_load
+    try:
+        _exp_sum_module = jit_load(
+            "pyjuice_lowrank_exp_sum_cuda",
+            sources = [os.path.join(_THIS_DIR, "lowrank_exp_sum.cu")],
+            extra_cuda_cflags = flags, verbose = False)
+    except Exception as e:
+        warnings.warn(
+            f"pyjuice CUDA kernel 'pyjuice_lowrank_exp_sum_cuda' failed to compile ({type(e).__name__}: {e}). "
+            "The low-rank exp_sum form keeps its torch passes.", RuntimeWarning)
+        _exp_sum_module = None
+    return _exp_sum_module

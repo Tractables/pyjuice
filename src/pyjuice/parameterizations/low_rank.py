@@ -64,9 +64,15 @@ class LowRank(_ForwardMixin, _BackwardMixin, _DenominatorsMixin, SumParameteriza
     low-rank scale built to equal a BlockScale gate, Anemone with momentum 0.9, parameters against BlockScale's
     after 16 steps 3e-2 apart that way, and the same to rounding this way and without momentum either way.
 
-    :note: the passes here are plain torch -- dense per node vector, `exp_sum` over `[B, M, N]` in chunks of samples,
-           `sum_exp` by float64 matmuls (a sample's child values spread over hundreds of nats, more than float32
-           holds beside one shift a sample). Correct on every structure; not yet kernels.
+    :note: the passes: `"exp_sum"` through its fused kernels (`lowrank/kernels/c/lowrank_exp_sum.cu`: the scale
+           made tile by tile on tensor cores and used where it is made, never stored) where a node vector's parameters
+           lie block-major in one run and the rank is at most 64 (`lowrank.forward.exp_sum_fused`) -- under the default
+           precision the factors' products in bf16 (`A B` from bf16 hi + lo, ~2^-16 of each product; the gradients'
+           products one bf16 term each), under `precision = "fp32"` in three-term TF32 (~fp32) --, `"sum_exp"` through
+           the plain sum-layer kernels on a virtual batch (`lowrank.virtual`) where it serves; elsewhere plain torch --
+           dense per node vector, `exp_sum` over `[B, M, N]` in chunks of samples, `sum_exp` by float64 matmuls (a
+           sample's child values spread over hundreds of nats, more than float32 holds beside one shift a sample).
+           Correct on every structure.
 
     :param rank: the rank `k`
     :type rank: int
@@ -144,13 +150,18 @@ class LowRank(_ForwardMixin, _BackwardMixin, _DenominatorsMixin, SumParameteriza
         return ((batch_size, ns.num_nodes, self.rank), (batch_size, self.rank, ns.num_ch_nodes))
 
     def storage_shapes(self, ns, batch_size: int):
-        """Stored with the batch innermost -- `A [M, K, B]`, `B [K, N, B]` --, as the circuit's own buffers are: the
-        kernels' threads run over the samples, and read consecutive addresses from every tensor alike. The staging
-        copy is the transpose (`storage_perm`), the gradients come back the same way."""
+        """`"exp_sum"`: stored as the caller gives them, `A [B, M, K]`, `B [B, K, N]` -- its fused kernels take a
+        sample's block whole (`lowrank/kernels/c/lowrank_exp_sum.cu`), and the staging copy is a plain copy, the
+        gradients added in the same layout. `"sum_exp"`: with the batch innermost -- `A [M, K, B]`, `B [K, N, B]` --,
+        as the circuit's own buffers are: its kernels' threads run over the samples and read consecutive addresses
+        from every tensor alike; the staging copy is the transpose (`storage_perm`), the gradients come back the same
+        way."""
+        if self.form == "exp_sum":
+            return self.tensor_shapes(ns, batch_size)
         return ((ns.num_nodes, self.rank, batch_size), (self.rank, ns.num_ch_nodes, batch_size))
 
     def storage_perm(self):
-        return (1, 2, 0)
+        return None if self.form == "exp_sum" else (1, 2, 0)
 
     def storage_offsets(self, ns):
         """Where an edge block's entries begin in each slot, in per-batch units (the layer's tables; the passes here
@@ -159,10 +170,18 @@ class LowRank(_ForwardMixin, _BackwardMixin, _DenominatorsMixin, SumParameteriza
         nb, cb = ns.edge_ids[0].long(), ns.edge_ids[1].long()
         return (nb * (ns.block_size * self.rank), cb * ns.ch_block_size)
 
-    @staticmethod
-    def _as_given(tensors):
-        """The staged `(A [M, K, B], B [K, N, B])` as the caller's `(A [B, M, K], B [B, K, N])`: views."""
+    def _as_given(self, tensors):
+        """The staged factors as the caller's `(A [B, M, K], B [B, K, N])`: themselves (`"exp_sum"`, stored so) or views
+        of the batch-innermost storage (`"sum_exp"`)."""
+        if self.form == "exp_sum":
+            return tensors[0], tensors[1]
         return tensors[0].permute(2, 0, 1), tensors[1].permute(2, 0, 1)
+
+    def _to_stored(self, dA, dB):
+        """The caller-layout gradients `(dA [B, M, K], dB [B, K, N])` in the storage's layout (views)."""
+        if self.form == "exp_sum":
+            return dA, dB
+        return dA.permute(1, 2, 0), dB.permute(1, 2, 0)
 
     def _geometry(self, layer, ns_info, device):
         """

@@ -159,6 +159,11 @@ class _ExternalParamsMixin:
         groups = self.__dict__.get("_external_grad_groups")
         if groups:
             for batched, rows, cats in groups:
+                if batched == "strided":                       # (`_group_strided`: a copy a slot, the other way round)
+                    for src, dst in self._group_strided(rows, cats, cats[0].size(0) if not torch.is_tensor(cats)
+                                                        else cats.size(0), self.external_params_grad):
+                        dst.copy_(src)
+                    continue
                 rows.launch(batched, cats, self.external_params_grad, to_buffer = False)
             self._external_grad_groups = None
 
@@ -514,6 +519,45 @@ class _ExternalParamsMixin:
                 return None
         return batched, rows, tensors
 
+    def _group_strided(self, name: str, tensors, batch_size: int, buffer: torch.Tensor):
+        """`[(the buffer's view, the caller's view)]`, a pair a slot, where the group's concatenated `tensors` go between
+        the caller and `buffer` as ONE strided copy a slot: its members stored as the caller gives them (no
+        `storage_perm`, the default `to_storage`), each its own slots, of one shape, their slots evenly spaced in the
+        buffer in the group's order (ascending) -- then a slot's members are `[T, B, n]` of the buffer (a stride a
+        member) and the concatenation's `[B, T, n]` permuted. Else None: the per-node path takes it."""
+        nodes, dim = self.external_params_groups[name]
+        if dim != 1 or len(nodes) < 2:
+            return None
+        for ns in nodes:
+            ep = ns.parameterization
+            if not (ep.storage_perm() is None and type(ep).to_storage is SumParameterization.to_storage
+                    and ep.storage_owner(ns) is ns):
+                return None
+        if torch.is_tensor(tensors):
+            tensors = (tensors,)
+        _, ns2slots = self._external_params_layout(batch_size)
+        shapes = ns2slots[nodes[0]]
+        if not isinstance(tensors, (tuple, list)) or len(tensors) != len(shapes):
+            return None
+        T, pairs = len(nodes), []
+        for slot, cat in enumerate(tensors):
+            off0, shape = shapes[slot]
+            if len(shape) < 2 or shape[0] != batch_size:
+                return None
+            if not all(tuple(ns2slots[ns][slot][1]) == tuple(shape) for ns in nodes):
+                return None
+            step = ns2slots[nodes[1]][slot][0] - off0
+            if step <= 0 or any(ns2slots[ns][slot][0] != off0 + k * step for k, ns in enumerate(nodes)):
+                return None                                    # (members not in the buffer's order, or not evenly)
+            want = (batch_size, T * shape[1]) + tuple(shape[2:])
+            if not (torch.is_tensor(cat) and cat.dtype == buffer.dtype and cat.device == buffer.device
+                    and cat.is_contiguous() and tuple(cat.size()) == want):
+                return None
+            per = math.prod(shape[1:])
+            pairs.append((buffer.as_strided((T, batch_size, per), (step, per, 1), off0),
+                          cat.view(batch_size, T, per).permute(1, 0, 2)))
+        return pairs
+
     def _expand_external_params_groups(self, ns2tensors: dict, batch_size: int) -> dict:
         """
         Replace every group-name key with one entry per member, holding a VIEW of the caller's tensor.
@@ -675,6 +719,13 @@ class _ExternalParamsMixin:
                 rows.launch(batched, cats, self.__dict__[name], to_buffer = True)
                 group_done.update(self.external_params_groups[key][0])
                 fast_keys.add(key)
+                continue
+            pairs = self._group_strided(key, tensors, batch_size, self.__dict__[name])
+            if pairs is not None:
+                for dst, src in pairs:
+                    dst.copy_(src)
+                group_done.update(self.external_params_groups[key][0])
+                fast_keys.add(key)
 
         # A group staged wholesale is dropped BEFORE the expansion: splitting it into T views and
         # validating each, only for the loop below to skip them, was most of what was left of the cost.
@@ -827,6 +878,9 @@ class _ExternalParamsMixin:
             if isinstance(key, str) and key in self.external_params_groups:
                 whole = self._group_batched(key, tensors, batch_size, self.external_params)    # (its device: the gradient
                                                                                                 # buffer is allocated next)
+                if whole is None and self._group_strided(key, tensors, batch_size, self.external_params) is not None:
+                    whole = ("strided", key, tensors)                                           # (the views: once the
+                                                                                                # buffer exists)
             if whole is None:
                 rest[key] = tensors
             else:
