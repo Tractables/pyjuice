@@ -908,6 +908,97 @@ def test_fused_em_correction_matches_the_torch_reference(block_size, n_blocks, c
     assert rel < 1e-5, f"fused M-step differs from the torch reference: relmax={rel}"
 
 
+class _Launches:
+    """A Triton kernel's launches counted (`kernel[grid](...)` through this)."""
+
+    def __init__(self, kernel):
+        self.kernel, self.n = kernel, 0
+
+    def __getitem__(self, grid):
+        self.n += 1
+        return self.kernel[grid]
+
+
+@cuda_only
+@pytest.mark.parametrize("path,dtype", [("kernels", torch.float32), ("torch", torch.float32),
+                                        ("kernels", torch.bfloat16), ("folded", torch.bfloat16),
+                                        ("torch", torch.bfloat16)],
+                         ids = ["kernels-fp32", "torch-fp32", "kernels-bf16", "folded-bf16", "torch-bf16"])
+@pytest.mark.parametrize("step_size", [1.0, 0.25])
+def test_a_node_no_flow_reached_keeps_its_parameters(path, dtype, step_size, monkeypatch):
+    """At pseudocount 0 the conditional M-step's ratio `F+ / F-` of a parameter no flow reached is 0 / 0: it keeps its
+    value, a ratio of 1. The root's parameters to two of the gated nodes are 0, so nothing reaches those: their
+    parameters come out as they were, renormalized -- the division's guard had made those ratios 0, and every
+    parameter of such a node 1e-30 at step size 1 --, every other node's the conditional update of its flows (a
+    float64 reference); the kernels and the torch passes alike, at fp32 and through the bf16 master copy -- its passes
+    beside the kernels' and folded into them (`kernels/dual_em_master.py`, `_fold_master`: a range past the L2,
+    forced here)."""
+    import pyjuice.parameterizations.blockscale.denominators as bsmod
+    import pyjuice.parameterizations.kernels.dual_em_master as dem
+    fused = path != "torch"
+    monkeypatch.setattr(bsmod, "_EM_FUSED", fused)
+    monkeypatch.setattr(SumParameterization, "_fold_master", staticmethod(lambda params, n: path == "folded"))
+    folds = [_Launches(dem._dual_em_cum_sync_kernel), _Launches(dem._dual_em_update_store_kernel)]
+    monkeypatch.setattr(dem, "_dual_em_cum_sync_kernel", folds[0])
+    monkeypatch.setattr(dem, "_dual_em_update_store_kernel", folds[1])
+    dev = torch.device("cuda:0")
+    root, ns = _build_shape(4, 3, 2)
+    pc = juice.compile(root, verbose = False, param_dtype = dtype).to(dev)
+    dead_nodes = torch.tensor([1, 7], device = dev)
+
+    # The root's parameters to the products over those two nodes 0 (product j is over node j of `ns`), renormalized
+    rs, re = root._param_range
+    child = (root.edge_ids[1].to(dev)[:, None] * root.ch_block_size
+             + torch.arange(root.ch_block_size, device = dev)[None, :]).reshape(-1)
+    with torch.no_grad():
+        rp = pc.params.data[rs:re].float()
+        rp[torch.isin(child, dead_nodes)] = 0.0
+        pc.params.data[rs:re] = (rp / rp.sum()).to(dtype)
+    B = 64
+    torch.manual_seed(3)
+    x = torch.randint(0, NUM_CATS, [B, 2], device = dev)
+    phi = _phi(ns, B, dev)
+    pc.init_param_flows(flows_memory = 0.0)
+    pc(x, sum_external_params = {ns: phi})
+    pc.backward(x, sum_external_params = {ns: phi}, logspace_flows = True, flows_memory = 0.0,
+                allow_modify_flows = False)
+
+    ps, pe = ns._param_range
+    pfs, pfe = ns._param_flow_range
+    E, cbs, bs = ns.edge_ids.size(1), ns.ch_block_size, ns.block_size
+    nodeof = (ns.edge_ids[0].to(dev)[:, None, None] * bs
+              + torch.arange(bs, device = dev)[None, None, :]).expand(E, cbs, bs).reshape(-1)
+    dead = torch.isin(nodeof, dead_nodes)
+    theta = pc._params_in_fp32()[ps:pe].clone()
+    fp, fm =pc.param_flows[pfs:pfe].clone(), _fminus(pc, ns)[pfs:pfe].clone()
+    assert bool((fp[dead] == 0).all() and (fm[dead] == 0).all()), "nothing should reach those nodes"
+    assert bool((fm[~dead] > 0).all())
+    sources = pc._denom_correction_nss()[ns]
+    ran = ns.parameterization._fused_em_correction(ns, pc._params_in_fp32(), pc.param_flows, pc.denom_param_flows,
+                                                   step_size, 0.0, False, sources)
+    assert (ran is not None) is fused                         # (the path under test is the one taken)
+
+    # The float64 reference: ratio F+ / F- (1 where 0 / 0), each node normalized as the M-step does it
+    t64, p64, m64 = theta.double(), fp.double(), fm.double()
+    ratio = torch.where((p64 == 0) & (m64 == 0), torch.ones_like(p64), p64 / m64.clamp_min(1e-300))
+    cum = torch.zeros(int(nodeof.max()) + 1, dtype = torch.float64, device = dev).index_add_(0, nodeof, t64 * ratio)
+    want = (t64 * ((1 - step_size) + step_size * ratio) / ((1 - step_size) + step_size * cum[nodeof])).clamp_min(1e-30)
+
+    pc.mini_batch_em(step_size = step_size, pseudocount = 0.0)
+    assert [f.n > 0 for f in folds] == [path == "folded"] * 2   # (the master copy's folded passes ran, or did not)
+    got = pc._params_in_fp32()[ps:pe].double()
+    assert torch.isfinite(got).all()
+    # those nodes' parameters as they were, renormalized (every ratio 1): at fp32, normalized to its rounding, the
+    # values they had; stored in bf16 their sums are 1 to bf16's rounding only, and the renormalization moves them so
+    assert torch.allclose(got[dead], want[dead], rtol = 1e-6, atol = 0), \
+        float(((got[dead] - want[dead]).abs() / want[dead]).max())
+    if dtype == torch.float32:
+        assert torch.allclose(got[dead], t64[dead], rtol = 1e-5, atol = 0), \
+            float(((got[dead] - t64[dead]).abs() / t64[dead]).max())
+    rel = float(((got - want).abs() / want).max())
+    assert rel < 1e-5, f"the update is {rel:.2e} from the float64 reference"
+
+
 @cuda_only
 def test_fused_em_correction_matches_reference_for_shared_layer_and_ties():
     """The two structural cases the per-shape test above cannot build: several gated `ns` in ONE layer

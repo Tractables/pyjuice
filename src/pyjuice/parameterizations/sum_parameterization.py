@@ -925,7 +925,11 @@ class SumParameterization():
 
         # ratio = (F+ + pc/K) / (F- + pc*theta) -- the MAP form (denominator `pc*theta`, not `pc`), so
         # a never-observed child floors instead of underflowing.
-        ratio = (Fp + pseudocount / K) / (Fm + pseudocount * theta).clamp_min(1e-38)
+        num, raw = Fp + pseudocount / K, Fm + pseudocount * theta
+        ratio = num / raw.clamp_min(1e-38)
+        # A parameter no flow reached, without a pseudocount (0 / 0), keeps its value: a ratio of 1 (the clamp gave it
+        # 0, and a node no flow reached 1e-30 for every parameter at step size 1)
+        ratio = torch.where((num == 0) & (raw == 0), torch.ones_like(ratio), ratio)
         flow = theta * ratio                                                # [E, cbs, bs]
 
         # cum[node block, m] = (1-s) + s * sum over the node's children of theta*ratio

@@ -72,7 +72,9 @@ class _LearningMixin:
         :param step_size: Step size - updated_params <- (1-step_size) * params + step_size * new_params
         :type step_size: float
 
-        :param pseudocount: a pseudo count added to the parameter flows
+        :param pseudocount: a pseudo count added to the parameter flows. At 0, a node no flow reached (its flows sum to
+            0, the update 0 / 0) keeps its parameters; the conditional dual-flow update takes such a parameter's ratio
+            `F+ / F-` as 1
         :type pseudocount: float
 
         :param keep_zero_params: if `True`, freeze exactly zero parameters; positive parameters are updated

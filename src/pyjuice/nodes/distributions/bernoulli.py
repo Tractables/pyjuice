@@ -95,9 +95,12 @@ class Bernoulli(Distribution):
         flow0 = tl.load(param_flows_ptr + s_pfids + 1, mask = mask, other = 0)
 
         param = tl.load(params_ptr + s_pids, mask = mask, other = 0)
-        updated_param = (flow1 + 0.5 * pseudocount) / (flow1 + flow0 + pseudocount)
+        den = flow1 + flow0 + pseudocount
+        updated_param = (flow1 + 0.5 * pseudocount) / den
 
         new_param = (1.0 - step_size) * param + step_size * updated_param
+        # A node no flow reached, without a pseudocount (0 / 0), keeps its parameter
+        new_param = tl.where(den == 0.0, param, new_param)
         tl.store(params_ptr + s_pids, new_param, mask = mask)
 
     def _get_constructor(self):

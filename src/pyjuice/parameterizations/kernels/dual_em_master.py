@@ -69,13 +69,17 @@ def _dual_em_cum_sync_kernel(mparams, stored, param_flows, denom, cum, cids, pid
         gidx = offs_edge // GROUP_CBS
         w = tl.load(denom + (nblock_id * BLOCK_SIZE_M + offs_node)[:,None] * n_groups + gidx[None,:],
                     mask = real[None,:] & (gidx < n_groups)[None,:], other = 0.0)
-        den = tl.maximum(theta * w + pseudocount * theta, tiny_den)
+        raw = theta * w + pseudocount * theta
     else:                                # DENOM_DENSE
         fm = tl.load(denom + (pf[None,:] + offs_node[:,None] - denom_base),
                      mask = real[None,:], other = 0.0)
-        den = tl.maximum(fm + pseudocount * theta, tiny_den)
+        raw = fm + pseudocount * theta
 
+    den = tl.maximum(raw, tiny_den)
     ratio = (fp + pseudocount / k) / den
+    # A parameter no flow reached, without a pseudocount (0 / 0), keeps its value: a ratio of 1 (the guard
+    # above gave it 0, and a node no flow reached 1e-30 for every parameter at step size 1)
+    ratio = tl.where((fp + pseudocount / k == 0.0) & (raw == 0.0), 1.0, ratio)
     acc = tl.sum(tl.where(real[None,:], theta * ratio, 0.0), axis = 1)          # [M]
 
     nid = tl.load(nids + nblock_id)
@@ -121,13 +125,17 @@ def _dual_em_update_store_kernel(mparams, stored, param_flows, denom, cum, out, 
         gidx = offs_edge // GROUP_CBS
         w = tl.load(denom + (nblock_id * BLOCK_SIZE_M + offs_node)[:,None] * n_groups + gidx[None,:],
                     mask = real[None,:] & (gidx < n_groups)[None,:], other = 0.0)
-        den = tl.maximum(theta * w + pseudocount * theta, tiny_den)
+        raw = theta * w + pseudocount * theta
     else:                                # DENOM_DENSE
         fm = tl.load(denom + (pf[None,:] + offs_node[:,None] - denom_base),
                      mask = real[None,:], other = 0.0)
-        den = tl.maximum(fm + pseudocount * theta, tiny_den)
+        raw = fm + pseudocount * theta
 
+    den = tl.maximum(raw, tiny_den)
     ratio = (fp + pseudocount / k) / den
+    # A parameter no flow reached, without a pseudocount (0 / 0), keeps its value: a ratio of 1 (the guard
+    # above gave it 0, and a node no flow reached 1e-30 for every parameter at step size 1)
+    ratio = tl.where((fp + pseudocount / k == 0.0) & (raw == 0.0), 1.0, ratio)
 
     nid = tl.load(nids + nblock_id)
     c = tl.load(cum + (nid + offs_node - cum_base))                            # [M]
