@@ -476,7 +476,7 @@ class SumParameterization():
 
         * `mode` -- `DENOM_DENSE` if `tensor[pfid - denom_base]` IS `F-`, or `DENOM_ROWGROUP` if
           `F-[n,c] = theta[n,c] * tensor[n, c // group_cbs]` (a per-(node, group-of-children) factor,
-          laid out `[rows * block_size, n_groups]`). See `kernels/dual_em.py`.
+          laid out `[rows * block_size, n_groups]`). See `pyjuice/optim/dual_flow/dual_em.py`.
         * `n_groups` / `group_cbs` -- the row-group geometry; `(0, 1)` when unused.
         * `denom_base` -- the `pfid` origin of `tensor` in dense mode; `0` when unused.
 
@@ -545,11 +545,11 @@ class SumParameterization():
     @staticmethod
     def _fold_master(params, n) -> bool:
         """Whether the fp32 master copy's check and store go into the update's own passes
-        (`kernels/dual_em_master.py`) for a range of `n` parameters: where its master copy is larger than the L2.
-        Below, the separate sync leaves the copy in the L2 for the update's first pass and the copy back reads it from
-        there, and the fused passes, reading the stored values too, are the slower (MEASURED: HMM-4096's 64 MB copy of
-        a 128 MB L2, 297 -> 309 us an M-step; HMM-6144's 144 MB 874 -> 776). A property of the device, not a timed
-        choice: every process makes the same one (the two orders' bits differ by ~1e-7)."""
+        (`pyjuice/optim/dual_flow/dual_em_master.py`) for a range of `n` parameters: where its master copy is larger
+        than the L2. Below, the separate sync leaves the copy in the L2 for the update's first pass and the copy back
+        reads it from there, and the fused passes, reading the stored values too, are the slower (MEASURED: HMM-4096's
+        64 MB copy of a 128 MB L2, 297 -> 309 us an M-step; HMM-6144's 144 MB 874 -> 776). A property of the device, not
+        a timed choice: every process makes the same one (the two orders' bits differ by ~1e-7)."""
         dev = params.device
         l2 = _L2_BYTES.get(dev)
         if l2 is None:
@@ -663,7 +663,7 @@ class SumParameterization():
         if a0.is_cuda and all(a.dtype == torch.float32 and a.is_contiguous() and a.shape == a0.shape
                               and a.device == a0.device and a.untyped_storage().data_ptr() == storage
                               for a in addends):
-            from .kernels.dual_em import _sum_slices_kernel
+            from pyjuice.optim.dual_flow.dual_em import _sum_slices_kernel
             from pyjuice.utils.util import device_scalars
 
             offs = tuple((a.data_ptr() - a0.data_ptr()) // a0.element_size() for a in addends)
@@ -696,16 +696,17 @@ class SumParameterization():
         kernels from whatever statistic was stored. A parameterization gets all of this by
         implementing that one method.
 
-        With `stored` (see :func:`compute_em_correction`), the two kernels of `kernels/dual_em_master.py`: the master
-        copy's check against the stored values in the first pass, the store back in the second. `rounded`: the
-        shared kernels' `ROUNDED` (`compute_em_correction`'s `_rounded`).
+        With `stored` (see :func:`compute_em_correction`), the two kernels of
+        `pyjuice/optim/dual_flow/dual_em_master.py`: the master copy's check against the stored values in the first
+        pass, the store back in the second. `rounded`: the shared kernels' `ROUNDED` (`compute_em_correction`'s
+        `_rounded`).
         """
         import triton
         if stored is None:
-            from .kernels.dual_em import _dual_em_cum_kernel, _dual_em_update_kernel
+            from pyjuice.optim.dual_flow.dual_em import _dual_em_cum_kernel, _dual_em_update_kernel
         else:
-            from .kernels.dual_em_master import _dual_em_cum_sync_kernel as _dual_em_cum_kernel
-            from .kernels.dual_em_master import _dual_em_update_store_kernel as _dual_em_update_kernel
+            from pyjuice.optim.dual_flow.dual_em_master import _dual_em_cum_sync_kernel as _dual_em_cum_kernel
+            from pyjuice.optim.dual_flow.dual_em_master import _dual_em_update_store_kernel as _dual_em_update_kernel
 
         sources = list(denom_sources)
         if len(sources) == 0:
@@ -744,7 +745,7 @@ class SumParameterization():
         # EVERY scalar the kernels use, fp32, on the DEVICE -- including the clamp thresholds. Triton
         # types a Python float KERNEL ARGUMENT as fp64, and a float LITERAL inside the kernel promotes
         # too, so either one silently turns the whole `den`/`ratio`/`new` chain into double precision.
-        # Order must match the `tl.load(consts + i)` offsets in `kernels/dual_em.py` and `kernels/dual_em_master.py`.
+        # Order must match the `tl.load(consts + i)` offsets in `optim/dual_flow/dual_em.py` and `dual_em_master.py`.
         # CACHED by value: every `ns` of one EM step uses the same step size and pseudocount, so
         # building this per `ns` was 15 host-to-device copies per step -- MEASURED 1007 -> 1185 us.
         ckey = (float(pseudocount), float(step_size), str(dev))

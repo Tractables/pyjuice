@@ -313,7 +313,7 @@ class _DenominatorsMixin:
         if not _EM_FUSED:
             return None                       # `PYJUICE_BLOCKSCALE_EM_FUSED=0` -> the generic path
 
-        from ..kernels.dual_em import DENOM_ROWGROUP
+        from pyjuice.optim.dual_flow.dual_em import DENOM_ROWGROUP
 
         _, _, n_gates = self.denom_gate_geometry(layer)[pid]
         gate_cbs = self.gate_sizes(layer.nodes[0])[1]

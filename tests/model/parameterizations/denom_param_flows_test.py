@@ -931,10 +931,10 @@ def test_a_node_no_flow_reached_keeps_its_parameters(path, dtype, step_size, mon
     parameters come out as they were, renormalized -- the division's guard had made those ratios 0, and every
     parameter of such a node 1e-30 at step size 1 --, every other node's the conditional update of its flows (a
     float64 reference); the kernels and the torch passes alike, at fp32 and through the bf16 master copy -- its passes
-    beside the kernels' and folded into them (`kernels/dual_em_master.py`, `_fold_master`: a range past the L2,
+    beside the kernels' and folded into them (`optim/dual_flow/dual_em_master.py`, `_fold_master`: a range past the L2,
     forced here)."""
     import pyjuice.parameterizations.blockscale.denominators as bsmod
-    import pyjuice.parameterizations.kernels.dual_em_master as dem
+    import pyjuice.optim.dual_flow.dual_em_master as dem
     fused = path != "torch"
     monkeypatch.setattr(bsmod, "_EM_FUSED", fused)
     monkeypatch.setattr(SumParameterization, "_fold_master", staticmethod(lambda params, n: path == "folded"))
@@ -2229,7 +2229,7 @@ class _DenseModeDescriptor(SumParameterization):
         return "DenseMode"
 
     def denom_kernel_spec(self, layer, denom_param_flows, pid):
-        from pyjuice.parameterizations.kernels.dual_em import DENOM_DENSE
+        from pyjuice.optim.dual_flow.dual_em import DENOM_DENSE
         return (DENOM_DENSE, self._fm, 0, 1, self._base)
 
     def materialize_denom_flows(self, ns, params, denom_param_flows, denom_sources, out = None):

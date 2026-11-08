@@ -1,5 +1,5 @@
 """
-The conditional dual-flow M-step (`kernels/dual_em.py`) for a circuit that stores its parameters below fp32 and
+The conditional dual-flow M-step (`dual_em.py` beside this file) for a circuit that stores its parameters below fp32 and
 updates their fp32 master copy (`pyjuice.model.backend.params_master`), with the copy's passes fused into its own:
 
   * `_dual_em_cum_sync_kernel`, the first pass: `theta` is the STORED value where that is no longer the master copy's
