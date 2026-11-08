@@ -150,13 +150,21 @@ def test_a_declined_tuning_allocates_no_benchmark_scratch():
     flow_bytes = max(pc.param_flows.numel(), pc.element_flows.numel()) * 4
 
     def peak_over(n = 4):
-        torch.cuda.synchronize()
-        torch.cuda.reset_peak_memory_stats()
-        base = torch.cuda.memory_allocated()
+        # The backward's peak alone, its forward run before each window: the forward's arms are tuned by timing, and
+        # a split pre-pass arm allocates its partials a launch (MEASURED here: 2.4-4.5 MB of peak in some runs, none
+        # in others -- c09d31df's tree as well) -- a buffer of the forward's, not the scratch this test is about
+        peak = 0
         for _ in range(n):
-            _backward(pc, x)
-        torch.cuda.synchronize()
-        return torch.cuda.max_memory_allocated() - base
+            pc.init_param_flows(flows_memory = 0.0)
+            pc(x, propagation_alg = "LL")
+            torch.cuda.synchronize()
+            torch.cuda.reset_peak_memory_stats()
+            base = torch.cuda.memory_allocated()
+            pc.backward(x, flows_memory = 1.0, allow_modify_flows = False, propagation_alg = "LL",
+                        logspace_flows = True)
+            torch.cuda.synchronize()
+            peak = max(peak, torch.cuda.max_memory_allocated() - base)
+        return peak
 
     was_enabled, cache = autotune.ENABLED, dict(autotune._CACHE)
     real_should_tune = autotune.should_tune
