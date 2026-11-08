@@ -28,7 +28,8 @@ A layer defers (`try_defer`) only when all of these hold, each checked, none ass
     the group's step is enough work -- at least
     `MIN_FLOWS` flows, or `MIN_FLOW_SAMPLES` flows x samples (a smaller step's backward is host-bound, and there
     the captures' launches cost more than the per-step kernels they replace);
-  * the slots fit `PAR_DEFER_MB` with room for two steps (a full group flushes and goes on).
+  * the slots fit their budget (`PAR_DEFER_MB`, at most `PAR_DEFER_SHARE` of the device's memory) with room for two
+    steps (a full group flushes and goes on).
 A group's slots belong to the scope that filled them: a new backward -- also after one that raised -- starts empty.
 A slot is at most 512 of a step's columns (its rows' scales its own): a batch past 512 takes `cps` slots a step.
 """
@@ -43,10 +44,18 @@ import torch
 from pyjuice.utils.deferred import current_scope
 
 #: The operand slots a group may hold (MB; device memory a deferring group keeps from its first backward on, up to 64
-#: slots). MEASURED (the training step, 128 -> 512 MB): HMM-8192 in 8 blocks, 7 steps, B 512 19.97 -> 13.00 ms (a
-#: 76 MB slot: at 128 MB no room for two, the group did not defer); HMM-4096 in 4 blocks B 512 (a 21 MB slot) 7 steps
-#: 4.091 -> 3.989 (one flush, not two), 15 steps 8.092 -> 7.996.
-PAR_DEFER_MB = 512
+#: slots), and at most `PAR_DEFER_SHARE` of the device's memory (a smaller GPU's budget its share of it). A slot holds a
+#: node block's children's operands for every node block -- a tied HMM's in blocks of 64 at 8192 states, 72 MB at 32
+#: columns, 140 MB at 64 --, so the budget sets how often a long chain flushes. MEASURED (the backward alone, one GPU
+#: no one else used, a tied HMM 32 x 8192, 31 steps, 512 -> 4096 MB): in blocks of 64, batch 64 16.80 -> 12.85 ms (3
+#: slots -> 29: 11 flushes -> 2), batch 32 16.24 -> 14.93; in blocks of 128, batch 64 10.18 -> 7.91, batch 32 13.15 ->
+#: 12.24; HMM-4096 in blocks of 64, batch 32 (18 MB slots: 2 flushes -> 1) 4.22 -> 4.07, batch 64 (35 MB: 3 -> 1) 3.16
+#: -> 3.21.
+#: Before (the training step, 128 -> 512 MB): HMM-8192 in 8 blocks, 7 steps, B 512 19.97 -> 13.00 ms (a 76 MB slot: at
+#: 128 MB no room for two, the group did not defer); HMM-4096 in 4 blocks B 512 (a 21 MB slot) 7 steps 4.091 -> 3.989
+#: (one flush, not two), 15 steps 8.092 -> 7.996.
+PAR_DEFER_MB = 4096
+PAR_DEFER_SHARE = 1 / 16
 
 #: The smallest group (flows per step) that defers on its flows alone -- the per-step kernels' read-add-write of the
 #: flow block, whatever the batch. The kernels win from ~1M flows (MEASURED with the TF32-operand
@@ -79,6 +88,16 @@ SIDE_TRIALS, SIDE_WARM, SIDE_MARGIN = 3, 3, 0.01
 
 # device index -> [the side stream, whether a capture was left on it since the last join]
 _SIDE = dict()
+
+
+@functools.lru_cache(maxsize = None)
+def _device_bytes(index: int) -> int:
+    return int(torch.cuda.get_device_properties(index).total_memory)
+
+
+def slot_budget(device) -> int:
+    """The bytes a group's slots may take on `device`: `PAR_DEFER_MB`, at most `PAR_DEFER_SHARE` of its memory."""
+    return int(min(PAR_DEFER_MB * 2 ** 20, PAR_DEFER_SHARE * _device_bytes(torch.device(device).index)))
 
 
 def join_side(device) -> None:
@@ -119,7 +138,7 @@ class _Group:
         self.cps = (Bp + 511) // 512                           # slots a step
         self.W = (Bp // 32 + self.cps - 1) // self.cps * 32    # a slot's columns, a multiple of 32 up to 512
         per_slot = nb * (blk + ne) * (self.W * 2 + 4)          # (fp16 values, a float scale a row)
-        self.S = int(min(64, (PAR_DEFER_MB * 2 ** 20) // per_slot)) // self.cps * self.cps
+        self.S = int(min(64, slot_budget(pf.device) // per_slot)) // self.cps * self.cps
         self.pfids, self.pids = pfids, pids
         self.bulk = _bulk_ok(pfids, pf)
         self.slots, self.scope, self.cfg = 0, None, None

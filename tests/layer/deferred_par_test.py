@@ -142,6 +142,26 @@ def test_the_deferred_flows_match_float64(name, L, nb, T, dt, B, mb, n, monkeypa
 
 
 @needs_kernels
+def test_the_slots_take_the_lesser_of_their_budget_and_a_share_of_the_device(monkeypatch):
+    """A group's slots fit `PAR_DEFER_MB`, and at most `PAR_DEFER_SHARE` of the device's memory (a smaller GPU's budget
+    its share): the lesser sets how many it holds -- here a slot of one node block of 64 nodes and 64 edges at 32
+    columns, 8704 bytes; the budgets half a slot past the counts."""
+    pf = torch.zeros(1 << 14, device = DEV)
+    pfids = (torch.arange(64, device = DEV) * 64).view(1, 64)
+    per_slot = (64 + 64) * (32 * 2 + 4)
+    total = torch.cuda.get_device_properties(DEV).total_memory
+    assert dpar.slot_budget(DEV) == min(4096 * 2 ** 20, int(total / 16))         # (the defaults)
+    monkeypatch.setattr(dpar, "PAR_DEFER_MB", 5.5 * per_slot / 2 ** 20)
+    monkeypatch.setattr(dpar, "PAR_DEFER_SHARE", 1.0)
+    g = dpar._Group(pfids, pfids.clone(), 1, 64, 64, 32, pf)
+    assert g.W == 32 and g.S == 5 and g.A.size(2) == 5 * 32                     # the MB the lesser
+    monkeypatch.setattr(dpar, "PAR_DEFER_MB", 4096)
+    monkeypatch.setattr(dpar, "PAR_DEFER_SHARE", 3.5 * per_slot / total)
+    g = dpar._Group(pfids, pfids.clone(), 1, 64, 64, 32, pf)
+    assert g.S == 3 and g.Bop.size(2) == 3 * 32                                 # the share the lesser
+
+
+@needs_kernels
 def test_it_accumulates_like_the_per_step_kernels(monkeypatch):
     """Flows left in the buffer (`flows_memory = 1`) are kept: two backwards give twice one."""
     pc, x = _instance(1024, 1, 6, "bf16", 64)
