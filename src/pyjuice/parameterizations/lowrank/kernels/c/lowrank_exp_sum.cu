@@ -26,7 +26,8 @@
 // terms' lw' and lc' apart by > 97 bits) is made again exactly, x' = lw' + lc' under its own max (a warp's vote). Each
 // warp writes its tiles' (max, sum) pairs; the combine folds the column tiles' into the node values and log Z.
 //
-// BACKWARD, bf16 (`bf_bw_kernel`): phi again from its own prologue's fragments (the forward keeps none), then in
+// BACKWARD, bf16, ranks 9 .. 64 (`bf_bw2_kernel`, below: tiles of 128 nodes x 64 children, persistent CTAs of 8 warps);
+// ranks to 8 (`bf_bw_kernel`): phi again from its own prologue's fragments (the forward keeps none), then in
 // registers: dA = G B^T -- G's accumulators ARE the m16n8k16 A operand (bf16 pairs), B^T phi's hi B fragments
 // transposed (`movmatrix`); dB^T = G^T A' over the CTA's 64 nodes -- each warp stages its G^T blocks (`movmatrix`)
 // and its A' fragments (phi's hi A fragments transposed) a sample parity, a barrier, then units (child m-tile, rank
@@ -819,6 +820,396 @@ __global__ void __launch_bounds__(128) bf_bw_kernel(
 }
 
 
+// ===================================== the bf16 backward on big tiles (`bf_bw2_kernel`, ranks 9 .. 64: padded 16, 32, 64)
+// A CTA of 8 warps works a tile of 128 nodes x 64 children -- a warp 16 nodes x the tile's 64 children (eight n-tiles)
+// -- over a run of (tile, sample) units: persistent, the units in tile-major order split evenly over the CTAs, so a
+// CTA's run spans a tile or two (theta, F+ and W in registers over a tile's samples, F+ and W added where the run leaves
+// the tile; a tile's theta loaded at its start, its log2 taken under the first sample's phi). A sample: B's fragments
+// (hi, lo: the tile's 64 children) staged in shared memory a sample ahead (cp.async), read by the 8 warps; A's from
+// global memory into each warp's registers (its own 16 nodes, one k-step ahead) -- the run's next tile's first stage and
+// A fragments fetched in the current tile's last sample. dA = G B^T over the tile's 64 children, all its rank tiles at
+// once (B^T: the staged hi fragments transposed), added through the warp's own shared rows in whole runs of a row's
+// ranks; dB^T = G^T A' over the tile's 128 nodes -- the 8 warps' G^T blocks and A' fragments (transposed) staged in the
+// MMA's operand order (one 16- / 8-byte load an operand), units (child m-tiles, rank tile) over the warps, a warp's
+// units interleaved and a short one's sum over the 8 node blocks split over partial accumulators (4 MMA chains a warp).
+// Two barriers a sample. The dA and dB partial sums (4 K (128 + 64) bytes a tile and sample) are its L2 traffic's
+// largest part: L2 takes adds at ~3 TB/s (loads ~6.3).
+constexpr int TM2 = 128, TN2 = 64, NW2 = 8;
+template <int KP> struct Bw2Geo {
+    static_assert(KP >= 16 && KP % 16 == 0, "the big tiles: padded ranks 16, 32, 64");
+    static constexpr int KS = KP / 16, NT = KP / 8;
+    static constexpr int SB = 2 * KS * 256;                    // words: a (sample, hi | lo) stage -- 2 jt x KS blocks
+    static constexpr int SA = NW2 * NT * 64;                   // A' hi fragments transposed: [warp][nt][2][32]
+    static constexpr int ST = NW2 * 16 * 32;                   // G^T blocks: [warp][2 nf + h][32]
+    static constexpr int SE = NW2 * TN2;                       // element flows: [warp][64]
+    static constexpr int PW = KP < 32 ? KP : 32;               // dA: a row's ranks a flush
+    static constexpr int SP = NW2 * 16 * (PW + 4);             // dA rows: [warp][node 16][PW + 4]
+    static constexpr int UM = 2 * NT >= NW2 ? 2 : 1;           // dB: m-tiles a unit (128-byte runs at 2)
+    static constexpr int UW = 16 * UM + 4;
+    static constexpr int SQ = NW2 * 8 * UW;                    // dB rows: [warp][rank 8][16 UM + 4]
+    static constexpr int MAIN = 4 * SB + SA + ST + SE + SP + SQ;
+    static constexpr int FLUSH = NW2 * 32 * 20;                // F+ / W: [warp][child 32][node 16 + 4], a half at a time
+    static constexpr int WORDS = MAIN > 4 * SB + FLUSH ? MAIN : 4 * SB + FLUSH;
+};
+
+template <int KP, typename TP, bool FLOWS, bool DENOM, bool GRADS>
+__global__ void __launch_bounds__(256, 1) bf_bw2_kernel(
+        const unsigned* __restrict__ AFh, const unsigned* __restrict__ AFl, const unsigned* __restrict__ BFh,
+        const unsigned* __restrict__ BFl, const TP* __restrict__ params, long p0, int Nb, int cbs, int bs,
+        const float* __restrict__ LU, const float* __restrict__ LC, float* __restrict__ ef, float* __restrict__ pflows,
+        long pf0, float* __restrict__ denom, long dn0, float* __restrict__ gA, float* __restrict__ gB, int M, int N,
+        int Mp, int Np, int K, int B, int nct, long units) {
+    using Gm = Bw2Geo<KP>;
+    constexpr int KS = Gm::KS, NT = Gm::NT, PW = Gm::PW, UM = Gm::UM, UW = Gm::UW;
+    extern __shared__ __align__(16) unsigned smw[];
+    unsigned* const sB = smw;                                  // [par][hi | lo][blk = jl KS + ks][half][lane][4]
+    unsigned* const sA = sB + 4 * Gm::SB;
+    unsigned* const sT = sA + Gm::SA;
+    float* const sE = reinterpret_cast<float*>(sT + Gm::ST);
+    float* const sP = sE + Gm::SE;
+    float* const sQ = sP + Gm::SP;
+    const int tid = threadIdx.x, lane = tid & 31, w = tid >> 5, g = lane >> 2, tq = lane & 3;
+    const long astr = (long)Mp * KP / 2, bstr = (long)Np * KP / 2;
+    const int njt = Np / BN;
+    const float2* lu0 = reinterpret_cast<const float2*>(LU);
+    const long u0 = (long)blockIdx.x * units / gridDim.x, u1 = (long)(blockIdx.x + 1) * units / gridDim.x;
+    // sample b's B fragments (hi and lo, child tile jcs's two 32-child blocks) into stage `par`, the lanes' two 16-byte
+    // halves apart (a warp's reads of one half conflict-free)
+    auto stage = [&](int b, int par, int jcs) {
+        constexpr int CH = 2 * KS * 64;                        // 16-byte chunks a (hi | lo) stage
+#pragma unroll
+        for (int q0 = 0; q0 < 2 * CH; q0 += 256) {
+            const int q = q0 + tid, hl = q / CH, r = q - hl * CH, blk = r >> 6, ln = (r >> 1) & 31, half = r & 1;
+            const unsigned* src = (hl ? BFl : BFh) + (long)b * bstr + ((long)2 * jcs * KS + blk) * 256 + ln * 8 + half * 4;
+            cp_async16(sB + (2 * par + hl) * Gm::SB + blk * 256 + half * 128 + ln * 4, src);
+        }
+        cp_async_commit();
+    };
+    // a warp's A fragments: k-step ks of sample b, row group rgs
+    uint4 nah, nal;
+    auto fetchA = [&](int b, int ks, int rgs) {
+        const long o = (long)b * astr + ((long)rgs * KS * 32 + lane) * 4 + ks * 128;
+        nah = __ldg(reinterpret_cast<const uint4*>(AFh + o));
+        nal = __ldg(reinterpret_cast<const uint4*>(AFl + o));
+    };
+    int pc = 0;                                                // the stage parity of the sample at hand
+    if (u0 < u1) {                                             // the run's first sample: its stage, its A fragments
+        const int t = (int)(u0 / B), b = (int)(u0 - (long)t * B), it = t / nct;
+        stage(b, 0, t - it * nct);
+        fetchA(b, 0, it * NW2 + w);
+    }
+#pragma unroll 1
+    for (long u = u0; u < u1;) {
+        const int t = (int)(u / B), b0 = (int)(u - (long)t * B);
+        const int b1 = (int)min((long)B, (long)b0 + (u1 - u));
+        u += b1 - b0;
+        const bool more = u < u1;                              // (the run's next tile: t + 1, from its sample 0)
+        const int it = t / nct, jc = t - it * nct;
+        const int i0 = it * TM2, j0 = jc * TN2, jt0 = 2 * jc;
+        const int rg = it * NW2 + w, rA = i0 + 16 * w + g, rB = rA + 8;
+        const int itn = (t + 1) / nct, jcn = (t + 1) - itn * nct, rgn = itn * NW2 + w;
+
+        // the tile's theta (its log2 taken under the first sample's phi), F+, W: element e = 4 nf + c -> row
+        // c & 2 ? rB : rA, child j0 + 8 nf + 2 tq + (c & 1)
+        float lt[32], fp[32], tw[32];
+#pragma unroll
+        for (int e = 0; e < 32; e++) {
+            const int nf = e >> 2, c = e & 3, i = c & 2 ? rB : rA, j = j0 + 8 * nf + 2 * tq + (c & 1);
+            lt[e] = (i < M && j < N) ? to_f(params[p0 + grid_at(i, j, Nb, cbs, bs)]) : 0.f;
+            fp[e] = 0.f;
+            tw[e] = 0.f;
+        }
+
+#pragma unroll 1
+        for (int b = b0; b < b1; b++, pc ^= 1) {
+            const int par = pc;
+            cp_async_wait<0>();
+            __syncthreads();                                   // [A] b's stage landed; b - 1's dB done (sA, sT, sE free)
+            if (b + 1 < b1) stage(b + 1, par ^ 1, jc);         // (its last readers: b - 1's phi and dA, before [A])
+            else if (more) stage(0, par ^ 1, jcn);             // (the next tile's first sample)
+            const unsigned* const sbh = sB + 2 * par * Gm::SB;
+            const unsigned* const sbl = sbh + Gm::SB;
+            const float2 tA = __ldg(lu0 + (long)b * Mp + rA), tB = __ldg(lu0 + (long)b * Mp + rB);
+            float lcv[16];                                     // lc' of children j0 + 8 nf + 2 tq + p at 2 nf + p
+#pragma unroll
+            for (int jl = 0; jl < 2; jl++) {
+                const float* lc0 = LC + ((long)b * njt + jt0 + jl) * 36 + tq * 8;
+                const float4 c0 = __ldg(reinterpret_cast<const float4*>(lc0));
+                const float4 c1 = __ldg(reinterpret_cast<const float4*>(lc0 + 4));
+                lcv[8 * jl + 0] = c0.x; lcv[8 * jl + 1] = c0.y; lcv[8 * jl + 2] = c0.z; lcv[8 * jl + 3] = c0.w;
+                lcv[8 * jl + 4] = c1.x; lcv[8 * jl + 5] = c1.y; lcv[8 * jl + 6] = c1.z; lcv[8 * jl + 7] = c1.w;
+            }
+            // ---- phi' (bf16 hi + lo): the warp's A fragments, the staged B fragments
+            float S[8][4];
+#pragma unroll
+            for (int nf = 0; nf < 8; nf++)
+#pragma unroll
+                for (int c = 0; c < 4; c++) S[nf][c] = 0.f;
+#pragma unroll
+            for (int ks = 0; ks < KS; ks++) {
+                const uint4 xh = nah, xl = nal;
+                if (ks + 1 < KS) fetchA(b, ks + 1, rg);
+                else if (b + 1 < b1) fetchA(b + 1, 0, rg);
+                else if (more) fetchA(0, 0, rgn);
+                const unsigned ah[4] = {xh.x, xh.y, xh.z, xh.w}, al[4] = {xl.x, xl.y, xl.z, xl.w};
+                if (GRADS) {                                   // dB's A' operand: the warp's hi fragments transposed
+#pragma unroll
+                    for (int r = 0; r < 2; r++)
+                        reinterpret_cast<uint2*>(sA)[(w * NT + 2 * ks + r) * 32 + lane] =
+                            make_uint2(movt(ah[2 * r]), movt(ah[2 * r + 1]));
+                }
+#pragma unroll
+                for (int jl = 0; jl < 2; jl++) {
+                    const uint4* bp = reinterpret_cast<const uint4*>(sbh + (jl * KS + ks) * 256) + lane;
+                    const uint4* lp = reinterpret_cast<const uint4*>(sbl + (jl * KS + ks) * 256) + lane;
+                    const uint4 h0 = bp[0], h1 = bp[32], l0 = lp[0], l1 = lp[32];
+                    const unsigned bh[8] = {h0.x, h0.y, h0.z, h0.w, h1.x, h1.y, h1.z, h1.w};
+                    const unsigned bl[8] = {l0.x, l0.y, l0.z, l0.w, l1.x, l1.y, l1.z, l1.w};
+#pragma unroll
+                    for (int q = 0; q < 4; q++) {
+                        mma_bf16_k16(S[4 * jl + q], al[0], al[1], al[2], al[3], bh[2 * q], bh[2 * q + 1]);
+                        mma_bf16_k16(S[4 * jl + q], ah[0], ah[1], ah[2], ah[3], bl[2 * q], bl[2 * q + 1]);
+                        mma_bf16_k16(S[4 * jl + q], ah[0], ah[1], ah[2], ah[3], bh[2 * q], bh[2 * q + 1]);
+                    }
+                }
+            }
+            if (b == b0) {                                     // (theta's loads under the first phi)
+#pragma unroll
+                for (int e = 0; e < 32; e++) lt[e] = lt[e] > 0.f ? __log2f(lt[e]) : NEG;
+            }
+            // ---- the element terms: q = 2^(lw' + lu' + lc'), t = 2^(lw' + lv')
+            unsigned R[8][2];                                  // (q - t) as bf16 pairs: (n-tile, node half)
+            float v[16];                                       // q over the lane's two rows, its children 2 nf + p
+#pragma unroll
+            for (int nf = 0; nf < 8; nf++) {
+                float gq[4], qq[4];
+#pragma unroll
+                for (int c = 0; c < 4; c++) {
+                    const float lw = S[nf][c] + lt[4 * nf + c];
+                    const float q = exp2f(lw + (c & 2 ? tB.x : tA.x) + lcv[2 * nf + (c & 1)]);
+                    const float tt = exp2f(lw + (c & 2 ? tB.y : tA.y));
+                    if (FLOWS) fp[4 * nf + c] += q;
+                    if (DENOM) tw[4 * nf + c] += tt;
+                    qq[c] = q;
+                    gq[c] = q - tt;
+                }
+                v[2 * nf] = qq[0] + qq[2];
+                v[2 * nf + 1] = qq[1] + qq[3];
+                R[nf][0] = pack_bf16(gq[0], gq[1]);
+                R[nf][1] = pack_bf16(gq[2], gq[3]);
+            }
+            // ---- the element flows: each child's sum over the warp's 16 nodes, a reduce-scatter over the 8 lanes of a tq
+            {
+                const bool h2 = g & 4, h1 = g & 2, h0 = g & 1;
+                float u8[8], u4[4], u2[2];
+#pragma unroll
+                for (int m = 0; m < 8; m++) {
+                    const float send = h2 ? v[m] : v[m + 8], keep = h2 ? v[m + 8] : v[m];
+                    u8[m] = keep + __shfl_xor_sync(0xffffffffu, send, 16);
+                }
+#pragma unroll
+                for (int m = 0; m < 4; m++) {
+                    const float send = h1 ? u8[m] : u8[m + 4], keep = h1 ? u8[m + 4] : u8[m];
+                    u4[m] = keep + __shfl_xor_sync(0xffffffffu, send, 8);
+                }
+#pragma unroll
+                for (int m = 0; m < 2; m++) {
+                    const float send = h0 ? u4[m] : u4[m + 2], keep = h0 ? u4[m + 2] : u4[m];
+                    u2[m] = keep + __shfl_xor_sync(0xffffffffu, send, 4);
+                }
+                const int base = (h2 ? 8 : 0) + (h1 ? 4 : 0) + (h0 ? 2 : 0);   // v's indices this lane holds: base, + 1
+#pragma unroll
+                for (int m = 0; m < 2; m++) {
+                    const int idx = base + m;
+                    sE[w * TN2 + 8 * (idx >> 1) + 2 * tq + (idx & 1)] = u2[m];
+                }
+            }
+            if (GRADS) {
+                // ---- dA += G B^T over the tile's 64 children: the A operand (k16 over children 16 kk ..) R[2 kk][0],
+                // R[2 kk][1], R[2 kk + 1][0], R[2 kk + 1][1]; B^T the staged hi fragments transposed
+                float* const pw = sP + w * 16 * (PW + 4);
+                // all NT rank tiles at once (independent accumulators); k16 over children 16 kk .. -- B^T from the
+                // staged hi fragments of block (kk / 2, ks), half kk & 1: words r (rank tile 2 ks + r: b0) and 2 + r (b1)
+                float dd[NT][4];
+#pragma unroll
+                for (int nt = 0; nt < NT; nt++)
+#pragma unroll
+                    for (int c = 0; c < 4; c++) dd[nt][c] = 0.f;
+#pragma unroll
+                for (int kk = 0; kk < 4; kk++) {
+#pragma unroll
+                    for (int ks = 0; ks < KS; ks++) {
+                        const uint4 hw = reinterpret_cast<const uint4*>(sbh + ((kk >> 1) * KS + ks) * 256)[(kk & 1) * 32 + lane];
+                        const unsigned m0 = movt(hw.x), m1 = movt(hw.y), m2 = movt(hw.z), m3 = movt(hw.w);
+                        mma_bf16_k16(dd[2 * ks], R[2 * kk][0], R[2 * kk][1], R[2 * kk + 1][0], R[2 * kk + 1][1], m0, m2);
+                        mma_bf16_k16(dd[2 * ks + 1], R[2 * kk][0], R[2 * kk][1], R[2 * kk + 1][0], R[2 * kk + 1][1], m1, m3);
+                    }
+                }
+#pragma unroll
+                for (int f0 = 0; f0 < NT; f0 += PW / 8) {       // the rows' ranks 8 f0 .. 8 f0 + PW: whole runs a row
+#pragma unroll
+                    for (int nt = f0; nt < f0 + PW / 8; nt++) {   // (nodes g / g + 8, ranks 8 nt + 2 tq, + 1)
+                        const int col = (8 * nt) % PW + 2 * tq;
+                        *reinterpret_cast<float2*>(pw + g * (PW + 4) + col) = make_float2(dd[nt][0], dd[nt][1]);
+                        *reinterpret_cast<float2*>(pw + (g + 8) * (PW + 4) + col) = make_float2(dd[nt][2], dd[nt][3]);
+                    }
+                    {
+                        __syncwarp();
+                        constexpr int LPR = PW / 4, RPI = 32 / LPR;     // lanes a row, rows an instruction
+                        const int k0 = 8 * f0, rr = lane / LPR, c4 = 4 * (lane % LPR), k = k0 + c4;
+#pragma unroll
+                        for (int r0 = 0; r0 < 16; r0 += RPI) {
+                            const int row = r0 + rr, i = i0 + 16 * w + row;
+                            const float4 val = *reinterpret_cast<const float4*>(pw + row * (PW + 4) + c4);
+                            if (i < M && k < K) {
+                                float* p = gA + ((long)b * M + i) * K + k;
+                                if (k + 3 < K && (reinterpret_cast<unsigned long>(p) & 15) == 0) red4(p, val);
+                                else {
+                                    red1(p, val.x);
+                                    if (k + 1 < K) red1(p + 1, val.y);
+                                    if (k + 2 < K) red1(p + 2, val.z);
+                                    if (k + 3 < K) red1(p + 3, val.w);
+                                }
+                            }
+                        }
+                        __syncwarp();
+                    }
+                }
+                // ---- dB's G^T blocks (child g, nodes 2 tq ..), a child m-tile's four in the A operand's order
+#pragma unroll
+                for (int mt = 0; mt < 4; mt++)
+                    reinterpret_cast<uint4*>(sT)[(w * 4 + mt) * 32 + lane] =
+                        make_uint4(movt(R[2 * mt][0]), movt(R[2 * mt + 1][0]), movt(R[2 * mt][1]), movt(R[2 * mt + 1][1]));
+            }
+            __syncthreads();                                   // [B] the 8 warps' sA, sT, sE of sample b written
+            if (tid < TN2) {                                   // the element flows: the 8 warps' sums, one add
+                float s = 0.f;
+#pragma unroll
+                for (int ww = 0; ww < NW2; ww++) s += sE[ww * TN2 + tid];
+                if (s != 0.f && j0 + tid < N) red1(ef + (long)b * Np + j0 + tid, s);
+            }
+            if (GRADS) {
+                // ---- dB^T += G^T A' over the tile's 128 nodes (the 8 warps' blocks as k-steps): units (UM m-tiles,
+                // rank tile nt) over the warps
+                constexpr int MG = 4 / UM, NU = MG * NT;
+                constexpr int UPW = NU > 0 ? (NU + NW2 - 1) / NW2 : 1, CHN = UPW * UM, KSPL = CHN >= 4 ? 1 : 4 / CHN;
+                static_assert(NU % NW2 == 0 || NU == 0, "dB's units: a whole number a warp");
+                float* const qw = sQ + w * 8 * UW;
+                float dq[UPW][UM][KSPL][4];
+#pragma unroll
+                for (int uu = 0; uu < UPW; uu++)
+#pragma unroll
+                    for (int m = 0; m < UM; m++)
+#pragma unroll
+                        for (int h = 0; h < KSPL; h++)
+#pragma unroll
+                            for (int c = 0; c < 4; c++) dq[uu][m][h][c] = 0.f;
+                if (NU > 0) {
+#pragma unroll
+                    for (int kw = 0; kw < NW2; kw++) {
+#pragma unroll
+                        for (int uu = 0; uu < UPW; uu++) {
+                            const int un = w + NW2 * uu, mg = un % MG, nt = un / MG;
+                            const uint2 bb = reinterpret_cast<const uint2*>(sA)[(kw * NT + nt) * 32 + lane];
+#pragma unroll
+                            for (int m = 0; m < UM; m++) {
+                                const uint4 aa = reinterpret_cast<const uint4*>(sT)[(kw * 4 + UM * mg + m) * 32 + lane];
+                                mma_bf16_k16(dq[uu][m][kw % KSPL], aa.x, aa.y, aa.z, aa.w, bb.x, bb.y);
+                            }
+                        }
+                    }
+                }
+#pragma unroll
+                for (int uu = 0; uu < (NU > 0 ? UPW : 0); uu++) {
+                    const int un = w + NW2 * uu, mg = un % MG, nt = un / MG;
+                    float d[UM][4];
+#pragma unroll
+                    for (int m = 0; m < UM; m++)
+#pragma unroll
+                        for (int c = 0; c < 4; c++) {
+                            float a = dq[uu][m][0][c];
+#pragma unroll
+                            for (int h = 1; h < KSPL; h++) a += dq[uu][m][h][c];
+                            d[m][c] = a;
+                        }
+                    // (children 16 mt + g / + 8, ranks 8 nt + 2 tq, + 1; A' carried log2 e) through the warp's rows
+#pragma unroll
+                    for (int m = 0; m < UM; m++) {
+                        qw[(2 * tq) * UW + 16 * m + g] = d[m][0] * LN2;
+                        qw[(2 * tq + 1) * UW + 16 * m + g] = d[m][1] * LN2;
+                        qw[(2 * tq) * UW + 16 * m + g + 8] = d[m][2] * LN2;
+                        qw[(2 * tq + 1) * UW + 16 * m + g + 8] = d[m][3] * LN2;
+                    }
+                    __syncwarp();
+                    constexpr int LPR = 4 * UM, RPI = 32 / LPR;      // lanes a rank's row, rows an instruction
+                    const int rr = lane / LPR, c4 = 4 * (lane % LPR), jc4 = j0 + 16 * UM * mg + c4;
+#pragma unroll
+                    for (int r0 = 0; r0 < 8; r0 += RPI) {
+                        const int rk = r0 + rr, k = 8 * nt + rk;
+                        const float4 val = *reinterpret_cast<const float4*>(qw + rk * UW + c4);
+                        if (k < K) {
+                            float* p = gB + ((long)b * K + k) * N + jc4;
+                            if (jc4 + 3 < N && (reinterpret_cast<unsigned long>(p) & 15) == 0) red4(p, val);
+                            else {
+                                if (jc4 < N) red1(p, val.x);
+                                if (jc4 + 1 < N) red1(p + 1, val.y);
+                                if (jc4 + 2 < N) red1(p + 2, val.z);
+                                if (jc4 + 3 < N) red1(p + 3, val.w);
+                            }
+                        }
+                    }
+                    __syncwarp();
+                }
+            }
+        }
+        // F+ and W of the warp's 16 x 64 cells, half the children at a time through its own shared rows (past the B
+        // stages: the next tile's first lands meanwhile): a lane four consecutive nodes of a child, one 16-byte add
+        // (scalar adds where the node blocks are under 4 or the runs unaligned)
+        if (FLOWS || DENOM) {
+            __syncthreads();                                   // (every warp's last reads of the stages done)
+            float* const st = reinterpret_cast<float*>(smw + 4 * Gm::SB) + w * (32 * 20);   // [child 32][node 16 + 4]
+            const bool vec = (bs & 3) == 0 && ((pf0 | dn0) & 3) == 0;
+#pragma unroll
+            for (int pass = 0; pass < 2; pass++) {
+                if ((pass == 0 && !FLOWS) || (pass == 1 && !DENOM)) continue;
+                float* const dst = pass == 0 ? pflows + pf0 : denom + dn0;
+#pragma unroll
+                for (int hh = 0; hh < 2; hh++) {
+#pragma unroll
+                    for (int e4 = 0; e4 < 16; e4++) {
+                        const int e = 16 * hh + e4, nf = e >> 2, c = e & 3;
+                        float val = pass == 0 ? fp[e] : tw[e];
+                        if (pass == 1) {
+                            const float th = exp2f(lt[e]);
+                            val = th > 0.f ? val / th : 0.f;
+                        }
+                        st[(8 * (nf - 4 * hh) + 2 * tq + (c & 1)) * 20 + g + 8 * (c >> 1)] = val;
+                    }
+                    __syncwarp();
+#pragma unroll
+                    for (int uu = 0; uu < 4; uu++) {           // (8 children an instruction, 4 lanes a child)
+                        const int col = 8 * uu + (lane >> 2), r4 = 4 * (lane & 3), i = i0 + 16 * w + r4;
+                        const int j = j0 + 32 * hh + col;
+                        const float4 vv = *reinterpret_cast<const float4*>(st + col * 20 + r4);
+                        if (j >= N || i >= M) continue;
+                        const long o = grid_at(i, j, Nb, cbs, bs);
+                        if (vec && i + 3 < M) {
+                            if (vv.x != 0.f || vv.y != 0.f || vv.z != 0.f || vv.w != 0.f) red4(dst + o, vv);
+                        } else {
+                            const float v4[4] = {vv.x, vv.y, vv.z, vv.w};
+#pragma unroll
+                            for (int q = 0; q < 4; q++)
+                                if (i + q < M && v4[q] != 0.f) red1(dst + grid_at(i + q, j, Nb, cbs, bs), v4[q]);
+                        }
+                    }
+                    __syncwarp();
+                }
+            }
+        }
+        __syncthreads();                                       // (the stages reused by the run's next tile)
+    }
+}
+
 // ======================================================================= TF32 products, three terms ("fp32")
 template <int KP> struct Fw3Geo {
     static constexpr bool K4 = KP == 4;
@@ -1595,10 +1986,38 @@ torch::Tensor exp_sum_forward(torch::Tensor A, torch::Tensor Bm, torch::Tensor p
     return lzs;
 }
 
+// The bf16 backward on big tiles: its shared memory (set once a device), its persistent grid -- the GPU's SMs times the
+// CTAs an SM holds (asked once a device), at most a CTA a unit, at most `cap` CTAs where `cap` > 0
+template <int KP, typename TP, bool FL, bool DE, bool GR>
+void launch_bf_bw2(cudaStream_t stream, const unsigned* afh, const unsigned* afl, const unsigned* bfh, const unsigned* bfl,
+                   const TP* pp, long p0, int Nb, int cbs, int bs, const float* LU, const float* LC, float* ef, float* pf,
+                   long pf0, float* dnp, long dn0, float* ga, float* gb, int M, int N, int Mp, int Np, int K, int B,
+                   int nct, long units, int cap) {
+    constexpr int bytes = Bw2Geo<KP>::WORDS * 4;
+    auto kern = bf_bw2_kernel<KP, TP, FL, DE, GR>;
+    constexpr int NDEV = 64;
+    static int per_sm[NDEV] = {0};                             // (a device's CTAs an SM; 0: not asked yet)
+    const int dev = at::cuda::current_device();
+    int occ = dev < NDEV ? per_sm[dev] : 0;
+    if (occ == 0) {
+        C10_CUDA_CHECK(cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes));
+        C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, kern, 256, bytes));
+        occ = std::max(occ, 1);
+        if (dev < NDEV) per_sm[dev] = occ;
+    }
+    const int sms = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
+    long grid = std::min<long>(units, (long)sms * occ);
+    if (cap > 0) grid = std::min<long>(grid, cap);
+    kern<<<(unsigned)std::max<long>(grid, 1), 256, bytes, stream>>>(afh, afl, bfh, bfl, pp, p0, Nb, cbs, bs, LU, LC, ef,
+                                                                   pf, pf0, dnp, dn0, ga, gb, M, N, Mp, Np, K, B, nct,
+                                                                   units);
+}
+
 // The backward of one node vector: the element flows of its children log-added into `element_flows` (the caller sets
 // them to -inf first, once a layer), and -- each where its tensor is given (not empty) -- F+ added into `param_flows`
 // from `pf0`, W into `denom` from `dn0`, dLL/dA and dLL/dB into the gradient buffers (the caller's layout, `[B, M, K]`,
-// `[B, K, N]`). `zsplit`: the samples split over this many CTAs a tile (0: as many as fill the GPU twice)
+// `[B, K, N]`). `zsplit`: ranks to 8 and the TF32 path, the samples split over this many CTAs a tile (0: as many as fill
+// the GPU twice); the big tiles (bf16, ranks 9 .. 64), their persistent CTAs at most this many (0: the GPU's)
 void exp_sum_backward(torch::Tensor A, torch::Tensor Bm, torch::Tensor params, int64_t p0, int64_t Nb, int64_t cbs,
                       int64_t bs, torch::Tensor emars, torch::Tensor rows, torch::Tensor node_flows,
                       torch::Tensor node_mars, int64_t nid0, torch::Tensor lzs, torch::Tensor element_flows,
@@ -1634,6 +2053,39 @@ void exp_sum_backward(torch::Tensor A, torch::Tensor Bm, torch::Tensor params, i
     while ((1 << lb) < B) lb++;
     if (bf16) {
         const int KPb = rank_pad(K, 8);
+        if (KPb >= 16) {                                       // ranks 9 .. 64: the big tiles (`bf_bw2_kernel`)
+            const int Mp2 = (int)((M + TM2 - 1) / TM2 * TM2), Np2 = (int)((N + TN2 - 1) / TN2 * TN2), njt2 = Np2 / BN;
+            const int nct = Np2 / TN2, nit2 = Mp2 / TM2;
+            const long na2 = (long)Mp2 * KPb / 2, nb2 = (long)Np2 * KPb / 2;
+            auto AF2 = torch::empty({2, B, na2}, A.options().dtype(torch::kInt32));
+            auto BF2 = torch::empty({2, B, nb2}, A.options().dtype(torch::kInt32));
+            auto LU2 = torch::empty({B, Mp2, 2}, A.options());
+            auto LC2 = torch::empty({B, njt2, 36}, A.options());
+            auto efs2 = torch::empty({B, Np2}, A.options());
+            unsigned* afh2 = reinterpret_cast<unsigned*>(AF2.data_ptr<int>());
+            unsigned* bfh2 = reinterpret_cast<unsigned*>(BF2.data_ptr<int>());
+            const int nbA2 = (int)((na2 + 255) / 256), nbB2 = (int)((nb2 + 255) / 256);
+            const int nT2 = (Mp2 + njt2 * 36 + Np2 + 255) / 256;
+            bf_bw_prep_kernel<<<dim3(nbA2 + nbB2 + nT2, (unsigned)B), 256, 0, stream>>>(
+                A.data_ptr<float>(), Bm.data_ptr<float>(), afh2, afh2 + B * na2, bfh2, bfh2 + B * nb2, LU2.data_ptr<float>(),
+                LC2.data_ptr<float>(), efs2.data_ptr<float>(), node_flows.data_ptr<float>(), node_mars.data_ptr<float>(),
+                nid0, lzs.data_ptr<float>(), emars.data_ptr<float>(), rw, (int)M, (int)N, Mp2, Np2, (int)K, KPb, (int)B,
+                nbA2, nbB2);
+            C10_CUDA_KERNEL_LAUNCH_CHECK();
+            float* ga2 = grads ? gA.data_ptr<float>() : nullptr;
+            float* gb2 = grads ? gB.data_ptr<float>() : nullptr;
+            const long units = (long)nit2 * nct * B;
+            EXP_SUM_KP_SWITCH(KPb, if constexpr (KP >= 16) { EXP_SUM_TP_SWITCH(params, EXP_SUM_FLAGS_SWITCH(flows, dn, grads,
+                launch_bf_bw2<KP, TP, FL, DE, GR>(stream, afh2, afh2 + B * na2, bfh2, bfh2 + B * nb2, pp, p0, (int)Nb,
+                    (int)cbs, (int)bs, LU2.data_ptr<float>(), LC2.data_ptr<float>(), efs2.data_ptr<float>(), pf, pf0, dnp,
+                    dn0, ga2, gb2, (int)M, (int)N, Mp2, Np2, (int)K, (int)B, nct, units, (int)zsplit))) })
+            C10_CUDA_KERNEL_LAUNCH_CHECK();
+            ef_epi_kernel<<<(unsigned)((((long)N << lb) + 255) / 256), 256, 0, stream>>>(
+                efs2.data_ptr<float>(), rw, element_flows.data_ptr<float>(), (int)N, Np2, (int)B, lb);
+            C10_CUDA_KERNEL_LAUNCH_CHECK();
+            return;
+        }
+        // ranks to 8 (`bf_bw_kernel`)
         const long na = (long)Mp * KPb / 2, nb = (long)Np * KPb / 2;
         auto AF = torch::empty({2, B, na}, A.options().dtype(torch::kInt32));
         auto BF = torch::empty({2, B, nb}, A.options().dtype(torch::kInt32));
@@ -1650,7 +2102,7 @@ void exp_sum_backward(torch::Tensor A, torch::Tensor Bm, torch::Tensor params, i
         C10_CUDA_KERNEL_LAUNCH_CHECK();
         float* ga = grads ? gA.data_ptr<float>() : nullptr;
         float* gb = grads ? gB.data_ptr<float>() : nullptr;
-        EXP_SUM_KP_SWITCH(KPb, if constexpr (KP >= 8) { EXP_SUM_TP_SWITCH(params, EXP_SUM_FLAGS_SWITCH(flows, dn, grads,
+        EXP_SUM_KP_SWITCH(KPb, if constexpr (KP == 8) { EXP_SUM_TP_SWITCH(params, EXP_SUM_FLAGS_SWITCH(flows, dn, grads,
             bf_bw_kernel<KP, TP, FL, DE, GR><<<grid, 128, 0, stream>>>(afh, afh + B * na, bfh, bfh + B * nb, pp, p0,
                 (int)Nb, (int)cbs, (int)bs, LU.data_ptr<float>(), LC.data_ptr<float>(), efs.data_ptr<float>(), pf, pf0,
                 dnp, dn0, ga, gb, (int)M, (int)N, Mp, Np, (int)K, (int)B, bper))) })

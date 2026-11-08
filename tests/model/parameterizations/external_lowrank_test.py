@@ -2551,8 +2551,9 @@ def test_the_fused_exp_sum_is_the_torch_pass(name, rank, batch, precision, monke
 
 
 def _hmm_blocks(L, bs, T = 4):
-    """A tied HMM of `L` latents in blocks of `bs`, its transitions LowRank exp_sum's: the fused kernels' tiles (128
-    nodes by 32 children) many, ragged where `L` is not a multiple of them."""
+    """A tied HMM of `L` latents in blocks of `bs`, its transitions LowRank exp_sum's: the fused kernels' tiles (64
+    nodes by 32 children; the bf16 backward's from rank 9 on 128 by 64) many, ragged where `L` is not a multiple of
+    them."""
     def build(external, rank = 2, form = "exp_sum", **kw):
         with juice.set_block_size(bs):
             ni = inputs(T - 1, num_node_blocks = L // bs, dist = dists.Categorical(num_cats = NUM_CATS))
@@ -2572,13 +2573,17 @@ def _hmm_blocks(L, bs, T = 4):
 @pytest.mark.parametrize("precision", ["auto", "fp32"])
 @pytest.mark.parametrize("L,bs,rank,batch,zsplit", [(160, 32, 3, 7, 0), (160, 32, 3, 7, 1), (300, 4, 16, 5, 0),
                                                     (256, 64, 8, 33, 2), (72, 8, 4, 2, 0), (160, 32, 40, 3, 0),
-                                                    (256, 64, 33, 4, 1), (300, 4, 17, 2, 0)])
+                                                    (256, 64, 33, 4, 1), (300, 4, 17, 2, 0), (300, 4, 16, 5, 3),
+                                                    (160, 32, 24, 7, 2), (160, 32, 17, 1, 2)])
 def test_the_fused_exp_sum_on_many_tiles(L, bs, rank, batch, zsplit, precision, monkeypatch):
     """The fused kernels where a node vector spans many of their tiles -- nodes past 64 and children past 32, ragged
     where `L` is not a multiple of either, the forward's column tiles combined, the backward's partial sums over tiles
     added, its samples split over CTAs (`EXP_SUM_ZSPLIT`: 0 the default, 1 none -- F+ and W added by the one CTA
     holding them --, 2 two), ranks past 16 (40, 33, 17: padded to 32 and 64) -- against the torch passes, at both
-    precisions."""
+    precisions. The bf16 backward's big tiles (ranks past 8) take `EXP_SUM_ZSPLIT` as their persistent CTAs' count at
+    most: 1 to 3 put all the units on as many runs, each crossing tiles (a tile's first stage and A fragments fetched in
+    the last sample of the tile before, F+ and W added where a run leaves a tile, a tile's samples split between runs;
+    at batch 1 every unit a tile of its own)."""
     import pyjuice.parameterizations.lowrank.forward as lr_forward
 
     monkeypatch.setattr(lr_forward, "EXP_SUM_ZSPLIT", zsplit)

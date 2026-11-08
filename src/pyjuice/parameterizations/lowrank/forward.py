@@ -22,7 +22,8 @@ EXP_SUM_FUSED = True
 #: ... up to this rank (the kernels' MMAs: ranks padded to 8, 16, 32 or 64)
 EXP_SUM_FUSED_RANK_MOST = 64
 #: The backward's samples split over this many CTAs a tile (0: as many as fill the GPU twice; F+ and W are then added
-#: atomically, a CTA holding them for its samples only)
+#: atomically, a CTA holding them for its samples only) -- ranks to 8 and the TF32 path; the bf16 big tiles (ranks 9 ..
+#: 64) take it as their persistent CTAs' count at most (0: the GPU's)
 EXP_SUM_ZSPLIT = 0
 
 
