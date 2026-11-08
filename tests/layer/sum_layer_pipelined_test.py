@@ -92,6 +92,72 @@ def test_the_pipelined_forward_is_the_cuda_forward_to_the_bit(name, B, monkeypat
     assert checked > 0, "no layer of the circuit takes the CUDA path"
 
 
+class _Stored:
+    """`autotune` whose store holds ``choice`` for the tlmm gate's keys (another process measured it); the rest real."""
+
+    def __init__(self, real, choice):
+        self.real, self.choice = real, choice
+
+    def __getattr__(self, name):
+        return getattr(self.real, name)
+
+    def cached(self, key):
+        if isinstance(key, tuple) and key and key[0] == "sum_fw_tlmm_cuda":
+            return self.choice
+        return self.real.cached(key)
+
+
+@pytest.mark.parametrize("module", ["not_loaded_yet", "not_loadable_here"])
+def test_a_stored_choice_of_the_pipelined_forward_runs(module, monkeypatch):
+    """A choice the tuner's on-disk store holds was measured by another process. In a fresh one -- the pipelined
+    kernel's module not loaded yet, which only the making of the gate's candidates does -- the forward taking a stored
+    ``("cuda_pipe", c)`` loads it first (it called the kernel with the module None: AttributeError), the values the
+    plain CUDA kernel's to the bit; where the module does not load (another toolchain wrote the store), the choice is
+    measured again among the arms that run here, the values the plain kernel's to the arms' agreement."""
+    if not (ck.is_available() and ck.pipe_is_available()):
+        pytest.skip("the CUDA kernels are not available here")
+    pc, V, C = _hmm()
+    B = 64
+    x = torch.randint(0, C, (B, V), device = DEV)
+    pc(x)
+    checked = 0
+    for lg in pc.inner_layer_groups:
+        if not lg.is_sum():
+            continue
+        for layer in lg:
+            sig = ("block_sparse", 0, 64)
+            if sig not in layer._cached_fw_cuda or not layer._cached_fw_cuda[sig][2]:
+                continue
+            plain, pipe = ck.valid_configs(layer.block_size, B), ck.pipe_valid_configs(layer.block_size, B)
+            if not plain or not pipe:
+                continue
+            ebase, pbase, _ = layer._cached_fw_cuda[sig]
+            nids = layer.partitioned_nids[0]
+            a, b = layer.nid_range
+            pc.node_mars[a:b] = NAN
+            ck.tlmm_forward_sum(pc.node_mars, pc.element_mars, pc.params, nids, ebase, pbase, B, layer.block_size,
+                                ebase.size(1), plain[0])
+            want = pc.node_mars[a:b].clone()
+            with monkeypatch.context() as mp:
+                mp.setattr(SL, "FORWARD_SUM_CUDA", True)
+                mp.setattr(SL, "autotune", _Stored(autotune, ("cuda_pipe", pipe[0])))
+                mp.setattr(ck, "_pipe_module", None)                   # (a fresh process: nothing loaded it,
+                mp.setattr(ck, "_pipe_attempted", module == "not_loadable_here")   # or it cannot load; nor were
+                mp.setattr(layer, "_fw_fast", {})                      # the layer's launches recorded)
+                pc.node_mars[a:b] = NAN
+                layer.forward(pc.node_mars, pc.element_mars, pc.params)
+                if module == "not_loaded_yet":
+                    assert ck._pipe_module is not None
+                    assert torch.equal(pc.node_mars[a:b], want)
+                else:
+                    got = pc.node_mars[a:b]
+                    assert torch.isfinite(got[torch.isfinite(want)]).all()
+                    assert torch.allclose(got, want, rtol = 1e-4, atol = 1e-5, equal_nan = True)
+            pc.node_mars[a:b] = want
+            checked += 1
+    assert checked > 0, "no layer of the circuit takes the CUDA path"
+
+
 @pytest.mark.parametrize("B", [64, 128])
 @pytest.mark.parametrize("name", list(CIRCUITS))
 def test_the_pipelined_element_backward_is_the_cuda_backward_to_the_bit(name, B, monkeypatch):

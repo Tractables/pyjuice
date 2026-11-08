@@ -334,6 +334,15 @@ def smallbatch_fw_mma_configs():
     return _sbmma_cfg_cache
 
 
+def smallbatch_fw_arm_loaded(kind: str) -> bool:
+    """`tlmm_arm_loaded` for the small-batch forward's arms (`sum_layer`'s small-batch gate). (A stored
+    ``("cuda_mma", code)`` loads its module in a fresh process anyway -- the launch reads the configs for its tile rows,
+    which loads it --; where the module does not load, that read was an empty list: IndexError.)"""
+    loader = {"cuda": smallbatch_fw_is_available, "cuda_bt": smallbatch_fw_bt_is_available,
+              "cuda_mma": smallbatch_fw_mma_is_available}.get(kind)
+    return loader is None or loader()
+
+
 def smallbatch_fw_mma_arms(block_size: int, batch_size: int, num_edges: int, n_blocks: int, grouped: int = 1):
     """The tensor-core small-batch forward's `code`s for a layer shape: every config whose node tile divides the block
     size -- or, ``grouped`` (`row_groups`: aligned runs of that many node blocks share their children), spans at most
@@ -610,6 +619,17 @@ def tlmm_forward_sum_pipelined(node_mars: torch.Tensor, element_mars: torch.Tens
     guarantee the plain kernel's dispatch conditions (the gate in ``sum_layer._forward_block_sparse``)."""
     _pipe_module.tlmm_forward_sum_pipelined(node_mars, element_mars, params, nids, ebase, pbase,
                                             int(batch_size), int(block_size), int(k_num_tiles), int(cfg))
+
+
+def tlmm_arm_loaded(kind: str) -> bool:
+    """Whether the forward's tlmm arm ``kind`` (a choice of `sum_layer`'s tlmm gate) runs in this process, its module
+    loaded now if it was not. A choice the tuner's on-disk store holds was measured by another process; in this one,
+    only the making of the gate's candidates loads the pipelined kernel's module -- a fresh process taking a stored
+    ``("cuda_pipe", c)`` called the kernel with that module None (AttributeError). False where the module does not load
+    here (another toolchain): the gate measures again."""
+    loader = {"cuda": is_available, "cuda_pipe": pipe_is_available, "cuda_prepass": prepass_is_available,
+              "cuda_stream": stream_is_available}.get(kind)
+    return loader is None or loader()
 
 
 def pipe_configs():

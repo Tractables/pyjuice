@@ -1529,6 +1529,8 @@ class SumLayer(Layer, nn.Module):
                 # (With a bf16 copy, a choice of its own: the stream kernel is among the arms.)
                 tlmm_key = ("sum_fw_tlmm_cuda", num_edges) + fw_key + (() if op_params is None else ("operands",))
                 choice = autotune.cached(tlmm_key)
+                if choice is not None and not cuda_kernels.tlmm_arm_loaded(choice[0]):
+                    choice = None                   # (stored where its module loaded, not here: measured again)
                 if choice is None and runs is not None:
                     choice = ("triton", -1)              # not measured yet: the reference (see `runs`)
                 elif choice is None:
@@ -1708,6 +1710,8 @@ class SumLayer(Layer, nn.Module):
                 sb_key = (("sum_fw_smallbatch_cuda", num_edges, mma_ok) + fw_key
                           + (() if op_params is None else ("operands",)))
                 choice = autotune.cached(sb_key)
+                if choice is not None and not cuda_kernels.smallbatch_fw_arm_loaded(choice[0]):
+                    choice = None                   # (stored where its module loaded, not here: measured again)
                 if choice is None:
                     mma_arms = (cuda_kernels.smallbatch_fw_mma_arms(self.block_size, batch_size, num_edges, nids.numel(),
                                                                      self._sb_mma_grouped(signature, self._cached_fw_cuda[signature][0], sb_pbase))

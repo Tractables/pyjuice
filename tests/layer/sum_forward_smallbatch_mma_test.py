@@ -176,6 +176,45 @@ def test_dispatch_reaches_it_and_agrees_with_triton(batch, dtype, monkeypatch):
         SL.FORWARD_SUM_CUDA = saved
 
 
+class _StoredOnly:
+    """`autotune` whose store holds ``choice`` for the small-batch gate's keys (another process measured it); the pick
+    itself real."""
+
+    def __init__(self, real, choice):
+        self.real, self.choice = real, choice
+
+    def __getattr__(self, name):
+        return getattr(self.real, name)
+
+    def cached(self, key):
+        if isinstance(key, tuple) and key and key[0] == "sum_fw_smallbatch_cuda":
+            return self.choice
+        return self.real.cached(key)
+
+
+@pytest.mark.skipif(not _available(), reason = "the tensor-core small-batch forward cannot build here")
+def test_a_stored_choice_of_the_tensor_core_forward_whose_module_does_not_load_is_measured_again(monkeypatch):
+    """The small-batch gate taking a stored ``("cuda_mma", code)`` where the tensor-core module does not load (another
+    toolchain wrote the store): the choice measured again among the arms that run here -- the launch read its configs
+    for its tile rows, an empty list (IndexError) -- and the forward agrees with the Triton one. (In a fresh process
+    where the module does load, that read loads it first: no guard needed for it.)"""
+    torch.manual_seed(0)
+    ns = juice.structures.HMM(seq_length = 6, num_latents = 256, num_emits = 16, homogeneous = True, block_size = 128)
+    ns.init_parameters(perturbation = 2.0)
+    pc = juice.compile(ns, verbose = False).to(DEV)
+    x = torch.randint(0, 16, (16, 6), device = DEV)
+    code = ck.smallbatch_fw_mma_arms(128, 16, 256, 2)[0]
+    monkeypatch.setattr(SL, "FORWARD_SUM_CUDA", False)
+    ref = pc(x).clone()
+    monkeypatch.setattr(SL, "FORWARD_SUM_CUDA", True)
+    monkeypatch.setattr(SL, "autotune", _StoredOnly(autotune, ("cuda_mma", code)))
+    monkeypatch.setattr(ck, "_sbmma_module", None)                   # (the module tried and not loaded)
+    monkeypatch.setattr(ck, "_sbmma_attempted", True)
+    monkeypatch.setattr(ck, "_sbmma_cfg_cache", None)
+    got = pc(x)
+    assert ((got - ref).abs() / ref.abs().clamp_min(1.0)).max() < 2e-3
+
+
 class _Recorder:
     """`autotune` recording the small-batch gate's keys and candidate lists (the real pick runs)."""
 
