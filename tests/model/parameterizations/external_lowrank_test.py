@@ -2626,7 +2626,7 @@ def test_the_fused_exp_sum_reads_bf16_parameters(rank, precision, monkeypatch):
 
 @needs_fused
 @pytest.mark.parametrize("precision", ["auto", "fp32"])
-@pytest.mark.parametrize("rank,batch", [(4, 3), (16, 4), (64, 2)])
+@pytest.mark.parametrize("rank,batch", [(4, 3), (16, 4), (64, 2), (16, 100), (64, 99)])
 def test_the_fused_exp_sum_forward_far_below_its_shift(rank, batch, precision):
     """The forward's S terms are Z's times the children's factors 2^(lc - mc), mc a tile's largest child value: where a
     tile's large weights and large child values sit on different children -- rank 0 puts every other child's scale at
@@ -2658,4 +2658,123 @@ def test_the_fused_exp_sum_forward_far_below_its_shift(rank, batch, precision):
     ln = torch.logsumexp(lw + emars.t().double()[:, None, :], 2) - lz
     worst = float((nmars.t().double().cpu() - ln).abs().max())
     assert worst < 1e-3, worst
+    assert float((lzs.t().double().cpu() - lz).abs().max()) < 1e-3
+
+
+@needs_fused
+@pytest.mark.parametrize("rank,batch,nslice", [(64, 160, 4), (16, 300, 3)])
+def test_a_batch_past_the_l2_runs_the_bf16_passes_in_chunks(rank, batch, nslice):
+    """A batch whose working set exceeds the L2 runs the bf16 passes a chunk of samples at a time (`sample_chunk`: at
+    1024 x 1024 nodes, rank 64 is ~2 MB a sample forward and 1.5 MB backward -- chunks of 54 and 80 at a 128 MB L2 --,
+    rank 16 forward ~0.75 MB -- chunks of 100): every output against the same passes over the batch's slices, a call a
+    slice -- the forward's node values and log Z to the bit (a sample's work is the same in any chunk), the backward's
+    element flows, F+, W and gradients to fp32 (their sums over tiles and samples are atomic adds, in any order)."""
+    from pyjuice.parameterizations.lowrank.kernels.c import get_exp_sum_module
+    mod, dev = get_exp_sum_module(), torch.device("cuda:0")
+    M = N = 1024
+    bs = cbs = 32
+    g = torch.Generator(device = "cpu").manual_seed(7)
+    A = (0.3 * torch.randn(batch, M, rank, generator = g)).to(dev)
+    Bm = (0.3 * torch.randn(batch, rank, N, generator = g)).to(dev)
+    theta = torch.rand(M, N, generator = g).add_(0.05)
+    theta = theta / theta.sum(1, keepdim = True)
+    params = theta.view(M // bs, bs, N // cbs, cbs).permute(0, 2, 3, 1).contiguous().view(-1).to(dev)
+    emars = (-5.0 + torch.randn(N, batch, generator = g)).to(dev)
+    nflows = (torch.randn(M, batch, generator = g) - 7.0).to(dev)
+    rows = torch.arange(N, device = dev)
+
+    def passes(lo, hi):
+        b = hi - lo
+        nmars = torch.empty(M, b, device = dev)
+        lzs = mod.exp_sum_forward(A[lo:hi].contiguous(), Bm[lo:hi].contiguous(), params, 0, N // cbs, cbs, bs,
+                                  emars[:, lo:hi].contiguous(), rows, nmars, 0, M, N, rank, True)
+        eflows = torch.full((N, b), -float("inf"), device = dev)
+        pf, dn = torch.zeros(M * N, device = dev), torch.zeros(M * N, device = dev)
+        gA, gB = torch.zeros(b, M, rank, device = dev), torch.zeros(b, rank, N, device = dev)
+        mod.exp_sum_backward(A[lo:hi].contiguous(), Bm[lo:hi].contiguous(), params, 0, N // cbs, cbs, bs,
+                             emars[:, lo:hi].contiguous(), rows, nflows[:, lo:hi].contiguous(), nmars, 0, lzs, eflows,
+                             pf, 0, dn, 0, gA, gB, M, N, rank, 0, True)
+        return nmars, lzs, eflows, pf, dn, gA, gB
+
+    whole = passes(0, batch)
+    cuts = [batch * i // nslice for i in range(nslice + 1)]
+    parts = [passes(lo, hi) for lo, hi in zip(cuts[:-1], cuts[1:])]
+    for k in (0, 1):                                       # node values, log Z: bit for bit
+        assert torch.equal(whole[k], torch.cat([p[k] for p in parts], 1)), k
+    ef = torch.cat([p[2] for p in parts], 1)
+    assert torch.isfinite(whole[2]).all()
+    assert float((whole[2] - ef).abs().max()) < 1e-5     # (log element flows)
+    for k in (3, 4):                                       # F+, W: summed over the slices
+        want = sum(p[k] for p in parts)
+        assert float((whole[k] - want).abs().max()) <= 1e-5 * float(want.abs().max()), k
+    for k in (5, 6):                                       # dA, dB
+        want = torch.cat([p[k] for p in parts], 0)
+        assert float((whole[k] - want).abs().max()) <= 1e-5 * float(want.abs().max()), k
+
+
+@needs_fused
+@pytest.mark.parametrize("precision", ["auto", "fp32"])
+@pytest.mark.parametrize("side", ["low", "high"])
+@pytest.mark.parametrize("rank,batch", [(16, 4), (64, 100)])
+def test_the_fused_exp_sum_forward_out_of_its_frame(rank, batch, side, precision):
+    """The bf16 forward sums a row's terms 2^(lw' - cm) unshifted, cm the row's largest log2 theta in the tile (once a
+    tile), where its sums z and s lie in [2^-92, 2^100]: rank 0 puts every child's scale of half the nodes at e^-95
+    (their terms flushed: z = 0, "low") or at e^80 (z past 2^100, "high"), so those rows take the shifted path, under
+    the row max of the sample. Batch 100 gives a CTA samples in pairs (its second sample's registers, the
+    pair's fallbacks). The node values and log Z against float64."""
+    from pyjuice.parameterizations.lowrank.kernels.c import get_exp_sum_module
+    mod, dev = get_exp_sum_module(), torch.device("cuda:0")
+    M = N = 128
+    bs = cbs = 32
+    g = torch.Generator(device = "cpu").manual_seed(5)
+    A = 0.3 * torch.randn(batch, M, rank, generator = g)
+    Bm = 0.3 * torch.randn(batch, rank, N, generator = g)
+    A[:, :, 0] = 0.0
+    A[:, 0::2, 0] = 1.0                                    # (phi[i, j] = B[0, j] + small for the even nodes)
+    Bm[:, 0, :] = -95.0 if side == "low" else 80.0
+    theta = torch.rand(M, N, generator = g).add_(0.05)
+    theta = theta / theta.sum(1, keepdim = True)
+    emars = -5.0 + torch.randn(N, batch, generator = g)
+    params = theta.view(M // bs, bs, N // cbs, cbs).permute(0, 2, 3, 1).contiguous().view(-1).to(dev)
+    nmars = torch.empty(M, batch, device = dev)
+    lzs = mod.exp_sum_forward(A.to(dev).contiguous(), Bm.to(dev).contiguous(), params, 0, N // cbs, cbs, bs,
+                              emars.to(dev).contiguous(), torch.arange(N, device = dev), nmars, 0, M, N, rank,
+                              precision != "fp32")
+    lw = torch.bmm(A.double(), Bm.double()) + theta.double().log()[None]
+    lz = torch.logsumexp(lw, 2)
+    ln = torch.logsumexp(lw + emars.t().double()[:, None, :], 2) - lz
+    assert torch.isfinite(nmars).all() and torch.isfinite(lzs).all()
+    assert float((nmars.t().double().cpu() - ln).abs().max()) < 1e-3
+    assert float(((lzs.t().double().cpu() - lz) / lz.abs().clamp_min(1.0)).abs().max()) < 1e-5
+
+
+@needs_fused
+@pytest.mark.parametrize("precision", ["auto", "fp32"])
+@pytest.mark.parametrize("rank,batch", [(16, 4), (64, 100)])
+def test_the_fused_exp_sum_forward_with_mostly_zero_parameters(rank, batch, precision):
+    """97% of the parameters 0 (their terms -inf), every node keeping its first child's: a row's four lanes in a tile
+    see few or none of its live terms -- the row's frame (its largest log2 theta in the tile) and liveness are taken
+    over all four, so a lane with no live term still stores its row's sums in the frame they were made in. The node
+    values and log Z against float64."""
+    from pyjuice.parameterizations.lowrank.kernels.c import get_exp_sum_module
+    mod, dev = get_exp_sum_module(), torch.device("cuda:0")
+    M = N = 128
+    bs = cbs = 32
+    g = torch.Generator(device = "cpu").manual_seed(9)
+    A = 0.3 * torch.randn(batch, M, rank, generator = g)
+    Bm = 0.3 * torch.randn(batch, rank, N, generator = g)
+    theta = torch.rand(M, N, generator = g).add_(0.05)
+    theta[torch.rand(M, N, generator = g) < 0.97] = 0.0
+    theta[:, 0] += 0.01
+    emars = -5.0 + torch.randn(N, batch, generator = g)
+    params = theta.view(M // bs, bs, N // cbs, cbs).permute(0, 2, 3, 1).contiguous().view(-1).to(dev)
+    nmars = torch.empty(M, batch, device = dev)
+    lzs = mod.exp_sum_forward(A.to(dev).contiguous(), Bm.to(dev).contiguous(), params, 0, N // cbs, cbs, bs,
+                              emars.to(dev).contiguous(), torch.arange(N, device = dev), nmars, 0, M, N, rank,
+                              precision != "fp32")
+    lw = torch.bmm(A.double(), Bm.double()) + theta.double().log()[None]
+    lz = torch.logsumexp(lw, 2)
+    ln = torch.logsumexp(lw + emars.t().double()[:, None, :], 2) - lz
+    assert torch.isfinite(nmars).all() and torch.isfinite(lzs).all()
+    assert float((nmars.t().double().cpu() - ln).abs().max()) < 1e-3
     assert float((lzs.t().double().cpu() - lz).abs().max()) < 1e-3

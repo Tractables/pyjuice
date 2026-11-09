@@ -17,14 +17,17 @@
 //     accumulation: ~2^-16 of each product), m16n8k16 MMAs (m16n8k8 at ranks <= 8); dA, dB one bf16 term each.
 //   tf32 ("fp32"): three-term TF32 (hi + lo, ~fp32) everywhere, m16n8k8 MMAs (m16n8k4 at ranks <= 4 in the forward).
 //
-// FORWARD (`bf_fw_kernel` / `tf_fw_kernel`, then `fw_comb_kernel`): a warp's MMA fragments read straight from global
+// FORWARD (`bf_fw2_kernel` / `tf_fw_kernel`, then `fw_comb_kernel`): a warp's MMA fragments read straight from global
 // memory one sample ahead, in FRAGMENT ORDER (the prologue lays each sample's A' and B out lane by lane: a 16-byte
-// load a lane a fragment), no shared memory, no barriers. Z's terms 2^(lw' - a), a the node's max over the tile; S's
-// the same terms times the children's factors: e w_j = 2^(lw' + lc' - a - mc), mc the tile's max lc' -- one
-// exponential an element. A term below 2^-126 of the reference 2^(a + mc) flushes; at most BN of them, so a sum of at
-// least 2^-97 is exact to fp32 (the flushed mass under 2^-24 of it), and a tile whose sum falls below that (its large
-// terms' lw' and lc' apart by > 97 bits) is made again exactly, x' = lw' + lc' under its own max (a warp's vote). Each
-// warp writes its tiles' (max, sum) pairs; the combine folds the column tiles' into the node values and log Z.
+// load a lane a fragment), no shared memory, no barriers. bf16: Z's terms 2^(lw' - c), c the row's largest log2 theta
+// in the tile (set once a tile, no row max a sample); S's the same terms times the children's factors w_j = 2^(lc' -
+// mc), mc the tile's max lc' -- one exponential an element. Where a row's sums lie in [2^-92, 2^100] no term within
+// 2^-29 of its largest flushed (under 2^-126) and none overflowed, so the sums are exact to fp32; a row out of that
+// range is summed again under its own max (tf32: always so), and a tile whose S sum falls below 2^-97 of its shift
+// (its large terms' lw' and lc' far apart) is made again exactly, x' = lw' + lc' under its own max (a warp's vote).
+// Each warp writes its tiles' (shift, sum) pairs; the combine folds the column tiles' into the node values and log Z.
+// LARGE BATCHES: the bf16 passes take the samples a chunk at a time (`sample_chunk`), each chunk's working set within
+// the L2.
 //
 // BACKWARD, bf16, ranks 9 .. 64 (`bf_bw2_kernel`, below: tiles of 128 nodes x 64 children, persistent CTAs of 8 warps);
 // ranks to 8 (`bf_bw_kernel`): phi again from its own prologue's fragments (the forward keeps none), then in
@@ -67,6 +70,15 @@ template <> __device__ __forceinline__ float to_f<__nv_bfloat16>(__nv_bfloat16 v
 __device__ __forceinline__ long grid_at(int i, int j, int Nb, int cbs, int bs) {
     const int lbs = __ffs(bs) - 1, lcbs = __ffs(cbs) - 1;                   // (block sizes are powers of two)
     return (((long)(i >> lbs) * Nb + (j >> lcbs)) << (lcbs + lbs)) + ((long)(j & (cbs - 1)) << lbs) + (i & (bs - 1));
+}
+
+// theta[i, j], 0 outside the node vector: the index clamped and the value selected -- no branch around the load, so a
+// tile's loads issue together (behind a bounds branch each load was a round trip of its own)
+template <typename TP>
+__device__ __forceinline__ float theta_at(const TP* __restrict__ params, long p0, int i, int j, int M, int N, int Nb,
+                                          int cbs, int bs) {
+    const float v = to_f(params[p0 + grid_at(min(i, M - 1), min(j, N - 1), Nb, cbs, bs)]);
+    return (i < M && j < N) ? v : 0.f;
 }
 
 // Atomic adds; the vector forms sm_90 on (elsewhere one a float)
@@ -176,7 +188,8 @@ __device__ __forceinline__ unsigned movt(unsigned x) {
 // tiles' base-2 (max, sum) pairs: four lanes an output, each up to 8 tiles (its loads issued together), folded by
 // two shuffles
 __global__ void __launch_bounds__(128) fw_comb_kernel(const float4* __restrict__ part, int njt, float* __restrict__ nmars,
-                                                        long nid0, float* __restrict__ lzs, int M, int Mp, int B) {
+                                                        long nid0, float* __restrict__ lzs, int M, int Mp, int B, int Bs,
+                                                        int b0) {
     const long t = (long)blockIdx.x * blockDim.x + threadIdx.x, e = t >> 2;
     const int q = (int)(t & 3);
     const bool live = e < (long)B * M;
@@ -202,13 +215,13 @@ __global__ void __launch_bounds__(128) fw_comb_kernel(const float4* __restrict__
     if (!live || q != 0) return;
     const float lz = z > 0.f ? (mz + __log2f(z)) * LN2 : NEG;
     const float ls = s > 0.f ? (ms + __log2f(s)) * LN2 : NEG;
-    nmars[(nid0 + i) * B + b] = ls > NEG ? ls - lz : ls;                   // (no mass: -inf, not 0 / 0)
-    lzs[(long)i * B + b] = lz;
+    nmars[(nid0 + i) * Bs + b0 + b] = ls > NEG ? ls - lz : ls;                   // (no mass: -inf, not 0 / 0)
+    lzs[(long)i * Bs + b0 + b] = lz;
 }
 
 // The backward's epilogue: the element flows to the log, log-added into the circuit's (a thread a (child, sample))
 __global__ void __launch_bounds__(256) ef_epi_kernel(const float* __restrict__ ef, const long* __restrict__ rows,
-                                                     float* __restrict__ eflows, int N, int Np, int B, int lb) {
+                                                     float* __restrict__ eflows, int N, int Np, int B, int lb, int Bs, int b0) {
     const long t = (long)blockIdx.x * 256 + threadIdx.x;
     const int b = (int)(t & ((1 << lb) - 1));
     const long j = t >> lb;
@@ -217,7 +230,7 @@ __global__ void __launch_bounds__(256) ef_epi_kernel(const float* __restrict__ e
     const float v = ef[(long)b * Np + j];
     if (er < 0 || !(v > 0.f)) return;
     const float lv = logf(v);
-    float* p = eflows + er * B + b;
+    float* p = eflows + er * Bs + b0 + b;
     const float o = *p;
     *p = o == NEG ? lv : fmaxf(o, lv) + log1pf(__expf(-fabsf(o - lv)));
 }
@@ -244,7 +257,7 @@ __global__ void __launch_bounds__(256) bf_fw_prep_kernel(
         const float* __restrict__ A, const float* __restrict__ Bm, unsigned* __restrict__ AFh, unsigned* __restrict__ AFl,
         unsigned* __restrict__ BFh, unsigned* __restrict__ BFl, float* __restrict__ WF, float* __restrict__ lcs,
         const float* __restrict__ emars, const long* __restrict__ rows, int M, int N, int Mp, int Np, int K, int KP,
-        int B, int nbA, int nbB) {
+        int B, int nbA, int nbB, int Bs, int b0) {
     const int b = blockIdx.y;
     const bool k8 = KP <= 8;
     const int KS = k8 ? 1 : KP / 16, NRA = k8 ? 2 : 4, NRB = k8 ? 4 : 8;
@@ -288,7 +301,7 @@ __global__ void __launch_bounds__(256) bf_fw_prep_kernel(
     if (jt >= njt) return;
     const int j = jt * BN + lane;
     const long rr = j < N ? rows[j] : -1;
-    const float lc = rr >= 0 ? emars[rr * B + b] * LOG2E : NEG;
+    const float lc = rr >= 0 ? emars[rr * Bs + b0 + b] * LOG2E : NEG;
     float mc = lc;
 #pragma unroll
     for (int d = 16; d; d >>= 1) mc = fmaxf(mc, __shfl_xor_sync(0xffffffffu, mc, d));
@@ -299,10 +312,14 @@ __global__ void __launch_bounds__(256) bf_fw_prep_kernel(
     if (lane < 4) wp[32 + lane] = lane == 0 ? mc : 0.f;
 }
 
-// The bf16 forward: `fwtc3_kernel` with phi from bf16 hi + lo MMAs, its fragments fetched one k-step ahead over the
-// (sample, k-step) sequence
+// The bf16 forward (`bf_fw2_kernel`): a warp a 16-node x 32-child tile over its samples, phi from bf16 hi + lo MMAs
+// (three terms), its fragments fetched one k-step ahead over the (sample, k-step) sequence into two register sets (no
+// copies; the next step's fetched unconditionally, the last sample's again at the end). A row's terms 2^(lw' - c), c
+// the row's largest log2 theta in the tile (over its four lanes, once a tile), summed without a row max: exact to fp32
+// where its sums z and s lie in [2^-92, 2^100]; a warp with a row past that takes the shifted path (the row max of the
+// sample; z in range but s not: s alone, under its own max)
 template <int KP, typename TP>
-__global__ void __launch_bounds__(128) bf_fw_kernel(
+__global__ void __launch_bounds__(128) bf_fw2_kernel(
         const unsigned* __restrict__ AFh, const unsigned* __restrict__ AFl, const unsigned* __restrict__ BFh,
         const unsigned* __restrict__ BFl, const TP* __restrict__ params, long p0, int Nb, int cbs, int bs,
         const float* __restrict__ WF, const float* __restrict__ lcs, float4* __restrict__ part, int M, int N, int Mp,
@@ -316,155 +333,225 @@ __global__ void __launch_bounds__(128) bf_fw_kernel(
     const int b0 = blockIdx.z * bper, b1 = min(B, b0 + bper);
     if (b0 >= b1) return;
 
-    float lt[16];
-#pragma unroll
-    for (int e = 0; e < 16; e++) {
-        const int nf = e >> 2, c = e & 3, i = c & 2 ? rB : rA, j = j0 + 8 * nf + 2 * tq + (c & 1);
-        lt[e] = (i < M && j < N) ? to_f(params[p0 + grid_at(i, j, Nb, cbs, bs)]) : 0.f;
-    }
-#pragma unroll
-    for (int e = 0; e < 16; e++) lt[e] = lt[e] > 0.f ? __log2f(lt[e]) : NEG;
-
     const long astr = (long)Mp * KP / 2, bstr = (long)Np * KP / 2, wstr = (long)njt * 36;
     const unsigned* ah0 = AFh + ((long)rg * KS * 32 + lane) * NRA;
     const unsigned* al0 = AFl + ((long)rg * KS * 32 + lane) * NRA;
     const unsigned* bh0 = BFh + ((long)jt * KS * 32 + lane) * NRB;
     const unsigned* bl0 = BFl + ((long)jt * KS * 32 + lane) * NRB;
     const float* wf = WF + (long)jt * 36 + tq * 8;
-    unsigned nah[NRA], nal[NRA], nbh[NRB], nbl[NRB];
-    auto fetch = [&](int b, int ks) {
+    unsigned xah[2][NRA], xal[2][NRA], xbh[2][NRB], xbl[2][NRB];
+    float xw[2][8], xmc[2];
+    auto fetch = [&](int st, int b, int ks) {           // (st a constant at every call once the loops unroll)
         const long ao = b * astr + ks * 32 * NRA, bo = b * bstr + ks * 32 * NRB;
         if constexpr (NRA == 4) {
             const uint4 x = __ldg(reinterpret_cast<const uint4*>(ah0 + ao)), y = __ldg(reinterpret_cast<const uint4*>(al0 + ao));
-            nah[0] = x.x; nah[1] = x.y; nah[2] = x.z; nah[3] = x.w; nal[0] = y.x; nal[1] = y.y; nal[2] = y.z; nal[3] = y.w;
+            xah[st][0] = x.x; xah[st][1] = x.y; xah[st][2] = x.z; xah[st][3] = x.w;
+            xal[st][0] = y.x; xal[st][1] = y.y; xal[st][2] = y.z; xal[st][3] = y.w;
         } else {
             const uint2 x = __ldg(reinterpret_cast<const uint2*>(ah0 + ao)), y = __ldg(reinterpret_cast<const uint2*>(al0 + ao));
-            nah[0] = x.x; nah[1] = x.y; nal[0] = y.x; nal[1] = y.y;
+            xah[st][0] = x.x; xah[st][1] = x.y; xal[st][0] = y.x; xal[st][1] = y.y;
         }
 #pragma unroll
         for (int u = 0; u < NRB; u += 4) {
             const uint4 x = __ldg(reinterpret_cast<const uint4*>(bh0 + bo + u));
             const uint4 y = __ldg(reinterpret_cast<const uint4*>(bl0 + bo + u));
-            nbh[u] = x.x; nbh[u + 1] = x.y; nbh[u + 2] = x.z; nbh[u + 3] = x.w;
-            nbl[u] = y.x; nbl[u + 1] = y.y; nbl[u + 2] = y.z; nbl[u + 3] = y.w;
+            xbh[st][u] = x.x; xbh[st][u + 1] = x.y; xbh[st][u + 2] = x.z; xbh[st][u + 3] = x.w;
+            xbl[st][u] = y.x; xbl[st][u + 1] = y.y; xbl[st][u + 2] = y.z; xbl[st][u + 3] = y.w;
         }
     };
-    fetch(b0, 0);
-#pragma unroll (KP >= 16 ? 2 : 1)                                // (two samples interleaved past rank 8)
-    for (int b = b0; b < b1; b++) {
-        float wv[8];
-        {
-            const float4 w0 = __ldg(reinterpret_cast<const float4*>(wf + b * wstr));
-            const float4 w1 = __ldg(reinterpret_cast<const float4*>(wf + b * wstr + 4));
-            wv[0] = w0.x; wv[1] = w0.y; wv[2] = w0.z; wv[3] = w0.w; wv[4] = w1.x; wv[5] = w1.y; wv[6] = w1.z; wv[7] = w1.w;
-        }
-        const float mc = __ldg(WF + b * wstr + (long)jt * 36 + 32);
-        float S[4][4];
-#pragma unroll
-        for (int nf = 0; nf < 4; nf++)
-#pragma unroll
-            for (int c = 0; c < 4; c++) S[nf][c] = 0.f;
-#pragma unroll
-        for (int ks = 0; ks < KS; ks++) {
-            unsigned ah[NRA], al[NRA], bh[NRB], bl[NRB];
-#pragma unroll
-            for (int u = 0; u < NRA; u++) { ah[u] = nah[u]; al[u] = nal[u]; }
-#pragma unroll
-            for (int u = 0; u < NRB; u++) { bh[u] = nbh[u]; bl[u] = nbl[u]; }
-            if (ks + 1 < KS) fetch(b, ks + 1);                 // (the next k-step's, or the next sample's first)
-            else if (b + 1 < b1) fetch(b + 1, 0);
-#pragma unroll
-            for (int nf = 0; nf < 4; nf++) {
-                if constexpr (K8) {
-                    mma_bf16_k8(S[nf], al[0], al[1], bh[nf]);
-                    mma_bf16_k8(S[nf], ah[0], ah[1], bl[nf]);
-                    mma_bf16_k8(S[nf], ah[0], ah[1], bh[nf]);
-                } else {
-                    mma_bf16_k16(S[nf], al[0], al[1], al[2], al[3], bh[2 * nf], bh[2 * nf + 1]);
-                    mma_bf16_k16(S[nf], ah[0], ah[1], ah[2], ah[3], bl[2 * nf], bl[2 * nf + 1]);
-                    mma_bf16_k16(S[nf], ah[0], ah[1], ah[2], ah[3], bh[2 * nf], bh[2 * nf + 1]);
-                }
-            }
-        }
-#pragma unroll
-        for (int nf = 0; nf < 4; nf++)
-#pragma unroll
-            for (int c = 0; c < 4; c++) S[nf][c] += lt[4 * nf + c];
+    auto fetchw = [&](int st, int b) {
+        const float4 w0 = __ldg(reinterpret_cast<const float4*>(wf + b * wstr));
+        const float4 w1 = __ldg(reinterpret_cast<const float4*>(wf + b * wstr + 4));
+        xw[st][0] = w0.x; xw[st][1] = w0.y; xw[st][2] = w0.z; xw[st][3] = w0.w;
+        xw[st][4] = w1.x; xw[st][5] = w1.y; xw[st][6] = w1.z; xw[st][7] = w1.w;
+        xmc[st] = __ldg(WF + b * wstr + (long)jt * 36 + 32);
+    };
+    fetch(0, b0, 0);
+    fetchw(0, b0);
 
-        float a[2] = {NEG, NEG};
+    float lt[16];
 #pragma unroll
-        for (int nf = 0; nf < 4; nf++)
+    for (int e = 0; e < 16; e++) {
+        const int nf = e >> 2, c = e & 3, i = c & 2 ? rB : rA, j = j0 + 8 * nf + 2 * tq + (c & 1);
+        lt[e] = theta_at(params, p0, i, j, M, N, Nb, cbs, bs);
+    }
+    bool live[2] = {false, false};                       // (a row with any parameter in the tile)
 #pragma unroll
-            for (int c = 0; c < 4; c++) a[c >> 1] = fmaxf(a[c >> 1], S[nf][c]);
+    for (int e = 0; e < 16; e++) {
+        live[(e & 3) >> 1] |= lt[e] > 0.f;
+        lt[e] = lt[e] > 0.f ? __log2f(lt[e]) : NEG;
+    }
 #pragma unroll
-        for (int d = 1; d <= 2; d <<= 1) {
-            a[0] = fmaxf(a[0], __shfl_xor_sync(0xffffffffu, a[0], d));
-            a[1] = fmaxf(a[1], __shfl_xor_sync(0xffffffffu, a[1], d));
-        }
-        const float sa0 = a[0] == NEG ? 0.f : a[0], sa1 = a[1] == NEG ? 0.f : a[1];
-        float z[2] = {0.f, 0.f}, s[2] = {0.f, 0.f};
+    for (int r = 0; r < 2; r++) {                        // (over the row's four lanes)
+        int lv = live[r] ? 1 : 0;
+        lv |= __shfl_xor_sync(0xffffffffu, lv, 1);
+        lv |= __shfl_xor_sync(0xffffffffu, lv, 2);
+        live[r] = lv != 0;
+    }
+    // each row's frame: its largest log2 theta in the tile (once a tile), lt' = lt - cm -- the unshifted sums then sit
+    // where phi' puts them, the old shifted path's 2^-97 criterion within reach of a fixed threshold
+    float cm[2] = {NEG, NEG};
 #pragma unroll
-        for (int nf = 0; nf < 4; nf++)
+    for (int e = 0; e < 16; e++) cm[(e & 3) >> 1] = fmaxf(cm[(e & 3) >> 1], lt[e]);
 #pragma unroll
-            for (int c = 0; c < 4; c++) {
-                const int h = c >> 1;
-                const float e = exp2f(S[nf][c] - (h ? sa1 : sa0));
-                z[h] += e;
-                s[h] = fmaf(e, wv[2 * nf + (c & 1)], s[h]);
-            }
+    for (int r = 0; r < 2; r++) {
+        cm[r] = fmaxf(cm[r], __shfl_xor_sync(0xffffffffu, cm[r], 1));
+        cm[r] = fmaxf(cm[r], __shfl_xor_sync(0xffffffffu, cm[r], 2));
+        if (!live[r]) cm[r] = 0.f;
+    }
 #pragma unroll
-        for (int d = 1; d <= 2; d <<= 1) {
-            z[0] += __shfl_xor_sync(0xffffffffu, z[0], d);
-            z[1] += __shfl_xor_sync(0xffffffffu, z[1], d);
-            s[0] += __shfl_xor_sync(0xffffffffu, s[0], d);
-            s[1] += __shfl_xor_sync(0xffffffffu, s[1], d);
-        }
-        float ms[2] = {s[0] > 0.f ? a[0] + mc : NEG, s[1] > 0.f ? a[1] + mc : NEG};
-        const bool need = mc > NEG && ((s[0] < 0x1p-97f && a[0] > NEG) || (s[1] < 0x1p-97f && a[1] > NEG));
-        if (__any_sync(0xffffffffu, need)) {                   // (exactly: x' = lw' + lc' under its own max)
-            float lcv[4][2];
+    for (int e = 0; e < 16; e++) lt[e] -= cm[(e & 3) >> 1];
+
+#pragma unroll 1
+    for (int b = b0; b < b1; b += 2) {
 #pragma unroll
-            for (int nf = 0; nf < 4; nf++) {
-                const float2 v = *reinterpret_cast<const float2*>(lcs + (long)b * Np + j0 + 8 * nf + 2 * tq);
-                lcv[nf][0] = v.x;
-                lcv[nf][1] = v.y;
-            }
-            float m2[2] = {NEG, NEG};
+        for (int h = 0; h < 2; h++) {
+            const int bb = b + h;
+            if (h == 1 && bb >= b1) break;
+            float S[4][4];
 #pragma unroll
             for (int nf = 0; nf < 4; nf++)
 #pragma unroll
-                for (int c = 0; c < 4; c++) m2[c >> 1] = fmaxf(m2[c >> 1], S[nf][c] + lcv[nf][c & 1]);
+                for (int c = 0; c < 4; c++) S[nf][c] = 0.f;
 #pragma unroll
-            for (int d = 1; d <= 2; d <<= 1) {
-                m2[0] = fmaxf(m2[0], __shfl_xor_sync(0xffffffffu, m2[0], d));
-                m2[1] = fmaxf(m2[1], __shfl_xor_sync(0xffffffffu, m2[1], d));
+            for (int ks = 0; ks < KS; ks++) {
+                const int st = (h * KS + ks) & 1;
+                if (ks + 1 < KS) fetch(st ^ 1, bb, ks + 1);
+                else fetch(st ^ 1, min(bb + 1, b1 - 1), 0);
+#pragma unroll
+                for (int nf = 0; nf < 4; nf++) {
+                    if constexpr (K8) {
+                        mma_bf16_k8(S[nf], xal[st][0], xal[st][1], xbh[st][nf]);
+                        mma_bf16_k8(S[nf], xah[st][0], xah[st][1], xbl[st][nf]);
+                        mma_bf16_k8(S[nf], xah[st][0], xah[st][1], xbh[st][nf]);
+                    } else {
+                        mma_bf16_k16(S[nf], xal[st][0], xal[st][1], xal[st][2], xal[st][3], xbh[st][2 * nf], xbh[st][2 * nf + 1]);
+                        mma_bf16_k16(S[nf], xah[st][0], xah[st][1], xah[st][2], xah[st][3], xbl[st][2 * nf], xbl[st][2 * nf + 1]);
+                        mma_bf16_k16(S[nf], xah[st][0], xah[st][1], xah[st][2], xah[st][3], xbh[st][2 * nf], xbh[st][2 * nf + 1]);
+                    }
+                }
             }
-            const float sc0 = m2[0] == NEG ? 0.f : m2[0], sc1 = m2[1] == NEG ? 0.f : m2[1];
-            float s2[2] = {0.f, 0.f};
+            const float mc = xmc[h];
+            float wv[8];
+#pragma unroll
+            for (int u = 0; u < 8; u++) wv[u] = xw[h][u];
+            fetchw(h ^ 1, min(bb + 1, b1 - 1));
+
+            // ---- unshifted: z = sum 2^lw', s = sum 2^lw' w
+            float z[2] = {0.f, 0.f}, s[2] = {0.f, 0.f};
 #pragma unroll
             for (int nf = 0; nf < 4; nf++)
 #pragma unroll
                 for (int c = 0; c < 4; c++) {
-                    const int h = c >> 1;
-                    s2[h] += exp2f(S[nf][c] + lcv[nf][c & 1] - (h ? sc1 : sc0));
+                    const int hr = c >> 1;
+                    const float e = exp2f(S[nf][c] + lt[4 * nf + c]);
+                    z[hr] += e;
+                    s[hr] = fmaf(e, wv[2 * nf + (c & 1)], s[hr]);
                 }
 #pragma unroll
             for (int d = 1; d <= 2; d <<= 1) {
-                s2[0] += __shfl_xor_sync(0xffffffffu, s2[0], d);
-                s2[1] += __shfl_xor_sync(0xffffffffu, s2[1], d);
+                z[0] += __shfl_xor_sync(0xffffffffu, z[0], d);
+                z[1] += __shfl_xor_sync(0xffffffffu, z[1], d);
+                s[0] += __shfl_xor_sync(0xffffffffu, s[0], d);
+                s[1] += __shfl_xor_sync(0xffffffffu, s[1], d);
             }
-            ms[0] = s2[0] > 0.f ? m2[0] : NEG;
-            ms[1] = s2[1] > 0.f ? m2[1] : NEG;
-            s[0] = s2[0];
-            s[1] = s2[1];
-        }
-        if (tq == 0) {
-            if (rA < M) part[((long)b * njt + jt) * Mp + rA] = make_float4(a[0], z[0], ms[0], s[0]);
-            if (rB < M) part[((long)b * njt + jt) * Mp + rB] = make_float4(a[1], z[1], ms[1], s[1]);
+            float a[2] = {z[0] > 0.f ? cm[0] : NEG, z[1] > 0.f ? cm[1] : NEG};
+            float ms[2] = {s[0] > 0.f ? cm[0] + mc : NEG, s[1] > 0.f ? cm[1] + mc : NEG};
+            bool needz = false, needs = false;                 // (2^-92: a row's largest term over 2^-97, so any term
+#pragma unroll                                                 //  flushed under 2^-126 is under 2^-29 of it)
+            for (int r = 0; r < 2; r++) {
+                needz |= live[r] && !(z[r] >= 0x1p-92f && z[r] <= 0x1p100f);
+                needs |= live[r] && mc > NEG && !(s[r] >= 0x1p-92f);
+            }
+            if (__any_sync(0xffffffffu, needz)) {              // (z out of range: the shifted path, a row max)
+#pragma unroll
+                for (int nf = 0; nf < 4; nf++)
+#pragma unroll
+                    for (int c = 0; c < 4; c++) S[nf][c] += lt[4 * nf + c] + cm[c >> 1];
+                float am[2] = {NEG, NEG};
+#pragma unroll
+                for (int nf = 0; nf < 4; nf++)
+#pragma unroll
+                    for (int c = 0; c < 4; c++) am[c >> 1] = fmaxf(am[c >> 1], S[nf][c]);
+#pragma unroll
+                for (int d = 1; d <= 2; d <<= 1) {
+                    am[0] = fmaxf(am[0], __shfl_xor_sync(0xffffffffu, am[0], d));
+                    am[1] = fmaxf(am[1], __shfl_xor_sync(0xffffffffu, am[1], d));
+                }
+                const float sa0 = am[0] == NEG ? 0.f : am[0], sa1 = am[1] == NEG ? 0.f : am[1];
+                z[0] = z[1] = s[0] = s[1] = 0.f;
+#pragma unroll
+                for (int nf = 0; nf < 4; nf++)
+#pragma unroll
+                    for (int c = 0; c < 4; c++) {
+                        const int hr = c >> 1;
+                        const float e = exp2f(S[nf][c] - (hr ? sa1 : sa0));
+                        z[hr] += e;
+                        s[hr] = fmaf(e, wv[2 * nf + (c & 1)], s[hr]);
+                    }
+#pragma unroll
+                for (int d = 1; d <= 2; d <<= 1) {
+                    z[0] += __shfl_xor_sync(0xffffffffu, z[0], d);
+                    z[1] += __shfl_xor_sync(0xffffffffu, z[1], d);
+                    s[0] += __shfl_xor_sync(0xffffffffu, s[0], d);
+                    s[1] += __shfl_xor_sync(0xffffffffu, s[1], d);
+                }
+                a[0] = am[0]; a[1] = am[1];
+                ms[0] = s[0] > 0.f ? am[0] + mc : NEG;
+                ms[1] = s[1] > 0.f ? am[1] + mc : NEG;
+                needs = mc > NEG && ((s[0] < 0x1p-97f && am[0] > NEG) || (s[1] < 0x1p-97f && am[1] > NEG));
+            } else if (__any_sync(0xffffffffu, needs)) {       // (z in range, s not: lw' as the shifted path has it)
+#pragma unroll
+                for (int nf = 0; nf < 4; nf++)
+#pragma unroll
+                    for (int c = 0; c < 4; c++) S[nf][c] += lt[4 * nf + c] + cm[c >> 1];
+            }
+            {
+                if (__any_sync(0xffffffffu, needs)) {          // (exactly: x' = lw' + lc' under its own max)
+                    float lcv[4][2];
+#pragma unroll
+                    for (int nf = 0; nf < 4; nf++) {
+                        const float2 v = *reinterpret_cast<const float2*>(lcs + (long)bb * Np + j0 + 8 * nf + 2 * tq);
+                        lcv[nf][0] = v.x;
+                        lcv[nf][1] = v.y;
+                    }
+                    float m2[2] = {NEG, NEG};
+#pragma unroll
+                    for (int nf = 0; nf < 4; nf++)
+#pragma unroll
+                        for (int c = 0; c < 4; c++) m2[c >> 1] = fmaxf(m2[c >> 1], S[nf][c] + lcv[nf][c & 1]);
+#pragma unroll
+                    for (int d = 1; d <= 2; d <<= 1) {
+                        m2[0] = fmaxf(m2[0], __shfl_xor_sync(0xffffffffu, m2[0], d));
+                        m2[1] = fmaxf(m2[1], __shfl_xor_sync(0xffffffffu, m2[1], d));
+                    }
+                    const float sc0 = m2[0] == NEG ? 0.f : m2[0], sc1 = m2[1] == NEG ? 0.f : m2[1];
+                    float s2[2] = {0.f, 0.f};
+#pragma unroll
+                    for (int nf = 0; nf < 4; nf++)
+#pragma unroll
+                        for (int c = 0; c < 4; c++) {
+                            const int hr = c >> 1;
+                            s2[hr] += exp2f(S[nf][c] + lcv[nf][c & 1] - (hr ? sc1 : sc0));
+                        }
+#pragma unroll
+                    for (int d = 1; d <= 2; d <<= 1) {
+                        s2[0] += __shfl_xor_sync(0xffffffffu, s2[0], d);
+                        s2[1] += __shfl_xor_sync(0xffffffffu, s2[1], d);
+                    }
+                    ms[0] = s2[0] > 0.f ? m2[0] : NEG;
+                    ms[1] = s2[1] > 0.f ? m2[1] : NEG;
+                    s[0] = s2[0];
+                    s[1] = s2[1];
+                }
+            }
+            if (tq == 0) {
+                if (rA < M) part[((long)bb * njt + jt) * Mp + rA] = make_float4(a[0], z[0], ms[0], s[0]);
+                if (rB < M) part[((long)bb * njt + jt) * Mp + rB] = make_float4(a[1], z[1], ms[1], s[1]);
+            }
         }
     }
 }
-
 
 // The bf16 backward's prologue, one launch, a grid row a sample: AF, BF (hi, lo) as the forward makes them (its
 // fragments again: nothing kept between the passes), the nodes' terms LU [B, Mp, 2] = (lu', lv') -- lu' = log2 (f /
@@ -475,7 +562,7 @@ __global__ void __launch_bounds__(256) bf_bw_prep_kernel(
         unsigned* __restrict__ BFh, unsigned* __restrict__ BFl, float* __restrict__ LU, float* __restrict__ LC,
         float* __restrict__ ef, const float* __restrict__ nflows, const float* __restrict__ nmars, long nid0,
         const float* __restrict__ lzs, const float* __restrict__ emars, const long* __restrict__ rows, int M, int N,
-        int Mp, int Np, int K, int KP, int B, int nbA, int nbB) {
+        int Mp, int Np, int K, int KP, int B, int nbA, int nbB, int Bs, int b0) {
     const int b = blockIdx.y, njt = Np / BN;
     const bool k8 = KP <= 8;
     const int KS = k8 ? 1 : KP / 16, NRA = k8 ? 2 : 4, NRB = k8 ? 4 : 8;
@@ -519,10 +606,10 @@ __global__ void __launch_bounds__(256) bf_bw_prep_kernel(
     if (o < Mp) {
         float lu = NEG, lv = NEG;
         if (o < M) {
-            const float lf = nflows[(nid0 + o) * B + b];
+            const float lf = nflows[(nid0 + o) * Bs + b0 + b];
             if (isfinite(lf)) {
-                const float lz = lzs[(long)o * B + b];
-                lu = (lf - (nmars[(nid0 + o) * B + b] + lz)) * LOG2E;
+                const float lz = lzs[(long)o * Bs + b0 + b];
+                lu = (lf - (nmars[(nid0 + o) * Bs + b0 + b] + lz)) * LOG2E;
                 lv = (lf - lz) * LOG2E;
             }
         }
@@ -533,7 +620,7 @@ __global__ void __launch_bounds__(256) bf_bw_prep_kernel(
         if (w < 32) {                                          // (slot 8 tq + 2 nf + p: child 8 nf + 2 tq + p)
             const int tq = w >> 3, nf = (w & 7) >> 1, p = w & 1, j = BN * jt + 8 * nf + 2 * tq + p;
             const long r = j < N ? rows[j] : -1;
-            v = r >= 0 ? emars[r * B + b] * LOG2E : NEG;
+            v = r >= 0 ? emars[r * Bs + b0 + b] * LOG2E : NEG;
         }
         LC[((long)b * njt + jt) * 36 + w] = v;
     } else if (o < Mp + njt * 36 + Np) {
@@ -567,7 +654,7 @@ __global__ void __launch_bounds__(128) bf_bw_kernel(
 #pragma unroll
     for (int e = 0; e < 16; e++) {
         const int nf = e >> 2, c = e & 3, i = c & 2 ? rB : rA, j = j0 + 8 * nf + 2 * tq + (c & 1);
-        lt[e] = (i < M && j < N) ? to_f(params[p0 + grid_at(i, j, Nb, cbs, bs)]) : 0.f;
+        lt[e] = theta_at(params, p0, i, j, M, N, Nb, cbs, bs);
         fp[e] = 0.f;
         tw[e] = 0.f;
     }
@@ -915,7 +1002,7 @@ __global__ void __launch_bounds__(256, 1) bf_bw2_kernel(
 #pragma unroll
         for (int e = 0; e < 32; e++) {
             const int nf = e >> 2, c = e & 3, i = c & 2 ? rB : rA, j = j0 + 8 * nf + 2 * tq + (c & 1);
-            lt[e] = (i < M && j < N) ? to_f(params[p0 + grid_at(i, j, Nb, cbs, bs)]) : 0.f;
+            lt[e] = theta_at(params, p0, i, j, M, N, Nb, cbs, bs);
             fp[e] = 0.f;
             tw[e] = 0.f;
         }
@@ -1281,7 +1368,7 @@ __global__ void __launch_bounds__(128) tf_fw_kernel(
 #pragma unroll
     for (int e = 0; e < 16; e++) {
         const int nf = e >> 2, c = e & 3, i = c & 2 ? rB : rA, j = j0 + 8 * nf + 2 * tq + (c & 1);
-        lt[e] = (i < M && j < N) ? to_f(params[p0 + grid_at(i, j, Nb, cbs, bs)]) : 0.f;
+        lt[e] = theta_at(params, p0, i, j, M, N, Nb, cbs, bs);
     }
 #pragma unroll
     for (int e = 0; e < 16; e++) lt[e] = lt[e] > 0.f ? __log2f(lt[e]) : NEG;
@@ -1494,7 +1581,7 @@ __global__ void __launch_bounds__(TNT) tf_bw_kernel(
 #pragma unroll
     for (int e = 0; e < 16; e++) {
         const int nf = e >> 2, c = e & 3, i = c & 2 ? rB : rA, j = j0 + 8 * nf + 2 * tq + (c & 1);
-        lt[e] = (i < M && j < N) ? to_f(params[p0 + grid_at(i, j, Nb, cbs, bs)]) : 0.f;
+        lt[e] = theta_at(params, p0, i, j, M, N, Nb, cbs, bs);
         fp[e] = 0.f;
         tw[e] = 0.f;
     }
@@ -1930,6 +2017,23 @@ int rank_pad(int64_t K, int least) {                          // the MMAs' ranks
     else if (GRADS) { constexpr bool FL = false, DE = false, GR = true; __VA_ARGS__; }                             \
     else { constexpr bool FL = false, DE = false, GR = false; __VA_ARGS__; }
 
+// Samples a bf16 pass takes at once: its per-sample working set `per` (bytes: the fragments hi + lo, the factors and
+// their gradients, the forward's partials) kept within the L2 -- past it the pass's traffic spills to DRAM (rank 64,
+// batch 256: the backward 1.9x the time a sample of batch 64) --, the batch split evenly over the chunks
+static int64_t sample_chunk(int64_t B, double per) {
+    constexpr int NDEV = 64;
+    static int l2s[NDEV] = {0};
+    const int dev = at::cuda::current_device();
+    int l2 = dev < NDEV ? l2s[dev] : 0;
+    if (l2 == 0) {
+        C10_CUDA_CHECK(cudaDeviceGetAttribute(&l2, cudaDevAttrL2CacheSize, dev));
+        if (dev < NDEV) l2s[dev] = l2;
+    }
+    const int64_t cmax = std::max<int64_t>(16, (int64_t)(l2 / per));
+    const int64_t nch = (B + cmax - 1) / cmax;
+    return (B + nch - 1) / nch;
+}
+
 // The forward of one node vector: its node values into `node_mars` rows `nid0..nid0 + M`; returns log Z [M, B]
 torch::Tensor exp_sum_forward(torch::Tensor A, torch::Tensor Bm, torch::Tensor params, int64_t p0, int64_t Nb,
                               int64_t cbs, int64_t bs, torch::Tensor emars, torch::Tensor rows, torch::Tensor node_mars,
@@ -1940,32 +2044,50 @@ torch::Tensor exp_sum_forward(torch::Tensor A, torch::Tensor Bm, torch::Tensor p
     const at::cuda::CUDAGuard guard(A.device());
     auto stream = at::cuda::getCurrentCUDAStream();
     const int Mp = (int)((M + TBM - 1) / TBM * TBM), Np = (int)((N + BN - 1) / BN * BN), njt = Np / BN, nit = Mp / TBM;
-    auto WF = torch::empty({B, njt, 36}, A.options());
-    auto lcs = torch::empty({B, Np}, A.options());
-    auto part = torch::empty({B, njt, Mp, 4}, A.options());
     auto lzs = torch::empty({M, B}, A.options());
-    const int z = grid_z(njt * nit, (int)B), bper = (int)((B + z - 1) / z);
-    const dim3 grid(njt, nit, (unsigned)((B + bper - 1) / bper));
-    float4* pp4 = reinterpret_cast<float4*>(part.data_ptr<float>());
     const long* rw = reinterpret_cast<const long*>(rows.data_ptr<int64_t>());
     const int nbW = (njt + 7) / 8;
-    if (bf16) {
+    if (bf16) {                                                // a chunk of samples at a time (`sample_chunk`)
         const int KPb = rank_pad(K, 8);
+        const int64_t BC = sample_chunk(B, 4.0 * (Mp + Np) * KPb + 4.0 * K * (M + N) + 16.0 * njt * Mp);
         const long na = (long)Mp * KPb / 2, nb = (long)Np * KPb / 2;
-        auto AF = torch::empty({2, B, na}, A.options().dtype(torch::kInt32));
-        auto BF = torch::empty({2, B, nb}, A.options().dtype(torch::kInt32));
+        auto WF = torch::empty({BC, njt, 36}, A.options());
+        auto lcs = torch::empty({BC, Np}, A.options());
+        auto part = torch::empty({BC, njt, Mp, 4}, A.options());
+        auto AF = torch::empty({2, BC, na}, A.options().dtype(torch::kInt32));
+        auto BF = torch::empty({2, BC, nb}, A.options().dtype(torch::kInt32));
+        float4* pp4 = reinterpret_cast<float4*>(part.data_ptr<float>());
         unsigned* afh = reinterpret_cast<unsigned*>(AF.data_ptr<int>());
         unsigned* bfh = reinterpret_cast<unsigned*>(BF.data_ptr<int>());
         const int nbA = (int)((na + 255) / 256), nbB = (int)((nb + 255) / 256);
-        bf_fw_prep_kernel<<<dim3(nbA + nbB + nbW, (unsigned)B), 256, 0, stream>>>(
-            A.data_ptr<float>(), Bm.data_ptr<float>(), afh, afh + B * na, bfh, bfh + B * nb, WF.data_ptr<float>(),
-            lcs.data_ptr<float>(), emars.data_ptr<float>(), rw, (int)M, (int)N, Mp, Np, (int)K, KPb, (int)B, nbA, nbB);
-        C10_CUDA_KERNEL_LAUNCH_CHECK();
-        EXP_SUM_KP_SWITCH(KPb, if constexpr (KP >= 8) { EXP_SUM_TP_SWITCH(params,
-            bf_fw_kernel<KP, TP><<<grid, 128, 0, stream>>>(afh, afh + B * na, bfh, bfh + B * nb, pp, p0, (int)Nb,
-                                                            (int)cbs, (int)bs, WF.data_ptr<float>(), lcs.data_ptr<float>(),
-                                                            pp4, (int)M, (int)N, Mp, Np, (int)B, bper)) })
-    } else {
+        for (int64_t b0 = 0; b0 < B; b0 += BC) {
+            const int Bc = (int)std::min<int64_t>(BC, B - b0);
+            const int z = grid_z(njt * nit, Bc), bper = (Bc + z - 1) / z;
+            const dim3 grid(njt, nit, (unsigned)((Bc + bper - 1) / bper));
+            bf_fw_prep_kernel<<<dim3(nbA + nbB + nbW, (unsigned)Bc), 256, 0, stream>>>(
+                A.data_ptr<float>() + b0 * M * K, Bm.data_ptr<float>() + b0 * K * N, afh, afh + BC * na, bfh,
+                bfh + BC * nb, WF.data_ptr<float>(), lcs.data_ptr<float>(), emars.data_ptr<float>(), rw, (int)M, (int)N,
+                Mp, Np, (int)K, KPb, Bc, nbA, nbB, (int)B, (int)b0);
+            C10_CUDA_KERNEL_LAUNCH_CHECK();
+            EXP_SUM_KP_SWITCH(KPb, if constexpr (KP >= 8) { EXP_SUM_TP_SWITCH(params,
+                bf_fw2_kernel<KP, TP><<<grid, 128, 0, stream>>>(afh, afh + BC * na, bfh, bfh + BC * nb, pp, p0, (int)Nb,
+                                                                 (int)cbs, (int)bs, WF.data_ptr<float>(), lcs.data_ptr<float>(),
+                                                                 pp4, (int)M, (int)N, Mp, Np, Bc, bper)) })
+            C10_CUDA_KERNEL_LAUNCH_CHECK();
+            fw_comb_kernel<<<(unsigned)((4L * Bc * M + 127) / 128), 128, 0, stream>>>(pp4, njt, node_mars.data_ptr<float>(),
+                                                                                    nid0, lzs.data_ptr<float>(), (int)M, Mp,
+                                                                                    Bc, (int)B, (int)b0);
+            C10_CUDA_KERNEL_LAUNCH_CHECK();
+        }
+        return lzs;
+    }
+    auto WF = torch::empty({B, njt, 36}, A.options());
+    auto lcs = torch::empty({B, Np}, A.options());
+    auto part = torch::empty({B, njt, Mp, 4}, A.options());
+    const int z = grid_z(njt * nit, (int)B), bper = (int)((B + z - 1) / z);
+    const dim3 grid(njt, nit, (unsigned)((B + bper - 1) / bper));
+    float4* pp4 = reinterpret_cast<float4*>(part.data_ptr<float>());
+    {
         const int KPf = rank_pad(K, 4), lkp = __builtin_ctz((unsigned)KPf);
         auto AF = torch::empty({B, (long)Mp * KPf}, A.options());
         auto BF = torch::empty({B, (long)Np * KPf}, A.options());
@@ -1981,7 +2103,7 @@ torch::Tensor exp_sum_forward(torch::Tensor A, torch::Tensor Bm, torch::Tensor p
     }
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     fw_comb_kernel<<<(unsigned)((4 * B * M + 127) / 128), 128, 0, stream>>>(pp4, njt, node_mars.data_ptr<float>(), nid0,
-                                                                         lzs.data_ptr<float>(), (int)M, Mp, (int)B);
+                                                                         lzs.data_ptr<float>(), (int)M, Mp, (int)B, (int)B, 0);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return lzs;
 }
@@ -2056,33 +2178,39 @@ void exp_sum_backward(torch::Tensor A, torch::Tensor Bm, torch::Tensor params, i
         if (KPb >= 16) {                                       // ranks 9 .. 64: the big tiles (`bf_bw2_kernel`)
             const int Mp2 = (int)((M + TM2 - 1) / TM2 * TM2), Np2 = (int)((N + TN2 - 1) / TN2 * TN2), njt2 = Np2 / BN;
             const int nct = Np2 / TN2, nit2 = Mp2 / TM2;
+            const int64_t BC = sample_chunk(B, 4.0 * (Mp2 + Np2) * KPb + 8.0 * K * (M + N));   // (a chunk of samples at a time)
             const long na2 = (long)Mp2 * KPb / 2, nb2 = (long)Np2 * KPb / 2;
-            auto AF2 = torch::empty({2, B, na2}, A.options().dtype(torch::kInt32));
-            auto BF2 = torch::empty({2, B, nb2}, A.options().dtype(torch::kInt32));
-            auto LU2 = torch::empty({B, Mp2, 2}, A.options());
-            auto LC2 = torch::empty({B, njt2, 36}, A.options());
-            auto efs2 = torch::empty({B, Np2}, A.options());
+            auto AF2 = torch::empty({2, BC, na2}, A.options().dtype(torch::kInt32));
+            auto BF2 = torch::empty({2, BC, nb2}, A.options().dtype(torch::kInt32));
+            auto LU2 = torch::empty({BC, Mp2, 2}, A.options());
+            auto LC2 = torch::empty({BC, njt2, 36}, A.options());
+            auto efs2 = torch::empty({BC, Np2}, A.options());
             unsigned* afh2 = reinterpret_cast<unsigned*>(AF2.data_ptr<int>());
             unsigned* bfh2 = reinterpret_cast<unsigned*>(BF2.data_ptr<int>());
             const int nbA2 = (int)((na2 + 255) / 256), nbB2 = (int)((nb2 + 255) / 256);
             const int nT2 = (Mp2 + njt2 * 36 + Np2 + 255) / 256;
-            bf_bw_prep_kernel<<<dim3(nbA2 + nbB2 + nT2, (unsigned)B), 256, 0, stream>>>(
-                A.data_ptr<float>(), Bm.data_ptr<float>(), afh2, afh2 + B * na2, bfh2, bfh2 + B * nb2, LU2.data_ptr<float>(),
-                LC2.data_ptr<float>(), efs2.data_ptr<float>(), node_flows.data_ptr<float>(), node_mars.data_ptr<float>(),
-                nid0, lzs.data_ptr<float>(), emars.data_ptr<float>(), rw, (int)M, (int)N, Mp2, Np2, (int)K, KPb, (int)B,
-                nbA2, nbB2);
-            C10_CUDA_KERNEL_LAUNCH_CHECK();
-            float* ga2 = grads ? gA.data_ptr<float>() : nullptr;
-            float* gb2 = grads ? gB.data_ptr<float>() : nullptr;
-            const long units = (long)nit2 * nct * B;
-            EXP_SUM_KP_SWITCH(KPb, if constexpr (KP >= 16) { EXP_SUM_TP_SWITCH(params, EXP_SUM_FLAGS_SWITCH(flows, dn, grads,
-                launch_bf_bw2<KP, TP, FL, DE, GR>(stream, afh2, afh2 + B * na2, bfh2, bfh2 + B * nb2, pp, p0, (int)Nb,
-                    (int)cbs, (int)bs, LU2.data_ptr<float>(), LC2.data_ptr<float>(), efs2.data_ptr<float>(), pf, pf0, dnp,
-                    dn0, ga2, gb2, (int)M, (int)N, Mp2, Np2, (int)K, (int)B, nct, units, (int)zsplit))) })
-            C10_CUDA_KERNEL_LAUNCH_CHECK();
-            ef_epi_kernel<<<(unsigned)((((long)N << lb) + 255) / 256), 256, 0, stream>>>(
-                efs2.data_ptr<float>(), rw, element_flows.data_ptr<float>(), (int)N, Np2, (int)B, lb);
-            C10_CUDA_KERNEL_LAUNCH_CHECK();
+            for (int64_t b0 = 0; b0 < B; b0 += BC) {
+                const int Bc = (int)std::min<int64_t>(BC, B - b0);
+                int lbc = 0;
+                while ((1 << lbc) < Bc) lbc++;
+                bf_bw_prep_kernel<<<dim3(nbA2 + nbB2 + nT2, (unsigned)Bc), 256, 0, stream>>>(
+                    A.data_ptr<float>() + b0 * M * K, Bm.data_ptr<float>() + b0 * K * N, afh2, afh2 + BC * na2, bfh2,
+                    bfh2 + BC * nb2, LU2.data_ptr<float>(), LC2.data_ptr<float>(), efs2.data_ptr<float>(),
+                    node_flows.data_ptr<float>(), node_mars.data_ptr<float>(), nid0, lzs.data_ptr<float>(),
+                    emars.data_ptr<float>(), rw, (int)M, (int)N, Mp2, Np2, (int)K, KPb, Bc, nbA2, nbB2, (int)B, (int)b0);
+                C10_CUDA_KERNEL_LAUNCH_CHECK();
+                float* ga2 = grads ? gA.data_ptr<float>() + b0 * M * K : nullptr;
+                float* gb2 = grads ? gB.data_ptr<float>() + b0 * K * N : nullptr;
+                const long units = (long)nit2 * nct * Bc;
+                EXP_SUM_KP_SWITCH(KPb, if constexpr (KP >= 16) { EXP_SUM_TP_SWITCH(params, EXP_SUM_FLAGS_SWITCH(flows, dn, grads,
+                    launch_bf_bw2<KP, TP, FL, DE, GR>(stream, afh2, afh2 + BC * na2, bfh2, bfh2 + BC * nb2, pp, p0, (int)Nb,
+                        (int)cbs, (int)bs, LU2.data_ptr<float>(), LC2.data_ptr<float>(), efs2.data_ptr<float>(), pf, pf0,
+                        dnp, dn0, ga2, gb2, (int)M, (int)N, Mp2, Np2, (int)K, Bc, nct, units, (int)zsplit))) })
+                C10_CUDA_KERNEL_LAUNCH_CHECK();
+                ef_epi_kernel<<<(unsigned)((((long)N << lbc) + 255) / 256), 256, 0, stream>>>(
+                    efs2.data_ptr<float>(), rw, element_flows.data_ptr<float>(), (int)N, Np2, Bc, lbc, (int)B, (int)b0);
+                C10_CUDA_KERNEL_LAUNCH_CHECK();
+            }
             return;
         }
         // ranks to 8 (`bf_bw_kernel`)
@@ -2098,7 +2226,8 @@ void exp_sum_backward(torch::Tensor A, torch::Tensor Bm, torch::Tensor params, i
         bf_bw_prep_kernel<<<dim3(nbA + nbB + nT, (unsigned)B), 256, 0, stream>>>(
             A.data_ptr<float>(), Bm.data_ptr<float>(), afh, afh + B * na, bfh, bfh + B * nb, LU.data_ptr<float>(),
             LC.data_ptr<float>(), efs.data_ptr<float>(), node_flows.data_ptr<float>(), node_mars.data_ptr<float>(), nid0,
-            lzs.data_ptr<float>(), emars.data_ptr<float>(), rw, (int)M, (int)N, Mp, Np, (int)K, KPb, (int)B, nbA, nbB);
+            lzs.data_ptr<float>(), emars.data_ptr<float>(), rw, (int)M, (int)N, Mp, Np, (int)K, KPb, (int)B, nbA, nbB,
+            (int)B, 0);
         C10_CUDA_KERNEL_LAUNCH_CHECK();
         float* ga = grads ? gA.data_ptr<float>() : nullptr;
         float* gb = grads ? gB.data_ptr<float>() : nullptr;
@@ -2108,7 +2237,7 @@ void exp_sum_backward(torch::Tensor A, torch::Tensor Bm, torch::Tensor params, i
                 dnp, dn0, ga, gb, (int)M, (int)N, Mp, Np, (int)K, (int)B, bper))) })
         C10_CUDA_KERNEL_LAUNCH_CHECK();
         ef_epi_kernel<<<(unsigned)((((long)N << lb) + 255) / 256), 256, 0, stream>>>(
-            efs.data_ptr<float>(), rw, element_flows.data_ptr<float>(), (int)N, Np, (int)B, lb);
+            efs.data_ptr<float>(), rw, element_flows.data_ptr<float>(), (int)N, Np, (int)B, lb, (int)B, 0);
         C10_CUDA_KERNEL_LAUNCH_CHECK();
         return;
     }
