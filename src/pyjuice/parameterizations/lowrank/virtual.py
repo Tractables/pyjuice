@@ -400,6 +400,11 @@ def _above(layer, kwargs, node_mars, element_mars):
 _STREAM = "unset"
 #: The most split ranges a row of the fused stream forward's GEMM takes (`lowrank_stream.cu`'s MAX_SPLIT)
 _STREAM_MAX_SPLIT = 12
+#: The pass's end forms its products' bf16 operands from the exponentials the pass keeps (`lowrank_kept_operands`:
+#: the backward's `exp(A - shift)`, the forward's V), not from the factors (`lowrank_data_operands`'s shifts and
+#: operands, `lowrank_u_operand`)
+KEPT_OPERANDS = True
+
 #: The tuner's code of the one-launch form (`lowrank_forward_om`); the pre-pass chain's arms are config id * 16 + split
 _OM_ARM = 4096
 
@@ -730,11 +735,13 @@ def _end_of_pass(mod, z, copies, node_flows, node_mars, params, param_flows, den
     The normalizer half: `W = U^T V` into the denominator statistic (the first copy's slice: `materialize_denom_flows`
     sums the copies'), `V * (U theta)` off the `dB` of each copy whose backward did not take it off already (`copies`'
     last entry: the one-launch form, `lowrank_backward_om`, does), `V` and the rows the forward's (`z`,
-    `_normalizers`). The
-    data half: `F+ = theta * (U^T V)`, `theta` read from `params` where they lie, for the copies whose product layer was
-    fused in (`copies`' last entry; another's plain backward has added its flows), into the first of them's flow block:
-    the blocks of a source's copies are summed before the parameters read them, as those of the plain kernels.
-    (`copies`: one source's, of one parameterization: its rank, its denominator or none.)"""
+    `_normalizers`). The data half: `F+ = theta * (U^T V)`, `theta` read from `params` where they lie, for the copies
+    whose product layer was fused in (`copies`' fifth entry; another's plain backward has added its flows), into the
+    first of them's flow block: the blocks of a source's copies are summed before the parameters read them, as those of
+    the plain kernels. The operands: at bf16, from the exponentials the pass keeps -- the backward's `exp(A - shift)`
+    (`_a_rows`) and the forward's V -- in one launch (`lowrank_kept_operands`); else from the factors
+    (`lowrank_data_operands`, `lowrank_u_operand`). (`copies`: one source's, of one parameterization: its rank, its
+    denominator or none.)"""
     layer0, info0 = copies[0][0], copies[0][1]
     desc, K = layer0.parameterization, layer0.parameterization.rank
     dev = node_flows.device
@@ -742,28 +749,43 @@ def _end_of_pass(mod, z, copies, node_flows, node_mars, params, param_flows, den
     M, N = geo["M"], geo["N"]
     fp = [] if param_flows is None else [c for c in copies if c[5] is not None]
     dtype = _dtype(precision, len(z["fb"]) * batch * K * M * N)
-
-    if fp:
-        rows = len(fp) * batch * K
-        Ud, Vd = torch.empty(M, rows, dtype = dtype, device = dev), torch.empty(N, rows, dtype = dtype, device = dev)
-        mod.lowrank_data_operands(Ud, Vd, node_flows, node_mars, [c[2][0] for c in fp], [c[3] for c in fp],
-                                  [c[2][1] for c in fp], [c[1].nid_start for c in fp],
-                                  [desc._geometry(c[0], c[1], dev)["rows"] for c in fp], [c[5][0] for c in fp],
-                                  [c[5][1] for c in fp], M, K)
-        desc._scatter_add(geo, param_flows, fp[0][1].ns._param_flow_range[0], _product(Ud, Vd.t(), dtype), params)
-
-    if not (want_denom or want_grads):
-        return
-    Vt, shift = (z["V"], z["shift"]) if dtype is z["dtype"] else _v_rows(mod, z["fb"], N, K, batch, dtype, dev)
     # The copies whose rows of U are read: every one for W; else those whose dB's normalizer half is still owed (their
     # backward did not take it off), U's other rows not made. (A copy the forward was given that did not come through
     # here: no rows of U, so nothing of it in W.)
     owed = [c for c in copies if c[4] is not None and not c[6]] if want_grads else []
     rows_of = copies if want_denom else owed
+    if not (fp or rows_of):
+        return
+    cols = batch * K
+    kept = KEPT_OPERANDS and dtype is torch.bfloat16 and z["dtype"] is torch.bfloat16
+    Vt, shift = (z["V"], z["shift"]) if dtype is z["dtype"] else _v_rows(mod, z["fb"], N, K, batch, dtype, dev)
     zeros = want_denom and len(copies) < len(z["row"])
-    Ut = (torch.zeros if zeros else torch.empty)(M, Vt.size(1), dtype = dtype, device = dev)
-    mod.lowrank_u_operand(Ut, shift, node_flows, [c[2][0] for c in rows_of], [c[3] for c in rows_of],
-                          [c[1].nid_start for c in rows_of], [z["row"][c[1].ns] for c in rows_of], M, K)
+    Ut = (torch.zeros if zeros else torch.empty)(M, Vt.size(1), dtype = dtype, device = dev) if rows_of else None
+    Ud = Vd = None
+    if fp:
+        Ud = torch.empty(M, len(fp) * cols, dtype = dtype, device = dev)
+        Vd = torch.empty(N, len(fp) * cols, dtype = dtype, device = dev)
+    if kept:
+        ua, sha = _a_rows(mod, z, batch, K, dev)
+        at = {id(c): k * cols for k, c in enumerate(fp)}
+        un = {id(c) for c in rows_of}
+        sel = [c for c in copies if id(c) in at or id(c) in un]
+        geos = [desc._geometry(c[0], c[1], dev)["rows"] if id(c) in at else None for c in sel]
+        mod.lowrank_kept_operands(Ud, Vd, Ut, ua, sha, Vt, shift, node_flows, node_mars, [c[3] for c in sel],
+                                  [c[1].nid_start for c in sel], geos, [c[5][0] if id(c) in at else None for c in sel],
+                                  [c[5][1] if id(c) in at else 0 for c in sel], [z["row"][c[1].ns] for c in sel],
+                                  [at.get(id(c), -1) for c in sel], [int(id(c) in un) for c in sel], M, K)
+    else:
+        if fp:
+            mod.lowrank_data_operands(Ud, Vd, node_flows, node_mars, [c[2][0] for c in fp], [c[3] for c in fp],
+                                      [c[2][1] for c in fp], [c[1].nid_start for c in fp],
+                                      [desc._geometry(c[0], c[1], dev)["rows"] for c in fp], [c[5][0] for c in fp],
+                                      [c[5][1] for c in fp], M, K)
+        if rows_of:
+            mod.lowrank_u_operand(Ut, shift, node_flows, [c[2][0] for c in rows_of], [c[3] for c in rows_of],
+                                  [c[1].nid_start for c in rows_of], [z["row"][c[1].ns] for c in rows_of], M, K)
+    if fp:
+        desc._scatter_add(geo, param_flows, fp[0][1].ns._param_flow_range[0], _product(Ud, Vd.t(), dtype), params)
     if want_denom:
         desc._scatter_add(geo, denom_param_flows, desc._denom_offsets(layer0)[id(info0.ns)][0],
                           _product(Ut, Vt.t(), dtype))
@@ -772,7 +794,7 @@ def _end_of_pass(mod, z, copies, node_flows, node_mars, params, param_flows, den
         if len(owed) == len(z["row"]):
             Gt = _product(theta.t(), Ut, dtype)                              # [N, rows]: (U theta)^T
         else:                                                                # (the owed copies' rows alone)
-            Gt, cols = torch.empty(N, Vt.size(1), device = dev), batch * K
+            Gt = torch.empty(N, Vt.size(1), device = dev)
             for c in owed:
                 a = z["row"][c[1].ns]
                 Gt[:, a:a + cols] = _product(theta.t(), Ut[:, a:a + cols], dtype)

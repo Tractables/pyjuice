@@ -1415,7 +1415,9 @@ def _plain_backwards(monkeypatch):
 
 
 def _normalizer_calls(monkeypatch):
-    """Counts the calls of the normalizer half's operand kernel, with the rows of each (copies x batch x rank)."""
+    """Counts the calls of the normalizer half's operand kernel -- from the factors (`lowrank_u_operand`) or from the
+    exponentials the pass keeps (`lowrank_kept_operands`, its U given) --, with the rows of each (copies x batch x
+    rank)."""
     import pyjuice.parameterizations.lowrank.virtual as lowrank_virtual
 
     real, calls = lowrank_virtual._module, []
@@ -1423,6 +1425,12 @@ def _normalizer_calls(monkeypatch):
     class Counted:
         def __getattr__(self, attr):
             fn = getattr(real(), attr)
+            if attr == "lowrank_kept_operands":
+                def kept(Ud, Vd, Un, *args):
+                    if Un is not None:
+                        calls.append((Un.size(1), Un.dtype))
+                    return fn(Ud, Vd, Un, *args)
+                return kept
             if attr != "lowrank_u_operand":
                 return fn
 
@@ -2296,11 +2304,12 @@ def test_the_parameter_flows_of_fused_layers_are_one_matrix_product(name, source
     class Counted:
         def __getattr__(self, attr):
             fn = getattr(real(), attr)
-            if attr != "lowrank_data_operands":
+            if attr not in ("lowrank_data_operands", "lowrank_kept_operands"):
                 return fn
 
-            def counted(Ut, Vt, *args):
-                calls.append((Ut.size(1), Ut.dtype))
+            def counted(Ut, Vt, *args):                          # (the data half's U: from the factors, or kept)
+                if Ut is not None:
+                    calls.append((Ut.size(1), Ut.dtype))
                 return fn(Ut, Vt, *args)
             return counted
 
@@ -2434,6 +2443,89 @@ def test_the_data_operands_follow_their_formulas(M, N, K, B, copies):
         assert all(float(Ut[0, B * K + 3 * K + r]) == 0.0 for r in range(K))
         assert float(Vt[1, :B * K].abs().max()) == 0.0
         assert float(Vt[:, K + 1].abs().max()) == 0.0 and float(Ut[:, K + 1].abs().max()) == 0.0
+
+
+@needs_virtual
+@pytest.mark.parametrize("M, N, K, B, copies", [(3, 300, 2, 37, 2),     # children past one warp's share, ragged runs
+                                                (6, 40, 16, 4, 3),      # whole 16-byte runs
+                                                (5, 3, 3, 4, 70)])      # few children, copies past one launch's
+def test_the_kept_operands_follow_their_formulas(M, N, K, B, copies):
+    """`lowrank_kept_operands`, the pass's end from the exponentials the pass keeps -- `Ua = exp(A - shA)`
+    (`lowrank_a_operand`) and `Vt = exp(B - shB)` (`lowrank_z_operand`), bf16 --, checked directly: on every row (copy,
+    b, r), `Ud[i] Vd[j] = f_b[i] exp(A[i, r, b] + B[r, j, b]) c_b[j] / S_b[i]` for the copies with a data half (their rows
+    of Ud / Vd in their own order), `Un[i] Vt[j] = f_b[i] exp(A[i, r, b] + B[r, j, b]) / Z_b[i]` for those whose U is
+    asked for, `c_b[j]` the product's two children's node values, `log S = node_mars + log Z`; Vd <= 1. A child no edge
+    reaches, a child without mass, a node without flow, mass or normalizer, a rank without mass: 0, never NaN; the rows
+    no copy writes untouched."""
+    import pyjuice.parameterizations.lowrank.virtual as lowrank_virtual
+
+    mod, dev = lowrank_virtual._module(), torch.device("cuda")
+    g = torch.Generator(device = "cpu").manual_seed(13)
+    children = 13
+    fa = [(torch.randn(M, K, B, generator = g) * 2).to(dev) for _ in range(copies)]
+    fb = [(torch.randn(K, N, B, generator = g) * 2).to(dev) for _ in range(copies)]
+    lz = [(torch.randn(M, B, generator = g) * 2).to(dev) for _ in range(copies)]
+    rows = children + copies * M
+    node_flows = (torch.randn(rows, B, generator = g) - 1.0).to(dev)
+    node_mars = (torch.randn(rows, B, generator = g) - 3.0).to(dev)
+    nid0 = [children + c * M for c in range(copies)]
+    first, elements = 5, N + 7
+    table = torch.randint(0, children, (elements, 2), generator = g, dtype = torch.int32).to(dev)
+    eids = [(first + torch.randperm(elements, generator = g)[:N]).to(dev) for _ in range(copies)]
+    eids[0][1] = -1                                                    # copy 0, child 1: no edge reaches it
+    node_mars[int(table[int(eids[0][0]) - first, 0]), 2] = -float("inf")   # a child without mass (and whatever shares its row)
+    node_flows[nid0[0] + 1, 2] = -float("inf")                         # copy 0, node 1, sample 2: no flow
+    node_mars[nid0[1] + 0, 3 % B] = -float("inf")                      # copy 1, node 0: no mass
+    node_mars[nid0[0] + M - 1, 3 % B] = -float("inf")                  # copy 0 (a data half), its last node: no mass
+    lz[1][M - 1, 1] = -float("inf")                                    # copy 1, its last node, sample 1: no normalizer
+    fb[0][1 % K, :, 1] = -float("inf")                                 # copy 0, a rank without mass at sample 1
+
+    total = copies * B * K
+    Ua = torch.empty(M, total, dtype = torch.bfloat16, device = dev)
+    sha = torch.empty(total, device = dev)
+    Vt = torch.empty(N, total, dtype = torch.bfloat16, device = dev)
+    shb = torch.empty(total, device = dev)
+    mod.lowrank_a_operand(Ua, sha, fa, B, K)
+    mod.lowrank_z_operand(Vt, shb, fb, B, K)
+    data = [c for c in range(copies) if c != 1]                        # (copy 1: no data half)
+    want_un = [c for c in range(copies) if c != 0]                     # (copy 0: no U asked for)
+    drow0 = [data.index(c) * B * K if c in data else -1 for c in range(copies)]
+    Ud = torch.full((M, len(data) * B * K), float("nan"), dtype = torch.bfloat16, device = dev)
+    Vd = torch.full((N, len(data) * B * K), float("nan"), dtype = torch.bfloat16, device = dev)
+    Un = torch.full((M, total), float("nan"), dtype = torch.bfloat16, device = dev)
+    mod.lowrank_kept_operands(Ud, Vd, Un, Ua, sha, Vt, shb, node_flows, node_mars, lz, nid0,
+                              [eids[c] if c in data else None for c in range(copies)],
+                              [table if c in data else None for c in range(copies)], [first] * copies,
+                              [c * B * K for c in range(copies)], drow0, [int(c in want_un) for c in range(copies)], M, K)
+    torch.cuda.synchronize()
+    assert torch.isfinite(Ud.float()).all() and torch.isfinite(Vd.float()).all()
+    assert float(Vd.float().max()) <= 1.0
+    for c in range(copies):
+        has = eids[c] >= 0
+        at = (eids[c].clamp_min(first) - first).long()
+        cv = node_mars[table[at, 0].long()] + node_mars[table[at, 1].long()]    # [N, B]
+        cv = torch.where(has[:, None], cv, torch.full_like(cv, -float("inf"))).double()
+        lf = node_flows[nid0[c]:nid0[c] + M].double()
+        ls = node_mars[nid0[c]:nid0[c] + M].double() + lz[c].double()
+        for r in range(K):
+            row = c * B * K + torch.arange(B, device = dev) * K + r
+            a, bb = fa[c][:, r].double(), fb[c][r].double()            # [M, B], [N, B]
+            if c in want_un:
+                want = torch.exp((lf + a - lz[c].double())[:, None] + bb[None])   # [M, N, B]
+                dead = (torch.isneginf(lf) | torch.isinf(lz[c].double()))[:, None] | torch.isneginf(bb)[None]
+                want = torch.where(dead, torch.zeros_like(want), want)
+                got = Un[:, row].double()[:, None] * Vt[:, row].double()[None]
+                assert torch.allclose(got, want, rtol = 3e-2, atol = 1e-30), f"Un: copy {c}, rank {r}"
+            else:
+                assert torch.isnan(Un[:, row].float()).all(), f"Un: copy {c}'s rows written"
+            if c in data:
+                d = data.index(c) * B * K + torch.arange(B, device = dev) * K + r
+                want = torch.exp((lf + a - ls)[:, None] + (cv + bb)[None])
+                dead = (torch.isneginf(lf) | torch.isneginf(ls))[:, None] | torch.isneginf(cv + bb)[None]
+                want = torch.where(dead, torch.zeros_like(want), want)
+                got = Ud[:, d].double()[:, None] * Vd[:, d].double()[None]
+                assert torch.allclose(got, want, rtol = 3e-2, atol = 1e-30), f"Ud Vd: copy {c}, rank {r}"
+    assert torch.isfinite(Un[:, B * K:].float()).all()
 
 
 @needs_virtual
