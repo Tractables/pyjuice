@@ -313,5 +313,5 @@ class LowRank(_ForwardMixin, _BackwardMixin, _DenominatorsMixin, SumParameteriza
     def drop_device_caches(self, layer) -> None:
         super().drop_device_caches(layer)
         for name in ("_lr_geometry", "_lr_state", "_lr_denom_offsets", "_lrv_state", "_lrv_disjoint", "_lrv_link",
-                     "_lrv_want", "_lrv_wasted", "_lrv_twin"):
+                     "_lrv_want", "_lrv_wasted", "_lrv_twin", "_lrv_stream", "_lrv_stream_bk", "_lrv_kd"):
             layer.__dict__.pop(name, None)

@@ -81,3 +81,42 @@ def get_exp_sum_module():
             "The low-rank exp_sum form keeps its torch passes.", RuntimeWarning)
         _exp_sum_module = None
     return _exp_sum_module
+
+
+_stream_module = None
+_stream_attempted = False
+
+
+def get_lowrank_stream_module():
+    """The "sum_exp" form's forward over the virtual batch, the virtual child values never stored -- the `expand` fused
+    into the stream kernel's pre-pass, or the whole layer one launch (`lowrank_stream.cu`: CuTe and TMA, the sum-layer
+    kernels' toolchain) --, or None if unavailable (warns once): the virtual batch then keeps the plain path
+    (`lowrank_expand`, the twin's forward)."""
+    global _stream_module, _stream_attempted
+
+    if _stream_attempted:
+        return _stream_module
+
+    _stream_attempted = True
+
+    if not ENABLE_CUDA_KERNELS:
+        return None
+
+    from pyjuice.layer.kernels.c import _compile_flags as _cute_flags
+    flags = _cute_flags()
+    if flags is None:
+        return None
+    cuda_cflags, ldflags = flags
+
+    from pyjuice.utils.cuda_ext import jit_load
+    try:
+        _stream_module = jit_load(
+            "pyjuice_lowrank_stream_cuda",
+            sources = [os.path.join(_THIS_DIR, "lowrank_stream.cu")],
+            extra_cuda_cflags = cuda_cflags, extra_ldflags = ldflags, verbose = False)
+    except Exception as e:
+        warnings.warn(
+            f"pyjuice CUDA kernel 'pyjuice_lowrank_stream_cuda' failed to compile ({type(e).__name__}: {e}). "
+            "The low-rank mixture's virtual batch keeps its plain path.", RuntimeWarning)
+        _stream_module = None
+    return _stream_module
