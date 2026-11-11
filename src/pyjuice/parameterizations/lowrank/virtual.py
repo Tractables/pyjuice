@@ -56,8 +56,8 @@ _EXTERNAL_PARAMS_GRAD_KWARG = "sum_external_params_grad"
 #: formed in the GEMM -- rank 16, B % 4 == 0, the normalizers in bf16; a layer of one node vector, bf16 parameters)
 FUSED_STREAM = True
 #: `False`: a backward through the virtual batch keeps the plain path where the one-launch backward would serve
-#: (`kernels/c/lowrank_stream.cu`'s `lr_om_bw_kernel`: the data half's element flows, dB's data half and, in the grid's
-#: free SMs, dA, one launch a layer; a layer of one node vector -- the product layer below handed to the backward (its
+#: (`kernels/c/lowrank_stream.cu`'s `lr_om_bw_kernel`: the data half's element flows, dB's data half and, by the grid's
+#: first CTAs, dA, one launch a layer; a layer of one node vector -- the product layer below handed to the backward (its
 #: children's node flows written) or not (the element flows written; the layer's children's values kept for the
 #: pass's end's parameter flows) --, rank 16, B % 4 == 0, bf16 parameters). MEASURED (HMM 1024 x 31, rank 16, backward
 #: wall, plain -> one launch): B16 1.83 -> 1.55 ms, B64 4.13 -> 3.57, B256 15.09 -> 13.73
@@ -1043,7 +1043,7 @@ def backward(desc, layer, ns_tensors, ns_grad_tensors, node_flows, element_flows
             if kids is not None and plan["orphans"] is not None:
                 kids[plan["orphans"]] = -float("inf")                   # (a child no edge reaches: no value)
         for at, part in enumerate(plan["parts"]):
-            # (dA by the first partition's launch, in its grid's free SMs)
+            # (dA by the first partition's launch: its grid's first CTAs)
             da = grads is not None and at == 0
             smod.lowrank_backward_om(out, vals, table, first, fb, plan["jrow"], plan["e_lo"],
                                      None if grads is None else grads[1], ua, row0, sha, node_flows, node_mars, lz,

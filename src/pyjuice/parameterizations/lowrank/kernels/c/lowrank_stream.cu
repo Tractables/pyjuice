@@ -64,6 +64,17 @@ using namespace cute;
 // sign flipped -- the keys' integer maximum (one `redux` across a warp) is the key of the floats' maximum
 __device__ __forceinline__ int fkey(float x) { const int b = __float_as_int(x); return b ^ ((b >> 31) & 0x7fffffff); }
 __device__ __forceinline__ float fkey_inv(int k) { return __int_as_float(k ^ ((k >> 31) & 0x7fffffff)); }
+// The one-launch kernels' tile `blk` of the grid's `nbt` sample tiles x `nmt` node (child) tiles, in GROUPS of `nbg`
+// sample tiles, node-tile-major inside a group: the tiles of one sample tile -- the readers of its operand rows (V and
+// the values; Ua and the flows) -- are `nbg` blocks apart, so the rows the first of them drew from DRAM are still in
+// the L2 for the others (in the grid's plain order they are `nbt` apart: 512 at a batch of 2048). `nbg >= nbt`: one
+// group, the plain order.
+__device__ __forceinline__ void tile_of(int blk, int nbt, int nmt, int nbg, int& pid_b, int& pid_m) {
+    if (nbg >= nbt) { pid_b = blk % nbt; pid_m = blk / nbt; return; }
+    const int per = nbg * nmt, g = blk / per, rem = blk - g * per;
+    const int cur = min(nbg, nbt - g * nbg);             // (the last group: the rest)
+    pid_m = rem / cur; pid_b = g * nbg + rem % cur;
+}
 __device__ __forceinline__ void cpa16(uint32_t smem, const void* gmem) {
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(smem), "l"(gmem) : "memory");
 }
@@ -456,7 +467,7 @@ __global__ void __launch_bounds__(OM_THREADS, 1) lr_om_kernel(
         const int* __restrict__ cbase, const int* __restrict__ jpos, const int* __restrict__ ugrp, int knt, int mtiles,
         int block_size, int B, float* __restrict__ vnm, const long* __restrict__ nids, int num_edges,
         const __grid_constant__ CUtensorMap tmapA, const float* __restrict__ fa, long a_sb, float* node_mars,
-        float* __restrict__ lz, long nshift, long vn0) {
+        float* __restrict__ lz, long nshift, long vn0, int nbg) {
     constexpr int BM = OM_BM, BN = OM_BN, K = OM_K, WM = 4, WN = 2;
     constexpr int KT = 32, NC = WM * WN * 32, NP = 128, NV = 128;
     static_assert(NC + NP + NV == OM_THREADS, "the warp roles");
@@ -470,7 +481,8 @@ __global__ void __launch_bounds__(OM_THREADS, 1) lr_om_kernel(
     constexpr int SUB = BK / KT;                         // k-steps an edge tile is
     const int cols = K * B;
     const int nbt = cols / BN;
-    const int pid_b = blockIdx.x % nbt, pid_m = blockIdx.x / nbt;
+    int pid_b, pid_m;                                    // (the grid's order: `tile_of`)
+    tile_of((int)blockIdx.x, nbt, (int)gridDim.x / nbt, nbg, pid_b, pid_m);
     // the node tile: one of `mtiles` of a node block, or `bpt` consecutive blocks of one group (blocks of 32 or 64)
     const int bpt = BM > block_size ? BM / block_size : 1;
     const int r = bpt > 1 ? pid_m * bpt : pid_m / mtiles, tile_id = bpt > 1 ? 0 : pid_m % mtiles;
@@ -898,10 +910,12 @@ __global__ void __launch_bounds__(OM_THREADS, 1) lr_om_kernel(
 // exp(lf - log Z - n_b)` beside U, n_b its own running max (a parent of no flow or a log Z of -inf: 0). Scope (`om_bw_serves` and the plan): rank OM_K, B % (OM_BN / OM_K), the tile's
 // children of one group of child blocks (equal parents), every parent a real node of the layer's node vector (no
 // dummy), parents' blocks a multiple of 32.
-// GRAD: and dA, by the grid's last `n_da` CTAs -- the free SMs of its last wave: a node vector's (node, sample) pairs
-// strided over them, `dLL / dA_r = f D_r` from the share differences the forward kept (`kd`, `kcols` wide, the twin's
-// rows), as the plain path's `lowrank_backward_pre` forms it (the same operations, the same bits): its loads and adds
-// beside the data half's GEMM instead of after it.
+// GRAD: and dA, by the grid's FIRST `n_da` CTAs: a node vector's (node, sample) pairs in tiles strided over them,
+// `dLL / dA_r = f D_r` from the share differences the forward kept (`kd`, `kcols` wide, the twin's rows), as the plain
+// path's `lowrank_backward_pre` forms it (the same operations, the same bits): its loads and adds beside the data
+// half's GEMM from the launch's start -- few CTAs (the launcher's share of the SMs by the work), DRAM-bound, while
+// the GEMM tiles leave the DRAM mostly idle. (Last in the grid they ran in the free SMs of its last wave -- at a large
+// batch there are none: a wave of their own after the tiles, every SM on DRAM-bound work.)
 // MEASURED (toast, HMM 1024 x 31, rank 16, B64, us a layer as the GPU timeline's frontier advances): the plain data
 // half 54.5 (backward_pre 20.8, the element stream's pre-pass 5.4, GEMM 14.8, merge 4.2, collapse_bw 9.3); this kernel
 // first 39.1 with dA a launch of its own beside (17.1) -- its main loop alone 16.8, the tail epilogue the rest: the
@@ -926,9 +940,10 @@ __global__ void __launch_bounds__(OM_THREADS, 1) lr_om_bw_kernel(
         int pbs, int mtiles, int B, const float* vals, const int* __restrict__ table, long first,
         const float* __restrict__ fb, long fb_sb, const int* __restrict__ jrow, long e_lo, int N, float* flows,
         float* grad_b, long gb_sb, const float* kd, long kcols, float* __restrict__ grad_a, long ga_sb, int M, int n_gemm,
-        int n_da) {
+        int n_da, int nbg) {
     constexpr int BM = OM_BM, BN = OM_BN, K = OM_K, WM = 4, WN = 2;
-    if ((int)blockIdx.x >= n_gemm) {
+    const int gblk = (int)blockIdx.x - n_da;             // (the grid: the dA CTAs, then the GEMM tiles)
+    if (gblk < 0) {
         // ---------------- the dA CTAs: tiles of DTI nodes x DTS samples through shared memory ----------------
         // (the kept share differences `kd` are node-major, [rows, (sample, rank)]; dA as the caller gives it is
         // sample-major, [B, M, K]: a tile's kd read as DTI contiguous rows, dA updated as DTS contiguous runs)
@@ -944,7 +959,7 @@ __global__ void __launch_bounds__(OM_THREADS, 1) lr_om_bw_kernel(
         const int nti = (M + DTI - 1) / DTI, nts = (B + DTS - 1) / DTS;
         // (every load of a phase issued before its stores: a tile's grad_a loads are not ordered after the stores of
         // another element -- the compiler cannot tell them apart, ga_sb being a run-time stride)
-        for (long tile = (long)blockIdx.x - n_gemm; tile < (long)nti * nts; tile += n_da) {
+        for (long tile = (long)blockIdx.x; tile < (long)nti * nts; tile += n_da) {
             const int i0 = (int)(tile / nts) * DTI, s0 = (int)(tile % nts) * DTS;
             float4 kv[NQ];
             CUTE_UNROLL
@@ -1018,7 +1033,8 @@ __global__ void __launch_bounds__(OM_THREADS, 1) lr_om_bw_kernel(
     constexpr int GS = BN + 4;                           // the epilogue's log G (log Gn) tile, a row's stride (padded)
     static_assert(NU * BM * GS * 4 <= ST * STAGE, "the log G tiles in the stages");
     const int cols = K * B, nbt = cols / BN;
-    const int pid_b = blockIdx.x % nbt, pid_m = blockIdx.x / nbt;
+    int pid_b, pid_m;                                    // (the grid's order: `tile_of`)
+    tile_of(gblk, nbt, n_gemm / nbt, nbg, pid_b, pid_m);
     // the child tile: one of `mtiles` of a child block, or `bpt` consecutive blocks of one group (equal parents)
     const int bpt = BM > cbs ? BM / cbs : 1;
     const int cb0 = bpt > 1 ? pid_m * bpt : pid_m / mtiles, tile_id = bpt > 1 ? 0 : pid_m % mtiles;
@@ -1734,6 +1750,25 @@ static CUtensorMap om_tmap(const void* base, long block_size, long knt, long row
     return e.map;
 }
 
+// The current device's SMs
+static int om_sms() {
+    static int sms_of[64] = {};
+    int dv = 0, sms = 0;
+    C10_CUDA_CHECK(cudaGetDevice(&dv));
+    if (dv < 64 && sms_of[dv] > 0) return sms_of[dv];
+    C10_CUDA_CHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dv));
+    if (dv < 64) sms_of[dv] = sms;
+    return sms;
+}
+// The sample tiles a group of the one-launch grids' order (`tile_of`): a quarter of the SMs -- the node tiles of a
+// sample tile then start within a wave or two of each other. MEASURED with the dA CTAs first (toast, HMM 1024 x 31,
+// rank 16, ms a step, the grid's plain order -> groups of 47 of 188 SMs): B64 2.93 -> 2.83, B256 9.03 -> 8.87, B512
+// 17.63 -> 17.06, B1024 35.5 -> 33.9, B2048 77.1 -> 70.3 (the groups alone at B2048: 77.1 -> 73.9-74.8 at 94 / 188 /
+// 376). The tests make the groups small (`set_tile_group`), so the sizes they run at take several.
+static int g_tile_group = 0;
+void set_tile_group(int64_t n) { g_tile_group = (int)std::max<int64_t>(n, 0); }
+static int om_tile_group() { return g_tile_group > 0 ? g_tile_group : std::max(1, om_sms() / 4); }
+
 template <bool FUSED, bool TMAA>
 static void launch_om(const bfloat16_t* params, const long* pbase, const bfloat16_t* vt, long vrows, long row0,
                       const float* shift, const float* vals, const long* ebase, const int* cbase, const int* jpos,
@@ -1757,7 +1792,7 @@ static void launch_om(const bfloat16_t* params, const long* pbase, const bfloat1
     TORCH_CHECK(n < (1L << 31), "lowrank om: a grid past 2^31 blocks");
     launch_pdl(kernel, dim3((unsigned)n), dim3(OM_THREADS), SMEM, st, params, pbase, vt, vrows, row0, shift, vals, ebase,
                cbase, jpos, ugrp, knt, mtiles, block_size, B, vnm, nids, num_edges, tmapA, fa, a_sb, node_mars, lz,
-               nshift, vn0);
+               nshift, vn0, om_tile_group());
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
@@ -1842,8 +1877,9 @@ void lowrank_forward_om(torch::Tensor vnm, torch::Tensor vals, c10::optional<tor
 // ---------------- the backward's one-launch form ----------------
 // Whether it serves a layer's backward partition: rank OM_K, B a multiple of the tile's samples, the child tile of
 // whole child blocks or inside one, the parents' blocks a multiple of the k-step
-// The dA CTAs a launch at most (0: as many as the pairs and the free SMs take): the tests make them few, so a CTA's
-// threads stride over the pairs more than once (the sizes they run at give a thread one pair otherwise)
+// The dA CTAs a launch at most (0: the launcher's share of the SMs): the tests make them few, so a CTA takes several
+// of the pairs' tiles (the sizes they run at give a CTA one otherwise)
+constexpr double OM_DA_KSTEPS = 12.0, OM_TILE_KSTEPS = 13.0;
 static int g_da_ctas_most = 0;
 void set_da_ctas_most(int64_t n) { g_da_ctas_most = (int)std::max<int64_t>(n, 0); }
 
@@ -1861,7 +1897,7 @@ bool om_bw_serves(int64_t K, int64_t B, int64_t cbs, int64_t pbs, int64_t n_cb) 
 // `lz` [M, B] (node index: the twin's row - `vn0`); `params` bf16; the twin's backward partition: `chids` [blocks] the
 // child blocks' first element rows (`cbs` rows a block), `ppar` / `ppid` int64 [blocks, parent blocks] each parent
 // block's first twin row and parameter slab (`pbs` parents a block).
-// `grad_a` given (with `grad_b`): dA too, in the grid's free SMs (`lr_om_bw_kernel`'s dA CTAs), from `kd` the share
+// `grad_a` given (with `grad_b`): dA too, by the grid's first CTAs (`lr_om_bw_kernel`'s dA CTAs), from `kd` the share
 // differences the forward kept [twin rows, B K]. `grad_b` given: dB's data half AND its normalizer half (the pass's end
 // then takes nothing off this copy's dB).
 void lowrank_backward_om(torch::Tensor flows, torch::Tensor vals, c10::optional<torch::Tensor> table, int64_t first,
@@ -1923,23 +1959,20 @@ void lowrank_backward_om(torch::Tensor flows, torch::Tensor vals, c10::optional<
     const long n = (long)(OM_K * B / OM_BN) * ((long)n_cb * cbs / OM_BM);
     TORCH_CHECK(n < (1L << 31), "lowrank om backward: a grid past 2^31 blocks");
     if (n == 0) return;
-    // the dA CTAs: the free SMs of the GEMM's last wave (a CTA an SM), or a wave of their own where few are free
-    int sms = 0;
-    {
-        int dv = 0;
-        C10_CUDA_CHECK(cudaGetDevice(&dv));
-        static int sms_of[64] = {};
-        if (dv >= 64 || sms_of[dv] == 0) {
-            C10_CUDA_CHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dv));
-            if (dv < 64) sms_of[dv] = sms;
-        } else {
-            sms = sms_of[dv];
-        }
-    }
-    const int free_sms = (int)((sms - n % sms) % sms);
-    const long pairs = (long)M * B;
-    int n_da = !da ? 0 : (int)std::min<long>((pairs + OM_THREADS - 1) / OM_THREADS,
-                                             free_sms >= sms / 4 ? free_sms : sms);
+    // the dA CTAs, first in the grid: the share of the SMs their work is of the launch's -- a dA tile (32 nodes x 32
+    // samples: DRAM-bound) costs about OM_DA_KSTEPS k-steps of a GEMM tile, a GEMM tile its k-steps and OM_TILE_KSTEPS
+    // more (its setup and epilogue) -- so the pairs are done as the tiles are: too few and the layer waits for them (a
+    // cliff), more cost little. MEASURED (brezel, HMM L x 31 in blocks of 32, rank 16, 188 SMs, ms a step, the dA CTAs
+    // forced; in brackets the grid's plain order, the dA CTAs in its last wave's free SMs or a wave of their own):
+    // L 1024 at B1024 12 / 16 / 20 / 26 / 34 CTAs 35.22 / 33.81 / 33.74 / 33.82 / 33.88 [35.34], at B256 9.29 / 8.97 /
+    // 9.01 / 8.99 / 9.16 [9.13]; L 512 at B1024 8 / 16 / 32 / 48 17.93 / 15.20 / 14.09 / 14.27 [14.30]; L 2048 at B512
+    // 5 / 9 55.21 / 50.60 [51.12]; L 256 at B2048 24 / 40 / 56 / 80 13.95 / 13.42 / 13.44 / 13.47 [13.30: its last
+    // wave's 104 free SMs took dA best], at B512 3.83 / 3.73 / 3.74 / 3.73 [3.75]. The share at L 1024 / 512 / 2048 /
+    // 256: 22 / 32 / 14 / 42 CTAs.
+    const int sms = om_sms();
+    const long da_tiles = (((long)M + 31) / 32) * (((long)B + 31) / 32);
+    const double da_w = (double)da_tiles * OM_DA_KSTEPS / ((double)n * (npb * (pbs / 32) + OM_TILE_KSTEPS));
+    int n_da = !da ? 0 : (int)std::min<long>(da_tiles, std::max<long>(1, std::lround(sms * da_w / (1.0 + da_w))));
     if (n_da > 0 && g_da_ctas_most > 0) n_da = std::min(n_da, g_da_ctas_most);
     // (store: the gradients' first writer -- dB, and dA where given, every element of the node vector's written, not
     // added into: the destination was not zeroed)
@@ -1968,7 +2001,7 @@ void lowrank_backward_om(torch::Tensor flows, torch::Tensor vals, c10::optional<
                    flows.data_ptr<float>(), grad_b.has_value() ? grad_b->data_ptr<float>() : (float*)nullptr,
                    grad_b.has_value() ? (long)grad_b->stride(0) : 0L,
                    da ? kd->data_ptr<float>() : (const float*)nullptr, da ? (long)kd->size(1) : 0L,
-                   da ? grad_a->data_ptr<float>() : (float*)nullptr, da ? (long)grad_a->stride(0) : 0L, M, (int)n, n_da);
+                   da ? grad_a->data_ptr<float>() : (float*)nullptr, da ? (long)grad_a->stride(0) : 0L, M, (int)n, n_da, om_tile_group());
         C10_CUDA_KERNEL_LAUNCH_CHECK();
     };
     using T_ = std::true_type;
@@ -1993,6 +2026,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("lowrank_backward_om", &lowrank_backward_om,
           "the data half of the sum_exp backward over the virtual batch in one launch: element flows and dB's data part");
     m.def("set_da_ctas_most", &set_da_ctas_most, "(tests) the backward's dA CTAs a launch at most; 0: no cap");
+    m.def("set_tile_group", &set_tile_group,
+          "(tests) the sample tiles a group of the one-launch grids' order; 0: a quarter of the SMs");
     m.def("om_bw_serves", &om_bw_serves,
           "whether the backward's one-launch form serves a partition (rank, batch, child and parent block sizes, blocks)");
     m.def("configs", &configs, "(BM, BN, KT) per config id (the stream forward's)");

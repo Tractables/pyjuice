@@ -1711,7 +1711,7 @@ def test_the_fused_stream_forward_is_the_plain_virtual_path(form, bs, batch, ran
 def test_the_one_launch_backward_is_the_plain_data_half(bs, batch, param_flows, plain_middle, da_ctas, monkeypatch):
     """The virtual batch's one-launch backward (`virtual.FUSED_STREAM_BK`, `kernels/c/lowrank_stream.cu`'s
     `lr_om_bw_kernel`: the data half's element flows -- the product layer below handed to the backward, so its children's
-    node flows --, dB's data half and its normalizer half, and, in the grid's free SMs, dA), where it serves -- blocks of
+    node flows --, dB's data half and its normalizer half, and, by the grid's first CTAs, dA), where it serves -- blocks of
     32, 64 and 128 (a child tile of 4, 2 and 1 child blocks, a parent block of 1, 2 and 4 k-steps), batches of 16, 12
     and 4 -- against the plain data half on the same circuit: every value, flow, denominator and gradient; the same bits
     from run to run; and the torch passes (fp32 parameters) within the bf16 copy's rounding. The first layer (its
@@ -1719,7 +1719,7 @@ def test_the_one_launch_backward_is_the_plain_data_half(bs, batch, param_flows, 
     for the pass's end's parameter flows. `plain_middle`: a middle layer's backward on the plain path (its plan
     withheld): its copy alone owes the normalizer half, past the normalizers' first rows -- with the parameter flows
     (U's rows every copy's: the denominators read them) and without (the owing copy's rows alone). `da_ctas`: the dA
-    CTAs capped (one), so their threads stride over the (node, sample) pairs (at these sizes a thread has one pair
+    CTAs capped (one), so it strides over the tiles of the (node, sample) pairs (at these sizes a CTA has one tile
     otherwise)."""
     import pyjuice.parameterizations.lowrank.virtual as lowrank_virtual
     from pyjuice.layer.kernels import autotune
@@ -3458,3 +3458,51 @@ def test_the_one_launch_passes_where_a_stages_values_lie_deep_and_apart(batch, m
             assert not torch.isnan(t).any(), k
     _same(got, plain, rtol = 2e-3, atol = 2e-3, grad_scale = 2e-2)
     _same(got, torch_pass, rtol = 2e-2, atol = 1e-3, grad_scale = 2e-2)
+
+
+@needs_virtual
+@pytest.mark.parametrize("bs,batch,group,da_ctas", [(32, 16, 1, 0), (32, 16, 3, 0), (64, 12, 2, 1), (128, 16, 3, 3)])
+def test_the_one_launch_grids_order_changes_no_bit(bs, batch, group, da_ctas, monkeypatch):
+    """The one-launch kernels' grids (`kernels/c/lowrank_stream.cu`): the tiles in groups of sample tiles (`tile_of`: a
+    quarter of the SMs a group -- at these sizes one group, the grid's plain order) and the backward's dA CTAs first in
+    the grid, the launcher's share of the SMs. A tile's sums and a pair's dA are its own whatever block of the grid
+    takes them: the passes give the same BITS in groups of 1, 2 or 3 sample tiles of the 4 or 3 (a last group of
+    fewer), and with the dA CTAs capped (1: one CTA strides over every tile of the pairs; 3: unevenly)."""
+    import pyjuice.parameterizations.lowrank.virtual as lowrank_virtual
+    from pyjuice.layer.kernels import autotune
+
+    pick = autotune.pick
+    monkeypatch.setattr(autotune, "pick", lambda key, cands, bench, **k: "fused"
+                        if key[0] in ("prod_stream_fusion", "prod_stream_fusion_bk") else pick(key, cands, bench, **k))
+    rank = 16
+    pc, sums, _, _, _, _ = _pair(_hmm_blocks(256, bs), "sum_exp", rank = rank)
+    monkeypatch.setattr(pc, "_param_operands_force", True, raising = False)   # (the bf16 copy: the stream path's)
+    monkeypatch.setattr(lowrank_virtual, "GEMM_BF16_WORK", 0)                # (bf16 normalizers, as at real sizes)
+    dev = pc.params.device
+    torch.manual_seed(47)
+    data = torch.randint(0, NUM_CATS, (batch, pc.num_vars), device = dev)
+    ext = {a: _factors(a, rank, batch, dev, seed = 530 + i) for i, a in enumerate(sums)}
+    smod = lowrank_virtual._stream_module()
+    calls, real = [], smod.lowrank_backward_om
+
+    def counted(*args):
+        calls.append(args[22] is not None)                              # (whether it took dA: `grad_a`)
+        return real(*args)
+
+    monkeypatch.setattr(smod, "lowrank_backward_om", counted)
+    taken = _stream_form(monkeypatch, "om")
+    want = _passes(pc, sums, data, ext)
+    assert len(taken) >= len(sums) and all(c == lowrank_virtual._OM_ARM for c, _ in taken)
+    assert len(calls) == len(sums) and all(calls), calls
+    smod.set_tile_group(group)
+    smod.set_da_ctas_most(da_ctas)
+    try:
+        got = _passes(pc, sums, data, ext)
+    finally:
+        smod.set_tile_group(0)
+        smod.set_da_ctas_most(0)
+    assert len(calls) == 2 * len(sums) and all(calls), calls
+    for k in ("lls", "mars", "flows", "fp", "fm"):
+        assert not torch.isnan(got[k]).any() and torch.equal(got[k], want[k]), k
+    for k in ("dA", "dB"):
+        assert all(not torch.isnan(a).any() and torch.equal(a, b) for a, b in zip(got[k], want[k])), k
