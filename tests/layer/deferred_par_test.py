@@ -124,6 +124,11 @@ CASES = [
     ("hmm1024_B16", 1024, 1, 8, "bf16", 16, None, 7),
     ("hmm1024_fp32_B40", 1024, 1, 8, "fp32", 40, None, 7),
     ("hmm1088x17_edges_in_64s", 1088, 17, 6, "bf16", 64, None, 5),
+    # node blocks of 32: one operand group of them (`deferred_par.operand_group`), and a batch the chained capture does
+    # not take (62: not in 4s) -- each node block its own operand, the layout before groups
+    ("hmm2048_blocks_of_32", 2048, 64, 6, "bf16", 64, None, 5),
+    ("hmm2048_blocks_of_32_B16_fp32", 2048, 64, 6, "fp32", 16, None, 5),
+    ("hmm1024_B62_per_block_operands", 1024, 16, 6, "bf16", 62, None, 5),
 ]
 
 
@@ -179,13 +184,24 @@ def test_it_accumulates_like_the_per_step_kernels(monkeypatch):
 
 
 @needs_kernels
-@pytest.mark.parametrize("label", ["a layer callback", "untied", "below MIN_FLOWS", "fp32-level dots"])
+@pytest.mark.parametrize("label", ["a layer callback", "untied", "below MIN_FLOWS", "fp32-level dots",
+                                   "blocks of 32 ungrouped", "blocks of 32 of other children"])
 def test_what_keeps_the_per_step_kernels(label, monkeypatch):
     """No deferral where a callback sees the flows between layers, where nothing is tied, where the group is too small
-    for it (2 x 256 x 512 = 262K flows < 1M), or where the dots are fp32-level (`precision = "fp32"`: not the regime of
-    the fp16 operands); the flows are the per-step kernels', against float64."""
+    for it (2 x 256 x 512 = 262K flows < 1M), where the dots are fp32-level (`precision = "fp32"`: not the regime of
+    the fp16 operands), or where node blocks of 32 form no operand group -- a batch the chained capture does not take,
+    node blocks of other children (`_block_sparse_chain`): each its own operand at 32 rows, measured slower deferred
+    (`deferred_par.may_defer`)."""
     if label == "below MIN_FLOWS":
         pc, x = _instance(512, 2, 6, "bf16", 64)
+    elif label == "blocks of 32 ungrouped":
+        pc, x = _instance(1024, 32, 6, "bf16", 62)
+    elif label == "blocks of 32 of other children":
+        torch.manual_seed(0)
+        root = _block_sparse_chain(2048, 32, 6, 16)                # 64 node blocks x 32 nodes x 512 edges: 1M flows
+        root.init_parameters(perturbation = 2.0)
+        pc = juice.compile(root, verbose = False, param_dtype = torch.bfloat16).to(DEV)
+        x = torch.randint(0, V, (64, 6), device = DEV)
     else:
         pc, x = _instance(1024, 1, 6, "bf16", 64, tied = label != "untied",
                           **({"precision": "fp32"} if label == "fp32-level dots" else {}))
@@ -204,6 +220,58 @@ def test_what_keeps_the_per_step_kernels(label, monkeypatch):
         pc.backward(x, flows_memory = 0.0)
     torch.cuda.synchronize()
     assert steps == [], f"{label}: {len(steps)} steps deferred"
+
+
+@needs_kernels
+@pytest.mark.parametrize("L,nb,B,G", [(2048, 64, 64, 64), (1024, 16, 16, 16), (1024, 1, 128, 1), (1024, 16, 62, 1)],
+                         ids = ["blocks_of_32", "blocks_of_64", "one_node_block", "batch_not_in_4s"])
+def test_the_operand_groups_follow_the_structure(L, nb, B, G, monkeypatch):
+    """An HMM's node blocks have the same children and no gates: one operand group of all of them, where the chained
+    capture takes the step's slots (a batch in 4s) and the group has more than one node block; else each node block its
+    own operand. `GROUP_OPERANDS` off: each its own -- and node blocks of 32 not deferred (`deferred_par.may_defer`)."""
+    pc, x = _instance(L, nb, 6, "bf16", B)
+    steps = _record(monkeypatch)
+    pc(x)
+    pc.backward(x, flows_memory = 0.0)
+    torch.cuda.synchronize()
+    groups = list(dpar._groups_of(pc.param_flows, create = False).values())
+    assert len(steps) == 5 and groups and all(g.G == G for g in groups), [g.G for g in groups]
+    assert all(g.Bop.size(0) == nb // G and g.A.size(0) == nb for g in groups)
+    monkeypatch.setattr(dpar, "GROUP_OPERANDS", False)
+    pc2, _ = _instance(L, nb, 6, "bf16", B)
+    del steps[:]
+    pc2(x)
+    pc2.backward(x, flows_memory = 0.0)
+    torch.cuda.synchronize()
+    groups = list(dpar._groups_of(pc2.param_flows, create = False).values())
+    if L // nb == 32:
+        assert steps == [] and not groups
+    else:
+        assert len(steps) == 5 and groups and all(g.G == 1 for g in groups)
+    # the two layouts' flows (or the per-step kernels'), each the float64 one's to the operands' rounding: each other's
+    d = float((pc.param_flows - pc2.param_flows).abs().max() / pc2.param_flows.abs().max())
+    assert d < 2e-3, f"grouped and per-block flows differ by {d:.2e} of the max"
+
+
+def _block_sparse_chain(L, blk, T, fan):
+    """A tied chain whose sum layer joins each node block of `blk` nodes to `fan` consecutive product blocks (its own
+    run of the L // blk below, the runs not all the same: node blocks of other children)."""
+    from pyjuice.nodes import inputs, multiply, summate
+    nb = L // blk
+    starts = torch.clamp(torch.arange(nb), max = nb - fan)
+    edges = torch.stack([torch.arange(nb).repeat_interleave(fan),
+                         (starts[:, None] + torch.arange(fan)[None, :]).reshape(-1)])
+    with juice.set_block_size(blk):
+        ns = inputs(0, num_node_blocks = nb, dist = juice.distributions.Categorical(num_cats = V))
+        src = esrc = None
+        for t in range(1, T):
+            emit = esrc.duplicate(t, tie_params = True) if esrc is not None else None
+            if emit is None:
+                emit = esrc = inputs(t, num_node_blocks = nb, dist = juice.distributions.Categorical(num_cats = V))
+            prod = multiply(ns, emit)
+            ns = src = summate(prod, num_node_blocks = nb, edge_ids = edges) if src is None else \
+                src.duplicate(prod, tie_params = True)
+        return summate(multiply(ns), num_node_blocks = 1, block_size = 1)
 
 
 @needs_kernels

@@ -348,10 +348,15 @@ def test_a_group_below_MIN_FLOWS_defers_on_its_flows_times_samples(B, defers, mo
 
 
 @needs_kernels
-@pytest.mark.parametrize("label", ["a layer callback", "untied", "below MIN_FLOWS"])
+@pytest.mark.parametrize("label", ["a layer callback", "untied", "below MIN_FLOWS", "node blocks of 32"])
 def test_what_keeps_the_per_step_kernels(label, monkeypatch):
+    """No deferral where a callback sees the flows between layers, where nothing is tied, where the group is too small,
+    or at node blocks of 32: a gated layer's node blocks are each their own operand, which at 32 rows was measured
+    slower deferred (`deferred_par.may_defer`)."""
     if label == "below MIN_FLOWS":
         pc, phi, x = _instance(512, 2, 16, 6, "bf16", 64)               # 2 x 256 x 512 = 262K flows < 1M
+    elif label == "node blocks of 32":
+        pc, phi, x = _instance(2048, 64, 32, 6, "bf16", 64)             # 64 x 32 x 2048: 4M flows
     else:
         pc, phi, x = _instance(1024, 1, 64, 6, "bf16", 64, tied = label != "untied")
     caps, _ = _record(monkeypatch)

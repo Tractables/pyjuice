@@ -1205,7 +1205,7 @@ class _BackwardMixin:
             """`defer(param_flows, node_flows, node_mars, element_mars, params, ext)`: whether `deferred_par.try_defer`
             took this call's flows of the partition into its tied group's slots -- or None where its shape never
             defers (`deferred_par.may_defer`)."""
-            if not _deferred_par().may_defer(pd_mod, ctx, n_ngates_):
+            if not _deferred_par().may_defer(pd_mod, ctx, n_ngates_, gated = True):
                 return None
             static = {k: v for k, v in ctx.items()
                       if k not in ("node_flows", "element_flows", "node_mars", "element_mars", "params", "param_flows")}
