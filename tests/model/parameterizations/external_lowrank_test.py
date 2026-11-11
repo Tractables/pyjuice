@@ -1742,7 +1742,7 @@ def test_the_one_launch_backward_is_the_plain_data_half(bs, batch, param_flows, 
     calls, real = [], smod.lowrank_backward_om
 
     def counted(*args):
-        calls.append(args[-5] is not None)                              # (whether it took dA)
+        calls.append(args[22] is not None)                              # (whether it took dA: `grad_a`)
         return real(*args)
 
     monkeypatch.setattr(smod, "lowrank_backward_om", counted)
