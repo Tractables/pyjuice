@@ -150,18 +150,21 @@ class LowRank(_ForwardMixin, _BackwardMixin, _DenominatorsMixin, SumParameteriza
         return ((batch_size, ns.num_nodes, self.rank), (batch_size, self.rank, ns.num_ch_nodes))
 
     def storage_shapes(self, ns, batch_size: int):
-        """`"exp_sum"`: stored as the caller gives them, `A [B, M, K]`, `B [B, K, N]` -- its fused kernels take a
-        sample's block whole (`lowrank/kernels/c/lowrank_exp_sum.cu`), and the staging copy is a plain copy, the
-        gradients added in the same layout. `"sum_exp"`: with the batch innermost -- `A [M, K, B]`, `B [K, N, B]` --,
-        as the circuit's own buffers are: its kernels' threads run over the samples and read consecutive addresses
-        from every tensor alike; the staging copy is the transpose (`storage_perm`), the gradients come back the same
-        way."""
-        if self.form == "exp_sum":
-            return self.tensor_shapes(ns, batch_size)
-        return ((ns.num_nodes, self.rank, batch_size), (self.rank, ns.num_ch_nodes, batch_size))
+        """Stored as the caller gives them, `A [B, M, K]`, `B [B, K, N]`, either form, and the gradients in the same
+        layout. `"exp_sum"`: its fused kernels take a sample's block whole (`lowrank/kernels/c/lowrank_exp_sum.cu`),
+        the staging copy a plain copy. `"sum_exp"`: read IN PLACE by the forward (`reads_in_place`): the kernels that
+        serve its one-launch forms take the caller's tensors as they are, the rest a batch-innermost copy -- `A [M, K,
+        B]`, `B [K, N, B]`, as the circuit's own buffers are: their threads run over the samples -- made when first
+        asked for in the pass (`lowrank/virtual.py`'s `_inner`), their gradients back the same way."""
+        return self.tensor_shapes(ns, batch_size)
 
     def storage_perm(self):
-        return None if self.form == "exp_sum" else (1, 2, 0)
+        return None
+
+    def reads_in_place(self, ns) -> bool:
+        """`"sum_exp"`: the forward's staging hands the layers the caller's tensors themselves (no copy), where the
+        virtual batch can serve it (the CUDA extension built: `lowrank/virtual.py`); `"exp_sum"` copies."""
+        return self.form == "sum_exp" and lowrank_virtual._module() is not None
 
     def storage_offsets(self, ns):
         """Where an edge block's entries begin in each slot, in per-batch units (the layer's tables; the passes here
@@ -171,17 +174,12 @@ class LowRank(_ForwardMixin, _BackwardMixin, _DenominatorsMixin, SumParameteriza
         return (nb * (ns.block_size * self.rank), cb * ns.ch_block_size)
 
     def _as_given(self, tensors):
-        """The staged factors as the caller's `(A [B, M, K], B [B, K, N])`: themselves (`"exp_sum"`, stored so) or views
-        of the batch-innermost storage (`"sum_exp"`)."""
-        if self.form == "exp_sum":
-            return tensors[0], tensors[1]
-        return tensors[0].permute(2, 0, 1), tensors[1].permute(2, 0, 1)
+        """The staged factors as the caller's `(A [B, M, K], B [B, K, N])`: themselves (stored so, either form)."""
+        return tensors[0], tensors[1]
 
     def _to_stored(self, dA, dB):
-        """The caller-layout gradients `(dA [B, M, K], dB [B, K, N])` in the storage's layout (views)."""
-        if self.form == "exp_sum":
-            return dA, dB
-        return dA.permute(1, 2, 0), dB.permute(1, 2, 0)
+        """The caller-layout gradients `(dA [B, M, K], dB [B, K, N])` in the storage's layout: themselves."""
+        return dA, dB
 
     def _geometry(self, layer, ns_info, device):
         """

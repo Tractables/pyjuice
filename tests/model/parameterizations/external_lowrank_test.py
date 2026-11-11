@@ -2549,9 +2549,9 @@ def test_a_backward_at_another_precision_than_its_forward(monkeypatch):
     made, real = [], lowrank_virtual._v_rows
     thetas, real_theta = [], LowRank._dense_params
 
-    def counted(mod, fbs, N, K, batch, dtype, dev):
+    def counted(mod, fbs, N, K, batch, dtype, dev, *rest):
         made.append(dtype)
-        return real(mod, fbs, N, K, batch, dtype, dev)
+        return real(mod, fbs, N, K, batch, dtype, dev, *rest)
 
     def theta(geo, params, dtype = torch.float32):
         thetas.append((params.dtype, dtype, params is pc.params))

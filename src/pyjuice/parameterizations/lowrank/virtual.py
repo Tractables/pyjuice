@@ -242,6 +242,93 @@ def _source(ns):
     return ns.get_source_ns() if ns.is_tied() else ns
 
 
+def _transposes(pairs, inverse: bool = False) -> None:
+    """`dst = src` with the batch axis moved: `[B, ...]` (any batch stride, the rest contiguous) into a contiguous
+    `[..., B]` -- or back (`inverse`: `src [..., B]` contiguous into `dst [B, ...]`) --, every pair in one launch of the
+    staging's batched transpose where the extension built (a strided copy else)."""
+    from pyjuice.parameterizations.kernels.c import get_module
+    mod = get_module()
+    batched = getattr(mod, "staging_transpose_batched", None) if mod is not None else None
+    rows, max_b, max_n = [], 0, 0
+    for dst, src in pairs:
+        caller = dst if inverse else src
+        b, n, sb = caller.size(0), caller[0].numel(), caller.stride(0)
+        if batched is None or max(sb, n, b) >= 1 << 31:
+            if inverse:
+                dst.copy_(src.permute(src.dim() - 1, *range(src.dim() - 1)))
+            else:
+                dst.copy_(src.permute(*range(1, src.dim()), 0))
+            continue
+        if inverse:                                     # (the kernel's B: the n rows of src, N: the b columns)
+            rows += (src.data_ptr(), dst.data_ptr(), n | b << 32, b | sb << 32)
+            max_b, max_n = max(max_b, n), max(max_n, b)
+        else:
+            rows += (src.data_ptr(), dst.data_ptr(), b | n << 32, sb | b << 32)
+            max_b, max_n = max(max_b, b), max(max_n, n)
+    if rows:
+        batched(rows, max_b, max_n)
+
+
+def _om_a(a: torch.Tensor) -> torch.Tensor:
+    """The one-launch forms' A `[B, M, K]` in place: as the storage holds it where its runs are 16-byte aligned (its
+    base and its batch stride), else a contiguous copy."""
+    if a.stride(2) == 1 and a.stride(1) == a.size(2) and a.stride(0) % 4 == 0 and a.data_ptr() % 16 == 0:
+        return a                                                        # (a sample's [M, K] block contiguous)
+    return a.contiguous()
+
+
+def _inner(kwargs, tensors, every: bool = False) -> tuple:
+    """The batch-innermost copies `(A [M, K, B], B [K, N, B])` of a node vector's factors, which the storage holds as
+    the caller gives them (`(A [B, M, K], B [B, K, N])`, read in place by the forward: any batch stride): what this
+    module's kernels other than the one-launch forms and the operands read. Made when first asked for in the pass, in
+    one launch of the batched transpose -- the node vector's own, or (`every`: the forward's plain path, whose pass's
+    layers mostly take that path alike) every "sum_exp" node vector's of the pass not made yet: a pass of the one-launch
+    forms copies none or few --, kept in the pass's state, by tensor."""
+    made = _pass(kwargs).setdefault("inner", dict())
+    want = [tensors]
+    if every:
+        want += [t for ns, t in kwargs[_EXTERNAL_PARAMS_KWARG].items()
+                 if getattr(ns.parameterization, "form", None) == "sum_exp"]
+    pairs = []
+    for ts in want:
+        for t in ts:
+            if id(t) not in made:
+                made[id(t)] = (t, torch.empty(tuple(t.shape[1:]) + (t.size(0),), device = t.device))
+                pairs.append((made[id(t)][1], t))
+    if pairs:
+        _transposes(pairs)
+    return tuple(made[id(t)][1] for t in tensors)
+
+
+def _inner_grads(kwargs, grads) -> Optional[tuple]:
+    """Batch-innermost scratch `(dA [M, K, B], dB [K, N, B])` for a node vector's gradient buffers (the storage's
+    `(dA [B, M, K], dB [B, K, N])`), what this module's kernels add into: zeroed when first asked for in the pass's
+    backward -- one a buffer region, so the copies of a tied node share theirs -- and added into the buffers by
+    `_flush_grads` at the pass's end."""
+    if grads is None:
+        return None
+    made = _pass(kwargs).setdefault("inner_grads", dict())
+    out = []
+    for g in grads:
+        key = (g.data_ptr(), tuple(g.shape))
+        hit = made.get(key)
+        if hit is None:
+            hit = made[key] = (g, torch.zeros(tuple(g.shape[1:]) + (g.size(0),), device = g.device))
+        out.append(hit[1])
+    return tuple(out)
+
+
+def _flush_grads(st) -> None:
+    """The pass's gradient scratch (`_inner_grads`) added into the buffers, in the storage's layout, and dropped."""
+    made = st.pop("inner_grads", None)
+    if not made:
+        return
+    temps = [(torch.empty_like(g), s) for g, s in made.values()]
+    _transposes(temps, inverse = True)
+    for (g, _), (t, _) in zip(made.values(), temps):
+        g.add_(t)
+
+
 def _dtype(precision, work: int):
     """The operands of the pass's matrix products: bf16 (fp32 accumulation) under the default precision where the work
     is `GEMM_BF16_WORK` or more, fp32 else."""
@@ -323,13 +410,14 @@ def _link(desc, layer, ran, stream_children, device) -> None:
                                        rest = rest)
 
 
-def _v_rows(mod, fbs, N, K, batch, dtype, dev) -> tuple:
+def _v_rows(mod, fbs, N, K, batch, dtype, dev, in_place: bool = False) -> tuple:
     """`(V^T [N, rows], each row's shift)`: `exp(B - shift)`, the rows `(copy, sample, rank)` -- a sample's ranks adjacent,
-    as in the virtual batch's columns --, the shift the row's largest `B`."""
+    as in the virtual batch's columns --, the shift the row's largest `B`. `in_place`: `fbs` as the caller gives them
+    (`B [B, K, N]`, read in place), else batch-innermost (`B [K, N, B]`)."""
     rows = len(fbs) * batch * K
     Vt = torch.empty(N, rows, dtype = dtype, device = dev)
     shift = torch.empty(rows, device = dev)
-    mod.lowrank_z_operand(Vt, shift, fbs, batch, K)
+    (mod.lowrank_z_operand_in_place if in_place else mod.lowrank_z_operand)(Vt, shift, fbs, batch, K)
     return Vt, shift
 
 
@@ -349,16 +437,20 @@ def _normalizers(desc, layer, info, st, kwargs, params, batch, dev) -> dict:
     zs = st.setdefault("z", dict())
     hit = zs.get(source)
     if hit is None or info.ns not in hit["row"]:
-        copies = [(c, t[1]) for c, t in kwargs[_EXTERNAL_PARAMS_KWARG].items() if _source(c) is source]
         K, mod, geo = desc.rank, _module(), desc._geometry(layer, info, dev)
+        # (the factors read in place where the operands' kernels serve the rank: the copies' as the caller gave them)
+        ip = mod.lowrank_in_place_rank(K)
+        mine = [(c, t if ip else _inner(kwargs, t)) for c, t in kwargs[_EXTERNAL_PARAMS_KWARG].items()
+                if _source(c) is source]
+        copies = [(c, t[1]) for c, t in mine]
         fbs = [fb for _, fb in copies]
         dtype = _dtype(kwargs.get("precision", "auto"), len(copies) * batch * K * geo["M"] * geo["N"])
-        Vt, shift = _v_rows(mod, fbs, geo["N"], K, batch, dtype, dev)
+        Vt, shift = _v_rows(mod, fbs, geo["N"], K, batch, dtype, dev, ip)
         op = kwargs.get("op_params")
         theta = desc._dense_params(geo, op if op is not None and dtype is torch.bfloat16 else params, dtype)
         hit = zs[source] = dict(zt = None, zt_done = set(), row = {c: at * batch * K for at, (c, _) in enumerate(copies)},
                                 V = Vt, shift = shift, dtype = dtype, fb = fbs, theta = theta, cols = batch * K,
-                                fa = [t[0] for c, t in kwargs[_EXTERNAL_PARAMS_KWARG].items() if _source(c) is source])
+                                fa = [t[0] for _, t in mine], in_place = ip)
     return hit
 
 
@@ -394,6 +486,7 @@ def _above(layer, kwargs, node_mars, element_mars):
     tensors = [staged.get(info.ns) for info in above.external_node_infos]
     if any(t is None for t in tensors):
         return None
+    tensors = [_inner(kwargs, t, every = True) for t in tensors]
     return above, tensors, _buffers(node_mars, element_mars, _columns(above, node_mars), "fw")
 
 
@@ -508,8 +601,8 @@ def _stream_plan(desc, layer, twin, info, node_mars, kwargs, stream_children, de
     return plan or None
 
 
-def _stream_run(plan, info, fb, fa, z, row0, vnm, kd, node_mars, element_mars, op, stream_children, twin, K, lz,
-                nshift) -> bool:
+def _stream_run(plan, info, tensors, kwargs, z, row0, vnm, kd, node_mars, element_mars, op, stream_children, twin, K,
+                lz, nshift) -> bool:
     """The fused stream forward of one node vector, the whole layer: per partition the pre-pass chain or the one-launch
     form (it takes the normalizers' V: bf16 ones), and whether it ran -- False, nothing launched: no form serves this
     call (the plain path then). The one-launch form also makes the copy's normalizers and the collapse
@@ -521,7 +614,9 @@ def _stream_run(plan, info, fb, fa, z, row0, vnm, kd, node_mars, element_mars, o
     normalizers of this node vector's source -- their row shifts the column bound, their V the one-launch form's
     operand; `row0` this copy's first row; `nshift` the circuit's node rows past the twin's. Handed the product group
     below, the kernels form the products' values from their children where every tile allows (`cbase`); else they are
-    formed into `element_mars` first (`form_elements`), as the plain path does."""
+    formed into `element_mars` first (`form_elements`), as the plain path does. `tensors`: the node vector's factors as
+    the storage holds them (the caller's layout: the one-launch form reads A in place; the chain and its collapse the
+    batch-innermost copies, `_inner`)."""
     from pyjuice.layer.kernels import autotune
     mod = _stream_module()
     vt = z["V"] if z["dtype"] is torch.bfloat16 else None
@@ -542,7 +637,10 @@ def _stream_run(plan, info, fb, fa, z, row0, vnm, kd, node_mars, element_mars, o
     def collapse():
         z["zt_done"].discard(info.ns)                   # (the copy's own rows: what the tuner times)
         _zt_rows(z, info.ns, every = False)
-        _module().lowrank_collapse(node_mars, vnm, kd, fa, lz, z["zt"], shift, row0, info.nid_start, vn0, M, K)
+        _module().lowrank_collapse(node_mars, vnm, kd, _inner(kwargs, tensors)[0], lz, z["zt"], shift, row0,
+                                   info.nid_start, vn0, M, K)
+
+    a_om = _om_a(tensors[0])
 
     for p in plan["parts"]:
         def launch(code, p = p):
@@ -550,8 +648,9 @@ def _stream_run(plan, info, fb, fa, z, row0, vnm, kd, node_mars, element_mars, o
             if code == _OM_ARM:
                 mod.lowrank_forward_om(kd, vals, cb, p["ebase"], p["jpos"], vt, row0, shift, op, p["nids"],
                                        p["pbase"], p["groups"][0], twin.block_size, p["knt"], p["om"][0], p["om"][1],
-                                       node_mars, lz, fa, nshift, vn0)
+                                       node_mars, lz, a_om, nshift, vn0)
             else:
+                fb = _inner(kwargs, tensors)[1]
                 mod.lowrank_forward_stream(vnm, vals, cb, p["ebase"], p["jpos"], fb, shift, row0, op, p["nids"],
                                            p["pbase"], p["groups"][0], p["groups"][1], p["cmax"], twin.block_size,
                                            p["knt"], code)
@@ -626,10 +725,10 @@ def _a_rows(mod, z, batch, K, dev):
     the one-launch backward's operand, made when its first layer runs."""
     hit = z.get("ua")
     if hit is None:
-        fas = z["fa"]
-        Ut = torch.empty(fas[0].size(0), len(fas) * batch * K, dtype = torch.bfloat16, device = dev)
+        fas, ip = z["fa"], z["in_place"]
+        Ut = torch.empty(fas[0].size(1 if ip else 0), len(fas) * batch * K, dtype = torch.bfloat16, device = dev)
         shift = torch.empty(Ut.size(1), device = dev)
-        mod.lowrank_a_operand(Ut, shift, fas, batch, K)
+        (mod.lowrank_a_operand_in_place if ip else mod.lowrank_a_operand)(Ut, shift, fas, batch, K)
         hit = z["ua"] = (Ut, shift)
     return hit
 
@@ -660,15 +759,16 @@ def forward(desc, layer, ns_tensors, node_mars, element_mars, params, kwargs, st
     if plan is not None:
         if mark is not None and mark[0] is layer:
             mark[1].__dict__.pop("_lrv_link", None)
-        info0, (fa0, fb0) = ns_tensors[0]
+        info0, t0 = ns_tensors[0]
         z0 = _normalizers(desc, layer, info0, st, kwargs, params, batch, dev)    # (its shifts, its V: the operands')
         # (the whole layer, its collapse too)
-        if not _stream_run(plan, info0, fb0, fa0, z0, z0["row"][info0.ns], vnm, kd, node_mars, element_mars,
+        if not _stream_run(plan, info0, t0, kwargs, z0, z0["row"][info0.ns], vnm, kd, node_mars, element_mars,
                            kwargs["op_params"], stream_children, twin, K, _lz(layer, info0, batch, dev), shift):
             plan = None                                                 # (no form serves this call: the plain path)
     if plan is None:
         if mark is None or mark[0] is not layer:
-            for info, (_, fb) in ns_tensors:
+            for info, t in ns_tensors:
+                fb = _inner(kwargs, t, every = True)[1]
                 rows = desc._geometry(layer, info, dev)["rows"]
                 if stream_children is None:
                     mod.lowrank_expand(bufs["vem"], element_mars, fb, rows, K)
@@ -691,7 +791,8 @@ def forward(desc, layer, ns_tensors, node_mars, element_mars, params, kwargs, st
     if plan is not None:
         pass
     elif nxt is None:
-        for info, (fa, _) in ns_tensors:
+        for info, t in ns_tensors:
+            fa = _inner(kwargs, t, every = True)[0]
             z = _normalizers(desc, layer, info, st, kwargs, params, batch, dev)
             _zt_rows(z, info.ns)
             mod.lowrank_collapse(node_mars, vnm, kd, fa, _lz(layer, info, batch, dev), z["zt"], z["shift"],
@@ -701,7 +802,8 @@ def forward(desc, layer, ns_tensors, node_mars, element_mars, params, kwargs, st
         link, adesc = layer.__dict__["_lrv_link"], above.parameterization
         infos = above.external_node_infos
         geo = lambda at: adesc._geometry(above, infos[at], dev)["rows"]
-        for info, (fa, _) in ns_tensors:
+        for info, t in ns_tensors:
+            fa = _inner(kwargs, t, every = True)[0]
             at = link["pairs"].get(info.nid_start)
             z = _normalizers(desc, layer, info, st, kwargs, params, batch, dev)
             _zt_rows(z, info.ns)
@@ -727,7 +829,7 @@ def forward(desc, layer, ns_tensors, node_mars, element_mars, params, kwargs, st
 
 
 def _end_of_pass(mod, z, copies, node_flows, node_mars, params, param_flows, denom_param_flows, want_denom, want_grads,
-                 precision, batch) -> None:
+                 precision, batch, inner) -> None:
     """What a node vector and its copies in the pass owe at the pass's end, as matrix products over the rows `(copy,
     sample, rank)` (`kernels/c/lowrank_mixture.cu`'s header has them), of cuBLAS: bf16 operands (fp32 accumulation) under
     the default precision where the work is `GEMM_BF16_WORK` or more, fp32 else.
@@ -740,8 +842,8 @@ def _end_of_pass(mod, z, copies, node_flows, node_mars, params, param_flows, den
     first of them's flow block: the blocks of a source's copies are summed before the parameters read them, as those of
     the plain kernels. The operands: at bf16, from the exponentials the pass keeps -- the backward's `exp(A - shift)`
     (`_a_rows`) and the forward's V -- in one launch (`lowrank_kept_operands`); else from the factors
-    (`lowrank_data_operands`, `lowrank_u_operand`). (`copies`: one source's, of one parameterization: its rank, its
-    denominator or none.)"""
+    (`lowrank_data_operands`, `lowrank_u_operand`: the factors' batch-innermost copies, `inner`). (`copies`: one
+    source's, of one parameterization: its rank, its denominator or none; their factors as the storage holds them.)"""
     layer0, info0 = copies[0][0], copies[0][1]
     desc, K = layer0.parameterization, layer0.parameterization.rank
     dev = node_flows.device
@@ -758,7 +860,8 @@ def _end_of_pass(mod, z, copies, node_flows, node_mars, params, param_flows, den
         return
     cols = batch * K
     kept = KEPT_OPERANDS and dtype is torch.bfloat16 and z["dtype"] is torch.bfloat16
-    Vt, shift = (z["V"], z["shift"]) if dtype is z["dtype"] else _v_rows(mod, z["fb"], N, K, batch, dtype, dev)
+    Vt, shift = (z["V"], z["shift"]) if dtype is z["dtype"] else _v_rows(mod, z["fb"], N, K, batch, dtype, dev,
+                                                                           z["in_place"])
     zeros = want_denom and len(copies) < len(z["row"])
     Ut = (torch.zeros if zeros else torch.empty)(M, Vt.size(1), dtype = dtype, device = dev) if rows_of else None
     Ud = Vd = None
@@ -777,12 +880,12 @@ def _end_of_pass(mod, z, copies, node_flows, node_mars, params, param_flows, den
                                   [at.get(id(c), -1) for c in sel], [int(id(c) in un) for c in sel], M, K)
     else:
         if fp:
-            mod.lowrank_data_operands(Ud, Vd, node_flows, node_mars, [c[2][0] for c in fp], [c[3] for c in fp],
-                                      [c[2][1] for c in fp], [c[1].nid_start for c in fp],
+            mod.lowrank_data_operands(Ud, Vd, node_flows, node_mars, [inner(c[2])[0] for c in fp], [c[3] for c in fp],
+                                      [inner(c[2])[1] for c in fp], [c[1].nid_start for c in fp],
                                       [desc._geometry(c[0], c[1], dev)["rows"] for c in fp], [c[5][0] for c in fp],
                                       [c[5][1] for c in fp], M, K)
         if rows_of:
-            mod.lowrank_u_operand(Ut, shift, node_flows, [c[2][0] for c in rows_of], [c[3] for c in rows_of],
+            mod.lowrank_u_operand(Ut, shift, node_flows, [inner(c[2])[0] for c in rows_of], [c[3] for c in rows_of],
                                   [c[1].nid_start for c in rows_of], [z["row"][c[1].ns] for c in rows_of], M, K)
     if fp:
         desc._scatter_add(geo, param_flows, fp[0][1].ns._param_flow_range[0], _product(Ud, Vd.t(), dtype), params)
@@ -818,6 +921,7 @@ def backward(desc, layer, ns_tensors, ns_grad_tensors, node_flows, element_flows
     flows = st.get("flows")
     if flows is None or flows() is not node_flows or any(info.ns in st["done"] for info, _ in ns_tensors):
         st.update(done = set(), norm = dict(), flows = weakref.ref(node_flows))
+        st.pop("inner_grads", None)                                     # (a backward again: its own gradients)
 
     kd = _kept(layer, twin, cols, dev)                                  # (the forward's: dLL / dA_r = f D_r)
     # The one-launch backward where it serves: dA from the kept responsibilities, then the data half's element flows (as
@@ -827,6 +931,7 @@ def backward(desc, layer, ns_tensors, ns_grad_tensors, node_flows, element_flows
     plan = _stream_plan_bk(desc, layer, twin, ns_tensors[0][0], node_mars, stream_children, dev) \
         if FUSED_STREAM_BK and len(ns_tensors) == 1 and op is not None else None
     if plan is not None:
+        # (B and the gradients as the storage holds them -- the caller's layout: read and written in place)
         smod = _stream_module()
         (info, (fa, fb)), grads = ns_tensors[0], ns_grad_tensors[0]
         lz = _lz(layer, info, batch, dev)
@@ -859,8 +964,9 @@ def backward(desc, layer, ns_tensors, ns_grad_tensors, node_flows, element_flows
             denom = param_flows is not None and denom_param_flows is not None and own.apply_z_correction
             grads = any(c[4] is not None and not c[6] for c in copies)          # (dB's normalizer half still owed)
             _end_of_pass(mod, st["z"][src], copies, node_flows, node_mars, params, param_flows, denom_param_flows,
-                         denom, grads, precision, batch)
+                         denom, grads, precision, batch, lambda t: _inner(kwargs, t))
         st["norm"] = dict()
+        _flush_grads(st)                                                 # (the gradients: in the storage's layout)
 
     return None
 
@@ -873,10 +979,12 @@ def _backward_data(desc, layer, twin, shift, ns_tensors, ns_grad_tensors, node_f
     from pyjuice.layer.sum_layer import SumLayer
 
     vectors = []
-    for (info, (fa, fb)), grads in zip(ns_tensors, ns_grad_tensors):
+    for (info, tensors), grads in zip(ns_tensors, ns_grad_tensors):
+        fa, fb = _inner(kwargs, tensors)                                 # (the plain kernels' layout)
+        grads = _inner_grads(kwargs, grads)
         rows = desc._geometry(layer, info, dev)["rows"]
         lz = _lz(layer, info, batch, dev)
-        vectors.append((info, fa, fb, grads, rows, lz))
+        vectors.append((info, tensors, fa, fb, grads, rows, lz))
         grad_a = None if grads is None else grads[0]
         if stream_children is None:
             mod.lowrank_backward_pre(bufs["vem_d"], element_mars, fb, rows, bufs["vnf_d"], node_flows, node_mars, fa,
@@ -893,12 +1001,12 @@ def _backward_data(desc, layer, twin, shift, ns_tensors, ns_grad_tensors, node_f
                       param_flows = param_flows if stream_children is None else None, logspace_flows = True,
                       precision = precision, op_params = layer.__dict__.get("_bk_op_params"))
 
-    for info, fa, fb, grads, rows, lz in vectors:
+    for info, tensors, fa, fb, grads, rows, lz in vectors:
         grad_b = None if grads is None else grads[1]
         if stream_children is None:
             mod.lowrank_collapse_bw(element_flows, bufs["vef_d"], rows, grad_b, K)
         else:
             mod.lowrank_collapse_bw_fused(node_flows, bufs["vef_d"], rows, stream_children[0], stream_children[1],
                                           grad_b, K)
-        st["norm"].setdefault(_source(info.ns), []).append((layer, info, (fa, fb), lz, grads, stream_children, False))
+        st["norm"].setdefault(_source(info.ns), []).append((layer, info, tensors, lz, grads, stream_children, False))
         st["done"].add(info.ns)

@@ -62,6 +62,7 @@
 
 #include <torch/extension.h>
 #include <vector>
+#include <type_traits>
 #include <c10/cuda/CUDAStream.h>
 #include <c10/cuda/CUDAException.h>
 #include <cuda_bf16.h>
@@ -534,6 +535,131 @@ __global__ void __launch_bounds__(OPERAND_THREADS, 1) z_operand_kernel(const ZCo
     for (int j = w + WARPS * ZKEEP; j < N; j += WARPS) {
         const float x = src[(long)j * sx];
         store_as(out + (long)j * rows, x > -INFINITY ? expf(x - m) : 0.0f);
+    }
+}
+
+// The same operands, `z_operand_kernel`'s operations (its bits), from the factors IN PLACE: as the caller gives them
+// (`LowRank.reads_in_place`) -- a copy's `A [B, M, K]` or `B [B, K, N]`, any batch stride, a sample's block contiguous.
+// A block is one (copy, sample) of KC ranks: its factor block (M KC or KC N floats) read once into registers (`IKEEP`
+// a thread; more read again), each rank's largest over the nodes or the children -- the row's shift --, then the
+// exponentials. OF_A: consecutive threads read consecutive floats of the block, a thread one rank throughout
+// (`ITHREADS % KC == 0`), a node's KC outputs one run; else a thread a child of every rank, a rank's row read
+// coalesced, a child's KC outputs one run (16-byte stores).
+struct ICopies { long long p[COPIES_PER_LAUNCH]; long long sb[COPIES_PER_LAUNCH]; };
+constexpr int ITHREADS = 256, INW = ITHREADS / 32, IKEEP = 64;
+
+template <typename TO, int KC>
+__device__ __forceinline__ void store_run(TO* o, const float (&v)[KC]) {
+    if constexpr (std::is_same<TO, __nv_bfloat16>::value && KC % 8 == 0) {
+        #pragma unroll
+        for (int q = 0; q < KC / 8; q++) {
+            __nv_bfloat162 h[4];
+            #pragma unroll
+            for (int x = 0; x < 4; x++) h[x] = __floats2bfloat162_rn(v[8 * q + 2 * x], v[8 * q + 2 * x + 1]);
+            *reinterpret_cast<uint4*>(o + 8 * q) = *reinterpret_cast<const uint4*>(h);
+        }
+    } else if constexpr (std::is_same<TO, float>::value && KC % 4 == 0) {
+        #pragma unroll
+        for (int q = 0; q < KC / 4; q++)
+            *reinterpret_cast<float4*>(o + 4 * q) = make_float4(v[4 * q], v[4 * q + 1], v[4 * q + 2], v[4 * q + 3]);
+    } else {
+        #pragma unroll
+        for (int r = 0; r < KC; r++) store_as(o + r, v[r]);
+    }
+}
+
+template <typename TO, int KC, bool OF_A>
+__global__ void __launch_bounds__(ITHREADS) inplace_operand_kernel(const ICopies copies, TO* __restrict__ out,
+                                                                   float* __restrict__ shift, long rows, long row0,
+                                                                   int X, int B) {
+    static_assert(KC <= 32 && ITHREADS % KC == 0, "a thread one rank (OF_A); a warp's lanes the ranks' maxima");
+    const int b = blockIdx.x, c = blockIdx.y, t = threadIdx.x, lane = t & 31, w = t >> 5;
+    const float* f = reinterpret_cast<const float*>(copies.p[c]) + (long)b * copies.sb[c];
+    const long at = row0 + (long)c * KC * B + (long)b * KC;           // the (copy, sample)'s first row
+    __shared__ float red[KC][INW];
+    __shared__ float mk[KC];
+    if constexpr (OF_A) {
+        const long n = (long)X * KC;                                  // A[b, x, r] at x KC + r: rank t % KC
+        const int r = t % KC;
+        float keep[IKEEP];
+        float m = -INFINITY;
+        #pragma unroll
+        for (int k = 0; k < IKEEP; k++) {
+            const long e = t + (long)ITHREADS * k;
+            keep[k] = e < n ? f[e] : -INFINITY;
+            m = fmaxf(m, keep[k]);
+        }
+        for (long e = t + (long)ITHREADS * IKEEP; e < n; e += ITHREADS) m = fmaxf(m, f[e]);
+        for (int off = KC; off < 32; off <<= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, off));
+        if (lane < KC) red[lane][w] = m;
+        __syncthreads();
+        if (t < KC) {
+            float x = red[t][0];
+            for (int i = 1; i < INW; i++) x = fmaxf(x, red[t][i]);
+            mk[t] = x;
+            shift[at + t] = x;
+        }
+        __syncthreads();
+        m = mk[r];
+        #pragma unroll
+        for (int k = 0; k < IKEEP; k++) {
+            const long e = t + (long)ITHREADS * k;
+            if (e < n) store_as(out + (e / KC) * rows + at + r, keep[k] > -INFINITY ? expf(keep[k] - m) : 0.0f);
+        }
+        for (long e = t + (long)ITHREADS * IKEEP; e < n; e += ITHREADS) {
+            const float x = f[e];
+            store_as(out + (e / KC) * rows + at + r, x > -INFINITY ? expf(x - m) : 0.0f);
+        }
+    } else {
+        constexpr int IKB = IKEEP / KC;                                // children kept a rank
+        float keep[KC][IKB];                                           // B[b, r, x] at r X + x
+        float mr[KC];
+        #pragma unroll
+        for (int r = 0; r < KC; r++) {
+            float m = -INFINITY;
+            #pragma unroll
+            for (int k = 0; k < IKB; k++) {
+                const int x = t + ITHREADS * k;
+                keep[r][k] = x < X ? f[(long)r * X + x] : -INFINITY;
+                m = fmaxf(m, keep[r][k]);
+            }
+            for (int x = t + ITHREADS * IKB; x < X; x += ITHREADS) m = fmaxf(m, f[(long)r * X + x]);
+            for (int off = 16; off >= 1; off >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, off));
+            mr[r] = m;
+        }
+        if (lane == 0) {
+            #pragma unroll
+            for (int r = 0; r < KC; r++) red[r][w] = mr[r];
+        }
+        __syncthreads();
+        if (t < KC) {
+            float x = red[t][0];
+            for (int i = 1; i < INW; i++) x = fmaxf(x, red[t][i]);
+            mk[t] = x;
+            shift[at + t] = x;
+        }
+        __syncthreads();
+        #pragma unroll
+        for (int r = 0; r < KC; r++) mr[r] = mk[r];
+        #pragma unroll
+        for (int k = 0; k < IKB; k++) {
+            const int x = t + ITHREADS * k;
+            if (x < X) {
+                float v[KC];
+                #pragma unroll
+                for (int r = 0; r < KC; r++) v[r] = keep[r][k] > -INFINITY ? expf(keep[r][k] - mr[r]) : 0.0f;
+                store_run<TO, KC>(out + (long)x * rows + at, v);
+            }
+        }
+        for (int x = t + ITHREADS * IKB; x < X; x += ITHREADS) {
+            float v[KC];
+            #pragma unroll
+            for (int r = 0; r < KC; r++) {
+                const float y = f[(long)r * X + x];
+                v[r] = y > -INFINITY ? expf(y - mr[r]) : 0.0f;
+            }
+            store_run<TO, KC>(out + (long)x * rows + at, v);
+        }
     }
 }
 
@@ -1270,6 +1396,61 @@ void lowrank_a_operand(torch::Tensor Ut, torch::Tensor shift, std::vector<torch:
     else TORCH_CHECK(false, "lowrank mixture: `Ut` must be float32 or bfloat16");
 }
 
+namespace {
+template <typename TO, int KC, bool OF_A>
+void inplace_operand_launch(torch::Tensor& out, torch::Tensor& shift, std::vector<torch::Tensor>& fs, int64_t B) {
+    const long rows = out.size(1), P = (long)fs.size();
+    const int X = (int)out.size(0);
+    auto stream = at::cuda::getCurrentCUDAStream();
+    for (long p0 = 0; p0 < P; p0 += COPIES_PER_LAUNCH) {
+        const int n = (int)std::min<long>(COPIES_PER_LAUNCH, P - p0);
+        ICopies copies;
+        for (int i = 0; i < n; i++) {
+            const torch::Tensor& f = fs[p0 + i];
+            TORCH_CHECK(f.is_cuda() && f.scalar_type() == torch::kFloat32 && f.dim() == 3 && f.size(0) == B &&
+                        (OF_A ? (f.size(1) == X && f.size(2) == KC) : (f.size(1) == KC && f.size(2) == X)) &&
+                        f.stride(2) == 1 && f.stride(1) == f.size(2) && f.stride(0) >= f.size(1) * f.size(2),
+                        "lowrank mixture: a factor in place is fp32 A [B, M, K] / B [B, K, N], a sample's block "
+                        "contiguous");
+            copies.p[i] = (long long)f.data_ptr<float>();
+            copies.sb[i] = (long long)f.stride(0);
+        }
+        inplace_operand_kernel<TO, KC, OF_A><<<dim3((unsigned)B, (unsigned)n), ITHREADS, 0, stream>>>(
+            copies, static_cast<TO*>(out.data_ptr()), shift.data_ptr<float>(), rows, p0 * KC * B, X, (int)B);
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+    }
+}
+
+template <bool OF_A>
+void inplace_operand(torch::Tensor& out, torch::Tensor& shift, std::vector<torch::Tensor>& fs, int64_t B, int64_t K) {
+    const long rows = (long)fs.size() * B * K;
+    check(shift, "shift", torch::kFloat32, rows);
+    TORCH_CHECK(out.is_cuda() && out.is_contiguous() && out.dim() == 2 && out.size(1) == rows,
+                "lowrank mixture: the operand does not match the copies");
+    if (rows == 0) return;
+    const bool bf = out.scalar_type() == torch::kBFloat16;
+    TORCH_CHECK(bf || out.scalar_type() == torch::kFloat32, "lowrank mixture: the operand float32 or bfloat16");
+#define GO(KC_) if (K == KC_) { if (bf) inplace_operand_launch<__nv_bfloat16, KC_, OF_A>(out, shift, fs, B);          \
+                                 else inplace_operand_launch<float, KC_, OF_A>(out, shift, fs, B); return; }
+    GO(4) GO(8) GO(16) GO(32)
+#undef GO
+    TORCH_CHECK(false, "lowrank mixture: the operands in place serve ranks 4, 8, 16, 32; got ", K);
+}
+}  // namespace
+
+// `lowrank_z_operand` / `lowrank_a_operand` from the factors IN PLACE -- each copy's `B [B, K, N]` / `A [B, M, K]` as
+// the caller gives it (`LowRank.reads_in_place`: fp32, any batch stride, a sample's block contiguous) --, the same
+// values (`inplace_operand_kernel`); ranks 4, 8, 16, 32 (`lowrank_in_place_rank`)
+void lowrank_z_operand_in_place(torch::Tensor Vt, torch::Tensor shift, std::vector<torch::Tensor> fb, int64_t B,
+                                int64_t K) {
+    inplace_operand<false>(Vt, shift, fb, B, K);
+}
+void lowrank_a_operand_in_place(torch::Tensor Ut, torch::Tensor shift, std::vector<torch::Tensor> fa, int64_t B,
+                                int64_t K) {
+    inplace_operand<true>(Ut, shift, fa, B, K);
+}
+bool lowrank_in_place_rank(int64_t K) { return K == 4 || K == 8 || K == 16 || K == 32; }
+
 // The data half's operands of the copies whose product layer is fused in, as `lowrank_u_operand`'s: `eid` each
 // copy's children's element rows, `table` / `first` its product layer's children table and first element row
 void lowrank_data_operands(torch::Tensor Ut, torch::Tensor Vt, torch::Tensor node_flows, torch::Tensor node_mars,
@@ -1353,6 +1534,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "`lowrank_collapse_bw` with the element flows written as their two children's node flows");
     m.def("lowrank_u_operand", &lowrank_u_operand, "the normalizer half's U^T of a node vector's copies, at the forward's shifts");
     m.def("lowrank_z_operand", &lowrank_z_operand, "the forward's normalizers: V^T of a node vector's copies, each row's shift");
+    m.def("lowrank_z_operand_in_place", &lowrank_z_operand_in_place, "lowrank_z_operand from the caller's B [B, K, N]");
+    m.def("lowrank_a_operand_in_place", &lowrank_a_operand_in_place, "lowrank_a_operand from the caller's A [B, M, K]");
+    m.def("lowrank_in_place_rank", &lowrank_in_place_rank, "whether the operands in place serve rank K");
     m.def("lowrank_a_operand", &lowrank_a_operand,
           "the backward's exp(A - shift) of a node vector's copies (the one-launch backward's operand), each row's shift");
     m.def("lowrank_data_operands", &lowrank_data_operands,

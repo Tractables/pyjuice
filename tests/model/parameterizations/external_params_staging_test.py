@@ -524,8 +524,8 @@ def test_external_params_usage():
 @pytest.mark.parametrize("form", ["exp_sum", "sum_exp"])
 def test_lowrank_params_reaches_kernels(form):
     """
-    The real parameterization is staged the same way, and its forward runs off the staged values -- "exp_sum" stores
-    the caller's tensors as they are, "sum_exp" with the batch innermost.
+    The real parameterization is staged the same way, and its forward runs off the staged values -- both forms stored
+    as the caller gives them: "exp_sum" copied into the buffer, "sum_exp" read in place (the caller's own tensors).
     """
 
     device = torch.device("cuda:0")
@@ -546,14 +546,14 @@ def test_lowrank_params_reaches_kernels(form):
     assert torch.all(torch.isfinite(lls))
     assert float((lls - pc(data)).abs().max()) > 1e-3               # (the factors were read: not the plain values)
 
-    # ... from the staged values: "sum_exp" stores the caller's tensors with the batch innermost (its `storage_perm`),
-    # the staging copy's fast form; "exp_sum" as they are (its fused kernels take a sample's block whole)
-    perm = trans_ns.parameterization.storage_perm()
-    assert perm == ((1, 2, 0) if form == "sum_exp" else None)
+    # ... from the staged values, stored as the caller gives them (`storage_perm` None): "exp_sum" copied into the
+    # buffer (its fused kernels take a sample's block whole), "sum_exp" the caller's tensors themselves (read in place)
+    assert trans_ns.parameterization.storage_perm() is None
     pc(data, sum_external_params = tensors)
     for ns, ns_tensors in tensors.items():
         for staged_tensor, tensor in zip(pc._staged_external_params[ns], ns_tensors):
-            assert torch.equal(staged_tensor, tensor.permute(*perm) if perm is not None else tensor)
+            assert torch.equal(staged_tensor, tensor)
+            assert (staged_tensor.data_ptr() == tensor.data_ptr()) == (form == "sum_exp")
 
 
 if __name__ == "__main__":

@@ -426,7 +426,8 @@ def test_a_group_of_several_tensors_goes_in_one_launch_each_way(monkeypatch, for
 @cuda_only
 def test_a_group_in_one_launch_at_other_batches_and_where_the_buffer_moved(monkeypatch):
     """What is kept of a group is per batch size and holds no address: other batches -- one large enough to move the
-    staging buffer -- and fresh tensors each call stage what they should, in one launch each, gradients coming back too."""
+    staging buffer -- and fresh tensors each call stage what they should ("sum_exp": read in place, nothing copied, the
+    staged views the call's own tensors), gradients coming back too."""
     dev, T = torch.device("cuda:0"), 3
     root, members = _lowrank_chain(T = T)
     pc = juice.compile(root, verbose = False).to(dev)
@@ -436,11 +437,13 @@ def test_a_group_in_one_launch_at_other_batches_and_where_the_buffer_moved(monke
         data = torch.randint(0, NUM_CATS, [batch, T + 1], device = dev)
         factors = _factors(members, batch, dev, 100 + seed)
         calls.update(batched = [], copies = 0)
-        pc(data, sum_external_params = {"tr": _cats(factors)})
-        assert calls == dict(batched = [2 * T], copies = 0), f"batch {batch}: {calls}"
+        cats = _cats(factors)
+        pc(data, sum_external_params = {"tr": cats})
+        assert calls["copies"] == 0, f"batch {batch}: {calls}"
         for m, tensors in zip(members, factors):
-            for staged, t in zip(pc._staged_external_params[m], tensors):
-                assert torch.equal(staged, t.permute(1, 2, 0)), f"batch {batch}"
+            for staged, t, cat in zip(pc._staged_external_params[m], tensors, cats):
+                assert torch.equal(staged, t), f"batch {batch}"
+                assert staged.untyped_storage().data_ptr() == cat.untyped_storage().data_ptr(), f"batch {batch}"
         grads = tuple(torch.empty_like(c) for c in _cats(factors))
         pc.backward(data, flows_memory = 0.0, sum_external_params_grad = {"tr": grads})
         torch.cuda.synchronize()
@@ -511,10 +514,11 @@ def test_a_group_of_one_tensor_a_node_out_of_the_buffers_order_in_one_launch(mon
 @cuda_only
 @pytest.mark.parametrize("form", ["blockscale", "sum_exp"])
 def test_a_group_name_registered_again_names_its_new_members(form):
-    """What staging keeps per group name -- the batched copy's rows (both forms' storage with the batch moved to the
-    end) -- is dropped when the name is registered again: the members in the other order get each its own slice,
-    forward and gradients, bit for bit the per-node form (the rows kept for the old members put the first slice in the
-    old first member's place)."""
+    """What staging keeps per group name -- the batched copy's rows ("blockscale": a storage with the batch moved to
+    the end), the in-place split, its storage owners and the in-place plan ("sum_exp": read in place) -- is dropped
+    when the name is registered again: the members in the other order get each its own slice, forward and gradients,
+    bit for bit the per-node form (the rows kept for the old members put the first slice in the old first member's
+    place)."""
     dev, batch = torch.device("cuda:0"), 40
     if form == "blockscale":
         root, s0, s1 = _two_gated()
@@ -626,13 +630,21 @@ def test_what_a_group_in_one_launch_does_not_take_goes_the_per_node_way(monkeypa
         big = torch.empty(2 * c.size(0), *c.shape[1:], device = dev)
         big[::2] = c
         return big[::2]
-    pc(data, sum_external_params = {"tr": tuple(spaced(c) for c in cats)})
-    assert calls["batched"] == [] and calls["copies"] == 1 and torch.equal(pc.external_params, staged_p), calls
+    # ("sum_exp" reads in place whatever has every axis past the batch contiguous: the rows are, so nothing is copied
+    # and the staged views are the spaced tensors' own)
+    spaced_cats = tuple(spaced(c) for c in cats)
+    pc(data, sum_external_params = {"tr": spaced_cats})
+    assert calls["copies"] == 0 and torch.equal(pc.external_params, staged_p), calls
+    for m, tensors in zip(members, factors):
+        for staged, t, cat in zip(pc._staged_external_params[m], tensors, spaced_cats):
+            assert torch.equal(staged, t) and staged.untyped_storage().data_ptr() == cat.untyped_storage().data_ptr()
 
-    # a group with the nodes it leaves out, in one dict
+    # a group with the nodes it leaves out, in one dict: in place, both kinds
     calls.update(batched = [], copies = 0)
     pc(data, sum_external_params = {"head": _cats(factors[:2]), **dict(zip(members[2:], factors[2:]))})
-    assert calls["batched"] == [4, 4] and torch.equal(pc.external_params, staged_p), calls
+    assert calls["copies"] == 0 and torch.equal(pc.external_params, staged_p), calls
+    for m, tensors in zip(members[2:], factors[2:]):
+        assert all(s_.data_ptr() == t.data_ptr() for s_, t in zip(pc._staged_external_params[m], tensors))
 
     # another dtype, another device: refused, never read as float32 bytes or through a host address
     with pytest.raises(AssertionError, match = "float32"):

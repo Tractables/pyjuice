@@ -451,7 +451,7 @@ __global__ void __launch_bounds__(OM_THREADS, 1) lr_om_kernel(
         long vrows, long row0, const float* shift, const float* vals, const long* __restrict__ ebase,
         const int* __restrict__ cbase, const int* __restrict__ jpos, const int* __restrict__ ugrp, int knt, int mtiles,
         int block_size, int B, float* __restrict__ vnm, const long* __restrict__ nids, int num_edges,
-        const __grid_constant__ CUtensorMap tmapA, const float* __restrict__ fa, float* node_mars,
+        const __grid_constant__ CUtensorMap tmapA, const float* __restrict__ fa, long a_sb, float* node_mars,
         float* __restrict__ lz, long nshift, long vn0) {
     constexpr int BM = OM_BM, BN = OM_BN, K = OM_K, WM = 4, WN = 2;
     constexpr int KT = 32, NC = WM * WN * 32, NP = 128, NV = 128;
@@ -520,9 +520,12 @@ __global__ void __launch_bounds__(OM_THREADS, 1) lr_om_kernel(
             const float4 x = *(const float4*)&shift[row0 + c0 + 4 * q];
             hv[4 * q] = x.x; hv[4 * q + 1] = x.y; hv[4 * q + 2] = x.z; hv[4 * q + 3] = x.w;
         }
-        const float* ap = fa + (i * K) * B + b;          // A[i, r, b]: r at a stride of B
+        const float* ap = fa + (long)b * a_sb + i * K;   // A[b, i, r] as the caller gives it: the K ranks one run
         CUTE_UNROLL
-        for (int q = 0; q < K; q++) av[q] = ap[(long)q * B];
+        for (int q = 0; q < K / 4; q++) {
+            const float4 x = reinterpret_cast<const float4*>(ap)[q];
+            av[4 * q] = x.x; av[4 * q + 1] = x.y; av[4 * q + 2] = x.z; av[4 * q + 3] = x.w;
+        }
         float ms = -INFINITY, mz = -INFINITY;
         CUTE_UNROLL
         for (int q = 0; q < K; q++) {
@@ -602,11 +605,11 @@ __global__ void __launch_bounds__(OM_THREADS, 1) lr_om_kernel(
         long vrows_l = vrows;                            // (strides in registers: else reloaded from the constant bank)
         int B_i = B;
         asm volatile("" : "+l"(vrows_l), "+r"(B_i));
-        // the epilogue's pieces of A of tile row `ptid` (the tile's S samples of a rank one 16-byte piece), one
-        // prefetched into L2 a k-step
+        // the epilogue's pieces of A of tile row `ptid` (a sample's K ranks one 64-byte run, the tile's S of them),
+        // one prefetched into L2 a k-step
         static_assert(NP == BM, "a producer a tile row's prefetches");
-        const float* pfa = fa + (node_of(ptid) - vn0) * K * B + b0;
-        auto prefetch = [&](int q) { asm volatile("prefetch.global.L2::evict_last [%0];" ::"l"(pfa + (long)q * B)); };
+        const float* pfa = fa + (long)b0 * a_sb + (node_of(ptid) - vn0) * K;
+        auto prefetch = [&](int q) { asm volatile("prefetch.global.L2::evict_last [%0];" ::"l"(pfa + (long)q * a_sb)); };
         CUTE_UNROLL
         for (int q = 0; q < CA; q++) asm volatile("" : "+r"(oA[q]), "+r"(gA[q]), "+r"(bA[q]));
         CUTE_UNROLL
@@ -706,13 +709,13 @@ __global__ void __launch_bounds__(OM_THREADS, 1) lr_om_kernel(
                                      "r"(ninf || base >= 0 ? 16u : 0u) : "memory");
                     }
                     cpa_mbar_arrive(&fullr[s]);          // (tracks every copy this thread issued: the stage's A too)
-                    if (t < K) prefetch(t);
+                    if (t < S) prefetch(t);
                     if (t + 2 < nk) { load_j(t + 2, jr[u]); load_b(t + 2, br[u]); load_jc(t + 2, jcr[u]); }
                     if (++s == ST) { s = 0; ph ^= 1; }
                 }
             }
         }
-        for (int q = nk; q < K; q++) prefetch(q);
+        for (int q = nk; q < S; q++) prefetch(q);
         asm volatile("cp.async.wait_all;\n" ::: "memory");
         epilogue_wait();
         epilogue();
@@ -913,30 +916,82 @@ __global__ void __launch_bounds__(OM_THREADS, 1) lr_om_bw_kernel(
         const bfloat16_t* __restrict__ ua, long urows, long row0, const float* sha, const float* nflow,
         const float* nmar, const float* lz, long nshift, long vn0, const long* __restrict__ chids, int npb, int cbs,
         int pbs, int mtiles, int B, const float* vals, const int* __restrict__ table, long first,
-        const float* __restrict__ fb, const int* __restrict__ jrow, long e_lo, int N, float* flows, float* grad_b,
-        const float* kd, long kcols, float* __restrict__ grad_a, int M, int n_gemm, int n_da) {
+        const float* __restrict__ fb, long fb_sb, const int* __restrict__ jrow, long e_lo, int N, float* flows,
+        float* grad_b, long gb_sb, const float* kd, long kcols, float* __restrict__ grad_a, long ga_sb, int M, int n_gemm,
+        int n_da) {
     constexpr int BM = OM_BM, BN = OM_BN, K = OM_K, WM = 4, WN = 2;
     if ((int)blockIdx.x >= n_gemm) {
-        // ---------------- the dA CTAs ----------------
+        // ---------------- the dA CTAs: tiles of DTI nodes x DTS samples through shared memory ----------------
+        // (the kept share differences `kd` are node-major, [rows, (sample, rank)]; dA as the caller gives it is
+        // sample-major, [B, M, K]: a tile's kd read as DTI contiguous rows, dA updated as DTS contiguous runs)
         cudaTriggerProgrammaticLaunchCompletion();
         if (!GRAD) return;
         cudaGridDependencySynchronize();                 // (the node flows: the launches before's)
-        const long P = (long)M * B, stride = (long)n_da * OM_THREADS;
-        for (long t = (long)(blockIdx.x - n_gemm) * OM_THREADS + threadIdx.x; t < P; t += stride) {
-            const int b = (int)(t % B), i = (int)(t / B);
-            const long row = vn0 + nshift + i;           // the node's circuit row
-            const long at = (long)i * K * B + b;         // A[i, r, b]: r at a stride of B
-            const float lf = nflow[row * B + b];
-            const float z = lz[(long)i * B + b];
-            const float ls = nmar[row * B + b] + z;      // log S = log n + log Z
-            if (!((lf > -INFINITY) && (ls > -INFINITY))) continue;
-            const float ef = expf(lf);
-            float dv[K], gv[K];
-            load_run4f(kd + (vn0 + i) * kcols + (long)b * K, dv);
+        constexpr int DTI = 32, DTS = 32, DROW = DTS * K + 4;    // (rows padded: 16-byte aligned, off the banks)
+        constexpr int NQ = DTI * DTS * K / 4 / OM_THREADS, NE = DTI * DTS / OM_THREADS;   // (float4s, pairs a thread)
+        static_assert(NQ * OM_THREADS * 4 == DTI * DTS * K && NE * OM_THREADS == DTI * DTS, "a tile's work evenly");
+        float* sk = (float*)smem_raw;                    // [DTI][DROW]
+        constexpr int DES = DTS + 1;                     // (se's rows padded: a warp's reads off one bank)
+        float* se = sk + DTI * DROW;                     // [DTI][DES] a pair's exp(lf), -1 where it takes nothing
+        const int nti = (M + DTI - 1) / DTI, nts = (B + DTS - 1) / DTS;
+        // (every load of a phase issued before its stores: a tile's grad_a loads are not ordered after the stores of
+        // another element -- the compiler cannot tell them apart, ga_sb being a run-time stride)
+        for (long tile = (long)blockIdx.x - n_gemm; tile < (long)nti * nts; tile += n_da) {
+            const int i0 = (int)(tile / nts) * DTI, s0 = (int)(tile % nts) * DTS;
+            float4 kv[NQ];
             CUTE_UNROLL
-            for (int r = 0; r < K; r++) gv[r] = grad_a[at + r * B];
+            for (int q = 0; q < NQ; q++) {
+                const int x = threadIdx.x + q * OM_THREADS;
+                const int ii = x / (DTS * K / 4), c4 = x % (DTS * K / 4), i = i0 + ii, sb = s0 + (c4 * 4) / K;
+                kv[q] = make_float4(0.f, 0.f, 0.f, 0.f);
+                if (i < M && sb < B) kv[q] = *reinterpret_cast<const float4*>(kd + (vn0 + i) * kcols + (long)s0 * K + c4 * 4);
+            }
+            float lfv[NE], lsv[NE];
             CUTE_UNROLL
-            for (int r = 0; r < K; r++) grad_a[at + r * B] = gv[r] + ef * dv[r];
+            for (int q = 0; q < NE; q++) {
+                const int x = threadIdx.x + q * OM_THREADS, ii = x / DTS, b = s0 + x % DTS, i = i0 + ii;
+                lfv[q] = -INFINITY; lsv[q] = -INFINITY;
+                if (b < B && i < M) {
+                    const long row = vn0 + nshift + i;   // the node's circuit row
+                    lfv[q] = nflow[row * B + b];
+                    lsv[q] = nmar[row * B + b] + lz[(long)i * B + b];   // log S = log n + log Z
+                }
+            }
+            CUTE_UNROLL
+            for (int q = 0; q < NQ; q++) {
+                const int x = threadIdx.x + q * OM_THREADS, ii = x / (DTS * K / 4), c4 = x % (DTS * K / 4);
+                *reinterpret_cast<float4*>(sk + ii * DROW + c4 * 4) = kv[q];
+            }
+            CUTE_UNROLL
+            for (int q = 0; q < NE; q++) {
+                const int x = threadIdx.x + q * OM_THREADS;
+                const float lf = lfv[q], ls = lsv[q];
+                se[(x / DTS) * DES + x % DTS] = ((lf > -INFINITY) && (ls > -INFINITY)) ? expf(lf) : -1.f;
+            }
+            __syncthreads();
+            float4 gv[NQ];
+            float ef[NQ];
+            CUTE_UNROLL
+            for (int q = 0; q < NQ; q++) {
+                const int x = threadIdx.x + q * OM_THREADS, ss = x / (DTI * K / 4), c4 = x % (DTI * K / 4);
+                const int b = s0 + ss, ii = (c4 * 4) / K, r0 = (c4 * 4) % K, i = i0 + ii;
+                ef[q] = (b < B && i < M) ? se[ii * DES + ss] : -1.f;      // (-1: no such pair, or it takes nothing)
+                gv[q] = make_float4(0.f, 0.f, 0.f, 0.f);
+                if (ef[q] >= 0.f)
+                    gv[q] = *reinterpret_cast<const float4*>(grad_a + (long)b * ga_sb + (long)i * K + r0);
+            }
+            CUTE_UNROLL
+            for (int q = 0; q < NQ; q++) {
+                const int x = threadIdx.x + q * OM_THREADS, ss = x / (DTI * K / 4), c4 = x % (DTI * K / 4);
+                const int b = s0 + ss, ii = (c4 * 4) / K, r0 = (c4 * 4) % K, i = i0 + ii;
+                if (!(ef[q] >= 0.f)) continue;           // (past the node vector or the batch; or no flow, no mass)
+                const float4 d = *reinterpret_cast<const float4*>(sk + ii * DROW + ss * K + r0);
+                float4 v = gv[q];
+                const float e = ef[q];
+                v.x = v.x + e * d.x; v.y = v.y + e * d.y; v.z = v.z + e * d.z; v.w = v.w + e * d.w;
+                *reinterpret_cast<float4*>(grad_a + (long)b * ga_sb + (long)i * K + r0) = v;
+            }
+            __syncthreads();
         }
         return;
     }
@@ -980,7 +1035,6 @@ __global__ void __launch_bounds__(OM_THREADS, 1) lr_om_bw_kernel(
     static_assert(BM * S == OM_THREADS, "a thread an epilogue pair");
     float* gs = (float*)smem_raw;
     float* gn = gs + BM * GS;                            // (GRAD: log Gn)
-    const long NB = (long)N * B;
     auto child_of = [&](int m, long& e, int& j) {         // a tile row's element row and the node vector's child
         const int bq = bpt > 1 ? m / cbs : 0;
         e = chids[cb0 + bq] + (bpt > 1 ? m - bq * cbs : tile_id * BM + m);
@@ -1001,14 +1055,14 @@ __global__ void __launch_bounds__(OM_THREADS, 1) lr_om_bw_kernel(
         } else {
             c = vals[e * B + b];
         }
-        const float* bsrc = fb + (long)j * B + b;        // B[r, j, b]: r at a stride of N B
-        float* g = GRAD ? grad_b + (long)j * B + b : nullptr;
+        const float* bsrc = fb + (long)b * fb_sb + j;    // B[b, r, j] as the caller gives it: r at a stride of N
+        float* g = GRAD ? grad_b + (long)b * gb_sb + j : nullptr;
         float x[K], gv[K];
         CUTE_UNROLL
-        for (int r = 0; r < K; r++) x[r] = bsrc[r * NB];
+        for (int r = 0; r < K; r++) x[r] = bsrc[(long)r * N];
         if (GRAD) {
             CUTE_UNROLL
-            for (int r = 0; r < K; r++) gv[r] = g[r * NB];
+            for (int r = 0; r < K; r++) gv[r] = g[(long)r * N];
         }
         float nv[K];                                     // (GRAD: the normalizer half, exp(B + log Gn))
         if (GRAD) {
@@ -1034,7 +1088,7 @@ __global__ void __launch_bounds__(OM_THREADS, 1) lr_om_bw_kernel(
         else flows[e * B + b] = lef;
         if (GRAD) {
             CUTE_UNROLL
-            for (int r = 0; r < K; r++) g[r * NB] = (gv[r] + (x[r] > -INFINITY ? __expf(x[r]) : 0.f)) - nv[r];
+            for (int r = 0; r < K; r++) g[(long)r * N] = (gv[r] + (x[r] > -INFINITY ? __expf(x[r]) : 0.f)) - nv[r];
         }
     };
     auto epilogue_wait = [&]() { asm volatile("bar.sync 5, %0;" ::"n"(OM_THREADS) : "memory"); };   // (gs written)
@@ -1044,8 +1098,9 @@ __global__ void __launch_bounds__(OM_THREADS, 1) lr_om_bw_kernel(
         constexpr int TA = ABYTES / 16, CA = (TA + NP - 1) / NP;
         constexpr int TB = UBYTES / 16, CB = (TB + NP - 1) / NP;
         constexpr int NC4 = 3 * KT * (S / 4), CC = (NC4 + NP - 1) / NP;
-        // the epilogue's pieces of tile row `ptid` (its S samples one 16-byte piece each: the child's value -- or
-        // the product's two children's --, B's K ranks, dB's), one prefetched into L2 a k-step
+        // the epilogue's pieces, one prefetched into L2 a k-step: tile row `ptid`'s values (its S samples one 16-byte
+        // piece: the child's -- or the product's two children's --), and of B and dB the tile's (sample, rank) rows
+        // over its children (a 512-byte run each, the children contiguous from tile row 0's), two lines a producer
         static_assert(NP == BM, "a producer a tile row's prefetches");
         long pe;
         int pj;
@@ -1059,13 +1114,22 @@ __global__ void __launch_bounds__(OM_THREADS, 1) lr_om_bw_kernel(
             } else {
                 pf[0] = vals + pe * B + b0; pf[1] = pf[0];
             }
-            npf = 2 + K + (GRAD ? K : 0);
+            npf = 2;
         }
-        const float* pfb = fb + (long)(pj >= 0 ? pj : 0) * B + b0;
-        const float* pdb = GRAD ? grad_b + (long)(pj >= 0 ? pj : 0) * B + b0 : fb;
+        static_assert(NP == 2 * S * K, "a producer two lines of a (sample, rank) row of B (and dB)");
+        long pe0;
+        int pj0;
+        child_of(0, pe0, pj0);
+        const int prow = ptid / 2, psl = prow / K, pr = prow % K;
+        const long poff = (long)pr * N + (pj0 >= 0 ? pj0 : 0) + (ptid % 2) * (BM / 2);
+        const float* pfb = fb + (long)(b0 + psl) * fb_sb + poff;
+        const float* pdb = GRAD ? grad_b + (long)(b0 + psl) * gb_sb + poff : pfb;
+        const int nbd = pj0 >= 0 ? 2 + (GRAD ? 2 : 0) : 0;   // (B's two lines, dB's two)
+        npf = 2 + nbd;                                   // (2: the values -- 0 past a row of no child, then skipped)
+        const bool pval = pj >= 0;
         auto prefetch = [&](int q) {                     // (q < npf)
-            const float* a = q < 2 ? pf[q] : q < 2 + K ? pfb + (q - 2) * NB : pdb + (q - 2 - K) * NB;
-            asm volatile("prefetch.global.L2::evict_last [%0];" ::"l"(a));
+            const float* a = q < 2 ? (pval ? pf[q] : nullptr) : q < 4 ? pfb + (q - 2) * 32 : pdb + (q - 4) * 32;
+            if (a != nullptr) asm volatile("prefetch.global.L2::evict_last [%0];" ::"l"(a));
         };
         // A: a chunk is 8 parents of child row m -- its block's slab of (block, parent block), the row in it
         uint32_t oA[CA];
@@ -1610,8 +1674,8 @@ template <bool FUSED, bool TMAA>
 static void launch_om(const bfloat16_t* params, const long* pbase, const bfloat16_t* vt, long vrows, long row0,
                       const float* shift, const float* vals, const long* ebase, const int* cbase, const int* jpos,
                       const int* ugrp, int knt, int rows, int block_size, int B, float* vnm, const long* nids,
-                      int num_edges, const CUtensorMap& tmapA, const float* fa, float* node_mars, float* lz,
-                      long nshift, long vn0, cudaStream_t st) {
+                      int num_edges, const CUtensorMap& tmapA, const float* fa, long a_sb, float* node_mars,
+                      float* lz, long nshift, long vn0, cudaStream_t st) {
     constexpr int ST = OM_ST, S = OM_BN / OM_K;
     constexpr int STAGE = (32 * OM_BM * 2 + 2 * 32 * OM_BN * 2 + 2 * 32 * S * 4 + 1023) / 1024 * 1024;
     constexpr int SMEM = ST * STAGE + OM_BN * 4 + ST * S * 4 + 3 * ST * 8;
@@ -1628,8 +1692,8 @@ static void launch_om(const bfloat16_t* params, const long* pbase, const bfloat1
     const long n = (long)(OM_K * B / OM_BN) * ((long)rows * block_size / OM_BM);
     TORCH_CHECK(n < (1L << 31), "lowrank om: a grid past 2^31 blocks");
     launch_pdl(kernel, dim3((unsigned)n), dim3(OM_THREADS), SMEM, st, params, pbase, vt, vrows, row0, shift, vals, ebase,
-               cbase, jpos, ugrp, knt, mtiles, block_size, B, vnm, nids, num_edges, tmapA, fa, node_mars, lz, nshift,
-               vn0);
+               cbase, jpos, ugrp, knt, mtiles, block_size, B, vnm, nids, num_edges, tmapA, fa, a_sb, node_mars, lz,
+               nshift, vn0);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
@@ -1645,7 +1709,8 @@ bool om_serves(int64_t K, int64_t B, int64_t block_size, int64_t rows) {
 // backward's dA takes); the tables `lowrank_forward_stream`'s; `vt` the normalizers' V bf16 [N, rows of V]
 // (`lowrank_z_operand`'s, the rows (copy, sample, rank)), `shift` their row shifts, this copy's rows from `row0`;
 // `node_mars` the node values at the node vector's circuit rows (the twin's + `nshift`), `lz` [M, B] log Z, `fa` the
-// factors A [M, K, B]; `vn0` the node vector's first twin row. `a_p0` / `a_bstr`: the
+// factors A [B, M, K] as the caller gives them (read in place: any batch stride, 16-byte aligned, a sample's block
+// contiguous); `vn0` the node vector's first twin row. `a_p0` / `a_bstr`: the
 // parameter slabs' bases `a_p0 + block a_bstr + edge tile 64 block_size` (`a_p0` -1: not so, or blocks not of 32 -- A by
 // cp.async; else by TMA), checked by the caller once per table.
 void lowrank_forward_om(torch::Tensor vnm, torch::Tensor vals, c10::optional<torch::Tensor> cbase, torch::Tensor ebase,
@@ -1679,14 +1744,18 @@ void lowrank_forward_om(torch::Tensor vnm, torch::Tensor vals, c10::optional<tor
         TORCH_CHECK(cbase->is_contiguous() && cbase->scalar_type() == torch::kInt32 &&
                     cbase->numel() == (long)rows * knt * 4, "lowrank om: cbase int32 [rows, knt, 2, 2]");
     const long M = lz.size(0);
-    for (const torch::Tensor* t : {&node_mars, &lz, &fa})
+    for (const torch::Tensor* t : {&node_mars, &lz})
         TORCH_CHECK(t->is_cuda() && t->is_contiguous() && t->scalar_type() == torch::kFloat32,
                     "lowrank om: the collapse's tensors contiguous float32 CUDA");
-    TORCH_CHECK(lz.dim() == 2 && lz.size(1) == B && fa.numel() == M * OM_K * B && node_mars.dim() == 2 &&
+    TORCH_CHECK(fa.is_cuda() && fa.scalar_type() == torch::kFloat32 && fa.dim() == 3 && fa.size(0) == B &&
+                fa.size(1) == M && fa.size(2) == OM_K && fa.stride(2) == 1 && fa.stride(1) == OM_K &&
+                fa.stride(0) >= M * OM_K && fa.stride(0) % 4 == 0 && (reinterpret_cast<uintptr_t>(fa.data_ptr()) & 15) == 0,
+                "lowrank om: A fp32 [B, M, K], a sample's block contiguous, 16-byte aligned runs");
+    TORCH_CHECK(lz.dim() == 2 && lz.size(1) == B && node_mars.dim() == 2 &&
                 node_mars.size(1) == B && vn0 >= 0 && node_mars.size(0) >= vn0 + nshift + M && vnm.size(0) >= vn0 + M &&
                 (reinterpret_cast<uintptr_t>(vnm.data_ptr()) & 15) == 0 &&
                 (reinterpret_cast<uintptr_t>(shift.data_ptr()) & 15) == 0,
-                "lowrank om: lz [M, B], A [M, K, B], the node rows, 16-byte aligned runs");
+                "lowrank om: lz [M, B], the node rows, 16-byte aligned runs");
     const bool tma = a_p0 >= 0 && block_size == 32;
     TORCH_CHECK(!tma || (a_bstr % 8 == 0 && a_p0 % 8 == 0), "lowrank om: the slabs' bases 16-byte aligned");
     const at::cuda::OptionalCUDAGuard guard(vnm.device());
@@ -1699,7 +1768,8 @@ void lowrank_forward_om(torch::Tensor vnm, torch::Tensor vals, c10::optional<tor
     launch_om<F, T>(pp, pbase.data_ptr<long>(), vtp, (long)vt.size(1), (long)row0, shift.data_ptr<float>(),         \
                     vals.data_ptr<float>(), ebase.data_ptr<long>(), cb, jpos.data_ptr<int>(), ugrp.data_ptr<int>(),     \
                     knt, rows, (int)block_size, B, vnm.data_ptr<float>(), nids.data_ptr<long>(), num_edges, tm,      \
-                    fa.data_ptr<float>(), node_mars.data_ptr<float>(), lz.data_ptr<float>(), (long)nshift, (long)vn0, st)
+                    fa.data_ptr<float>(), (long)fa.stride(0), node_mars.data_ptr<float>(), lz.data_ptr<float>(),       \
+                    (long)nshift, (long)vn0, st)
     if (fused) { if (tma) LOWRANK_OM(true, true); else LOWRANK_OM(true, false); }
     else { if (tma) LOWRANK_OM(false, true); else LOWRANK_OM(false, false); }
 #undef LOWRANK_OM
@@ -1736,16 +1806,17 @@ void lowrank_backward_om(torch::Tensor flows, torch::Tensor vals, c10::optional<
                          torch::Tensor node_mars, torch::Tensor lz, int64_t nshift, int64_t vn0, torch::Tensor params,
                          torch::Tensor chids, torch::Tensor ppar, torch::Tensor ppid, int64_t cbs, int64_t pbs,
                          c10::optional<torch::Tensor> grad_a, c10::optional<torch::Tensor> kd) {
-    const int B = (int)node_flows.size(1), K = (int)fb.size(0), N = (int)fb.size(1);
+    const int B = (int)node_flows.size(1), K = (int)fb.size(1), N = (int)fb.size(2);
     const int n_cb = (int)chids.size(0), npb = (int)ppar.size(1);
-    TORCH_CHECK(om_bw_serves(K, B, cbs, pbs, n_cb) && fb.size(2) == B, "lowrank om backward: rank ", OM_K, ", B a "
+    TORCH_CHECK(om_bw_serves(K, B, cbs, pbs, n_cb) && fb.dim() == 3 && fb.size(0) == B, "lowrank om backward: rank ", OM_K, ", B a "
                 "multiple of ", OM_BN / OM_K, ", the parents' blocks of 32, the ", OM_BM, "-child tile dividing the child "
                 "block or the blocks dividing the tile; got rank ", K, ", B ", B, ", blocks ", cbs, " / ", pbs);
     TORCH_CHECK(params.scalar_type() == torch::kBFloat16 && ua.scalar_type() == torch::kBFloat16,
                 "lowrank om backward: bf16 parameters and exp(A)");
-    for (const torch::Tensor* t : {&flows, &vals, &fb, &jrow, &ua, &sha, &node_flows, &node_mars, &lz, &chids, &ppar,
-                                   &ppid})
+    for (const torch::Tensor* t : {&flows, &vals, &jrow, &ua, &sha, &node_flows, &node_mars, &lz, &chids, &ppar, &ppid})
         TORCH_CHECK(t->is_cuda() && t->is_contiguous(), "lowrank om backward: contiguous CUDA tensors");
+    TORCH_CHECK(fb.is_cuda() && fb.stride(2) == 1 && fb.stride(1) == N && fb.stride(0) >= (long)K * N,
+                "lowrank om backward: B [B, K, N] as the caller gives it, a sample's block contiguous");
     TORCH_CHECK(flows.scalar_type() == torch::kFloat32 && vals.scalar_type() == torch::kFloat32 &&
                 fb.scalar_type() == torch::kFloat32 && jrow.scalar_type() == torch::kInt32 &&
                 sha.scalar_type() == torch::kFloat32 && node_flows.scalar_type() == torch::kFloat32 &&
@@ -1762,18 +1833,23 @@ void lowrank_backward_om(torch::Tensor flows, torch::Tensor vals, c10::optional<
         TORCH_CHECK(table->is_cuda() && table->is_contiguous() && table->scalar_type() == torch::kInt32 &&
                     table->dim() == 2 && table->size(1) == 2, "lowrank om backward: the products' table int32 [*, 2]");
     if (grad_b.has_value())
-        TORCH_CHECK(grad_b->is_cuda() && grad_b->is_contiguous() && grad_b->scalar_type() == torch::kFloat32 &&
-                    grad_b->numel() == fb.numel(), "lowrank om backward: dB as B");
+        TORCH_CHECK(grad_b->is_cuda() && grad_b->scalar_type() == torch::kFloat32 && grad_b->sizes() == fb.sizes() &&
+                    grad_b->stride(2) == 1 && grad_b->stride(1) == N && grad_b->stride(0) >= (long)K * N,
+                    "lowrank om backward: dB [B, K, N] as B, a sample's block contiguous");
     const bool da = grad_a.has_value();
     TORCH_CHECK(da == grad_b.has_value() && da == kd.has_value(), "lowrank om backward: dA's tensors with dB, all or none");
     const int M = (int)lz.size(0);
     if (da) {
-        for (const torch::Tensor* t : {&*grad_a, &*kd})
-            TORCH_CHECK(t->is_cuda() && t->is_contiguous() && t->scalar_type() == torch::kFloat32 &&
-                        (reinterpret_cast<uintptr_t>(t->data_ptr()) & 15) == 0,
-                        "lowrank om backward: dA's tensors contiguous float32 CUDA, 16-byte aligned");
-        TORCH_CHECK(grad_a->numel() == (long)M * K * B && kd->dim() == 2 && kd->size(1) == (long)K * B &&
-                    kd->size(0) >= vn0 + M, "lowrank om backward: dA's tensors do not fit the node vector");
+        TORCH_CHECK(kd->is_cuda() && kd->is_contiguous() && kd->scalar_type() == torch::kFloat32 &&
+                    (reinterpret_cast<uintptr_t>(kd->data_ptr()) & 15) == 0,
+                    "lowrank om backward: the kept share differences contiguous float32 CUDA, 16-byte aligned");
+        TORCH_CHECK(grad_a->is_cuda() && grad_a->scalar_type() == torch::kFloat32 && grad_a->dim() == 3 &&
+                    grad_a->size(0) == B && grad_a->size(1) == M && grad_a->size(2) == K && grad_a->stride(2) == 1 &&
+                    grad_a->stride(1) == K && grad_a->stride(0) >= (long)M * K && grad_a->stride(0) % 4 == 0 &&
+                    (reinterpret_cast<uintptr_t>(grad_a->data_ptr()) & 15) == 0,
+                    "lowrank om backward: dA [B, M, K] as the caller gives it, 16-byte aligned runs");
+        TORCH_CHECK(kd->dim() == 2 && kd->size(1) == (long)K * B && kd->size(0) >= vn0 + M,
+                    "lowrank om backward: dA's tensors do not fit the node vector");
     }
     const at::cuda::OptionalCUDAGuard guard(flows.device());
     const auto* pp = reinterpret_cast<const bfloat16_t*>(param_ptr<__nv_bfloat16>(params));
@@ -1807,6 +1883,7 @@ void lowrank_backward_om(torch::Tensor flows, torch::Tensor vals, c10::optional<
         constexpr int STAGE = (32 * OM_BM * 2 + NU * 32 * OM_BN * 2 + 3 * 32 * S * 4 + 1023) / 1024 * 1024;
         constexpr int SMEM = ST * STAGE + NU * OM_BN * 4 + NU * ST * S * 4 + 3 * ST * 8;
         static_assert(SMEM <= 101376, "past sm_120's 99 KB of shared memory a block");
+        static_assert(!G || 32 * ((32 * OM_K + 4) + (32 + 1)) * 4 <= SMEM, "the dA CTAs' tiles in the shared memory");
         auto kernel = lr_om_bw_kernel<ST, F, G>;
         static bool attr_set[64] = {};
         int dev = 0;
@@ -1820,10 +1897,11 @@ void lowrank_backward_om(torch::Tensor flows, torch::Tensor vals, c10::optional<
                    (long)row0, sha.data_ptr<float>(), node_flows.data_ptr<float>(), node_mars.data_ptr<float>(),
                    lz.data_ptr<float>(), (long)nshift, (long)vn0, chids.data_ptr<long>(), npb, (int)cbs, (int)pbs,
                    mtiles, B, vals.data_ptr<float>(), fused ? table->data_ptr<int>() : (const int*)nullptr,
-                   (long)first, fb.data_ptr<float>(), jrow.data_ptr<int>(), (long)e_lo, N, flows.data_ptr<float>(),
-                   grad_b.has_value() ? grad_b->data_ptr<float>() : (float*)nullptr,
+                   (long)first, fb.data_ptr<float>(), (long)fb.stride(0), jrow.data_ptr<int>(), (long)e_lo, N,
+                   flows.data_ptr<float>(), grad_b.has_value() ? grad_b->data_ptr<float>() : (float*)nullptr,
+                   grad_b.has_value() ? (long)grad_b->stride(0) : 0L,
                    da ? kd->data_ptr<float>() : (const float*)nullptr, da ? (long)kd->size(1) : 0L,
-                   da ? grad_a->data_ptr<float>() : (float*)nullptr, M, (int)n, n_da);
+                   da ? grad_a->data_ptr<float>() : (float*)nullptr, da ? (long)grad_a->stride(0) : 0L, M, (int)n, n_da);
         C10_CUDA_KERNEL_LAUNCH_CHECK();
     };
     if (fused) { if (grad_b.has_value()) go(std::true_type{}, std::true_type{}); else go(std::true_type{}, std::false_type{}); }
