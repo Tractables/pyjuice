@@ -83,6 +83,41 @@ def get_exp_sum_module():
     return _exp_sum_module
 
 
+_fp8_module = None
+_fp8_attempted = False
+
+
+def get_pass_end_fp8_module():
+    """The "sum_exp" form's pass's end operands in e4m3 (`lowrank_pass_end_fp8.cu`: `LowRank(flow_precision =
+    "fp8")`), or None if unavailable (warns once): the pass's end then keeps its bf16 operands. Plain CUDA."""
+    global _fp8_module, _fp8_attempted
+
+    if _fp8_attempted:
+        return _fp8_module
+
+    _fp8_attempted = True
+
+    if not ENABLE_CUDA_KERNELS:
+        return None
+
+    flags = _compile_flags()
+    if flags is None:
+        return None
+
+    from pyjuice.utils.cuda_ext import jit_load
+    try:
+        _fp8_module = jit_load(
+            "pyjuice_lowrank_pass_end_fp8_cuda",
+            sources = [os.path.join(_THIS_DIR, "lowrank_pass_end_fp8.cu")],
+            extra_cuda_cflags = flags, verbose = False)
+    except Exception as e:
+        warnings.warn(
+            f"pyjuice CUDA kernel 'pyjuice_lowrank_pass_end_fp8_cuda' failed to compile ({type(e).__name__}: {e}). "
+            "The low-rank pass's end keeps its bf16 operands.", RuntimeWarning)
+        _fp8_module = None
+    return _fp8_module
+
+
 _stream_module = None
 _stream_attempted = False
 

@@ -86,6 +86,17 @@ class LowRank(_ForwardMixin, _BackwardMixin, _DenominatorsMixin, SumParameteriza
 
     :param tie_external: share one pair of tensors across every copy of a tied node, instead of one per copy
     :type tie_external: bool
+
+    :param flow_precision: `"bf16"` (default) or `"fp8"`, an OPT-IN for `"sum_exp"`: the pass's end's two products
+                           -- the parameter flows' `theta * (Ud Vd^T)` and the denominators' `Un Vt^T`, over every
+                           (copy, sample, rank) of the pass -- from e4m3 operands (a power-of-2 scale a row, fp32
+                           accumulation) where they are bf16 by default (precision "auto", the products large enough:
+                           `lowrank.virtual`); about twice the bf16 products' speed, the statistics' entries about
+                           16x less accurate (MEASURED against float64 on an HMM of 1024 states, rank 16, batch 64:
+                           the M-step's `F+ / F-` a median 3e-4 .. 1.4e-2 and at most 2e-3 .. 0.18 off as the factors'
+                           spread goes from 0.3 to 4 nats, against bf16's 2e-5 .. 8e-4 and 1e-4 .. 1e-2; no entry
+                           made 0). Under precision "fp32" the products stay fp32. The gradients are not affected.
+    :type flow_precision: str
     """
 
     #: The node values are not the shared ones corrected: the scale differs for every pair, so they are made here
@@ -108,29 +119,35 @@ class LowRank(_ForwardMixin, _BackwardMixin, _DenominatorsMixin, SumParameteriza
         """The mixture form's plain kernels run on `rank` columns a sample (the virtual batch)."""
         return batch_size * self.rank if self.form == "sum_exp" else batch_size
 
-    def __init__(self, rank: int, form: str = "exp_sum", apply_z_correction: bool = True, tie_external: bool = False):
+    def __init__(self, rank: int, form: str = "exp_sum", apply_z_correction: bool = True, tie_external: bool = False,
+                 flow_precision: str = "bf16"):
         super(LowRank, self).__init__()
 
         assert isinstance(rank, int) and rank >= 1, f"`rank` must be a positive integer, got {rank}."
         assert form in LOWRANK_FORMS, f"`form` must be one of {LOWRANK_FORMS}, got {form!r}."
+        assert flow_precision in ("bf16", "fp8"), f"`flow_precision` must be \"bf16\" or \"fp8\", got {flow_precision!r}."
+        assert flow_precision == "bf16" or form == "sum_exp", \
+            "`flow_precision = \"fp8\"` is the \"sum_exp\" form's (its pass's end products); \"exp_sum\" makes its " \
+            "flows in its fused kernels."
 
         self.rank = rank
         self.form = form
         self.apply_z_correction = bool(apply_z_correction)
         self.tie_external = bool(tie_external)
+        self.flow_precision = flow_precision
 
     # ------------------------------------------------------------------ identity
 
     def get_signature(self) -> str:
         return f"LowRank_{self.form}_r{self.rank}" + ("" if self.apply_z_correction else "_noz") + \
-            ("_tied" if self.tie_external else "")
+            ("_tied" if self.tie_external else "") + ("_f8" if self.flow_precision == "fp8" else "")
 
     def _get_constructor(self):
         return LowRank, {"rank": self.rank, "form": self.form, "apply_z_correction": self.apply_z_correction,
-                         "tie_external": self.tie_external}
+                         "tie_external": self.tie_external, "flow_precision": self.flow_precision}
 
     def __reduce__(self):
-        return (self.__class__, (self.rank, self.form, self.apply_z_correction, self.tie_external))
+        return (self.__class__, (self.rank, self.form, self.apply_z_correction, self.tie_external, self.flow_precision))
 
     def storage_owner(self, ns):
         """With `tie_external`, every copy of a tied node reads one shared pair of tensors -- the source's."""

@@ -447,12 +447,23 @@ def _normalizers(desc, layer, info, st, kwargs, params, batch, dev) -> dict:
         copies = [(c, t[1]) for c, t in mine]
         fbs = [fb for _, fb in copies]
         dtype = _dtype(kwargs.get("precision", "auto"), len(copies) * batch * K * geo["M"] * geo["N"])
-        Vt, shift = _v_rows(mod, fbs, geo["N"], K, batch, dtype, dev, ip)
+        # (`flow_precision = "fp8"`: V's twin besides gives each (child, copy, sample)'s largest V over the ranks, what
+        # the pass's end's e4m3 operands take their rows' scales from -- `gv`; V the same bits)
+        gv = None
+        if ip and dtype is torch.bfloat16 and getattr(desc, "flow_precision", "bf16") == "fp8" and \
+                _fp8_module() is not None:
+            rows = len(fbs) * batch * K
+            Vt = torch.empty(geo["N"], rows, dtype = dtype, device = dev)
+            shift = torch.empty(rows, device = dev)
+            gv = torch.empty(geo["N"], rows // K, device = dev)
+            _fp8_module().lowrank_z_operand_in_place_g(Vt, shift, gv, fbs, batch, K)
+        else:
+            Vt, shift = _v_rows(mod, fbs, geo["N"], K, batch, dtype, dev, ip)
         op = kwargs.get("op_params")
         theta = desc._dense_params(geo, op if op is not None and dtype is torch.bfloat16 else params, dtype)
         hit = zs[source] = dict(zt = None, zt_done = set(), row = {c: at * batch * K for at, (c, _) in enumerate(copies)},
                                 V = Vt, shift = shift, dtype = dtype, fb = fbs, theta = theta, cols = batch * K,
-                                fa = [t[0] for _, t in mine], in_place = ip)
+                                fa = [t[0] for _, t in mine], in_place = ip, gv = gv)
     return hit
 
 
@@ -511,6 +522,32 @@ def _stream_module():
         from .kernels.c import get_lowrank_stream_module
         _STREAM = get_lowrank_stream_module()
     return _STREAM
+
+
+_FP8 = "unset"
+_FP8_ONE = dict()
+
+
+def _fp8_module():
+    """The e4m3 pass's end's extension (`lowrank_pass_end_fp8.cu`: `LowRank(flow_precision = "fp8")`), or None."""
+    global _FP8
+    if _FP8 == "unset":
+        from .kernels.c import get_pass_end_fp8_module
+        _FP8 = get_pass_end_fp8_module()
+    return _FP8
+
+
+def _product_fp8(a8, b8, sa, sb):
+    """`(a b^T)` of e4m3 operands `a8` [M, rows], `b8` [N, rows] under the power-of-2 scales `sa` [M], `sb` [N] of their
+    rows (`lowrank_kept_operands_fp8`'s): one e4m3 product, fp32 accumulation (`torch._scaled_mm`, scale 1), then the
+    rows' and columns' scales in one launch (`lowrank_scale_rows_cols`) -- the fp32 output of a rowwise-scaled product,
+    which torch serves at 16-bit outputs alone."""
+    one = _FP8_ONE.get(a8.device)
+    if one is None:
+        one = _FP8_ONE[a8.device] = torch.ones((), device = a8.device)
+    out = torch._scaled_mm(a8, b8.t(), one, one, out_dtype = torch.float32)
+    _fp8_module().lowrank_scale_rows_cols(out, sa, sb)
+    return out
 
 
 def _om_slabs(pbase: torch.Tensor, knt: int, block_size: int) -> tuple:
@@ -875,6 +912,40 @@ def _end_of_pass(mod, z, copies, node_flows, node_mars, params, param_flows, den
     Vt, shift = (z["V"], z["shift"]) if dtype is z["dtype"] else _v_rows(mod, z["fb"], N, K, batch, dtype, dev,
                                                                            z["in_place"])
     zeros = want_denom and len(copies) < len(z["row"])
+    # `flow_precision = "fp8"`: the statistics' two products -- F+'s, W's -- from the kept operands in e4m3 (a
+    # power-of-2 scale a row) with fp32 accumulation, where the bf16 kept operands serve and every dimension is a
+    # multiple of 16 (the e4m3 product's); the gradients' (`owed`: theta^T U, dB's normalizer half) as the default's
+    fp8 = kept and getattr(desc, "flow_precision", "bf16") == "fp8" and M % 16 == 0 and N % 16 == 0 and \
+        Vt.size(1) % 16 == 0 and (len(fp) * cols) % 16 == 0 and (fp or want_denom) and _fp8_module() is not None
+    if fp8:
+        f8 = torch.float8_e4m3fn
+        ua, sha = _a_rows(mod, z, batch, K, dev)
+        at = {id(c): k * cols for k, c in enumerate(fp)}
+        un = {id(c) for c in copies} if want_denom else set()
+        sel = [c for c in copies if id(c) in at or id(c) in un]
+        geos = [desc._geometry(c[0], c[1], dev)["rows"] if id(c) in at else None for c in sel]
+        Ud8 = torch.empty(M, len(fp) * cols, dtype = f8, device = dev) if fp else None
+        Vd8 = torch.empty(N, len(fp) * cols, dtype = f8, device = dev) if fp else None
+        # (a copy of the source the pass did not bring: its columns of both 0, as Ut's are)
+        Un8 = (torch.zeros if zeros else torch.empty)(M, Vt.size(1), dtype = f8, device = dev) if want_denom else None
+        Vt8 = (torch.zeros if zeros else torch.empty)(N, Vt.size(1), dtype = f8, device = dev) if want_denom else None
+        sc = torch.empty(2 * M + 2 * N, device = dev)
+        _fp8_module().lowrank_kept_operands_fp8(
+            Ud8, Vd8, Un8, Vt8, sc, ua, sha, Vt, shift, node_flows, node_mars, [c[3] for c in sel],
+            [c[1].nid_start for c in sel], geos, [c[5][0] if id(c) in at else None for c in sel],
+            [c[5][1] if id(c) in at else 0 for c in sel], [z["row"][c[1].ns] for c in sel],
+            [at.get(id(c), -1) for c in sel], [int(id(c) in un) for c in sel], M, K,
+            [c[5][2] if id(c) in at else None for c in sel], z.get("gv"))
+        if fp:
+            desc._scatter_add(geo, param_flows, fp[0][1].ns._param_flow_range[0],
+                              _product_fp8(Ud8, Vd8, sc[:M], sc[2 * M:2 * M + N]), params)
+        if want_denom:
+            desc._scatter_add(geo, denom_param_flows, desc._denom_offsets(layer0)[id(info0.ns)][0],
+                              _product_fp8(Un8, Vt8, sc[M:2 * M], sc[2 * M + N:]))
+        if not owed:
+            return
+        # (the owing copies' rows of U alone, in bf16, for their theta^T U)
+        fp, rows_of, want_denom, zeros = [], owed, False, False
     Ut = (torch.zeros if zeros else torch.empty)(M, Vt.size(1), dtype = dtype, device = dev) if rows_of else None
     Ud = Vd = None
     if fp:

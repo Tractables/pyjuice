@@ -2609,6 +2609,302 @@ def test_the_kept_operands_follow_their_formulas(M, N, K, B, copies):
     assert torch.isfinite(Un[:, B * K:].float()).all()
 
 
+def _fp8_rows(q8, scales):
+    """e4m3 operand rows back in float64: each row's codes times its scale."""
+    return q8.float().double() * scales.double()[:, None]
+
+
+@needs_virtual
+@pytest.mark.parametrize("M, N, K, B, copies", [(3, 300, 2, 37, 2),     # children past one warp's share, ragged runs
+                                                (6, 40, 16, 4, 3),      # whole runs (8-byte stores)
+                                                (5, 3, 3, 4, 70)])      # few children, copies past one launch's
+@pytest.mark.parametrize("from_g", [False, True])
+def test_the_fp8_operands_are_the_kept_ones_in_e4m3(M, N, K, B, copies, from_g):
+    """`lowrank_kept_operands_fp8` (`LowRank(flow_precision = "fp8")`) against `lowrank_kept_operands` on the same
+    exponentials: each operand row -- Ud's, Un's (a node), Vd's, Vt's (a child) -- under a power-of-2 scale whose row's
+    largest code lies in [224, 448] (1 for a row of zeros); every entry the bf16 one within e4m3's rounding (2^-4 of it,
+    2^-10 of the scale below e4m3's normal range) and bf16's, 0 where it is 0; Vt's copy written for the copies whose U
+    is asked for, the other columns untouched; copies past one launch (the rows' maxima over every launch); the
+    children's values kept instead of the table the same bits. The edge cases of
+    `test_the_kept_operands_follow_their_formulas`: finite, 0 where a factor of the term is. `from_g`: the rows' maxima
+    from each (child, copy, sample)'s largest V over its ranks (what the in-place V operand's twin gives: here made from
+    V) and the nodes' runs of exp(A - shift), not from a pass over the operands."""
+    import pyjuice.parameterizations.lowrank.virtual as lowrank_virtual
+
+    mod, mod8, dev = lowrank_virtual._module(), lowrank_virtual._fp8_module(), torch.device("cuda")
+    if mod8 is None:
+        pytest.skip("the e4m3 pass's end did not build")
+    f8 = torch.float8_e4m3fn
+    g = torch.Generator(device = "cpu").manual_seed(13)
+    children = 13
+    fa = [(torch.randn(M, K, B, generator = g) * 2).to(dev) for _ in range(copies)]
+    fb = [(torch.randn(K, N, B, generator = g) * 2).to(dev) for _ in range(copies)]
+    lz = [(torch.randn(M, B, generator = g) * 2).to(dev) for _ in range(copies)]
+    rows = children + copies * M
+    node_flows = (torch.randn(rows, B, generator = g) - 1.0).to(dev)
+    node_mars = (torch.randn(rows, B, generator = g) - 3.0).to(dev)
+    nid0 = [children + c * M for c in range(copies)]
+    first, elements = 5, N + 7
+    table = torch.randint(0, children, (elements, 2), generator = g, dtype = torch.int32).to(dev)
+    eids = [(first + torch.randperm(elements, generator = g)[:N]).to(dev) for _ in range(copies)]
+    eids[0][1] = -1                                                    # copy 0, child 1: no edge reaches it
+    node_mars[int(table[int(eids[0][0]) - first, 0]), 2] = -float("inf")   # a child without mass
+    node_flows[nid0[0] + 1, 2] = -float("inf")                         # copy 0, node 1, sample 2: no flow
+    node_mars[nid0[1] + 0, 3 % B] = -float("inf")                      # copy 1, node 0: no mass
+    node_mars[nid0[0] + M - 1, 3 % B] = -float("inf")                  # copy 0 (a data half), its last node: no mass
+    lz[1][M - 1, 1] = -float("inf")                                    # copy 1, its last node, sample 1: no normalizer
+    fb[0][1 % K, :, 1] = -float("inf")                                 # copy 0, a rank without mass at sample 1
+    for c in range(copies):                                            # node 2: no flow anywhere -- rows of zeros
+        node_flows[nid0[c] + 2 % M] = -float("inf")
+
+    total = copies * B * K
+    Ua = torch.empty(M, total, dtype = torch.bfloat16, device = dev)
+    sha = torch.empty(total, device = dev)
+    Vt = torch.empty(N, total, dtype = torch.bfloat16, device = dev)
+    shb = torch.empty(total, device = dev)
+    mod.lowrank_a_operand(Ua, sha, fa, B, K)
+    mod.lowrank_z_operand(Vt, shb, fb, B, K)
+    data = [c for c in range(copies) if c != 1]                        # (copy 1: no data half)
+    want_un = [c for c in range(copies) if c != 0]                     # (copy 0: no U asked for)
+    drow0 = [data.index(c) * B * K if c in data else -1 for c in range(copies)]
+
+    def args(cv):
+        return (Ua, sha, Vt, shb, node_flows, node_mars, lz, nid0,
+                [eids[c] if c in data else None for c in range(copies)],
+                [table if c in data and cv is None else None for c in range(copies)], [first] * copies,
+                [c * B * K for c in range(copies)], drow0, [int(c in want_un) for c in range(copies)], M, K,
+                [None] * copies if cv is None else [cv[c] if c in data else None for c in range(copies)])
+
+    Ud = torch.zeros(M, len(data) * B * K, dtype = torch.bfloat16, device = dev)
+    Vd = torch.zeros(N, len(data) * B * K, dtype = torch.bfloat16, device = dev)
+    Un = torch.zeros(M, total, dtype = torch.bfloat16, device = dev)
+    mod.lowrank_kept_operands(Ud, Vd, Un, *args(None))
+    # (each (child, copy, sample)'s largest V over its ranks)
+    g = (Vt.float().view(N, total // K, K).amax(2).contiguous() if from_g else None,)
+
+    def run(cv):
+        q = dict(Ud = torch.full(Ud.shape, float("nan"), dtype = f8, device = dev),
+                 Vd = torch.full(Vd.shape, float("nan"), dtype = f8, device = dev),
+                 Un = torch.full(Un.shape, float("nan"), dtype = f8, device = dev),
+                 Vt = torch.full(Vt.shape, float("nan"), dtype = f8, device = dev))
+        sc = torch.full((2 * M + 2 * N,), float("nan"), device = dev)
+        mod8.lowrank_kept_operands_fp8(q["Ud"], q["Vd"], q["Un"], q["Vt"], sc, *args(cv), *g)
+        torch.cuda.synchronize()
+        return q, sc
+
+    q, sc = run(None)
+    scales = dict(Ud = sc[:M], Un = sc[M:2 * M], Vd = sc[2 * M:2 * M + N], Vt = sc[2 * M + N:])
+    assert torch.isfinite(sc).all() and torch.equal(torch.exp2(torch.log2(sc).round()), sc), "powers of 2"
+    un_cols = torch.cat([torch.arange(c * B * K, (c + 1) * B * K, device = dev) for c in want_un])
+    off_cols = torch.arange(0, B * K, device = dev)                    # (copy 0's: no U asked for)
+    refs = dict(Ud = (Ud, slice(None)), Vd = (Vd, slice(None)), Un = (Un, un_cols), Vt = (Vt, un_cols))
+    for name, (ref, cols) in refs.items():
+        got, s, want = q[name][:, cols], scales[name], ref[:, cols].double()
+        assert torch.isfinite(got.float()).all(), f"{name}: a written entry not finite"
+        codes = got.float().abs().amax(1)
+        live = want.abs().amax(1) > 0
+        assert ((codes[live] >= 224) & (codes[live] <= 448)).all(), f"{name}: a row's largest code {codes[live]}"
+        assert (s[~live] == 1).all() and (codes[~live] == 0).all(), f"{name}: a row of zeros"
+        deq = _fp8_rows(got, s)
+        assert bool((deq[want == 0] == 0).all()), f"{name}: an entry 0 in bf16 not 0"
+        tol = want.abs() * (2 ** -4 + 2 ** -8) + s.double()[:, None] * 2 ** -10
+        assert bool(((deq - want).abs() <= tol).all()), \
+            f"{name}: off by {float(((deq - want).abs() / tol).max())} tolerances"
+    assert not bool((scales["Ud"] == 1).all()) and not bool((scales["Vd"] == 1).all())
+    assert torch.isnan(q["Un"][:, off_cols].float()).all() and torch.isnan(q["Vt"][:, off_cols].float()).all(), \
+        "the columns of a copy whose U is not asked for written"
+    # (the children's values kept instead of the table -- a copy whose product layer was not fused in: the same bits)
+    qk, sck = run([_kept_children(node_mars, table, first, e) for e in eids])
+    assert torch.equal(sck, sc), "the kept children's scales"
+    for name in q:
+        assert torch.equal(qk[name].view(torch.uint8), q[name].view(torch.uint8)), f"the kept children's {name}"
+
+
+@needs_virtual
+@pytest.mark.parametrize("L, bs, rank, batch, fp8", [(256, 32, 16, 8, True),     # the one-launch passes, e4m3 products
+                                                     (160, 32, 2, 7, False)])    # rows not a multiple of 16: bf16
+def test_the_fp8_flow_products_change_the_statistics_alone(monkeypatch, L, bs, rank, batch, fp8):
+    """`LowRank(flow_precision = "fp8")` against the default on the same circuit and inputs: the log-likelihoods,
+    node values, flows and gradients bit for bit, the parameter flows and the denominators within e4m3's rounding of
+    the pass's end's products (an entry two roundings of each of its terms at most, 1e-5 of the largest below e4m3's
+    range; their rel-l2 under 1e-2, not 0); the e4m3 products taken -- two a pass, F+ and W -- where they serve, the
+    bf16 ones (the same values) where they do not."""
+    import pyjuice.parameterizations.lowrank.virtual as lowrank_virtual
+    from pyjuice.layer.kernels import autotune
+
+    if lowrank_virtual._fp8_module() is None:
+        pytest.skip("the e4m3 pass's end did not build")
+    pick = autotune.pick
+    monkeypatch.setattr(autotune, "pick", lambda key, cands, bench, **k: "fused"
+                        if key[0] in ("prod_stream_fusion", "prod_stream_fusion_bk") else pick(key, cands, bench, **k))
+    monkeypatch.setattr(lowrank_virtual, "GEMM_BF16_WORK", 0)
+    calls, real = [], lowrank_virtual._product_fp8
+
+    def counted(*a):
+        calls.append(tuple(a[0].shape))
+        return real(*a)
+
+    monkeypatch.setattr(lowrank_virtual, "_product_fp8", counted)
+    twins, real_twin = [], lowrank_virtual._fp8_module().lowrank_z_operand_in_place_g
+
+    def counted_twin(*a):
+        twins.append(a[0].shape)
+        return real_twin(*a)
+
+    monkeypatch.setattr(lowrank_virtual._fp8_module(), "lowrank_z_operand_in_place_g", counted_twin)
+    out = {}
+    for prec in ("bf16", "fp8"):
+        twins.clear()
+        pc, sums, _, _, _, _ = _pair(_hmm_blocks(L, bs), "sum_exp", rank = rank, flow_precision = prec)
+        monkeypatch.setattr(pc, "_param_operands_force", True, raising = False)
+        dev = pc.params.device
+        torch.manual_seed(37)
+        data = torch.randint(0, NUM_CATS, (batch, pc.num_vars), device = dev)
+        ext = {a: _factors(a, rank, batch, dev, seed = 470 + i) for i, a in enumerate(sums)}
+        _passes(pc, sums, data, ext)
+        calls.clear()
+        out[prec] = _passes(pc, sums, data, ext)
+        out[prec]["calls"], out[prec]["twins"] = list(calls), list(twins)
+    got, want = out["fp8"], out["bf16"]
+    assert want["calls"] == [] and want["twins"] == [], "the default took the e4m3 products or V's twin"
+    assert len(got["calls"]) == (2 if fp8 else 0), got["calls"]
+    # (rank 16, the factors read in place: V's twin makes the children's maxima -- no pass over the operands)
+    assert bool(got["twins"]) == (rank in (4, 8, 16, 32)), got["twins"]
+    for k in ("lls", "mars", "flows"):
+        assert torch.equal(got[k], want[k]), k
+    for k in ("dA", "dB"):
+        assert all(torch.equal(a, b) for a, b in zip(got[k], want[k])), k
+    for k in ("fp", "fm"):
+        if not fp8:
+            assert torch.allclose(got[k], want[k], rtol = 1e-6, atol = 0), k       # (atomic adds' order alone)
+            continue
+        # (a term's two e4m3 roundings at most 2^-4 each, bf16's 2^-8 under them; the sums -- 384 terms here --
+        # average them out: their l2 a few 1e-3)
+        top = float(want[k].abs().max())
+        assert torch.allclose(got[k], want[k], rtol = 2 * 2 ** -4 + 2 ** -6, atol = 1e-5 * top), \
+            f"{k}: {float(((got[k] - want[k]).abs() / (want[k].abs() + 1e-5 * top)).max())}"
+        l2 = float((got[k] - want[k]).norm() / want[k].norm())
+        assert 0 < l2 < 1e-2, f"{k}: rel-l2 {l2}"
+
+
+def test_flow_precision_is_part_of_the_parameterization():
+    """`flow_precision` is the "sum_exp" form's, in the parameterization's identity (signature, constructor, pickling);
+    anything but "bf16" / "fp8" refused."""
+    import pickle
+
+    a, b = LowRank(rank = 4, form = "sum_exp"), LowRank(rank = 4, form = "sum_exp", flow_precision = "fp8")
+    assert a.flow_precision == "bf16" and b.flow_precision == "fp8"
+    assert a.get_signature() != b.get_signature() and b.get_signature().endswith("_f8")
+    cls, kw = b._get_constructor()
+    assert cls(**kw).get_signature() == b.get_signature()
+    assert pickle.loads(pickle.dumps(b)).flow_precision == "fp8"
+    with pytest.raises(AssertionError):
+        LowRank(rank = 4, form = "exp_sum", flow_precision = "fp8")
+    with pytest.raises(AssertionError):
+        LowRank(rank = 4, form = "sum_exp", flow_precision = "fp16")
+
+
+@needs_virtual
+def test_fp8_flow_products_with_tied_copies_that_do_not_go_through_the_virtual_batch(monkeypatch):
+    """`test_a_tied_copy_that_does_not_go_through_the_virtual_batch` at `flow_precision = "fp8"` (blocks of 16, 8
+    samples at rank 2: every dimension of the e4m3 products a multiple of 16): the forward's normalizers hold rows for
+    the three copies, one of them comes through the virtual batch's backward -- the e4m3 operands' columns of the other
+    two 0, so W holds the one's terms alone --, on the plain path (its dB's normalizer half owed to the pass's end:
+    the bf16 theta^T U beside the e4m3 W): against "bf16" on the same circuit, everything bit for bit but the
+    parameter flows and the denominators, those within e4m3's rounding; W the e4m3 product's."""
+    import pyjuice.parameterizations.lowrank.virtual as lowrank_virtual
+
+    if lowrank_virtual._fp8_module() is None:
+        pytest.skip("the e4m3 pass's end did not build")
+    monkeypatch.setattr(lowrank_virtual, "GEMM_BF16_WORK", 0)
+    rank, batch, dev, K = 2, 8, torch.device("cuda:0"), 16
+    calls, real = [], lowrank_virtual._product_fp8
+
+    def counted(*a):
+        calls.append(tuple(a[0].shape))
+        return real(*a)
+
+    monkeypatch.setattr(lowrank_virtual, "_product_fp8", counted)
+
+    def build(prec):
+        torch.manual_seed(0)
+        with juice.set_block_size(K):
+            leaf = lambda v: inputs(v, num_node_blocks = 1, dist = dists.Categorical(num_cats = NUM_CATS))
+            below = summate(multiply(leaf(0), leaf(1)), num_node_blocks = 1)
+            s0 = summate(multiply(below, leaf(2)), num_node_blocks = 1,
+                         parameterization = LowRank(rank = rank, form = "sum_exp", flow_precision = prec))
+            shared = multiply(leaf(3), leaf(4))
+            s1, s2 = s0.duplicate(shared, tie_params = True), s0.duplicate(shared, tie_params = True)
+            mix = summate(multiply(s1), multiply(s2), num_node_blocks = 1)        # (the two over one scope: mixed)
+            root = summate(multiply(s0, mix), num_node_blocks = 1, block_size = 1)
+        torch.manual_seed(0)
+        root.init_parameters(perturbation = 2.0)
+        return juice.compile(root, verbose = False).to(dev), [s0, s1, s2]
+
+    out = dict()
+    for prec in ("bf16", "fp8"):
+        pc, sums = build(prec)
+        torch.manual_seed(41)
+        data = torch.randint(0, NUM_CATS, (batch, pc.num_vars), device = dev)
+        ext = {a: _factors(a, rank, batch, dev, seed = 260 + i) for i, a in enumerate(sums)}
+        calls.clear()
+        out[prec] = _passes(pc, sums, data, ext)
+        out[prec]["calls"] = list(calls)
+        kinds = [type(pc.external_params_nodes[a].__dict__["_lr_state"]) for a in sums]
+        assert kinds == [tuple, dict, dict], kinds
+    got, want = out["fp8"], out["bf16"]
+    # (W's alone: the copy's parameter flows are its plain backward's, and its dB's normalizer half -- owed -- the
+    # bf16 product's, as the default's)
+    assert want["calls"] == [] and got["calls"] == [(16, 3 * batch * rank)], (want["calls"], got["calls"])
+    for k in ("lls", "mars", "flows"):
+        assert torch.equal(got[k], want[k]), k
+    for k in ("dA", "dB"):
+        assert all(torch.equal(a, b) for a, b in zip(got[k], want[k])), k
+    for k in ("fp", "fm"):
+        top = float(want[k].abs().max())
+        assert torch.isfinite(got[k]).all(), k
+        assert torch.allclose(got[k], want[k], rtol = 2 * 2 ** -4 + 2 ** -6, atol = 1e-5 * top), \
+            f"{k}: {float(((got[k] - want[k]).abs() / (want[k].abs() + 1e-5 * top)).max())}"
+
+
+@needs_virtual
+@pytest.mark.parametrize("M, N, K, B, copies", [(40, 300, 16, 5, 3),      # a node's ranks over lanes, children ragged
+                                                (1100, 1100, 16, 2, 2),   # past the kept registers' share (2nd loops)
+                                                (8, 8, 4, 2, 70)])        # copies past one launch's
+def test_the_fp8_in_place_operands_give_their_ranks_maxima(M, N, K, B, copies):
+    """`lowrank_z_operand_in_place_g` (`LowRank(flow_precision = "fp8")`'s V): V and its shifts the bits of
+    `lowrank_z_operand_in_place`; besides, each (child, copy, sample)'s largest V over its ranks, as stored. A rank
+    without mass (its V 0), a sample without any (its maxima 0)."""
+    import pyjuice.parameterizations.lowrank.virtual as lowrank_virtual
+
+    mod, mod8, dev = lowrank_virtual._module(), lowrank_virtual._fp8_module(), torch.device("cuda")
+    if mod8 is None:
+        pytest.skip("the e4m3 pass's end did not build")
+    g = torch.Generator(device = "cpu").manual_seed(29)
+    fa = [(torch.randn(B, M, K, generator = g) * 2).to(dev) for _ in range(copies)]
+    fb = [(torch.randn(B, K, N, generator = g) * 2).to(dev) for _ in range(copies)]
+    fb[0][B - 1, K - 1, :] = -float("inf")                              # a rank without mass
+    fb[copies - 1][0] = -float("inf")                                   # a sample without any: its maxima 0
+    total = copies * B * K
+    out = {}
+    for twin in (False, True):
+        Vt = torch.full((N, total), float("nan"), dtype = torch.bfloat16, device = dev)
+        shb = torch.full((total,), float("nan"), device = dev)
+        if twin:
+            gv = torch.full((N, total // K), float("nan"), device = dev)
+            mod8.lowrank_z_operand_in_place_g(Vt, shb, gv, fb, B, K)
+            out[twin] = (Vt, shb, gv)
+        else:
+            mod.lowrank_z_operand_in_place(Vt, shb, fb, B, K)
+            out[twin] = (Vt, shb)
+    torch.cuda.synchronize()
+    assert torch.equal(out[False][0].view(torch.int16), out[True][0].view(torch.int16)), "V"
+    assert torch.equal(out[False][1].view(torch.int32), out[True][1].view(torch.int32)), "V's shifts"
+    Vt, shb, gv = out[True]
+    assert torch.equal(gv, Vt.float().view(N, total // K, K).amax(2)), "V's maxima"
+    assert bool((gv[:, (copies - 1) * B] == 0).all()), "a sample without mass: its maxima 0"
+
+
 @needs_virtual
 def test_a_backward_at_another_precision_than_its_forward(monkeypatch):
     """The forward's operands are the backward's where their dtype is what the backward's precision asks for. A backward at
