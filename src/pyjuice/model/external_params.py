@@ -167,7 +167,17 @@ class _ExternalParamsMixin:
         caller's tensors are in the layout they supplied the gates in. `from_storage` is what maps
         between the two, so this is the exact inverse of what staging does on the forward, batched into
         one `_foreach_copy_` rather than one op per node.
+
+        Destinations handed over unzeroed (`StagedExternalParams.fresh`) that no layer claimed are zeroed
+        first: what a node whose layers wrote nothing has for its gradient.
         """
+        fresh = self.__dict__.get("_staged_external_params_grad")
+        if fresh is not None and fresh.fresh:
+            claimed = fresh.__dict__.get("claimed", ())
+            left = {id(ts): ts for ts in fresh.values() if ts is not None and id(ts) not in claimed}
+            if left:
+                torch._foreach_zero_([t for ts in left.values() for t in ts])
+            fresh.fresh = False
         groups = self.__dict__.get("_external_grad_groups")
         if groups:
             for batched, rows, cats in groups:
@@ -739,11 +749,13 @@ class _ExternalParamsMixin:
                         member[self._ext_ns_static(ns)[1]] = ns
                     pairs = tuple((ns, member[self._ext_ns_static(ns)[1]]) for ns in views
                                   if self._ext_ns_static(ns)[1] in member)
-                    plan = memo[(keys, batch_size)] = (pairs, frozenset(member))
+                    plan = memo[(keys, batch_size)] = (
+                        pairs, frozenset(member), all(ns.parameterization.initializes_grads(ns) for ns, _ in pairs))
                 views = StagedExternalParams({ns: in_place[m] for ns, m in plan[0]})
                 views.in_place_versions = in_place_versions
                 views.in_place_owners = set(plan[1])
                 views.in_place_plan = plan[0]
+                views.in_place_initializes = plan[2]
                 kwargs[EXTERNAL_PARAMS_KWARG] = views
                 kwargs[EXTERNAL_PARAMS_BUFFER_KWARG] = self.__dict__[name]
                 self._staged_external_params = views
@@ -1123,10 +1135,14 @@ class _ExternalParamsMixin:
         if plan is not None and in_place_grads and all(m in in_place_grads for _, m in plan):
             self._external_params_views(name = "external_params_grad", batch_size = batch_size, set_value = None)
             grad_views = StagedExternalParams({ns: in_place_grads[m] for ns, m in plan})
-            seen = {}
-            for t in zero:
-                seen.setdefault((t.data_ptr(), tuple(t.shape), tuple(t.stride())), t)
-            torch._foreach_zero_(list(seen.values()))
+            if getattr(self._staged_external_params, "in_place_initializes", False):
+                grad_views.fresh = True         # (not zeroed: each destination's first writer initializes it; the end
+                                                # of the backward zeroes those none wrote, `_write_external_params_grads`)
+            else:
+                seen = {}
+                for t in zero:
+                    seen.setdefault((t.data_ptr(), tuple(t.shape), tuple(t.stride())), t)
+                torch._foreach_zero_(list(seen.values()))
             kwargs[EXTERNAL_PARAMS_GRAD_KWARG] = grad_views
             kwargs[EXTERNAL_PARAMS_GRAD_BUFFER_KWARG] = self.external_params_grad
             self._staged_external_params_grad = grad_views

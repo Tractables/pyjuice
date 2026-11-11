@@ -49,6 +49,7 @@ VIRTUAL_BYTES_MOST = 4 << 30
 GEMM_BF16_WORK = 1 << 28
 
 _EXTERNAL_PARAMS_KWARG = "sum_external_params"
+_EXTERNAL_PARAMS_GRAD_KWARG = "sum_external_params_grad"
 #: `False`: a forward through the virtual batch keeps the plain path (`expand`, then the twin's forward) where the
 #: fused stream forward would serve (`kernels/c/lowrank_stream.cu`, the virtual child values never stored: the `expand`
 #: in the stream kernel's pre-pass -- rank <= 16, B K % 64 == 0, B % 16 == 0 -- or the layer one launch, the operand
@@ -715,7 +716,14 @@ def _stream_plan_bk(desc, layer, twin, info, node_mars, stream_children, dev):
                     break
                 parts.append(dict(chids = chids, ppar = ppar, ppid = ppid, cbs = cbs, pbs = pbs))
             if ok and parts:
-                plan = dict(parts = parts, jrow = jrow, e_lo = e_lo, vn0 = vn0)
+                # (`covers`: every child of the node vector an element row of some partition's tiles -- the launches
+                # write all of dB then, as they do all of dA)
+                cov = torch.zeros(rows.numel(), dtype = torch.bool, device = dev)
+                for part in parts:
+                    e = (part["chids"][:, None] + torch.arange(part["cbs"], device = dev)[None, :]).reshape(-1)
+                    j = jrow[e - e_lo]
+                    cov[j[j >= 0].long()] = True
+                plan = dict(parts = parts, jrow = jrow, e_lo = e_lo, vn0 = vn0, covers = bool(cov.all()))
         cache[key] = plan
     return plan or None
 
@@ -930,6 +938,10 @@ def backward(desc, layer, ns_tensors, ns_grad_tensors, node_flows, element_flows
     op = op if op is not None else (params if params.dtype == torch.bfloat16 else None)
     plan = _stream_plan_bk(desc, layer, twin, ns_tensors[0][0], node_mars, stream_children, dev) \
         if FUSED_STREAM_BK and len(ns_tensors) == 1 and op is not None else None
+    # (gradient destinations the circuit did not zero -- `fresh`, `StagedExternalParams.claim`: each one's first
+    # writer here stores into all of it, or zeroes it before adding)
+    gviews = kwargs.get(_EXTERNAL_PARAMS_GRAD_KWARG)
+    fresh = getattr(gviews, "fresh", False)
     if plan is not None:
         # (B and the gradients as the storage holds them -- the caller's layout: read and written in place)
         smod = _stream_module()
@@ -938,6 +950,11 @@ def backward(desc, layer, ns_tensors, ns_grad_tensors, node_flows, element_flows
         z = st["z"][_source(info.ns)]
         row0 = z["row"][info.ns]
         ua, sha = _a_rows(mod, z, batch, K, dev)
+        # (the launches write every element of dA and dB where every child of the node vector is a tile's: they store
+        # into a destination they claim first)
+        store = fresh and grads is not None and plan["covers"] and gviews.claim(grads)
+        if fresh and not store:
+            gviews.init_grads(grads)
         for at, part in enumerate(plan["parts"]):
             # (dA by the first partition's launch, in its grid's free SMs)
             da = grads is not None and at == 0
@@ -945,12 +962,15 @@ def backward(desc, layer, ns_tensors, ns_grad_tensors, node_flows, element_flows
                                      plan["e_lo"], None if grads is None else grads[1], ua, row0, sha, node_flows,
                                      node_mars, lz, shift, plan["vn0"], op, part["chids"], part["ppar"],
                                      part["ppid"], part["cbs"], part["pbs"], grads[0] if da else None,
-                                     kd if da else None)
+                                     kd if da else None, store)
         # (dB's normalizer half taken off by the launches: `grads` given)
         st["norm"].setdefault(_source(info.ns), []).append((layer, info, (fa, fb), lz, grads, stream_children,
                                                             grads is not None))
         st["done"].add(info.ns)
     else:
+        if fresh:                                                       # (the pass's end adds the scratch into them)
+            for grads in ns_grad_tensors:
+                gviews.init_grads(grads)
         bufs = _buffers(node_mars, element_mars, cols, "bw", twin._layer_nid_range)
         _backward_data(desc, layer, twin, shift, ns_tensors, ns_grad_tensors, node_flows, element_flows, node_mars,
                        element_mars, params, param_flows, kwargs, stream_children, bufs, kd, st, mod, K, batch, dev,

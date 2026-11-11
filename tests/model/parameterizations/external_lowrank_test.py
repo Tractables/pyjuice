@@ -794,8 +794,9 @@ needs_virtual = pytest.mark.skipif(not _virtual_available(), reason = "the low-r
 
 
 def _passes(pc, sums, data, ext, param_flows = True):
-    """One forward and backward with gradient buffers: everything they leave."""
-    grads = {a: (torch.zeros_like(ext[a][0]), torch.zeros_like(ext[a][1])) for a in sums}
+    """One forward and backward with gradient buffers: everything they leave. The buffers start as NaN: whatever the
+    backward does not write -- a destination it was handed unzeroed (`StagedExternalParams.fresh`) -- shows."""
+    grads = {a: (torch.full_like(ext[a][0], float("nan")), torch.full_like(ext[a][1], float("nan"))) for a in sums}
     lls = pc(data, sum_external_params = ext).clone()
     pc.init_param_flows(flows_memory = 0.0)
     pc.backward(data, allow_modify_flows = False, logspace_flows = True, compute_param_flows = param_flows,
@@ -1733,6 +1734,10 @@ def test_the_one_launch_backward_is_the_plain_data_half(bs, batch, param_flows, 
     torch.manual_seed(37)
     data = torch.randint(0, NUM_CATS, (batch, pc.num_vars), device = dev)
     ext = {a: _factors(a, rank, batch, dev, seed = 470 + i) for i, a in enumerate(sums)}
+    # (a child of the first and of the last node vector cut off at sample 1 -- its B -inf at every rank: the node below
+    # gets no flow there, its dA pairs take nothing, what the one-launch backward stores as 0 into the NaN-filled buffers)
+    for a in (sums[0], sums[-1]):
+        ext[a][1][1, :, 0] = -float("inf")
     monkeypatch.setattr(lowrank_virtual, "ENABLED", False)
     torch_pass = _passes(pc, sums, data, ext, param_flows = param_flows)
     monkeypatch.setattr(lowrank_virtual, "ENABLED", True)
@@ -1767,6 +1772,60 @@ def test_the_one_launch_backward_is_the_plain_data_half(bs, batch, param_flows, 
     for k in ("dA", "dB"):
         assert all(torch.equal(a, b) for a, b in zip(got[k], again[k])), k
     _same(got, torch_pass, rtol = 2e-2, atol = 1e-3, grad_scale = 2e-2)
+
+
+@needs_virtual
+def test_tied_copies_through_the_one_launch_backward_into_one_destination(monkeypatch):
+    """`tie_external` through the one-launch backward (rank 16, blocks of 32): every copy reads the source's factors
+    and adds its gradients into the source's one destination, handed over unzeroed (`StagedExternalParams.fresh`;
+    NaN-filled here) -- the first copy's launch stores into it (it claims it), every other one adds --: the sums of the
+    untied circuit's gradients over its copies, to fp32's order of the additions; every layer but the first (no product
+    layer below) took the form."""
+    import pyjuice.parameterizations.lowrank.virtual as lowrank_virtual
+    from pyjuice.layer.kernels import autotune
+
+    pick = autotune.pick
+    monkeypatch.setattr(autotune, "pick", lambda key, cands, bench, **k: "fused"
+                        if key[0] in ("prod_stream_fusion", "prod_stream_fusion_bk") else pick(key, cands, bench, **k))
+    monkeypatch.setattr(lowrank_virtual, "GEMM_BF16_WORK", 0)
+    rank, batch = 16, 8
+    pc_t, sums_t, _, _, _, _ = _pair(_hmm_blocks(256, 32), "sum_exp", rank = rank, tie_external = True)
+    pc_a, sums_a, _, _, _, _ = _pair(_hmm_blocks(256, 32), "sum_exp", rank = rank)
+    for pc in (pc_t, pc_a):
+        monkeypatch.setattr(pc, "_param_operands_force", True, raising = False)
+    dev = pc_t.params.device
+    torch.manual_seed(5)
+    data = torch.randint(0, NUM_CATS, (batch, pc_t.num_vars), device = dev)
+    A, B = _factors(sums_t[0], rank, batch, dev)
+    smod = lowrank_virtual._stream_module()
+    stores, real = [], smod.lowrank_backward_om
+
+    def counted(*args):
+        stores.append(args[-1])                                       # (whether the launch stored)
+        return real(*args)
+
+    monkeypatch.setattr(smod, "lowrank_backward_om", counted)
+    nan = float("nan")
+    for _ in range(2):                                                # (the circuit settles its choices at the first)
+        gt = (torch.full_like(A, nan), torch.full_like(B, nan))
+        pc_t(data, sum_external_params = {sums_t[0]: (A, B)})
+        pc_t.init_param_flows(flows_memory = 0.0)
+        stores.clear()
+        pc_t.backward(data, allow_modify_flows = False, logspace_flows = True,
+                      sum_external_params_grad = {sums_t[0]: gt})
+    assert len(stores) == len(sums_t) - 1 and stores.count(True) == 1 and stores[0], stores
+    ga = {a: (torch.full_like(A, nan), torch.full_like(B, nan)) for a in sums_a}
+    for _ in range(2):
+        ga = {a: (torch.full_like(A, nan), torch.full_like(B, nan)) for a in sums_a}
+        pc_a(data, sum_external_params = {a: (A, B) for a in sums_a})
+        pc_a.init_param_flows(flows_memory = 0.0)
+        pc_a.backward(data, allow_modify_flows = False, logspace_flows = True, sum_external_params_grad = ga)
+    torch.cuda.synchronize()
+    for k in range(2):
+        want = sum(ga[a][k].double() for a in sums_a)
+        assert torch.isfinite(gt[k]).all(), k
+        err = float((gt[k].double() - want).abs().max() / want.abs().max())
+        assert err < 1e-5, f"slot {k}: {err}"
 
 
 @needs_virtual

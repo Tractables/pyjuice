@@ -183,6 +183,16 @@ class SumParameterization():
         """
         return ns
 
+    def initializes_grads(self, ns) -> bool:
+        """
+        Whether the BACKWARD initializes the gradient destinations of `ns` it writes in place (those the
+        forward's tensors were read in place for, :func:`reads_in_place`): each one's first writer stores into
+        every element of it, or zeroes it before adding (`StagedExternalParams.claim` / `init_grads`). Where
+        every node of a backward's destinations says so, the circuit hands them over unzeroed (`fresh`),
+        zeroing at the backward's end what no writer claimed. False by default: zeroed beforehand.
+        """
+        return False
+
     def reads_in_place(self, ns) -> bool:
         """
         Whether the FORWARD pass hands `ns`'s tensors to the layers as the caller gave them -- views of the

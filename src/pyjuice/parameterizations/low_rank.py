@@ -166,6 +166,11 @@ class LowRank(_ForwardMixin, _BackwardMixin, _DenominatorsMixin, SumParameteriza
         virtual batch can serve it (the CUDA extension built: `lowrank/virtual.py`); `"exp_sum"` copies."""
         return self.form == "sum_exp" and lowrank_virtual._module() is not None
 
+    def initializes_grads(self, ns) -> bool:
+        """`"sum_exp"`: its backward claims each gradient destination it writes in place -- the one-launch form
+        storing into all of it, the other paths zeroing it before they add (`lowrank/virtual.py`, `backward.py`)."""
+        return self.form == "sum_exp"
+
     def storage_offsets(self, ns):
         """Where an edge block's entries begin in each slot, in per-batch units (the layer's tables; the passes here
         address the slots by their own geometry): `A` at the node block's first node, `B` at the child block's first

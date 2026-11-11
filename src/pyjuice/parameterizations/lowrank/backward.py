@@ -53,6 +53,10 @@ class _BackwardMixin:
             return lowrank_virtual.backward(self, layer, ns_tensors, ns_grad_tensors, node_flows, element_flows,
                                             node_mars, element_mars, params, param_flows, denom_param_flows, kwargs,
                                             stream_children = layer.__dict__.get("_bk_stream_children"))
+        gviews = kwargs.get("sum_external_params_grad")
+        if getattr(gviews, "fresh", False):                     # (destinations not zeroed: these passes add into them)
+            for grads in ns_grad_tensors:
+                gviews.init_grads(grads)
         geos = [self._geometry(layer, ns_info, dev) for ns_info, _ in ns_tensors]
         for geo in geos:
             element_flows[geo["kids"], :] = -float("inf")

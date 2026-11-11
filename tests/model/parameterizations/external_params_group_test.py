@@ -557,6 +557,43 @@ def test_a_group_name_registered_again_names_its_new_members(form):
         assert torch.equal(got, torch.cat([w[slot] for w in want], dim = 1)), f"slot {slot}"
 
 
+@cuda_only
+def test_a_fresh_destination_no_layer_writes_comes_back_zero(monkeypatch):
+    """Destinations handed over unzeroed (`StagedExternalParams.fresh`: every node's parameterization initializes what
+    it writes -- LowRank's "sum_exp") that no layer claimed are zeroed at the backward's end: a node whose layer is
+    handed no gradient tensors gets zeros, the others their gradients, bit for bit the per-node form's."""
+    from pyjuice.layer.parameterized_sum_layer import ParameterizedSumLayer
+    dev, batch, T = torch.device("cuda:0"), 40, 3
+    root, members = _lowrank_chain(T = T)
+    pc = juice.compile(root, verbose = False).to(dev)
+    pc.register_external_params_group("tr", members)
+    data = torch.randint(0, NUM_CATS, [batch, T + 1], device = dev)
+    factors = _factors(members, batch, dev, 21)
+    pc(data, sum_external_params = dict(zip(members, factors)))
+    pc.backward(data, flows_memory = 0.0)
+    want = [tuple(g.clone() for g in pc.get_external_params_grad(m)) for m in members]
+
+    skip = members[1]
+    real = ParameterizedSumLayer._resolve_external_grad_tensors
+    monkeypatch.setattr(ParameterizedSumLayer, "_resolve_external_grad_tensors",
+                        lambda self, kwargs, info, *a: None if info.ns is skip else real(self, kwargs, info, *a))
+    cats = _cats(factors)
+    pc(data, sum_external_params = {"tr": cats})
+    grads = tuple(torch.full_like(c, float("nan")) for c in cats)
+    pc.backward(data, flows_memory = 0.0, sum_external_params_grad = {"tr": grads})
+    torch.cuda.synchronize()
+    assert pc._staged_external_params_grad.__dict__.get("claimed"), "the destinations went over zeroed"
+    for slot, got in enumerate(grads):
+        at = 0
+        for m, w in zip(members, want):
+            part = got.narrow(1, at, w[slot].size(1))
+            at += w[slot].size(1)
+            if m is skip:
+                assert torch.equal(part, torch.zeros_like(part)), f"slot {slot}: the unclaimed destination"
+            else:
+                assert torch.equal(part, w[slot]), f"slot {slot}"
+
+
 class _CallersOrder(SumParameterization):
     """Two tensors a node, stored in the caller's order (`storage_perm` None): not a transpose, whatever it holds."""
 

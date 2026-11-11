@@ -97,8 +97,31 @@ class StagedExternalParams(dict):
 
     Layers use the type as the marker that re-validation is unnecessary -- the per-call checks would
     otherwise run over every tensor of every node on every forward and backward.
+
+    A mapping of GRADIENT destinations handed over `fresh` was not zeroed: every node's parameterization
+    initializes what it writes (:func:`SumParameterization.initializes_grads`). A destination's first writer
+    in the backward claims it (:func:`claim`) and then writes every element of it rather than adding; one
+    that adds zeroes it first (:func:`init_grads`). The circuit zeroes, at the backward's end, the
+    destinations no writer claimed.
     """
-    pass
+    fresh = False
+
+    def claim(self, tensors) -> bool:
+        """Whether the caller is the first writer, in this backward, of the destination `tensors` (a node's
+        gradient tensors from this mapping; nodes sharing a destination share the tuple) -- marked claimed
+        now. Always False where the mapping is not `fresh` (zeroed: add into it)."""
+        if not self.fresh or tensors is None:
+            return False
+        claimed = self.__dict__.setdefault("claimed", set())
+        if id(tensors) in claimed:
+            return False
+        claimed.add(id(tensors))
+        return True
+
+    def init_grads(self, tensors) -> None:
+        """For a writer that ADDS into the destination `tensors`: zeroed where it is their first (`claim`)."""
+        if self.claim(tensors):
+            torch._foreach_zero_(list(tensors))
 
 
 def validate_external_tensors(ns, parameterization, tensors: Any, batch_size: int, device,

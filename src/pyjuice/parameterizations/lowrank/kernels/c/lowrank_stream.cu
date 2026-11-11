@@ -910,7 +910,7 @@ __device__ __forceinline__ void load_run4f(const float* __restrict__ p, float (&
     }
 }
 
-template <int ST, bool FUSED, bool GRAD>
+template <int ST, bool FUSED, bool GRAD, bool STORE>
 __global__ void __launch_bounds__(OM_THREADS, 1) lr_om_bw_kernel(
         const bfloat16_t* __restrict__ params, const long* __restrict__ ppid, const long* __restrict__ ppar,
         const bfloat16_t* __restrict__ ua, long urows, long row0, const float* sha, const float* nflow,
@@ -975,16 +975,21 @@ __global__ void __launch_bounds__(OM_THREADS, 1) lr_om_bw_kernel(
             for (int q = 0; q < NQ; q++) {
                 const int x = threadIdx.x + q * OM_THREADS, ss = x / (DTI * K / 4), c4 = x % (DTI * K / 4);
                 const int b = s0 + ss, ii = (c4 * 4) / K, r0 = (c4 * 4) % K, i = i0 + ii;
-                ef[q] = (b < B && i < M) ? se[ii * DES + ss] : -1.f;      // (-1: no such pair, or it takes nothing)
-                gv[q] = make_float4(0.f, 0.f, 0.f, 0.f);
-                if (ef[q] >= 0.f)
+                ef[q] = (b < B && i < M) ? se[ii * DES + ss] : -2.f;      // (-2: no such pair; -1: it takes nothing)
+                gv[q] = make_float4(0.f, 0.f, 0.f, 0.f);                  // (STORE: dA's first writer, onto +0)
+                if (!STORE && ef[q] >= 0.f)
                     gv[q] = *reinterpret_cast<const float4*>(grad_a + (long)b * ga_sb + (long)i * K + r0);
             }
             CUTE_UNROLL
             for (int q = 0; q < NQ; q++) {
                 const int x = threadIdx.x + q * OM_THREADS, ss = x / (DTI * K / 4), c4 = x % (DTI * K / 4);
                 const int b = s0 + ss, ii = (c4 * 4) / K, r0 = (c4 * 4) % K, i = i0 + ii;
-                if (!(ef[q] >= 0.f)) continue;           // (past the node vector or the batch; or no flow, no mass)
+                if (ef[q] < -1.5f) continue;             // (past the node vector or the batch)
+                if (!(ef[q] >= 0.f)) {                   // (no flow or no mass: dA takes nothing -- STORE: its +0)
+                    if (STORE)
+                        *reinterpret_cast<float4*>(grad_a + (long)b * ga_sb + (long)i * K + r0) = gv[q];
+                    continue;
+                }
                 const float4 d = *reinterpret_cast<const float4*>(sk + ii * DROW + ss * K + r0);
                 float4 v = gv[q];
                 const float e = ef[q];
@@ -1062,7 +1067,7 @@ __global__ void __launch_bounds__(OM_THREADS, 1) lr_om_bw_kernel(
         for (int r = 0; r < K; r++) x[r] = bsrc[(long)r * N];
         if (GRAD) {
             CUTE_UNROLL
-            for (int r = 0; r < K; r++) gv[r] = g[(long)r * N];
+            for (int r = 0; r < K; r++) gv[r] = STORE ? 0.f : g[(long)r * N];   // (STORE: dB's first writer)
         }
         float nv[K];                                     // (GRAD: the normalizer half, exp(B + log Gn))
         if (GRAD) {
@@ -1124,7 +1129,7 @@ __global__ void __launch_bounds__(OM_THREADS, 1) lr_om_bw_kernel(
         const long poff = (long)pr * N + (pj0 >= 0 ? pj0 : 0) + (ptid % 2) * (BM / 2);
         const float* pfb = fb + (long)(b0 + psl) * fb_sb + poff;
         const float* pdb = GRAD ? grad_b + (long)(b0 + psl) * gb_sb + poff : pfb;
-        const int nbd = pj0 >= 0 ? 2 + (GRAD ? 2 : 0) : 0;   // (B's two lines, dB's two)
+        const int nbd = pj0 >= 0 ? 2 + (GRAD && !STORE ? 2 : 0) : 0;   // (B's two lines, dB's two: read unless STORE)
         npf = 2 + nbd;                                   // (2: the values -- 0 past a row of no child, then skipped)
         const bool pval = pj >= 0;
         auto prefetch = [&](int q) {                     // (q < npf)
@@ -1805,7 +1810,7 @@ void lowrank_backward_om(torch::Tensor flows, torch::Tensor vals, c10::optional<
                          torch::Tensor ua, int64_t row0, torch::Tensor sha, torch::Tensor node_flows,
                          torch::Tensor node_mars, torch::Tensor lz, int64_t nshift, int64_t vn0, torch::Tensor params,
                          torch::Tensor chids, torch::Tensor ppar, torch::Tensor ppid, int64_t cbs, int64_t pbs,
-                         c10::optional<torch::Tensor> grad_a, c10::optional<torch::Tensor> kd) {
+                         c10::optional<torch::Tensor> grad_a, c10::optional<torch::Tensor> kd, bool store) {
     const int B = (int)node_flows.size(1), K = (int)fb.size(1), N = (int)fb.size(2);
     const int n_cb = (int)chids.size(0), npb = (int)ppar.size(1);
     TORCH_CHECK(om_bw_serves(K, B, cbs, pbs, n_cb) && fb.dim() == 3 && fb.size(0) == B, "lowrank om backward: rank ", OM_K, ", B a "
@@ -1877,14 +1882,17 @@ void lowrank_backward_om(torch::Tensor flows, torch::Tensor vals, c10::optional<
     int n_da = !da ? 0 : (int)std::min<long>((pairs + OM_THREADS - 1) / OM_THREADS,
                                              free_sms >= sms / 4 ? free_sms : sms);
     if (n_da > 0 && g_da_ctas_most > 0) n_da = std::min(n_da, g_da_ctas_most);
-    auto go = [&](auto f, auto g) {
-        constexpr bool F = decltype(f)::value, G = decltype(g)::value;
+    // (store: the gradients' first writer -- dB, and dA where given, every element of the node vector's written, not
+    // added into: the destination was not zeroed)
+    TORCH_CHECK(!store || grad_b.has_value(), "lowrank om backward: storing the gradients without dB");
+    auto go = [&](auto f, auto g, auto s) {
+        constexpr bool F = decltype(f)::value, G = decltype(g)::value, SG = decltype(s)::value;
         constexpr int NU = G ? 2 : 1;                    // (as the kernel's: U; and Un with the gradients)
         constexpr int STAGE = (32 * OM_BM * 2 + NU * 32 * OM_BN * 2 + 3 * 32 * S * 4 + 1023) / 1024 * 1024;
         constexpr int SMEM = ST * STAGE + NU * OM_BN * 4 + NU * ST * S * 4 + 3 * ST * 8;
         static_assert(SMEM <= 101376, "past sm_120's 99 KB of shared memory a block");
         static_assert(!G || 32 * ((32 * OM_K + 4) + (32 + 1)) * 4 <= SMEM, "the dA CTAs' tiles in the shared memory");
-        auto kernel = lr_om_bw_kernel<ST, F, G>;
+        auto kernel = lr_om_bw_kernel<ST, F, G, SG>;
         static bool attr_set[64] = {};
         int dev = 0;
         C10_CUDA_CHECK(cudaGetDevice(&dev));
@@ -1904,8 +1912,17 @@ void lowrank_backward_om(torch::Tensor flows, torch::Tensor vals, c10::optional<
                    da ? grad_a->data_ptr<float>() : (float*)nullptr, da ? (long)grad_a->stride(0) : 0L, M, (int)n, n_da);
         C10_CUDA_KERNEL_LAUNCH_CHECK();
     };
-    if (fused) { if (grad_b.has_value()) go(std::true_type{}, std::true_type{}); else go(std::true_type{}, std::false_type{}); }
-    else { if (grad_b.has_value()) go(std::false_type{}, std::true_type{}); else go(std::false_type{}, std::false_type{}); }
+    using T_ = std::true_type;
+    using F_ = std::false_type;
+    if (fused) {
+        if (!grad_b.has_value()) go(T_{}, F_{}, F_{});
+        else if (store) go(T_{}, T_{}, T_{});
+        else go(T_{}, T_{}, F_{});
+    } else {
+        if (!grad_b.has_value()) go(F_{}, F_{}, F_{});
+        else if (store) go(F_{}, T_{}, T_{});
+        else go(F_{}, T_{}, F_{});
+    }
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
