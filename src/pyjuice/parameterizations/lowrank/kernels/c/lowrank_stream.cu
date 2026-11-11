@@ -60,6 +60,10 @@ using namespace cute;
 #define MAX_SPLIT 12
 #define KMAX 16         // the largest rank served
 
+// A float's order as a signed int (`fkey`): a non-negative float its bits, a negative one its bits with all but the
+// sign flipped -- the keys' integer maximum (one `redux` across a warp) is the key of the floats' maximum
+__device__ __forceinline__ int fkey(float x) { const int b = __float_as_int(x); return b ^ ((b >> 31) & 0x7fffffff); }
+__device__ __forceinline__ float fkey_inv(int k) { return __int_as_float(k ^ ((k >> 31) & 0x7fffffff)); }
 __device__ __forceinline__ void cpa16(uint32_t smem, const void* gmem) {
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(smem), "l"(gmem) : "memory");
 }
@@ -237,7 +241,7 @@ using AtomA32 = decltype(composition(Swizzle<2, 3, 3>{}, Layout<Shape<_32, _8>, 
 // K-major A of 32-wide k-steps (the backward's theta^T: a child's 32 parents one swizzled 64-byte line)
 using AtomAK32 = decltype(composition(Swizzle<2, 3, 3>{}, Layout<Shape<_8, _32>, Stride<_32, _1>>{}));
 __device__ __forceinline__ void tma_load_3d(uint32_t smem, const CUtensorMap* desc, int c0, int c1, int c2, uint32_t bar) {
-    asm volatile("cp.async.bulk.tensor.3d.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1, {%2, %3, %4}], [%5];"
+    asm volatile("cp.async.bulk.tensor.3d.shared::cta.global.mbarrier::complete_tx::bytes [%0], [%1, {%2, %3, %4}], [%5];"
                  ::"r"(smem), "l"(reinterpret_cast<uint64_t>(desc)), "r"(c0), "r"(c1), "r"(c2), "r"(bar) : "memory");
 }
 
@@ -628,10 +632,11 @@ __global__ void __launch_bounds__(OM_THREADS, 1) lr_om_kernel(
                 pnx[q] = knt > 1 ? pbase[(long)bA[q] * knt + 1] : 0;
             }
         }
-        auto issue_a = [&](int t, uint32_t ss) {         // (t increasing)
+        const uint32_t bar0 = (uint32_t)__cvta_generic_to_shared(&fullr[0]);
+        auto issue_a = [&](int t, uint32_t ss, int st) {    // (t increasing; st = t % ST, its stage)
             if constexpr (TMAA) {
                 if (ptid == 0) {
-                    const uint32_t bar = (uint32_t)__cvta_generic_to_shared(&fullr[t % ST]);
+                    const uint32_t bar = bar0 + st * 8;
                     asm volatile("mbarrier.expect_tx.relaxed.cta.shared::cta.b64 [%0], %1;" ::"r"(bar), "r"(ABYTES)
                                  : "memory");
                     tma_load_3d(ss, &tmapA, 0, t * KT, r, bar);
@@ -651,16 +656,21 @@ __global__ void __launch_bounds__(OM_THREADS, 1) lr_om_kernel(
             }
         };
         // the first stages' parameter tiles while the launch before may still run (none of the pass writes them)
-        for (int t = 0; t < min(nk, ST); t++) issue_a(t, sbase + t * STAGE);
+        for (int t = 0; t < min(nk, ST); t++) issue_a(t, sbase + t * STAGE, t);
         // V's children, the element rows' bases and (run 0) the rows' children, two k-steps ahead
         const int* jg = jpos + (long)g * num_edges;
         const int* cbr = FUSED ? cbase + (long)r * knt * 4 : nullptr;
         const long* ebr = ebase + (long)r * knt;
         int jr[2][CB], jcr[2][CC];
         long br[2][2];
+        const int* jq[CB];                               // (a chunk's row in jpos at k-step 0)
+        CUTE_UNROLL
+        for (int q = 0; q < CB; q++) jq[q] = jg + eB[q];
+        CUTE_UNROLL
+        for (int q = 0; q < CB; q++) asm volatile("" : "+l"(jq[q]));
         auto load_j = [&](int t, int (&j)[CB]) {
             CUTE_UNROLL
-            for (int q = 0; q < CB; q++) j[q] = oB[q] != ~0u ? ldv_s32(jg + t * KT + eB[q]) : -1;
+            for (int q = 0; q < CB; q++) j[q] = TB % NP == 0 || oB[q] != ~0u ? ldv_s32(jq[q] + t * KT) : -1;
         };
         auto load_b = [&](int t, long (&bb)[2]) {        // (FUSED: the products' two runs of children; else the row)
             if (FUSED) {
@@ -689,7 +699,7 @@ __global__ void __launch_bounds__(OM_THREADS, 1) lr_om_kernel(
                     asm volatile("" : "+r"(ss));
                     if (t >= ST) {
                         mbar_wait(&empty[s], ph ^ 1);
-                        issue_a(t, ss);
+                        issue_a(t, ss, s);
                     }
                     CUTE_UNROLL
                     for (int q = 0; q < CB; q++) {
@@ -756,15 +766,14 @@ __global__ void __launch_bounds__(OM_THREADS, 1) lr_om_kernel(
                 cv[i] = mx[i] = a_;
             }
             CUTE_UNROLL
-            for (int bit = 16; bit >= 1; bit >>= 1)
-                CUTE_UNROLL
-                for (int i = 0; i < SPW; i++) mx[i] = fmaxf(mx[i], __shfl_xor_sync(FULLM, mx[i], bit));
+            for (int i = 0; i < SPW; i++) mx[i] = fkey_inv(__reduce_max_sync(FULLM, fkey(mx[i])));
             float ex[SPW];
             CUTE_UNROLL
             for (int i = 0; i < SPW; i++) {
                 const float mold = mrun[i], mnew = fmaxf(mold, mx[i]);
                 // (the consumers' factor: the sums so far where the max rose, else exactly 1)
-                if (lane == 0) sfac[s * S + w * SPW + i] = mnew > mold && mold > -INFINITY ? __expf(mold - mnew) : 1.f;
+                const float fac = mnew > mold && mold > -INFINITY ? __expf(mold - mnew) : 1.f;
+                if (lane == 0) sfac[s * S + w * SPW + i] = fac;
                 mrun[i] = mnew;
                 ex[i] = mnew > -INFINITY ? __expf(cv[i] - mnew) : 0.f;
             }
@@ -777,9 +786,8 @@ __global__ void __launch_bounds__(OM_THREADS, 1) lr_om_kernel(
                 unsigned h[4] = {vv.x, vv.y, vv.z, vv.w};
                 CUTE_UNROLL
                 for (int x = 0; x < 4; x++) {
-                    __nv_bfloat162 p2 = *reinterpret_cast<__nv_bfloat162*>(&h[x]);
-                    const float2 f = __bfloat1622float2(p2);
-                    p2 = __floats2bfloat162_rn(f.x * e_, f.y * e_);
+                    const float2 f = make_float2(__uint_as_float(h[x] << 16), __uint_as_float(h[x] & 0xffff0000u));
+                    __nv_bfloat162 p2 = __floats2bfloat162_rn(f.x * e_, f.y * e_);
                     h[x] = *reinterpret_cast<unsigned*>(&p2);
                 }
                 asm volatile("st.shared.v4.u32 [%0], {%1,%2,%3,%4};" ::"r"(ss + oB[j] + UBYTES), "r"(h[0]), "r"(h[1]),
@@ -838,13 +846,13 @@ __global__ void __launch_bounds__(OM_THREADS, 1) lr_om_kernel(
         for (int kb = 0; kb < KB; kb++) cute::gemm(mma, tCrA(_, _, kb), tCrB(_, _, kb), tCrZ);
         CUTE_UNROLL
         for (int kb = 0; kb < KB; kb++) copy(s2rB, tXsU(_, _, kb), tXrB(_, _, kb));
-        mbar_arrive(&empty[s]);                          // the stage is read
         float f[S];                                      // the samples' rescale factors (1: no rise)
         CUTE_UNROLL
         for (int x4 = 0; x4 < S / 4; x4++) {
             const float4 q = *(const float4*)&sfac[s * S + 4 * x4];
             f[4 * x4] = q.x; f[4 * x4 + 1] = q.y; f[4 * x4 + 2] = q.z; f[4 * x4 + 3] = q.w;
         }
+        mbar_arrive(&empty[s]);                          // the stage is read (its factors too)
         bool rise = false;
         CUTE_UNROLL
         for (int x = 0; x < S; x++) rise |= f[x] != 1.f;
@@ -1020,6 +1028,7 @@ __global__ void __launch_bounds__(OM_THREADS, 1) lr_om_bw_kernel(
     uint64_t* fullr = (uint64_t*)(sfac + NU * ST * S);
     uint64_t* full = fullr + ST;
     uint64_t* empty = full + ST;
+    uint32_t* sflg = (uint32_t*)(empty + ST);           // [ST][NU] a stage's "a max rose": a byte a converter warp
     const int tid = threadIdx.x;
     auto sAl = tile_to_shape(AtomAK32{}, make_shape(Int<BM>{}, Int<KT>{}));   // (K-major: a child's parents a line)
     auto sBl = tile_to_shape(Atom64{}, make_shape(Int<BN>{}, Int<KT>{}));
@@ -1178,26 +1187,44 @@ __global__ void __launch_bounds__(OM_THREADS, 1) lr_om_bw_kernel(
             oC[k] = on ? (uint32_t)(ABYTES + NU * UBYTES + ((x * KT + e) * S + 4 * q4) * 4) : ~0u;
             cx[k] = x; ce[k] = e + (4 * q4 << 8);        // (the row and, above bit 8, the sample offset)
         }
-        long urows_l = urows;
-        int B_i = B;
-        asm volatile("" : "+l"(urows_l), "+r"(B_i));
+        // Every chunk's base made once (in registers: else remade every k-step), its k-step's offset added: A's slab
+        // table row and its offset in the slab; Ua's chunk at the vector's first node; the flows', values' or log
+        // normalizers' chunk at the vector's first node (their rows: the parents' circuit rows, or node indices, lz's)
+        const long* ptab[CA];
+        const bfloat16_t* abase[CA];
         CUTE_UNROLL
-        for (int q = 0; q < CA; q++) asm volatile("" : "+r"(oA[q]), "+r"(cA[q]), "+r"(mA[q]), "+r"(kA[q]));
+        for (int q = 0; q < CA; q++) { ptab[q] = ppid + (long)cA[q] * npb; abase[q] = params + mA[q]; }
+        const long* ptab0 = ppar + (long)cb0 * npb;
+        const bfloat16_t* ubase[CB];
         CUTE_UNROLL
-        for (int q = 0; q < CB; q++) asm volatile("" : "+r"(oB[q]), "+r"(eB[q]), "+l"(uptr[q]));
+        for (int q = 0; q < CB; q++) ubase[q] = uptr[q] + (long)eB[q] * urows;
+        const float* cfirst[CC];
         CUTE_UNROLL
-        for (int k = 0; k < CC; k++) asm volatile("" : "+r"(oC[k]), "+r"(cx[k]), "+r"(ce[k]));
-        // a k-step's tables, a step ahead: its parent block's slab per chunk (A), its first parent's twin row (shared
-        // by the tile's blocks: the group's)
-        auto slabs = [&](int t, long (&pa)[CA], long& p0) {
-            const int pb = t / SPB, sub = t - pb * SPB;
+        for (int k = 0; k < CC; k++) {
+            const int e = ce[k] & 0xff, so = ce[k] >> 8;
+            cfirst[k] = (cx[k] == 2 ? lz : (cx[k] ? nmar : nflow) + (vn0 + nshift) * B) + (long)e * B + b0 + so;
+        }
+        long urows_l = urows, B_l = B;
+        asm volatile("" : "+l"(urows_l), "+l"(B_l));
+        CUTE_UNROLL
+        for (int q = 0; q < CA; q++) asm volatile("" : "+r"(oA[q]), "+l"(ptab[q]), "+l"(abase[q]));
+        CUTE_UNROLL
+        for (int q = 0; q < CB; q++) asm volatile("" : "+r"(oB[q]), "+l"(ubase[q]));
+        CUTE_UNROLL
+        for (int k = 0; k < CC; k++) asm volatile("" : "+r"(oC[k]), "+l"(cfirst[k]));
+        // a k-step's tables, two steps ahead: its parent block's slab per chunk (A), its first parent's node index
+        // (from its twin row, shared by the tile's blocks: the group's) -- the parent block and sub-step counted
+        int lpb = 0, lsub = 0;
+        auto slabs = [&](long (&pa)[CA], long& i0) {
             CUTE_UNROLL
-            for (int q = 0; q < CA; q++) pa[q] = oA[q] != ~0u ? ldv_s64(ppid + (long)cA[q] * npb + pb) + sub * KT : 0;
-            p0 = ldv_s64(ppar + (long)cb0 * npb + pb) + sub * KT;
+            for (int q = 0; q < CA; q++)
+                pa[q] = TA % NP == 0 || oA[q] != ~0u ? ldv_s64(ptab[q] + lpb) + lsub * KT : 0;
+            i0 = ldv_s64(ptab0 + lpb) + lsub * KT - vn0;
+            if (++lsub == SPB) { lsub = 0; lpb++; }
         };
-        long pa[2][CA], p0[2];
-        slabs(0, pa[0], p0[0]);
-        if (nk > 1) slabs(1, pa[1], p0[1]);
+        long pa[2][CA], i0[2];
+        slabs(pa[0], i0[0]);
+        if (nk > 1) slabs(pa[1], i0[1]);
         cudaGridDependencySynchronize();                 // (the flows above: the launches before's)
         int s = 0, ph = 0;
         uint32_t sb_r = sbase;
@@ -1212,22 +1239,16 @@ __global__ void __launch_bounds__(OM_THREADS, 1) lr_om_bw_kernel(
                     if (t >= ST) mbar_wait(&empty[s], ph ^ 1);
                     CUTE_UNROLL
                     for (int q = 0; q < CA; q++)
-                        if (TA % NP == 0 || oA[q] != ~0u) cpa16(ss + oA[q], params + pa[u][q] + mA[q]);
-                    const long i0 = p0[u] - vn0;         // the k-step's first parent, its node index
-                    CUTE_UNROLL
+                        if (TA % NP == 0 || oA[q] != ~0u) cpa16(ss + oA[q], abase[q] + pa[u][q]);
+                    CUTE_UNROLL                          // (i0: the k-step's first parent, its node index)
                     for (int q = 0; q < CB; q++)
-                        if (TB % NP == 0 || oB[q] != ~0u) cpa16(ss + oB[q], uptr[q] + (i0 + eB[q]) * urows_l);
+                        if (TB % NP == 0 || oB[q] != ~0u) cpa16(ss + oB[q], ubase[q] + i0[u] * urows_l);
                     CUTE_UNROLL
-                    for (int k = 0; k < CC; k++) {
-                        if (oC[k] == ~0u) continue;
-                        const int e = ce[k] & 0xff, so = ce[k] >> 8;
-                        const float* src = cx[k] == 2 ? lz + (i0 + e) * B_i + b0 + so
-                                                      : (cx[k] ? nmar : nflow) + (p0[u] + e + nshift) * B_i + b0 + so;
-                        cpa16(ss + oC[k], src);
-                    }
+                    for (int k = 0; k < CC; k++)
+                        if (oC[k] != ~0u) cpa16(ss + oC[k], cfirst[k] + i0[u] * B_l);
                     cpa_mbar_arrive(&fullr[s]);
                     if (t < npf) prefetch(t);
-                    if (t + 2 < nk) slabs(t + 2, pa[u], p0[u]);
+                    if (t + 2 < nk) slabs(pa[u], i0[u]);
                     if (++s == ST) { s = 0; ph ^= 1; }
                 }
             }
@@ -1274,19 +1295,19 @@ __global__ void __launch_bounds__(OM_THREADS, 1) lr_om_bw_kernel(
                 if (GRAD) cv[NU - 1][i] = mx[NU - 1][i] = (lf > -INFINITY && z > -INFINITY) ? lf - z : -INFINITY;
             }
             CUTE_UNROLL
-            for (int bit = 16; bit >= 1; bit >>= 1)
+            for (int u = 0; u < NU; u++)
                 CUTE_UNROLL
-                for (int u = 0; u < NU; u++)
-                    CUTE_UNROLL
-                    for (int i = 0; i < SPW; i++) mx[u][i] = fmaxf(mx[u][i], __shfl_xor_sync(FULLM, mx[u][i], bit));
+                for (int i = 0; i < SPW; i++) mx[u][i] = fkey_inv(__reduce_max_sync(FULLM, fkey(mx[u][i])));
             float ex[NU][SPW];
+            bool rose[NU] = {};
             CUTE_UNROLL
             for (int u = 0; u < NU; u++)
                 CUTE_UNROLL
                 for (int i = 0; i < SPW; i++) {
                     const float mold = mrun[u][i], mnew = fmaxf(mold, mx[u][i]);
-                    if (lane == 0)
-                        sfac[(u * ST + s) * S + w * SPW + i] = mnew > mold && mold > -INFINITY ? __expf(mold - mnew) : 1.f;
+                    const float fac = mnew > mold && mold > -INFINITY ? __expf(mold - mnew) : 1.f;
+                    if (lane == 0) sfac[(u * ST + s) * S + w * SPW + i] = fac;
+                    rose[u] |= fac != 1.f;
                     mrun[u][i] = mnew;
                     ex[u][i] = mnew > -INFINITY ? __expf(cv[u][i] - mnew) : 0.f;
                 }
@@ -1299,9 +1320,8 @@ __global__ void __launch_bounds__(OM_THREADS, 1) lr_om_bw_kernel(
                 unsigned h[4] = {vv.x, vv.y, vv.z, vv.w}, hn[4];
                 CUTE_UNROLL
                 for (int x = 0; x < 4; x++) {
-                    __nv_bfloat162 p2 = *reinterpret_cast<__nv_bfloat162*>(&h[x]);
-                    const float2 f = __bfloat1622float2(p2);
-                    p2 = __floats2bfloat162_rn(f.x * e_, f.y * e_);
+                    const float2 f = make_float2(__uint_as_float(h[x] << 16), __uint_as_float(h[x] & 0xffff0000u));
+                    __nv_bfloat162 p2 = __floats2bfloat162_rn(f.x * e_, f.y * e_);
                     h[x] = *reinterpret_cast<unsigned*>(&p2);
                     if (GRAD) {
                         __nv_bfloat162 q2 = __floats2bfloat162_rn(f.x * en, f.y * en);
@@ -1313,6 +1333,10 @@ __global__ void __launch_bounds__(OM_THREADS, 1) lr_om_bw_kernel(
                 if (GRAD)
                     asm volatile("st.shared.v4.u32 [%0], {%1,%2,%3,%4};" ::"r"(ss + oB[j] + UBYTES), "r"(hn[0]),
                                  "r"(hn[1]), "r"(hn[2]), "r"(hn[3]) : "memory");
+            }
+            if (lane == 0) {                             // (the stage's flags: a max of this warp's samples rose)
+                CUTE_UNROLL
+                for (int u = 0; u < NU; u++) reinterpret_cast<unsigned char*>(sflg)[(s * NU + u) * 4 + w] = rose[u];
             }
             mbar_arrive(&full[s]);
             if (++s == ST) { s = 0; ph ^= 1; }
@@ -1367,15 +1391,31 @@ __global__ void __launch_bounds__(OM_THREADS, 1) lr_om_bw_kernel(
             for (int i = 0; i < size(acc); i++) acc(i) *= f[i / (4 * MI)];
         }
     };
-    int s = 0, ph = 0;
-    for (int j = 0; j < nk; j++) {
+    // Each fragment's partition made once, at stage 0 (a stage's: the same layout STAGE bytes on -- the swizzles act on
+    // the offsets within 1024 bytes): made in the k-step, the compiler remade their swizzled offsets every k-step
+    const auto tXsA0 = tA.partition_S(make_tensor(make_smem_ptr(stA(0)), sAl));
+    const auto tXsB0 = tB.partition_S(make_tensor(make_smem_ptr(stB(0)), sBl));
+    const auto tXsN0 = tB.partition_S(make_tensor(make_smem_ptr(stN(0)), sBl));
+    static_assert(STAGE % 1024 == 0, "a stage a multiple of the swizzles' period");
+    // A stage's first fragments (A's and B's of its first 16 k) and its flags, its full wait passed: issued during the
+    // k-step before's last MMAs (the stages are converted well ahead), else the k-step's first MMAs wait for them
+    auto head = [&](int s, int ph, uint32_t& fl) {
         mbar_wait(&full[s], ph);
-        auto tXsA = tA.partition_S(make_tensor(make_smem_ptr(stA(s)), sAl));
-        auto tXsB = tB.partition_S(make_tensor(make_smem_ptr(stB(s)), sBl));
-        auto tXsN = tB.partition_S(make_tensor(make_smem_ptr(stN(s)), sBl));
-        copy(s2rA, tXsA(_, _, 0), tXrA(_, _, 0));
-        copy(s2rB, tXsB(_, _, 0), tXrB(_, _, 0));
-        rescale(tCrL, 0, s);
+        const int so = s * (STAGE / 2);
+        copy(s2rA, make_tensor(tXsA0.data() + so, tXsA0.layout())(_, _, 0), tXrA(_, _, 0));
+        copy(s2rB, make_tensor(tXsB0.data() + so, tXsB0.layout())(_, _, 0), tXrB(_, _, 0));
+        fl = sflg[s * NU];
+        if (GRAD) fl |= sflg[s * NU + NU - 1];
+    };
+    // A stage's k-step (its head loaded); RS: the sums first rescaled where a sample's max rose (`rescale`); the next
+    // stage's head (sn, phn into fl) before the k-step's last MMAs where there is one
+    auto kstep = [&](int s, auto rs, bool more, int sn, int phn, uint32_t& fl) {
+        constexpr bool RS = decltype(rs)::value;
+        const int so = s * (STAGE / 2);                  // (the stage's offset in bf16 elements)
+        auto tXsA = make_tensor(tXsA0.data() + so, tXsA0.layout());
+        auto tXsB = make_tensor(tXsB0.data() + so, tXsB0.layout());
+        auto tXsN = make_tensor(tXsN0.data() + so, tXsN0.layout());
+        if constexpr (RS) rescale(tCrL, 0, s);
         CUTE_UNROLL
         for (int kb = 0; kb < KB; kb++) {
             if (kb + 1 < KB) {
@@ -1385,19 +1425,38 @@ __global__ void __launch_bounds__(OM_THREADS, 1) lr_om_bw_kernel(
                 copy(s2rB, tXsN(_, _, 0), tXrB(_, _, 0));    // (the parameters' fragments again: Gn's too)
             } else {
                 mbar_arrive(&empty[s]);
+                if (more) head(sn, phn, fl);             // (into the first fragments' registers: their MMAs issued)
             }
             cute::gemm(mma, tCrA(_, _, kb), tCrB(_, _, kb), tCrL);
         }
         if (GRAD) {
-            rescale(tCrN, 1, s);
+            if constexpr (RS) rescale(tCrN, 1, s);
             CUTE_UNROLL
             for (int kb = 0; kb < KB; kb++) {
                 if (kb + 1 < KB) copy(s2rB, tXsN(_, _, kb + 1), tXrB(_, _, kb + 1));
-                else mbar_arrive(&empty[s]);
+                else {
+                    mbar_arrive(&empty[s]);
+                    if (more) head(sn, phn, fl);
+                }
                 cute::gemm(mma, tCrA(_, _, kb), tCrB(_, _, kb), tCrN);
             }
         }
-        if (++s == ST) { s = 0; ph ^= 1; }
+    };
+    // The k-steps: a stage none of whose maxima rose (the converters' flags, read after its full wait) takes the
+    // k-step without the rescales' code, the others (MEASURED: ~30% of them, the HMM's parents in random order) the
+    // rescaling one. (MEASURED, B64: the loop of every k-step's rescale checked in line -- its factors compared, its
+    // multiplications predicated -- cost the kernel 7%: the checks' register pressure remade the fragments' swizzled
+    // offsets every k-step; with the rescale as a branch the same. The next stage's head during the k-step's last MMAs:
+    // the kernel 2% more at B64, 3% at B16.)
+    int s = 0, ph = 0;
+    uint32_t fl = 0u;
+    head(0, 0, fl);
+    for (int j = 0; j < nk; j++) {
+        const int sn = s + 1 == ST ? 0 : s + 1, phn = sn == 0 ? ph ^ 1 : ph;
+        const uint32_t f = fl;
+        if (f != 0u) kstep(s, cute::true_type{}, j + 1 < nk, sn, phn, fl);
+        else kstep(s, cute::false_type{}, j + 1 < nk, sn, phn, fl);
+        s = sn; ph = phn;
     }
     cudaGridDependencySynchronize();                     // (the epilogue's own guarantee: the launch before is done)
     asm volatile("bar.sync 3, %0;" ::"n"(NC + NV) : "memory");   // (smsh: the converters'; every stage read)
@@ -1889,7 +1948,7 @@ void lowrank_backward_om(torch::Tensor flows, torch::Tensor vals, c10::optional<
         constexpr bool F = decltype(f)::value, G = decltype(g)::value, SG = decltype(s)::value;
         constexpr int NU = G ? 2 : 1;                    // (as the kernel's: U; and Un with the gradients)
         constexpr int STAGE = (32 * OM_BM * 2 + NU * 32 * OM_BN * 2 + 3 * 32 * S * 4 + 1023) / 1024 * 1024;
-        constexpr int SMEM = ST * STAGE + NU * OM_BN * 4 + NU * ST * S * 4 + 3 * ST * 8;
+        constexpr int SMEM = ST * STAGE + NU * OM_BN * 4 + NU * ST * S * 4 + 3 * ST * 8 + NU * ST * 4;
         static_assert(SMEM <= 101376, "past sm_120's 99 KB of shared memory a block");
         static_assert(!G || 32 * ((32 * OM_K + 4) + (32 + 1)) * 4 <= SMEM, "the dA CTAs' tiles in the shared memory");
         auto kernel = lr_om_bw_kernel<ST, F, G, SG>;

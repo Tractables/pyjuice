@@ -3389,3 +3389,72 @@ def test_the_fused_exp_sum_forward_with_mostly_zero_parameters(rank, batch, prec
     assert torch.isfinite(nmars).all() and torch.isfinite(lzs).all()
     assert float((nmars.t().double().cpu() - ln).abs().max()) < 1e-3
     assert float((lzs.t().double().cpu() - lz).abs().max()) < 1e-3
+
+
+@needs_virtual
+@pytest.mark.parametrize("batch", [16, 12])
+def test_the_one_launch_passes_where_a_stages_values_lie_deep_and_apart(batch, monkeypatch):
+    """The one-launch forward and backward (`lr_om_kernel`, `lr_om_bw_kernel`) where a stage's values lie deep below 0
+    and far apart: a chain of 64 steps (the values ~100 nats down), in every node block of 32 half the states emitting
+    half the categories with probability 0 and the other half the others (an HMM's sparse emissions: half a k-step's
+    children impossible whatever the token), and the factors matching each half of a block's nodes to the same half
+    of the child blocks' (a node's other children ~60 nats down: half the parents' values ~60 below the others'). A
+    stage's maxima, as the converters take them (an integer redux of the floats' order-preserving keys), must be the
+    largest (a shift of 0 loses every term); the normalizer half's running max rises where the data half's does not
+    (a stage's flags take either). Against the plain path and the torch passes on the same circuit."""
+    import pyjuice.parameterizations.lowrank.virtual as lowrank_virtual
+    from pyjuice.layer.kernels import autotune
+
+    def sparse_emissions(root):
+        for ns in root:
+            if ns.is_input() and not ns.is_tied():
+                p = ns.get_params().reshape(ns.num_nodes, NUM_CATS).clone()
+                low = (torch.arange(ns.num_nodes, device = p.device) % 32) < 16
+                p[low, NUM_CATS // 2:] = 0.0
+                p[~low, :NUM_CATS // 2] = 0.0
+                ns.set_params(p / p.sum(dim = 1, keepdim = True))
+
+    pick = autotune.pick
+    monkeypatch.setattr(autotune, "pick", lambda key, cands, bench, **k: "fused"
+                        if key[0] in ("prod_stream_fusion", "prod_stream_fusion_bk") else pick(key, cands, bench, **k))
+    rank = 16
+    pc, sums, _, _, _, _ = _pair(_hmm_blocks(256, 32, T = 64), "sum_exp", rank = rank, prepare = sparse_emissions)
+    monkeypatch.setattr(pc, "_param_operands_force", True, raising = False)   # (the bf16 copy: the stream path's)
+    monkeypatch.setattr(lowrank_virtual, "GEMM_BF16_WORK", 0)                # (bf16 normalizers, as at real sizes)
+    dev = pc.params.device
+    torch.manual_seed(43)
+    data = torch.randint(0, NUM_CATS, (batch, pc.num_vars), device = dev)
+    ext = {a: _factors(a, rank, batch, dev, seed = 490 + i) for i, a in enumerate(sums)}
+    for a in sums:                                      # (ranks 0..7 a block's first half's, 8..15 its second's)
+        lo_i = (torch.arange(a.num_nodes, device = dev) % 32) < 16
+        lo_j = (torch.arange(a.num_ch_nodes, device = dev) % 32) < 16
+        lo_r = torch.arange(rank, device = dev) < rank // 2
+        ext[a][0][:] += torch.where(lo_i[:, None] == lo_r[None, :], 30.0, -30.0)
+        ext[a][1][:] += torch.where(lo_r[:, None] == lo_j[None, :], 30.0, -30.0)
+    monkeypatch.setattr(lowrank_virtual, "ENABLED", False)
+    torch_pass = _passes(pc, sums, data, ext)
+    monkeypatch.setattr(lowrank_virtual, "ENABLED", True)
+    monkeypatch.setattr(lowrank_virtual, "FUSED_STREAM", False)
+    monkeypatch.setattr(lowrank_virtual, "FUSED_STREAM_BK", False)
+    plain = _passes(pc, sums, data, ext)
+    smod = lowrank_virtual._stream_module()
+    calls, real = [], smod.lowrank_backward_om
+
+    def counted(*args):
+        calls.append(1)
+        return real(*args)
+
+    monkeypatch.setattr(smod, "lowrank_backward_om", counted)
+    monkeypatch.setattr(lowrank_virtual, "FUSED_STREAM", True)
+    monkeypatch.setattr(lowrank_virtual, "FUSED_STREAM_BK", True)
+    taken = _stream_form(monkeypatch, "om")
+    got = _passes(pc, sums, data, ext)
+    assert len(taken) >= len(sums) and all(c == lowrank_virtual._OM_ARM for c, _ in taken)
+    assert len(calls) == len(sums), calls
+    assert torch.isneginf(plain["mars"]).any() and torch.isfinite(plain["lls"]).all()   # (impossible nodes, possible data)
+    assert float(plain["lls"].max()) < -88.0, plain["lls"]                    # (every value past a shift of 0's range)
+    for k in ("lls", "mars", "flows", "fp", "fm", "dA", "dB"):
+        for t in (got[k] if isinstance(got[k], list) else [got[k]]):
+            assert not torch.isnan(t).any(), k
+    _same(got, plain, rtol = 2e-3, atol = 2e-3, grad_scale = 2e-2)
+    _same(got, torch_pass, rtol = 2e-2, atol = 1e-3, grad_scale = 2e-2)
