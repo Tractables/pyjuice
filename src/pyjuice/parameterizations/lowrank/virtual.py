@@ -57,9 +57,10 @@ _EXTERNAL_PARAMS_GRAD_KWARG = "sum_external_params_grad"
 FUSED_STREAM = True
 #: `False`: a backward through the virtual batch keeps the plain path where the one-launch backward would serve
 #: (`kernels/c/lowrank_stream.cu`'s `lr_om_bw_kernel`: the data half's element flows, dB's data half and, in the grid's
-#: free SMs, dA, one launch a layer; a layer of one node vector with the product layer below handed to the backward,
-#: rank 16, B % 4 == 0, bf16 parameters). MEASURED (HMM 1024 x 31, rank 16, backward wall, plain -> one launch): B16
-#: 1.83 -> 1.55 ms, B64 4.13 -> 3.57, B256 15.09 -> 13.73
+#: free SMs, dA, one launch a layer; a layer of one node vector -- the product layer below handed to the backward (its
+#: children's node flows written) or not (the element flows written; the layer's children's values kept for the
+#: pass's end's parameter flows) --, rank 16, B % 4 == 0, bf16 parameters). MEASURED (HMM 1024 x 31, rank 16, backward
+#: wall, plain -> one launch): B16 1.83 -> 1.55 ms, B64 4.13 -> 3.57, B256 15.09 -> 13.73
 FUSED_STREAM_BK = True
 
 
@@ -675,19 +676,20 @@ def _stream_run(plan, info, tensors, kwargs, z, row0, vnm, kd, node_mars, elemen
 
 
 def _stream_plan_bk(desc, layer, twin, info, node_mars, stream_children, dev):
-    """What the one-launch backward of this layer (one node vector `info`, the product layer below fused in) launches, or
-    None where it does not serve: per backward partition of the twin, its child blocks' first element rows (`chids`),
-    each one's parent blocks' first twin rows and parameter slabs (`ppar`, `ppid` [blocks, parent blocks]) and the
-    block sizes; each element row's child `jrow` from `e_lo` on. Served where every child block's rows are the node
-    vector's children, every parent a node of it (no dummy), the child blocks a tile spans of equal parents, the slabs
-    8-aligned (`lowrank_stream.cu`'s `om_bw_serves` for the rest). Built once per (layer, device, product table, batch) --
-    a device sync --, kept on the layer, dropped with its device caches."""
+    """What the one-launch backward of this layer (one node vector `info`; the product layer below fused in, its
+    children's node flows written, or not -- `stream_children` None: the element flows written, the product layer's
+    backward after) launches, or None where it does not serve: per backward partition of the twin, its child blocks'
+    first element rows (`chids`), each one's parent blocks' first twin rows and parameter slabs (`ppar`, `ppid`
+    [blocks, parent blocks]) and the block sizes; each element row's child `jrow` from `e_lo` on. Served where every
+    child block's rows are the node vector's children, every parent a node of it (no dummy), the child blocks a tile
+    spans of equal parents, the slabs 8-aligned (`lowrank_stream.cu`'s `om_bw_serves` for the rest). Built once per
+    (layer, device, product table, batch) -- a device sync --, kept on the layer, dropped with its device caches."""
     mod = _stream_module()
     K, B = desc.rank, node_mars.size(1)
-    if mod is None or stream_children is None:
+    if mod is None:
         return None
     cache = layer.__dict__.setdefault("_lrv_stream_bk", {})
-    key = (dev, id(stream_children[0]), B)
+    key = (dev, None if stream_children is None else id(stream_children[0]), B)
     plan = cache.get(key)
     if plan is None:
         plan = False
@@ -723,7 +725,8 @@ def _stream_plan_bk(desc, layer, twin, info, node_mars, stream_children, dev):
                     e = (part["chids"][:, None] + torch.arange(part["cbs"], device = dev)[None, :]).reshape(-1)
                     j = jrow[e - e_lo]
                     cov[j[j >= 0].long()] = True
-                plan = dict(parts = parts, jrow = jrow, e_lo = e_lo, vn0 = vn0, covers = bool(cov.all()))
+                plan = dict(parts = parts, jrow = jrow, e_lo = e_lo, vn0 = vn0, covers = bool(cov.all()),
+                            rows = rows.clamp_min(0), orphans = None if bool(has.all()) else ~has)
         cache[key] = plan
     return plan or None
 
@@ -846,7 +849,8 @@ def _end_of_pass(mod, z, copies, node_flows, node_mars, params, param_flows, den
     sums the copies'), `V * (U theta)` off the `dB` of each copy whose backward did not take it off already (`copies`'
     last entry: the one-launch form, `lowrank_backward_om`, does), `V` and the rows the forward's (`z`,
     `_normalizers`). The data half: `F+ = theta * (U^T V)`, `theta` read from `params` where they lie, for the copies
-    whose product layer was fused in (`copies`' fifth entry; another's plain backward has added its flows), into the
+    whose plain backward did not add their flows (`copies`' fifth entry, `(table, first, kept)`: the product layer
+    fused in, its children's values from its table; or the one-launch backward's without it, the values it kept), into the
     first of them's flow block: the blocks of a source's copies are summed before the parameters read them, as those of
     the plain kernels. The operands: at bf16, from the exponentials the pass keeps -- the backward's `exp(A - shift)`
     (`_a_rows`) and the forward's V -- in one launch (`lowrank_kept_operands`); else from the factors
@@ -885,13 +889,14 @@ def _end_of_pass(mod, z, copies, node_flows, node_mars, params, param_flows, den
         mod.lowrank_kept_operands(Ud, Vd, Ut, ua, sha, Vt, shift, node_flows, node_mars, [c[3] for c in sel],
                                   [c[1].nid_start for c in sel], geos, [c[5][0] if id(c) in at else None for c in sel],
                                   [c[5][1] if id(c) in at else 0 for c in sel], [z["row"][c[1].ns] for c in sel],
-                                  [at.get(id(c), -1) for c in sel], [int(id(c) in un) for c in sel], M, K)
+                                  [at.get(id(c), -1) for c in sel], [int(id(c) in un) for c in sel], M, K,
+                                  [c[5][2] if id(c) in at else None for c in sel])
     else:
         if fp:
             mod.lowrank_data_operands(Ud, Vd, node_flows, node_mars, [inner(c[2])[0] for c in fp], [c[3] for c in fp],
                                       [inner(c[2])[1] for c in fp], [c[1].nid_start for c in fp],
                                       [desc._geometry(c[0], c[1], dev)["rows"] for c in fp], [c[5][0] for c in fp],
-                                      [c[5][1] for c in fp], M, K)
+                                      [c[5][1] for c in fp], M, K, [c[5][2] for c in fp])
         if rows_of:
             mod.lowrank_u_operand(Ut, shift, node_flows, [inner(c[2])[0] for c in rows_of], [c[3] for c in rows_of],
                                   [c[1].nid_start for c in rows_of], [z["row"][c[1].ns] for c in rows_of], M, K)
@@ -933,7 +938,8 @@ def backward(desc, layer, ns_tensors, ns_grad_tensors, node_flows, element_flows
 
     kd = _kept(layer, twin, cols, dev)                                  # (the forward's: dLL / dA_r = f D_r)
     # The one-launch backward where it serves: dA from the kept responsibilities, then the data half's element flows (as
-    # the products' children's node flows) and dB's data part in one launch -- no virtual buffers
+    # the products' children's node flows where the product layer below is fused in) and dB's data part in one launch
+    # -- no virtual buffers
     op = layer.__dict__.get("_bk_op_params")
     op = op if op is not None else (params if params.dtype == torch.bfloat16 else None)
     plan = _stream_plan_bk(desc, layer, twin, ns_tensors[0][0], node_mars, stream_children, dev) \
@@ -955,16 +961,25 @@ def backward(desc, layer, ns_tensors, ns_grad_tensors, node_flows, element_flows
         store = fresh and grads is not None and plan["covers"] and gviews.claim(grads)
         if fresh and not store:
             gviews.init_grads(grads)
+        # (the product layer fused in: its children's node flows written, its children's values read from theirs; else
+        # the element flows written and the children's values read from `element_mars` -- kept for the pass's end where
+        # it forms the parameter flows: the layers after this one write `element_mars`)
+        if stream_children is not None:
+            out, vals, table, first, kids = node_flows, node_mars, stream_children[0], stream_children[1], None
+        else:
+            out, vals, table, first = element_flows, element_mars, None, 0
+            kids = element_mars[plan["rows"]] if param_flows is not None else None
+            if kids is not None and plan["orphans"] is not None:
+                kids[plan["orphans"]] = -float("inf")                   # (a child no edge reaches: no value)
         for at, part in enumerate(plan["parts"]):
             # (dA by the first partition's launch, in its grid's free SMs)
             da = grads is not None and at == 0
-            smod.lowrank_backward_om(node_flows, node_mars, stream_children[0], stream_children[1], fb, plan["jrow"],
-                                     plan["e_lo"], None if grads is None else grads[1], ua, row0, sha, node_flows,
-                                     node_mars, lz, shift, plan["vn0"], op, part["chids"], part["ppar"],
-                                     part["ppid"], part["cbs"], part["pbs"], grads[0] if da else None,
-                                     kd if da else None, store)
-        # (dB's normalizer half taken off by the launches: `grads` given)
-        st["norm"].setdefault(_source(info.ns), []).append((layer, info, (fa, fb), lz, grads, stream_children,
+            smod.lowrank_backward_om(out, vals, table, first, fb, plan["jrow"], plan["e_lo"],
+                                     None if grads is None else grads[1], ua, row0, sha, node_flows, node_mars, lz,
+                                     shift, plan["vn0"], op, part["chids"], part["ppar"], part["ppid"], part["cbs"],
+                                     part["pbs"], grads[0] if da else None, kd if da else None, store)
+        # (dB's normalizer half taken off by the launches: `grads` given; the parameter flows at the pass's end)
+        st["norm"].setdefault(_source(info.ns), []).append((layer, info, (fa, fb), lz, grads, (table, first, kids),
                                                             grads is not None))
         st["done"].add(info.ns)
     else:
@@ -1028,5 +1043,7 @@ def _backward_data(desc, layer, twin, shift, ns_tensors, ns_grad_tensors, node_f
         else:
             mod.lowrank_collapse_bw_fused(node_flows, bufs["vef_d"], rows, stream_children[0], stream_children[1],
                                           grad_b, K)
-        st["norm"].setdefault(_source(info.ns), []).append((layer, info, tensors, lz, grads, stream_children, False))
+        st["norm"].setdefault(_source(info.ns), []).append(
+            (layer, info, tensors, lz, grads,
+             None if stream_children is None else (stream_children[0], stream_children[1], None), False))
         st["done"].add(info.ns)

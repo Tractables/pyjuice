@@ -1714,12 +1714,13 @@ def test_the_one_launch_backward_is_the_plain_data_half(bs, batch, param_flows, 
     node flows --, dB's data half and its normalizer half, and, in the grid's free SMs, dA), where it serves -- blocks of
     32, 64 and 128 (a child tile of 4, 2 and 1 child blocks, a parent block of 1, 2 and 4 k-steps), batches of 16, 12
     and 4 -- against the plain data half on the same circuit: every value, flow, denominator and gradient; the same bits
-    from run to run; and the torch passes (fp32 parameters) within the bf16 copy's rounding. The first layer takes the
-    plain path (no product layer below): the pass's end takes its dB's normalizer half off, its copy's alone -- with
-    the parameter flows (U's rows every copy's: the denominators read them) and without (the owing copy's rows
-    alone). `plain_middle`: a middle layer's backward on the plain path too (its plan withheld): two copies owe the
-    normalizer half, one of them past the normalizers' first rows. `da_ctas`: the dA CTAs capped (one), so their threads
-    stride over the (node, sample) pairs (at these sizes a thread has one pair otherwise)."""
+    from run to run; and the torch passes (fp32 parameters) within the bf16 copy's rounding. The first layer (its
+    children the inputs: no product layer below) takes it too, writing the element flows, its children's values kept
+    for the pass's end's parameter flows. `plain_middle`: a middle layer's backward on the plain path (its plan
+    withheld): its copy alone owes the normalizer half, past the normalizers' first rows -- with the parameter flows
+    (U's rows every copy's: the denominators read them) and without (the owing copy's rows alone). `da_ctas`: the dA
+    CTAs capped (one), so their threads stride over the (node, sample) pairs (at these sizes a thread has one pair
+    otherwise)."""
     import pyjuice.parameterizations.lowrank.virtual as lowrank_virtual
     from pyjuice.layer.kernels import autotune
 
@@ -1763,9 +1764,8 @@ def test_the_one_launch_backward_is_the_plain_data_half(bs, batch, param_flows, 
     finally:
         smod.set_da_ctas_most(0)
     assert got["path"] == {tuple}
-    # every layer but the first (its children the inputs: no product layer below) took it, each with dA -- and but
-    # the middle one, `plain_middle`
-    assert len(calls) == 2 * (len(sums) - 1 - plain_middle) and all(calls), calls
+    # every layer took it, each with dA -- but the middle one, `plain_middle`
+    assert len(calls) == 2 * (len(sums) - plain_middle) and all(calls), calls
     _same(got, plain, rtol = 2e-3, atol = 2e-3, grad_scale = 2e-2)
     for k in ("lls", "mars", "flows", "fp", "fm"):
         assert torch.equal(got[k], again[k]), k
@@ -1779,8 +1779,7 @@ def test_tied_copies_through_the_one_launch_backward_into_one_destination(monkey
     """`tie_external` through the one-launch backward (rank 16, blocks of 32): every copy reads the source's factors
     and adds its gradients into the source's one destination, handed over unzeroed (`StagedExternalParams.fresh`;
     NaN-filled here) -- the first copy's launch stores into it (it claims it), every other one adds --: the sums of the
-    untied circuit's gradients over its copies, to fp32's order of the additions; every layer but the first (no product
-    layer below) took the form."""
+    untied circuit's gradients over its copies, to fp32's order of the additions; every layer took the form."""
     import pyjuice.parameterizations.lowrank.virtual as lowrank_virtual
     from pyjuice.layer.kernels import autotune
 
@@ -1813,7 +1812,7 @@ def test_tied_copies_through_the_one_launch_backward_into_one_destination(monkey
         stores.clear()
         pc_t.backward(data, allow_modify_flows = False, logspace_flows = True,
                       sum_external_params_grad = {sums_t[0]: gt})
-    assert len(stores) == len(sums_t) - 1 and stores.count(True) == 1 and stores[0], stores
+    assert len(stores) == len(sums_t) and stores.count(True) == 1 and stores[0], stores
     ga = {a: (torch.full_like(A, nan), torch.full_like(B, nan)) for a in sums_a}
     for _ in range(2):
         ga = {a: (torch.full_like(A, nan), torch.full_like(B, nan)) for a in sums_a}
@@ -2442,6 +2441,14 @@ def test_the_parameter_flows_of_copies_in_several_flow_blocks(monkeypatch):
     assert torch.allclose(out["virtual"], out["torch"], rtol = 1e-3, atol = 1e-5)
 
 
+def _kept_children(node_mars, table, first, eid):
+    """What a copy without its product layer fused in keeps of its children, `[N, B]`: the products' values (here the
+    sum of their two children's node values, the kernels' own fp32 add), -inf at a child no edge reaches."""
+    at = (eid.clamp_min(first) - first).long()
+    cv = node_mars[table[at, 0].long()] + node_mars[table[at, 1].long()]
+    return torch.where((eid >= 0)[:, None], cv, torch.full_like(cv, -float("inf"))).contiguous()
+
+
 @needs_virtual
 @pytest.mark.parametrize("M, N, K, B, copies", [(3, 300, 2, 37, 2),     # children past one warp's share, samples past a block's
                                                 (5, 3, 3, 4, 70)])      # few children, copies past one launch's
@@ -2478,9 +2485,14 @@ def test_the_data_operands_follow_their_formulas(M, N, K, B, copies):
         Ut = torch.full((M, total), float("nan"), dtype = dtype, device = dev)
         Vt = torch.full((N, total), float("nan"), dtype = dtype, device = dev)
         mod.lowrank_data_operands(Ut, Vt, node_flows, node_mars, fa, lz, fb, nid0, eids, [table] * copies,
-                                  [first] * copies, M, K)
+                                  [first] * copies, M, K, [None] * copies)
         torch.cuda.synchronize()
         assert torch.isfinite(Ut.float()).all() and torch.isfinite(Vt.float()).all()
+        # (the children's values kept instead of the table -- a copy whose product layer was not fused in: the same bits)
+        Uk, Vk = torch.full_like(Ut, float("nan")), torch.full_like(Vt, float("nan"))
+        mod.lowrank_data_operands(Uk, Vk, node_flows, node_mars, fa, lz, fb, nid0, eids, [None] * copies,
+                                  [0] * copies, M, K, [_kept_children(node_mars, table, first, e) for e in eids])
+        assert torch.equal(Uk, Ut) and torch.equal(Vk, Vt), "the kept children's values"
         for c in range(copies):
             has = eids[c] >= 0
             at = (eids[c].clamp_min(first) - first).long()
@@ -2555,9 +2567,19 @@ def test_the_kept_operands_follow_their_formulas(M, N, K, B, copies):
     mod.lowrank_kept_operands(Ud, Vd, Un, Ua, sha, Vt, shb, node_flows, node_mars, lz, nid0,
                               [eids[c] if c in data else None for c in range(copies)],
                               [table if c in data else None for c in range(copies)], [first] * copies,
-                              [c * B * K for c in range(copies)], drow0, [int(c in want_un) for c in range(copies)], M, K)
+                              [c * B * K for c in range(copies)], drow0, [int(c in want_un) for c in range(copies)], M, K,
+                              [None] * copies)
     torch.cuda.synchronize()
     assert torch.isfinite(Ud.float()).all() and torch.isfinite(Vd.float()).all()
+    # (the children's values kept instead of the table -- a copy whose product layer was not fused in: the same bits)
+    Udk, Vdk, Unk = torch.full_like(Ud, float("nan")), torch.full_like(Vd, float("nan")), torch.full_like(Un, float("nan"))
+    mod.lowrank_kept_operands(Udk, Vdk, Unk, Ua, sha, Vt, shb, node_flows, node_mars, lz, nid0,
+                              [eids[c] if c in data else None for c in range(copies)], [None] * copies, [0] * copies,
+                              [c * B * K for c in range(copies)], drow0, [int(c in want_un) for c in range(copies)], M, K,
+                              [_kept_children(node_mars, table, first, eids[c]) if c in data else None
+                               for c in range(copies)])
+    assert torch.equal(Udk, Ud) and torch.equal(Vdk, Vd) and torch.equal(Unk.isnan(), Un.isnan()) and \
+        torch.equal(Unk.nan_to_num(), Un.nan_to_num()), "the kept children's values"
     assert float(Vd.float().max()) <= 1.0
     for c in range(copies):
         has = eids[c] >= 0

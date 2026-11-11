@@ -668,16 +668,27 @@ __global__ void __launch_bounds__(ITHREADS) inplace_operand_kernel(const ICopies
 // the shift the row's largest log of `c_b[j] exp(B[r, j, b])`, `c_b[j]` the value of the product at child `j`, formed from
 // its two children's node values -- which, unlike `element_mars`, the layers below have not overwritten at the pass's end.
 // `S_b[i]`: `node_mars` holds `log S - log Z`. Two launches, as the normalizer's: the shifts (`data_shift`, into a
-// scratch of the launch's rows), then both operands. (A child no edge reaches: 0.)
-struct DataCopies { long long rows[COPIES_PER_LAUNCH * 7]; };   // A, log Z, B, first node row, children's rows, table, first
+// scratch of the launch's rows), then both operands. (A child no edge reaches: 0.) A copy without a product layer
+// fused in -- its backward kept its children's values, `cv` [N, B] (`element_mars` at its children's rows, -inf at a
+// child of none) -- reads them from there instead of from the table.
+struct DataCopies { long long rows[COPIES_PER_LAUNCH * 8]; };   // A, log Z, B, first node row, children's rows, table, first, cv
+
+// The value of child `j` (element row `e`) at sample `b`: its two children's node values, or the kept `cv`
+__device__ __forceinline__ float child_value(const float* cv, const int32_t* table, long e, long first, int j, int b,
+                                             const float* node_mars, int B) {
+    if (cv != nullptr) return cv[(long)j * B + b];
+    const int32_t* ch = table + (e - first) * 2;
+    return node_mars[(long)ch[0] * B + b] + node_mars[(long)ch[1] * B + b];
+}
 
 __global__ void data_shift_kernel(const DataCopies copies, float* __restrict__ shd, const float* __restrict__ node_mars,
                                   int N, int B, int K) {
-    const long long* c = copies.rows + 7 * blockIdx.z;
+    const long long* c = copies.rows + 8 * blockIdx.z;
     const float* fb = reinterpret_cast<const float*>(c[2]);
     const int64_t* eid = reinterpret_cast<const int64_t*>(c[4]);
     const int32_t* table = reinterpret_cast<const int32_t*>(c[5]);
     const long first = (long)c[6];
+    const float* cv = reinterpret_cast<const float*>(c[7]);
     const int lane = threadIdx.x & 31, w = threadIdx.x >> 5;
     const int r = blockIdx.y, b = blockIdx.x * 32 + lane;
     __shared__ float most[WARPS][32];
@@ -688,8 +699,7 @@ __global__ void data_shift_kernel(const DataCopies copies, float* __restrict__ s
         for (int j = w; j < N; j += WARPS) {
             const long e = eid[j];
             if (e < 0) continue;
-            const int32_t* ch = table + (e - first) * 2;
-            m = fmaxf(m, node_mars[(long)ch[0] * B + b] + node_mars[(long)ch[1] * B + b] + brow[(long)j * B]);
+            m = fmaxf(m, child_value(cv, table, e, first, j, b, node_mars, B) + brow[(long)j * B]);
         }
     }
     most[w][lane] = m;
@@ -706,7 +716,7 @@ __global__ void data_operands_kernel(const DataCopies copies, TO* __restrict__ U
                                      const float* __restrict__ shd, long rows, long row0,
                                      const float* __restrict__ node_flows, const float* __restrict__ node_mars, int M,
                                      int N, int B, int K, bool vec) {
-    const long long* c = copies.rows + 7 * blockIdx.z;
+    const long long* c = copies.rows + 8 * blockIdx.z;
     const float* fa = reinterpret_cast<const float*>(c[0]);
     const float* lz = reinterpret_cast<const float*>(c[1]);
     const float* fb = reinterpret_cast<const float*>(c[2]);
@@ -714,6 +724,7 @@ __global__ void data_operands_kernel(const DataCopies copies, TO* __restrict__ U
     const int64_t* eid = reinterpret_cast<const int64_t*>(c[4]);
     const int32_t* table = reinterpret_cast<const int32_t*>(c[5]);
     const long first = (long)c[6];
+    const float* cv = reinterpret_cast<const float*>(c[7]);
     const int R = B * K, runs = (R + RUN - 1) / RUN;
     const long t = (long)blockIdx.x * blockDim.x + threadIdx.x;
     if (t >= (long)(N + M) * runs) return;
@@ -727,13 +738,11 @@ __global__ void data_operands_kernel(const DataCopies copies, TO* __restrict__ U
     float v[RUN];
     if (of_v) {
         const long e = eid[x];
-        const int32_t* ch = table + (e >= 0 ? e - first : 0) * 2;
         #pragma unroll
         for (int q = 0; q < RUN; q++) {
             float y = 0.0f;
             if (q < n && e >= 0) {
-                const float w = node_mars[(long)ch[0] * B + b] + node_mars[(long)ch[1] * B + b] +
-                                fb[((long)r * N + x) * B + b];
+                const float w = child_value(cv, table, e, first, x, b, node_mars, B) + fb[((long)r * N + x) * B + b];
                 y = w > -INFINITY ? expf(w - sh[q]) : 0.0f;
             }
             v[q] = y;
@@ -816,15 +825,16 @@ __global__ void normalizer_grads_kernel(const NormalizerGrads grads, const TO* _
 // none); `cm_b` the copy's largest child value at sample b (`kept_cmax`): Vd <= 1, as under `data_shift`'s shifts,
 // whose pass reads B. So `Ud Vd^T` and `Un Vt^T` are the products the factors' operands make (one rounding more: Ua's).
 // A node of no flow, no mass (no normalizer, Un) or an operand entry 0: 0 (never 0 times an overflow).
-struct KeptCopies { long long rows[COPIES_PER_LAUNCH * 8]; };   // log Z, first node row, eid, table, first, row0, drow0, Un
+struct KeptCopies { long long rows[COPIES_PER_LAUNCH * 9]; };   // log Z, first node row, eid, table, first, row0, drow0, Un, cv
 
 // cm_b of a launch's copies with a data half: a block 32 samples, `WARPS` warps over every `WARPS`th child
 __global__ void kept_cmax_kernel(const KeptCopies copies, float* __restrict__ cm, const float* __restrict__ node_mars,
                                  int N, int B) {
-    const long long* c = copies.rows + 8 * blockIdx.z;
+    const long long* c = copies.rows + 9 * blockIdx.z;
     const int64_t* eid = reinterpret_cast<const int64_t*>(c[2]);
     const int32_t* table = reinterpret_cast<const int32_t*>(c[3]);
     const long first = (long)c[4];
+    const float* cv = reinterpret_cast<const float*>(c[8]);
     const int lane = threadIdx.x & 31, w = threadIdx.x >> 5, b = blockIdx.x * 32 + lane;
     __shared__ float most[WARPS][32];
     float m = -INFINITY;
@@ -832,8 +842,7 @@ __global__ void kept_cmax_kernel(const KeptCopies copies, float* __restrict__ cm
         for (int j = w; j < N; j += WARPS) {
             const long e = eid[j];
             if (e < 0) continue;
-            const int32_t* ch = table + (e - first) * 2;
-            m = fmaxf(m, node_mars[(long)ch[0] * B + b] + node_mars[(long)ch[1] * B + b]);
+            m = fmaxf(m, child_value(cv, table, e, first, j, b, node_mars, B));
         }
     }
     most[w][lane] = m;
@@ -870,12 +879,13 @@ __global__ void kept_operands_kernel(const KeptCopies copies, __nv_bfloat16* __r
                                      const float* __restrict__ cm, long rows, long drows,
                                      const float* __restrict__ node_flows, const float* __restrict__ node_mars, int M,
                                      int N, int B, int K, bool vec) {
-    const long long* c = copies.rows + 8 * blockIdx.z;
+    const long long* c = copies.rows + 9 * blockIdx.z;
     const float* lz = reinterpret_cast<const float*>(c[0]);
     const long nid0 = (long)c[1];
     const int64_t* eid = reinterpret_cast<const int64_t*>(c[2]);
     const int32_t* table = reinterpret_cast<const int32_t*>(c[3]);
     const long first = (long)c[4], row0 = (long)c[5], drow0 = (long)c[6];
+    const float* cv = reinterpret_cast<const float*>(c[8]);
     const bool dh = drow0 >= 0, un = c[7] != 0;
     const int R = B * K, runs = (R + RUN - 1) / RUN;
     const long t = (long)blockIdx.x * blockDim.x + threadIdx.x;
@@ -889,14 +899,13 @@ __global__ void kept_operands_kernel(const KeptCopies copies, __nv_bfloat16* __r
     run_at(t0, K, b, r);
     if (of_v) {
         const long e = eid[x];
-        const int32_t* ch = table + (e >= 0 ? e - first : 0) * 2;
         float vin[RUN], v[RUN];
         load_run_n(vt + (long)x * rows + row0 + t0, vin, n, vec);
         #pragma unroll
         for (int q = 0; q < RUN; q++) {
             float y = 0.0f;
             if (q < n && e >= 0) {
-                const float w = node_mars[(long)ch[0] * B + b] + node_mars[(long)ch[1] * B + b], m = cmb[b];
+                const float w = child_value(cv, table, e, first, x, b, node_mars, B), m = cmb[b];
                 y = (w > -INFINITY && m > -INFINITY && vin[q] != 0.0f) ? vin[q] * expf(w - m) : 0.0f;
             }
             v[q] = y;
@@ -1234,7 +1243,8 @@ template <typename TO>
 void data_operands_launch(torch::Tensor& Ut, torch::Tensor& Vt, torch::Tensor& node_flows, torch::Tensor& node_mars,
                           std::vector<torch::Tensor>& fa, std::vector<torch::Tensor>& lz,
                           std::vector<torch::Tensor>& fb, std::vector<int64_t>& nid0, std::vector<torch::Tensor>& eid,
-                          std::vector<torch::Tensor>& table, std::vector<int64_t>& first, int64_t M, int64_t K) {
+                          std::vector<c10::optional<torch::Tensor>>& table, std::vector<int64_t>& first, int64_t M,
+                          int64_t K, std::vector<c10::optional<torch::Tensor>>& cv) {
     const int B = node_flows.size(1), N = Vt.size(0);
     const long rows = Ut.size(1), P = (long)fa.size();
     auto stream = at::cuda::getCurrentCUDAStream();
@@ -1248,13 +1258,17 @@ void data_operands_launch(torch::Tensor& Ut, torch::Tensor& Vt, torch::Tensor& n
             const long c = p0 + i;
             check(fa[c], "A", torch::kFloat32, (long)B * M * K); check(lz[c], "lz", torch::kFloat32, (long)B * M);
             check(fb[c], "B", torch::kFloat32, (long)B * K * N); check(eid[c], "eid", torch::kInt64, N);
-            check(table[c], "table", torch::kInt32, -1);
+            const bool kept = cv[c].has_value();
+            TORCH_CHECK(kept || table[c].has_value(), "lowrank mixture: a copy's children: a product table or their values");
+            if (kept) check(*cv[c], "the children's values", torch::kFloat32, (long)N * B);
+            else check(*table[c], "table", torch::kInt32, -1);
             TORCH_CHECK(nid0[c] >= 0 && node_flows.size(0) >= nid0[c] + M, "lowrank mixture: a copy's node rows");
-            long long* row = copies.rows + 7 * i;
+            long long* row = copies.rows + 8 * i;
             row[0] = (long long)fa[c].data_ptr<float>(); row[1] = (long long)lz[c].data_ptr<float>();
             row[2] = (long long)fb[c].data_ptr<float>(); row[3] = (long long)nid0[c];
-            row[4] = (long long)eid[c].data_ptr<int64_t>(); row[5] = (long long)table[c].data_ptr<int32_t>();
-            row[6] = (long long)first[c];
+            row[4] = (long long)eid[c].data_ptr<int64_t>();
+            row[5] = kept ? 0 : (long long)table[c]->data_ptr<int32_t>();
+            row[6] = (long long)first[c]; row[7] = kept ? (long long)cv[c]->data_ptr<float>() : 0;
         }
         data_shift_kernel<<<dim3((B + 31) / 32, (int)K, n), OPERAND_THREADS, 0, stream>>>(
             copies, shd.data_ptr<float>(), node_mars.data_ptr<float>(), N, B, (int)K);
@@ -1272,7 +1286,7 @@ void kept_operands_launch(c10::optional<torch::Tensor>& Ud, c10::optional<torch:
                           std::vector<torch::Tensor>& lz, std::vector<int64_t>& nid0,
                           std::vector<c10::optional<torch::Tensor>>& eid, std::vector<c10::optional<torch::Tensor>>& table,
                           std::vector<int64_t>& first, std::vector<int64_t>& row0, std::vector<int64_t>& drow0,
-                          std::vector<int64_t>& un, int64_t M, int64_t K) {
+                          std::vector<int64_t>& un, int64_t M, int64_t K, std::vector<c10::optional<torch::Tensor>>& cv) {
     const int B = node_flows.size(1), N = vt.size(0);
     const long rows = ua.size(1), drows = Ud.has_value() ? Ud->size(1) : 0, P = (long)lz.size();
     auto stream = at::cuda::getCurrentCUDAStream();
@@ -1295,16 +1309,22 @@ void kept_operands_launch(c10::optional<torch::Tensor>& Ud, c10::optional<torch:
             TORCH_CHECK(nid0[c] >= 0 && node_flows.size(0) >= nid0[c] + M, "lowrank mixture: a copy's node rows");
             TORCH_CHECK(row0[c] >= 0 && row0[c] + (long)B * K <= rows, "lowrank mixture: a copy's rows of Ua");
             const bool d = drow0[c] >= 0;
-            TORCH_CHECK(!d || (Ud.has_value() && eid[c].has_value() && table[c].has_value() &&
+            const bool kept = d && cv[c].has_value();       // (its children's values kept: no table)
+            TORCH_CHECK(!d || (Ud.has_value() && eid[c].has_value() && (kept || table[c].has_value()) &&
                                drow0[c] + (long)B * K <= drows), "lowrank mixture: a copy's data half");
             TORCH_CHECK(!un[c] || Un.has_value(), "lowrank mixture: a copy's rows of Un without Un");
-            if (d) { check(*eid[c], "eid", torch::kInt64, N); check(*table[c], "table", torch::kInt32, -1); }
+            if (d) {
+                check(*eid[c], "eid", torch::kInt64, N);
+                if (kept) check(*cv[c], "the children's values", torch::kFloat32, (long)N * B);
+                else check(*table[c], "table", torch::kInt32, -1);
+            }
             any_d = any_d || d;
-            long long* row = copies.rows + 8 * i;
+            long long* row = copies.rows + 9 * i;
             row[0] = (long long)lz[c].data_ptr<float>(); row[1] = (long long)nid0[c];
-            row[2] = d ? (long long)eid[c]->data_ptr<int64_t>() : 0; row[3] = d ? (long long)table[c]->data_ptr<int32_t>() : 0;
+            row[2] = d ? (long long)eid[c]->data_ptr<int64_t>() : 0;
+            row[3] = d && !kept ? (long long)table[c]->data_ptr<int32_t>() : 0;
             row[4] = (long long)first[c]; row[5] = (long long)row0[c]; row[6] = (long long)drow0[c];
-            row[7] = (long long)(un[c] != 0);
+            row[7] = (long long)(un[c] != 0); row[8] = kept ? (long long)cv[c]->data_ptr<float>() : 0;
         }
         if (any_d) {
             kept_cmax_kernel<<<dim3((B + 31) / 32, 1, n), OPERAND_THREADS, 0, stream>>>(
@@ -1455,20 +1475,22 @@ bool lowrank_in_place_rank(int64_t K) { return K == 4 || K == 8 || K == 16 || K 
 // copy's children's element rows, `table` / `first` its product layer's children table and first element row
 void lowrank_data_operands(torch::Tensor Ut, torch::Tensor Vt, torch::Tensor node_flows, torch::Tensor node_mars,
                            std::vector<torch::Tensor> fa, std::vector<torch::Tensor> lz, std::vector<torch::Tensor> fb,
-                           std::vector<int64_t> nid0, std::vector<torch::Tensor> eid, std::vector<torch::Tensor> table,
-                           std::vector<int64_t> first, int64_t M, int64_t K) {
+                           std::vector<int64_t> nid0, std::vector<torch::Tensor> eid,
+                           std::vector<c10::optional<torch::Tensor>> table, std::vector<int64_t> first, int64_t M,
+                           int64_t K, std::vector<c10::optional<torch::Tensor>> cv) {
     check(node_flows, "node_flows", torch::kFloat32, -1); check(node_mars, "node_mars", torch::kFloat32, node_flows.numel());
     const long rows = (long)fa.size() * node_flows.size(1) * K;
     TORCH_CHECK(Ut.is_cuda() && Ut.is_contiguous() && Vt.is_cuda() && Vt.is_contiguous()
                 && Ut.scalar_type() == Vt.scalar_type() && Ut.dim() == 2 && Vt.dim() == 2 && Ut.size(1) == rows
                 && Vt.size(1) == rows && Ut.size(0) == M && fa.size() == lz.size() && fa.size() == fb.size()
                 && fa.size() == nid0.size() && fa.size() == eid.size() && fa.size() == table.size()
-                && fa.size() == first.size(), "lowrank mixture: the data operands do not match the copies");
+                && fa.size() == first.size() && fa.size() == cv.size(),
+                "lowrank mixture: the data operands do not match the copies");
     if (rows == 0) return;
     if (Ut.scalar_type() == torch::kBFloat16)
-        data_operands_launch<__nv_bfloat16>(Ut, Vt, node_flows, node_mars, fa, lz, fb, nid0, eid, table, first, M, K);
+        data_operands_launch<__nv_bfloat16>(Ut, Vt, node_flows, node_mars, fa, lz, fb, nid0, eid, table, first, M, K, cv);
     else if (Ut.scalar_type() == torch::kFloat32)
-        data_operands_launch<float>(Ut, Vt, node_flows, node_mars, fa, lz, fb, nid0, eid, table, first, M, K);
+        data_operands_launch<float>(Ut, Vt, node_flows, node_mars, fa, lz, fb, nid0, eid, table, first, M, K, cv);
     else TORCH_CHECK(false, "lowrank mixture: the data operands must be float32 or bfloat16");
 }
 
@@ -1483,7 +1505,7 @@ void lowrank_kept_operands(c10::optional<torch::Tensor> Ud, c10::optional<torch:
                            std::vector<torch::Tensor> lz, std::vector<int64_t> nid0,
                            std::vector<c10::optional<torch::Tensor>> eid, std::vector<c10::optional<torch::Tensor>> table,
                            std::vector<int64_t> first, std::vector<int64_t> row0, std::vector<int64_t> drow0,
-                           std::vector<int64_t> un, int64_t M, int64_t K) {
+                           std::vector<int64_t> un, int64_t M, int64_t K, std::vector<c10::optional<torch::Tensor>> cv) {
     check(node_flows, "node_flows", torch::kFloat32, -1); check(node_mars, "node_mars", torch::kFloat32, node_flows.numel());
     const long rows = ua.dim() == 2 ? ua.size(1) : -1;
     auto bf16_2d = [&](const torch::Tensor& t, long r0, long c0) {
@@ -1498,10 +1520,11 @@ void lowrank_kept_operands(c10::optional<torch::Tensor> Ud, c10::optional<torch:
                 "lowrank mixture: Ud, Vd, Un: bf16 [M, data rows], [N, data rows], [M, rows]");
     const size_t P = lz.size();
     TORCH_CHECK(nid0.size() == P && eid.size() == P && table.size() == P && first.size() == P && row0.size() == P &&
-                drow0.size() == P && un.size() == P, "lowrank mixture: the kept operands' copies do not match");
+                drow0.size() == P && un.size() == P && cv.size() == P,
+                "lowrank mixture: the kept operands' copies do not match");
     if (P == 0 || rows == 0) return;
     kept_operands_launch(Ud, Vd, Un, ua, sha, vt, shb, node_flows, node_mars, lz, nid0, eid, table, first, row0, drow0,
-                         un, M, K);
+                         un, M, K, cv);
 }
 
 // Each copy's `dB` [K, N, B] minus `Vt * Gt` on its rows (`Gt` [N, copies B K] float32: `theta^T U`); None: a copy
