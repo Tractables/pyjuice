@@ -508,6 +508,51 @@ def test_a_group_of_one_tensor_a_node_out_of_the_buffers_order_in_one_launch(mon
     assert torch.equal(got, want)
 
 
+@cuda_only
+@pytest.mark.parametrize("form", ["blockscale", "sum_exp"])
+def test_a_group_name_registered_again_names_its_new_members(form):
+    """What staging keeps per group name -- the batched copy's rows (both forms' storage with the batch moved to the
+    end) -- is dropped when the name is registered again: the members in the other order get each its own slice,
+    forward and gradients, bit for bit the per-node form (the rows kept for the old members put the first slice in the
+    old first member's place)."""
+    dev, batch = torch.device("cuda:0"), 40
+    if form == "blockscale":
+        root, s0, s1 = _two_gated()
+        n_vars = 3
+    else:
+        root, (s0, s1) = _lowrank_chain(T = 2)
+        n_vars = 3
+    pc = juice.compile(root, verbose = False).to(dev)
+    data = torch.randint(0, NUM_CATS, [batch, n_vars], device = dev)
+    if form == "blockscale":
+        t0, t1 = (_gates(s0, batch, dev, 11),), (_gates(s1, batch, dev, 12),)
+    else:
+        t0, t1 = _factors([s0, s1], batch, dev, 13)
+    ll_p = pc(data, sum_external_params = {s0: t0 if form == "sum_exp" else t0[0],
+                                           s1: t1 if form == "sum_exp" else t1[0]}).clone()
+    pc.backward(data, flows_memory = 0.0)
+    want = [tuple(g.clone() for g in pc.get_external_params_grad(m)) for m in (s1, s0)]
+
+    def run(order):
+        cats = _cats([t1, t0] if order == "new" else [t0, t1])
+        given = cats if form == "sum_exp" else cats[0]
+        ll = pc(data, sum_external_params = {"g": given}).clone()
+        grads = tuple(torch.full_like(c, float("nan")) for c in cats)
+        pc.backward(data, flows_memory = 0.0, sum_external_params_grad = {"g": grads if form == "sum_exp" else grads[0]})
+        torch.cuda.synchronize()
+        return ll, grads
+
+    pc.register_external_params_group("g", [s0, s1])
+    ll_old, _ = run("old")
+    assert torch.equal(ll_old, ll_p)
+    pc.unregister_external_params_group("g")
+    pc.register_external_params_group("g", [s1, s0])
+    ll_new, grads = run("new")
+    assert torch.equal(ll_new, ll_p), "the old members' plan staged the new order"
+    for slot, got in enumerate(grads):
+        assert torch.equal(got, torch.cat([w[slot] for w in want], dim = 1)), f"slot {slot}"
+
+
 class _CallersOrder(SumParameterization):
     """Two tensors a node, stored in the caller's order (`storage_perm` None): not a transpose, whatever it holds."""
 

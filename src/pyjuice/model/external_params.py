@@ -390,12 +390,18 @@ class _ExternalParamsMixin:
                     )
 
         self.external_params_groups[name] = (list(nodes), int(dim))
+        self._forget_group_plans()
 
     def unregister_external_params_group(self, name: str) -> None:
         """Remove a group registered by :func:`register_external_params_group`."""
         assert name in self.external_params_groups, \
             f"No external-parameter group named '{name}'."
         del self.external_params_groups[name]
+        self._forget_group_plans()
+
+    def _forget_group_plans(self) -> None:
+        """Drop what is kept per group name (its rows, `_group_rows`): a name registered again may name other nodes."""
+        self.__dict__.pop("_ext_group_rows", None)
 
     def _group_fast_stage(self, name: str, tensors, views: dict, batch_size: int,
                           buffer: Optional[torch.Tensor] = None):
