@@ -1120,7 +1120,7 @@ __global__ void __launch_bounds__(OM_THREADS, 1) lr_om_kernel(
 // sample, rank); `am` each (node, sample)'s largest A over its ranks) of its 32 parents and their flows, values, log
 // normalizers and shifts `am`; converters scale Ua in place by `exp(lf - log S + am - m_b)`, m_b each sample's running
 // max over the parents so far (the consumers rescale their sums
-// where it rose); the epilogue forms `log G = log(sum) + m_b + shift` and from it, a (child, sample) a thread, the
+// where it rose); the epilogue forms `log G = log(sum) + m_b + shift` and from it, a (child, sample) a pair, the
 // element flow `lse_r (c_b[j] + B_b[r, j] + log G)` -- written as the product's two children's node flows where the
 // product layer below is fused in (FUSED) -- and dB's data half, `exp(c + B + log G)` (GRAD). A parent of no flow or
 // no mass (lf or log S -inf): 0.
@@ -1149,6 +1149,13 @@ __global__ void __launch_bounds__(OM_THREADS, 1) lr_om_kernel(
 // B256 8.39 -> 8.31, B64 2.76 -> 2.70. The k-loop's resources alone (globaltimer stamps, B1024, us a tile, later
 // waves): the consumers alone 16.1 (the tensor floor 14.2), the feed alone 13.1, both 18.9; each copy left out: the
 // parents' arrays (32 rows' scattered 16-byte pieces each) 1.5, the parameter tile 1.8, Ua 0.8.
+// The tile's serial phases (the same stamps by role): the first stage 2.56 us (the CTA's start to the producers' code
+// 0.51, their prefetches' chains 0.51, the first copies issued 0.5, landed 0.51, converted 0.26), the epilogue 2.82
+// (log G written 0.77, the pairs' loads 1.8, the stores 0.26) -- so the converters prefetch the epilogue's pieces, idle
+// before their first stage, and the producers and converters load their pairs right after their own loops, the
+// consumers only writing log G: MEASURED (toast, step ms, 2 rounds x 2) B2048 60.12 -> 59.57 / 60.33 -> 59.80, B1024
+// 30.70 -> 30.33 / 30.67 -> 30.33, B256 8.49 -> 8.32 / 8.46 -> 8.31, B64 2.761 -> 2.704 / 2.753 -> 2.694. (The dA
+// CTAs' next tile prefetched into L2: slower, its streaming lines held in the L2 -- +0.7% B1024, +1.2% B2048.)
 template <int KC>
 __device__ __forceinline__ void load_run4f(const float* __restrict__ p, float (&v)[KC]) {
     CUTE_UNROLL
@@ -1288,10 +1295,13 @@ __global__ void __launch_bounds__(OM_THREADS, 1) lr_om_bw_kernel(
     const uint32_t sbase = (uint32_t)__cvta_generic_to_shared(smem_raw);
     const long col0 = (long)pid_b * BN;
     const int b0 = pid_b * S;
-    // The epilogue, every role's (a (child, sample) pair a thread, `BM S` of them): from the consumers' log G tile `gs`,
-    // the pair's element flow over the sample's K ranks and dB's data half -- every load (the child's value, B, dB)
-    // before the first store; the pieces were prefetched into L2 by the producers during the main loop
-    static_assert(BM * S == OM_THREADS, "a thread an epilogue pair");
+    // The epilogue, the producers' and converters' (a (child, sample) pair `P` of the `BM S` two a thread, `P` and
+    // `P + NP + NV` for the thread's `P` = tid - NC): from the consumers' log G tile `gs`, the pair's element flow over
+    // the sample's K ranks and dB's data half. Its loads (the rows' chains to the child, the child's value, B, dB) by
+    // `epi_load` right after the thread's own loop -- the producers' last copies issued ST k-steps before the consumers'
+    // end, the converters' last stage one or two -- the rest past the log G tile (`epi_finish`): every load before the
+    // first store, as one thread a pair did. (The pieces were prefetched into L2 by the converters at the start.)
+    static_assert(BM * S == 2 * (NP + NV), "two epilogue pairs a producer and a converter");
     float* gs = (float*)smem_raw;
     float* gn = gs + BM * GS;                            // (GRAD: log Gn)
     auto child_of = [&](int m, long& e, int& j) {         // a tile row's element row and the node vector's child
@@ -1299,30 +1309,41 @@ __global__ void __launch_bounds__(OM_THREADS, 1) lr_om_bw_kernel(
         e = chids[cb0 + bq] + (bpt > 1 ? m - bq * cbs : tile_id * BM + m);
         j = jrow[e - e_lo];
     };
-    auto epilogue = [&]() {
-        const int m = tid / S, sl = tid % S, b = b0 + sl;
-        long e;
+    struct EpiPair {                                     // (a pair's pieces, loaded: `epi_load`)
+        long e, ch0, ch1;
         int j;
-        child_of(m, e, j);
-        if (j < 0) return;                               // (no child of the node vector)
-        long ch0 = 0, ch1 = 0;
-        float c;
+        float c, x[K], gv[K];
+    };
+    auto epi_load = [&](int P, EpiPair& p) {
+        const int m = P / S, sl = P % S, b = b0 + sl;
+        child_of(m, p.e, p.j);
+        if (p.j < 0) return;                             // (no child of the node vector)
+        p.ch0 = 0; p.ch1 = 0;
         if (FUSED) {
-            const int* chp = table + (e - first) * 2;
-            ch0 = chp[0]; ch1 = chp[1];
-            c = vals[ch0 * B + b] + vals[ch1 * B + b];
+            const int* chp = table + (p.e - first) * 2;
+            p.ch0 = chp[0]; p.ch1 = chp[1];
+            p.c = vals[p.ch0 * B + b] + vals[p.ch1 * B + b];
         } else {
-            c = vals[e * B + b];
+            p.c = vals[p.e * B + b];
         }
-        const float* bsrc = fb + (long)b * fb_sb + j;    // B[b, r, j] as the caller gives it: r at a stride of N
-        float* g = GRAD ? grad_b + (long)b * gb_sb + j : nullptr;
-        float x[K], gv[K];
+        const float* bsrc = fb + (long)b * fb_sb + p.j;  // B[b, r, j] as the caller gives it: r at a stride of N
         CUTE_UNROLL
-        for (int r = 0; r < K; r++) x[r] = bsrc[(long)r * N];
+        for (int r = 0; r < K; r++) p.x[r] = bsrc[(long)r * N];
         if (GRAD) {
+            const float* g = grad_b + (long)b * gb_sb + p.j;
             CUTE_UNROLL
-            for (int r = 0; r < K; r++) gv[r] = STORE ? 0.f : g[(long)r * N];   // (STORE: dB's first writer)
+            for (int r = 0; r < K; r++) p.gv[r] = STORE ? 0.f : g[(long)r * N];   // (STORE: dB's first writer)
         }
+    };
+    auto epi_finish = [&](int P, EpiPair& p) {
+        if (p.j < 0) return;
+        const int m = P / S, sl = P % S, b = b0 + sl;
+        const long e = p.e, ch0 = p.ch0, ch1 = p.ch1;
+        const int j = p.j;
+        const float c = p.c;
+        float* g = GRAD ? grad_b + (long)b * gb_sb + j : nullptr;
+        float (&x)[K] = p.x;
+        float (&gv)[K] = p.gv;
         float nv[K];                                     // (GRAD: the normalizer half, exp(B + log Gn))
         if (GRAD) {
             CUTE_UNROLL
@@ -1357,39 +1378,6 @@ __global__ void __launch_bounds__(OM_THREADS, 1) lr_om_bw_kernel(
         constexpr int TA = ABYTES / 16, CA = (TA + NP - 1) / NP;
         constexpr int TB = UBYTES / 16, CB = (TB + NP - 1) / NP;
         constexpr int NC4 = 4 * KT * (S / 4), CC = (NC4 + NP - 1) / NP;
-        // the epilogue's pieces, one prefetched into L2 a k-step: tile row `ptid`'s values (its S samples one 16-byte
-        // piece: the child's -- or the product's two children's --), and of B and dB the tile's (sample, rank) rows
-        // over its children (a 512-byte run each, the children contiguous from tile row 0's), two lines a producer
-        static_assert(NP == BM, "a producer a tile row's prefetches");
-        long pe;
-        int pj;
-        child_of(ptid, pe, pj);
-        const float* pf[2] = {vals, vals};
-        int npf = 0;
-        if (pj >= 0) {
-            if (FUSED) {
-                const int* chp = table + (pe - first) * 2;
-                pf[0] = vals + (long)chp[0] * B + b0; pf[1] = vals + (long)chp[1] * B + b0;
-            } else {
-                pf[0] = vals + pe * B + b0; pf[1] = pf[0];
-            }
-            npf = 2;
-        }
-        static_assert(NP == 2 * S * K, "a producer two lines of a (sample, rank) row of B (and dB)");
-        long pe0;
-        int pj0;
-        child_of(0, pe0, pj0);
-        const int prow = ptid / 2, psl = prow / K, pr = prow % K;
-        const long poff = (long)pr * N + (pj0 >= 0 ? pj0 : 0) + (ptid % 2) * (BM / 2);
-        const float* pfb = fb + (long)(b0 + psl) * fb_sb + poff;
-        const float* pdb = GRAD ? grad_b + (long)(b0 + psl) * gb_sb + poff : pfb;
-        const int nbd = pj0 >= 0 ? 2 + (GRAD && !STORE ? 2 : 0) : 0;   // (B's two lines, dB's two: read unless STORE)
-        npf = 2 + nbd;                                   // (2: the values -- 0 past a row of no child, then skipped)
-        const bool pval = pj >= 0;
-        auto prefetch = [&](int q) {                     // (q < npf)
-            const float* a = q < 2 ? (pval ? pf[q] : nullptr) : q < 4 ? pfb + (q - 2) * 32 : pdb + (q - 4) * 32;
-            if (a != nullptr) asm volatile("prefetch.global.L2::evict_last [%0];" ::"l"(a));
-        };
         // A: a chunk is 8 parents of child row m -- its block's slab of (block, parent block), the row in it
         uint32_t oA[CA];
         int cA[CA], mA[CA], kA[CA];
@@ -1517,16 +1505,18 @@ __global__ void __launch_bounds__(OM_THREADS, 1) lr_om_bw_kernel(
                     for (int k = 0; k < CC; k++)
                         if (oC[k] != ~0u) cpa16(ss + oC[k], cfirst[k] + i0[u] * B_l);
                     cpa_mbar_arrive(&fullr[s]);
-                    if (t < npf) prefetch(t);
                     if (t + 2 < nk) slabs(pa[u], i0[u]);
                     if (++s == ST) { s = 0; ph ^= 1; }
                 }
             }
         }
-        for (int q = nk; q < npf; q++) prefetch(q);
+        EpiPair ep0, ep1;                                // (pairs NV + ptid and NV + ptid + NP + NV)
+        epi_load(NV + ptid, ep0);
+        epi_load(NV + ptid + NP + NV, ep1);
         asm volatile("cp.async.wait_all;\n" ::: "memory");
         epilogue_wait();
-        epilogue();
+        epi_finish(NV + ptid, ep0);
+        epi_finish(NV + ptid + NP + NV, ep1);
         return;
     }
     if (tid >= NC) {
@@ -1543,6 +1533,40 @@ __global__ void __launch_bounds__(OM_THREADS, 1) lr_om_bw_kernel(
         }
         CUTE_UNROLL
         for (int j = 0; j < CPL; j++) asm volatile("" : "+r"(oB[j]));
+        {
+            // The epilogue's pieces prefetched into L2, all at once before the PDL wait (the converters idle until the
+            // first stage lands; by the producers, the rows' chains held the first stage's copies back): tile row
+            // `vtid`'s values (its S samples one 16-byte piece: the child's -- or the product's two children's --),
+            // and of B and dB the tile's (sample, rank) rows over its children (a 512-byte run each, the children
+            // contiguous from tile row 0's: two lines a converter; dB's read unless STORE)
+            static_assert(NV == BM && NV == 2 * S * K, "a converter a tile row's values and two lines of B (and dB)");
+            auto l2 = [](const float* a) { asm volatile("prefetch.global.L2::evict_last [%0];" ::"l"(a)); };
+            long e;
+            int j;
+            child_of(vtid, e, j);
+            if (j >= 0) {
+                if (FUSED) {
+                    const int* chp = table + (e - first) * 2;
+                    l2(vals + (long)chp[0] * B + b0);
+                    l2(vals + (long)chp[1] * B + b0);
+                } else {
+                    l2(vals + e * B + b0);
+                }
+            }
+            child_of(0, e, j);
+            if (j >= 0) {
+                const int prow = vtid / 2, psl = prow / K, pr = prow % K;
+                const long poff = (long)pr * N + j + (vtid % 2) * (BM / 2);
+                const float* pfb = fb + (long)(b0 + psl) * fb_sb + poff;
+                l2(pfb);
+                l2(pfb + 32);
+                if (GRAD && !STORE) {
+                    const float* pdb = grad_b + (long)(b0 + psl) * gb_sb + poff;
+                    l2(pdb);
+                    l2(pdb + 32);
+                }
+            }
+        }
         cudaGridDependencySynchronize();
         float mrun[NU][SPW];                             // (U's running max; Un's)
         CUTE_UNROLL
@@ -1621,8 +1645,12 @@ __global__ void __launch_bounds__(OM_THREADS, 1) lr_om_bw_kernel(
             if (lane < CPW) smsh[u * BN + w * CPW + lane] = m;   // (Ua's shifts in the factors: none a column)
         }
         asm volatile("bar.arrive 3, %0;" ::"n"(NC + NV) : "memory");
+        EpiPair ep0, ep1;                                // (pairs vtid and vtid + NP + NV)
+        epi_load(vtid, ep0);
+        epi_load(vtid + NP + NV, ep1);
         epilogue_wait();
-        epilogue();
+        epi_finish(vtid, ep0);
+        epi_finish(vtid + NP + NV, ep1);
         return;
     }
     // ---------------- consumers: the k-steps into one fp32 accumulator, then the epilogue ----------------
@@ -1747,8 +1775,7 @@ __global__ void __launch_bounds__(OM_THREADS, 1) lr_om_bw_kernel(
             *(float2*)&gn[m * GS + c] = make_float2(n0, n1);
         }
     }
-    epilogue_wait();
-    epilogue();
+    epilogue_wait();                                     // (the log G tile handed over: the pairs are the others')
 }
 
 // ---------------- merge: a thread per 4 columns of a node ----------------
