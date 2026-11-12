@@ -608,6 +608,34 @@ def _om_slabs(pbase: torch.Tensor, knt: int, block_size: int) -> tuple:
     return (p0, bstr)
 
 
+def _om_v_boxes(jpos: torch.Tensor, cbase) -> bool:
+    """Whether the one-launch forward takes V's rows and the children's values as TMA boxes (`lowrank_stream.cu`'s VTMA):
+    every k-step's 32 children consecutive -- a child each, in order: `jpos` [groups, edges] -- and every run of the
+    products' values whole (`cbase`, the product layer below fused in: no -1). A device sync."""
+    jk = jpos.reshape(jpos.size(0), -1, 32)
+    return jk.numel() > 0 and bool((jk >= 0).all()) and \
+        bool(torch.equal(jk - jk[:, :, :1], torch.arange(32, device = jk.device, dtype = jk.dtype).expand_as(jk))) and \
+        (cbase is None or bool((cbase >= 0).all()))
+
+
+def _om_bw_slabs(ppid: torch.Tensor, cbs: int, pbs: int) -> tuple:
+    """The one-launch backward's parameter tiles: `(p0, cstr, pstr)` where every slab's base is `p0 + child block cstr +
+    parent block pstr`, all whole rows of `pbs` parents and a tile's child blocks' slabs one run where it spans several
+    (one TMA box a k-step: `lowrank_stream.cu`'s `om_bw_tmap`), else `(-1, 0, 0)` (cp.async). A device sync."""
+    nb, npb = ppid.shape
+    if nb == 0 or npb == 0:
+        return (-1, 0, 0)
+    p0 = int(ppid[0, 0])
+    cstr = int(ppid[1, 0]) - p0 if nb > 1 else cbs * pbs
+    pstr = int(ppid[0, 1]) - p0 if npb > 1 else 0
+    want = p0 + torch.arange(nb, device = ppid.device)[:, None] * cstr + \
+        torch.arange(npb, device = ppid.device)[None, :] * pstr
+    if p0 < 0 or p0 % pbs != 0 or cstr % pbs != 0 or pstr % pbs != 0 or (cbs < 128 and cstr != cbs * pbs) or \
+            not bool(torch.equal(ppid, want)):
+        return (-1, 0, 0)
+    return (p0, cstr, pstr)
+
+
 def _stream_plan(desc, layer, twin, info, node_mars, kwargs, stream_children, dev):
     """What the fused stream forward of this layer (one node vector `info`) launches, or None where it does not serve:
     per partition of the twin, the stream kernel's tables -- `nids` (the twin's rows), `ebase` / `pbase` [rows, knt] of
@@ -671,11 +699,12 @@ def _stream_plan(desc, layer, twin, info, node_mars, kwargs, stream_children, de
                 epos = ebase[groups[1].long()][:, :, None] + ar
                 inside = (epos >= e_lo) & (epos < e_hi)
                 jpos = torch.where(inside, jrow[(epos - e_lo).clamp(0, jrow.numel() - 1)], jrow.new_full((), -1))
+                vtma = _om_v_boxes(jpos.reshape(groups[1].numel(), -1), cbase)
                 # the column maxima of the pre-pass, at every split an arm may take: -inf between calls (the GEMM sets
                 # them back)
                 cmax = torch.full((groups[1].numel() * _STREAM_MAX_SPLIT * B,), -float("inf"), device = dev)
                 parts.append(dict(nids = nids.contiguous().to(torch.int64), ebase = ebase, pbase = pbase, knt = knt,
-                                  groups = groups, arms = arms, om = om, cbase = cbase, tuned = dict(),
+                                  groups = groups, arms = arms, om = om, cbase = cbase, tuned = dict(), vtma = vtma,
                                   jpos = jpos.reshape(groups[1].numel(), -1).contiguous(), cmax = cmax))
             if ok:
                 plan = dict(parts = parts, jrow = jrow, e_lo = e_lo)
@@ -733,7 +762,7 @@ def _stream_run(plan, info, tensors, kwargs, z, row0, vnm, kd, node_mars, elemen
                 ua = _ua_buffers(z, node_mars.size(1), K, node_mars.device) if z["in_place"] else (None, None)
                 mod.lowrank_forward_om(kd, vals, cb, p["ebase"], p["jpos"], vt, row0, shift, op, p["nids"],
                                        p["pbase"], p["groups"][0], twin.block_size, p["knt"], p["om"][0], p["om"][1],
-                                       node_mars, lz, a_om, nshift, vn0, ua[0], ua[1])
+                                       node_mars, lz, a_om, nshift, vn0, ua[0], ua[1], p["vtma"])
             else:
                 fb = _inner(kwargs, tensors)[1]
                 mod.lowrank_forward_stream(vnm, vals, cb, p["ebase"], p["jpos"], fb, shift, row0, op, p["nids"],
@@ -801,7 +830,8 @@ def _stream_plan_bk(desc, layer, twin, info, node_mars, stream_children, dev):
                     (bpt == 1 or bool((ppar.view(-1, bpt, ppar.size(1)) == ppar.view(-1, bpt, ppar.size(1))[:, :1]).all()))
                 if not ok:
                     break
-                parts.append(dict(chids = chids, ppar = ppar, ppid = ppid, cbs = cbs, pbs = pbs))
+                parts.append(dict(chids = chids, ppar = ppar, ppid = ppid, cbs = cbs, pbs = pbs,
+                                  atma = _om_bw_slabs(ppid, cbs, pbs)))
             if ok and parts:
                 # (`covers`: every child of the node vector an element row of some partition's tiles -- the launches
                 # write all of dB then, as they do all of dA)
@@ -1112,7 +1142,7 @@ def backward(desc, layer, ns_tensors, ns_grad_tensors, node_flows, element_flows
             smod.lowrank_backward_om(out, vals, table, first, fb, plan["jrow"], plan["e_lo"],
                                      None if grads is None else grads[1], ua, row0, am, node_flows, node_mars, lz,
                                      shift, plan["vn0"], op, part["chids"], part["ppar"], part["ppid"], part["cbs"],
-                                     part["pbs"], grads[0] if da else None, kd if da else None, store)
+                                     part["pbs"], grads[0] if da else None, kd if da else None, *part["atma"], store)
         # (dB's normalizer half taken off by the launches: `grads` given; the parameter flows at the pass's end)
         st["norm"].setdefault(_source(info.ns), []).append((layer, info, (fa, fb), lz, grads, (table, first, kids),
                                                             grads is not None))

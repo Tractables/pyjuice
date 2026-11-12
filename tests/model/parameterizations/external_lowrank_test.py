@@ -3561,7 +3561,7 @@ def test_the_one_launch_grids_order_changes_no_bit(bs, batch, group, da_ctas, fw
         smod.set_om_ctas_most(0)
     # (the hooks took: the last launches' grids -- every layer's the same shape -- the forward's CTAs, the dA CTAs and
     # both kernels' groups as set)
-    fw_n, fw_group, da_n, bw_group = smod.om_last_grids()
+    fw_n, fw_group, da_n, bw_group = smod.om_last_grids()[:4]
     assert fw_group == group and bw_group == group and (fw_n == fw_ctas if fw_ctas else fw_n >= 6), (fw_n, fw_group)
     assert da_n == da_ctas if da_ctas else da_n >= 1, da_n
     assert len(calls) == 2 * len(sums) and all(calls), calls
@@ -3569,6 +3569,99 @@ def test_the_one_launch_grids_order_changes_no_bit(bs, batch, group, da_ctas, fw
         assert not torch.isnan(got[k]).any() and torch.equal(got[k], want[k]), k
     for k in ("dA", "dB"):
         assert all(not torch.isnan(a).any() and torch.equal(a, b) for a, b in zip(got[k], want[k])), k
+
+
+@needs_virtual
+@pytest.mark.parametrize("bs,batch,fw,bw", [(32, 16, True, True), (32, 64, True, True), (64, 16, True, True),
+                                            (128, 32, True, True), (256, 16, None, True)])
+def test_the_one_launch_tma_boxes_change_no_bit(bs, batch, fw, bw, monkeypatch):
+    """The one-launch kernels' TMA boxes (`kernels/c/lowrank_stream.cu`): the forward's V rows and children's values
+    where a k-step's children are consecutive (`virtual._om_v_boxes`; the launcher's where a CTA takes more than one
+    tile), the backward's parameter tiles and Ua rows where the parameter slabs are affine (`virtual._om_bw_slabs`) --
+    the same BITS as the producers' cp.async copies (`set_om_boxes(2)`), every box served (`set_om_boxes(1)`: the
+    readout's last two entries say both kernels took theirs, `fw` / `bw`; blocks of 256: a child block two of the
+    backward's 128-row tiles)."""
+    import pyjuice.parameterizations.lowrank.virtual as lowrank_virtual
+    from pyjuice.layer.kernels import autotune
+
+    pick = autotune.pick
+    monkeypatch.setattr(autotune, "pick", lambda key, cands, bench, **k: "fused"
+                        if key[0] in ("prod_stream_fusion", "prod_stream_fusion_bk") else pick(key, cands, bench, **k))
+    rank = 16
+    pc, sums, _, _, _, _ = _pair(_hmm_blocks(256, bs), "sum_exp", rank = rank)
+    monkeypatch.setattr(pc, "_param_operands_force", True, raising = False)   # (the bf16 copy: the stream path's)
+    monkeypatch.setattr(lowrank_virtual, "GEMM_BF16_WORK", 0)                # (bf16 normalizers, as at real sizes)
+    dev = pc.params.device
+    torch.manual_seed(61)
+    data = torch.randint(0, NUM_CATS, (batch, pc.num_vars), device = dev)
+    ext = {a: _factors(a, rank, batch, dev, seed = 610 + i) for i, a in enumerate(sums)}
+    smod = lowrank_virtual._stream_module()
+    taken = _stream_form(monkeypatch, "om")
+    smod.set_om_boxes(1)
+    try:
+        want = _passes(pc, sums, data, ext)
+        on = list(smod.om_last_grids())
+        smod.set_om_boxes(2)
+        got = _passes(pc, sums, data, ext)
+        off = list(smod.om_last_grids())
+    finally:
+        smod.set_om_boxes(0)
+    assert len(taken) >= len(sums) and all(c == lowrank_virtual._OM_ARM for c, _ in taken)
+    assert (fw is None or on[4] == int(fw)) and on[5] == int(bw) and off[4] == 0 and off[5] == 0, (on, off)
+    for k in ("lls", "mars", "flows", "fp", "fm"):
+        assert not torch.isnan(got[k]).any() and torch.equal(got[k], want[k]), k
+    for k in ("dA", "dB"):
+        assert all(not torch.isnan(a).any() and torch.equal(a, b) for a, b in zip(got[k], want[k])), k
+
+
+@needs_virtual
+def test_the_backward_parameter_boxes_need_affine_slabs():
+    """`virtual._om_bw_slabs`: the one-launch backward's parameter tiles go as TMA boxes only where every slab's base is
+    `p0 + child block cstr + parent block pstr`, all in whole rows of `pbs` parents and -- blocks of fewer than 128
+    children, a tile spanning several -- a tile's child blocks' slabs one run; else `(-1, 0, 0)`: the producers'
+    cp.async."""
+    import pyjuice.parameterizations.lowrank.virtual as lowrank_virtual
+
+    f = lowrank_virtual._om_bw_slabs
+    nb, npb, pbs = 8, 4, 32
+    cb, pb = torch.arange(nb)[:, None], torch.arange(npb)[None, :]
+    for cbs in (32, 128):
+        slab = cbs * pbs
+        run = 1024 + cb * slab + pb * nb * slab                          # (the child blocks' slabs one run a parent block)
+        assert f(run, cbs, pbs) == (1024, slab, nb * slab), cbs
+        bent = run.clone()
+        bent[3, 2] += pbs                                                # (one slab off the lattice)
+        assert f(bent, cbs, pbs) == (-1, 0, 0), cbs
+        assert f(run + 8, cbs, pbs) == (-1, 0, 0), cbs                   # (not whole rows)
+        apart = 1024 + cb * 2 * slab + pb * 2 * nb * slab                # (a slab's room between the blocks')
+        assert f(apart, cbs, pbs) == ((1024, 2 * slab, 2 * nb * slab) if cbs >= 128 else (-1, 0, 0)), cbs
+        assert f(run[:1, :1], cbs, pbs) == (1024, slab, 0), cbs          # (one slab)
+
+
+@needs_virtual
+def test_the_forward_v_boxes_need_consecutive_children():
+    """`virtual._om_v_boxes`: the one-launch forward's V rows and children's values go as TMA boxes only where every
+    k-step's 32 children are consecutive -- a child each, in order -- and every run of the products' values is whole
+    (no -1 in `cbase`); else the producers' gathers."""
+    import pyjuice.parameterizations.lowrank.virtual as lowrank_virtual
+
+    f = lowrank_virtual._om_v_boxes
+    base = torch.arange(2 * 128, dtype = torch.int32).reshape(2, 128)     # (2 groups of 4 k-steps, children in order)
+    assert f(base, None) and f(base + 100, None)
+    apart = base.clone()
+    apart[1, 32:] += 7                                                     # (each k-step's own run, the runs apart)
+    assert f(apart, None)
+    for at, how in (((0, 40), "dup"), ((1, 5), "none"), ((0, 3), "swap")):
+        bad = base.clone()
+        if how == "dup":
+            bad[at] += 1                                                   # (a child twice, one missing)
+        elif how == "none":
+            bad[at] = -1                                                   # (a row of no child)
+        else:
+            bad[0, [3, 4]] = bad[0, [4, 3]]                                # (two children out of order)
+        assert not f(bad, None), how
+    assert f(base, torch.zeros(8, dtype = torch.int32))
+    assert not f(base, torch.tensor([0, 3, -1, 5], dtype = torch.int32))   # (a run of the products' values not whole)
 
 
 @needs_virtual
