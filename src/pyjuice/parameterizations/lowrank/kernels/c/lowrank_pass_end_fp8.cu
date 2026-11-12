@@ -5,8 +5,8 @@
 //
 // The operands are `lowrank_mixture.cu`'s `kept_operands_kernel`'s, from the exponentials the pass keeps (that file's
 // header and the kernel's comment have them):
-//     Ud[i, row'] = Ua[i, row] exp(lf - log S + cm_b + shA + shB)     Vd[j, row'] = Vt[j, row] exp(c_b[j] - cm_b)
-//     Un[i, row]  = Ua[i, row] exp(lf - log Z + shA + shB)            Vt8[j, row] = Vt[j, row]
+//     Ud[i, row'] = Ua[i, row] exp(lf - log S + cm_b + am + shB)      Vd[j, row'] = Vt[j, row] exp(c_b[j] - cm_b)
+//     Un[i, row]  = Ua[i, row] exp(lf - log Z + am + shB)             Vt8[j, row] = Vt[j, row]
 // every entry >= 0. A row's scale is 2^e, e the least with the row's largest entry over 2^e at most 448 (e4m3's
 // largest), so its largest entry lands in (224, 448]; an entry is stored as e4m3(x 2^-e), rounded to nearest even,
 // saturating. A row's largest entry over every copy of the pass takes a pass of its own (`fp8_rowmax_kernel`: the
@@ -37,6 +37,16 @@ int run_grid(long items, long B, long K) { return grid_of(items * ((B * K + RUN 
 
 inline __device__ void run_at(int t0, int K, int& b, int& r) { b = t0 / K; r = t0 - b * K; }
 inline __device__ void run_step(int K, int& b, int& r) { if (++r == K) { r = 0; b++; } }
+// A run's shifts of Ua: each entry's sample's `am` (`amx` the node's, [B])
+inline __device__ void am_run(const float* amx, int t0, int K, float (&ha)[RUN], int n) {
+    int b, r;
+    run_at(t0, K, b, r);
+    #pragma unroll
+    for (int q = 0; q < RUN; q++) {
+        ha[q] = q < n ? amx[b] : 0.0f;
+        run_step(K, b, r);
+    }
+}
 
 inline __device__ void load_run(const float* p, float (&v)[RUN]) {
     const float4 a = reinterpret_cast<const float4*>(p)[0], b = reinterpret_cast<const float4*>(p)[1];
@@ -181,7 +191,7 @@ __device__ __forceinline__ float inv_pow2(float s) { return __int_as_float((254 
 // warp's lanes of one row (consecutive threads: a row's runs) combined, the segment's first lane one atomic max a role
 // into `mx` [Ud M | Un M | Vd N | Vt N] (zeroed before the first launch; entries >= 0: their bits order as unsigned)
 __global__ void fp8_rowmax_kernel(const KeptCopies copies, unsigned* __restrict__ mx, const __nv_bfloat16* __restrict__ ua,
-                                  const float* __restrict__ sha, const __nv_bfloat16* __restrict__ vt,
+                                  const float* __restrict__ am, const __nv_bfloat16* __restrict__ vt,
                                   const float* __restrict__ shb, const float* __restrict__ cm, long rows,
                                   const float* __restrict__ node_flows, const float* __restrict__ node_mars, int M,
                                   int N, int B, int K, bool vec) {
@@ -211,7 +221,7 @@ __global__ void fp8_rowmax_kernel(const KeptCopies copies, unsigned* __restrict_
         } else {
             float uin[RUN], ha[RUN], hb[RUN], d[RUN], v[RUN];
             load_run_n(ua + (long)x * rows + k.row0 + t0, uin, n, vec);
-            load_run_n(sha + k.row0 + t0, ha, n, vec);
+            am_run(am + ((long)(k.row0 / R) * M + x) * B, t0, K, ha, n);
             load_run_n(shb + k.row0 + t0, hb, n, vec);
             node_run(k, uin, ha, hb, d, v, x, t0, n, cmb, node_flows, node_mars, B, K);
             #pragma unroll
@@ -362,12 +372,12 @@ __global__ void __launch_bounds__(ITHREADS) inplace_g_kernel(const ICopies copie
 
 
 // Each operand row's largest entry from the children's (row, copy, sample) maxima `gv` (V's twin's) and, a node's,
-// from its runs of `Ua` (the largest log of Ua exp(shA + shB) over a (node, sample)'s ranks, the exponent apart):
+// from its runs of `Ua` (the largest log of Ua exp(am + shB) over a (node, sample)'s ranks, the exponent apart):
 // a thread a (row, sample) of a launch's copy -- the first N B a child's (Vd, Vt), the M B after them a node's (Ud,
 // Un) --, the operands' expressions with the rank's factors at their largest; a warp's lanes of one row combined, one
 // atomic max a segment (`fp8_rowmax_kernel`'s)
 __global__ void fp8_gmax_kernel(const KeptCopies copies, unsigned* __restrict__ mx, const __nv_bfloat16* __restrict__ ua,
-                                const float* __restrict__ sha, const float* __restrict__ shb, long rows,
+                                const float* __restrict__ am, const float* __restrict__ shb, long rows,
                                 const float* __restrict__ gv, long gcols, const float* __restrict__ cm,
                                 const float* __restrict__ node_flows, const float* __restrict__ node_mars, int M, int N,
                                 int B, int K, bool vec) {
@@ -392,22 +402,23 @@ __global__ void fp8_gmax_kernel(const KeptCopies copies, unsigned* __restrict__ 
             }
             if (k.un) m2 = vmax;
         } else {
-            // (the (node, sample)'s largest log of Ua exp(shA + shB) over its K ranks, a run of Ua)
+            // (the (node, sample)'s largest log of Ua exp(am + shB) over its K ranks, a run of Ua)
             const long r0 = k.row0 + (long)b * K;
             const __nv_bfloat16* up = ua + (long)x * rows + r0;
+            const float a = am[((long)(k.row0 / ((long)B * K)) * M + x) * B + b];
             float lg = -INFINITY;
             if (vec) {                                   // (K a multiple of RUN, the runs aligned: 16-byte loads)
                 for (int r = 0; r < K; r += RUN) {
-                    float y[RUN], ha[RUN], hb[RUN];
-                    load_run(up + r, y); load_run(sha + r0 + r, ha); load_run(shb + r0 + r, hb);
+                    float y[RUN], hb[RUN];
+                    load_run(up + r, y); load_run(shb + r0 + r, hb);
                     #pragma unroll
                     for (int q = 0; q < RUN; q++)
-                        if (y[q] > 0.0f) lg = fmaxf(lg, __logf(y[q]) + ha[q] + hb[q]);
+                        if (y[q] > 0.0f) lg = fmaxf(lg, __logf(y[q]) + a + hb[q]);
                 }
             } else {
                 for (int r = 0; r < K; r++) {
                     const float y = __bfloat162float(up[r]);
-                    if (y > 0.0f) lg = fmaxf(lg, __logf(y) + sha[r0 + r] + shb[r0 + r]);
+                    if (y > 0.0f) lg = fmaxf(lg, __logf(y) + a + shb[r0 + r]);
                 }
             }
             if (lg > -INFINITY) {
@@ -454,7 +465,7 @@ inline __device__ void store_run8(uint8_t* p, const float (&v)[RUN], float inv, 
 __global__ void fp8_operands_kernel(const KeptCopies copies, uint8_t* __restrict__ Ud, uint8_t* __restrict__ Vd,
                                     uint8_t* __restrict__ Un, uint8_t* __restrict__ Vt8,
                                     const float* __restrict__ scales, const __nv_bfloat16* __restrict__ ua,
-                                    const float* __restrict__ sha, const __nv_bfloat16* __restrict__ vt,
+                                    const float* __restrict__ am, const __nv_bfloat16* __restrict__ vt,
                                     const float* __restrict__ shb, const float* __restrict__ cm, long rows, long drows,
                                     const float* __restrict__ node_flows, const float* __restrict__ node_mars, int M,
                                     int N, int B, int K, bool vec) {
@@ -478,7 +489,7 @@ __global__ void fp8_operands_kernel(const KeptCopies copies, uint8_t* __restrict
     } else {
         float uin[RUN], ha[RUN], hb[RUN], d[RUN], v[RUN];
         load_run_n(ua + (long)x * rows + k.row0 + t0, uin, n, vec);
-        load_run_n(sha + k.row0 + t0, ha, n, vec);
+        am_run(am + ((long)(k.row0 / R) * M + x) * B, t0, K, ha, n);
         load_run_n(shb + k.row0 + t0, hb, n, vec);
         node_run(k, uin, ha, hb, d, v, x, t0, n, cmb, node_flows, node_mars, B, K);
         if (k.dh) store_run8(Ud + (long)x * drows + k.drow0 + t0, d, inv_pow2(scales[x]), n, vec);
@@ -506,7 +517,7 @@ bool whole_runs(const torch::Tensor& op, long B, long K, int align) {
 // over every copy (then the scales), the operands.
 void lowrank_kept_operands_fp8(c10::optional<torch::Tensor> Ud, c10::optional<torch::Tensor> Vd,
                                c10::optional<torch::Tensor> Un, c10::optional<torch::Tensor> Vt8, torch::Tensor scales,
-                               torch::Tensor ua, torch::Tensor sha, torch::Tensor vt, torch::Tensor shb,
+                               torch::Tensor ua, torch::Tensor am, torch::Tensor vt, torch::Tensor shb,
                                torch::Tensor node_flows, torch::Tensor node_mars, std::vector<torch::Tensor> lz,
                                std::vector<int64_t> nid0, std::vector<c10::optional<torch::Tensor>> eid,
                                std::vector<c10::optional<torch::Tensor>> table, std::vector<int64_t> first,
@@ -522,7 +533,8 @@ void lowrank_kept_operands_fp8(c10::optional<torch::Tensor> Ud, c10::optional<to
                 vt.dim() == 2 && vt.size(1) == ua.size(1), "lowrank fp8: Ua [M, rows], Vt [N, rows] bf16");
     const int B = node_flows.size(1), N = vt.size(0);
     const long rows = ua.size(1), drows = Ud.has_value() ? Ud->size(1) : 0;
-    check(sha, "sha", torch::kFloat32, rows); check(shb, "shb", torch::kFloat32, rows);
+    TORCH_CHECK(rows % K == 0, "lowrank fp8: Ua's rows (copy, sample, rank)");
+    check(am, "am", torch::kFloat32, rows / K * M); check(shb, "shb", torch::kFloat32, rows);
     check(scales, "scales", torch::kFloat32, 2 * M + 2 * (long)N);
     auto f8 = [&](c10::optional<torch::Tensor>& t, long r, long c, const char* name) {
         if (t.has_value())
@@ -537,7 +549,6 @@ void lowrank_kept_operands_fp8(c10::optional<torch::Tensor> Ud, c10::optional<to
     auto stream = at::cuda::getCurrentCUDAStream();
     bool vec = whole_runs(ua, B, K, 16) && whole_runs(vt, B, K, 16) && (!Un.has_value() || (whole_runs(*Un, B, K, 8) &&
                whole_runs(*Vt8, B, K, 8))) && (!Ud.has_value() || (whole_runs(*Ud, B, K, 8) && whole_runs(*Vd, B, K, 8))) &&
-               (reinterpret_cast<uintptr_t>(sha.data_ptr()) & 15) == 0 &&
                (reinterpret_cast<uintptr_t>(shb.data_ptr()) & 15) == 0;
     for (size_t c = 0; c < P; c++) vec = vec && row0[c] % RUN == 0 && (drow0[c] < 0 || drow0[c] % RUN == 0);
     torch::Tensor cm = torch::empty({(long)P * B}, node_flows.options());
@@ -593,14 +604,14 @@ void lowrank_kept_operands_fp8(c10::optional<torch::Tensor> Ud, c10::optional<to
     }
     for (size_t l = 0; from_g && l < launches.size(); l++) {
         fp8_gmax_kernel<<<dim3(grid_of((long)(N + M) * B), 1, counts[l]), THREADS, 0, stream>>>(
-            launches[l], mxp, uap, sha.data_ptr<float>(), shb.data_ptr<float>(), rows, gv->data_ptr<float>(), rows / K,
+            launches[l], mxp, uap, am.data_ptr<float>(), shb.data_ptr<float>(), rows, gv->data_ptr<float>(), rows / K,
             cm.data_ptr<float>() + (long)l * COPIES_PER_LAUNCH * B, node_flows.data_ptr<float>(),
             node_mars.data_ptr<float>(), (int)M, N, B, (int)K, vec && K % RUN == 0);
         C10_CUDA_KERNEL_LAUNCH_CHECK();
     }
     for (size_t l = 0; !from_g && l < launches.size(); l++) {
         fp8_rowmax_kernel<<<dim3(run_grid(N + M, B, K), 1, counts[l]), THREADS, 0, stream>>>(
-            launches[l], mxp, uap, sha.data_ptr<float>(), vtp, shb.data_ptr<float>(),
+            launches[l], mxp, uap, am.data_ptr<float>(), vtp, shb.data_ptr<float>(),
             cm.data_ptr<float>() + (long)l * COPIES_PER_LAUNCH * B, rows, node_flows.data_ptr<float>(),
             node_mars.data_ptr<float>(), (int)M, N, B, (int)K, vec);
         C10_CUDA_KERNEL_LAUNCH_CHECK();
@@ -610,7 +621,7 @@ void lowrank_kept_operands_fp8(c10::optional<torch::Tensor> Ud, c10::optional<to
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     for (size_t l = 0; l < launches.size(); l++) {
         fp8_operands_kernel<<<dim3(run_grid(N + M, B, K), 1, counts[l]), THREADS, 0, stream>>>(
-            launches[l], u8(Ud), u8(Vd), u8(Un), u8(Vt8), scales.data_ptr<float>(), uap, sha.data_ptr<float>(), vtp,
+            launches[l], u8(Ud), u8(Vd), u8(Un), u8(Vt8), scales.data_ptr<float>(), uap, am.data_ptr<float>(), vtp,
             shb.data_ptr<float>(), cm.data_ptr<float>() + (long)l * COPIES_PER_LAUNCH * B, rows, drows,
             node_flows.data_ptr<float>(), node_mars.data_ptr<float>(), (int)M, N, B, (int)K, vec);
         C10_CUDA_KERNEL_LAUNCH_CHECK();

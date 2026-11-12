@@ -2517,12 +2517,52 @@ def test_the_data_operands_follow_their_formulas(M, N, K, B, copies):
 
 
 @needs_virtual
+@pytest.mark.parametrize("in_place", [True, False], ids = ["in_place", "batch_innermost"])
+@pytest.mark.parametrize("M, K, B, copies", [(5, 16, 7, 3), (40, 8, 33, 2), (3, 32, 4, 70), (6, 4, 9, 2), (7, 3, 5, 2)])
+def test_the_a_operand_is_exp_a_under_each_node_and_samples_largest(M, K, B, copies, in_place):
+    """`lowrank_a_operand` (A batch innermost, [M, K, B]) and `lowrank_a_operand_in_place` (A as the caller gives it,
+    [B, M, K], a wider batch stride), bf16 and fp32: `am[c, i, b]` each (node, sample)'s largest A over its K ranks,
+    `Ua[i, (c, b, r)] = exp(A[c][b, i, r] - am[c, i, b])` -- ranks 8, 16, 32 held in registers, 3 and 4 not; copies past
+    one launch's --; a (node, sample) of no rank with mass (every A -inf): am -inf, its row of Ua 0, no NaN."""
+    import pyjuice.parameterizations.lowrank.virtual as lowrank_virtual
+
+    mod, dev = lowrank_virtual._module(), torch.device("cuda")
+    if in_place and not mod.lowrank_in_place_rank(K):
+        pytest.skip("the operands in place serve ranks 4, 8, 16, 32")
+    g = torch.Generator(device = "cpu").manual_seed(29)
+    fa = [(torch.randn(B, M, K, generator = g) * 3).to(dev) for _ in range(copies)]   # A[b, i, r]
+    fa[0][1, M - 1, :] = -float("inf")                                  # (copy 0, its last node, sample 1: no mass)
+    fa[-1][0, 0, 0] = -float("inf")                                     # (one rank of no mass)
+    if in_place:   # (a wider batch stride: slices of a bigger tensor)
+        given = [torch.cat([a, torch.zeros_like(a)], dim = 1)[:, :M] for a in fa]
+    else:
+        given = [a.permute(1, 2, 0).contiguous() for a in fa]          # [M, K, B]
+    for dtype in (torch.bfloat16, torch.float32):
+        Ua = torch.full((M, copies * B * K), float("nan"), dtype = dtype, device = dev)
+        am = torch.full((copies, M, B), float("nan"), device = dev)
+        (mod.lowrank_a_operand_in_place if in_place else mod.lowrank_a_operand)(Ua, am, given, B, K)
+        torch.cuda.synchronize()
+        for c, a in enumerate(fa):
+            want_am = a.max(dim = 2).values.t()                         # [M, B]
+            assert torch.equal(am[c], want_am), c
+            want = torch.where(want_am.t()[:, :, None] > -float("inf"), torch.exp(a - want_am.t()[:, :, None]),
+                               torch.zeros_like(a)).nan_to_num(0.0)     # [B, M, K]
+            got = Ua[:, c * B * K:(c + 1) * B * K].float().view(M, B, K).permute(1, 0, 2)
+            assert not torch.isnan(got).any(), c
+            tol = 4e-3 if dtype is torch.bfloat16 else 1e-6
+            assert torch.allclose(got, want, rtol = tol, atol = 1e-30), (c, float((got - want).abs().max()))
+        assert bool((Ua[:, 0 * B * K + 1 * K:0 * B * K + 2 * K][M - 1] == 0).all())   # (copy 0's (last node, sample 1))
+        assert am[0, M - 1, 1] == -float("inf")
+
+
+@needs_virtual
 @pytest.mark.parametrize("M, N, K, B, copies", [(3, 300, 2, 37, 2),     # children past one warp's share, ragged runs
                                                 (6, 40, 16, 4, 3),      # whole 16-byte runs
                                                 (5, 3, 3, 4, 70)])      # few children, copies past one launch's
 def test_the_kept_operands_follow_their_formulas(M, N, K, B, copies):
-    """`lowrank_kept_operands`, the pass's end from the exponentials the pass keeps -- `Ua = exp(A - shA)`
-    (`lowrank_a_operand`) and `Vt = exp(B - shB)` (`lowrank_z_operand`), bf16 --, checked directly: on every row (copy,
+    """`lowrank_kept_operands`, the pass's end from the exponentials the pass keeps -- `Ua = exp(A - am)`
+    (`lowrank_a_operand`, am each (node, sample)'s largest A) and `Vt = exp(B - shB)` (`lowrank_z_operand`), bf16 --,
+    checked directly: on every row (copy,
     b, r), `Ud[i] Vd[j] = f_b[i] exp(A[i, r, b] + B[r, j, b]) c_b[j] / S_b[i]` for the copies with a data half (their rows
     of Ud / Vd in their own order), `Un[i] Vt[j] = f_b[i] exp(A[i, r, b] + B[r, j, b]) / Z_b[i]` for those whose U is
     asked for, `c_b[j]` the product's two children's node values, `log S = node_mars + log Z`; Vd <= 1. A child no edge
@@ -2553,10 +2593,10 @@ def test_the_kept_operands_follow_their_formulas(M, N, K, B, copies):
 
     total = copies * B * K
     Ua = torch.empty(M, total, dtype = torch.bfloat16, device = dev)
-    sha = torch.empty(total, device = dev)
+    am = torch.empty(copies, M, B, device = dev)
     Vt = torch.empty(N, total, dtype = torch.bfloat16, device = dev)
     shb = torch.empty(total, device = dev)
-    mod.lowrank_a_operand(Ua, sha, fa, B, K)
+    mod.lowrank_a_operand(Ua, am, fa, B, K)
     mod.lowrank_z_operand(Vt, shb, fb, B, K)
     data = [c for c in range(copies) if c != 1]                        # (copy 1: no data half)
     want_un = [c for c in range(copies) if c != 0]                     # (copy 0: no U asked for)
@@ -2564,7 +2604,7 @@ def test_the_kept_operands_follow_their_formulas(M, N, K, B, copies):
     Ud = torch.full((M, len(data) * B * K), float("nan"), dtype = torch.bfloat16, device = dev)
     Vd = torch.full((N, len(data) * B * K), float("nan"), dtype = torch.bfloat16, device = dev)
     Un = torch.full((M, total), float("nan"), dtype = torch.bfloat16, device = dev)
-    mod.lowrank_kept_operands(Ud, Vd, Un, Ua, sha, Vt, shb, node_flows, node_mars, lz, nid0,
+    mod.lowrank_kept_operands(Ud, Vd, Un, Ua, am, Vt, shb, node_flows, node_mars, lz, nid0,
                               [eids[c] if c in data else None for c in range(copies)],
                               [table if c in data else None for c in range(copies)], [first] * copies,
                               [c * B * K for c in range(copies)], drow0, [int(c in want_un) for c in range(copies)], M, K,
@@ -2573,7 +2613,7 @@ def test_the_kept_operands_follow_their_formulas(M, N, K, B, copies):
     assert torch.isfinite(Ud.float()).all() and torch.isfinite(Vd.float()).all()
     # (the children's values kept instead of the table -- a copy whose product layer was not fused in: the same bits)
     Udk, Vdk, Unk = torch.full_like(Ud, float("nan")), torch.full_like(Vd, float("nan")), torch.full_like(Un, float("nan"))
-    mod.lowrank_kept_operands(Udk, Vdk, Unk, Ua, sha, Vt, shb, node_flows, node_mars, lz, nid0,
+    mod.lowrank_kept_operands(Udk, Vdk, Unk, Ua, am, Vt, shb, node_flows, node_mars, lz, nid0,
                               [eids[c] if c in data else None for c in range(copies)], [None] * copies, [0] * copies,
                               [c * B * K for c in range(copies)], drow0, [int(c in want_un) for c in range(copies)], M, K,
                               [_kept_children(node_mars, table, first, eids[c]) if c in data else None
@@ -2659,17 +2699,17 @@ def test_the_fp8_operands_are_the_kept_ones_in_e4m3(M, N, K, B, copies, from_g):
 
     total = copies * B * K
     Ua = torch.empty(M, total, dtype = torch.bfloat16, device = dev)
-    sha = torch.empty(total, device = dev)
+    am = torch.empty(copies, M, B, device = dev)
     Vt = torch.empty(N, total, dtype = torch.bfloat16, device = dev)
     shb = torch.empty(total, device = dev)
-    mod.lowrank_a_operand(Ua, sha, fa, B, K)
+    mod.lowrank_a_operand(Ua, am, fa, B, K)
     mod.lowrank_z_operand(Vt, shb, fb, B, K)
     data = [c for c in range(copies) if c != 1]                        # (copy 1: no data half)
     want_un = [c for c in range(copies) if c != 0]                     # (copy 0: no U asked for)
     drow0 = [data.index(c) * B * K if c in data else -1 for c in range(copies)]
 
     def args(cv):
-        return (Ua, sha, Vt, shb, node_flows, node_mars, lz, nid0,
+        return (Ua, am, Vt, shb, node_flows, node_mars, lz, nid0,
                 [eids[c] if c in data else None for c in range(copies)],
                 [table if c in data and cv is None else None for c in range(copies)], [first] * copies,
                 [c * B * K for c in range(copies)], drow0, [int(c in want_un) for c in range(copies)], M, K,
@@ -3401,7 +3441,8 @@ def test_the_one_launch_passes_where_a_stages_values_lie_deep_and_apart(batch, m
     of the child blocks' (a node's other children ~60 nats down: half the parents' values ~60 below the others'). A
     stage's maxima, as the converters take them (an integer redux of the floats' order-preserving keys), must be the
     largest (a shift of 0 loses every term); the normalizer half's running max rises where the data half's does not
-    (a stage's flags take either). Against the plain path and the torch passes on the same circuit."""
+    (a stage's flags take either). Against the plain path and the torch passes on the same circuit; the A operand the
+    forward's collapse's (no launch of its own)."""
     import pyjuice.parameterizations.lowrank.virtual as lowrank_virtual
     from pyjuice.layer.kernels import autotune
 
@@ -3448,9 +3489,20 @@ def test_the_one_launch_passes_where_a_stages_values_lie_deep_and_apart(batch, m
     monkeypatch.setattr(lowrank_virtual, "FUSED_STREAM", True)
     monkeypatch.setattr(lowrank_virtual, "FUSED_STREAM_BK", True)
     taken = _stream_form(monkeypatch, "om")
+    # (every copy's forward the one-launch form, the factors read in place: the A operand its collapse's -- the
+    # backward and the pass's end launch none of their own)
+    mod, ops = lowrank_virtual._module(), []
+    real_a = mod.lowrank_a_operand_in_place
+
+    def counted_a(*args):
+        ops.append(1)
+        return real_a(*args)
+
+    monkeypatch.setattr(mod, "lowrank_a_operand_in_place", counted_a)
     got = _passes(pc, sums, data, ext)
     assert len(taken) >= len(sums) and all(c == lowrank_virtual._OM_ARM for c, _ in taken)
     assert len(calls) == len(sums), calls
+    assert not ops, ops
     assert torch.isneginf(plain["mars"]).any() and torch.isfinite(plain["lls"]).all()   # (impossible nodes, possible data)
     assert float(plain["lls"].max()) < -88.0, plain["lls"]                    # (every value past a shift of 0's range)
     for k in ("lls", "mars", "flows", "fp", "fm", "dA", "dB"):

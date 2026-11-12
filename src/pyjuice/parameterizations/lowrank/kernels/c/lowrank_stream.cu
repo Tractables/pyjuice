@@ -443,7 +443,10 @@ __global__ void __launch_bounds__((WM * WN + PW) * 32) lr_gemm_kernel(
 // over a stage's rows and, where it rose, the factor exp(m_old - m_new) the consumers rescale their sums by before
 // the stage (exactly 1 where it did not: the sums untouched) -- so no pass over the values comes first, and the
 // collapse takes `log(sum) + m_b + shift` (the sample's final max; shift V's row's). A row of no child (`jpos` -1)
-// copies -inf for its value (its V row: zeros).
+// copies -inf for its value (its V row: zeros). `uaw` given: the collapse writes the one-launch backward's operand
+// besides, from the A it reads anyway -- `Ua = exp(A - am)` [M, urows] (this copy's rows from row0, as V's) and `am`
+// (`amw`: this copy's [M, B]) each (node, sample)'s largest A over its ranks (`lowrank_mixture.cu`'s
+// `a_operand_kernel`, its operations): the pass then makes it in no launch of its own.
 //
 // PERSISTENT, THE RING CONTINUOUS, THE COLLAPSE IN THE CONSUMERS' REGISTERS: a CTA an SM takes the tiles blockIdx.x,
 // + gridDim.x, ... (in `tile_of`'s order); its ring runs on across its tiles (the CTA's k-step g in stage g % ST), so
@@ -481,7 +484,8 @@ __global__ void __launch_bounds__(OM_THREADS, 1) lr_om_kernel(
         const int* __restrict__ cbase, const int* __restrict__ jpos, const int* __restrict__ ugrp, int knt, int mtiles,
         int block_size, int B, float* __restrict__ vnm, const long* __restrict__ nids, int num_edges,
         const __grid_constant__ CUtensorMap tmapA, const float* __restrict__ fa, long a_sb, float* node_mars,
-        float* __restrict__ lz, long nshift, long vn0, int ntiles, int nbg) {
+        float* __restrict__ lz, long nshift, long vn0, int ntiles, int nbg, bfloat16_t* __restrict__ uaw, long urows,
+        float* __restrict__ amw) {
     constexpr int BM = OM_BM, BN = OM_BN, K = OM_K, WM = 4, WN = 2;
     constexpr int KT = 32, NC = WM * WN * 32, NP = 128, NV = 128;
     static_assert(NC + NP + NV == OM_THREADS, "the warp roles");
@@ -968,6 +972,22 @@ __global__ void __launch_bounds__(OM_THREADS, 1) lr_om_kernel(
                 tCrZ(2 * e1 + 1) = A1[sg][ro].y + (tCrZ(2 * e1 + 1) + H1[sg].y);
                 ms[sg][ro] = fmaxf(fmaxf(tCrL(2 * e0), tCrL(2 * e0 + 1)), fmaxf(tCrL(2 * e1), tCrL(2 * e1 + 1)));
                 mz[sg][ro] = fmaxf(fmaxf(tCrZ(2 * e0), tCrZ(2 * e0 + 1)), fmaxf(tCrZ(2 * e1), tCrZ(2 * e1 + 1)));
+                if (uaw != nullptr) {                    // (the A operand: `lowrank_mixture.cu`'s `a_operand_kernel`'s)
+                    const float2 p = A0[sg][ro], q = A1[sg][ro];
+                    float a = fmaxf(fmaxf(p.x, p.y), fmaxf(q.x, q.y));
+                    a = fmaxf(a, __shfl_xor_sync(FULLW, a, 1));
+                    a = fmaxf(a, __shfl_xor_sync(FULLW, a, 2));
+                    const bool on = a > -INFINITY;
+                    const __nv_bfloat162 u0 = __floats2bfloat162_rn(on && p.x > -INFINITY ? expf(p.x - a) : 0.0f,
+                                                                    on && p.y > -INFINITY ? expf(p.y - a) : 0.0f);
+                    const __nv_bfloat162 u1 = __floats2bfloat162_rn(on && q.x > -INFINITY ? expf(q.x - a) : 0.0f,
+                                                                    on && q.y > -INFINITY ? expf(q.y - a) : 0.0f);
+                    const int b = T.b0 + c0[sg] / K;
+                    bfloat16_t* u = uaw + (long)irow[ro] * urows + row0 + (long)b * K + c0[sg] % K;
+                    *reinterpret_cast<__nv_bfloat162*>(u) = u0;
+                    *reinterpret_cast<__nv_bfloat162*>(u + 8) = u1;
+                    if (head) amw[(long)irow[ro] * B + b] = a;
+                }
             }
         };
         float ss[NR], sz[NR];
@@ -1046,9 +1066,10 @@ __global__ void __launch_bounds__(OM_THREADS, 1) lr_om_kernel(
 // path writes `vnf = log U` and the virtual child values (`lowrank_backward_pre`), runs the stream backward on them
 // (pre-pass, GEMM, merge: `vef = vem + log G`) and collapses (`lowrank_collapse_bw`). `lr_om_bw_kernel` does it in one
 // launch, as `lr_om_kernel` does the forward: producers copy a k-step's parameter tile (theta^T: a child's 32 parents
-// contiguous in its slab), the rows of the pass's `exp(A - shift)` (`lowrank_a_operand`: Ua [M, rows], the rows (copy,
-// sample, rank)) of its 32 parents and their flows, values and log normalizers; converters scale Ua in place by
-// `exp(lf - log S - m_b)`, m_b each sample's running max over the parents so far (the consumers rescale their sums
+// contiguous in its slab), the rows of the pass's `exp(A - am)` (`lowrank_a_operand`: Ua [M, rows], the rows (copy,
+// sample, rank); `am` each (node, sample)'s largest A over its ranks) of its 32 parents and their flows, values, log
+// normalizers and shifts `am`; converters scale Ua in place by `exp(lf - log S + am - m_b)`, m_b each sample's running
+// max over the parents so far (the consumers rescale their sums
 // where it rose); the epilogue forms `log G = log(sum) + m_b + shift` and from it, a (child, sample) a thread, the
 // element flow `lse_r (c_b[j] + B_b[r, j] + log G)` -- written as the product's two children's node flows where the
 // product layer below is fused in (FUSED) -- and dB's data half, `exp(c + B + log G)` (GRAD). A parent of no flow or
@@ -1056,7 +1077,7 @@ __global__ void __launch_bounds__(OM_THREADS, 1) lr_om_kernel(
 // GRAD: and dB's NORMALIZER half in the same launch, `- exp(B_b[r, j] + log Gn)`, `Gn[j, v] = sum_i theta[i, j]
 // exp(lf_b[i] - log Z_b[i] + A_b[i, r])` (what the pass's end would form as `theta^T U` and take off with
 // `lowrank_normalizer_grads`): the same parameter fragments, a second accumulator -- the converters write `Un = Ua
-// exp(lf - log Z - n_b)` beside U, n_b its own running max (a parent of no flow or a log Z of -inf: 0). Scope (`om_bw_serves` and the plan): rank OM_K, B % (OM_BN / OM_K), the tile's
+// exp(lf - log Z + am - n_b)` beside U, n_b its own running max (a parent of no flow or a log Z of -inf: 0). Scope (`om_bw_serves` and the plan): rank OM_K, B % (OM_BN / OM_K), the tile's
 // children of one group of child blocks (equal parents), every parent a real node of the layer's node vector (no
 // dummy), parents' blocks a multiple of 32.
 // GRAD: and dA, by the grid's FIRST `n_da` CTAs: a node vector's (node, sample) pairs in tiles strided over them,
@@ -1084,7 +1105,7 @@ __device__ __forceinline__ void load_run4f(const float* __restrict__ p, float (&
 template <int ST, bool FUSED, bool GRAD, bool STORE>
 __global__ void __launch_bounds__(OM_THREADS, 1) lr_om_bw_kernel(
         const bfloat16_t* __restrict__ params, const long* __restrict__ ppid, const long* __restrict__ ppar,
-        const bfloat16_t* __restrict__ ua, long urows, long row0, const float* sha, const float* nflow,
+        const bfloat16_t* __restrict__ ua, long urows, long row0, const float* am, const float* nflow,
         const float* nmar, const float* lz, long nshift, long vn0, const long* __restrict__ chids, int npb, int cbs,
         int pbs, int mtiles, int B, const float* vals, const int* __restrict__ table, long first,
         const float* __restrict__ fb, long fb_sb, const int* __restrict__ jrow, long e_lo, int N, float* flows,
@@ -1177,7 +1198,7 @@ __global__ void __launch_bounds__(OM_THREADS, 1) lr_om_bw_kernel(
     constexpr int S = BN / K;                            // the tile's samples
     static_assert(S % 4 == 0, "a row's values of the tile's samples in 16-byte runs");
     constexpr int NU = GRAD ? 2 : 1;                     // (U; and Un, GRAD)
-    constexpr int ABYTES = KT * BM * 2, UBYTES = KT * BN * 2, CBYTES = 3 * KT * S * 4;   // (flows, values, log Z)
+    constexpr int ABYTES = KT * BM * 2, UBYTES = KT * BN * 2, CBYTES = 4 * KT * S * 4;   // (flows, values, log Z, am)
     constexpr int STAGE = (ABYTES + NU * UBYTES + CBYTES + 1023) / 1024 * 1024;
     constexpr int GS = BN + 4;                           // the epilogue's log G (log Gn) tile, a row's stride (padded)
     static_assert(NU * BM * GS * 4 <= ST * STAGE, "the log G tiles in the stages");
@@ -1276,7 +1297,7 @@ __global__ void __launch_bounds__(OM_THREADS, 1) lr_om_bw_kernel(
         const int ptid = tid - NC - NV;
         constexpr int TA = ABYTES / 16, CA = (TA + NP - 1) / NP;
         constexpr int TB = UBYTES / 16, CB = (TB + NP - 1) / NP;
-        constexpr int NC4 = 3 * KT * (S / 4), CC = (NC4 + NP - 1) / NP;
+        constexpr int NC4 = 4 * KT * (S / 4), CC = (NC4 + NP - 1) / NP;
         // the epilogue's pieces, one prefetched into L2 a k-step: tile row `ptid`'s values (its S samples one 16-byte
         // piece: the child's -- or the product's two children's --), and of B and dB the tile's (sample, rank) rows
         // over its children (a 512-byte run each, the children contiguous from tile row 0's), two lines a producer
@@ -1367,7 +1388,8 @@ __global__ void __launch_bounds__(OM_THREADS, 1) lr_om_bw_kernel(
         CUTE_UNROLL
         for (int k = 0; k < CC; k++) {
             const int e = ce[k] & 0xff, so = ce[k] >> 8;
-            cfirst[k] = (cx[k] == 2 ? lz : (cx[k] ? nmar : nflow) + (vn0 + nshift) * B) + (long)e * B + b0 + so;
+            cfirst[k] = (cx[k] == 3 ? am : cx[k] == 2 ? lz : (cx[k] ? nmar : nflow) + (vn0 + nshift) * B) + (long)e * B +
+                        b0 + so;
         }
         long urows_l = urows, B_l = B;
         asm volatile("" : "+l"(urows_l), "+l"(B_l));
@@ -1425,7 +1447,7 @@ __global__ void __launch_bounds__(OM_THREADS, 1) lr_om_bw_kernel(
         return;
     }
     if (tid >= NC) {
-        // ---------------- converters: U = Ua exp(lf - log S - m), in place, m each sample's running max ----------------
+        // ---------------- converters: U = Ua exp(lf - log S + am - m), in place, m each sample's running max ----------------
         constexpr unsigned FULLM = 0xffffffffu;
         constexpr int CPW = BN / 4, SPW = CPW / K, CPL = CPW / 8;
         static_assert(SPW >= 1 && CPW % K == 0 && NV == 128, "a converter warp's columns: whole samples");
@@ -1439,7 +1461,6 @@ __global__ void __launch_bounds__(OM_THREADS, 1) lr_om_bw_kernel(
         CUTE_UNROLL
         for (int j = 0; j < CPL; j++) asm volatile("" : "+r"(oB[j]));
         cudaGridDependencySynchronize();
-        const float shv = lane < CPW ? sha[row0 + col0 + w * CPW + lane] : 0.f;
         float mrun[NU][SPW];                             // (U's running max; Un's)
         CUTE_UNROLL
         for (int u = 0; u < NU; u++)
@@ -1456,8 +1477,11 @@ __global__ void __launch_bounds__(OM_THREADS, 1) lr_om_bw_kernel(
             for (int i = 0; i < SPW; i++) {
                 const int sl = w * SPW + i;
                 const float lf = cs[lane * S + sl], z = cs[(2 * KT + lane) * S + sl], ls = cs[(KT + lane) * S + sl] + z;
-                cv[0][i] = mx[0][i] = (lf > -INFINITY && ls > -INFINITY) ? lf - ls : -INFINITY;
-                if (GRAD) cv[NU - 1][i] = mx[NU - 1][i] = (lf > -INFINITY && z > -INFINITY) ? lf - z : -INFINITY;
+                const float a = cs[(3 * KT + lane) * S + sl];   // (Ua's shift; -inf: its row 0)
+                cv[0][i] = mx[0][i] = (lf > -INFINITY && ls > -INFINITY && a > -INFINITY) ? lf - ls + a : -INFINITY;
+                if (GRAD)
+                    cv[NU - 1][i] = mx[NU - 1][i] = (lf > -INFINITY && z > -INFINITY && a > -INFINITY) ? lf - z + a
+                                                                                                    : -INFINITY;
             }
             CUTE_UNROLL
             for (int u = 0; u < NU; u++)
@@ -1507,11 +1531,11 @@ __global__ void __launch_bounds__(OM_THREADS, 1) lr_om_bw_kernel(
             if (++s == ST) { s = 0; ph ^= 1; }
         }
         CUTE_UNROLL
-        for (int u = 0; u < NU; u++) {                   // the columns' shifts: the running max + Ua's row's
+        for (int u = 0; u < NU; u++) {                   // the columns' shifts: the running max
             float m = mrun[u][0];
             CUTE_UNROLL
             for (int i = 1; i < SPW; i++) if ((lane % CPW) / K == i) m = mrun[u][i];
-            if (lane < CPW) smsh[u * BN + w * CPW + lane] = (m > -INFINITY && shv > -INFINITY) ? m + shv : -INFINITY;
+            if (lane < CPW) smsh[u * BN + w * CPW + lane] = m;   // (Ua's shifts in the factors: none a column)
         }
         asm volatile("bar.arrive 3, %0;" ::"n"(NC + NV) : "memory");
         epilogue_wait();
@@ -1932,7 +1956,7 @@ static void launch_om(const bfloat16_t* params, const long* pbase, const bfloat1
                       const float* shift, const float* vals, const long* ebase, const int* cbase, const int* jpos,
                       const int* ugrp, int knt, int rows, int block_size, int B, float* vnm, const long* nids,
                       int num_edges, const CUtensorMap& tmapA, const float* fa, long a_sb, float* node_mars,
-                      float* lz, long nshift, long vn0, cudaStream_t st) {
+                      float* lz, long nshift, long vn0, bfloat16_t* uaw, long urows, float* amw, cudaStream_t st) {
     constexpr int ST = OM_ST, S = OM_BN / OM_K;
     constexpr int STAGE = (32 * OM_BM * 2 + 2 * 32 * OM_BN * 2 + 2 * 32 * S * 4 + 1023) / 1024 * 1024;
     constexpr int SMEM = ST * STAGE + 2 * ST * S * 4 + 3 * ST * 8;   // (the stages, their records, the barriers)
@@ -1954,7 +1978,7 @@ static void launch_om(const bfloat16_t* params, const long* pbase, const bfloat1
     g_last_grids[0] = std::min<long>(n, nsm); g_last_grids[1] = om_tile_group();
     launch_pdl(kernel, dim3((unsigned)std::min<long>(n, nsm)), dim3(OM_THREADS), SMEM, st, params, pbase, vt, vrows, row0,
                shift, vals, ebase, cbase, jpos, ugrp, knt, mtiles, block_size, B, vnm, nids, num_edges, tmapA, fa, a_sb,
-               node_mars, lz, nshift, vn0, (int)n, om_tile_group());
+               node_mars, lz, nshift, vn0, (int)n, om_tile_group(), uaw, urows, amw);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
@@ -1978,7 +2002,7 @@ void lowrank_forward_om(torch::Tensor vnm, torch::Tensor vals, c10::optional<tor
                         torch::Tensor jpos, torch::Tensor vt, int64_t row0, torch::Tensor shift, torch::Tensor params,
                         torch::Tensor nids, torch::Tensor pbase, torch::Tensor ugrp, int64_t block_size, int64_t knt_,
                         int64_t a_p0, int64_t a_bstr, torch::Tensor node_mars, torch::Tensor lz, torch::Tensor fa,
-                        int64_t nshift, int64_t vn0) {
+                        int64_t nshift, int64_t vn0, c10::optional<torch::Tensor> ua, c10::optional<torch::Tensor> am) {
     const int knt = (int)knt_, rows = (int)nids.size(0);
     const int B = (int)vals.size(1), cols = (int)vnm.size(1);
     const int num_edges = knt * BK;
@@ -2017,6 +2041,14 @@ void lowrank_forward_om(torch::Tensor vnm, torch::Tensor vals, c10::optional<tor
                 (reinterpret_cast<uintptr_t>(vnm.data_ptr()) & 15) == 0 &&
                 (reinterpret_cast<uintptr_t>(shift.data_ptr()) & 15) == 0,
                 "lowrank om: lz [M, B], the node rows, 16-byte aligned runs");
+    TORCH_CHECK(ua.has_value() == am.has_value() &&
+                (!ua.has_value() || (ua->is_cuda() && ua->is_contiguous() && ua->scalar_type() == torch::kBFloat16 &&
+                                     ua->dim() == 2 && ua->size(0) == M && ua->size(1) == vt.size(1) &&
+                                     am->is_cuda() && am->is_contiguous() && am->scalar_type() == torch::kFloat32 &&
+                                     am->numel() == vt.size(1) / OM_K * M && row0 % cols == 0)),
+                "lowrank om: the A operand's Ua bf16 [M, rows] and am float32 [copies, M, B], with V's rows");
+    bfloat16_t* uaw = ua.has_value() ? reinterpret_cast<bfloat16_t*>(ua->data_ptr()) : nullptr;
+    float* amw = am.has_value() ? am->data_ptr<float>() + row0 / OM_K * M : nullptr;
     const bool tma = a_p0 >= 0 && block_size == 32;
     TORCH_CHECK(!tma || (a_bstr % 8 == 0 && a_p0 % 8 == 0), "lowrank om: the slabs' bases 16-byte aligned");
     const at::cuda::OptionalCUDAGuard guard(vnm.device());
@@ -2030,7 +2062,7 @@ void lowrank_forward_om(torch::Tensor vnm, torch::Tensor vals, c10::optional<tor
                     vals.data_ptr<float>(), ebase.data_ptr<long>(), cb, jpos.data_ptr<int>(), ugrp.data_ptr<int>(),     \
                     knt, rows, (int)block_size, B, vnm.data_ptr<float>(), nids.data_ptr<long>(), num_edges, tm,      \
                     fa.data_ptr<float>(), (long)fa.stride(0), node_mars.data_ptr<float>(), lz.data_ptr<float>(),       \
-                    (long)nshift, (long)vn0, st)
+                    (long)nshift, (long)vn0, uaw, (long)vt.size(1), amw, st)
     if (fused) { if (tma) LOWRANK_OM(true, true); else LOWRANK_OM(true, false); }
     else { if (tma) LOWRANK_OM(false, true); else LOWRANK_OM(false, false); }
 #undef LOWRANK_OM
@@ -2054,8 +2086,9 @@ bool om_bw_serves(int64_t K, int64_t B, int64_t cbs, int64_t pbs, int64_t n_cb) 
 // flows [rows, B] -- or, `table` given (the product layer below fused in: int32 [products, 2], from element row `first`
 // on), the NODE flows the products' two children take --, `vals` the element values or (`table`) the node values;
 // `fb` the factors B [K, N, B], `jrow` int32 the node vector's child of each element row from `e_lo` on; `grad_b` dB
-// [K, N, B] (None: no gradient); `ua` the pass's exp(A - shift) bf16 [M, rows] (`lowrank_a_operand`), `sha` its rows'
-// shifts, this copy's from `row0`; the parents' `node_flows`, `node_mars` (circuit rows: the twin's + `nshift`) and
+// [K, N, B] (None: no gradient); `ua` the pass's exp(A - am) bf16 [M, rows] and `am` [copies, M, B] its (node, sample)
+// shifts (`lowrank_a_operand`), this copy's from `row0`; the parents' `node_flows`, `node_mars` (circuit rows: the
+// twin's + `nshift`) and
 // `lz` [M, B] (node index: the twin's row - `vn0`); `params` bf16; the twin's backward partition: `chids` [blocks] the
 // child blocks' first element rows (`cbs` rows a block), `ppar` / `ppid` int64 [blocks, parent blocks] each parent
 // block's first twin row and parameter slab (`pbs` parents a block).
@@ -2064,7 +2097,7 @@ bool om_bw_serves(int64_t K, int64_t B, int64_t cbs, int64_t pbs, int64_t n_cb) 
 // then takes nothing off this copy's dB).
 void lowrank_backward_om(torch::Tensor flows, torch::Tensor vals, c10::optional<torch::Tensor> table, int64_t first,
                          torch::Tensor fb, torch::Tensor jrow, int64_t e_lo, c10::optional<torch::Tensor> grad_b,
-                         torch::Tensor ua, int64_t row0, torch::Tensor sha, torch::Tensor node_flows,
+                         torch::Tensor ua, int64_t row0, torch::Tensor am, torch::Tensor node_flows,
                          torch::Tensor node_mars, torch::Tensor lz, int64_t nshift, int64_t vn0, torch::Tensor params,
                          torch::Tensor chids, torch::Tensor ppar, torch::Tensor ppid, int64_t cbs, int64_t pbs,
                          c10::optional<torch::Tensor> grad_a, c10::optional<torch::Tensor> kd, bool store) {
@@ -2075,21 +2108,22 @@ void lowrank_backward_om(torch::Tensor flows, torch::Tensor vals, c10::optional<
                 "block or the blocks dividing the tile; got rank ", K, ", B ", B, ", blocks ", cbs, " / ", pbs);
     TORCH_CHECK(params.scalar_type() == torch::kBFloat16 && ua.scalar_type() == torch::kBFloat16,
                 "lowrank om backward: bf16 parameters and exp(A)");
-    for (const torch::Tensor* t : {&flows, &vals, &jrow, &ua, &sha, &node_flows, &node_mars, &lz, &chids, &ppar, &ppid})
+    for (const torch::Tensor* t : {&flows, &vals, &jrow, &ua, &am, &node_flows, &node_mars, &lz, &chids, &ppar, &ppid})
         TORCH_CHECK(t->is_cuda() && t->is_contiguous(), "lowrank om backward: contiguous CUDA tensors");
     TORCH_CHECK(fb.is_cuda() && fb.stride(2) == 1 && fb.stride(1) == N && fb.stride(0) >= (long)K * N,
                 "lowrank om backward: B [B, K, N] as the caller gives it, a sample's block contiguous");
     TORCH_CHECK(flows.scalar_type() == torch::kFloat32 && vals.scalar_type() == torch::kFloat32 &&
                 fb.scalar_type() == torch::kFloat32 && jrow.scalar_type() == torch::kInt32 &&
-                sha.scalar_type() == torch::kFloat32 && node_flows.scalar_type() == torch::kFloat32 &&
+                am.scalar_type() == torch::kFloat32 && node_flows.scalar_type() == torch::kFloat32 &&
                 node_mars.scalar_type() == torch::kFloat32 && lz.scalar_type() == torch::kFloat32 &&
                 chids.scalar_type() == torch::kInt64 && ppar.scalar_type() == torch::kInt64 &&
                 ppid.scalar_type() == torch::kInt64, "lowrank om backward: dtypes");
     TORCH_CHECK(ppar.dim() == 2 && ppar.size(0) == n_cb && ppid.sizes() == ppar.sizes(),
                 "lowrank om backward: ppar / ppid [child blocks, parent blocks]");
-    TORCH_CHECK(ua.dim() == 2 && row0 >= 0 && row0 + (long)K * B <= ua.size(1) && sha.numel() == ua.size(1) &&
-                ua.size(1) % 8 == 0 && lz.size(1) == B && vals.size(1) == B && flows.size(1) == B,
-                "lowrank om backward: exp(A) [M, rows] and its shifts holding this copy's rows from row0");
+    TORCH_CHECK(ua.dim() == 2 && row0 >= 0 && row0 % ((long)K * B) == 0 && row0 + (long)K * B <= ua.size(1) &&
+                ua.size(1) % 8 == 0 && am.numel() == ua.size(1) / K * ua.size(0) && lz.size(0) == ua.size(0) &&
+                lz.size(1) == B && vals.size(1) == B && flows.size(1) == B,
+                "lowrank om backward: exp(A) [M, rows] and its shifts [copies, M, B] holding this copy's from row0");
     const bool fused = table.has_value();
     if (fused)
         TORCH_CHECK(table->is_cuda() && table->is_contiguous() && table->scalar_type() == torch::kInt32 &&
@@ -2142,7 +2176,7 @@ void lowrank_backward_om(torch::Tensor flows, torch::Tensor vals, c10::optional<
     auto go = [&](auto f, auto g, auto s) {
         constexpr bool F = decltype(f)::value, G = decltype(g)::value, SG = decltype(s)::value;
         constexpr int NU = G ? 2 : 1;                    // (as the kernel's: U; and Un with the gradients)
-        constexpr int STAGE = (32 * OM_BM * 2 + NU * 32 * OM_BN * 2 + 3 * 32 * S * 4 + 1023) / 1024 * 1024;
+        constexpr int STAGE = (32 * OM_BM * 2 + NU * 32 * OM_BN * 2 + 4 * 32 * S * 4 + 1023) / 1024 * 1024;
         constexpr int SMEM = ST * STAGE + NU * OM_BN * 4 + NU * ST * S * 4 + 3 * ST * 8 + NU * ST * 4;
         static_assert(SMEM <= 101376, "past sm_120's 99 KB of shared memory a block");
         static_assert(!G || 32 * ((32 * OM_K + 4) + (32 + 1)) * 4 <= SMEM, "the dA CTAs' tiles in the shared memory");
@@ -2157,7 +2191,8 @@ void lowrank_backward_om(torch::Tensor flows, torch::Tensor vals, c10::optional<
         if (da) { g_last_grids[2] = n_da; g_last_grids[3] = om_tile_group(); }
         launch_pdl(kernel, dim3((unsigned)(n + n_da)), dim3(OM_THREADS), SMEM, st, pp, ppid.data_ptr<long>(),
                    ppar.data_ptr<long>(), reinterpret_cast<const bfloat16_t*>(ua.data_ptr()), (long)ua.size(1),
-                   (long)row0, sha.data_ptr<float>(), node_flows.data_ptr<float>(), node_mars.data_ptr<float>(),
+                   (long)row0, am.data_ptr<float>() + row0 / K * ua.size(0), node_flows.data_ptr<float>(),
+                   node_mars.data_ptr<float>(),
                    lz.data_ptr<float>(), (long)nshift, (long)vn0, chids.data_ptr<long>(), npb, (int)cbs, (int)pbs,
                    mtiles, B, vals.data_ptr<float>(), fused ? table->data_ptr<int>() : (const int*)nullptr,
                    (long)first, fb.data_ptr<float>(), (long)fb.stride(0), jrow.data_ptr<int>(), (long)e_lo, N,

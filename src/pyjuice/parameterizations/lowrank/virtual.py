@@ -728,9 +728,12 @@ def _stream_run(plan, info, tensors, kwargs, z, row0, vnm, kd, node_mars, elemen
         def launch(code, p = p):
             cb = p["cbase"] if fused else None
             if code == _OM_ARM:
+                # (the A operand of this copy's rows written by the collapse, where the factors are read in place: the
+                # backward's, `_a_rows`)
+                ua = _ua_buffers(z, node_mars.size(1), K, node_mars.device) if z["in_place"] else (None, None)
                 mod.lowrank_forward_om(kd, vals, cb, p["ebase"], p["jpos"], vt, row0, shift, op, p["nids"],
                                        p["pbase"], p["groups"][0], twin.block_size, p["knt"], p["om"][0], p["om"][1],
-                                       node_mars, lz, a_om, nshift, vn0)
+                                       node_mars, lz, a_om, nshift, vn0, ua[0], ua[1])
             else:
                 fb = _inner(kwargs, tensors)[1]
                 mod.lowrank_forward_stream(vnm, vals, cb, p["ebase"], p["jpos"], fb, shift, row0, op, p["nids"],
@@ -750,6 +753,8 @@ def _stream_run(plan, info, tensors, kwargs, z, row0, vnm, kd, node_mars, elemen
         launch(hit[1])
         if hit[1] == _OM_ARM:
             z["zt_done"].add(info.ns)                   # (its rows not needed: nothing reads them)
+            if z["in_place"]:
+                z["ua_rows"].add(info.ns)               # (its rows of the A operand written)
     if not one:
         collapse()
     return True
@@ -811,16 +816,31 @@ def _stream_plan_bk(desc, layer, twin, info, node_mars, stream_children, dev):
     return plan or None
 
 
+def _ua_buffers(z, batch, K, dev):
+    """The pass's A operand of a source's copies, allocated: `exp(A - am)` (bf16 [M, rows], the rows the normalizers')
+    and `am` [copies, M, batch], each (node, sample)'s largest A over its ranks; `z["ua_rows"]` the copies whose rows
+    are written (by their one-launch forward, `_stream_run`)."""
+    buf = z.get("ua_buf")
+    if buf is None:
+        fas, ip = z["fa"], z["in_place"]
+        M = fas[0].size(1 if ip else 0)
+        buf = z["ua_buf"] = (torch.empty(M, len(fas) * batch * K, dtype = torch.bfloat16, device = dev),
+                             torch.empty(len(fas), M, batch, device = dev))
+        z["ua_rows"] = set()
+    return buf
+
+
 def _a_rows(mod, z, batch, K, dev):
-    """The pass's `exp(A - shift)` of a source's copies (bf16 [M, rows], the rows the normalizers'), and each row's shift:
-    the one-launch backward's operand, made when its first layer runs."""
+    """The pass's A operand of a source's copies (`_ua_buffers`): the one-launch backward's operand and the pass's
+    end's -- as the copies' one-launch forwards wrote it where every copy's did, else made when its first layer runs
+    (`lowrank_a_operand`: every copy's)."""
     hit = z.get("ua")
     if hit is None:
-        fas, ip = z["fa"], z["in_place"]
-        Ut = torch.empty(fas[0].size(1 if ip else 0), len(fas) * batch * K, dtype = torch.bfloat16, device = dev)
-        shift = torch.empty(Ut.size(1), device = dev)
-        (mod.lowrank_a_operand_in_place if ip else mod.lowrank_a_operand)(Ut, shift, fas, batch, K)
-        hit = z["ua"] = (Ut, shift)
+        Ut, am = _ua_buffers(z, batch, K, dev)
+        if z["ua_rows"] != set(z["row"]):
+            fas, ip = z["fa"], z["in_place"]
+            (mod.lowrank_a_operand_in_place if ip else mod.lowrank_a_operand)(Ut, am, fas, batch, K)
+        hit = z["ua"] = (Ut, am)
     return hit
 
 
@@ -962,7 +982,7 @@ def _end_of_pass(mod, z, copies, node_flows, node_mars, params, param_flows, den
         Vt.size(1) % 16 == 0 and (len(fp) * cols) % 16 == 0 and (fp or want_denom) and _fp8_module() is not None
     if fp8:
         f8 = torch.float8_e4m3fn
-        ua, sha = _a_rows(mod, z, batch, K, dev)
+        ua, am = _a_rows(mod, z, batch, K, dev)
         at = {id(c): k * cols for k, c in enumerate(fp)}
         un = {id(c) for c in copies} if want_denom else set()
         sel = [c for c in copies if id(c) in at or id(c) in un]
@@ -974,7 +994,7 @@ def _end_of_pass(mod, z, copies, node_flows, node_mars, params, param_flows, den
         Vt8 = (torch.zeros if zeros else torch.empty)(N, Vt.size(1), dtype = f8, device = dev) if want_denom else None
         sc = torch.empty(2 * M + 2 * N, device = dev)
         _fp8_module().lowrank_kept_operands_fp8(
-            Ud8, Vd8, Un8, Vt8, sc, ua, sha, Vt, shift, node_flows, node_mars, [c[3] for c in sel],
+            Ud8, Vd8, Un8, Vt8, sc, ua, am, Vt, shift, node_flows, node_mars, [c[3] for c in sel],
             [c[1].nid_start for c in sel], geos, [c[5][0] if id(c) in at else None for c in sel],
             [c[5][1] if id(c) in at else 0 for c in sel], [z["row"][c[1].ns] for c in sel],
             [at.get(id(c), -1) for c in sel], [int(id(c) in un) for c in sel], M, K,
@@ -995,12 +1015,12 @@ def _end_of_pass(mod, z, copies, node_flows, node_mars, params, param_flows, den
         Ud = torch.empty(M, len(fp) * cols, dtype = dtype, device = dev)
         Vd = torch.empty(N, len(fp) * cols, dtype = dtype, device = dev)
     if kept:
-        ua, sha = _a_rows(mod, z, batch, K, dev)
+        ua, am = _a_rows(mod, z, batch, K, dev)
         at = {id(c): k * cols for k, c in enumerate(fp)}
         un = {id(c) for c in rows_of}
         sel = [c for c in copies if id(c) in at or id(c) in un]
         geos = [desc._geometry(c[0], c[1], dev)["rows"] if id(c) in at else None for c in sel]
-        mod.lowrank_kept_operands(Ud, Vd, Ut, ua, sha, Vt, shift, node_flows, node_mars, [c[3] for c in sel],
+        mod.lowrank_kept_operands(Ud, Vd, Ut, ua, am, Vt, shift, node_flows, node_mars, [c[3] for c in sel],
                                   [c[1].nid_start for c in sel], geos, [c[5][0] if id(c) in at else None for c in sel],
                                   [c[5][1] if id(c) in at else 0 for c in sel], [z["row"][c[1].ns] for c in sel],
                                   [at.get(id(c), -1) for c in sel], [int(id(c) in un) for c in sel], M, K,
@@ -1070,7 +1090,7 @@ def backward(desc, layer, ns_tensors, ns_grad_tensors, node_flows, element_flows
         lz = _lz(layer, info, batch, dev)
         z = st["z"][_source(info.ns)]
         row0 = z["row"][info.ns]
-        ua, sha = _a_rows(mod, z, batch, K, dev)
+        ua, am = _a_rows(mod, z, batch, K, dev)
         # (the launches write every element of dA and dB where every child of the node vector is a tile's: they store
         # into a destination they claim first)
         store = fresh and grads is not None and plan["covers"] and gviews.claim(grads)
@@ -1090,7 +1110,7 @@ def backward(desc, layer, ns_tensors, ns_grad_tensors, node_flows, element_flows
             # (dA by the first partition's launch: its grid's first CTAs)
             da = grads is not None and at == 0
             smod.lowrank_backward_om(out, vals, table, first, fb, plan["jrow"], plan["e_lo"],
-                                     None if grads is None else grads[1], ua, row0, sha, node_flows, node_mars, lz,
+                                     None if grads is None else grads[1], ua, row0, am, node_flows, node_mars, lz,
                                      shift, plan["vn0"], op, part["chids"], part["ppar"], part["ppid"], part["cbs"],
                                      part["pbs"], grads[0] if da else None, kd if da else None, store)
         # (dB's normalizer half taken off by the launches: `grads` given; the parameter flows at the pass's end)
