@@ -553,6 +553,11 @@ _STREAM_MAX_SPLIT = 12
 #: the backward's `exp(A - shift)`, the forward's V), not from the factors (`lowrank_data_operands`'s shifts and
 #: operands, `lowrank_u_operand`)
 KEPT_OPERANDS = True
+#: The pass's end's two products as split-K GEMMs forming their operands from the kept exponentials in their own stages
+#: (`lowrank_pass_end_fused`: neither operand written), where they serve -- the kept bf16 operands, no copy owing its
+#: dB's normalizer half to the pass's end, a sample's ranks whole 16-byte runs (the rank a power of 2, 8 or more;
+#: batch x rank % 32), 64 copies at most
+FUSED_PASS_END = True
 
 #: The tuner's code of the one-launch form (`lowrank_forward_om`); the pre-pass chain's arms are config id * 16 + split
 _OM_ARM = 4096
@@ -569,6 +574,18 @@ def _stream_module():
 
 _FP8 = "unset"
 _FP8_ONE = dict()
+
+
+_FUSED_END = "unset"
+
+
+def _fused_end_module():
+    """The fused pass's end's extension (`lowrank_pass_end_fused.cu`), or None."""
+    global _FUSED_END
+    if _FUSED_END == "unset":
+        from .kernels.c import get_pass_end_fused_module
+        _FUSED_END = get_pass_end_fused_module()
+    return _FUSED_END
 
 
 def _fp8_module():
@@ -1039,6 +1056,29 @@ def _end_of_pass(mod, z, copies, node_flows, node_mars, params, param_flows, den
             return
         # (the owing copies' rows of U alone, in bf16, for their theta^T U)
         fp, rows_of, want_denom, zeros = [], owed, False, False
+    # The fused pass's end where it serves: F+ and W each one GEMM whose stages form the operands from Ua and Vt -- the
+    # kept operands never written (`lowrank_kept_operands`), the copies the pass did not bring in neither product (their
+    # rows of Un 0 above)
+    fused = FUSED_PASS_END and kept and not owed and K >= 8 and K & (K - 1) == 0 and cols % 32 == 0 and \
+        Vt.size(1) % 8 == 0 and len(copies) <= 64 and (fp or want_denom) and _fused_end_module() is not None
+    if fused:
+        ua, am = _a_rows(mod, z, batch, K, dev)
+        at = {id(c): k * cols for k, c in enumerate(fp)}
+        un = {id(c) for c in rows_of}
+        sel = [c for c in copies if id(c) in at or id(c) in un]
+        geos = [desc._geometry(c[0], c[1], dev)["rows"] if id(c) in at else None for c in sel]
+        F = torch.empty(M, N, device = dev) if fp else None
+        W = torch.empty(M, N, device = dev) if want_denom else None
+        _fused_end_module().lowrank_pass_end_fused(
+            F, W, ua, am, Vt, shift, node_flows, node_mars, [c[3] for c in sel], [c[1].nid_start for c in sel], geos,
+            [c[5][0] if id(c) in at else None for c in sel], [c[5][1] if id(c) in at else 0 for c in sel],
+            [z["row"][c[1].ns] for c in sel], [at.get(id(c), -1) for c in sel], [int(id(c) in un) for c in sel], M, K,
+            [c[5][2] if id(c) in at else None for c in sel])
+        if fp:
+            desc._scatter_add(geo, param_flows, fp[0][1].ns._param_flow_range[0], F, params)
+        if want_denom:
+            desc._scatter_add(geo, denom_param_flows, desc._denom_offsets(layer0)[id(info0.ns)][0], W)
+        return
     Ut = (torch.zeros if zeros else torch.empty)(M, Vt.size(1), dtype = dtype, device = dev) if rows_of else None
     Ud = Vd = None
     if fp:

@@ -155,3 +155,41 @@ def get_lowrank_stream_module():
             "The low-rank mixture's virtual batch keeps its plain path.", RuntimeWarning)
         _stream_module = None
     return _stream_module
+
+
+_fused_end_module = None
+_fused_end_attempted = False
+
+
+def get_pass_end_fused_module():
+    """The pass's end's two products as split-K GEMMs that form their operands from the kept exponentials in their own
+    stages (`lowrank_pass_end_fused.cu`: CuTe and TMA, the sum-layer kernels' toolchain), or None if unavailable (warns
+    once): the pass's end then forms the operands (`lowrank_kept_operands`) for cuBLAS."""
+    global _fused_end_module, _fused_end_attempted
+
+    if _fused_end_attempted:
+        return _fused_end_module
+
+    _fused_end_attempted = True
+
+    if not ENABLE_CUDA_KERNELS:
+        return None
+
+    from pyjuice.layer.kernels.c import _compile_flags as _cute_flags
+    flags = _cute_flags()
+    if flags is None:
+        return None
+    cuda_cflags, ldflags = flags
+
+    from pyjuice.utils.cuda_ext import jit_load
+    try:
+        _fused_end_module = jit_load(
+            "pyjuice_lowrank_pass_end_fused_cuda",
+            sources = [os.path.join(_THIS_DIR, "lowrank_pass_end_fused.cu")],
+            extra_cuda_cflags = cuda_cflags, extra_ldflags = ldflags, verbose = False)
+    except Exception as e:
+        warnings.warn(
+            f"pyjuice CUDA kernel 'pyjuice_lowrank_pass_end_fused_cuda' failed to compile ({type(e).__name__}: {e}). "
+            "The low-rank pass's end forms its operands for cuBLAS.", RuntimeWarning)
+        _fused_end_module = None
+    return _fused_end_module

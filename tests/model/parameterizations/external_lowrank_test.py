@@ -2649,6 +2649,156 @@ def test_the_kept_operands_follow_their_formulas(M, N, K, B, copies):
     assert torch.isfinite(Un[:, B * K:].float()).all()
 
 
+@needs_virtual
+@pytest.mark.parametrize("structure,rank,batch,grads", [("blocks", 16, 12, True), ("blocks", 16, 4, False),
+                                                        ("blocks512", 16, 8, True), ("hmm", 8, 4, True)])
+def test_the_fused_pass_end_is_the_kept_operands_products(structure, rank, batch, grads, monkeypatch):
+    """The pass's end fused (`virtual.FUSED_PASS_END`: F+ and W each ONE split-K GEMM forming its operands from the
+    exponentials the pass keeps in its own stages, `lowrank_pass_end_fused.cu`) against the kept operands' products
+    (`lowrank_kept_operands`, cuBLAS), both bf16 (`GEMM_BF16_WORK` forced to 0): the statistics alike to the operands'
+    last bits (the factors split -- the kept form takes one exp an entry, the fused a (node, sample)'s times a row's
+    -- and the products summed in another order) and the same bits from run to run (the K-splits summed in order);
+    every other output the same bits; one call a pass's end. Where the one-launch backward took every copy's dB
+    normalizer half (rank 16, 256 / 512 latents in blocks of 32 / 64; with the gradients and without); an 8-latent
+    HMM's plain backward owes it (its U's products with theta): the pass's end not fused, the same bits."""
+    import pyjuice.parameterizations.lowrank.virtual as lowrank_virtual
+    from pyjuice.layer.kernels import autotune
+
+    pick = autotune.pick
+    monkeypatch.setattr(autotune, "pick", lambda key, cands, bench, **k: "fused"
+                        if key[0] in ("prod_stream_fusion", "prod_stream_fusion_bk") else pick(key, cands, bench, **k))
+    build, kw = {"blocks": (_hmm_blocks(256, 32), dict()), "blocks512": (_hmm_blocks(512, 64), dict()),
+                 "hmm": ("hmm_tied", dict(seq_length = 5))}[structure]
+    pc, sums, _, _, _, _ = _pair(build, "sum_exp", rank = rank, **kw)
+    monkeypatch.setattr(pc, "_param_operands_force", True, raising = False)   # (the bf16 copy: the stream path's)
+    monkeypatch.setattr(lowrank_virtual, "GEMM_BF16_WORK", 0)
+    dev = pc.params.device
+    torch.manual_seed(41)
+    data = torch.randint(0, NUM_CATS, (batch, pc.num_vars), device = dev)
+    ext = {a: _factors(a, rank, batch, dev, seed = 510 + i) for i, a in enumerate(sums)}
+    real, calls = lowrank_virtual._fused_end_module(), []
+
+    class Counted:
+        def __getattr__(self, attr):
+            fn = getattr(real, attr)
+
+            def counted(*args):
+                calls.append(attr)
+                return fn(*args)
+            return counted
+
+    counted = Counted()
+    monkeypatch.setattr(lowrank_virtual, "_fused_end_module", lambda: counted)
+
+    def run():
+        if grads:
+            return _passes(pc, sums, data, ext)
+        lls = pc(data, sum_external_params = ext).clone()
+        pc.init_param_flows(flows_memory = 0.0)
+        pc.backward(data, allow_modify_flows = False, logspace_flows = True, compute_param_flows = True)
+        return dict(lls = lls, mars = pc.node_mars.clone(), flows = pc.node_flows.clone(), fp = pc.param_flows.clone(),
+                    fm = _denominators(pc, sums))
+
+    monkeypatch.setattr(lowrank_virtual, "FUSED_PASS_END", True)
+    run()                                                              # (the tuner's choices made: one arm a shape on)
+    calls.clear()
+    got, again = run(), run()
+    fused = structure != "hmm"
+    assert calls == ["lowrank_pass_end_fused"] * (2 if fused else 0), calls
+    monkeypatch.setattr(lowrank_virtual, "FUSED_PASS_END", False)
+    want = run()
+    assert len(calls) == (2 if fused else 0)
+    for k in ("lls", "mars", "flows"):
+        assert torch.equal(got[k], want[k]), k
+    for k in (("dA", "dB") if grads else ()):
+        assert all(torch.equal(a, b) for a, b in zip(got[k], want[k])), k
+    for k in ("fp", "fm"):
+        assert torch.equal(got[k], again[k]), k
+        assert float(want[k].abs().max()) > 0, k
+        # (bf16 operands: an entry whose factor rounds the other way is a bf16 step off -- at these few terms a
+        # product's share of 1e-4 of the largest)
+        assert float((got[k] - want[k]).abs().max()) <= (1e-3 if fused else 0.0) * float(want[k].abs().max()), \
+            (k, float((got[k] - want[k]).abs().max()), float(want[k].abs().max()))
+
+
+@needs_virtual
+@pytest.mark.parametrize("M, N, K, B, copies, kept", [(40, 300, 8, 4, 3, False),    # M under a tile, N past one, ragged
+                                                      (130, 40, 16, 2, 2, True),    # M past a tile; the kept values
+                                                      (6, 33, 32, 1, 5, False),     # rank 32: a sample a k32 step
+                                                      (8, 8, 16, 2, 40, False)])    # many copies: the K splits over them
+def test_the_fused_pass_end_follows_the_kept_operands(M, N, K, B, copies, kept):
+    """`lowrank_pass_end_fused` (the fused pass's end: F+ and W each one split-K GEMM scaling the kept exponentials in
+    its stages) against `lowrank_kept_operands`' operands multiplied in fp32: on the inputs of
+    `test_the_kept_operands_follow_their_formulas` -- a child no edge reaches, a child without mass, a node without
+    flow, mass or normalizer, a rank without mass, a sample without a child of mass --, F+ over the copies with a data
+    half, W over those whose U is asked
+    for, to the operands' last bits (the factors split: an entry's bf16 rounding may land a step the other way), never
+    NaN, the same bits from run to run; ranks 8, 16, 32, M and N ragged under and past a tile (128 x 256), the copies'
+    children's values from the table or kept."""
+    import pyjuice.parameterizations.lowrank.virtual as lowrank_virtual
+
+    mod, fmod, dev = lowrank_virtual._module(), lowrank_virtual._fused_end_module(), torch.device("cuda")
+    if fmod is None:
+        pytest.skip("the fused pass's end's extension is not built")
+    g = torch.Generator(device = "cpu").manual_seed(17)
+    children = 13
+    fa = [(torch.randn(M, K, B, generator = g) * 2).to(dev) for _ in range(copies)]
+    fb = [(torch.randn(K, N, B, generator = g) * 2).to(dev) for _ in range(copies)]
+    lz = [(torch.randn(M, B, generator = g) * 2).to(dev) for _ in range(copies)]
+    rows = children + copies * M
+    node_flows = (torch.randn(rows, B, generator = g) - 1.0).to(dev)
+    node_mars = (torch.randn(rows, B, generator = g) - 3.0).to(dev)
+    nid0 = [children + c * M for c in range(copies)]
+    first, elements = 5, N + 7
+    table = torch.randint(0, children, (elements, 2), generator = g, dtype = torch.int32).to(dev)
+    eids = [(first + torch.randperm(elements, generator = g)[:N]).to(dev) for _ in range(copies)]
+    eids[0][1] = -1                                                    # copy 0, child 1: no edge reaches it
+    node_mars[int(table[int(eids[0][0]) - first, 0]), 0] = -float("inf")   # a child without mass
+    node_flows[nid0[0] + 1, 0] = -float("inf")                         # copy 0, node 1, sample 0: no flow
+    node_mars[nid0[1] + 0, B - 1] = -float("inf")                      # copy 1, node 0: no mass
+    lz[1][M - 1, 0] = -float("inf")                                    # copy 1, its last node, sample 0: no normalizer
+    fb[0][1, :, 0] = -float("inf")                                     # copy 0, a rank without mass at sample 0
+    if B > 1:
+        node_mars[:children, B - 1] = -float("inf")                    # no child with mass at the last sample: cm_b -inf
+
+    total = copies * B * K
+    Ua = torch.empty(M, total, dtype = torch.bfloat16, device = dev)
+    am = torch.empty(copies, M, B, device = dev)
+    Vt = torch.empty(N, total, dtype = torch.bfloat16, device = dev)
+    shb = torch.empty(total, device = dev)
+    mod.lowrank_a_operand(Ua, am, fa, B, K)
+    mod.lowrank_z_operand(Vt, shb, fb, B, K)
+    data = [c for c in range(copies) if c != 1]                        # (copy 1: no data half)
+    want_un = [c for c in range(copies) if c != 0]                     # (copy 0: no U asked for)
+    drow0 = [data.index(c) * B * K if c in data else -1 for c in range(copies)]
+    cvs = [_kept_children(node_mars, table, first, eids[c]) if kept and c in data else None for c in range(copies)]
+    tables = [table if c in data and not kept else None for c in range(copies)]
+    eid_of = [eids[c] if c in data else None for c in range(copies)]
+    row0 = [c * B * K for c in range(copies)]
+    un = [int(c in want_un) for c in range(copies)]
+    Ud = torch.empty(M, len(data) * B * K, dtype = torch.bfloat16, device = dev)
+    Vd = torch.empty(N, len(data) * B * K, dtype = torch.bfloat16, device = dev)
+    Un = torch.zeros(M, total, dtype = torch.bfloat16, device = dev)
+    mod.lowrank_kept_operands(Ud, Vd, Un, Ua, am, Vt, shb, node_flows, node_mars, lz, nid0, eid_of, tables,
+                              [first if not kept else 0] * copies, row0, drow0, un, M, K, cvs)
+    want_f = Ud.float() @ Vd.float().t()
+    want_w = Un.float() @ Vt.float().t()                               # (the copies not asked for: their rows 0)
+    outs = []
+    for _ in range(2):
+        F = torch.full((M, N), float("nan"), device = dev)
+        W = torch.full((M, N), float("nan"), device = dev)
+        fmod.lowrank_pass_end_fused(F, W, Ua, am, Vt, shb, node_flows, node_mars, lz, nid0, eid_of, tables,
+                                    [first if not kept else 0] * copies, row0, drow0, un, M, K, cvs)
+        outs.append((F, W))
+    torch.cuda.synchronize()
+    for (got, want), name in zip(zip(outs[0], (want_f, want_w)), ("F+", "W")):
+        assert torch.isfinite(got).all(), name
+        assert float(want.abs().max()) > 0, name
+        assert float((got - want).abs().max()) <= 1e-3 * float(want.abs().max()), \
+            (name, float((got - want).abs().max()), float(want.abs().max()))
+    assert torch.equal(outs[0][0], outs[1][0]) and torch.equal(outs[0][1], outs[1][1]), "run to run"
+
+
 def _fp8_rows(q8, scales):
     """e4m3 operand rows back in float64: each row's codes times its scale."""
     return q8.float().double() * scales.double()[:, None]
@@ -3677,6 +3827,7 @@ def test_the_pass_ends_products_in_rounds_are_torch_mms(rounds, monkeypatch):
     pc, sums, _, _, _, _ = _pair(_hmm_blocks(256, 32), "sum_exp", rank = rank)
     monkeypatch.setattr(pc, "_param_operands_force", True, raising = False)   # (the bf16 copy: the kept operands)
     monkeypatch.setattr(lowrank_virtual, "GEMM_BF16_WORK", 0)                # (bf16 products)
+    monkeypatch.setattr(lowrank_virtual, "FUSED_PASS_END", False)            # (the kept operands' products, not fused)
     dev = pc.params.device
     torch.manual_seed(53)
     data = torch.randint(0, NUM_CATS, (batch, pc.num_vars), device = dev)
