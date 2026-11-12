@@ -3517,3 +3517,42 @@ def test_the_one_launch_grids_order_changes_no_bit(bs, batch, group, da_ctas, fw
         assert not torch.isnan(got[k]).any() and torch.equal(got[k], want[k]), k
     for k in ("dA", "dB"):
         assert all(not torch.isnan(a).any() and torch.equal(a, b) for a, b in zip(got[k], want[k])), k
+
+
+@needs_virtual
+@pytest.mark.parametrize("rounds", [2, 4])
+def test_the_pass_ends_products_in_rounds_are_torch_mms(rounds, monkeypatch):
+    """The pass's end's two products (`virtual._product_nt`: F+ = Ud Vd^T, W = Un Vt^T, bf16) in rounds of a batch-8
+    torch.bmm over 8 R chunks of K, each round's 8 summed in fp32 (`PRODUCT_ROUNDS` forced: the tuner takes them where
+    they are faster, at large batches): the parameter flows and their denominators those of torch.mm within fp32's
+    rounding of the sums in another order."""
+    import pyjuice.parameterizations.lowrank.virtual as lowrank_virtual
+
+    rank, batch = 16, 16
+    pc, sums, _, _, _, _ = _pair(_hmm_blocks(256, 32), "sum_exp", rank = rank)
+    monkeypatch.setattr(pc, "_param_operands_force", True, raising = False)   # (the bf16 copy: the kept operands)
+    monkeypatch.setattr(lowrank_virtual, "GEMM_BF16_WORK", 0)                # (bf16 products)
+    dev = pc.params.device
+    torch.manual_seed(53)
+    data = torch.randint(0, NUM_CATS, (batch, pc.num_vars), device = dev)
+    ext = {a: _factors(a, rank, batch, dev, seed = 560 + i) for i, a in enumerate(sums)}
+    calls, real = [], lowrank_virtual._product_nt
+
+    def counted(a, b):
+        calls.append(a.size(1))
+        return real(a, b)
+
+    monkeypatch.setattr(lowrank_virtual, "_product_nt", counted)
+    monkeypatch.setattr(lowrank_virtual, "PRODUCT_ROUNDS", 0)
+    want = _passes(pc, sums, data, ext)
+    took = len(calls)
+    monkeypatch.setattr(lowrank_virtual, "PRODUCT_ROUNDS", rounds)
+    got = _passes(pc, sums, data, ext)
+    # (F+ and W, the rounds' chunks whole: K a multiple of 8 R)
+    assert took >= 1 and len(calls) == 2 * took and all(k % (8 * rounds) == 0 for k in calls), calls
+    for k in ("fp", "fm"):
+        top = float(want[k].abs().max())
+        assert top > 0 and torch.allclose(got[k], want[k], rtol = 1e-5, atol = 1e-6 * top), \
+            f"{k}: {float((got[k] - want[k]).abs().max())} against {top}"
+    for k in ("lls", "mars", "flows"):
+        assert torch.equal(got[k], want[k]), k

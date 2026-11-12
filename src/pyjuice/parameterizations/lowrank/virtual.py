@@ -341,6 +341,49 @@ def _product(a, b, dtype):
     return torch.mm(a, b, out_dtype = torch.float32) if dtype is torch.bfloat16 else torch.mm(a, b)
 
 
+#: The pass's end's two products (F+ = Ud Vd^T, W = Un Vt^T: [M, Kt] x [Kt, N], Kt every copy's (sample, rank) rows --
+#: a small output over a long K) in bf16: torch.mm, or in ROUNDS of a batch-8 torch.bmm over 8 R chunks of K (views,
+#: each round's 8 summed in fp32) -- the tuner's choice a shape (`_product_nt`), R >= 2: chains of Kt / 16 terms or
+#: fewer, no longer than torch.mm's (MEASURED: its error that of chains of Kt / 16; a chain's error grows with its
+#: length). MEASURED (croissant, M = N = 1024, Kt = 31 B 16, ms a product, torch.mm / 2 rounds / 4 rounds; the largest
+#: relative error against chains of Kt / 128 summed in float64): B256 0.730 / 0.804 / 0.859; B512 1.390 / 1.521 /
+#: 1.592; B1024 3.208 / 2.931 / 2.989 (1.7e-4 / 1.7e-4 / 7.8e-5); B2048 8.018 / 5.660 / 5.832 (3.6e-4 / 3.7e-4 /
+#: 1.8e-4); B4096 20.23 / 14.69 / 14.49 (7.3e-4 / 7.6e-4 / 3.7e-4). (One batch of 8 R: slower past R = 1 -- cuBLAS's
+#: choice for the batch-8 shape is the fast one --; one round, R = 1: chains of Kt / 8, twice torch.mm's error.)
+#: None: the tuner's choice; else the rounds forced (0: torch.mm), where they serve.
+PRODUCT_ROUNDS = None
+#: The rounds' partial products' memory at most (8 of [M, N] in fp32 a round)
+PRODUCT_ROUNDS_BYTES = 1 << 30
+#: A product's FLOPs below which torch.mm is taken untried (the rounds lose there: MEASURED above, B512 and below)
+PRODUCT_ROUNDS_WORK = 1e12
+
+
+def _product_nt(a, b):
+    """`a b^T` in fp32 from bf16 `a` [M, Kt], `b` [N, Kt]: torch.mm, or rounds of a batch-8 torch.bmm (`PRODUCT_ROUNDS`)."""
+    from pyjuice.layer.kernels import autotune
+    M, Kt, N = a.size(0), a.size(1), b.size(0)
+    serve = a.is_contiguous() and b.is_contiguous() and b.size(1) == Kt and 8 * M * N * 4 <= PRODUCT_ROUNDS_BYTES
+    tried = serve and 2.0 * M * N * Kt >= PRODUCT_ROUNDS_WORK
+    rounds = [r for r in (2, 4) if serve and Kt % (8 * r) == 0 and Kt // (8 * r) >= 16]
+
+    def run(r):
+        if r == 0:
+            return torch.mm(a, b.t(), out_dtype = torch.float32)
+        Kc = Kt // (8 * r)
+        av, bv = a.view(M, 8 * r, Kc).permute(1, 0, 2), b.view(N, 8 * r, Kc).permute(1, 2, 0)
+        out = torch.bmm(av[:8], bv[:8], out_dtype = torch.float32).sum(0)
+        for q in range(1, r):
+            out += torch.bmm(av[8 * q:8 * q + 8], bv[8 * q:8 * q + 8], out_dtype = torch.float32).sum(0)
+        return out
+
+    if PRODUCT_ROUNDS is not None:
+        return run(PRODUCT_ROUNDS if PRODUCT_ROUNDS in rounds else 0)
+    if not rounds or not tried:
+        return run(0)
+    # (a tie keeps torch.mm: the margin a few percent -- one product's time is milliseconds, its noise well under that)
+    return run(autotune.pick(("lowrank_pass_end_product", M, N, Kt), [0] + rounds, run, margin = 1.03))
+
+
 def fuses(desc, layer, children) -> bool:
     """Whether a forward of this layer through the virtual batch takes the product group below fused into its
     `expand` (`children`: the group's `(table, first_row)`): products of two children, as the fused kernels of the
@@ -972,10 +1015,11 @@ def _end_of_pass(mod, z, copies, node_flows, node_mars, params, param_flows, den
             mod.lowrank_u_operand(Ut, shift, node_flows, [inner(c[2])[0] for c in rows_of], [c[3] for c in rows_of],
                                   [c[1].nid_start for c in rows_of], [z["row"][c[1].ns] for c in rows_of], M, K)
     if fp:
-        desc._scatter_add(geo, param_flows, fp[0][1].ns._param_flow_range[0], _product(Ud, Vd.t(), dtype), params)
+        desc._scatter_add(geo, param_flows, fp[0][1].ns._param_flow_range[0],
+                          _product_nt(Ud, Vd) if dtype is torch.bfloat16 else _product(Ud, Vd.t(), dtype), params)
     if want_denom:
         desc._scatter_add(geo, denom_param_flows, desc._denom_offsets(layer0)[id(info0.ns)][0],
-                          _product(Ut, Vt.t(), dtype))
+                          _product_nt(Ut, Vt) if dtype is torch.bfloat16 else _product(Ut, Vt.t(), dtype))
     if owed:
         theta = z["theta"] if z["theta"].dtype == dtype else desc._dense_params(geo, params, dtype)
         if len(owed) == len(z["row"]):
