@@ -3461,13 +3461,17 @@ def test_the_one_launch_passes_where_a_stages_values_lie_deep_and_apart(batch, m
 
 
 @needs_virtual
-@pytest.mark.parametrize("bs,batch,group,da_ctas", [(32, 16, 1, 0), (32, 16, 3, 0), (64, 12, 2, 1), (128, 16, 3, 3)])
-def test_the_one_launch_grids_order_changes_no_bit(bs, batch, group, da_ctas, monkeypatch):
+@pytest.mark.parametrize("bs,batch,group,da_ctas,fw_ctas", [(32, 16, 1, 0, 0), (32, 16, 3, 0, 1), (64, 12, 2, 1, 3),
+                                                             (128, 16, 3, 3, 5)])
+def test_the_one_launch_grids_order_changes_no_bit(bs, batch, group, da_ctas, fw_ctas, monkeypatch):
     """The one-launch kernels' grids (`kernels/c/lowrank_stream.cu`): the tiles in groups of sample tiles (`tile_of`: a
-    quarter of the SMs a group -- at these sizes one group, the grid's plain order) and the backward's dA CTAs first in
-    the grid, the launcher's share of the SMs. A tile's sums and a pair's dA are its own whatever block of the grid
-    takes them: the passes give the same BITS in groups of 1, 2 or 3 sample tiles of the 4 or 3 (a last group of
-    fewer), and with the dA CTAs capped (1: one CTA strides over every tile of the pairs; 3: unevenly)."""
+    quarter of the SMs a group -- at these sizes one group, the grid's plain order), the backward's dA CTAs first in
+    the grid, the launcher's share of the SMs, and the forward PERSISTENT, a CTA an SM taking every grid-th tile, its
+    ring running on across them. A tile's sums and a pair's dA are its own whatever block of the grid takes them: the
+    passes give the same BITS in groups of 1, 2 or 3 sample tiles of the 4 or 3 (a last group of fewer), with the dA
+    CTAs capped (1: one CTA strides over every tile of the pairs; 3: unevenly) and the forward's CTAs capped (1: one
+    CTA takes a layer's 8 or 6 tiles, its stages' phases flipping across them; 3, 5: unevenly -- at these sizes a CTA
+    has one tile otherwise)."""
     import pyjuice.parameterizations.lowrank.virtual as lowrank_virtual
     from pyjuice.layer.kernels import autotune
 
@@ -3496,11 +3500,18 @@ def test_the_one_launch_grids_order_changes_no_bit(bs, batch, group, da_ctas, mo
     assert len(calls) == len(sums) and all(calls), calls
     smod.set_tile_group(group)
     smod.set_da_ctas_most(da_ctas)
+    smod.set_om_ctas_most(fw_ctas)
     try:
         got = _passes(pc, sums, data, ext)
     finally:
         smod.set_tile_group(0)
         smod.set_da_ctas_most(0)
+        smod.set_om_ctas_most(0)
+    # (the hooks took: the last launches' grids -- every layer's the same shape -- the forward's CTAs, the dA CTAs and
+    # both kernels' groups as set)
+    fw_n, fw_group, da_n, bw_group = smod.om_last_grids()
+    assert fw_group == group and bw_group == group and (fw_n == fw_ctas if fw_ctas else fw_n >= 6), (fw_n, fw_group)
+    assert da_n == da_ctas if da_ctas else da_n >= 1, da_n
     assert len(calls) == 2 * len(sums) and all(calls), calls
     for k in ("lls", "mars", "flows", "fp", "fm"):
         assert not torch.isnan(got[k]).any() and torch.equal(got[k], want[k]), k

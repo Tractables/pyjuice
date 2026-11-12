@@ -442,8 +442,22 @@ __global__ void __launch_bounds__((WM * WN + PW) * 32) lr_gemm_kernel(
 // shift m_b is each sample's running max over the k-steps so far -- ONLINE: a converter warp takes its sample's max
 // over a stage's rows and, where it rose, the factor exp(m_old - m_new) the consumers rescale their sums by before
 // the stage (exactly 1 where it did not: the sums untouched) -- so no pass over the values comes first, and the
-// epilogue writes `vnm = log(sum) + m_b + shift` (the sample's final max; shift V's row's). A row of no child (`jpos`
-// -1) copies -inf for its value (its V row: zeros).
+// collapse takes `log(sum) + m_b + shift` (the sample's final max; shift V's row's). A row of no child (`jpos` -1)
+// copies -inf for its value (its V row: zeros).
+//
+// PERSISTENT, THE RING CONTINUOUS, THE COLLAPSE IN THE CONSUMERS' REGISTERS: a CTA an SM takes the tiles blockIdx.x,
+// + gridDim.x, ... (in `tile_of`'s order); its ring runs on across its tiles (the CTA's k-step g in stage g % ST), so
+// the producers and converters never stop at a tile's end; the consumers collapse a tile from their accumulators --
+// the stage's columns permuted so that a warp holds whole samples -- and go on to the next: no shared-memory round
+// trip, no barrier of every role, no stage drained. MEASURED (toast, HMM 1024 x 31 in blocks of 32, rank 16, B1024, us
+// a layer, every variant's MMAs counted in its SASS): the tensor floor 156; the consumers alone 163 (no copies, no
+// waits); + the ring's waits 173, + the conversion 182, + the copies 208 (A +3, V +9, the values +5 alone), + A's
+// prefetch for the collapse 218; the collapse through shared memory by every role, a tile a CTA (before) 283; this 265
+// (its loads 10, stores 19, FP32 11, exponentials 6). The kernel at B16 / 64 / 256 / 1024 / 2048 (ms, 31 layers): 0.684
+// / 0.787 / 2.42 / 8.85 / 19.3 before, the grids' groups alone 0.69 / 0.80 / 2.49 / 8.92 / 17.6, this 0.65 / 0.79 /
+// 2.35 / 8.23 / 16.2. Not taken (each measured): the collapse by two warps of their own beside the k-steps, the
+// consumers' raw sums through a scratch slot in global memory (B1024 258 us a layer, B64 +28%: FP32 work beside the
+// MMAs costs them as much on the same SM); a waiting warp asleep (`try_wait` with a suspend-time hint: no change).
 //
 // MEASURED (croissant, one GPU no one else used, HMM 1024 x 1024 in blocks of 32, rank 16, batch 64, the layer's
 // launches replayed in a CUDA graph, us a call; `knt` edge tiles of the layer's 16): the pre-pass chain 9.2 at one edge
@@ -467,7 +481,7 @@ __global__ void __launch_bounds__(OM_THREADS, 1) lr_om_kernel(
         const int* __restrict__ cbase, const int* __restrict__ jpos, const int* __restrict__ ugrp, int knt, int mtiles,
         int block_size, int B, float* __restrict__ vnm, const long* __restrict__ nids, int num_edges,
         const __grid_constant__ CUtensorMap tmapA, const float* __restrict__ fa, long a_sb, float* node_mars,
-        float* __restrict__ lz, long nshift, long vn0, int nbg) {
+        float* __restrict__ lz, long nshift, long vn0, int ntiles, int nbg) {
     constexpr int BM = OM_BM, BN = OM_BN, K = OM_K, WM = 4, WN = 2;
     constexpr int KT = 32, NC = WM * WN * 32, NP = 128, NV = 128;
     static_assert(NC + NP + NV == OM_THREADS, "the warp roles");
@@ -476,21 +490,35 @@ __global__ void __launch_bounds__(OM_THREADS, 1) lr_om_kernel(
     // a stage: A, V as copied (the normalizer's operand), u = V exp(c - m) (the converters'), the children's values
     constexpr int ABYTES = KT * BM * 2, UBYTES = KT * BN * 2, CBYTES = 2 * KT * S * 4;
     constexpr int STAGE = (ABYTES + 2 * UBYTES + CBYTES + 1023) / 1024 * 1024;
-    constexpr int GS = BN + 4;                           // the epilogue's tiles of log S_r and Z_r, a row's stride
-    static_assert(2 * BM * GS * 4 <= ST * STAGE, "the epilogue's tiles in the stages");
     constexpr int SUB = BK / KT;                         // k-steps an edge tile is
     const int cols = K * B;
     const int nbt = cols / BN;
-    int pid_b, pid_m;                                    // (the grid's order: `tile_of`)
-    tile_of((int)blockIdx.x, nbt, (int)gridDim.x / nbt, nbg, pid_b, pid_m);
-    // the node tile: one of `mtiles` of a node block, or `bpt` consecutive blocks of one group (blocks of 32 or 64)
     const int bpt = BM > block_size ? BM / block_size : 1;
-    const int r = bpt > 1 ? pid_m * bpt : pid_m / mtiles, tile_id = bpt > 1 ? 0 : pid_m % mtiles;
     const int nk = knt * SUB;
-    const int g = ugrp[r];
-    float* smsh = (float*)(smem_raw + ST * STAGE);       // [BN] the columns' final shifts (the converters')
-    float* sfac = smsh + BN;                             // [ST][S] a stage's rescale factors (the converters')
-    uint64_t* fullr = (uint64_t*)(sfac + ST * S);        // a stage's copies landed (the producers')
+    // PERSISTENT: a CTA takes the tiles blockIdx.x, + gridDim.x, ... of the layer's `ntiles` (the grid: a CTA an SM at
+    // most), in `tile_of`'s order, a node tile one of `mtiles` of a node block, or `bpt` consecutive blocks of one group
+    // (blocks of 32 or 64).
+    struct Tile { int r, tile_id, b0; };                 // (its node block / tile of it, its first sample)
+    auto tile_at = [&](int t) {
+        int pid_b, pid_m;                                // (the tiles' order: `tile_of`)
+        tile_of(t, nbt, ntiles / nbt, nbg, pid_b, pid_m);
+        Tile x;
+        x.r = bpt > 1 ? pid_m * bpt : pid_m / mtiles; x.tile_id = bpt > 1 ? 0 : pid_m % mtiles;
+        x.b0 = pid_b * S;
+        return x;
+    };
+    auto col0_of = [&](const Tile& T) { return (long)T.b0 * K; };   // (its first column: S samples a tile, K each)
+    const int step = (int)gridDim.x;
+    // The ring is CONTINUOUS over a CTA's tiles: its k-step g (counted from the CTA's first) in stage g % ST, phase
+    // (g / ST) & 1. A stage's record (the converters'): its samples' rescale factors, then their maxima after it.
+    float* srec = (float*)(smem_raw + ST * STAGE);       // [ST][2 S]
+    uint64_t* fullr = (uint64_t*)(srec + 2 * ST * S);    // a stage's copies landed (the producers')
+    // A consumer warp's fragment n-blocks are the tile's 8-column blocks 2 ni + wn (CuTe's (WM, WN) tiling): half of
+    // every sample's ranks. The stage holds the tile's 8-column blocks PERMUTED (1 <-> 2, 5 <-> 6: `pcol`, its own
+    // inverse) so that a warp's are whole samples (wn and wn + 2) -- the collapse then stays in a warp, a (row,
+    // sample)'s 16 ranks in the 4 lanes of a group. A column's sums are the same whatever its place.
+    static_assert(WN == 2 && S == 4 && K == 16, "the permutation: 2 warps across, 4 samples of 16 ranks");
+    auto pcol = [](int c) { const int b8 = c >> 3, q = b8 & 3; return (((q == 1 || q == 2) ? b8 ^ 3 : b8) << 3) | (c & 7); };
     uint64_t* full = fullr + ST;                         // ... and converted (the converters')
     uint64_t* empty = full + ST;                         // ... and read (the consumers')
     const int tid = threadIdx.x;
@@ -510,67 +538,12 @@ __global__ void __launch_bounds__(OM_THREADS, 1) lr_om_kernel(
     __syncthreads();
     cudaTriggerProgrammaticLaunchCompletion();           // the launch after may launch (it waits for this one)
     const uint32_t sbase = (uint32_t)__cvta_generic_to_shared(smem_raw);
-    const long col0 = (long)pid_b * BN;
-    const int b0 = pid_b * S;                            // the tile's first sample
-    // The epilogue, every role's (a (node, sample) a thread, `BM S` of them), from the consumers' tiles of log S_r
-    // (`gS`) and Z_r (`gZ`): the COLLAPSE -- the node's value lse_r(A + log S_r) - lse_r(A + log Z_r) and log Z, as
-    // `lowrank_mixture.cu`'s `collapse_sums<16>` forms them (the same operations in the same order) -- and the share
-    // differences the backward's dA takes (`vnm`: the layer's kept D, 64-byte runs). A's pieces were prefetched into L2
-    // by the producers during the main loop.
-    static_assert(BM * S == OM_THREADS && K == 16, "a thread an epilogue pair");
-    float* gS = (float*)smem_raw;
-    float* gZ = gS + BM * GS;
-    auto node_of = [&](int m) {                          // a tile row's twin row
+    auto node_of = [&](const Tile& T, int m) {           // a tile row's twin row
         const int bq = bpt > 1 ? m / block_size : 0;
-        return nids[r + bq] + (bpt > 1 ? m - bq * block_size : tile_id * BM + m);
+        return nids[T.r + bq] + (bpt > 1 ? m - bq * block_size : T.tile_id * BM + m);
     };
-    auto epilogue = [&]() {
-        const int m = tid / S, sl = tid % S, b = b0 + sl;
-        const long nid = node_of(m), i = nid - vn0;     // (the twin's row, the node vector's node)
-        const long c0 = col0 + sl * K;                  // the sample's first column
-        float av[K], sv[K], zv[K], hv[K];
-        CUTE_UNROLL
-        for (int q = 0; q < K; q++) { sv[q] = gS[m * GS + sl * K + q]; zv[q] = gZ[m * GS + sl * K + q]; }
-        CUTE_UNROLL
-        for (int q = 0; q < K / 4; q++) {
-            const float4 x = *(const float4*)&shift[row0 + c0 + 4 * q];
-            hv[4 * q] = x.x; hv[4 * q + 1] = x.y; hv[4 * q + 2] = x.z; hv[4 * q + 3] = x.w;
-        }
-        const float* ap = fa + (long)b * a_sb + i * K;   // A[b, i, r] as the caller gives it: the K ranks one run
-        CUTE_UNROLL
-        for (int q = 0; q < K / 4; q++) {
-            const float4 x = reinterpret_cast<const float4*>(ap)[q];
-            av[4 * q] = x.x; av[4 * q + 1] = x.y; av[4 * q + 2] = x.z; av[4 * q + 3] = x.w;
-        }
-        float ms = -INFINITY, mz = -INFINITY;
-        CUTE_UNROLL
-        for (int q = 0; q < K; q++) {
-            sv[q] = av[q] + sv[q];
-            zv[q] = av[q] + (logf(zv[q]) + hv[q]);
-            ms = fmaxf(ms, sv[q]);
-            mz = fmaxf(mz, zv[q]);
-        }
-        float ss = 0.0f, sz = 0.0f;
-        CUTE_UNROLL
-        for (int q = 0; q < K; q++) {
-            ss += expf(sv[q] - ms);
-            sz += expf(zv[q] - mz);
-        }
-        const float ls = ms > -INFINITY ? ms + logf(ss) : -INFINITY;
-        const float z = mz > -INFINITY ? mz + logf(sz) : -INFINITY;
-        const bool live = ls > -INFINITY && z > -INFINITY;
-        // (Z = 0, a node whose parameters are all 0: no mass, -inf -- as the collapse kernel)
-        node_mars[(nid + nshift) * B + b] = live ? ls - z : -INFINITY;
-        lz[i * B + b] = z;
-        CUTE_UNROLL
-        for (int q = 0; q < K; q++) sv[q] = live ? expf(sv[q] - ls) - expf(zv[q] - z) : 0.0f;
-        CUTE_UNROLL
-        for (int q = 0; q < K / 4; q++)
-            *(float4*)&vnm[nid * cols + c0 + 4 * q] = make_float4(sv[4 * q], sv[4 * q + 1], sv[4 * q + 2], sv[4 * q + 3]);
-    };
-    auto epilogue_wait = [&]() { asm volatile("bar.sync 5, %0;" ::"n"(OM_THREADS) : "memory"); };   // (the tiles written)
     if (tid >= NC + NV) {
-        // ---------------- producers: k-step t into stage t % ST once the consumers released it ----------------
+        // ---------------- producers: the CTA's k-step g into stage g % ST once the consumers released it ----------------
         // Every per-chunk address made before the loop (pinned in registers: else the compiler remakes the swizzled
         // offsets from the thread id every stage), the slab bases and the rows' children loaded ahead, and no
         // shared-memory load in the loop (MEASURED: one costs a cp.async loop 34% to 2.1x, even predicated off).
@@ -578,72 +551,98 @@ __global__ void __launch_bounds__(OM_THREADS, 1) lr_om_kernel(
         constexpr int TA = ABYTES / 16, CA = (TA + NP - 1) / NP;
         constexpr int TB = UBYTES / 16, CB = (TB + NP - 1) / NP;
         constexpr int NC4 = (FUSED ? 2 : 1) * KT * (S / 4), CC = (NC4 + NP - 1) / NP;
-        uint32_t oA[CA];
-        int gA[CA], bA[CA];
-        {
-            Tensor sAt = make_tensor(make_smem_ptr(stA(0)), sAl);
-            CUTE_UNROLL
-            for (int q = 0; q < CA; q++) {
-                const int i = ptid + q * NP, e = i / (BM / 8), mm = (i % (BM / 8)) * 8;
-                oA[q] = i < TA ? (uint32_t)((char*)&sAt(mm, e) - smem_raw) : ~0u;
-                const int bq = bpt > 1 ? mm / block_size : 0;
-                gA[q] = e * block_size + (bpt > 1 ? mm - bq * block_size : mm) + tile_id * BM;
-                bA[q] = r + bq;
+        // (`places`: the chunks' places in a stage -- the same every tile -- and the strides, pinned in registers)
+        uint32_t oA[CA], oB[CB], oC[CC];
+        int eB[CB], cx[CC], ce[CC];
+        long vrows_l = 0;                                // (strides in registers: else reloaded from the constant bank)
+        int B_i = 0;
+        uint32_t sb_r = 0;
+        auto places = [&]() {
+            {
+                Tensor sAt = make_tensor(make_smem_ptr(stA(0)), sAl);
+                CUTE_UNROLL
+                for (int q = 0; q < CA; q++) {
+                    const int i = ptid + q * NP, e = i / (BM / 8), mm = (i % (BM / 8)) * 8;
+                    oA[q] = i < TA ? (uint32_t)((char*)&sAt(mm, e) - smem_raw) : ~0u;
+                }
             }
-        }
-        uint32_t oB[CB];
-        int eB[CB];
-        const bfloat16_t* vptr[CB];                      // V's row 0 at the chunk's columns (+ the child's row)
-        {
-            Tensor sBt = make_tensor(make_smem_ptr(stB(0)), sBl);
-            CUTE_UNROLL
-            for (int q = 0; q < CB; q++) {
-                const int i = ptid + q * NP, e = i / (BN / 8), bb = (i % (BN / 8)) * 8;
-                oB[q] = i < TB ? (uint32_t)((char*)&sBt(bb, e) - smem_raw) : ~0u;
-                eB[q] = e;
-                vptr[q] = vt + row0 + col0 + bb;
+            {
+                Tensor sBt = make_tensor(make_smem_ptr(stB(0)), sBl);
+                CUTE_UNROLL
+                for (int q = 0; q < CB; q++) {
+                    const int i = ptid + q * NP, e = i / (BN / 8), bb = (i % (BN / 8)) * 8;
+                    oB[q] = i < TB ? (uint32_t)((char*)&sBt(pcol(bb), e) - smem_raw) : ~0u;
+                    eB[q] = e;
+                }
             }
-        }
-        uint32_t oC[CC];
-        int cx[CC], ce[CC];
-        const float* cptr[CC];                           // the values at the chunk's samples (+ the row's offset)
-        CUTE_UNROLL
-        for (int k = 0; k < CC; k++) {
-            constexpr int s4 = S / 4;
-            const int ci = ptid + k * NP;
-            const bool on = ci < NC4;
-            const int x = on ? ci / (KT * s4) : 0, rem = ci - x * (KT * s4);
-            const int e = on ? rem / s4 : 0, q4 = on ? rem % s4 : 0;
-            oC[k] = on ? (uint32_t)(ABYTES + 2 * UBYTES + ((x * KT + e) * S + 4 * q4) * 4) : ~0u;   // (after V, u)
-            cx[k] = x; ce[k] = e;
-            cptr[k] = vals + b0 + 4 * q4;
-        }
-        long vrows_l = vrows;                            // (strides in registers: else reloaded from the constant bank)
-        int B_i = B;
-        asm volatile("" : "+l"(vrows_l), "+r"(B_i));
-        // the epilogue's pieces of A of tile row `ptid` (a sample's K ranks one 64-byte run, the tile's S of them),
-        // one prefetched into L2 a k-step
+            CUTE_UNROLL
+            for (int k = 0; k < CC; k++) {
+                constexpr int s4 = S / 4;
+                const int ci = ptid + k * NP;
+                const bool on = ci < NC4;
+                const int x = on ? ci / (KT * s4) : 0, rem = ci - x * (KT * s4);
+                const int e = on ? rem / s4 : 0, q4 = on ? rem % s4 : 0;
+                oC[k] = on ? (uint32_t)(ABYTES + 2 * UBYTES + ((x * KT + e) * S + 4 * q4) * 4) : ~0u;   // (after V, u)
+                cx[k] = x; ce[k] = e;
+            }
+            vrows_l = vrows; B_i = B; sb_r = sbase;
+            asm volatile("" : "+l"(vrows_l), "+r"(B_i), "+r"(sb_r));
+            CUTE_UNROLL
+            for (int q = 0; q < CA; q++) asm volatile("" : "+r"(oA[q]));
+            CUTE_UNROLL
+            for (int q = 0; q < CB; q++) asm volatile("" : "+r"(oB[q]), "+r"(eB[q]));
+            CUTE_UNROLL
+            for (int k = 0; k < CC; k++) asm volatile("" : "+r"(oC[k]), "+r"(cx[k]), "+r"(ce[k]));
+        };
+        places();
+        // The tile being produced (`pt`) and its bases, `tile_bases`: A's chunks in their slabs, V's row 0 at the chunk's
+        // columns (its place in the stage permuted: `pcol`), the values at the chunk's samples, the collapse's pieces
+        // of A of tile row `ptid` (a sample's K ranks one 64-byte run, the tile's S of them: one prefetched into L2 a
+        // k-step) -- and the parameter tiles' pointers (cp.async: each chunk's at the current edge tile's slab, the
+        // next one's base loaded an edge tile ahead)
         static_assert(NP == BM, "a producer a tile row's prefetches");
-        const float* pfa = fa + (long)b0 * a_sb + (node_of(ptid) - vn0) * K;
-        auto prefetch = [&](int q) { asm volatile("prefetch.global.L2::evict_last [%0];" ::"l"(pfa + (long)q * a_sb)); };
-        CUTE_UNROLL
-        for (int q = 0; q < CA; q++) asm volatile("" : "+r"(oA[q]), "+r"(gA[q]), "+r"(bA[q]));
-        CUTE_UNROLL
-        for (int q = 0; q < CB; q++) asm volatile("" : "+r"(oB[q]), "+r"(eB[q]), "+l"(vptr[q]));
-        CUTE_UNROLL
-        for (int k = 0; k < CC; k++) asm volatile("" : "+r"(oC[k]), "+r"(cx[k]), "+r"(ce[k]), "+l"(cptr[k]));
-        // the parameter tiles (cp.async): each chunk's pointer at the current edge tile's slab, the next one's base
-        // loaded an edge tile ahead
+        Tile pt = tile_at((int)blockIdx.x);
+        int gA[CA], bA[CA];
+        const bfloat16_t* vptr[CB];
+        const float* cptr[CC];
+        const float* pfa = nullptr;
         int ecur = 0;
         const bfloat16_t* aptr[CA];
         long pnx[CA];
-        if constexpr (!TMAA) {
+        auto tile_bases = [&]() {
             CUTE_UNROLL
             for (int q = 0; q < CA; q++) {
-                aptr[q] = params + gA[q] + pbase[(long)bA[q] * knt];
-                pnx[q] = knt > 1 ? pbase[(long)bA[q] * knt + 1] : 0;
+                const int i = ptid + q * NP, e = i / (BM / 8), mm = (i % (BM / 8)) * 8;
+                const int bq = bpt > 1 ? mm / block_size : 0;
+                gA[q] = e * block_size + (bpt > 1 ? mm - bq * block_size : mm) + pt.tile_id * BM;
+                bA[q] = pt.r + bq;
             }
-        }
+            CUTE_UNROLL
+            for (int q = 0; q < CB; q++) vptr[q] = vt + row0 + col0_of(pt) + ((ptid + q * NP) % (BN / 8)) * 8;
+            CUTE_UNROLL
+            for (int k = 0; k < CC; k++) {
+                constexpr int s4 = S / 4;
+                const int ci = ptid + k * NP;
+                cptr[k] = vals + pt.b0 + 4 * (ci < NC4 ? (ci % (KT * s4)) % s4 : 0);
+            }
+            pfa = fa + (long)pt.b0 * a_sb + (node_of(pt, ptid) - vn0) * K;
+            ecur = 0;
+            if constexpr (!TMAA) {
+                CUTE_UNROLL
+                for (int q = 0; q < CA; q++) {
+                    aptr[q] = params + gA[q] + pbase[(long)bA[q] * knt];
+                    pnx[q] = knt > 1 ? pbase[(long)bA[q] * knt + 1] : 0;
+                }
+            }
+            CUTE_UNROLL
+            for (int q = 0; q < CA; q++) asm volatile("" : "+r"(gA[q]), "+r"(bA[q]));
+            CUTE_UNROLL
+            for (int q = 0; q < CB; q++) asm volatile("" : "+l"(vptr[q]));
+            CUTE_UNROLL
+            for (int k = 0; k < CC; k++) asm volatile("" : "+l"(cptr[k]));
+        };
+        tile_bases();
+        auto prefetch = [&](int q) { asm volatile("prefetch.global.L2::evict_last [%0];" ::"l"(pfa + (long)q * a_sb)); };
         const uint32_t bar0 = (uint32_t)__cvta_generic_to_shared(&fullr[0]);
         auto issue_a = [&](int t, uint32_t ss, int st) {    // (t increasing; st = t % ST, its stage)
             if constexpr (TMAA) {
@@ -651,7 +650,7 @@ __global__ void __launch_bounds__(OM_THREADS, 1) lr_om_kernel(
                     const uint32_t bar = bar0 + st * 8;
                     asm volatile("mbarrier.expect_tx.relaxed.cta.shared::cta.b64 [%0], %1;" ::"r"(bar), "r"(ABYTES)
                                  : "memory");
-                    tma_load_3d(ss, &tmapA, 0, t * KT, r, bar);
+                    tma_load_3d(ss, &tmapA, 0, t * KT, pt.r, bar);
                 }
             } else {
                 if (t / SUB != ecur) {
@@ -667,19 +666,18 @@ __global__ void __launch_bounds__(OM_THREADS, 1) lr_om_kernel(
                 for (int q = 0; q < CA; q++) if (TA % NP == 0 || oA[q] != ~0u) cpa16(ss + oA[q], aptr[q] + hs);
             }
         };
-        // the first stages' parameter tiles while the launch before may still run (none of the pass writes them)
-        for (int t = 0; t < min(nk, ST); t++) issue_a(t, sbase + t * STAGE, t);
-        // V's children, the element rows' bases and (run 0) the rows' children, two k-steps ahead
-        const int* jg = jpos + (long)g * num_edges;
-        const int* cbr = FUSED ? cbase + (long)r * knt * 4 : nullptr;
-        const long* ebr = ebase + (long)r * knt;
+        // the CTA's first tile's first stages' parameter tiles while the launch before may still run (none of the pass
+        // writes them)
+        const int npre = min(nk, ST);
+        for (int t = 0; t < npre; t++) issue_a(t, sbase + t * STAGE, t);
+        // V's children, the element rows' bases and (run 0) the rows' children, two k-steps ahead: a tile's tables
+        // (`tile_tables`: its first two k-steps' loaded)
+        const int* jg = nullptr;
+        const int* cbr = nullptr;
+        const long* ebr = nullptr;
         int jr[2][CB], jcr[2][CC];
         long br[2][2];
         const int* jq[CB];                               // (a chunk's row in jpos at k-step 0)
-        CUTE_UNROLL
-        for (int q = 0; q < CB; q++) jq[q] = jg + eB[q];
-        CUTE_UNROLL
-        for (int q = 0; q < CB; q++) asm volatile("" : "+l"(jq[q]));
         auto load_j = [&](int t, int (&j)[CB]) {
             CUTE_UNROLL
             for (int q = 0; q < CB; q++) j[q] = TB % NP == 0 || oB[q] != ~0u ? ldv_s32(jq[q] + t * KT) : -1;
@@ -696,51 +694,69 @@ __global__ void __launch_bounds__(OM_THREADS, 1) lr_om_kernel(
             CUTE_UNROLL
             for (int k = 0; k < CC; k++) j[k] = oC[k] != ~0u && cx[k] == 0 ? ldv_s32(jg + t * KT + ce[k]) : 0;
         };
-        load_j(0, jr[0]); load_b(0, br[0]); load_jc(0, jcr[0]);
-        if (nk > 1) { load_j(1, jr[1]); load_b(1, br[1]); load_jc(1, jcr[1]); }
-        cudaGridDependencySynchronize();                 // (the children's values: the launches before's)
-        int s = 0, ph = 0;                               // the stage and the parity of its uses so far
-        uint32_t sb_r = sbase;
-        asm volatile("" : "+r"(sb_r));
-        for (int jb = 0; jb < nk; jb += 2) {
+        auto tile_rows = [&]() {                         // (the tile's rows of the tables)
+            jg = jpos + (long)ugrp[pt.r] * num_edges;
+            cbr = FUSED ? cbase + (long)pt.r * knt * 4 : nullptr;
+            ebr = ebase + (long)pt.r * knt;
             CUTE_UNROLL
-            for (int u = 0; u < 2; u++) {
-                const int t = jb + u;
-                if (t < nk) {
-                    uint32_t ss = sb_r + s * STAGE;
-                    asm volatile("" : "+r"(ss));
-                    if (t >= ST) {
-                        mbar_wait(&empty[s], ph ^ 1);
-                        issue_a(t, ss, s);
-                    }
-                    CUTE_UNROLL
-                    for (int q = 0; q < CB; q++) {
-                        if (TB % NP != 0 && oB[q] == ~0u) continue;
-                        const int jc = jr[u][q];         // (no child: nothing copied, zeros)
-                        const bfloat16_t* src = vptr[q] + (long)max(jc, 0) * vrows_l;
-                        asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(ss + oB[q]), "l"(src),
-                                     "r"(jc >= 0 ? 16u : 0u) : "memory");
-                    }
-                    CUTE_UNROLL
-                    for (int k = 0; k < CC; k++) {
-                        if (oC[k] == ~0u) continue;
-                        const long base = cx[k] ? br[u][1] : br[u][0];   // (a dummy chunk of a product: -1)
-                        const bool ninf = cx[k] == 0 && jcr[u][k] < 0;   // (a row of no child: -inf)
-                        const float* src = ninf ? g_ninf : cptr[k] + (max(base, 0L) + ce[k]) * B_i;
-                        asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(ss + oC[k]), "l"(src),
-                                     "r"(ninf || base >= 0 ? 16u : 0u) : "memory");
-                    }
-                    cpa_mbar_arrive(&fullr[s]);          // (tracks every copy this thread issued: the stage's A too)
-                    if (t < S) prefetch(t);
-                    if (t + 2 < nk) { load_j(t + 2, jr[u]); load_b(t + 2, br[u]); load_jc(t + 2, jcr[u]); }
-                    if (++s == ST) { s = 0; ph ^= 1; }
+            for (int q = 0; q < CB; q++) jq[q] = jg + eB[q];
+            CUTE_UNROLL
+            for (int q = 0; q < CB; q++) asm volatile("" : "+l"(jq[q]));
+        };
+        auto tile_tables = [&]() {
+            tile_rows();
+            load_j(0, jr[0]); load_b(0, br[0]); load_jc(0, jcr[0]);
+            if (nk > 1) { load_j(1, jr[1]); load_b(1, br[1]); load_jc(1, jcr[1]); }
+        };
+        tile_tables();
+        cudaGridDependencySynchronize();                 // (the children's values: the launches before's)
+        int s = 0, g = 0;                                // the ring's stage, the CTA's k-steps so far
+        unsigned ph = 0u;                                // (the round's phase)
+        auto kstep = [&](int t, int u) {                 // k-step t of the tile, its tables in slot u
+            uint32_t ss = sb_r + s * STAGE;
+            asm volatile("" : "+r"(ss));
+            if (g >= ST) mbar_wait(&empty[s], (int)(ph ^ 1u));   // (used before: once the consumers released it)
+            if (g >= npre) issue_a(t, ss, s);            // (the CTA's first stages' A went ahead)
+            CUTE_UNROLL
+            for (int q = 0; q < CB; q++) {
+                if (TB % NP != 0 && oB[q] == ~0u) continue;
+                const int jc = jr[u][q];         // (no child: nothing copied, zeros)
+                const bfloat16_t* src = vptr[q] + (long)max(jc, 0) * vrows_l;
+                asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(ss + oB[q]), "l"(src),
+                             "r"(jc >= 0 ? 16u : 0u) : "memory");
+            }
+            CUTE_UNROLL
+            for (int k = 0; k < CC; k++) {
+                if (oC[k] == ~0u) continue;
+                const long base = cx[k] ? br[u][1] : br[u][0];   // (a dummy chunk of a product: -1)
+                const bool ninf = cx[k] == 0 && jcr[u][k] < 0;   // (a row of no child: -inf)
+                const float* src = ninf ? g_ninf : cptr[k] + (max(base, 0L) + ce[k]) * B_i;
+                asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(ss + oC[k]), "l"(src),
+                             "r"(ninf || base >= 0 ? 16u : 0u) : "memory");
+            }
+            cpa_mbar_arrive(&fullr[s]);          // (tracks every copy this thread issued: the stage's A too)
+            if (t < S) prefetch(t);
+            if (t + 2 < nk) { load_j(t + 2, jr[u]); load_b(t + 2, br[u]); load_jc(t + 2, jcr[u]); }
+            g++;
+            s = s + 1 == ST ? 0 : s + 1;
+            if (s == 0) ph ^= 1u;                 // (the ring went round)
+        };
+        for (int tile = (int)blockIdx.x;;) {
+            for (int jb = 0; jb < nk; jb += 2) {
+                CUTE_UNROLL
+                for (int u = 0; u < 2; u++) {
+                    const int t = jb + u;
+                    if (t < nk) kstep(t, u);
                 }
             }
+            for (int q = nk; q < S; q++) prefetch(q);
+            tile += step;
+            if (tile >= ntiles) break;
+            pt = tile_at(tile);
+            tile_bases();
+            tile_tables();
         }
-        for (int q = nk; q < S; q++) prefetch(q);
         asm volatile("cp.async.wait_all;\n" ::: "memory");
-        epilogue_wait();
-        epilogue();
         return;
     }
     if (tid >= NC) {
@@ -755,18 +771,15 @@ __global__ void __launch_bounds__(OM_THREADS, 1) lr_om_kernel(
         {
             Tensor sBt = make_tensor(make_smem_ptr(stB(0)), sBl);
             CUTE_UNROLL
-            for (int j = 0; j < CPL; j++) oB[j] = (uint32_t)((char*)&sBt(w * CPW + j * 8, lane) - smem_raw);
+            for (int j = 0; j < CPL; j++) oB[j] = (uint32_t)((char*)&sBt(pcol(w * CPW + j * 8), lane) - smem_raw);
         }
         CUTE_UNROLL
         for (int j = 0; j < CPL; j++) asm volatile("" : "+r"(oB[j]));
-        cudaGridDependencySynchronize();                 // (the shifts: the pass's, read once at the end)
-        const float shv = lane < CPW ? shift[row0 + col0 + w * CPW + lane] : 0.f;
         float mrun[SPW];                                 // the running max of the warp's samples (every lane)
-        CUTE_UNROLL
-        for (int i = 0; i < SPW; i++) mrun[i] = -INFINITY;
-        int s = 0, ph = 0;
-        for (int jj = 0; jj < nk; jj++) {
-            mbar_wait(&fullr[s], ph);
+        int s = 0;
+        unsigned ph = 0u;
+        auto convert = [&]() {                           // the next stage of the ring
+            mbar_wait(&fullr[s], (int)ph);
             const uint32_t ss = sbase + s * STAGE;
             const float* cs = stC(s);
             float cv[SPW], mx[SPW];                      // row `lane`'s values of the warp's samples (both runs)
@@ -785,7 +798,7 @@ __global__ void __launch_bounds__(OM_THREADS, 1) lr_om_kernel(
                 const float mold = mrun[i], mnew = fmaxf(mold, mx[i]);
                 // (the consumers' factor: the sums so far where the max rose, else exactly 1)
                 const float fac = mnew > mold && mold > -INFINITY ? __expf(mold - mnew) : 1.f;
-                if (lane == 0) sfac[s * S + w * SPW + i] = fac;
+                if (lane == 0) { srec[s * 2 * S + w * SPW + i] = fac; srec[s * 2 * S + S + w * SPW + i] = mnew; }
                 mrun[i] = mnew;
                 ex[i] = mnew > -INFINITY ? __expf(cv[i] - mnew) : 0.f;
             }
@@ -806,20 +819,17 @@ __global__ void __launch_bounds__(OM_THREADS, 1) lr_om_kernel(
                              "r"(h[2]), "r"(h[3]) : "memory");
             }
             mbar_arrive(&full[s]);
-            if (++s == ST) { s = 0; ph ^= 1; }
-        }
-        {                                                // the columns' shifts: the running max + V's row's
-            float m = mrun[0];
+            s = s + 1 == ST ? 0 : s + 1;
+            if (s == 0) ph ^= 1u;                         // (the ring went round)
+        };
+        for (int tile = (int)blockIdx.x; tile < ntiles; tile += step) {
             CUTE_UNROLL
-            for (int i = 1; i < SPW; i++) if ((lane % CPW) / K == i) m = mrun[i];
-            if (lane < CPW) smsh[w * CPW + lane] = m > -INFINITY ? m + shv : -INFINITY;
+            for (int i = 0; i < SPW; i++) mrun[i] = -INFINITY;   // (a tile's maxima anew)
+            for (int jj = 0; jj < nk; jj++) convert();
         }
-        asm volatile("bar.arrive 3, %0;" ::"n"(NC + NV) : "memory");   // (smsh: for the consumers' epilogue)
-        epilogue_wait();
-        epilogue();
         return;
     }
-    // ---------------- consumers: the k-steps in order into two fp32 accumulators: S_r (A u) and Z_r (A V) ----------------
+    // ---------------- consumers: a tile's k-steps into two fp32 accumulators, S_r (A u) and Z_r (A V); its collapse ----------------
     TiledMMA mma = make_tiled_mma(SM80_16x8x16_F32BF16BF16F32_TN{}, Layout<Shape<Int<WM>, Int<WN>, _1>>{});
     ThrMMA thr = mma.get_thread_slice(tid);
     Tensor sAt0 = make_tensor(make_smem_ptr(stA(0)), sAl);
@@ -839,57 +849,196 @@ __global__ void __launch_bounds__(OM_THREADS, 1) lr_om_kernel(
     clear(tCrL);
     clear(tCrZ);
     constexpr int KB = size<2>(tCrA);
-    // tCrL is ((2, 2), MI, NI): n-block ni the columns 16 ni + 8 wn + [0, 8) -- sample ni (rank 16)
+    // tCrL is ((2, 2), MI, NI): n-block ni the stage's 8-column block 2 ni + wn -- the tile's sample 2 (ni / 2) + wn, its
+    // ranks 8 (ni % 2) + [0, 8) (`pcol`)
     constexpr int MI = BM / (16 * WM), NI = size<2>(tCrL);
-    static_assert(NI == S && K == 16, "a fragment n-block a sample");
-    int s = 0, ph = 0;
-    for (int j = 0; j < nk; j++) {
-        mbar_wait(&full[s], ph);
-        auto tXsA = tA.partition_S(make_tensor(make_smem_ptr(stA(s)), sAl));
-        auto tXsV = tB.partition_S(make_tensor(make_smem_ptr(stB(s)), sBl));
-        auto tXsU = tB.partition_S(make_tensor(make_smem_ptr(stU(s)), sBl));
+    // Each fragment's partition made once, at stage 0 (a stage's: the same layout STAGE bytes on -- the swizzles act on
+    // the offsets within 1024 bytes): made in the k-step, the compiler remade their swizzled offsets every k-step
+    const auto tXsA0 = tA.partition_S(make_tensor(make_smem_ptr(stA(0)), sAl));
+    const auto tXsV0 = tB.partition_S(make_tensor(make_smem_ptr(stB(0)), sBl));
+    const auto tXsU0 = tB.partition_S(make_tensor(make_smem_ptr(stU(0)), sBl));
+    static_assert(STAGE % 1024 == 0, "a stage a multiple of the swizzles' period");
+    // (a fragment's source: its first element's place in stage 0, for the first 16 k -- the next 16 k's a constant on,
+    // u's UBYTES after V's -- pinned in a register a tile: else remade from the thread id every k-step)
+    constexpr int NFA = size<1>(tXrA), NFB = size<1>(tXrB);
+    uint32_t fA[NFA], fV[NFB];
+    const int dkA = KB > 1 ? (int)((char*)&tXsA0(0, 0, KB - 1) - (char*)&tXsA0(0, 0, 0)) / (KB - 1) : 0;
+    const int dkV = KB > 1 ? (int)((char*)&tXsV0(0, 0, KB - 1) - (char*)&tXsV0(0, 0, 0)) / (KB - 1) : 0;
+    auto load_frag = [&](auto& cpy, uint32_t off, auto&& like, auto&& dst) {
+        copy(cpy, make_tensor(make_smem_ptr((bfloat16_t*)(smem_raw + off)), make_layout(shape(like))), dst);
+    };
+    const int wn = (get<1>(tCcC(0)) >> 3) & 1;
+    constexpr int NR = 2 * MI, NE = NR * NI;             // a thread's rows; its (row, n-block)s: 2 adjacent columns each
+    static_assert(size(tCrL) == 2 * NE && NI == 4, "a thread: NR rows x 2 samples x 2 halves x 2 columns");
+    int s = 0;
+    unsigned ph = 0u;
+    float mfin[2];                                       // its samples' maxima after the tile's last stage
+    int tile = (int)blockIdx.x;
+    Tile T = tile_at(tile);
+    int irow[NR];                                        // its rows' nodes in the node vector (the tile's: loaded in
+    auto kbody = [&](const bool last) {                  // its last k-step, under the MMAs)
+        mbar_wait(&full[s], (int)ph);
+        if (last) {
+            T = tile_at(tile);
+            CUTE_UNROLL
+            for (int ro = 0; ro < NR; ro++) irow[ro] = (int)(node_of(T, get<0>(tCcC(2 * ro))) - vn0);
+        }
+        const uint32_t so = (uint32_t)s * STAGE;         // (the stage's place)
         // the stage's A fragments once, V's into the B fragments for Z, then u's into the same registers for S
         CUTE_UNROLL
         for (int kb = 0; kb < KB; kb++) {
-            copy(s2rA, tXsA(_, _, kb), tXrA(_, _, kb));
-            copy(s2rB, tXsV(_, _, kb), tXrB(_, _, kb));
+            CUTE_UNROLL
+            for (int i = 0; i < NFA; i++) load_frag(s2rA, so + fA[i] + kb * dkA, tXsA0(_, i, kb), tXrA(_, i, kb));
+            CUTE_UNROLL
+            for (int i = 0; i < NFB; i++) load_frag(s2rB, so + fV[i] + kb * dkV, tXsV0(_, i, kb), tXrB(_, i, kb));
         }
         CUTE_UNROLL
         for (int kb = 0; kb < KB; kb++) cute::gemm(mma, tCrA(_, _, kb), tCrB(_, _, kb), tCrZ);
         CUTE_UNROLL
-        for (int kb = 0; kb < KB; kb++) copy(s2rB, tXsU(_, _, kb), tXrB(_, _, kb));
-        float f[S];                                      // the samples' rescale factors (1: no rise)
-        CUTE_UNROLL
-        for (int x4 = 0; x4 < S / 4; x4++) {
-            const float4 q = *(const float4*)&sfac[s * S + 4 * x4];
-            f[4 * x4] = q.x; f[4 * x4 + 1] = q.y; f[4 * x4 + 2] = q.z; f[4 * x4 + 3] = q.w;
-        }
-        mbar_arrive(&empty[s]);                          // the stage is read (its factors too)
-        bool rise = false;
-        CUTE_UNROLL
-        for (int x = 0; x < S; x++) rise |= f[x] != 1.f;
-        if (rise) {                                      // (a sample's max rose this stage: the sums so far rescaled)
+        for (int kb = 0; kb < KB; kb++)
             CUTE_UNROLL
-            for (int i = 0; i < size(tCrL); i++) tCrL(i) *= f[i / (4 * MI)];
+            for (int i = 0; i < NFB; i++)
+                load_frag(s2rB, so + fV[i] + kb * dkV + UBYTES, tXsU0(_, i, kb), tXrB(_, i, kb));
+        const float* rec = srec + s * 2 * S + wn;        // the stage's record: its two samples' factors (1: no rise)
+        const float f0 = rec[0], f1 = rec[2];
+        if (last) { mfin[0] = rec[S]; mfin[1] = rec[S + 2]; }
+        mbar_arrive(&empty[s]);                          // the stage is read (its record too)
+        if (f0 != 1.f || f1 != 1.f) {                    // (a sample's max rose this stage: the sums so far rescaled)
+            CUTE_UNROLL
+            for (int i = 0; i < size(tCrL); i++) tCrL(i) *= (i / (4 * MI)) / 2 ? f1 : f0;
         }
         CUTE_UNROLL
         for (int kb = 0; kb < KB; kb++) cute::gemm(mma, tCrA(_, _, kb), tCrB(_, _, kb), tCrL);
-        if (++s == ST) { s = 0; ph ^= 1; }
-    }
-    cudaGridDependencySynchronize();                     // (the epilogue's own guarantee: the launch before is done)
-    asm volatile("bar.sync 3, %0;" ::"n"(NC + NV) : "memory");   // (smsh: the converters'; every stage read)
+        s = s + 1 == ST ? 0 : s + 1;
+        if (s == 0) ph ^= 1u;                            // (the ring went round)
+    };
+    for (;; tile += step) {
     CUTE_UNROLL
-    for (int i = 0; i < size(tCrL); i += 2) {            // (i, i + 1): columns c, c + 1 of one row
-        const int m = get<0>(tCcC(i)), c = get<1>(tCcC(i));
-        const float2 M = *(const float2*)&smsh[c];
-        const float o0 = M.x == -INFINITY ? -INFINITY : (logf(tCrL(i)) + M.x);
-        const float o1 = M.y == -INFINITY ? -INFINITY : (logf(tCrL(i + 1)) + M.y);
-        *(float2*)&gS[m * GS + c] = make_float2(o0, o1);
-        *(float2*)&gZ[m * GS + c] = make_float2(tCrZ(i), tCrZ(i + 1));
+    for (int i = 0; i < NFA; i++) { fA[i] = (uint32_t)((char*)&tXsA0(0, i, 0) - smem_raw); asm volatile("" : "+r"(fA[i])); }
+    CUTE_UNROLL
+    for (int i = 0; i < NFB; i++) { fV[i] = (uint32_t)((char*)&tXsV0(0, i, 0) - smem_raw); asm volatile("" : "+r"(fV[i])); }
+    clear(tCrL);
+    clear(tCrZ);
+    for (int j = 0; j + 1 < nk; j++) kbody(false);
+    kbody(true);
+    if (tile == (int)blockIdx.x)
+        cudaGridDependencySynchronize();                 // (the epilogue's own guarantee: the launch before is done)
+    // THE COLLAPSE, from the registers: element e = ro + NR ni holds the columns (c, c + 1) of row ro's node in n-block
+    // ni; a (row, sample)'s 16 ranks are 2 halves x 2 columns here x the 4 lanes of the group. The node's value
+    // lse_r(A + log S_r) - lse_r(A + log Z_r), log Z and the share differences the backward's dA takes (`vnm`: the
+    // layer's kept D), as `lowrank_mixture.cu`'s `collapse_sums<16>` forms them, the sums over the ranks as a tree
+    // (the pair, the halves, the lanes) and a share as its term over the sum. A warp issues in order -- it waits a
+    // cache round trip at the first use of a load not back yet, and a spill is such a load (the stages hold the SM's
+    // cache): so nothing on the stack, and each sample's loads issued ahead of work that needs none.
+    {
+        const long cT = col0_of(T);
+        constexpr unsigned FULLW = 0xffffffffu;
+        const bool head = (tid & 3) == 0;                // (a group's one writer of the pair's values)
+        int c0[2];                                       // a sample's columns here: c0, c0 + 1, c0 + 8, c0 + 9
+        float2 A0[2][NR], A1[2][NR], H0[2], H1[2];       // A's and the shifts' there
+        float ms[2][NR], mz[2][NR];
+        auto load = [&](int sg) {
+            c0[sg] = pcol(get<1>(tCcC(2 * NR * (2 * sg))));
+            H0[sg] = *(const float2*)&shift[row0 + cT + c0[sg]];
+            H1[sg] = *(const float2*)&shift[row0 + cT + c0[sg] + 8];
+            const float* base = fa + (long)(T.b0 + c0[sg] / K) * a_sb + c0[sg] % K;   // (A[b, i, r] as the caller gives it)
+            CUTE_UNROLL
+            for (int ro = 0; ro < NR; ro++) {
+                A0[sg][ro] = *(const float2*)(base + (long)irow[ro] * K);
+                A1[sg][ro] = *(const float2*)(base + (long)irow[ro] * K + 8);
+            }
+        };
+        auto logs = [&]() {
+            CUTE_UNROLL
+            for (int i = 0; i < size(tCrL); i++) { tCrL(i) = logf(tCrL(i)); tCrZ(i) = logf(tCrZ(i)); }
+        };
+        auto part1 = [&](int sg) {                       // the terms' logs (in the sums' registers), their maxima
+            const float mm = mfin[sg];
+            const float M00 = mm + H0[sg].x, M01 = mm + H0[sg].y, M10 = mm + H1[sg].x, M11 = mm + H1[sg].y;
+            CUTE_UNROLL
+            for (int ro = 0; ro < NR; ro++) {
+                const int e0 = ro + NR * (2 * sg), e1 = e0 + NR;
+                tCrL(2 * e0) = A0[sg][ro].x + (tCrL(2 * e0) + M00);
+                tCrL(2 * e0 + 1) = A0[sg][ro].y + (tCrL(2 * e0 + 1) + M01);
+                tCrL(2 * e1) = A1[sg][ro].x + (tCrL(2 * e1) + M10);
+                tCrL(2 * e1 + 1) = A1[sg][ro].y + (tCrL(2 * e1 + 1) + M11);
+                tCrZ(2 * e0) = A0[sg][ro].x + (tCrZ(2 * e0) + H0[sg].x);
+                tCrZ(2 * e0 + 1) = A0[sg][ro].y + (tCrZ(2 * e0 + 1) + H0[sg].y);
+                tCrZ(2 * e1) = A1[sg][ro].x + (tCrZ(2 * e1) + H1[sg].x);
+                tCrZ(2 * e1 + 1) = A1[sg][ro].y + (tCrZ(2 * e1 + 1) + H1[sg].y);
+                ms[sg][ro] = fmaxf(fmaxf(tCrL(2 * e0), tCrL(2 * e0 + 1)), fmaxf(tCrL(2 * e1), tCrL(2 * e1 + 1)));
+                mz[sg][ro] = fmaxf(fmaxf(tCrZ(2 * e0), tCrZ(2 * e0 + 1)), fmaxf(tCrZ(2 * e1), tCrZ(2 * e1 + 1)));
+            }
+        };
+        float ss[NR], sz[NR];
+        auto part2a = [&](int sg) {
+            CUTE_UNROLL
+            for (int d = 1; d <= 2; d <<= 1) {
+                CUTE_UNROLL
+                for (int ro = 0; ro < NR; ro++) {
+                    ms[sg][ro] = fmaxf(ms[sg][ro], __shfl_xor_sync(FULLW, ms[sg][ro], d));
+                    mz[sg][ro] = fmaxf(mz[sg][ro], __shfl_xor_sync(FULLW, mz[sg][ro], d));
+                }
+            }
+            CUTE_UNROLL
+            for (int ro = 0; ro < NR; ro++) {            // the terms (a pair of no mass: nan, caught below)
+                const int e0 = ro + NR * (2 * sg), e1 = e0 + NR;
+                CUTE_UNROLL
+                for (int x = 0; x < 2; x++) {
+                    tCrL(2 * e0 + x) = expf(tCrL(2 * e0 + x) - ms[sg][ro]); tCrL(2 * e1 + x) = expf(tCrL(2 * e1 + x) - ms[sg][ro]);
+                    tCrZ(2 * e0 + x) = expf(tCrZ(2 * e0 + x) - mz[sg][ro]); tCrZ(2 * e1 + x) = expf(tCrZ(2 * e1 + x) - mz[sg][ro]);
+                }
+                ss[ro] = (tCrL(2 * e0) + tCrL(2 * e0 + 1)) + (tCrL(2 * e1) + tCrL(2 * e1 + 1));
+                sz[ro] = (tCrZ(2 * e0) + tCrZ(2 * e0 + 1)) + (tCrZ(2 * e1) + tCrZ(2 * e1 + 1));
+            }
+            CUTE_UNROLL
+            for (int d = 1; d <= 2; d <<= 1) {
+                CUTE_UNROLL
+                for (int ro = 0; ro < NR; ro++) {
+                    ss[ro] += __shfl_xor_sync(FULLW, ss[ro], d);
+                    sz[ro] += __shfl_xor_sync(FULLW, sz[ro], d);
+                }
+            }
+        };
+        auto part2b = [&](int sg, auto&& mid) {          // (`mid`: run after the first two rows)
+            const int b = T.b0 + c0[sg] / K;
+            float nv[NR], zs[NR];                        // the pairs' values and log Z (the group's head stores them)
+            CUTE_UNROLL
+            for (int ro = 0; ro < NR; ro++) {
+                const int e0 = ro + NR * (2 * sg), e1 = e0 + NR;
+                const float ls = ms[sg][ro] > -INFINITY ? ms[sg][ro] + logf(ss[ro]) : -INFINITY;
+                const float z = mz[sg][ro] > -INFINITY ? mz[sg][ro] + logf(sz[ro]) : -INFINITY;
+                const bool live = ls > -INFINITY && z > -INFINITY;
+                // (Z = 0, a node whose parameters are all 0: no mass, -inf -- as the collapse kernel)
+                nv[ro] = live ? ls - z : -INFINITY; zs[ro] = z;
+                const float rs = live ? 1.f / ss[ro] : 0.f, rz = live ? 1.f / sz[ro] : 0.f;
+                const float o0 = live ? tCrL(2 * e0) * rs - tCrZ(2 * e0) * rz : 0.f;
+                const float o1 = live ? tCrL(2 * e0 + 1) * rs - tCrZ(2 * e0 + 1) * rz : 0.f;
+                const float o2 = live ? tCrL(2 * e1) * rs - tCrZ(2 * e1) * rz : 0.f;
+                const float o3 = live ? tCrL(2 * e1 + 1) * rs - tCrZ(2 * e1 + 1) * rz : 0.f;
+                float* vr = vnm + ((long)irow[ro] + vn0) * cols + cT + c0[sg];
+                *(float2*)vr = make_float2(o0, o1);
+                *(float2*)(vr + 8) = make_float2(o2, o3);
+                if (ro == 1) mid();
+            }
+            if (head) {
+                CUTE_UNROLL
+                for (int ro = 0; ro < NR; ro++) {
+                    node_mars[((long)irow[ro] + vn0 + nshift) * B + b] = nv[ro];
+                    lz[(long)irow[ro] * B + b] = zs[ro];
+                }
+            }
+        };
+        load(0);
+        logs();
+        part1(0); part2a(0); part2b(0, [] {});
+        load(1);
+        part1(1); part2a(1); part2b(1, [] {});
     }
-    epilogue_wait();
-    epilogue();
+    if (tile + step >= ntiles) break;
+    }
 }
+
 
 // ======================= the backward's one-launch form: the data half's element flows =======================
 // On the virtual batch (its node values taken as 0) the data half's virtual element flows are one product over the
@@ -1750,6 +1899,15 @@ static CUtensorMap om_tmap(const void* base, long block_size, long knt, long row
     return e.map;
 }
 
+// The forward's CTAs a launch at most (0: an SM each): the tests make them few, so a CTA takes several tiles at the
+// sizes they run (one or two a CTA otherwise)
+static int g_om_ctas_most = 0;
+void set_om_ctas_most(int64_t n) { g_om_ctas_most = (int)std::max<int64_t>(n, 0); }
+// The one-launch kernels' last grids (for the tests: whether their hooks took): the forward's CTAs and sample tiles a
+// group; the backward's dA CTAs and sample tiles a group
+static int64_t g_last_grids[4] = {0, 0, 0, 0};
+std::vector<int64_t> om_last_grids() { return std::vector<int64_t>(g_last_grids, g_last_grids + 4); }
+
 // The current device's SMs
 static int om_sms() {
     static int sms_of[64] = {};
@@ -1777,7 +1935,7 @@ static void launch_om(const bfloat16_t* params, const long* pbase, const bfloat1
                       float* lz, long nshift, long vn0, cudaStream_t st) {
     constexpr int ST = OM_ST, S = OM_BN / OM_K;
     constexpr int STAGE = (32 * OM_BM * 2 + 2 * 32 * OM_BN * 2 + 2 * 32 * S * 4 + 1023) / 1024 * 1024;
-    constexpr int SMEM = ST * STAGE + OM_BN * 4 + ST * S * 4 + 3 * ST * 8;
+    constexpr int SMEM = ST * STAGE + 2 * ST * S * 4 + 3 * ST * 8;   // (the stages, their records, the barriers)
     static_assert(SMEM <= 101376, "past sm_120's 99 KB of shared memory a block");
     auto kernel = lr_om_kernel<ST, FUSED, TMAA>;
     static bool attr_set[64] = {};
@@ -1789,10 +1947,14 @@ static void launch_om(const bfloat16_t* params, const long* pbase, const bfloat1
     }
     const int mtiles = OM_BM >= block_size ? 1 : block_size / OM_BM;
     const long n = (long)(OM_K * B / OM_BN) * ((long)rows * block_size / OM_BM);
-    TORCH_CHECK(n < (1L << 31), "lowrank om: a grid past 2^31 blocks");
-    launch_pdl(kernel, dim3((unsigned)n), dim3(OM_THREADS), SMEM, st, params, pbase, vt, vrows, row0, shift, vals, ebase,
-               cbase, jpos, ugrp, knt, mtiles, block_size, B, vnm, nids, num_edges, tmapA, fa, a_sb, node_mars, lz,
-               nshift, vn0, om_tile_group());
+    TORCH_CHECK(n < (1L << 31), "lowrank om: past 2^31 tiles");
+    // (persistent: a CTA an SM at most -- one fits, by its shared memory --, each taking every grid-th tile)
+    int nsm = om_sms();
+    if (g_om_ctas_most > 0) nsm = std::min(nsm, g_om_ctas_most);
+    g_last_grids[0] = std::min<long>(n, nsm); g_last_grids[1] = om_tile_group();
+    launch_pdl(kernel, dim3((unsigned)std::min<long>(n, nsm)), dim3(OM_THREADS), SMEM, st, params, pbase, vt, vrows, row0,
+               shift, vals, ebase, cbase, jpos, ugrp, knt, mtiles, block_size, B, vnm, nids, num_edges, tmapA, fa, a_sb,
+               node_mars, lz, nshift, vn0, (int)n, om_tile_group());
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
@@ -1992,6 +2154,7 @@ void lowrank_backward_om(torch::Tensor flows, torch::Tensor vals, c10::optional<
             C10_CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM));
             if (dev < 64) attr_set[dev] = true;
         }
+        if (da) { g_last_grids[2] = n_da; g_last_grids[3] = om_tile_group(); }
         launch_pdl(kernel, dim3((unsigned)(n + n_da)), dim3(OM_THREADS), SMEM, st, pp, ppid.data_ptr<long>(),
                    ppar.data_ptr<long>(), reinterpret_cast<const bfloat16_t*>(ua.data_ptr()), (long)ua.size(1),
                    (long)row0, sha.data_ptr<float>(), node_flows.data_ptr<float>(), node_mars.data_ptr<float>(),
@@ -2026,6 +2189,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("lowrank_backward_om", &lowrank_backward_om,
           "the data half of the sum_exp backward over the virtual batch in one launch: element flows and dB's data part");
     m.def("set_da_ctas_most", &set_da_ctas_most, "(tests) the backward's dA CTAs a launch at most; 0: no cap");
+    m.def("set_om_ctas_most", &set_om_ctas_most, "(tests) the forward's CTAs a launch at most; 0: an SM each");
+    m.def("om_last_grids", &om_last_grids,
+          "(tests) the last launches' grids: the forward's CTAs and group, the backward's dA CTAs and group");
     m.def("set_tile_group", &set_tile_group,
           "(tests) the sample tiles a group of the one-launch grids' order; 0: a quarter of the SMs");
     m.def("om_bw_serves", &om_bw_serves,
