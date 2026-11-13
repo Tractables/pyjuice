@@ -27,10 +27,15 @@ EXP_SUM_FUSED_RANK_MOST = 64
 EXP_SUM_ZSPLIT = 0
 #: At rank 16 and the default precision, the kernels of the exp_sum of the fp16-ROUNDED factors
 #: (`kernels/c/lowrank_exp_sum_h.cu`: A' = log2 e A and B rounded to fp16 once, one MMA a 16 x 8 tile, fp32 sums) where
-#: the fused kernels serve (`exp_sum_h`); off, the bf16 three-term kernels of the unrounded factors
+#: the fused kernels serve (`exp_sum_h`); off, the bf16 three-term kernels of the unrounded factors. They read fp16
+#: factors where they lie (`LowRank.external_dtypes`), others (fp32, bf16) through an fp16 copy
 EXP_SUM_H = True
-#: ... their forward's tiles' children (64 or 128)
+#: ... their forward's tiles' children
 EXP_SUM_H_TN = 64
+#: ... the forward's fp16 copy of the factors (made where they are fp32, or fp16 the kernels cannot read in place) kept
+#: for the backward, which reads it instead of converting the factors again (its prologue -61% at B1024; the copy half
+#: the fp32 factors' bytes, held from the forward to the node vector's backward); off, each pass converts its own
+EXP_SUM_H_KEEP = True
 
 
 def exp_sum_bf16(kwargs) -> bool:
@@ -83,9 +88,9 @@ def samples_contiguous(t: torch.Tensor) -> bool:
 def exp_sum_fused(desc, geo, tensors, params, node_mars, element_mars) -> bool:
     """Whether a node vector's pass goes through the "exp_sum" form's fused kernels: the form, a rank they hold, the
     shared parameters block-major in one run (`LowRank._geometry`'s grid), the circuit's buffers fp32 on a GPU of
-    compute capability 8.0 on (the kernels' MMAs), the parameters fp32 or bf16, the factors fp32 with each sample's
-    block contiguous (the caller's, read in place: the bf16 / TF32 kernels take a contiguous copy), and the module
-    built."""
+    compute capability 8.0 on (the kernels' MMAs), the parameters fp32 or bf16, the factors fp32, fp16 or bf16 with
+    each sample's block contiguous (the caller's, read in place: the bf16 / TF32 kernels take a contiguous fp32 copy,
+    `as_f32`), and the module built."""
     if not (EXP_SUM_FUSED and desc.form == "exp_sum" and desc.rank <= EXP_SUM_FUSED_RANK_MOST
             and geo["grid"] is not None and node_mars.is_cuda):
         return False
@@ -94,9 +99,15 @@ def exp_sum_fused(desc, geo, tensors, params, node_mars, element_mars) -> bool:
     if node_mars.dtype != torch.float32 or element_mars.dtype != torch.float32 \
             or params.dtype not in (torch.float32, torch.bfloat16):
         return False
-    if not all(t.dtype == torch.float32 and samples_contiguous(t) for t in tensors):
+    if not all(t.dtype in (torch.float32, torch.float16, torch.bfloat16) and samples_contiguous(t) for t in tensors):
         return False
     return exp_sum_module() is not None
+
+
+def as_f32(t: torch.Tensor) -> torch.Tensor:
+    """A factor as the fp32 kernels and the torch passes take it: contiguous fp32 (fp16 factors converted; fp32 ones
+    themselves where contiguous)."""
+    return t.float().contiguous()
 
 
 class _ForwardMixin:
@@ -137,25 +148,26 @@ class _ForwardMixin:
             form_elements(element_mars, node_mars, children)
 
         state = layer.__dict__["_lr_state"] = dict()
-        rounded = layer.__dict__["_lr_h"] = set()              # (the node vectors the fp16-rounded kernels took)
+        rounded = layer.__dict__["_lr_h"] = dict()             # (the node vectors the fp16-rounded kernels took: their
+                                                                #  factors' fp16 copy, or empty -- read in place)
         for ns_info, tensors in ns_tensors:
             geo = self._geometry(layer, ns_info, node_mars.device)
             if exp_sum_fused(self, geo, tensors, params, node_mars, element_mars):
                 _, _, Nb, cbs, bs = geo["grid"]
                 if exp_sum_h(self, kwargs):
-                    lzs = exp_sum_h_module().exp_sum_h_forward(tensors[0], tensors[1], params, geo["p0"], Nb, cbs, bs,
-                                                               element_mars, geo["rows"], node_mars, ns_info.nid_start,
-                                                               geo["M"], geo["N"], self.rank, EXP_SUM_H_TN,
-                                                               exp_sum_h_theta(geo, params, kwargs))
-                    rounded.add(id(ns_info.ns))
+                    lzs, *copy = exp_sum_h_module().exp_sum_h_forward(
+                        tensors[0], tensors[1], params, geo["p0"], Nb, cbs, bs, element_mars, geo["rows"], node_mars,
+                        ns_info.nid_start, geo["M"], geo["N"], self.rank, EXP_SUM_H_TN,
+                        exp_sum_h_theta(geo, params, kwargs), EXP_SUM_H_KEEP)
+                    rounded[id(ns_info.ns)] = copy if copy[0].numel() > 0 else []
                 else:
-                    lzs = exp_sum_module().exp_sum_forward(tensors[0].contiguous(), tensors[1].contiguous(), params,
-                                                           geo["p0"], Nb, cbs, bs, element_mars, geo["rows"],
-                                                           node_mars, ns_info.nid_start, geo["M"], geo["N"],
-                                                           self.rank, exp_sum_bf16(kwargs))
+                    lzs = exp_sum_module().exp_sum_forward(as_f32(tensors[0]), as_f32(tensors[1]), params, geo["p0"],
+                                                           Nb, cbs, bs, element_mars, geo["rows"], node_mars,
+                                                           ns_info.nid_start, geo["M"], geo["N"], self.rank,
+                                                           exp_sum_bf16(kwargs))
                 state[id(ns_info.ns)] = lzs.t()                 # (`[B, M]` as the torch passes keep it: a view)
                 continue
-            A, Bm = self._as_given(tensors)
+            A, Bm = (t.float() for t in self._as_given(tensors))  # (fp16 factors as float32; views as they lie)
             theta = self._dense_params(geo, params)
             lc = self._child_values(geo, element_mars)
 

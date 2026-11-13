@@ -162,8 +162,9 @@ def validate_external_tensors(ns, parameterization, tensors: Any, batch_size: in
         assert torch.is_tensor(tensor), f"External tensor {idx} should be a `torch.Tensor`."
         assert tuple(tensor.size()) == tuple(shape), \
             f"External tensor {idx} should be of shape {tuple(shape)}, got {tuple(tensor.size())}."
-        assert tensor.dtype == torch.float32, \
-            f"External tensor {idx} should be of dtype `torch.float32`, got {tensor.dtype}."
+        assert tensor.dtype == torch.float32 or tensor.dtype in parameterization.external_dtypes(ns), \
+            f"External tensor {idx} should be of dtype " \
+            f"{' or '.join(f'`{d}`' for d in parameterization.external_dtypes(ns))}, got {tensor.dtype}."
         if require_contiguous:
             assert tensor.is_contiguous(), f"External tensor {idx} should be contiguous."
         assert tensor.device == device, \

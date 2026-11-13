@@ -190,6 +190,16 @@ class LowRank(_ForwardMixin, _BackwardMixin, _DenominatorsMixin, SumParameteriza
             return lowrank_forward.EXP_SUM_H and self.rank == 16 and lowrank_forward.exp_sum_h_module() is not None
         return self.form == "sum_exp" and lowrank_virtual._module() is not None
 
+    def external_dtypes(self, ns):
+        """float32, and float16 / bfloat16 where the "exp_sum" form's fp16 kernels read the factors in place
+        (`reads_in_place`): they take fp16 factors as they lie -- the rounding they make of float32 ones anyway,
+        `A' = log2 e A` rounded once more from fp16 A (`lowrank/kernels/c/lowrank_exp_sum_h.cu`'s `scale_h2`) -- with
+        no copy, bf16 ones (an autocast head's) through their fp16 copy, as float32 ones; a pass at `precision = "fp32"`
+        takes either as float32."""
+        if self.form == "exp_sum" and self.reads_in_place(ns):
+            return (torch.float32, torch.float16, torch.bfloat16)
+        return (torch.float32,)
+
     def initializes_grads(self, ns) -> bool:
         """`"sum_exp"`: its backward claims each gradient destination it writes in place -- the one-launch form
         storing into all of it, the other paths zeroing it before they add (`lowrank/virtual.py`, `backward.py`)."""

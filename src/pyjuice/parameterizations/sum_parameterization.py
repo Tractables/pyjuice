@@ -209,6 +209,14 @@ class SumParameterization():
         """
         return False
 
+    def external_dtypes(self, ns) -> Tuple[torch.dtype, ...]:
+        """
+        The dtypes `ns`'s external tensors may come in: float32 alone by default. A parameterization whose
+        kernels read another where the tensors lie (:func:`reads_in_place`) lists it too; a tensor of it that
+        is copied into the staging buffer instead is converted to float32 there.
+        """
+        return (torch.float32,)
+
     def validate_ns(self, ns) -> None:
         """
         Check that `ns` is compatible with this parameterization. Called once, at node construction.

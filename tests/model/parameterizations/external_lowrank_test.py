@@ -3656,17 +3656,18 @@ def _h_case(M, N, B, bs = 32, cbs = 32, gain = 1.0, pdtype = torch.float32, thet
                 theta = params[p0 + off.reshape(-1)].double().view(M, N), c = emars[3:3 + N].double().t(), lf = lf)
 
 
-def _h_run(mod, d, A = None, Bf = None, grads = None):
-    """The fp16 forward then backward on `_h_case`'s inputs (A, B as given: in place where they are views; the
-    gradients added into `grads`): (node values [B, M], log Z [B, M], log element flows [B, N], F+ [M, N], W [M, N],
-    dA, dB)."""
+def _h_run(mod, d, A = None, Bf = None, grads = None, keep = False):
+    """The fp16 forward then backward on `_h_case`'s inputs (A, B as given -- fp32 or fp16, in place where they are
+    views --; the gradients added into `grads`; `keep`: the backward reads the forward's fp16 copy of the factors where
+    it made one): (node values [B, M], log Z [B, M], log element flows [B, N], F+ [M, N], W [M, N], dA, dB)."""
     A = d["A"] if A is None else A
     Bf = d["Bf"] if Bf is None else Bf
     M, N, B, dev = d["M"], d["N"], d["B"], d["A"].device
     nm = torch.full([11 + M, B], 123.0, device = dev)
-    lz = mod.exp_sum_h_forward(A, Bf, d["params"], d["p0"], d["Nb"], d["cbs"], d["bs"], d["emars"], d["rows"], nm, 11,
-                               M, N, 16, 64, [])
+    lz, *copy = mod.exp_sum_h_forward(A, Bf, d["params"], d["p0"], d["Nb"], d["cbs"], d["bs"], d["emars"], d["rows"],
+                                      nm, 11, M, N, 16, 64, [], keep)
     assert bool((nm[:11] == 123.0).all())                  # (only the node vector's rows written)
+    assert (copy[0].numel() > 0) == (keep and not _h_in_place(A, Bf))
     nflows = torch.full_like(nm, -float("inf"))
     nflows[11:11 + M] = d["lf"].t().float()
     ef = torch.full_like(d["emars"], -float("inf"))
@@ -3674,14 +3675,34 @@ def _h_run(mod, d, A = None, Bf = None, grads = None):
     dn = torch.zeros_like(pf)
     gA, gB = grads if grads is not None else (torch.zeros(B, M, 16, device = dev), torch.zeros(B, 16, N, device = dev))
     mod.exp_sum_h_backward(A, Bf, d["params"], d["p0"], d["Nb"], d["cbs"], d["bs"], d["emars"], d["rows"], nflows, nm,
-                           11, lz.contiguous(), ef, pf, 0, dn, 0, gA, gB, M, N, 16)
+                           11, lz.contiguous(), ef, pf, 0, dn, 0, gA, gB, M, N, 16, copy if keep else [])
     off = d["off"]                                          # (F+ and W from offset 0 of their buffers)
     return nm[11:].t(), lz.t(), ef[3:3 + N].t(), pf[off], dn[off], gA, gB
 
 
-def _h_reference(d):
-    """`_h_run`'s outputs in float64 from the same fp16-rounded factors: A' = log2 e A, B rounded once."""
-    A2 = (d["A"] * LOG2E).half().double()
+def _h_in_place(A, Bf):
+    """Whether the fp16 kernels read the factors where they lie: fp16, each sample's block 16-byte aligned, M a
+    multiple of 4, N of 8 (`h_in_place`); else through an fp16 copy."""
+    al = lambda t: t.data_ptr() % 16 == 0 and (t.size(0) <= 1 or t.stride(0) % 8 == 0)
+    return A.dtype == torch.float16 and Bf.dtype == torch.float16 and al(A) and al(Bf) and A.size(1) % 4 == 0 and \
+        Bf.size(2) % 8 == 0
+
+
+def _scale_h2(A16):
+    """The kernels' A' of fp16 A (`scale_h2`): fma(a, c1, fl16(a c2)), c1 = fl16(log2 e), c2 = fl16(log2 e - c1),
+    each product exact, each result rounded once (float64 into float16, numpy: one rounding)."""
+    import numpy as np
+    a = A16.cpu().numpy().astype(np.float64)
+    c1, c2 = float.fromhex("0x1.714p+0"), float.fromhex("0x1.478p-12")
+    p = (a * c2).astype(np.float16).astype(np.float64)
+    return torch.from_numpy((a * c1 + p).astype(np.float16)).to(A16.device)
+
+
+def _h_reference(d, A16 = None):
+    """`_h_run`'s outputs in float64 from the same fp16-rounded factors: A' = log2 e A, B rounded once -- from fp16
+    factors `A16` (and `d["Bf"]` rounded), A' their `_scale_h2` and dB's product of A16 itself."""
+    A2 = (d["A"] * LOG2E).half().double() if A16 is None else _scale_h2(A16).double()
+    Ad = A2 * LN2 if A16 is None else A16.double()
     Bf = d["Bf"].half().double()
     th = d["theta"]
     lt = torch.where(th > 0, th.log(), torch.full_like(th, -float("inf")))
@@ -3694,7 +3715,7 @@ def _h_reference(d):
     t = torch.exp(lw + (lf - lz)[:, :, None])
     W = torch.where(th > 0, t.sum(0) / th, torch.zeros_like(th))
     G = q - t
-    return ln, lz, torch.log(q.sum(1)), q.sum(0), W, G @ Bf.transpose(1, 2), (A2 * LN2).transpose(1, 2) @ G
+    return ln, lz, torch.log(q.sum(1)), q.sum(0), W, G @ Bf.transpose(1, 2), Ad.transpose(1, 2) @ G
 
 
 @needs_fused_h
@@ -3711,8 +3732,12 @@ def test_the_fp16_exp_sum_is_the_rounded_factors_exp_sum(case):
     if mod is None:
         pytest.skip("the fp16 exp_sum kernels are not built")
     d = _h_case(**case)
-    got = _h_run(mod, d)
-    want = _h_reference(d)
+    _h_check(_h_run(mod, d), _h_reference(d))
+
+
+def _h_check(got, want):
+    """`_h_run`'s outputs against `_h_reference`'s: node values, log Z and element flows to fp32 rounding, F+ and W to
+    their fp32 sums', the gradients to the fp16 products' (G, B, A' fp16 in their MMAs)."""
     for k, name in enumerate(("values", "log Z", "element flows")):
         x, y = got[k].double(), want[k]
         assert torch.equal(torch.isfinite(x), torch.isfinite(y)), name
@@ -3799,7 +3824,8 @@ def test_the_fp16_exp_sum_forward_off_its_frames(batch):
         params = theta.view(M // bs, bs, N // cbs, cbs).permute(0, 2, 3, 1).contiguous().view(-1).to(dev)
         nmars = torch.empty(M, batch, device = dev)
         lzs = mod.exp_sum_h_forward(A.to(dev).contiguous(), Bm.to(dev).contiguous(), params, 0, N // cbs, cbs, bs,
-                                    emars.to(dev).contiguous(), torch.arange(N, device = dev), nmars, 0, M, N, 16, 64, [])
+                                    emars.to(dev).contiguous(), torch.arange(N, device = dev), nmars, 0, M, N, 16, 64, [],
+                                    False)[0]
         A2 = (A * LOG2E).half().double()
         lw = torch.bmm(A2, Bm.half().double()) * LN2 + theta.double().log()[None]
         lz = torch.logsumexp(lw, 2)
@@ -3867,6 +3893,130 @@ def test_the_fp16_exp_sum_in_chunks_is_the_whole_batchs():
     for k in (5, 6):
         want = torch.cat([p[k] for p in parts], 0)
         assert float((whole[k] - want).abs().max()) <= 1e-5 * float(want.abs().max()), k
+
+
+@needs_fused_h
+@pytest.mark.parametrize("case", [dict(M = 512, N = 512, B = 8), dict(M = 500, N = 488, B = 5, bs = 4, cbs = 8),
+                                  dict(M = 256, N = 384, B = 4, gain = 3.0), dict(M = 250, N = 492, B = 3, bs = 2, cbs = 4)])
+def test_the_fp16_exp_sum_takes_fp16_factors(case):
+    """fp16 factors as they lie (`LowRank.external_dtypes`): read in place -- TMA boxes and cp.async pieces, zeros past
+    M and N -- where each sample's block is 16-byte aligned, M a multiple of 4 and N of 8 (250 x 492: not), else
+    through an fp16 copy; A' their `scale_h2` either way, so the copy's outputs are the in-place ones (the forward's bit
+    for bit; dB's of A' rather than A, to the fp16 products' bar). Every output against float64 from the same factors to
+    the rounded factors' bars."""
+    mod = _fused_h_module()
+    if mod is None:
+        pytest.skip("the fp16 exp_sum kernels are not built")
+    d = _h_case(**case)
+    A16, B16 = d["A"].half(), d["Bf"].half()
+    got = _h_run(mod, d, A = A16, Bf = B16)
+    _h_check(got, _h_reference(d, A16))
+    B, M, N, dev = d["B"], d["M"], d["N"], A16.device
+    bigA = torch.zeros(B, M * 16 + 2, dtype = torch.float16, device = dev)    # (a batch stride of an odd count)
+    bigB = torch.zeros(B, 16 * N + 2, dtype = torch.float16, device = dev)
+    Av, Bv = bigA[:, 1:1 + M * 16].view(B, M, 16), bigB[:, 1:1 + 16 * N].view(B, 16, N)
+    Av.copy_(A16)
+    Bv.copy_(B16)
+    assert not _h_in_place(Av, Bv)
+    for keep in (False, True):
+        again = _h_run(mod, d, A = Av, Bf = Bv, keep = keep)
+        for k in (0, 1):
+            assert torch.equal(again[k], got[k]), (keep, k)
+        fin = torch.isfinite(got[2])
+        assert torch.equal(torch.isfinite(again[2]), fin) and float((again[2] - got[2])[fin].abs().max()) < 1e-5
+        for k, bar in ((3, 1e-5), (4, 1e-5), (5, 1e-5), (6, 2e-3)):
+            assert float((again[k] - got[k]).abs().max()) <= bar * float(got[k].abs().max()), (keep, k)
+
+
+@needs_fused_h
+def test_the_fp16_exp_sum_takes_bf16_factors_through_its_copy():
+    """bf16 factors (an autocast head's) go through the fp16 copy -- A' = log2 e A rounded once from fp32, B exactly
+    (fp16 holds bf16's values in range) --: every output against float64 from those operands."""
+    mod = _fused_h_module()
+    if mod is None:
+        pytest.skip("the fp16 exp_sum kernels are not built")
+    d = _h_case(500, 488, 5, bs = 4, cbs = 8)
+    A16, B16 = d["A"].bfloat16(), d["Bf"].bfloat16()
+    for keep in (False, True):
+        got = _h_run(mod, d, A = A16, Bf = B16, keep = keep)
+        _h_check(got, _h_reference(dict(d, A = A16.float(), Bf = B16.float())))
+
+
+@needs_fused_h
+def test_the_fp16_backward_reads_the_forwards_copy():
+    """fp32 factors are rounded to fp16 once a pass: the forward's copy, kept for the backward (`EXP_SUM_H_KEEP`), which
+    reads it rather than converting the factors again -- its outputs those of a backward converting them itself, to
+    the order of its atomic adds."""
+    mod = _fused_h_module()
+    if mod is None:
+        pytest.skip("the fp16 exp_sum kernels are not built")
+    d = _h_case(500, 488, 5, bs = 4, cbs = 8)
+    kept, own = _h_run(mod, d, keep = True), _h_run(mod, d)
+    for k in (0, 1):
+        assert torch.equal(kept[k], own[k]), k
+    fin = torch.isfinite(own[2])
+    assert torch.equal(torch.isfinite(kept[2]), fin) and float((kept[2] - own[2])[fin].abs().max()) < 1e-5
+    for k in (3, 4, 5, 6):
+        assert float((kept[k] - own[k]).abs().max()) <= 1e-5 * float(own[k].abs().max()), k
+
+
+@needs_fused
+def test_lowrank_exp_sum_takes_fp16_factors_in_place(monkeypatch):
+    """A circuit's LowRank exp_sum node vectors at rank 16 given fp16 factors (`external_dtypes`): the caller's tensors
+    read where they lie by the fp16 kernels, everything the passes leave that of the same values in fp32 to those
+    kernels' tolerance (A' an ulp apart where `scale_h2` rounds otherwise; the gradients into fp16 buffers). fp32
+    factors: the forward's fp16 copy held for each node vector's backward, which drops it."""
+    if _fused_h_module() is None:
+        pytest.skip("the fp16 exp_sum kernels are not built")
+    pc, sums, _, _, _, _ = _pair(_hmm_blocks(160, 32), "exp_sum", rank = 16)
+    dev = pc.params.device
+    torch.manual_seed(13)
+    data = torch.randint(0, NUM_CATS, (6, pc.num_vars), device = dev)
+    ext16 = {a: tuple(t.half() for t in _factors(a, 16, 6, dev, spread = 0.6, seed = 70 + i)) for i, a in enumerate(sums)}
+    ext32 = {a: tuple(t.float() for t in ext16[a]) for a in sums}
+    calls = _fused_calls(monkeypatch)
+    got = _passes(pc, sums, data, ext16)
+    assert calls.count("exp_sum_h_forward") == calls.count("exp_sum_h_backward") == len(sums) > 1, calls
+    for a in sums:
+        assert all(t.data_ptr() == u.data_ptr() for t, u in zip(pc._staged_external_params[a], ext16[a]))
+    want = _passes(pc, sums, data, ext32)
+    _same(got, want, **FUSED_TOL["h"])
+    pc(data, sum_external_params = ext32)
+    for a in sums:
+        copy = pc.external_params_nodes[a].__dict__["_lr_h"][id(a)]
+        assert len(copy) == 2 and all(t.dtype == torch.float16 for t in copy), a
+    pc.backward(data, allow_modify_flows = False, logspace_flows = True)
+    for a in sums:
+        assert pc.external_params_nodes[a].__dict__["_lr_h"][id(a)] == [], a
+
+
+@needs_fused
+def test_lowrank_exp_sum_group_takes_fp16_factors_in_place():
+    """A group's concatenated fp16 factors (`register_external_params_group`) read where they lie -- the members' views
+    split along the group's axis --, the passes those of the same values in fp32 to the fp16 kernels' tolerance."""
+    if _fused_h_module() is None:
+        pytest.skip("the fp16 exp_sum kernels are not built")
+    pc, src = _gated_chain(LowRank(rank = 16, form = "exp_sum"))
+    dev = pc.params.device
+    batch, n = 8, GATE_T - 1
+    g = torch.Generator(device = "cpu").manual_seed(5)
+    A16 = (0.5 * torch.randn(batch, n * GATE_L, 16, generator = g)).half().to(dev)
+    B16 = (0.5 * torch.randn(batch, n * 16, GATE_L, generator = g)).half().to(dev)
+    x = torch.randint(0, NUM_CATS, (batch, GATE_T), generator = g).to(dev)
+    out = {}
+    for name, (A, B) in (("fp16", (A16, B16)), ("fp32", (A16.float(), B16.float()))):
+        gA, gB = torch.zeros(A.shape, device = dev), torch.zeros(B.shape, device = dev)
+        ll = pc(x, sum_external_params = {"tr": (A, B)}).clone()
+        if name == "fp16":
+            mine = {A16.untyped_storage().data_ptr(), B16.untyped_storage().data_ptr()}
+            staged = pc._staged_external_params
+            assert len(staged) == n and all(t.untyped_storage().data_ptr() in mine for ts in staged.values() for t in ts)
+        pc.backward(x, allow_modify_flows = False, logspace_flows = True, sum_external_params_grad = {"tr": (gA, gB)})
+        out[name] = (ll, gA, gB)
+    assert torch.allclose(out["fp16"][0], out["fp32"][0], rtol = 1e-4, atol = 1e-4), \
+        float((out["fp16"][0] - out["fp32"][0]).abs().max())
+    for k in (1, 2):
+        assert float((out["fp16"][k] - out["fp32"][k]).abs().max()) <= 1e-2 * float(out["fp32"][k].abs().max()), k
 
 
 @needs_virtual
