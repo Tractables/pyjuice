@@ -477,16 +477,16 @@ __global__ void __launch_bounds__((WM * WN + PW) * 32) lr_gemm_kernel(
 //
 // V BY SIDE CTAS (`vnext`; `virtual.PIPELINED_V`): the grid's first n_v CTAs form ANOTHER copy's V rows and shifts --
 // the next copy the pass visits -- beside the tiles (`om_v_rows`), instead of every copy's by a launch of their own
-// before the pass; n_v by the launch's shape (`virtual._om_vctas`: 16 where the tiles take at most 4 rounds of the SMs,
-// else 24; none where V's units would take more than twice the tiles' rounds). The side CTAs come FIRST: last in the
-// grid they took the SMs the launch before freed last and ran ~1.5x slower (B2048, 24 of them: the forward 18.8 -> 28.5
-// ms). Their pace (~1.4-2 us a 16 KB unit under the tiles' load) is set by their stores -- V's rows 8 bytes a child a
-// unit, scattered (B1024, 16 side CTAs, V upfront too: the forward 16.4 ms, 9.1 with no stores, 9.5 with no loads). Not
-// taken: an L2 prefetch of the units 8 ahead (B64 / B256 +2%, B1024 / B2048 0).
+// before the pass; n_v by the launch's shape (`virtual._om_vctas`: 16 where the tiles take at most 12 rounds of the
+// SMs, else 20; none where V's units would take more than twice the tiles' rounds). The side CTAs come FIRST: last in
+// the grid they took the SMs the launch before freed last and ran ~1.5x slower (B2048, 24 of them: the forward 18.8 ->
+// 28.5 ms). A side CTA writes a child's run of a sample's ranks at once, 32 bytes (with 8 bytes a child a unit,
+// scattered, the step at B256 / B1024 / B2048 -2.7 / -2.6 / -2.0%). Not taken: an L2 prefetch of the units 8 ahead (B64
+// / B256 +2%, B1024 / B2048 0).
 // MEASURED (croissant, HMM 1024 x 31 in blocks of 32, rank 16, step ms, 3 rounds, two GPUs no one else used, every
-// copy's V upfront -> by side CTAs): B2048 55.22 -> 54.10 (-2.0%), B1024 27.56 -> 26.84 (-2.6%), B256 7.91 -> 7.70
-// (-2.7%), B64 2.569 -> 2.495 (-2.9%), the other GPU -2.0 / -2.3 / -2.7 / -2.9%; at B1024 the forward's launches
-// 8.21 -> 9.65 ms, V's 2.12 -> 0.08 (the pass's first copy).
+// copy's V upfront -> by side CTAs): B2048 55.29 -> 52.98 (-4.2%), B1024 27.51 -> 26.59 (-3.3%), B256 7.88 -> 7.41
+// (-5.9%), B64 2.571 -> 2.505 (-2.6%), the other GPU -3.8 / -3.3 / -6.6 / -2.6%; at B1024 the forward's launches
+// 8.21 -> 9.35 ms, V's 2.12 -> 0.08 (the pass's first copy).
 __device__ __align__(16) float g_ninf[4] = {-INFINITY, -INFINITY, -INFINITY, -INFINITY};   // (a row of no child)
 
 
@@ -502,8 +502,11 @@ constexpr int OM_BM = 128, OM_BN = 64, OM_K = 16, OM_ST = 5, OM_THREADS = 512;
 // its operations -- the same bits: the maxima order-free, the same expf and rounding): the copy's factors `f` [B, K, X]
 // in place (sample stride `f_sb`), V [X, rows] from `row0` (the rows (sample, rank): a sample's K ranks adjacent), `sh`
 // the rows' shifts (each its rank's largest B). Units of OMV_G ranks of a sample -- OMV_G X floats, one bulk copy --,
-// the side CTA vi's samples vi, + n_v, ...; OMV_NB units in flight in the shared memory (`omv_smem` bytes).
-constexpr int OMV_G = 4, OMV_NB = 4, OMV_NW = OM_THREADS / 32;
+// the side CTA vi's samples vi, + n_v, ...; OMV_NB units in flight in the shared memory (`omv_smem` bytes): a sample's.
+// A thread keeps its children's (at most OMV_MAXX) bf16 values of the sample's ranks in registers and writes each
+// child's run of them at once, 32 bytes (MEASURED, B1024, 16 side CTAs: the forward with 8 bytes a child a unit, its
+// stores scattered, 16.4 ms; with no stores 9.1).
+constexpr int OMV_G = 4, OMV_NB = 4, OMV_MAXX = 3, OMV_NW = OM_THREADS / 32;
 // (the one-launch forward's shared memory: its stages, their records, the barriers -- what a side CTA has)
 constexpr long OM_SMEM = (long)OM_ST * ((32 * OM_BM * 2 + 2 * 32 * OM_BN * 2 + 2 * 32 * (OM_BN / OM_K) * 4 + 1023) / 1024 *
                                        1024) + 2 * OM_ST * (OM_BN / OM_K) * 4 + 3 * OM_ST * 8;
@@ -514,6 +517,7 @@ __device__ __forceinline__ void om_v_rows(const float* __restrict__ f0, long f_s
                                           int n_v) {
     static_assert(KC % OMV_G == 0 && OMV_NW % OMV_G == 0, "a unit's ranks; its warps a rank");
     constexpr int NG = KC / OMV_G, WPR = OMV_NW / OMV_G;      // (units a sample; warps a rank)
+    static_assert(OMV_G == 4 && OMV_NB == NG && KC % 8 == 0, "a unit 2 bf16 pairs; a sample's units the buffers");
     float* buf = (float*)smem_raw;                              // [NB][G X]
     uint64_t* bar = (uint64_t*)(smem_raw + (long)OMV_NB * OMV_G * X * 4);
     float* red = (float*)(bar + OMV_NB);                       // [G][WPR]
@@ -535,46 +539,62 @@ __device__ __forceinline__ void om_v_rows(const float* __restrict__ f0, long f_s
     };
     if (tid == 0)
         for (int u = 0; u < min(OMV_NB, nu); u++) issue(u);
-    for (int u = 0; u < nu; u++) {
-        const int q = u % OMV_NB, b = vi + n_v * (u / NG), g = u % NG;
-        mbar_wait(&bar[q], (u / OMV_NB) & 1);
-        const float* in = buf + (long)q * OMV_G * X;
-        {                                                       // rank w / WPR's largest over its children
-            const int r = w / WPR, p = w % WPR;
-            float m = -INFINITY;
-            for (int x = p * 32 + lane; x < X; x += 32 * WPR) m = fmaxf(m, in[(long)r * X + x]);
-            for (int off = 16; off >= 1; off >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, off));
-            if (lane == 0) red[r * WPR + p] = m;
-        }
-        __syncthreads();
-        float mr[OMV_G];
+    for (int s = 0; s < nsamp; s++) {
+        const int b = vi + n_v * s;
+        uint32_t acc[OMV_MAXX][KC / 2];                         // (the sample's ranks at the thread's children)
         #pragma unroll
-        for (int r = 0; r < OMV_G; r++) {
-            float m = red[r * WPR];
-            for (int i = 1; i < WPR; i++) m = fmaxf(m, red[r * WPR + i]);
-            mr[r] = m;
-        }
-        const long at = row0 + (long)b * KC + g * OMV_G;
-        if (tid < OMV_G) {                                      // (its own rank's max again: no array indexed by tid)
-            float m = red[tid * WPR];
-            for (int i = 1; i < WPR; i++) m = fmaxf(m, red[tid * WPR + i]);
-            sh[at + tid] = m;
-        }
-        for (int x = tid; x < X; x += OM_THREADS) {             // (a child's G ranks: 8 bytes of its run)
-            float v[OMV_G];
+        for (int g = 0; g < NG; g++) {                          // (unit s NG + g in buffer g)
+            const int u = s * NG + g;
+            mbar_wait(&bar[g], s & 1);
+            const float* in = buf + (long)g * OMV_G * X;
+            {                                                   // rank w / WPR's largest over its children
+                const int r = w / WPR, p = w % WPR;
+                float m = -INFINITY;
+                for (int x = p * 32 + lane; x < X; x += 32 * WPR) m = fmaxf(m, in[(long)r * X + x]);
+                for (int off = 16; off >= 1; off >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, off));
+                if (lane == 0) red[r * WPR + p] = m;
+            }
+            __syncthreads();
+            float mr[OMV_G];
             #pragma unroll
             for (int r = 0; r < OMV_G; r++) {
-                const float y = in[(long)r * X + x];
-                v[r] = y > -INFINITY ? expf(y - mr[r]) : 0.0f;
+                float m = red[r * WPR];
+                for (int i = 1; i < WPR; i++) m = fmaxf(m, red[r * WPR + i]);
+                mr[r] = m;
             }
-            const __nv_bfloat162 h0 = __floats2bfloat162_rn(v[0], v[1]), h1 = __floats2bfloat162_rn(v[2], v[3]);
-            uint2 pk;
-            pk.x = *reinterpret_cast<const uint32_t*>(&h0);
-            pk.y = *reinterpret_cast<const uint32_t*>(&h1);
-            *reinterpret_cast<uint2*>(out + (long)x * rows + at) = pk;
+            if (tid < OMV_G) {                                  // (its own rank's max again: no array indexed by tid)
+                float m = red[tid * WPR];
+                for (int i = 1; i < WPR; i++) m = fmaxf(m, red[tid * WPR + i]);
+                sh[row0 + (long)b * KC + g * OMV_G + tid] = m;
+            }
+            #pragma unroll
+            for (int i = 0; i < OMV_MAXX; i++) {
+                const int x = tid + i * OM_THREADS;
+                if (x < X) {
+                    float v[OMV_G];
+                    #pragma unroll
+                    for (int r = 0; r < OMV_G; r++) {
+                        const float y = in[(long)r * X + x];
+                        v[r] = y > -INFINITY ? expf(y - mr[r]) : 0.0f;
+                    }
+                    const __nv_bfloat162 h0 = __floats2bfloat162_rn(v[0], v[1]), h1 = __floats2bfloat162_rn(v[2], v[3]);
+                    acc[i][2 * g] = *reinterpret_cast<const uint32_t*>(&h0);
+                    acc[i][2 * g + 1] = *reinterpret_cast<const uint32_t*>(&h1);
+                }
+            }
+            __syncthreads();                                    // (buffer g and `red` free again)
+            if (tid == 0 && u + OMV_NB < nu) issue(u + OMV_NB);
         }
-        __syncthreads();                                        // (buffer q and `red` free again)
-        if (tid == 0 && u + OMV_NB < nu) issue(u + OMV_NB);
+        #pragma unroll
+        for (int i = 0; i < OMV_MAXX; i++) {                    // (a child's run of the sample's ranks: 32 bytes)
+            const int x = tid + i * OM_THREADS;
+            if (x < X) {
+                uint4* dst = reinterpret_cast<uint4*>(out + (long)x * rows + row0 + (long)b * KC);
+                #pragma unroll
+                for (int k = 0; k < KC / 8; k++)
+                    dst[k] = make_uint4(acc[i][4 * k], acc[i][4 * k + 1], acc[i][4 * k + 2], acc[i][4 * k + 3]);
+            }
+        }
     }
 }
 
@@ -2253,7 +2273,9 @@ bool om_serves(int64_t K, int64_t B, int64_t block_size, int64_t rows) {
 // B [B, K, N] fp32 in place, its first row `row0` of `vt` [N, rows] -- by the one-launch forward's side-CTA code
 // (`lowrank_mixture.cu`'s `inplace_operand_kernel`'s operations: the same bits). `om_v_serves(N, K)`: whether it (and
 // the forward's side CTAs) serve N children at rank K.
-bool om_v_serves(int64_t N, int64_t K) { return K == OM_K && N >= 1 && omv_smem((int)N) <= OM_SMEM; }
+bool om_v_serves(int64_t N, int64_t K) {
+    return K == OM_K && N >= 1 && N <= OMV_MAXX * OM_THREADS && omv_smem((int)N) <= OM_SMEM;
+}
 void lowrank_v_rows(torch::Tensor vt, torch::Tensor shift, torch::Tensor fb, int64_t row0) {
     const long X = vt.size(0), rows = vt.size(1), B = fb.size(0);
     TORCH_CHECK(om_v_serves(X, fb.size(1)) && vt.is_cuda() && vt.scalar_type() == torch::kBFloat16 && vt.is_contiguous() &&

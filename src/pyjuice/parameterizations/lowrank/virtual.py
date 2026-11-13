@@ -604,19 +604,19 @@ PIPELINED_V = True
 
 def _om_vctas(B: int, K: int, X: int, tiles: int, children: int, dev) -> int:
     """The one-launch forward's side CTAs forming the next copy's V rows (`B` samples, rank `K`, `X` children; the
-    launch's `tiles`, `children` a tile's k range): few where the tiles take a few rounds of the SMs (the side CTAs'
-    SMs then a round more), more past (the tiles long enough that more of V's work keeps up), a quarter of the SMs at
-    most; 0, none -- the copy's rows by a launch of their own after the forward -- where the side CTAs' units (4 ranks
-    of a sample, ~0.065 of a tile's time a child: ~1.6 us for 1024 children against ~24.5 us) would take more than
-    twice the tiles' rounds. MEASURED (croissant, HMM 1024 x 31 in blocks of 32, rank 16, step ms, every copy's V
-    upfront -> 16 / 24 side CTAs): B64 2.566 -> 2.500 / 2.518, B256 7.988 -> 7.800 / 8.186, B1024 27.68 -> 29.74 /
-    27.05, B2048 55.84 -> 60.63 / 54.87. Not tuned: the tuner's runs (the same launch again and again, its data warm
-    in L2) took 0 at B256 and B2048 (+2-3% there)."""
+    launch's `tiles`, `children` a tile's k range): 16 where the tiles take at most 12 rounds of the SMs, 20 past (the
+    tiles long enough that more of V's work keeps up), a quarter of the SMs at most; 0, none -- the copy's rows by a
+    launch of their own after the forward -- where the side CTAs' units (4 ranks of a sample, ~0.05 of a tile's time a
+    child: ~1.15 us for 1024 children against ~24 us) would take more than twice the tiles' rounds. MEASURED
+    (croissant, HMM 1024 x 31 in blocks of 32, rank 16, step ms, every copy's V upfront -> 12 / 16 / 20 / 24 side
+    CTAs): B64 2.569 -> 2.504 / 2.506 / 2.520 / 2.532, B256 7.990 -> 8.024 / 7.507 / 8.141 / 8.166, B1024 27.69 ->
+    28.50 / 26.67 / 26.78 / 26.89, B2048 55.88 -> 58.23 / 54.49 / 53.83 / 54.00. Not tuned: the tuner's runs (the
+    same launch again and again, its data warm in L2) took 0 at B256 and B2048 (+2-3% there)."""
     sms = torch.cuda.get_device_properties(dev).multi_processor_count
-    nv = min(16 if tiles <= 4 * sms else 24, sms // 4)
+    nv = min(16 if tiles <= 12 * sms else 20, sms // 4)
     if nv == 0:
         return 0
-    side = -(-(B * K // 4) // nv) * X * 0.065
+    side = -(-(B * K // 4) // nv) * X * 0.05
     return nv if side <= 2 * -(-tiles // max(1, sms - nv)) * children else 0
 
 

@@ -3801,8 +3801,8 @@ def test_the_side_ctas_v_rows_are_the_operand_kernels(N, B, copies):
 @needs_virtual
 def test_the_side_ctas_count(monkeypatch):
     """`virtual._om_vctas`, the one-launch forward's side CTAs forming the next copy's V rows: 16 where the tiles take
-    at most 4 rounds of the SMs, 24 past (the HMM's layers of 1024 nodes and children, rank 16: 2 B tiles of 1024
-    children); none where their units would take more than twice the tiles' rounds (a layer of 256 nodes: a quarter
+    at most 12 rounds of the SMs, 20 past (the HMM's layers of 1024 nodes and children, rank 16: 2 B tiles of 1024
+    children); none where their units would take more than twice the tiles' rounds (a layer of 128 nodes: an eighth
     of the tiles, V's work the same); a quarter of the SMs at most (a GPU of 20)."""
     import pyjuice.parameterizations.lowrank.virtual as lowrank_virtual
 
@@ -3811,9 +3811,9 @@ def test_the_side_ctas_count(monkeypatch):
     if sms < 96:
         pytest.skip("the counts below are a GPU of 96 SMs or more's")
     count = lambda B, nodes = 1024: lowrank_virtual._om_vctas(B, 16, 1024, (16 * B // 64) * (nodes // 128), 1024, dev)
-    assert [count(B) for B in (64, sms, 2 * sms)] == [16, 16, 16]
-    assert [count(B) for B in (2 * sms + 4, 1024, 2048)] == [24, 24, 24]
-    assert count(1024, nodes = 256) == 0 and count(64, nodes = 256) == 16
+    assert [count(B) for B in (64, 3 * sms, 6 * sms)] == [16, 16, 16]
+    assert [count(B) for B in (6 * sms + 4, 12 * sms)] == [20, 20]
+    assert count(6 * sms, nodes = 128) == 0 and count(64, nodes = 128) == 16
     props = type("P", (), {"multi_processor_count": 20})()
     monkeypatch.setattr(torch.cuda, "get_device_properties", lambda d: props)
     assert count(1024) == 5 and count(64) == 5
