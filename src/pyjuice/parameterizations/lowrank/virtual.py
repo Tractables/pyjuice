@@ -492,7 +492,7 @@ def _normalizers(desc, layer, info, st, kwargs, params, batch, dev) -> dict:
         dtype = _dtype(kwargs.get("precision", "auto"), len(copies) * batch * K * geo["M"] * geo["N"])
         # (`flow_precision = "fp8"`: V's twin besides gives each (child, copy, sample)'s largest V over the ranks, what
         # the pass's end's e4m3 operands take their rows' scales from -- `gv`; V the same bits)
-        gv = None
+        gv, pipe, order = None, False, None
         if ip and dtype is torch.bfloat16 and getattr(desc, "flow_precision", "bf16") == "fp8" and \
                 _fp8_module() is not None:
             rows = len(fbs) * batch * K
@@ -501,13 +501,46 @@ def _normalizers(desc, layer, info, st, kwargs, params, batch, dev) -> dict:
             gv = torch.empty(geo["N"], rows // K, device = dev)
             _fp8_module().lowrank_z_operand_in_place_g(Vt, shift, gv, fbs, batch, K)
         else:
-            Vt, shift = _v_rows(mod, fbs, geo["N"], K, batch, dtype, dev, ip)
+            # (pipelined: the copies' rows formed as they come, where an earlier pass left the order it visited every
+            # one of these copies in; else every copy's now)
+            order = source.__dict__.get("_lr_vorder")
+            smod = _stream_module() if PIPELINED_V else None
+            pipe = smod is not None and ip and dtype is torch.bfloat16 and order is not None and \
+                len(order) == len(copies) and set(order) == {c for c, _ in copies} and \
+                bool(smod.om_v_serves(geo["N"], K))
+            if pipe:
+                Vt = torch.empty(geo["N"], len(fbs) * batch * K, dtype = dtype, device = dev)
+                shift = torch.empty(Vt.size(1), device = dev)
+            else:
+                Vt, shift = _v_rows(mod, fbs, geo["N"], K, batch, dtype, dev, ip)
         op = kwargs.get("op_params")
         theta = desc._dense_params(geo, op if op is not None and dtype is torch.bfloat16 else params, dtype)
         hit = zs[source] = dict(zt = None, zt_done = set(), row = {c: at * batch * K for at, (c, _) in enumerate(copies)},
                                 V = Vt, shift = shift, dtype = dtype, fb = fbs, theta = theta, cols = batch * K,
-                                fa = [t[0] for _, t in mine], in_place = ip, gv = gv)
+                                fa = [t[0] for _, t in mine], in_place = ip, gv = gv,
+                                v_ready = set() if pipe else None, v_order = list(order) if pipe else None,
+                                v_seen = [])
+    # (the copies' visit order, kept on the source once a pass visited every copy: the next pass's pipelined V)
+    seen = hit["v_seen"]
+    if info.ns not in seen:
+        seen.append(info.ns)
+        if len(seen) == len(hit["row"]):
+            source.__dict__["_lr_vorder"] = list(seen)
+    _v_ensure(hit, (info.ns,))
     return hit
+
+
+def _v_ensure(z, copies) -> None:
+    """The copies' rows of V (and their shifts) formed where the pass forms them a copy at a time (`PIPELINED_V`) and
+    nothing formed them yet: one launch a copy (`lowrank_v_rows`)."""
+    ready = z.get("v_ready")
+    if ready is None:
+        return
+    for ns in copies:
+        if ns not in ready:
+            at = z["row"][ns]
+            _stream_module().lowrank_v_rows(z["V"], z["shift"], z["fb"][at // z["cols"]], at)
+            ready.add(ns)
 
 
 def _zt_rows(z, ns, every: bool = True) -> None:
@@ -515,6 +548,7 @@ def _zt_rows(z, ns, every: bool = True) -> None:
     every copy at once while no copy has its rows (`every`: allowed), else the copy's own."""
     if ns in z["zt_done"]:
         return
+    _v_ensure(z, z["row"] if every and not z["zt_done"] else (ns,))
     if z["zt"] is None:
         z["zt"] = torch.empty(z["theta"].size(0), z["V"].size(1), device = z["V"].device)
     if every and not z["zt_done"]:
@@ -561,6 +595,29 @@ FUSED_PASS_END = True
 
 #: The tuner's code of the one-launch form (`lowrank_forward_om`); the pre-pass chain's arms are config id * 16 + split
 _OM_ARM = 4096
+#: V's rows (the normalizers' operand, `exp(B - shift)` bf16) formed a copy at a time beside the one-launch forwards --
+#: each forward's side CTAs form the next copy's (in the order an earlier pass visited them), the copy being visited
+#: formed first where nothing formed it yet -- instead of every copy's by a launch of their own before the first
+#: (`lowrank_v_rows`, the forward's `vnext`; the same bits). `False`: every copy upfront.
+PIPELINED_V = True
+
+
+def _om_vctas(B: int, K: int, X: int, tiles: int, children: int, dev) -> int:
+    """The one-launch forward's side CTAs forming the next copy's V rows (`B` samples, rank `K`, `X` children; the
+    launch's `tiles`, `children` a tile's k range): few where the tiles take a few rounds of the SMs (the side CTAs'
+    SMs then a round more), more past (the tiles long enough that more of V's work keeps up), a quarter of the SMs at
+    most; 0, none -- the copy's rows by a launch of their own after the forward -- where the side CTAs' units (4 ranks
+    of a sample, ~0.065 of a tile's time a child: ~1.6 us for 1024 children against ~24.5 us) would take more than
+    twice the tiles' rounds. MEASURED (croissant, HMM 1024 x 31 in blocks of 32, rank 16, step ms, every copy's V
+    upfront -> 16 / 24 side CTAs): B64 2.566 -> 2.500 / 2.518, B256 7.988 -> 7.800 / 8.186, B1024 27.68 -> 29.74 /
+    27.05, B2048 55.84 -> 60.63 / 54.87. Not tuned: the tuner's runs (the same launch again and again, its data warm
+    in L2) took 0 at B256 and B2048 (+2-3% there)."""
+    sms = torch.cuda.get_device_properties(dev).multi_processor_count
+    nv = min(16 if tiles <= 4 * sms else 24, sms // 4)
+    if nv == 0:
+        return 0
+    side = -(-(B * K // 4) // nv) * X * 0.065
+    return nv if side <= 2 * -(-tiles // max(1, sms - nv)) * children else 0
 
 
 def _stream_module():
@@ -777,9 +834,27 @@ def _stream_run(plan, info, tensors, kwargs, z, row0, vnm, kd, node_mars, elemen
                 # (the A operand of this copy's rows written by the collapse, where the factors are read in place: the
                 # backward's, `_a_rows`)
                 ua = _ua_buffers(z, node_mars.size(1), K, node_mars.device) if z["in_place"] else (None, None)
-                mod.lowrank_forward_om(kd, vals, cb, p["ebase"], p["jpos"], vt, row0, shift, op, p["nids"],
-                                       p["pbase"], p["groups"][0], twin.block_size, p["knt"], p["om"][0], p["om"][1],
-                                       node_mars, lz, a_om, nshift, vn0, ua[0], ua[1], p["vtma"])
+                # (pipelined V: the next copy not yet formed, in the visit order, by this launch's side CTAs --
+                # `_om_vctas`; 0: by a launch of its own after this one)
+                nxt, ready, order = None, z.get("v_ready"), z.get("v_order")
+                if ready is not None and order is not None and info.ns in order:
+                    nxt = next((c for c in order[order.index(info.ns) + 1:] if c not in ready), None)
+                fbn = None if nxt is None else z["fb"][z["row"][nxt] // z["cols"]]
+
+                def fw(nv):
+                    mod.lowrank_forward_om(kd, vals, cb, p["ebase"], p["jpos"], vt, row0, shift, op, p["nids"],
+                                           p["pbase"], p["groups"][0], twin.block_size, p["knt"], p["om"][0],
+                                           p["om"][1], node_mars, lz, a_om, nshift, vn0, ua[0], ua[1], p["vtma"],
+                                           fbn if nv > 0 else None, z["row"][nxt] if nv > 0 else 0, nv)
+                    if fbn is not None and nv == 0:
+                        mod.lowrank_v_rows(z["V"], z["shift"], fbn, z["row"][nxt])
+                if nxt is None:
+                    fw(0)
+                else:
+                    B = node_mars.size(1)
+                    fw(_om_vctas(B, K, z["V"].size(0), (K * B // 64) * max(1, info.ns.num_nodes // 128),
+                                 p["knt"] * 64, node_mars.device))
+                    ready.add(nxt)
             else:
                 fb = _inner(kwargs, tensors)[1]
                 mod.lowrank_forward_stream(vnm, vals, cb, p["ebase"], p["jpos"], fb, shift, row0, op, p["nids"],
@@ -1019,6 +1094,7 @@ def _end_of_pass(mod, z, copies, node_flows, node_mars, params, param_flows, den
         return
     cols = batch * K
     kept = KEPT_OPERANDS and dtype is torch.bfloat16 and z["dtype"] is torch.bfloat16
+    _v_ensure(z, z["row"])
     Vt, shift = (z["V"], z["shift"]) if dtype is z["dtype"] else _v_rows(mod, z["fb"], N, K, batch, dtype, dev,
                                                                            z["in_place"])
     zeros = want_denom and len(copies) < len(z["row"])

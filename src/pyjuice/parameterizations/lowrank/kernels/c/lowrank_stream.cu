@@ -452,8 +452,8 @@ __global__ void __launch_bounds__((WM * WN + PW) * 32) lr_gemm_kernel(
 // (`amw`: this copy's [M, B]) each (node, sample)'s largest A over its ranks (`lowrank_mixture.cu`'s
 // `a_operand_kernel`, its operations): the pass then makes it in no launch of its own.
 //
-// PERSISTENT, THE RING CONTINUOUS, THE COLLAPSE IN THE CONSUMERS' REGISTERS: a CTA an SM takes the tiles blockIdx.x,
-// + gridDim.x, ... (in `tile_of`'s order); its ring runs on across its tiles (the CTA's k-step g in stage g % ST), so
+// PERSISTENT, THE RING CONTINUOUS, THE COLLAPSE IN THE CONSUMERS' REGISTERS: a CTA an SM takes the tiles blockIdx.x -
+// n_v, + nct, ... (in `tile_of`'s order); its ring runs on across its tiles (the CTA's k-step g in stage g % ST), so
 // the producers and converters never stop at a tile's end; the consumers collapse a tile from their accumulators --
 // the stage's columns permuted so that a warp holds whole samples -- and go on to the next: no shared-memory round
 // trip, no barrier of every role, no stage drained. MEASURED (toast, HMM 1024 x 31 in blocks of 32, rank 16, B1024, us
@@ -474,7 +474,21 @@ __global__ void __launch_bounds__((WM * WN + PW) * 32) lr_gemm_kernel(
 // V by TMA (16.7 -> 20.7: a 64-column box a k-step half); two-CTA clusters of 128 x 128 tiles summing two k-ranges
 // (18.8-19.6: sm_120's distributed shared memory moves 32 KB a CTA in 4-14 us, so the halves went through L2;
 // `setmaxnreg` is ignored in cluster kernels); TMA multicast (ptxas: "substantially reduced performance" on sm_120a).
+//
+// V BY SIDE CTAS (`vnext`; `virtual.PIPELINED_V`): the grid's first n_v CTAs form ANOTHER copy's V rows and shifts --
+// the next copy the pass visits -- beside the tiles (`om_v_rows`), instead of every copy's by a launch of their own
+// before the pass; n_v by the launch's shape (`virtual._om_vctas`: 16 where the tiles take at most 4 rounds of the SMs,
+// else 24; none where V's units would take more than twice the tiles' rounds). The side CTAs come FIRST: last in the
+// grid they took the SMs the launch before freed last and ran ~1.5x slower (B2048, 24 of them: the forward 18.8 -> 28.5
+// ms). Their pace (~1.4-2 us a 16 KB unit under the tiles' load) is set by their stores -- V's rows 8 bytes a child a
+// unit, scattered (B1024, 16 side CTAs, V upfront too: the forward 16.4 ms, 9.1 with no stores, 9.5 with no loads). Not
+// taken: an L2 prefetch of the units 8 ahead (B64 / B256 +2%, B1024 / B2048 0).
+// MEASURED (croissant, HMM 1024 x 31 in blocks of 32, rank 16, step ms, 3 rounds, two GPUs no one else used, every
+// copy's V upfront -> by side CTAs): B2048 55.22 -> 54.10 (-2.0%), B1024 27.56 -> 26.84 (-2.6%), B256 7.91 -> 7.70
+// (-2.7%), B64 2.569 -> 2.495 (-2.9%), the other GPU -2.0 / -2.3 / -2.7 / -2.9%; at B1024 the forward's launches
+// 8.21 -> 9.65 ms, V's 2.12 -> 0.08 (the pass's first copy).
 __device__ __align__(16) float g_ninf[4] = {-INFINITY, -INFINITY, -INFINITY, -INFINITY};   // (a row of no child)
+
 
 // The tile: OM_BM nodes x OM_BN columns (OM_BN / OM_K samples, every rank), KT = 32 children a k-step in ST stages;
 // 8 consumer warps (4 x 2), 4 producer warps, 4 converter warps. TMAA: A by TMA (`tmapA`: 32 nodes x 32 k x the tile's
@@ -484,6 +498,93 @@ __device__ __align__(16) float g_ninf[4] = {-INFINITY, -INFINITY, -INFINITY, -IN
 // (`tmapC`: 32 rows x the tile's 4 samples), one producer issuing them; else the producers gather both by cp.async.
 constexpr int OM_BM = 128, OM_BN = 64, OM_K = 16, OM_ST = 5, OM_THREADS = 512;
 
+// V's rows of one copy by the side CTAs of the one-launch forward (`lowrank_mixture.cu`'s `inplace_operand_kernel`,
+// its operations -- the same bits: the maxima order-free, the same expf and rounding): the copy's factors `f` [B, K, X]
+// in place (sample stride `f_sb`), V [X, rows] from `row0` (the rows (sample, rank): a sample's K ranks adjacent), `sh`
+// the rows' shifts (each its rank's largest B). Units of OMV_G ranks of a sample -- OMV_G X floats, one bulk copy --,
+// the side CTA vi's samples vi, + n_v, ...; OMV_NB units in flight in the shared memory (`omv_smem` bytes).
+constexpr int OMV_G = 4, OMV_NB = 4, OMV_NW = OM_THREADS / 32;
+// (the one-launch forward's shared memory: its stages, their records, the barriers -- what a side CTA has)
+constexpr long OM_SMEM = (long)OM_ST * ((32 * OM_BM * 2 + 2 * 32 * OM_BN * 2 + 2 * 32 * (OM_BN / OM_K) * 4 + 1023) / 1024 *
+                                       1024) + 2 * OM_ST * (OM_BN / OM_K) * 4 + 3 * OM_ST * 8;
+__host__ __device__ constexpr long omv_smem(int X) { return (long)OMV_NB * OMV_G * X * 4 + 8 * OMV_NB + 4 * 64; }
+template <int KC>
+__device__ __forceinline__ void om_v_rows(const float* __restrict__ f0, long f_sb, bfloat16_t* __restrict__ out,
+                                          float* __restrict__ sh, long rows, long row0, int X, int B, int vi,
+                                          int n_v) {
+    static_assert(KC % OMV_G == 0 && OMV_NW % OMV_G == 0, "a unit's ranks; its warps a rank");
+    constexpr int NG = KC / OMV_G, WPR = OMV_NW / OMV_G;      // (units a sample; warps a rank)
+    float* buf = (float*)smem_raw;                              // [NB][G X]
+    uint64_t* bar = (uint64_t*)(smem_raw + (long)OMV_NB * OMV_G * X * 4);
+    float* red = (float*)(bar + OMV_NB);                       // [G][WPR]
+    const int tid = threadIdx.x, lane = tid & 31, w = tid >> 5;
+    const int nsamp = (B - vi + n_v - 1) / n_v, nu = nsamp * NG;
+    if (tid == 0) {
+        for (int q = 0; q < OMV_NB; q++) mbar_init(&bar[q], 1);
+        asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+    }
+    __syncthreads();
+    const uint32_t bytes = (uint32_t)OMV_G * X * 4;
+    auto issue = [&](int u) {                                   // (thread 0: unit u into buffer u % NB)
+        const int q = u % OMV_NB, b = vi + n_v * (u / NG), g = u % NG;
+        const uint32_t ba = (uint32_t)__cvta_generic_to_shared(&bar[q]);
+        const uint32_t da = (uint32_t)__cvta_generic_to_shared(buf + (long)q * OMV_G * X);
+        asm volatile("mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _, [%0], %1;" ::"r"(ba), "r"(bytes) : "memory");
+        asm volatile("cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];"
+                     ::"r"(da), "l"(f0 + (long)b * f_sb + (long)g * OMV_G * X), "r"(bytes), "r"(ba) : "memory");
+    };
+    if (tid == 0)
+        for (int u = 0; u < min(OMV_NB, nu); u++) issue(u);
+    for (int u = 0; u < nu; u++) {
+        const int q = u % OMV_NB, b = vi + n_v * (u / NG), g = u % NG;
+        mbar_wait(&bar[q], (u / OMV_NB) & 1);
+        const float* in = buf + (long)q * OMV_G * X;
+        {                                                       // rank w / WPR's largest over its children
+            const int r = w / WPR, p = w % WPR;
+            float m = -INFINITY;
+            for (int x = p * 32 + lane; x < X; x += 32 * WPR) m = fmaxf(m, in[(long)r * X + x]);
+            for (int off = 16; off >= 1; off >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, off));
+            if (lane == 0) red[r * WPR + p] = m;
+        }
+        __syncthreads();
+        float mr[OMV_G];
+        #pragma unroll
+        for (int r = 0; r < OMV_G; r++) {
+            float m = red[r * WPR];
+            for (int i = 1; i < WPR; i++) m = fmaxf(m, red[r * WPR + i]);
+            mr[r] = m;
+        }
+        const long at = row0 + (long)b * KC + g * OMV_G;
+        if (tid < OMV_G) {                                      // (its own rank's max again: no array indexed by tid)
+            float m = red[tid * WPR];
+            for (int i = 1; i < WPR; i++) m = fmaxf(m, red[tid * WPR + i]);
+            sh[at + tid] = m;
+        }
+        for (int x = tid; x < X; x += OM_THREADS) {             // (a child's G ranks: 8 bytes of its run)
+            float v[OMV_G];
+            #pragma unroll
+            for (int r = 0; r < OMV_G; r++) {
+                const float y = in[(long)r * X + x];
+                v[r] = y > -INFINITY ? expf(y - mr[r]) : 0.0f;
+            }
+            const __nv_bfloat162 h0 = __floats2bfloat162_rn(v[0], v[1]), h1 = __floats2bfloat162_rn(v[2], v[3]);
+            uint2 pk;
+            pk.x = *reinterpret_cast<const uint32_t*>(&h0);
+            pk.y = *reinterpret_cast<const uint32_t*>(&h1);
+            *reinterpret_cast<uint2*>(out + (long)x * rows + at) = pk;
+        }
+        __syncthreads();                                        // (buffer q and `red` free again)
+        if (tid == 0 && u + OMV_NB < nu) issue(u + OMV_NB);
+    }
+}
+
+// A copy's V rows alone (the pass's first copy, or one no side CTAs formed): the side CTAs' work on a grid of its own
+__global__ void __launch_bounds__(OM_THREADS, 1) om_v_kernel(const float* __restrict__ f, long f_sb,
+                                                             bfloat16_t* __restrict__ out, float* __restrict__ sh,
+                                                             long rows, long row0, int X, int B) {
+    om_v_rows<OM_K>(f, f_sb, out, sh, rows, row0, X, B, (int)blockIdx.x, (int)gridDim.x);
+}
+
 template <int ST, bool FUSED, bool TMAA, bool VTMA>
 __global__ void __launch_bounds__(OM_THREADS, 1) lr_om_kernel(
         const bfloat16_t* __restrict__ params, const long* __restrict__ pbase, const bfloat16_t* __restrict__ vt,
@@ -492,8 +593,17 @@ __global__ void __launch_bounds__(OM_THREADS, 1) lr_om_kernel(
         int block_size, int B, float* __restrict__ vnm, const long* __restrict__ nids, int num_edges,
         const __grid_constant__ CUtensorMap tmapA, const float* __restrict__ fa, long a_sb, float* node_mars,
         float* __restrict__ lz, long nshift, long vn0, int ntiles, int nbg, bfloat16_t* __restrict__ uaw, long urows,
-        float* __restrict__ amw, const __grid_constant__ CUtensorMap tmapV, const __grid_constant__ CUtensorMap tmapC) {
+        float* __restrict__ amw, const __grid_constant__ CUtensorMap tmapV, const __grid_constant__ CUtensorMap tmapC,
+        const float* __restrict__ vfb, long vf_sb, bfloat16_t* __restrict__ vout, float* __restrict__ vsh, long vrow0,
+        int vX, int n_v, int nct) {
     constexpr int BM = OM_BM, BN = OM_BN, K = OM_K, WM = 4, WN = 2;
+    if ((int)blockIdx.x < n_v) {
+        // ---------- the side CTAs (the grid's first): another copy's V rows (the launch before done first) ----------
+        cudaTriggerProgrammaticLaunchCompletion();
+        cudaGridDependencySynchronize();
+        om_v_rows<OM_K>(vfb, vf_sb, vout, vsh, vrows, vrow0, vX, B, (int)blockIdx.x, n_v);
+        return;
+    }
     constexpr int KT = 32, NC = WM * WN * 32, NP = 128, NV = 128;
     static_assert(NC + NP + NV == OM_THREADS, "the warp roles");
     constexpr int S = BN / K;                            // the tile's samples
@@ -506,9 +616,9 @@ __global__ void __launch_bounds__(OM_THREADS, 1) lr_om_kernel(
     const int nbt = cols / BN;
     const int bpt = BM > block_size ? BM / block_size : 1;
     const int nk = knt * SUB;
-    // PERSISTENT: a CTA takes the tiles blockIdx.x, + gridDim.x, ... of the layer's `ntiles` (the grid: a CTA an SM at
-    // most), in `tile_of`'s order, a node tile one of `mtiles` of a node block, or `bpt` consecutive blocks of one group
-    // (blocks of 32 or 64).
+    // PERSISTENT: a CTA past the side CTAs takes the tiles blockIdx.x - n_v, + nct, ... of the layer's `ntiles` (the
+    // grid: a CTA an SM at most), in `tile_of`'s order, a node tile one of `mtiles` of a node block, or `bpt`
+    // consecutive blocks of one group (blocks of 32 or 64).
     struct Tile { int r, tile_id, b0; };                 // (its node block / tile of it, its first sample)
     auto tile_at = [&](int t) {
         int pid_b, pid_m;                                // (the tiles' order: `tile_of`)
@@ -519,7 +629,7 @@ __global__ void __launch_bounds__(OM_THREADS, 1) lr_om_kernel(
         return x;
     };
     auto col0_of = [&](const Tile& T) { return (long)T.b0 * K; };   // (its first column: S samples a tile, K each)
-    const int step = (int)gridDim.x;
+    const int gblk = (int)blockIdx.x - n_v, step = nct; // (past the side CTAs: the grid's first n_v)
     // The ring is CONTINUOUS over a CTA's tiles: its k-step g (counted from the CTA's first) in stage g % ST, phase
     // (g / ST) & 1. A stage's record (the converters'): its samples' rescale factors, then their maxima after it.
     float* srec = (float*)(smem_raw + ST * STAGE);       // [ST][2 S]
@@ -611,7 +721,7 @@ __global__ void __launch_bounds__(OM_THREADS, 1) lr_om_kernel(
         // k-step) -- and the parameter tiles' pointers (cp.async: each chunk's at the current edge tile's slab, the
         // next one's base loaded an edge tile ahead)
         static_assert(NP == BM, "a producer a tile row's prefetches");
-        Tile pt = tile_at((int)blockIdx.x);
+        Tile pt = tile_at(gblk);
         int gA[CA], bA[CA];
         const bfloat16_t* vptr[CB];
         const float* cptr[CC];
@@ -770,7 +880,7 @@ __global__ void __launch_bounds__(OM_THREADS, 1) lr_om_kernel(
             s = s + 1 == ST ? 0 : s + 1;
             if (s == 0) ph ^= 1u;                 // (the ring went round)
         };
-        for (int tile = (int)blockIdx.x;;) {
+        for (int tile = gblk;;) {
             for (int jb = 0; jb < nk; jb += 2) {
                 CUTE_UNROLL
                 for (int u = 0; u < 2; u++) {
@@ -851,7 +961,7 @@ __global__ void __launch_bounds__(OM_THREADS, 1) lr_om_kernel(
             s = s + 1 == ST ? 0 : s + 1;
             if (s == 0) ph ^= 1u;                         // (the ring went round)
         };
-        for (int tile = (int)blockIdx.x; tile < ntiles; tile += step) {
+        for (int tile = gblk; tile < ntiles; tile += step) {
             CUTE_UNROLL
             for (int i = 0; i < SPW; i++) mrun[i] = -INFINITY;   // (a tile's maxima anew)
             for (int jj = 0; jj < nk; jj++) convert();
@@ -927,7 +1037,7 @@ __global__ void __launch_bounds__(OM_THREADS, 1) lr_om_kernel(
     int s = 0;
     unsigned ph = 0u;
     float mfin[2];                                       // its samples' maxima after the tile's last stage
-    int tile = (int)blockIdx.x;
+    int tile = gblk;
     Tile T = tile_at(tile);
     int irow[NR];                                        // its rows' nodes in the node vector (the tile's: loaded in
     auto kbody = [&](const bool last) {                  // its last k-step, under the MMAs)
@@ -975,7 +1085,7 @@ __global__ void __launch_bounds__(OM_THREADS, 1) lr_om_kernel(
     clear(tCrZ);
     for (int j = 0; j + 1 < nk; j++) kbody(false);
     kbody(true);
-    if (tile == (int)blockIdx.x)
+    if (tile == gblk)
         cudaGridDependencySynchronize();                 // (the epilogue's own guarantee: the launch before is done)
     // THE COLLAPSE, from the registers: element e = ro + NR ni holds the columns (c, c + 1) of row ro's node in n-block
     // ni; a (row, sample)'s 16 ranks are 2 halves x 2 columns here x the 4 lanes of the group. The node's value
@@ -2103,7 +2213,8 @@ static void launch_om(const bfloat16_t* params, const long* pbase, const bfloat1
                       const int* ugrp, int knt, int rows, int block_size, int B, float* vnm, const long* nids,
                       int num_edges, const CUtensorMap& tmapA, const float* fa, long a_sb, float* node_mars,
                       float* lz, long nshift, long vn0, bfloat16_t* uaw, long urows, float* amw,
-                      const CUtensorMap& tmapV, const CUtensorMap& tmapC, cudaStream_t st) {
+                      const CUtensorMap& tmapV, const CUtensorMap& tmapC, const float* vfb, long vf_sb,
+                      bfloat16_t* vout, float* vsh, long vrow0, int vX, int n_v, cudaStream_t st) {
     constexpr int ST = OM_ST, S = OM_BN / OM_K;
     constexpr int STAGE = (32 * OM_BM * 2 + 2 * 32 * OM_BN * 2 + 2 * 32 * S * 4 + 1023) / 1024 * 1024;
     constexpr int SMEM = ST * STAGE + 2 * ST * S * 4 + 3 * ST * 8;   // (the stages, their records, the barriers)
@@ -2120,12 +2231,14 @@ static void launch_om(const bfloat16_t* params, const long* pbase, const bfloat1
     const long n = (long)(OM_K * B / OM_BN) * ((long)rows * block_size / OM_BM);
     TORCH_CHECK(n < (1L << 31), "lowrank om: past 2^31 tiles");
     // (persistent: a CTA an SM at most -- one fits, by its shared memory --, each taking every grid-th tile)
-    int nsm = om_sms();
+    int nsm = om_sms() - n_v;                            // (the side CTAs' SMs not the tiles')
     if (g_om_ctas_most > 0) nsm = std::min(nsm, g_om_ctas_most);
-    g_last_grids[0] = std::min<long>(n, nsm); g_last_grids[1] = om_tile_group();
-    launch_pdl(kernel, dim3((unsigned)std::min<long>(n, nsm)), dim3(OM_THREADS), SMEM, st, params, pbase, vt, vrows, row0,
-               shift, vals, ebase, cbase, jpos, ugrp, knt, mtiles, block_size, B, vnm, nids, num_edges, tmapA, fa, a_sb,
-               node_mars, lz, nshift, vn0, (int)n, om_tile_group(), uaw, urows, amw, tmapV, tmapC);
+    const int nct = (int)std::min<long>(n, nsm);         // (the tiles' CTAs, after the side CTAs)
+    g_last_grids[0] = nct; g_last_grids[1] = om_tile_group();
+    launch_pdl(kernel, dim3((unsigned)(nct + n_v)), dim3(OM_THREADS), SMEM, st, params, pbase, vt,
+               vrows, row0, shift, vals, ebase, cbase, jpos, ugrp, knt, mtiles, block_size, B, vnm, nids, num_edges, tmapA,
+               fa, a_sb, node_mars, lz, nshift, vn0, (int)n, om_tile_group(), uaw, urows, amw, tmapV, tmapC, vfb, vf_sb,
+               vout, vsh, vrow0, vX, n_v, nct);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
@@ -2135,6 +2248,38 @@ bool om_serves(int64_t K, int64_t B, int64_t block_size, int64_t rows) {
     return K == OM_K && B % (OM_BN / OM_K) == 0 && block_size % 32 == 0 &&
            (block_size % OM_BM == 0 || (OM_BM % block_size == 0 && (rows * block_size) % OM_BM == 0));
 }
+
+// V's rows (`exp(B - shift)` bf16, the rows (copy, sample, rank)) and their shifts of ONE copy -- its factors `fb`
+// B [B, K, N] fp32 in place, its first row `row0` of `vt` [N, rows] -- by the one-launch forward's side-CTA code
+// (`lowrank_mixture.cu`'s `inplace_operand_kernel`'s operations: the same bits). `om_v_serves(N, K)`: whether it (and
+// the forward's side CTAs) serve N children at rank K.
+bool om_v_serves(int64_t N, int64_t K) { return K == OM_K && N >= 1 && omv_smem((int)N) <= OM_SMEM; }
+void lowrank_v_rows(torch::Tensor vt, torch::Tensor shift, torch::Tensor fb, int64_t row0) {
+    const long X = vt.size(0), rows = vt.size(1), B = fb.size(0);
+    TORCH_CHECK(om_v_serves(X, fb.size(1)) && vt.is_cuda() && vt.scalar_type() == torch::kBFloat16 && vt.is_contiguous() &&
+                rows % 8 == 0 && (reinterpret_cast<uintptr_t>(vt.data_ptr()) & 15) == 0 && fb.is_cuda() &&
+                fb.scalar_type() == torch::kFloat32 && fb.dim() == 3 && fb.size(2) == X && fb.stride(2) == 1 &&
+                fb.stride(1) == X && fb.stride(0) >= OM_K * X && fb.stride(0) % 4 == 0 &&
+                (reinterpret_cast<uintptr_t>(fb.data_ptr()) & 15) == 0 && shift.is_cuda() && shift.is_contiguous() &&
+                shift.scalar_type() == torch::kFloat32 && shift.numel() == rows && row0 >= 0 && row0 % (OM_K * B) == 0 &&
+                row0 + OM_K * B <= rows, "lowrank v rows: B fp32 [B, K, N] in place (16-byte runs), V bf16 [N, rows]");
+    if (B == 0) return;
+    const at::cuda::OptionalCUDAGuard guard(vt.device());
+    const int smem = (int)omv_smem((int)X);
+    static bool attr_set[64] = {};
+    int dev = 0;
+    C10_CUDA_CHECK(cudaGetDevice(&dev));
+    if (dev >= 64 || !attr_set[dev]) {
+        C10_CUDA_CHECK(cudaFuncSetAttribute(om_v_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)OM_SMEM));
+        if (dev < 64) attr_set[dev] = true;
+    }
+    const int grid = (int)std::min<long>(B, om_sms());
+    om_v_kernel<<<grid, OM_THREADS, smem, c10::cuda::getCurrentCUDAStream()>>>(
+        fb.data_ptr<float>(), (long)fb.stride(0), reinterpret_cast<bfloat16_t*>(vt.data_ptr()), shift.data_ptr<float>(),
+        rows, (long)row0, (int)X, (int)B);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
 
 // The sum_exp forward of a layer over the virtual batch in ONE launch (the online-max form), its normalizer (Z_r =
 // theta V under V's shifts) and collapse beside: `vnm` [twin rows, B K] the layer's kept share differences (what the
@@ -2150,7 +2295,7 @@ void lowrank_forward_om(torch::Tensor vnm, torch::Tensor vals, c10::optional<tor
                         torch::Tensor nids, torch::Tensor pbase, torch::Tensor ugrp, int64_t block_size, int64_t knt_,
                         int64_t a_p0, int64_t a_bstr, torch::Tensor node_mars, torch::Tensor lz, torch::Tensor fa,
                         int64_t nshift, int64_t vn0, c10::optional<torch::Tensor> ua, c10::optional<torch::Tensor> am,
-                        bool vtma) {
+                        bool vtma, c10::optional<torch::Tensor> vnext, int64_t vrow0, int64_t n_v) {
     const int knt = (int)knt_, rows = (int)nids.size(0);
     const int B = (int)vals.size(1), cols = (int)vnm.size(1);
     const int num_edges = knt * BK;
@@ -2218,12 +2363,27 @@ void lowrank_forward_om(torch::Tensor vnm, torch::Tensor vals, c10::optional<tor
     cudaStream_t st = c10::cuda::getCurrentCUDAStream();
     const auto* vtp = reinterpret_cast<const bfloat16_t*>(vt.data_ptr());
     const int* cb = fused ? cbase->data_ptr<int>() : nullptr;
+    // (side CTAs forming another copy's V rows -- its factors `vnext` B [B, K, N] in place, its first row vrow0 --
+    // beside the tiles)
+    const int nv = vnext.has_value() && omv_smem((int)vt.size(0)) <= OM_SMEM ? (int)n_v : 0;   // (else: no side CTAs)
+    if (nv > 0)
+        TORCH_CHECK(nv < om_sms() && vnext->is_cuda() && vnext->scalar_type() == torch::kFloat32 && vnext->dim() == 3 &&
+                    vnext->size(0) == B && vnext->size(1) == OM_K && vnext->size(2) == vt.size(0) &&
+                    vnext->stride(2) == 1 && vnext->stride(1) == vnext->size(2) &&
+                    vnext->stride(0) >= vnext->size(1) * vnext->size(2) && vrow0 >= 0 && vrow0 % ((long)OM_K * B) == 0 &&
+                    vrow0 + (long)OM_K * B <= vt.size(1) && vt.size(1) % 8 == 0 &&
+                    (reinterpret_cast<uintptr_t>(vt.data_ptr()) & 15) == 0,
+                    "lowrank om: the side CTAs' copy: B fp32 [B, K, N] in place, its rows of V");
+    const float* vfb = nv > 0 ? vnext->data_ptr<float>() : nullptr;
+    const long vf_sb = nv > 0 ? (long)vnext->stride(0) : 0;
+    bfloat16_t* vout = nv > 0 ? reinterpret_cast<bfloat16_t*>(vt.data_ptr()) : nullptr;
 #define LOWRANK_OM(F, T, VT)                                                                                          \
     launch_om<F, T, VT>(pp, pbase.data_ptr<long>(), vtp, (long)vt.size(1), (long)row0, shift.data_ptr<float>(),     \
                     vals.data_ptr<float>(), ebase.data_ptr<long>(), cb, jpos.data_ptr<int>(), ugrp.data_ptr<int>(),     \
                     knt, rows, (int)block_size, B, vnm.data_ptr<float>(), nids.data_ptr<long>(), num_edges, tm,      \
                     fa.data_ptr<float>(), (long)fa.stride(0), node_mars.data_ptr<float>(), lz.data_ptr<float>(),       \
-                    (long)nshift, (long)vn0, uaw, (long)vt.size(1), amw, tv, tc, st)
+                    (long)nshift, (long)vn0, uaw, (long)vt.size(1), amw, tv, tc, vfb, vf_sb, vout,           \
+                    shift.data_ptr<float>(), (long)vrow0, (int)vt.size(0), nv, st)
     if (vtma) {
         if (fused) { if (tma) LOWRANK_OM(true, true, true); else LOWRANK_OM(true, false, true); }
         else { if (tma) LOWRANK_OM(false, true, true); else LOWRANK_OM(false, false, true); }
@@ -2457,6 +2617,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("lowrank_forward_om", &lowrank_forward_om,
           "the sum_exp forward over the virtual batch in one launch: the operand formed in the GEMM, the maxima online");
     m.def("om_serves", &om_serves, "whether the one-launch form serves a layer (rank, batch, block size, node blocks)");
+    m.def("om_v_serves", &om_v_serves, "whether the side CTAs (and lowrank_v_rows) form V's rows of N children at rank K");
+    m.def("lowrank_v_rows", &lowrank_v_rows, "V's rows and their shifts of one copy, its factors read in place");
     m.def("lowrank_backward_om", &lowrank_backward_om,
           "the data half of the sum_exp backward over the virtual batch in one launch: element flows and dB's data part");
     m.def("set_da_ctas_most", &set_da_ctas_most, "(tests) the backward's dA CTAs a launch at most; 0: no cap");

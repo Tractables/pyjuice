@@ -3764,6 +3764,126 @@ def test_the_one_launch_tma_boxes_change_no_bit(bs, batch, fw, bw, monkeypatch):
         assert all(not torch.isnan(a).any() and torch.equal(a, b) for a, b in zip(got[k], want[k])), k
 
 
+
+@needs_virtual
+@pytest.mark.parametrize("N, B, copies", [(64, 4, 3), (256, 16, 2), (1024, 8, 3), (1344, 4, 2)])
+def test_the_side_ctas_v_rows_are_the_operand_kernels(N, B, copies):
+    """`lowrank_v_rows` (the one-launch forward's side-CTA code, `kernels/c/lowrank_stream.cu`'s `om_v_rows`): a copy's
+    V rows and their shifts, copy by copy at their rows, the same BITS as `lowrank_z_operand_in_place`'s (every copy in
+    one launch) -- factors read in place at a sample stride past their block, entries of -inf (a rank of no finite
+    entry: its shift -inf, its V 0), children past one unit's threads (N 1344)."""
+    import pyjuice.parameterizations.lowrank.virtual as lowrank_virtual
+
+    smod, mod, K = lowrank_virtual._stream_module(), lowrank_virtual._module(), 16
+    if smod is None or not smod.om_v_serves(N, K):
+        pytest.skip("the side CTAs do not serve this shape")
+    dev = torch.device("cuda")
+    torch.manual_seed(N + B)
+    fbs = []
+    for c in range(copies):
+        big = torch.randn(B, K * N + 8, device = dev) * 4.0             # (a sample's stride past its block)
+        f = big[:, :K * N].view(B, K, N)
+        f[:, 3, ::5] = -float("inf")
+        f[0, 7, :] = -float("inf")
+        fbs.append(f)
+    rows = copies * B * K
+    want = torch.empty(N, rows, dtype = torch.bfloat16, device = dev)
+    wsh = torch.empty(rows, device = dev)
+    mod.lowrank_z_operand_in_place(want, wsh, fbs, B, K)
+    got = torch.full_like(want, float("nan"))
+    gsh = torch.full_like(wsh, float("nan"))
+    for c in reversed(range(copies)):
+        smod.lowrank_v_rows(got, gsh, fbs[c], c * B * K)
+    assert torch.equal(got.view(torch.int16), want.view(torch.int16))
+    assert torch.equal(gsh, wsh) and bool(torch.isinf(wsh).any())
+
+
+@needs_virtual
+def test_the_side_ctas_count(monkeypatch):
+    """`virtual._om_vctas`, the one-launch forward's side CTAs forming the next copy's V rows: 16 where the tiles take
+    at most 4 rounds of the SMs, 24 past (the HMM's layers of 1024 nodes and children, rank 16: 2 B tiles of 1024
+    children); none where their units would take more than twice the tiles' rounds (a layer of 256 nodes: a quarter
+    of the tiles, V's work the same); a quarter of the SMs at most (a GPU of 20)."""
+    import pyjuice.parameterizations.lowrank.virtual as lowrank_virtual
+
+    dev = torch.device("cuda")
+    sms = torch.cuda.get_device_properties(dev).multi_processor_count
+    if sms < 96:
+        pytest.skip("the counts below are a GPU of 96 SMs or more's")
+    count = lambda B, nodes = 1024: lowrank_virtual._om_vctas(B, 16, 1024, (16 * B // 64) * (nodes // 128), 1024, dev)
+    assert [count(B) for B in (64, sms, 2 * sms)] == [16, 16, 16]
+    assert [count(B) for B in (2 * sms + 4, 1024, 2048)] == [24, 24, 24]
+    assert count(1024, nodes = 256) == 0 and count(64, nodes = 256) == 16
+    props = type("P", (), {"multi_processor_count": 20})()
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda d: props)
+    assert count(1024) == 5 and count(64) == 5
+
+
+class _NanEmpty:
+    """`torch` whose `empty` fills a floating tensor with NaN: what a buffer read before it is written gives."""
+
+    def __init__(self, t):
+        self._t = t
+
+    def __getattr__(self, k):
+        return getattr(self._t, k)
+
+    def empty(self, *a, **k):
+        x = self._t.empty(*a, **k)
+        return x.fill_(float("nan")) if x.is_floating_point() else x
+
+
+@needs_virtual
+@pytest.mark.parametrize("bs, batch, form, nv", [(32, 16, "om", 16), (256, 64, "om", 24), (32, 16, "om", 0),
+                                                (32, 16, "chain", None), (32, 16, "plain", None)])
+def test_the_pipelined_v_rows_change_no_bit(bs, batch, form, nv, monkeypatch):
+    """V's rows a copy at a time (`virtual.PIPELINED_V`): once a pass left the copies' visit order, the next forms each
+    copy's rows as it comes -- by the side CTAs of the one-launch forward before it (`lowrank_forward_om`'s `vnext`,
+    as many as `virtual._om_vctas` gives: `nv`; 0, none: by a launch of its own after it), else by a launch of its own
+    (`lowrank_v_rows`: the pass's first copy; every copy under the pre-pass chain) -- the same BITS as every copy's
+    upfront. ("plain": no fused stream forward -- the normalizers' product of every copy at the first,
+    `virtual._zt_rows`, forms the copies not yet formed.)"""
+    import pyjuice.parameterizations.lowrank.virtual as lowrank_virtual
+    from pyjuice.layer.kernels import autotune
+
+    pick = autotune.pick
+    monkeypatch.setattr(autotune, "pick", lambda key, cands, bench, **k: "fused"
+                        if key[0] in ("prod_stream_fusion", "prod_stream_fusion_bk") else pick(key, cands, bench, **k))
+    if nv is not None:
+        monkeypatch.setattr(lowrank_virtual, "_om_vctas", lambda *a: nv)
+    rank = 16
+    pc, sums, _, _, _, _ = _pair(_hmm_blocks(256, bs), "sum_exp", rank = rank)
+    monkeypatch.setattr(pc, "_param_operands_force", True, raising = False)   # (the bf16 copy: the stream path's)
+    monkeypatch.setattr(lowrank_virtual, "GEMM_BF16_WORK", 0)                # (bf16 normalizers, as at real sizes)
+    dev = pc.params.device
+    torch.manual_seed(62)
+    data = torch.randint(0, NUM_CATS, (batch, pc.num_vars), device = dev)
+    ext = {a: _factors(a, rank, batch, dev, seed = 620 + i) for i, a in enumerate(sums)}
+    smod = lowrank_virtual._stream_module()
+    if form == "plain":
+        monkeypatch.setattr(lowrank_virtual, "FUSED_STREAM", False)
+    taken = _stream_form(monkeypatch, form) if form != "plain" else None
+    side, own = [], []
+    fw, vr = smod.lowrank_forward_om, smod.lowrank_v_rows
+    monkeypatch.setattr(smod, "lowrank_forward_om", lambda *a: (side.append(a[-3] is not None), fw(*a))[1])
+    monkeypatch.setattr(smod, "lowrank_v_rows", lambda *a: (own.append(a[-1]), vr(*a))[1])
+    monkeypatch.setattr(lowrank_virtual, "PIPELINED_V", False)
+    want = _passes(pc, sums, data, ext)                                  # (every copy upfront; the order kept)
+    assert not own and not any(side)
+    monkeypatch.setattr(lowrank_virtual, "PIPELINED_V", True)
+    monkeypatch.setattr(lowrank_virtual, "torch", _NanEmpty(torch))      # (a row never formed reads as NaN, not as
+    side.clear()                                                         # the bits an earlier pass left there)
+    got = _passes(pc, sums, data, ext)
+    assert form == "plain" or taken and all((c == lowrank_virtual._OM_ARM) == (form == "om") for c, _ in taken)
+    if form == "om" and nv > 0:
+        assert sum(side) == len(sums) - 1 and len(own) == 1, (side, own)   # (the first copy alone: its own launch)
+    else:
+        assert not any(side) and len(own) == len(sums), (side, own)
+    for k in ("lls", "mars", "flows", "fp", "fm"):
+        assert not torch.isnan(got[k]).any() and torch.equal(got[k], want[k]), k
+    for k in ("dA", "dB"):
+        assert all(not torch.isnan(a).any() and torch.equal(a, b) for a, b in zip(got[k], want[k])), k
+
 @needs_virtual
 def test_the_backward_parameter_boxes_need_affine_slabs():
     """`virtual._om_bw_slabs`: the one-launch backward's parameter tiles go as TMA boxes only where every slab's base is
