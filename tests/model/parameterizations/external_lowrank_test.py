@@ -2783,12 +2783,20 @@ def test_the_fused_pass_end_follows_the_kept_operands(M, N, K, B, copies, kept):
                               [first if not kept else 0] * copies, row0, drow0, un, M, K, cvs)
     want_f = Ud.float() @ Vd.float().t()
     want_w = Un.float() @ Vt.float().t()                               # (the copies not asked for: their rows 0)
+    # (c_m given as a forward's tile maxima would give it: the children's values' max over 3 runs of the children)
+    cmos = []
+    for c in range(copies):
+        if c not in data:
+            cmos.append(None)
+            continue
+        w = cvs[c] if cvs[c] is not None else _kept_children(node_mars, table, first, eids[c])
+        cmos.append(torch.stack([p.max(0).values for p in w.tensor_split(3)]).contiguous())
     outs = []
-    for _ in range(2):
+    for cmo in ([None] * copies, [None] * copies, cmos):
         F = torch.full((M, N), float("nan"), device = dev)
         W = torch.full((M, N), float("nan"), device = dev)
         fmod.lowrank_pass_end_fused(F, W, Ua, am, Vt, shb, node_flows, node_mars, lz, nid0, eid_of, tables,
-                                    [first if not kept else 0] * copies, row0, drow0, un, M, K, cvs)
+                                    [first if not kept else 0] * copies, row0, drow0, un, M, K, cvs, cmo)
         outs.append((F, W))
     torch.cuda.synchronize()
     for (got, want), name in zip(zip(outs[0], (want_f, want_w)), ("F+", "W")):
@@ -2797,6 +2805,7 @@ def test_the_fused_pass_end_follows_the_kept_operands(M, N, K, B, copies, kept):
         assert float((got - want).abs().max()) <= 1e-3 * float(want.abs().max()), \
             (name, float((got - want).abs().max()), float(want.abs().max()))
     assert torch.equal(outs[0][0], outs[1][0]) and torch.equal(outs[0][1], outs[1][1]), "run to run"
+    assert torch.equal(outs[0][0], outs[2][0]) and torch.equal(outs[0][1], outs[2][1]), "c_m from tile maxima"
 
 
 def _fp8_rows(q8, scales):
@@ -3819,6 +3828,56 @@ def test_the_side_ctas_count(monkeypatch):
     assert count(1024) == 5 and count(64) == 5
 
 
+@needs_virtual
+@pytest.mark.parametrize("bs, batch", [(32, 16), (256, 64)])
+def test_the_forward_tile_maxima_change_no_bit(bs, batch, monkeypatch):
+    """The fused pass's end's c_m from the one-launch forward's tile maxima (`virtual.FORWARD_CMAX`: its converters'
+    running max at each tile's end, `lowrank_forward_om`'s `cmo`) -- the same BITS as from the children's values
+    (`pe_cmax_kernel`): every output of the passes, the statistics too; and every (tile, sample) entry the largest of
+    the copy's children's values (the HMM's layers dense: every tile reaches every child), the buffers NaN-filled."""
+    import pyjuice.parameterizations.lowrank.virtual as lowrank_virtual
+    from pyjuice.layer.kernels import autotune
+
+    pick = autotune.pick
+    monkeypatch.setattr(autotune, "pick", lambda key, cands, bench, **k: "fused"
+                        if key[0] in ("prod_stream_fusion", "prod_stream_fusion_bk") else pick(key, cands, bench, **k))
+    rank = 16
+    pc, sums, _, _, _, _ = _pair(_hmm_blocks(256, bs), "sum_exp", rank = rank)
+    monkeypatch.setattr(pc, "_param_operands_force", True, raising = False)
+    monkeypatch.setattr(lowrank_virtual, "GEMM_BF16_WORK", 0)
+    dev = pc.params.device
+    torch.manual_seed(63)
+    data = torch.randint(0, NUM_CATS, (batch, pc.num_vars), device = dev)
+    ext = {a: _factors(a, rank, batch, dev, seed = 630 + i) for i, a in enumerate(sums)}
+    smod, fmod = lowrank_virtual._stream_module(), lowrank_virtual._fused_end_module()
+    if fmod is None:
+        pytest.skip("the fused pass's end's extension is not built")
+    taken = _stream_form(monkeypatch, "om")
+    given, fw, pe = [], smod.lowrank_forward_om, fmod.lowrank_pass_end_fused
+    monkeypatch.setattr(smod, "lowrank_forward_om", lambda *a: (given.append(a[-1] is not None), fw(*a))[1])
+    took, args = [], []
+    monkeypatch.setattr(fmod, "lowrank_pass_end_fused",
+                        lambda *a: (took.append(sum(t is not None for t in a[-1])), args.append(a), pe(*a))[2])
+    monkeypatch.setattr(lowrank_virtual, "FORWARD_CMAX", False)
+    want = _passes(pc, sums, data, ext)
+    assert taken and not any(given) and took and not any(took)
+    monkeypatch.setattr(lowrank_virtual, "FORWARD_CMAX", True)
+    monkeypatch.setattr(lowrank_virtual, "torch", _NanEmpty(torch))      # (an entry never written: NaN)
+    given.clear(); took.clear(); args.clear()
+    got = _passes(pc, sums, data, ext)
+    assert given and all(given) and took and all(t > 0 for t in took), (given, took)
+    for a in args:                                    # (node_mars, eid, table, first, cv, cmo: the call's)
+        for c, cmo in enumerate(a[19]):
+            if cmo is None:
+                continue
+            w = a[18][c] if a[18][c] is not None else _kept_children(a[7], a[11][c], a[12][c], a[10][c])
+            assert torch.equal(cmo, w.max(0).values.expand_as(cmo)), c
+    for k in ("lls", "mars", "flows", "fp", "fm"):
+        assert not torch.isnan(got[k]).any() and torch.equal(got[k], want[k]), k
+    for k in ("dA", "dB"):
+        assert all(not torch.isnan(a).any() and torch.equal(a, b) for a, b in zip(got[k], want[k])), k
+
+
 class _NanEmpty:
     """`torch` whose `empty` fills a floating tensor with NaN: what a buffer read before it is written gives."""
 
@@ -3865,7 +3924,7 @@ def test_the_pipelined_v_rows_change_no_bit(bs, batch, form, nv, monkeypatch):
     taken = _stream_form(monkeypatch, form) if form != "plain" else None
     side, own = [], []
     fw, vr = smod.lowrank_forward_om, smod.lowrank_v_rows
-    monkeypatch.setattr(smod, "lowrank_forward_om", lambda *a: (side.append(a[-3] is not None), fw(*a))[1])
+    monkeypatch.setattr(smod, "lowrank_forward_om", lambda *a: (side.append(a[-4] is not None), fw(*a))[1])
     monkeypatch.setattr(smod, "lowrank_v_rows", lambda *a: (own.append(a[-1]), vr(*a))[1])
     monkeypatch.setattr(lowrank_virtual, "PIPELINED_V", False)
     want = _passes(pc, sums, data, ext)                                  # (every copy upfront; the order kept)

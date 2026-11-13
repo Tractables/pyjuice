@@ -56,8 +56,9 @@ __device__ __forceinline__ void tma_load_2d(uint32_t smem, const CUtensorMap* de
 // ---------------- the copies' tables ----------------
 // A copy's pointers and places (the kept operands' `KeptCopies`, and its slots in the two products): log Z, first node
 // row, eid (its children's element rows), table, first, cv (its children's kept values), row0 (its rows of Ua / Vt),
-// am's copy, its slot in F+ (-1: none), its slot in W (-1: none)
-constexpr int CW = 10;
+// am's copy, its slot in F+ (-1: none), its slot in W (-1: none), the one-launch forward's tile maxima (0: none) and
+// their node tiles
+constexpr int CW = 12;
 struct Copies { long long v[64 * CW]; };
 struct Rows { long long r[64]; };                       // (a product's slots' first rows of Ua / Vt)
 
@@ -84,7 +85,8 @@ __global__ void pe_cmax_kernel(const Copies copies, float* __restrict__ cmp, con
     __shared__ float most[8][32];
     float m = -INFINITY;
     const int j0 = (int)((long)N * blockIdx.y / CMS), j1 = (int)((long)N * (blockIdx.y + 1) / CMS);
-    if (b < B && qd >= 0)
+    const bool fwd = c[10] != 0;                         // (c_m from the forward's tile maxima: nothing to do)
+    if (b < B && qd >= 0 && !fwd)
         for (int j = j0 + w; j < j1; j += 8) {
             const long e = eid[j];
             if (e < 0) continue;
@@ -92,7 +94,7 @@ __global__ void pe_cmax_kernel(const Copies copies, float* __restrict__ cmp, con
         }
     most[w][lane] = m;
     __syncthreads();
-    if (w != 0 || b >= B || qd < 0) return;
+    if (w != 0 || b >= B || qd < 0 || fwd) return;
     float sh = most[0][lane];
     for (int i = 1; i < 8; i++) sh = fmaxf(sh, most[i][lane]);
     cmp[((long)qd * CMS + blockIdx.y) * B + b] = sh;
@@ -126,8 +128,13 @@ __global__ void pe_tables_kernel(const Copies copies, float* __restrict__ fd, fl
         csh[tx] = m > -INFINITY ? m : 0.f;
     } else if (ty == 1) {
         float m = -INFINITY;
-        if (qd >= 0 && b < B)
-            for (int y = 0; y < CMS; y++) m = fmaxf(m, cmp[((long)qd * CMS + y) * B + b]);
+        const float* cmo = reinterpret_cast<const float*>(c[10]);
+        if (qd >= 0 && b < B) {
+            if (cmo != nullptr)                          // (the forward's tile maxima: the same max over the children)
+                for (int y = 0; y < (int)c[11]; y++) m = fmaxf(m, cmo[(long)y * B + b]);
+            else
+                for (int y = 0; y < CMS; y++) m = fmaxf(m, cmp[((long)qd * CMS + y) * B + b]);
+        }
         cmsh[tx] = m;
     }
     __syncthreads();
@@ -441,14 +448,16 @@ void check(const torch::Tensor& t, const char* what, at::ScalarType dt, long num
 using namespace lrpe;
 
 // The fused pass's end (the copies as `lowrank_kept_operands` takes them; `drow0[c]` >= 0: the copy in F+, `un[c]`: in
-// W): F+ into `F` [M, N] and W into `W` [M, N] (fp32, written), neither operand written.
+// W): F+ into `F` [M, N] and W into `W` [M, N] (fp32, written), neither operand written. `cmo[c]` (or none): the
+// copy's one-launch forward's tile maxima [node tiles, B] (`lowrank_forward_om`'s), its c_m then theirs.
 void lowrank_pass_end_fused(c10::optional<torch::Tensor> F, c10::optional<torch::Tensor> W, torch::Tensor ua,
                             torch::Tensor am, torch::Tensor vt, torch::Tensor shb, torch::Tensor node_flows,
                             torch::Tensor node_mars, std::vector<torch::Tensor> lz, std::vector<int64_t> nid0,
                             std::vector<c10::optional<torch::Tensor>> eid,
                             std::vector<c10::optional<torch::Tensor>> table, std::vector<int64_t> first,
                             std::vector<int64_t> row0, std::vector<int64_t> drow0, std::vector<int64_t> un, int64_t M,
-                            int64_t K, std::vector<c10::optional<torch::Tensor>> cv) {
+                            int64_t K, std::vector<c10::optional<torch::Tensor>> cv,
+                            std::vector<c10::optional<torch::Tensor>> cmo) {
     const int B = (int)node_flows.size(1), N = (int)vt.size(0);
     const long rows = ua.size(1), P = (long)lz.size(), R = (long)B * K;
     TORCH_CHECK(P <= 64, "lowrank fused pass's end: at most 64 copies");
@@ -464,8 +473,10 @@ void lowrank_pass_end_fused(c10::optional<torch::Tensor> F, c10::optional<torch:
     check(node_mars, "node_mars", torch::kFloat32, -1);
     const at::cuda::OptionalCUDAGuard guard(ua.device());
     cudaStream_t st = c10::cuda::getCurrentCUDAStream();
+    TORCH_CHECK((long)cmo.size() == P, "lowrank fused pass's end: cmo a copy");
     Copies copies;
     std::vector<int64_t> rd, rn;
+    bool cmax = false;                                   // (a copy in F+ whose c_m `pe_cmax` makes)
     for (long c = 0; c < P; c++) {
         check(lz[c], "lz", torch::kFloat32, (long)B * M);
         TORCH_CHECK(nid0[c] >= 0 && node_flows.size(0) >= nid0[c] + M, "lowrank fused pass's end: a copy's node rows");
@@ -486,6 +497,11 @@ void lowrank_pass_end_fused(c10::optional<torch::Tensor> F, c10::optional<torch:
         v[4] = (long long)first[c]; v[5] = kept ? (long long)cv[c]->data_ptr<float>() : 0;
         v[6] = (long long)row0[c]; v[7] = (long long)(row0[c] / R);
         v[8] = d ? (long long)rd.size() : -1; v[9] = n ? (long long)rn.size() : -1;
+        const bool fw = d && cmo[c].has_value();
+        if (fw) TORCH_CHECK(cmo[c]->is_cuda() && cmo[c]->is_contiguous() && cmo[c]->scalar_type() == torch::kFloat32 &&
+                            cmo[c]->numel() % B == 0 && cmo[c]->numel() > 0, "lowrank fused pass's end: cmo [tiles, B]");
+        v[10] = fw ? (long long)cmo[c]->data_ptr<float>() : 0; v[11] = fw ? (long long)(cmo[c]->numel() / B) : 0;
+        cmax = cmax || (d && !fw);
         if (d) rd.push_back(row0[c]);
         if (n) rn.push_back(row0[c]);
     }
@@ -497,7 +513,7 @@ void lowrank_pass_end_fused(c10::optional<torch::Tensor> F, c10::optional<torch:
     torch::Tensor fd = torch::empty({std::max<long>(1, Pd * B * M)}, f32), gd = torch::empty({std::max<long>(1, Pd * B * N)}, f32);
     torch::Tensor fn = torch::empty({std::max<long>(1, Pn * B * M)}, f32);
     torch::Tensor skd = torch::empty({std::max<long>(1, Pd * R)}, f32), skn = torch::empty({std::max<long>(1, Pn * R)}, f32);
-    if (Pd > 0) {
+    if (cmax) {
         pe_cmax_kernel<<<dim3((B + 31) / 32, CMS, (unsigned)P), 256, 0, st>>>(copies, cmp.data_ptr<float>(),
                                                                               node_mars.data_ptr<float>(), N, B);
         C10_CUDA_KERNEL_LAUNCH_CHECK();

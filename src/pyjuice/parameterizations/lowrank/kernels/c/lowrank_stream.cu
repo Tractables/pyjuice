@@ -615,7 +615,7 @@ __global__ void __launch_bounds__(OM_THREADS, 1) lr_om_kernel(
         float* __restrict__ lz, long nshift, long vn0, int ntiles, int nbg, bfloat16_t* __restrict__ uaw, long urows,
         float* __restrict__ amw, const __grid_constant__ CUtensorMap tmapV, const __grid_constant__ CUtensorMap tmapC,
         const float* __restrict__ vfb, long vf_sb, bfloat16_t* __restrict__ vout, float* __restrict__ vsh, long vrow0,
-        int vX, int n_v, int nct) {
+        int vX, int n_v, int nct, float* __restrict__ cmo) {
     constexpr int BM = OM_BM, BN = OM_BN, K = OM_K, WM = 4, WN = 2;
     if ((int)blockIdx.x < n_v) {
         // ---------- the side CTAs (the grid's first): another copy's V rows (the launch before done first) ----------
@@ -985,6 +985,12 @@ __global__ void __launch_bounds__(OM_THREADS, 1) lr_om_kernel(
             CUTE_UNROLL
             for (int i = 0; i < SPW; i++) mrun[i] = -INFINITY;   // (a tile's maxima anew)
             for (int jj = 0; jj < nk; jj++) convert();
+            if (cmo != nullptr && lane == 0) {           // (the tile's children's maxima: the pass's end's c_m there)
+                int pid_b, pid_m;
+                tile_of(tile, nbt, ntiles / nbt, nbg, pid_b, pid_m);
+                CUTE_UNROLL
+                for (int i = 0; i < SPW; i++) cmo[(long)pid_m * B + pid_b * S + w * SPW + i] = mrun[i];
+            }
         }
         return;
     }
@@ -2234,7 +2240,7 @@ static void launch_om(const bfloat16_t* params, const long* pbase, const bfloat1
                       int num_edges, const CUtensorMap& tmapA, const float* fa, long a_sb, float* node_mars,
                       float* lz, long nshift, long vn0, bfloat16_t* uaw, long urows, float* amw,
                       const CUtensorMap& tmapV, const CUtensorMap& tmapC, const float* vfb, long vf_sb,
-                      bfloat16_t* vout, float* vsh, long vrow0, int vX, int n_v, cudaStream_t st) {
+                      bfloat16_t* vout, float* vsh, long vrow0, int vX, int n_v, float* cmo, cudaStream_t st) {
     constexpr int ST = OM_ST, S = OM_BN / OM_K;
     constexpr int STAGE = (32 * OM_BM * 2 + 2 * 32 * OM_BN * 2 + 2 * 32 * S * 4 + 1023) / 1024 * 1024;
     constexpr int SMEM = ST * STAGE + 2 * ST * S * 4 + 3 * ST * 8;   // (the stages, their records, the barriers)
@@ -2258,7 +2264,7 @@ static void launch_om(const bfloat16_t* params, const long* pbase, const bfloat1
     launch_pdl(kernel, dim3((unsigned)(nct + n_v)), dim3(OM_THREADS), SMEM, st, params, pbase, vt,
                vrows, row0, shift, vals, ebase, cbase, jpos, ugrp, knt, mtiles, block_size, B, vnm, nids, num_edges, tmapA,
                fa, a_sb, node_mars, lz, nshift, vn0, (int)n, om_tile_group(), uaw, urows, amw, tmapV, tmapC, vfb, vf_sb,
-               vout, vsh, vrow0, vX, n_v, nct);
+               vout, vsh, vrow0, vX, n_v, nct, cmo);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
@@ -2311,13 +2317,15 @@ void lowrank_v_rows(torch::Tensor vt, torch::Tensor shift, torch::Tensor fb, int
 // factors A [B, M, K] as the caller gives them (read in place: any batch stride, 16-byte aligned, a sample's block
 // contiguous); `vn0` the node vector's first twin row. `a_p0` / `a_bstr`: the
 // parameter slabs' bases `a_p0 + block a_bstr + edge tile 64 block_size` (`a_p0` -1: not so, or blocks not of 32 -- A by
-// cp.async; else by TMA), checked by the caller once per table.
+// cp.async; else by TMA), checked by the caller once per table. `cmo` (or none): each (node tile, sample)'s largest
+// child value over the tile's children, [node tiles, B] -- what the fused pass's end takes c_m from (`pe_tables`).
 void lowrank_forward_om(torch::Tensor vnm, torch::Tensor vals, c10::optional<torch::Tensor> cbase, torch::Tensor ebase,
                         torch::Tensor jpos, torch::Tensor vt, int64_t row0, torch::Tensor shift, torch::Tensor params,
                         torch::Tensor nids, torch::Tensor pbase, torch::Tensor ugrp, int64_t block_size, int64_t knt_,
                         int64_t a_p0, int64_t a_bstr, torch::Tensor node_mars, torch::Tensor lz, torch::Tensor fa,
                         int64_t nshift, int64_t vn0, c10::optional<torch::Tensor> ua, c10::optional<torch::Tensor> am,
-                        bool vtma, c10::optional<torch::Tensor> vnext, int64_t vrow0, int64_t n_v) {
+                        bool vtma, c10::optional<torch::Tensor> vnext, int64_t vrow0, int64_t n_v,
+                        c10::optional<torch::Tensor> cmo) {
     const int knt = (int)knt_, rows = (int)nids.size(0);
     const int B = (int)vals.size(1), cols = (int)vnm.size(1);
     const int num_edges = knt * BK;
@@ -2399,13 +2407,17 @@ void lowrank_forward_om(torch::Tensor vnm, torch::Tensor vals, c10::optional<tor
     const float* vfb = nv > 0 ? vnext->data_ptr<float>() : nullptr;
     const long vf_sb = nv > 0 ? (long)vnext->stride(0) : 0;
     bfloat16_t* vout = nv > 0 ? reinterpret_cast<bfloat16_t*>(vt.data_ptr()) : nullptr;
+    if (cmo.has_value())
+        TORCH_CHECK(cmo->is_cuda() && cmo->is_contiguous() && cmo->scalar_type() == torch::kFloat32 &&
+                    cmo->numel() == ((long)rows * block_size / OM_BM) * B, "lowrank om: cmo float32 [node tiles, B]");
+    float* cmw = cmo.has_value() ? cmo->data_ptr<float>() : nullptr;
 #define LOWRANK_OM(F, T, VT)                                                                                          \
     launch_om<F, T, VT>(pp, pbase.data_ptr<long>(), vtp, (long)vt.size(1), (long)row0, shift.data_ptr<float>(),     \
                     vals.data_ptr<float>(), ebase.data_ptr<long>(), cb, jpos.data_ptr<int>(), ugrp.data_ptr<int>(),     \
                     knt, rows, (int)block_size, B, vnm.data_ptr<float>(), nids.data_ptr<long>(), num_edges, tm,      \
                     fa.data_ptr<float>(), (long)fa.stride(0), node_mars.data_ptr<float>(), lz.data_ptr<float>(),       \
                     (long)nshift, (long)vn0, uaw, (long)vt.size(1), amw, tv, tc, vfb, vf_sb, vout,           \
-                    shift.data_ptr<float>(), (long)vrow0, (int)vt.size(0), nv, st)
+                    shift.data_ptr<float>(), (long)vrow0, (int)vt.size(0), nv, cmw, st)
     if (vtma) {
         if (fused) { if (tma) LOWRANK_OM(true, true, true); else LOWRANK_OM(true, false, true); }
         else { if (tma) LOWRANK_OM(false, true, true); else LOWRANK_OM(false, false, true); }

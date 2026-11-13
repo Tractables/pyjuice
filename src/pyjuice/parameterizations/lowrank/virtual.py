@@ -600,6 +600,10 @@ _OM_ARM = 4096
 #: formed first where nothing formed it yet -- instead of every copy's by a launch of their own before the first
 #: (`lowrank_v_rows`, the forward's `vnext`; the same bits). `False`: every copy upfront.
 PIPELINED_V = True
+#: The fused pass's end's c_m (each copy's and sample's largest child value) from the one-launch forward's tile maxima
+#: (`lowrank_forward_om`'s `cmo`: its converters' running max at each tile's end, the max over the tiles the same as
+#: over the children an edge reaches) instead of a launch of its own (`pe_cmax_kernel`; the same bits).
+FORWARD_CMAX = True
 
 
 def _om_vctas(B: int, K: int, X: int, tiles: int, children: int, dev) -> int:
@@ -841,11 +845,19 @@ def _stream_run(plan, info, tensors, kwargs, z, row0, vnm, kd, node_mars, elemen
                     nxt = next((c for c in order[order.index(info.ns) + 1:] if c not in ready), None)
                 fbn = None if nxt is None else z["fb"][z["row"][nxt] // z["cols"]]
 
+                # (the tile maxima for the fused pass's end's c_m: [node tiles, B])
+                cmo = None
+                if FORWARD_CMAX:
+                    cmo = z.setdefault("cmo", dict()).get(info.ns)
+                    if cmo is None:
+                        cmo = z["cmo"][info.ns] = torch.empty(p["nids"].numel() * twin.block_size // 128,
+                                                              node_mars.size(1), device = node_mars.device)
+
                 def fw(nv):
                     mod.lowrank_forward_om(kd, vals, cb, p["ebase"], p["jpos"], vt, row0, shift, op, p["nids"],
                                            p["pbase"], p["groups"][0], twin.block_size, p["knt"], p["om"][0],
                                            p["om"][1], node_mars, lz, a_om, nshift, vn0, ua[0], ua[1], p["vtma"],
-                                           fbn if nv > 0 else None, z["row"][nxt] if nv > 0 else 0, nv)
+                                           fbn if nv > 0 else None, z["row"][nxt] if nv > 0 else 0, nv, cmo)
                     if fbn is not None and nv == 0:
                         mod.lowrank_v_rows(z["V"], z["shift"], fbn, z["row"][nxt])
                 if nxt is None:
@@ -1149,7 +1161,8 @@ def _end_of_pass(mod, z, copies, node_flows, node_mars, params, param_flows, den
             F, W, ua, am, Vt, shift, node_flows, node_mars, [c[3] for c in sel], [c[1].nid_start for c in sel], geos,
             [c[5][0] if id(c) in at else None for c in sel], [c[5][1] if id(c) in at else 0 for c in sel],
             [z["row"][c[1].ns] for c in sel], [at.get(id(c), -1) for c in sel], [int(id(c) in un) for c in sel], M, K,
-            [c[5][2] if id(c) in at else None for c in sel])
+            [c[5][2] if id(c) in at else None for c in sel],
+            [z.get("cmo", dict()).get(c[1].ns) if id(c) in at and FORWARD_CMAX else None for c in sel])
         if fp:
             desc._scatter_add(geo, param_flows, fp[0][1].ns._param_flow_range[0], F, params)
         if want_denom:
