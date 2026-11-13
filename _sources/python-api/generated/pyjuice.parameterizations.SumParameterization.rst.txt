@@ -1,0 +1,16 @@
+﻿pyjuice.parameterizations.SumParameterization
+=============================================
+
+.. currentmodule:: pyjuice.parameterizations
+
+.. autoclass:: SumParameterization
+
+   
+   .. automethod:: __init__
+
+   
+   
+
+   
+   
+   

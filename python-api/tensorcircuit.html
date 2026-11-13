@@ -25,7 +25,7 @@
     <link rel="index" title="Index" href="../genindex.html" />
     <link rel="search" title="Search" href="../search.html" />
     <link rel="next" title="pyjuice.queries" href="queries.html" />
-    <link rel="prev" title="pyjuice.nodes.distributions.ExternProductCategorical" href="generated/pyjuice.nodes.distributions.ExternProductCategorical.html" /> 
+    <link rel="prev" title="pyjuice.parameterizations.LowRank" href="generated/pyjuice.parameterizations.LowRank.html" /> 
 </head>
 
 <body class="wy-body-for-nav"> 
@@ -56,6 +56,7 @@
 <ul class="current">
 <li class="toctree-l1"><a class="reference internal" href="pyjuice.html">pyjuice</a></li>
 <li class="toctree-l1"><a class="reference internal" href="nodes.html">pyjuice.nodes</a></li>
+<li class="toctree-l1"><a class="reference internal" href="parameterizations.html">pyjuice.parameterizations</a></li>
 <li class="toctree-l1 current"><a class="current reference internal" href="#">pyjuice.TensorCircuit</a><ul>
 <li class="toctree-l2"><a class="reference internal" href="#pyjuice.TensorCircuit"><code class="docutils literal notranslate"><span class="pre">TensorCircuit</span></code></a></li>
 <li class="toctree-l2"><a class="reference internal" href="#inference">Inference</a><ul>
@@ -220,7 +221,9 @@ selected per-call by passing <cite>propagation_alg=…</cite> directly to <a cla
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
 <li><p><strong>step_size</strong> (<a class="reference external" href="https://docs.python.org/3/builtins/functions.html#float" title="(in Python v3.15)"><em>float</em></a>) – Step size - updated_params &lt;- (1-step_size) * params + step_size * new_params</p></li>
-<li><p><strong>pseudocount</strong> (<a class="reference external" href="https://docs.python.org/3/builtins/functions.html#float" title="(in Python v3.15)"><em>float</em></a>) – a pseudo count added to the parameter flows</p></li>
+<li><p><strong>pseudocount</strong> (<a class="reference external" href="https://docs.python.org/3/builtins/functions.html#float" title="(in Python v3.15)"><em>float</em></a>) – a pseudo count added to the parameter flows. At 0, a node no flow reached (its flows sum to
+0, the update 0 / 0) keeps its parameters; the conditional dual-flow update takes such a parameter’s ratio
+<cite>F+ / F-</cite> as 1</p></li>
 <li><p><strong>keep_zero_params</strong> (<a class="reference external" href="https://docs.python.org/3/builtins/functions.html#bool" title="(in Python v3.15)"><em>bool</em></a>) – if <cite>True</cite>, freeze exactly zero parameters; positive parameters are updated
 regardless of their magnitude (no implicit pruning threshold)</p></li>
 <li><p><strong>step_size_rescaling</strong> (<a class="reference external" href="https://docs.python.org/3/builtins/functions.html#bool" title="(in Python v3.15)"><em>bool</em></a>) – whether to rescale the step size by flows</p></li>
@@ -349,7 +352,7 @@ zeroing the flows if set to 0</p>
            </div>
           </div>
           <footer><div class="rst-footer-buttons" role="navigation" aria-label="Footer">
-        <a href="generated/pyjuice.nodes.distributions.ExternProductCategorical.html" class="btn btn-neutral float-left" title="pyjuice.nodes.distributions.ExternProductCategorical" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> Previous</a>
+        <a href="generated/pyjuice.parameterizations.LowRank.html" class="btn btn-neutral float-left" title="pyjuice.parameterizations.LowRank" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> Previous</a>
         <a href="queries.html" class="btn btn-neutral float-right" title="pyjuice.queries" accesskey="n" rel="next">Next <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
     </div>
 

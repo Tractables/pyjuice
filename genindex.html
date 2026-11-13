@@ -53,6 +53,7 @@
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="python-api/pyjuice.html">pyjuice</a></li>
 <li class="toctree-l1"><a class="reference internal" href="python-api/nodes.html">pyjuice.nodes</a></li>
+<li class="toctree-l1"><a class="reference internal" href="python-api/parameterizations.html">pyjuice.parameterizations</a></li>
 <li class="toctree-l1"><a class="reference internal" href="python-api/tensorcircuit.html">pyjuice.TensorCircuit</a></li>
 <li class="toctree-l1"><a class="reference internal" href="python-api/queries.html">pyjuice.queries</a></li>
 <li class="toctree-l1"><a class="reference internal" href="python-api/optim.html">pyjuice.optim</a></li>
@@ -137,9 +138,17 @@
 </li>
         <li><a href="python-api/generated/pyjuice.nodes.InputNodes.html#pyjuice.nodes.InputNodes.__init__">(pyjuice.nodes.InputNodes method)</a>
 </li>
+        <li><a href="python-api/generated/pyjuice.nodes.ParameterizedSumNodes.html#pyjuice.nodes.ParameterizedSumNodes.__init__">(pyjuice.nodes.ParameterizedSumNodes method)</a>
+</li>
         <li><a href="python-api/generated/pyjuice.nodes.ProdNodes.html#pyjuice.nodes.ProdNodes.__init__">(pyjuice.nodes.ProdNodes method)</a>
 </li>
         <li><a href="python-api/generated/pyjuice.nodes.SumNodes.html#pyjuice.nodes.SumNodes.__init__">(pyjuice.nodes.SumNodes method)</a>
+</li>
+        <li><a href="python-api/generated/pyjuice.parameterizations.BlockScale.html#pyjuice.parameterizations.BlockScale.__init__">(pyjuice.parameterizations.BlockScale method)</a>
+</li>
+        <li><a href="python-api/generated/pyjuice.parameterizations.LowRank.html#pyjuice.parameterizations.LowRank.__init__">(pyjuice.parameterizations.LowRank method)</a>
+</li>
+        <li><a href="python-api/generated/pyjuice.parameterizations.SumParameterization.html#pyjuice.parameterizations.SumParameterization.__init__">(pyjuice.parameterizations.SumParameterization method)</a>
 </li>
         <li><a href="python-api/generated/pyjuice.set_block_size.html#pyjuice.set_block_size.__init__">(pyjuice.set_block_size method)</a>
 </li>
@@ -171,6 +180,8 @@
       <li><a href="python-api/generated/pyjuice.nodes.methods.edge_constructors.block_sparse_rnd_blk_edge_constructor.html#pyjuice.nodes.methods.edge_constructors.block_sparse_rnd_blk_edge_constructor">block_sparse_rnd_blk_edge_constructor() (in module pyjuice.nodes.methods.edge_constructors)</a>
 </li>
       <li><a href="python-api/generated/pyjuice.blockify.html#pyjuice.blockify">blockify() (in module pyjuice)</a>
+</li>
+      <li><a href="python-api/generated/pyjuice.parameterizations.BlockScale.html#pyjuice.parameterizations.BlockScale">BlockScale (class in pyjuice.parameterizations)</a>
 </li>
       <li><a href="python-api/generated/pyjuice.transformations.bump_block_size.html#pyjuice.transformations.bump_block_size">bump_block_size() (in module pyjuice.transformations)</a>
 </li>
@@ -296,6 +307,8 @@
   <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="python-api/generated/pyjuice.load.html#pyjuice.load">load() (in module pyjuice)</a>
 </li>
+      <li><a href="python-api/generated/pyjuice.parameterizations.LowRank.html#pyjuice.parameterizations.LowRank">LowRank (class in pyjuice.parameterizations)</a>
+</li>
   </ul></td>
 </tr></table>
 
@@ -322,6 +335,8 @@
 <h2 id="P">P</h2>
 <table style="width: 100%" class="indextable genindextable"><tr>
   <td style="width: 33%; vertical-align: top;"><ul>
+      <li><a href="python-api/generated/pyjuice.nodes.ParameterizedSumNodes.html#pyjuice.nodes.ParameterizedSumNodes">ParameterizedSumNodes (class in pyjuice.nodes)</a>
+</li>
       <li><a href="python-api/generated/pyjuice.structures.PD.html#pyjuice.structures.PD">PD() (in module pyjuice.structures)</a>
 </li>
       <li><a href="python-api/generated/pyjuice.structures.PDHCLT.html#pyjuice.structures.PDHCLT">PDHCLT() (in module pyjuice.structures)</a>
@@ -368,8 +383,6 @@
 </li>
       <li><a href="python-api/generated/pyjuice.nodes.distributions.SoftEvidenceIndicator.html#pyjuice.nodes.distributions.SoftEvidenceIndicator">SoftEvidenceIndicator (class in pyjuice.nodes.distributions)</a>
 </li>
-  </ul></td>
-  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="python-api/optim.html#pyjuice.optim.Anemone.step">step() (pyjuice.optim.Anemone method)</a>
 
       <ul>
@@ -380,11 +393,15 @@
         <li><a href="python-api/optim.html#pyjuice.optim.MiniBatchEM.step">(pyjuice.optim.MiniBatchEM method)</a>
 </li>
       </ul></li>
+  </ul></td>
+  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="python-api/generated/pyjuice.structural_properties.html#pyjuice.structural_properties">structural_properties (class in pyjuice)</a>
 </li>
       <li><a href="python-api/generated/pyjuice.summate.html#pyjuice.summate">summate() (in module pyjuice)</a>
 </li>
       <li><a href="python-api/generated/pyjuice.nodes.SumNodes.html#pyjuice.nodes.SumNodes">SumNodes (class in pyjuice.nodes)</a>
+</li>
+      <li><a href="python-api/generated/pyjuice.parameterizations.SumParameterization.html#pyjuice.parameterizations.SumParameterization">SumParameterization (class in pyjuice.parameterizations)</a>
 </li>
   </ul></td>
 </tr></table>

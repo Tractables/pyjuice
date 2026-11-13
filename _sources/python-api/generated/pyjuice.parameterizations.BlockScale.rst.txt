@@ -1,0 +1,16 @@
+﻿pyjuice.parameterizations.BlockScale
+====================================
+
+.. currentmodule:: pyjuice.parameterizations
+
+.. autoclass:: BlockScale
+
+   
+   .. automethod:: __init__
+
+   
+   
+
+   
+   
+   

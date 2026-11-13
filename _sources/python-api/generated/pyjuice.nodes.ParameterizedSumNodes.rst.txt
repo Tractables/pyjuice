@@ -1,0 +1,29 @@
+﻿pyjuice.nodes.ParameterizedSumNodes
+===================================
+
+.. currentmodule:: pyjuice.nodes
+
+.. autoclass:: ParameterizedSumNodes
+
+   
+   .. automethod:: __init__
+
+   
+   .. rubric:: Methods
+
+   .. autosummary::
+   
+      ~ParameterizedSumNodes.duplicate
+      ~ParameterizedSumNodes.gather_parameters
+      ~ParameterizedSumNodes.get_params
+      ~ParameterizedSumNodes.init_parameters
+      ~ParameterizedSumNodes.num_parameters
+      ~ParameterizedSumNodes.set_params
+      ~ParameterizedSumNodes.update_param_flows
+      ~ParameterizedSumNodes.update_parameters
+   
+   
+
+   
+   
+   

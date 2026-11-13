@@ -14,6 +14,7 @@ Nodes
     InputNodes
     ProdNodes
     SumNodes
+    ParameterizedSumNodes
 
 Methods
 -------

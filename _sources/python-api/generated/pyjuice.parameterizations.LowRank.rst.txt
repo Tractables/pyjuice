@@ -1,0 +1,16 @@
+﻿pyjuice.parameterizations.LowRank
+=================================
+
+.. currentmodule:: pyjuice.parameterizations
+
+.. autoclass:: LowRank
+
+   
+   .. automethod:: __init__
+
+   
+   
+
+   
+   
+   

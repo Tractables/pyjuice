@@ -1,0 +1,220 @@
+
+
+<!DOCTYPE html>
+<html class="writer-html5" lang="en" data-content_root="../../">
+<head>
+  <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>pyjuice.parameterizations.BlockScale &mdash; PyJuice 2.7.0 documentation</title>
+      <link rel="stylesheet" type="text/css" href="../../_static/pygments.css?v=b86133f3" />
+      <link rel="stylesheet" type="text/css" href="../../_static/css/theme.css?v=9edc463e" />
+      <link rel="stylesheet" type="text/css" href="../../_static/sg_gallery.css?v=c83e6b79" />
+      <link rel="stylesheet" type="text/css" href="../../_static/sg_gallery-binder.css?v=f4aeca0c" />
+      <link rel="stylesheet" type="text/css" href="../../_static/sg_gallery-dataframe.css?v=2082cf3c" />
+      <link rel="stylesheet" type="text/css" href="../../_static/sg_gallery-rendered-html.css?v=1277b6f3" />
+
+  
+      <script src="../../_static/jquery.js?v=5d32c60e"></script>
+      <script src="../../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
+      <script src="../../_static/documentation_options.js?v=dfec817d"></script>
+      <script src="../../_static/doctools.js?v=9bcbadda"></script>
+      <script src="../../_static/sphinx_highlight.js?v=dc90522c"></script>
+      <script src="../../_static/sg-tags.js?v=d80f6fa4"></script>
+    <script src="../../_static/js/theme.js"></script>
+    <link rel="index" title="Index" href="../../genindex.html" />
+    <link rel="search" title="Search" href="../../search.html" />
+    <link rel="next" title="pyjuice.parameterizations.LowRank" href="pyjuice.parameterizations.LowRank.html" />
+    <link rel="prev" title="pyjuice.parameterizations.SumParameterization" href="pyjuice.parameterizations.SumParameterization.html" /> 
+</head>
+
+<body class="wy-body-for-nav"> 
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side">
+      <div class="wy-side-scroll">
+        <div class="wy-side-nav-search" >
+
+          
+          
+          <a href="../../index.html" class="icon icon-home">
+            PyJuice
+          </a>
+<div role="search">
+  <form id="rtd-search-form" class="wy-form" action="../../search.html" method="get">
+    <input type="text" name="q" placeholder="Search docs" aria-label="Search docs" />
+    <input type="hidden" name="check_keywords" value="yes" />
+    <input type="hidden" name="area" value="default" />
+  </form>
+</div>
+        </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="Navigation menu">
+              <p class="caption" role="heading"><span class="caption-text">Getting Started</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../getting-started/installation.html">Installation</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../getting-started/tutorials/index.html">Tutorials</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">API</span></p>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../pyjuice.html">pyjuice</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../nodes.html">pyjuice.nodes</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="../parameterizations.html">pyjuice.parameterizations</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="pyjuice.parameterizations.SumParameterization.html">pyjuice.parameterizations.SumParameterization</a></li>
+<li class="toctree-l2 current"><a class="current reference internal" href="#">pyjuice.parameterizations.BlockScale</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#pyjuice.parameterizations.BlockScale"><code class="docutils literal notranslate"><span class="pre">BlockScale</span></code></a><ul>
+<li class="toctree-l4"><a class="reference internal" href="#pyjuice.parameterizations.BlockScale.__init__"><code class="docutils literal notranslate"><span class="pre">BlockScale.__init__()</span></code></a></li>
+</ul>
+</li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="pyjuice.parameterizations.LowRank.html">pyjuice.parameterizations.LowRank</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../tensorcircuit.html">pyjuice.TensorCircuit</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../queries.html">pyjuice.queries</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../optim.html">pyjuice.optim</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../structures.html">pyjuice.structures</a></li>
+</ul>
+
+        </div>
+      </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap"><nav class="wy-nav-top" aria-label="Mobile navigation menu" >
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="../../index.html">PyJuice</a>
+      </nav>
+
+      <div class="wy-nav-content">
+        <div class="rst-content">
+          <div role="navigation" aria-label="Page navigation">
+  <ul class="wy-breadcrumbs">
+      <li><a href="../../index.html" class="icon icon-home" aria-label="Home"></a></li>
+          <li class="breadcrumb-item"><a href="../parameterizations.html">pyjuice.parameterizations</a></li>
+      <li class="breadcrumb-item active">pyjuice.parameterizations.BlockScale</li>
+      <li class="wy-breadcrumbs-aside">
+            <a href="../../_sources/python-api/generated/pyjuice.parameterizations.BlockScale.rst.txt" rel="nofollow"> View page source</a>
+      </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+           <div itemprop="articleBody">
+             
+  <section id="pyjuice-parameterizations-blockscale">
+<h1>pyjuice.parameterizations.BlockScale<a class="headerlink" href="#pyjuice-parameterizations-blockscale" title="Link to this heading"></a></h1>
+<dl class="py class">
+<dt class="sig sig-object py" id="pyjuice.parameterizations.BlockScale">
+<em class="property"><span class="pre">class</span><span class="w"> </span></em><span class="sig-prename descclassname"><span class="pre">pyjuice.parameterizations.</span></span><span class="sig-name descname"><span class="pre">BlockScale</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">block_size</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3/builtins/functions.html#int" title="(in Python v3.15)"><span class="pre">int</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3/builtins/constants.html#None" title="(in Python v3.15)"><span class="pre">None</span></a></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">ch_block_size</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3/builtins/functions.html#int" title="(in Python v3.15)"><span class="pre">int</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3/builtins/constants.html#None" title="(in Python v3.15)"><span class="pre">None</span></a></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">apply_z_correction</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3/builtins/functions.html#bool" title="(in Python v3.15)"><span class="pre">bool</span></a></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">True</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">tie_external</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3/builtins/functions.html#bool" title="(in Python v3.15)"><span class="pre">bool</span></a></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">False</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#pyjuice.parameterizations.BlockScale" title="Link to this definition"></a></dt>
+<dd><p>A per-sample <strong>multiplicative gate</strong> on each parameter block, supplied externally at call time.</p>
+<p>Every gate owns one scalar per sample. Writing <cite>g(n,c)</cite> for the gate covering the edge from node <cite>n</cite>
+to child <cite>c</cite>, the effective parameters for batch element <cite>b</cite> are</p>
+<div class="highlight-text notranslate"><div class="highlight"><pre><span></span>theta_b[n, c] = phi[b, g(n,c)] * theta_shared[n, c] / Z_b[n]
+Z_b[n]        = sum_c phi[b, g(n,c)] * theta_shared[n, c]
+</pre></div>
+</div>
+<p>normalized over the children of <cite>n</cite>. Factoring out each gate’s share of the node’s mass,
+<cite>sigma[g,n] = sum_{c in g} theta_shared[n,c]</cite>, shows what the gate actually does:</p>
+<div class="highlight-text notranslate"><div class="highlight"><pre><span></span>theta_b[n,c] = [ phi[b,g] sigma[g,n] / sum_{g'} phi[b,g'] sigma[g',n] ] * ( theta_shared[n,c] / sigma[g,n] )
+</pre></div>
+</div>
+<p>– it reweights the <strong>gate-level mixture weights</strong> per sample and leaves each gate’s internal
+conditional untouched. Two consequences follow directly:</p>
+<ul class="simple">
+<li><p>it is an <strong>exact no-op when a node has only one gate</strong>, since the reweighting then cancels against
+the normalizer. Whether a node has several gates is entirely the caller’s choice of gate sizes; a
+dense transition with one edge block and the default gate size does nothing at all.</p></li>
+<li><p>a gate that does not depend on the parent node is equivalent to multiplying the child’s value, i.e.
+to soft evidence on the children, which PyJuice already provides. The capability that is new here
+is a gate that depends on the parent group <strong>and</strong> the child group.</p></li>
+</ul>
+<p><strong>Why it is cheap.</strong> Because <cite>phi</cite> is constant within a gate it pulls out of the block matmul, so in
+log space it folds into the child values as an elementwise add – the dense per-sample parameter
+matrix is never materialized, and the tensor is <cite>[B, num_gates]</cite> rather than anything shaped like the
+parameters. For a 1024-state layer at <cite>block_size = 32</cite> that is 1 MB at batch 256.</p>
+<p><strong>Tensor layout.</strong> One <cite>float32</cite> tensor of LOG gates:</p>
+<ul class="simple">
+<li><p><cite>phi</cite>: <cite>[B, Nk, Ck]</cite>, a dense grid with <cite>Nk = ns.num_nodes / block_size</cite> gates along the node axis
+and <cite>Ck = ns.num_ch_nodes / ch_block_size</cite> along the child axis. <cite>phi[b, i, j]</cite> scales the
+parameters from child gate-block <cite>j</cite> into node gate-block <cite>i</cite>, for sample <cite>b</cite>.</p></li>
+</ul>
+<p>The grid is indexed by the GATE’s own block sizes and the layer’s node counts – it does not depend
+on <cite>ns.block_size</cite>, so asking for gates of a given size gives a grid of exactly that many whatever
+blocking pyjuice happens to use inside. Entries for (node block, child block) pairs the layer does
+not connect are ignored, and their gradients come back zero.</p>
+<p>Log space keeps the gate positive for free and makes the fold an add rather than a multiply.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Note<span class="colon">:</span></dt>
+<dd class="field-odd"><p>the gate tile is deliberately NOT forced to equal the parameter block. Refining along the CHILD axis
+is free (the fold is elementwise in the child index), while refining along the NODE axis costs
+one reduction per subgroup, because a single staged tile can only serve nodes that share a
+gate. Shrinking <cite>ns.block_size</cite> to obtain a finer gate would instead tax the whole layer: the
+node tile of the standard kernels collapses with it, below the 16 rows an efficient MMA wants,
+and the compiled index tensors grow as <cite>K^2 / block_size</cite>.</p>
+</dd>
+<dt class="field-even">Parameters<span class="colon">:</span></dt>
+<dd class="field-even"><ul class="simple">
+<li><p><strong>block_size</strong> (<em>Optional</em><em>[</em><a class="reference external" href="https://docs.python.org/3/builtins/functions.html#int" title="(in Python v3.15)"><em>int</em></a><em>]</em>) – the GATE’s block size – how many nodes one gate spans, NOT the node’s own
+<cite>block_size</cite>. <cite>None</cite> means the node’s, i.e. one gate per parameter block, and it
+must divide the node’s. Only the full block size is supported so far; splitting
+the node axis needs a separate kernel.</p></li>
+<li><p><strong>ch_block_size</strong> (<em>Optional</em><em>[</em><a class="reference external" href="https://docs.python.org/3/builtins/functions.html#int" title="(in Python v3.15)"><em>int</em></a><em>]</em>) – the GATE’s child block size – how many children one gate spans. <cite>None</cite> means
+the node’s own. Any divisor is allowed and costs nothing, which is why this is
+the axis to refine.</p></li>
+<li><p><strong>apply_z_correction</strong> (<a class="reference external" href="https://docs.python.org/3/builtins/functions.html#bool" title="(in Python v3.15)"><em>bool</em></a>) – make EM exact under a live gate. The gate makes the normalizer
+<cite>Z = sum_c phi * theta</cite> depend on <cite>theta</cite>, so pyjuice’s plain M-step
+<cite>theta &lt;- normalize(F+)</cite> solves a stationarity condition that is missing
+the term <cite>sum_b f_b * theta_b</cite>. With this set, the backward also
+accumulates that term as a DENOMINATOR flow <cite>F-</cite> and the M-step becomes
+the conditional <cite>theta &lt;- normalize(theta * F+ / F-)</cite>, whose fixed point
+is the true one (and whose <cite>F+ - F-</cite> is <cite>d LL / d log theta</cite>). Costs a
+second flow accumulator – kept in gate space, <cite>ch_block_size</cite> times
+smaller than <cite>param_flows</cite> – and ~1% of an EM step. On by default; with
+<cite>False</cite> the layer allocates nothing and takes the plain M-step. Not
+implemented for a gate finer than <cite>ns.block_size</cite> along the node axis (the
+backward raises): pass <cite>False</cite> there. Supported by <cite>FullBatchEM</cite> /
+<cite>MiniBatchEM</cite> / <cite>Anemone</cite>; the gradient optimizers warn, since their
+descent direction is uncorrected.</p></li>
+<li><p><strong>tie_external</strong> (<a class="reference external" href="https://docs.python.org/3/builtins/functions.html#bool" title="(in Python v3.15)"><em>bool</em></a>) – share one gate tensor across every copy of a tied node, instead of one per copy.</p></li>
+</ul>
+</dd>
+</dl>
+<dl class="py method">
+<dt class="sig sig-object py" id="pyjuice.parameterizations.BlockScale.__init__">
+<span class="sig-name descname"><span class="pre">__init__</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">block_size</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3/builtins/functions.html#int" title="(in Python v3.15)"><span class="pre">int</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3/builtins/constants.html#None" title="(in Python v3.15)"><span class="pre">None</span></a></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">ch_block_size</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3/builtins/functions.html#int" title="(in Python v3.15)"><span class="pre">int</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3/builtins/constants.html#None" title="(in Python v3.15)"><span class="pre">None</span></a></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">apply_z_correction</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3/builtins/functions.html#bool" title="(in Python v3.15)"><span class="pre">bool</span></a></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">True</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">tie_external</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3/builtins/functions.html#bool" title="(in Python v3.15)"><span class="pre">bool</span></a></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">False</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#pyjuice.parameterizations.BlockScale.__init__" title="Link to this definition"></a></dt>
+<dd></dd></dl>
+
+</dd></dl>
+
+</section>
+
+
+           </div>
+          </div>
+          <footer><div class="rst-footer-buttons" role="navigation" aria-label="Footer">
+        <a href="pyjuice.parameterizations.SumParameterization.html" class="btn btn-neutral float-left" title="pyjuice.parameterizations.SumParameterization" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> Previous</a>
+        <a href="pyjuice.parameterizations.LowRank.html" class="btn btn-neutral float-right" title="pyjuice.parameterizations.LowRank" accesskey="n" rel="next">Next <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <p>&#169; Copyright 2026, Anji Liu.</p>
+  </div>
+
+  Built with <a href="https://www.sphinx-doc.org/">Sphinx</a> using a
+    <a href="https://github.com/readthedocs/sphinx_rtd_theme">theme</a>
+    provided by <a href="https://readthedocs.org">Read the Docs</a>.
+   
+
+</footer>
+        </div>
+      </div>
+    </section>
+  </div>
+  <script>
+      jQuery(function () {
+          SphinxRtdTheme.Navigation.enable(true);
+      });
+  </script> 
+
+</body>
+</html>

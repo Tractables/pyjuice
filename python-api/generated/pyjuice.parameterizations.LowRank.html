@@ -1,0 +1,216 @@
+
+
+<!DOCTYPE html>
+<html class="writer-html5" lang="en" data-content_root="../../">
+<head>
+  <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>pyjuice.parameterizations.LowRank &mdash; PyJuice 2.7.0 documentation</title>
+      <link rel="stylesheet" type="text/css" href="../../_static/pygments.css?v=b86133f3" />
+      <link rel="stylesheet" type="text/css" href="../../_static/css/theme.css?v=9edc463e" />
+      <link rel="stylesheet" type="text/css" href="../../_static/sg_gallery.css?v=c83e6b79" />
+      <link rel="stylesheet" type="text/css" href="../../_static/sg_gallery-binder.css?v=f4aeca0c" />
+      <link rel="stylesheet" type="text/css" href="../../_static/sg_gallery-dataframe.css?v=2082cf3c" />
+      <link rel="stylesheet" type="text/css" href="../../_static/sg_gallery-rendered-html.css?v=1277b6f3" />
+
+  
+      <script src="../../_static/jquery.js?v=5d32c60e"></script>
+      <script src="../../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
+      <script src="../../_static/documentation_options.js?v=dfec817d"></script>
+      <script src="../../_static/doctools.js?v=9bcbadda"></script>
+      <script src="../../_static/sphinx_highlight.js?v=dc90522c"></script>
+      <script src="../../_static/sg-tags.js?v=d80f6fa4"></script>
+    <script src="../../_static/js/theme.js"></script>
+    <link rel="index" title="Index" href="../../genindex.html" />
+    <link rel="search" title="Search" href="../../search.html" />
+    <link rel="next" title="pyjuice.TensorCircuit" href="../tensorcircuit.html" />
+    <link rel="prev" title="pyjuice.parameterizations.BlockScale" href="pyjuice.parameterizations.BlockScale.html" /> 
+</head>
+
+<body class="wy-body-for-nav"> 
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side">
+      <div class="wy-side-scroll">
+        <div class="wy-side-nav-search" >
+
+          
+          
+          <a href="../../index.html" class="icon icon-home">
+            PyJuice
+          </a>
+<div role="search">
+  <form id="rtd-search-form" class="wy-form" action="../../search.html" method="get">
+    <input type="text" name="q" placeholder="Search docs" aria-label="Search docs" />
+    <input type="hidden" name="check_keywords" value="yes" />
+    <input type="hidden" name="area" value="default" />
+  </form>
+</div>
+        </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="Navigation menu">
+              <p class="caption" role="heading"><span class="caption-text">Getting Started</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../getting-started/installation.html">Installation</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../getting-started/tutorials/index.html">Tutorials</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">API</span></p>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../pyjuice.html">pyjuice</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../nodes.html">pyjuice.nodes</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="../parameterizations.html">pyjuice.parameterizations</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="pyjuice.parameterizations.SumParameterization.html">pyjuice.parameterizations.SumParameterization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="pyjuice.parameterizations.BlockScale.html">pyjuice.parameterizations.BlockScale</a></li>
+<li class="toctree-l2 current"><a class="current reference internal" href="#">pyjuice.parameterizations.LowRank</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#pyjuice.parameterizations.LowRank"><code class="docutils literal notranslate"><span class="pre">LowRank</span></code></a><ul>
+<li class="toctree-l4"><a class="reference internal" href="#pyjuice.parameterizations.LowRank.__init__"><code class="docutils literal notranslate"><span class="pre">LowRank.__init__()</span></code></a></li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../tensorcircuit.html">pyjuice.TensorCircuit</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../queries.html">pyjuice.queries</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../optim.html">pyjuice.optim</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../structures.html">pyjuice.structures</a></li>
+</ul>
+
+        </div>
+      </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap"><nav class="wy-nav-top" aria-label="Mobile navigation menu" >
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="../../index.html">PyJuice</a>
+      </nav>
+
+      <div class="wy-nav-content">
+        <div class="rst-content">
+          <div role="navigation" aria-label="Page navigation">
+  <ul class="wy-breadcrumbs">
+      <li><a href="../../index.html" class="icon icon-home" aria-label="Home"></a></li>
+          <li class="breadcrumb-item"><a href="../parameterizations.html">pyjuice.parameterizations</a></li>
+      <li class="breadcrumb-item active">pyjuice.parameterizations.LowRank</li>
+      <li class="wy-breadcrumbs-aside">
+            <a href="../../_sources/python-api/generated/pyjuice.parameterizations.LowRank.rst.txt" rel="nofollow"> View page source</a>
+      </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+           <div itemprop="articleBody">
+             
+  <section id="pyjuice-parameterizations-lowrank">
+<h1>pyjuice.parameterizations.LowRank<a class="headerlink" href="#pyjuice-parameterizations-lowrank" title="Link to this heading"></a></h1>
+<dl class="py class">
+<dt class="sig sig-object py" id="pyjuice.parameterizations.LowRank">
+<em class="property"><span class="pre">class</span><span class="w"> </span></em><span class="sig-prename descclassname"><span class="pre">pyjuice.parameterizations.</span></span><span class="sig-name descname"><span class="pre">LowRank</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">rank</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3/builtins/functions.html#int" title="(in Python v3.15)"><span class="pre">int</span></a></span></em>, <em class="sig-param"><span class="n"><span class="pre">form</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3/builtins/stdtypes.html#str" title="(in Python v3.15)"><span class="pre">str</span></a></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">'exp_sum'</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">apply_z_correction</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3/builtins/functions.html#bool" title="(in Python v3.15)"><span class="pre">bool</span></a></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">True</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">tie_external</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3/builtins/functions.html#bool" title="(in Python v3.15)"><span class="pre">bool</span></a></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">flow_precision</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3/builtins/stdtypes.html#str" title="(in Python v3.15)"><span class="pre">str</span></a></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">'bf16'</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#pyjuice.parameterizations.LowRank" title="Link to this definition"></a></dt>
+<dd><p>A per-sample <strong>multiplicative low-rank scale</strong> on the sum node’s parameters, supplied externally at call time.</p>
+<p>A node vector of <cite>M</cite> nodes over <cite>N</cite> children takes two tensors per sample <cite>b</cite>, <cite>A_b</cite> of <cite>[M, k]</cite> and <cite>B_b</cite> of
+<cite>[k, N]</cite>; they make a scale <cite>g_b[i, j]</cite> of every (node, child) pair, and the effective parameters are</p>
+<div class="highlight-text notranslate"><div class="highlight"><pre><span></span>theta_b[i, j] = theta_shared[i, j] * g_b[i, j] / Z_b[i]
+Z_b[i]        = sum_j theta_shared[i, j] * g_b[i, j]
+</pre></div>
+</div>
+<p>normalized over the children of node <cite>i</cite>, as <a class="reference internal" href="pyjuice.parameterizations.BlockScale.html#pyjuice.parameterizations.BlockScale" title="pyjuice.parameterizations.block_scale.BlockScale"><code class="xref py py-class docutils literal notranslate"><span class="pre">BlockScale</span></code></a>’ are. <cite>form</cite> says how
+the factors make the scale:</p>
+<div class="highlight-text notranslate"><div class="highlight"><pre><span></span>"exp_sum":  g_b[i, j] = exp( sum_r A_b[i, r] * B_b[r, j] )          # the log-scale is the rank-k product
+"sum_exp":  g_b[i, j] = sum_r exp( A_b[i, r] ) * exp( B_b[r, j] )   # a mixture of k rank-one scales
+</pre></div>
+</div>
+<p><cite>“exp_sum”</cite> gives every pair an exponent of its own, so it costs one <cite>exp</cite> per (sample, node, child) and the
+samples share no matmul; <cite>“sum_exp”</cite> is <cite>k</cite> matmuls with the shared parameters. Both are defined on the pairs the
+node vector’s <cite>edge_ids</cite> connect; a pair without parameters has none here either.</p>
+<p><strong>Tensor layout.</strong> Two <cite>float32</cite> tensors per node vector, in this order:</p>
+<ul class="simple">
+<li><p><cite>A</cite>: <cite>[B, ns.num_nodes, k]</cite></p></li>
+<li><p><cite>B</cite>: <cite>[B, k, ns.num_ch_nodes]</cite></p></li>
+</ul>
+<p>whatever blocks the node vector is stored in. A registered group (<cite>TensorCircuit.register_external_params_group</cite>)
+concatenates both along axis 1: <cite>A</cite> over the members’ nodes, <cite>B</cite> over their ranks.</p>
+<p><strong>Training.</strong> The backward writes the element and parameter flows itself, and <cite>d LL / d A</cite>, <cite>d LL / d B</cite> into
+the gradient buffers. With <cite>apply_z_correction</cite> it also accumulates the denominator flow’s statistic, and the
+M-step is the conditional <cite>theta &lt;- normalize(theta * F+ / F-)</cite>
+(<code class="xref py py-func docutils literal notranslate"><span class="pre">compute_em_correction()</span></code>): <cite>Z_b</cite> depends on <cite>theta</cite>, so
+<cite>normalize(F+)</cite> alone is not EM here, as for BlockScale. What is kept is</p>
+<div class="highlight-text notranslate"><div class="highlight"><pre><span></span>W[i, j] = sum_b f_b[i] * g_b[i, j] / Z_b[i]            F-[i, j] = theta[i, j] * W[i, j]
+</pre></div>
+</div>
+<p>in the parameter flows’ layout (it has no smaller form here), FREE OF THE PARAMETERS as BlockScale’s gate-space
+statistic is, and multiplied by them when <cite>F-</cite> is read. That is what an optimizer averaging the flows over steps
+needs (Anemone’s momentum): the update is then <cite>normalize(avg F+ / avg W)</cite>, the M-step of the averaged
+statistics. Kept as <cite>F-</cite> itself, the average would carry the parameters of past steps against the current ones
+in <cite>theta * F+ / F-</cite> – a parameter that grew is pushed further – and the training is another: MEASURED, a
+low-rank scale built to equal a BlockScale gate, Anemone with momentum 0.9, parameters against BlockScale’s
+after 16 steps 3e-2 apart that way, and the same to rounding this way and without momentum either way.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Note<span class="colon">:</span></dt>
+<dd class="field-odd"><p>the passes: <cite>“exp_sum”</cite> through its fused kernels (<cite>lowrank/kernels/c/lowrank_exp_sum.cu</cite>: the scale
+made tile by tile on tensor cores and used where it is made, never stored) where a node vector’s parameters
+lie block-major in one run and the rank is at most 64 (<cite>lowrank.forward.exp_sum_fused</cite>) – under the default
+precision the factors’ products in bf16 (<cite>A B</cite> from bf16 hi + lo, ~2^-16 of each product; the gradients’
+products one bf16 term each), under <cite>precision = “fp32”</cite> in three-term TF32 (~fp32) –, <cite>“sum_exp”</cite> through
+the plain sum-layer kernels on a virtual batch (<cite>lowrank.virtual</cite>) where it serves; elsewhere plain torch –
+dense per node vector, <cite>exp_sum</cite> over <cite>[B, M, N]</cite> in chunks of samples, <cite>sum_exp</cite> by float64 matmuls (a
+sample’s child values spread over hundreds of nats, more than float32 holds beside one shift a sample).
+Correct on every structure.</p>
+</dd>
+<dt class="field-even">Parameters<span class="colon">:</span></dt>
+<dd class="field-even"><ul class="simple">
+<li><p><strong>rank</strong> (<a class="reference external" href="https://docs.python.org/3/builtins/functions.html#int" title="(in Python v3.15)"><em>int</em></a>) – the rank <cite>k</cite></p></li>
+<li><p><strong>form</strong> (<a class="reference external" href="https://docs.python.org/3/builtins/stdtypes.html#str" title="(in Python v3.15)"><em>str</em></a>) – <cite>“exp_sum”</cite> or <cite>“sum_exp”</cite> (above)</p></li>
+<li><p><strong>apply_z_correction</strong> (<a class="reference external" href="https://docs.python.org/3/builtins/functions.html#bool" title="(in Python v3.15)"><em>bool</em></a>) – accumulate the denominator flow and take the conditional M-step (default); <cite>False</cite>
+leaves the plain <cite>normalize(F+)</cite> and allocates nothing</p></li>
+<li><p><strong>tie_external</strong> (<a class="reference external" href="https://docs.python.org/3/builtins/functions.html#bool" title="(in Python v3.15)"><em>bool</em></a>) – share one pair of tensors across every copy of a tied node, instead of one per copy</p></li>
+<li><p><strong>flow_precision</strong> (<a class="reference external" href="https://docs.python.org/3/builtins/stdtypes.html#str" title="(in Python v3.15)"><em>str</em></a>) – <cite>“bf16”</cite> (default) or <cite>“fp8”</cite>, an OPT-IN for <cite>“sum_exp”</cite>: the pass’s end’s two products
+– the parameter flows’ <cite>theta * (Ud Vd^T)</cite> and the denominators’ <cite>Un Vt^T</cite>, over every
+(copy, sample, rank) of the pass – from e4m3 operands (a power-of-2 scale a row, fp32
+accumulation) where they are bf16 by default (precision “auto”, the products large enough:
+<cite>lowrank.virtual</cite>); about twice the bf16 products’ speed, the statistics’ entries about
+16x less accurate (MEASURED against float64 on an HMM of 1024 states, rank 16, batch 64:
+the M-step’s <cite>F+ / F-</cite> a median 3e-4 .. 1.4e-2 and at most 2e-3 .. 0.18 off as the factors’
+spread goes from 0.3 to 4 nats, against bf16’s 2e-5 .. 8e-4 and 1e-4 .. 1e-2; no entry
+made 0). Under precision “fp32” the products stay fp32. The gradients are not affected.</p></li>
+</ul>
+</dd>
+</dl>
+<dl class="py method">
+<dt class="sig sig-object py" id="pyjuice.parameterizations.LowRank.__init__">
+<span class="sig-name descname"><span class="pre">__init__</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">rank</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3/builtins/functions.html#int" title="(in Python v3.15)"><span class="pre">int</span></a></span></em>, <em class="sig-param"><span class="n"><span class="pre">form</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3/builtins/stdtypes.html#str" title="(in Python v3.15)"><span class="pre">str</span></a></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">'exp_sum'</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">apply_z_correction</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3/builtins/functions.html#bool" title="(in Python v3.15)"><span class="pre">bool</span></a></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">True</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">tie_external</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3/builtins/functions.html#bool" title="(in Python v3.15)"><span class="pre">bool</span></a></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">flow_precision</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3/builtins/stdtypes.html#str" title="(in Python v3.15)"><span class="pre">str</span></a></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">'bf16'</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#pyjuice.parameterizations.LowRank.__init__" title="Link to this definition"></a></dt>
+<dd></dd></dl>
+
+</dd></dl>
+
+</section>
+
+
+           </div>
+          </div>
+          <footer><div class="rst-footer-buttons" role="navigation" aria-label="Footer">
+        <a href="pyjuice.parameterizations.BlockScale.html" class="btn btn-neutral float-left" title="pyjuice.parameterizations.BlockScale" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> Previous</a>
+        <a href="../tensorcircuit.html" class="btn btn-neutral float-right" title="pyjuice.TensorCircuit" accesskey="n" rel="next">Next <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <p>&#169; Copyright 2026, Anji Liu.</p>
+  </div>
+
+  Built with <a href="https://www.sphinx-doc.org/">Sphinx</a> using a
+    <a href="https://github.com/readthedocs/sphinx_rtd_theme">theme</a>
+    provided by <a href="https://readthedocs.org">Read the Docs</a>.
+   
+
+</footer>
+        </div>
+      </div>
+    </section>
+  </div>
+  <script>
+      jQuery(function () {
+          SphinxRtdTheme.Navigation.enable(true);
+      });
+  </script> 
+
+</body>
+</html>

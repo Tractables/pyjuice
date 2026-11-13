@@ -1,0 +1,222 @@
+
+
+<!DOCTYPE html>
+<html class="writer-html5" lang="en" data-content_root="../../">
+<head>
+  <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>pyjuice.nodes.ParameterizedSumNodes &mdash; PyJuice 2.7.0 documentation</title>
+      <link rel="stylesheet" type="text/css" href="../../_static/pygments.css?v=b86133f3" />
+      <link rel="stylesheet" type="text/css" href="../../_static/css/theme.css?v=9edc463e" />
+      <link rel="stylesheet" type="text/css" href="../../_static/sg_gallery.css?v=c83e6b79" />
+      <link rel="stylesheet" type="text/css" href="../../_static/sg_gallery-binder.css?v=f4aeca0c" />
+      <link rel="stylesheet" type="text/css" href="../../_static/sg_gallery-dataframe.css?v=2082cf3c" />
+      <link rel="stylesheet" type="text/css" href="../../_static/sg_gallery-rendered-html.css?v=1277b6f3" />
+
+  
+      <script src="../../_static/jquery.js?v=5d32c60e"></script>
+      <script src="../../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
+      <script src="../../_static/documentation_options.js?v=dfec817d"></script>
+      <script src="../../_static/doctools.js?v=9bcbadda"></script>
+      <script src="../../_static/sphinx_highlight.js?v=dc90522c"></script>
+      <script src="../../_static/sg-tags.js?v=d80f6fa4"></script>
+    <script src="../../_static/js/theme.js"></script>
+    <link rel="index" title="Index" href="../../genindex.html" />
+    <link rel="search" title="Search" href="../../search.html" />
+    <link rel="next" title="pyjuice.nodes.foreach" href="pyjuice.nodes.foreach.html" />
+    <link rel="prev" title="pyjuice.nodes.SumNodes" href="pyjuice.nodes.SumNodes.html" /> 
+</head>
+
+<body class="wy-body-for-nav"> 
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side">
+      <div class="wy-side-scroll">
+        <div class="wy-side-nav-search" >
+
+          
+          
+          <a href="../../index.html" class="icon icon-home">
+            PyJuice
+          </a>
+<div role="search">
+  <form id="rtd-search-form" class="wy-form" action="../../search.html" method="get">
+    <input type="text" name="q" placeholder="Search docs" aria-label="Search docs" />
+    <input type="hidden" name="check_keywords" value="yes" />
+    <input type="hidden" name="area" value="default" />
+  </form>
+</div>
+        </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="Navigation menu">
+              <p class="caption" role="heading"><span class="caption-text">Getting Started</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../getting-started/installation.html">Installation</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../getting-started/tutorials/index.html">Tutorials</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">API</span></p>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../pyjuice.html">pyjuice</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="../nodes.html">pyjuice.nodes</a><ul class="current">
+<li class="toctree-l2 current"><a class="reference internal" href="../nodes.html#nodes">Nodes</a><ul class="current">
+<li class="toctree-l3"><a class="reference internal" href="pyjuice.nodes.CircuitNodes.html">pyjuice.nodes.CircuitNodes</a></li>
+<li class="toctree-l3"><a class="reference internal" href="pyjuice.nodes.InputNodes.html">pyjuice.nodes.InputNodes</a></li>
+<li class="toctree-l3"><a class="reference internal" href="pyjuice.nodes.ProdNodes.html">pyjuice.nodes.ProdNodes</a></li>
+<li class="toctree-l3"><a class="reference internal" href="pyjuice.nodes.SumNodes.html">pyjuice.nodes.SumNodes</a></li>
+<li class="toctree-l3 current"><a class="current reference internal" href="#">pyjuice.nodes.ParameterizedSumNodes</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="#pyjuice.nodes.ParameterizedSumNodes"><code class="docutils literal notranslate"><span class="pre">ParameterizedSumNodes</span></code></a></li>
+</ul>
+</li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="../nodes.html#methods">Methods</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../nodes.html#edge-constructors">Edge Constructors</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../nodes.html#input-distributions">Input Distributions</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../parameterizations.html">pyjuice.parameterizations</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../tensorcircuit.html">pyjuice.TensorCircuit</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../queries.html">pyjuice.queries</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../optim.html">pyjuice.optim</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../structures.html">pyjuice.structures</a></li>
+</ul>
+
+        </div>
+      </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap"><nav class="wy-nav-top" aria-label="Mobile navigation menu" >
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="../../index.html">PyJuice</a>
+      </nav>
+
+      <div class="wy-nav-content">
+        <div class="rst-content">
+          <div role="navigation" aria-label="Page navigation">
+  <ul class="wy-breadcrumbs">
+      <li><a href="../../index.html" class="icon icon-home" aria-label="Home"></a></li>
+          <li class="breadcrumb-item"><a href="../nodes.html">pyjuice.nodes</a></li>
+      <li class="breadcrumb-item active">pyjuice.nodes.ParameterizedSumNodes</li>
+      <li class="wy-breadcrumbs-aside">
+            <a href="../../_sources/python-api/generated/pyjuice.nodes.ParameterizedSumNodes.rst.txt" rel="nofollow"> View page source</a>
+      </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+           <div itemprop="articleBody">
+             
+  <section id="pyjuice-nodes-parameterizedsumnodes">
+<h1>pyjuice.nodes.ParameterizedSumNodes<a class="headerlink" href="#pyjuice-nodes-parameterizedsumnodes" title="Link to this heading"></a></h1>
+<dl class="py class">
+<dt class="sig sig-object py" id="pyjuice.nodes.ParameterizedSumNodes">
+<em class="property"><span class="pre">class</span><span class="w"> </span></em><span class="sig-prename descclassname"><span class="pre">pyjuice.nodes.</span></span><span class="sig-name descname"><span class="pre">ParameterizedSumNodes</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">num_node_blocks</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3/builtins/functions.html#int" title="(in Python v3.15)"><span class="pre">int</span></a></span></em>, <em class="sig-param"><span class="n"><span class="pre">chs</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">Sequence</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">edge_ids</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">Tensor</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">Sequence</span><span class="p"><span class="pre">[</span></span><span class="pre">Tensor</span><span class="p"><span class="pre">]</span></span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3/builtins/constants.html#None" title="(in Python v3.15)"><span class="pre">None</span></a></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">params</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">Tensor</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3/builtins/constants.html#None" title="(in Python v3.15)"><span class="pre">None</span></a></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">zero_param_mask</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">Tensor</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3/builtins/constants.html#None" title="(in Python v3.15)"><span class="pre">None</span></a></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">block_size</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3/builtins/functions.html#int" title="(in Python v3.15)"><span class="pre">int</span></a></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">parameterization</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference internal" href="pyjuice.parameterizations.SumParameterization.html#pyjuice.parameterizations.SumParameterization" title="pyjuice.parameterizations.SumParameterization"><span class="pre">SumParameterization</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3/builtins/constants.html#None" title="(in Python v3.15)"><span class="pre">None</span></a></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="o"><span class="pre">**</span></span><span class="n"><span class="pre">kwargs</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#pyjuice.nodes.ParameterizedSumNodes" title="Link to this definition"></a></dt>
+<dd><p>A vector of sum nodes whose effective parameters are the shared (EM-trained) parameters modified
+by <strong>per-sample tensors supplied externally</strong> at call time. It is created by
+<code class="code docutils literal notranslate"><span class="pre">pyjuice.summate(...,</span> <span class="pre">parameterization</span> <span class="pre">=</span> <span class="pre">&lt;descriptor&gt;)</span></code>.</p>
+<p>This is the single node class for every external parameterization; <em>how</em> the external tensors
+modify the parameters is owned by the <cite>parameterization</cite> descriptor – an
+<a class="reference internal" href="pyjuice.parameterizations.SumParameterization.html#pyjuice.parameterizations.SumParameterization" title="pyjuice.parameterizations.SumParameterization"><code class="xref py py-class docutils literal notranslate"><span class="pre">SumParameterization</span></code></a> such as
+<a class="reference internal" href="pyjuice.parameterizations.LowRank.html#pyjuice.parameterizations.LowRank" title="pyjuice.parameterizations.LowRank"><code class="xref py py-class docutils literal notranslate"><span class="pre">LowRank</span></code></a>. The arrangement mirrors input nodes,
+where one <a class="reference internal" href="pyjuice.nodes.InputNodes.html#pyjuice.nodes.InputNodes" title="pyjuice.nodes.InputNodes"><code class="xref py py-class docutils literal notranslate"><span class="pre">InputNodes</span></code></a> class carries a <cite>dist</cite> descriptor, and it means a new
+mode adds a descriptor rather than a node class.</p>
+<p>The external tensors are passed per call and are never owned or EM-trained by the node:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">ns</span> <span class="o">=</span> <span class="n">juice</span><span class="o">.</span><span class="n">summate</span><span class="p">(</span><span class="n">ch</span><span class="p">,</span> <span class="n">num_node_blocks</span> <span class="o">=</span> <span class="mi">1</span><span class="p">,</span>
+                   <span class="n">parameterization</span> <span class="o">=</span> <span class="n">LowRank</span><span class="p">(</span><span class="n">rank</span> <span class="o">=</span> <span class="mi">16</span><span class="p">))</span>
+<span class="n">pc</span> <span class="o">=</span> <span class="n">juice</span><span class="o">.</span><span class="n">compile</span><span class="p">(</span><span class="n">root_ns</span><span class="p">)</span>
+
+<span class="n">lls</span> <span class="o">=</span> <span class="n">pc</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">sum_external_params</span> <span class="o">=</span> <span class="p">{</span><span class="n">ns</span><span class="p">:</span> <span class="p">(</span><span class="n">A</span><span class="p">,</span> <span class="n">B</span><span class="p">)})</span>          <span class="c1"># A [batch, nodes, 16], B [batch, 16, children]</span>
+<span class="n">pc</span><span class="o">.</span><span class="n">backward</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">sum_external_params_grad</span> <span class="o">=</span> <span class="p">{</span><span class="n">ns</span><span class="p">:</span> <span class="p">(</span><span class="n">dA</span><span class="p">,</span> <span class="n">dB</span><span class="p">)})</span>
+</pre></div>
+</div>
+<p>The shared parameters continue to train through the ordinary EM / gradient path, unchanged.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Note<span class="colon">:</span></dt>
+<dd class="field-odd"><p>at compile time these nodes are grouped into their own layer, keyed by
+<cite>parameterization.get_signature()</cite>, so the standard sum-layer kernels used by every other
+node are never branched on.</p>
+</dd>
+<dt class="field-even">Note<span class="colon">:</span></dt>
+<dd class="field-even"><p>the external tensors are keyed by the <cite>ns</cite> <strong>instance</strong>. A tied duplicate needs its own
+entry; passing the same tensors for several of them shares one per-sample modification
+across all of them.</p>
+</dd>
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>num_node_blocks</strong> (<a class="reference external" href="https://docs.python.org/3/builtins/functions.html#int" title="(in Python v3.15)"><em>int</em></a>) – number of node blocks</p></li>
+<li><p><strong>chs</strong> (<em>Sequence</em><em>[</em><a class="reference internal" href="pyjuice.nodes.CircuitNodes.html#pyjuice.nodes.CircuitNodes" title="pyjuice.nodes.CircuitNodes"><em>CircuitNodes</em></a><em>]</em>) – sequence of child nodes</p></li>
+<li><p><strong>edge_ids</strong> (<em>Optional</em><em>[</em><em>Tensor</em><em>]</em>) – a matrix of size [2, # edges] - every size-2 column vector [i,j] defines a set of
+edges that fully connect the ith sum node block and the jth child node block</p></li>
+<li><p><strong>parameterization</strong> (<a class="reference internal" href="pyjuice.parameterizations.SumParameterization.html#pyjuice.parameterizations.SumParameterization" title="pyjuice.parameterizations.SumParameterization"><em>SumParameterization</em></a>) – the external parameterization descriptor</p></li>
+<li><p><strong>block_size</strong> (<a class="reference external" href="https://docs.python.org/3/builtins/functions.html#int" title="(in Python v3.15)"><em>int</em></a>) – block size</p></li>
+</ul>
+</dd>
+</dl>
+<dl class="py method">
+<dt class="sig sig-object py" id="pyjuice.nodes.ParameterizedSumNodes.__init__">
+<span class="sig-name descname"><span class="pre">__init__</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">num_node_blocks</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3/builtins/functions.html#int" title="(in Python v3.15)"><span class="pre">int</span></a></span></em>, <em class="sig-param"><span class="n"><span class="pre">chs</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">Sequence</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">edge_ids</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">Tensor</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">Sequence</span><span class="p"><span class="pre">[</span></span><span class="pre">Tensor</span><span class="p"><span class="pre">]</span></span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3/builtins/constants.html#None" title="(in Python v3.15)"><span class="pre">None</span></a></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">params</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">Tensor</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3/builtins/constants.html#None" title="(in Python v3.15)"><span class="pre">None</span></a></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">zero_param_mask</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">Tensor</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3/builtins/constants.html#None" title="(in Python v3.15)"><span class="pre">None</span></a></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">block_size</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3/builtins/functions.html#int" title="(in Python v3.15)"><span class="pre">int</span></a></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">parameterization</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference internal" href="pyjuice.parameterizations.SumParameterization.html#pyjuice.parameterizations.SumParameterization" title="pyjuice.parameterizations.SumParameterization"><span class="pre">SumParameterization</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3/builtins/constants.html#None" title="(in Python v3.15)"><span class="pre">None</span></a></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="o"><span class="pre">**</span></span><span class="n"><span class="pre">kwargs</span></span></em><span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><a class="reference external" href="https://docs.python.org/3/builtins/constants.html#None" title="(in Python v3.15)"><span class="pre">None</span></a></span></span><a class="headerlink" href="#pyjuice.nodes.ParameterizedSumNodes.__init__" title="Link to this definition"></a></dt>
+<dd></dd></dl>
+
+<p class="rubric">Methods</p>
+<table class="autosummary longtable docutils align-default">
+<tbody>
+<tr class="row-odd"><td><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">duplicate</span></code>(*args[, tie_params])</p></td>
+<td><p>Create a duplication of the current node with the same specification (i.e., number of nodes, block size).</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">gather_parameters</span></code>(params)</p></td>
+<td><p>Update parameters from the current node to the compiled <cite>pyjuice.TensorCircuit</cite>.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">get_params</span></code>([as_matrix])</p></td>
+<td><p>Get the sum node parameters.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">init_parameters</span></code>([perturbation, recursive, ...])</p></td>
+<td><p>Randomly initialize node parameters.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">num_parameters</span></code>([count_input_params, recursive])</p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-even"><td><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">set_params</span></code>(params[, normalize, pseudocount])</p></td>
+<td><p>Set the sum node parameters.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">update_param_flows</span></code>(param_flows[, ...])</p></td>
+<td><p>Update parameter flows from <cite>pyjuice.TensorCircuit</cite> to the current node.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">update_parameters</span></code>(params[, clone])</p></td>
+<td><p>Update parameters from <cite>pyjuice.TensorCircuit</cite> to the current node.</p></td>
+</tr>
+</tbody>
+</table>
+</dd></dl>
+
+</section>
+
+
+           </div>
+          </div>
+          <footer><div class="rst-footer-buttons" role="navigation" aria-label="Footer">
+        <a href="pyjuice.nodes.SumNodes.html" class="btn btn-neutral float-left" title="pyjuice.nodes.SumNodes" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> Previous</a>
+        <a href="pyjuice.nodes.foreach.html" class="btn btn-neutral float-right" title="pyjuice.nodes.foreach" accesskey="n" rel="next">Next <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <p>&#169; Copyright 2026, Anji Liu.</p>
+  </div>
+
+  Built with <a href="https://www.sphinx-doc.org/">Sphinx</a> using a
+    <a href="https://github.com/readthedocs/sphinx_rtd_theme">theme</a>
+    provided by <a href="https://readthedocs.org">Read the Docs</a>.
+   
+
+</footer>
+        </div>
+      </div>
+    </section>
+  </div>
+  <script>
+      jQuery(function () {
+          SphinxRtdTheme.Navigation.enable(true);
+      });
+  </script> 
+
+</body>
+</html>
