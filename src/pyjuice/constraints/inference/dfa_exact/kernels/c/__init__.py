@@ -1,7 +1,7 @@
 """
 The dfa_exact backend's CUDA kernels (``fused_sum.cu``, ``liveness.cu``, ``walk.cu``; ``dense_live_mma.cu`` its own
 extension), JIT-compiled on first use like pyjuice's other extensions
-(:mod:`pyjuice.nodes.external_params.kernels.c`): if anything about the toolchain is missing -- no ``nvcc``, a GPU
+(:mod:`pyjuice.parameterizations.kernels.c`): if anything about the toolchain is missing -- no ``nvcc``, a GPU
 without TF32 tensor cores, a compile error -- the loader disables itself (warning once) and the callers run their
 Triton kernels. ``PYJUICE_DISABLE_CUDA_KERNELS=1`` turns it off with the others. Nothing here runs at import time.
 """

@@ -2,10 +2,33 @@ from __future__ import annotations
 
 import torch
 import pickle
+import io
 from functools import partial
 from typing import Sequence
 
-from pyjuice.nodes import CircuitNodes, InputNodes, ProdNodes, SumNodes, ExternalParamsSumNodes, inputs, multiply, summate
+from pyjuice.nodes import CircuitNodes, InputNodes, ProdNodes, SumNodes, ParameterizedSumNodes, inputs, multiply, summate
+
+
+_RENAMED = {"ExternalSumParams": "SumParameterization", "BlockScaleSumParams": "BlockScale", "LowRankSumParams": "LowRank"}
+# the modules that held them since: the base class's module renamed, LowRank's class module beside its package
+_MOVED = {"pyjuice.parameterizations.external_params": "pyjuice.parameterizations.sum_parameterization",
+          "pyjuice.parameterizations.base": "pyjuice.parameterizations.sum_parameterization",
+          "pyjuice.parameterizations.lowrank": "pyjuice.parameterizations.low_rank"}
+
+
+class _Unpickler(pickle.Unpickler):
+    """Reads a parameterization saved before 2026-11-07, when the package was `pyjuice.nodes.external_params`."""
+    def find_class(self, module, name):
+        if module.startswith("pyjuice.nodes.external_params"):
+            module = "pyjuice.parameterizations" + module[len("pyjuice.nodes.external_params"):]
+        module = _MOVED.get(module, module)
+        return super().find_class(module, _RENAMED.get(name, name))
+
+
+def _load_parameterization(data: bytes):
+    return _Unpickler(io.BytesIO(data)).load()
+
+
 
 
 def serialize_nodes(root_ns: CircuitNodes):
@@ -30,8 +53,8 @@ def serialize_nodes(root_ns: CircuitNodes):
         if ns.is_prod() or ns.is_sum():
             ns_info["edge_ids"] = ns.edge_ids.detach().cpu().numpy().copy()
 
-        if isinstance(ns, ExternalParamsSumNodes):
-            ns_info["external_params"] = pickle.dumps(ns.external_params)
+        if isinstance(ns, ParameterizedSumNodes):
+            ns_info["external_params"] = pickle.dumps(ns.parameterization)
 
         if hasattr(ns, "_params") and ns._params is not None:
             ns_info["params"] = ns._params.detach().cpu().numpy().copy()
@@ -107,10 +130,10 @@ def deserialize_nodes(nodes_list: Sequence):
 
             external_params = ns_info.get("external_params", None)
             if external_params is not None:
-                external_params = pickle.loads(external_params)
+                external_params = _load_parameterization(external_params)
 
             ns = summate(*chs, edge_ids = edge_ids, params = params, block_size = block_size,
-                         external_params = external_params)
+                         parameterization = external_params)
 
             if "zero_param_mask" in ns_info:
                 zero_param_mask = torch.from_numpy(ns_info["zero_param_mask"])

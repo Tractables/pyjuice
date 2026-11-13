@@ -197,22 +197,23 @@ def test_sync_param_flows_noop_without_dist():
 # exactly like `param_flows` and so must be all-reduced with it -- otherwise a DDP M-step divides a
 # GLOBAL numerator by a LOCAL denominator, which is a smooth rescaling rather than a crash and would not
 # show up as a failure anywhere. Its layout is the parameterization's own (gate space for
-# `BlockScaleSumParams`), which is the reason this needs its own coverage rather than riding the
+# `BlockScale`), which is the reason this needs its own coverage rather than riding the
 # `param_flows` assertions above: a reduce that handled only the `param_flows` SHAPE would still pass them.
 
 
 def _build_gated_pc(device):
     import pyjuice as juice
     import pyjuice.nodes.distributions as dists
-    from pyjuice.nodes import inputs, multiply, summate, BlockScaleSumParams
+    from pyjuice.nodes import inputs, multiply, summate
+    from pyjuice.parameterizations import BlockScale
 
     torch.manual_seed(0)   # identical structure AND parameters on every rank
     with juice.set_block_size(4):
         i0 = inputs(0, num_node_blocks = 2, dist = dists.Categorical(num_cats = 5))
         i1 = inputs(1, num_node_blocks = 2, dist = dists.Categorical(num_cats = 5))
         ns = summate(multiply(i0, i1), num_node_blocks = 2,
-                     external_params = BlockScaleSumParams(ch_block_size = 2,
-                                                           apply_z_correction = True))
+                     parameterization = BlockScale(ch_block_size = 2,
+                                                   apply_z_correction = True))
         root = summate(multiply(ns), num_node_blocks = 1, block_size = 1)
     torch.manual_seed(0)
     root.init_parameters(perturbation = 2.0)
@@ -244,7 +245,7 @@ def _ddp_denom_worker(rank, world_size, init_file, errdir):
         torch.manual_seed(7)
         x_all = torch.randint(0, 5, (world_size * B, 2), device = device)
         torch.manual_seed(11)
-        phi_all = torch.randn(ns.external_params.tensor_shapes(ns, world_size * B)[0], device = device)
+        phi_all = torch.randn(ns.parameterization.tensor_shapes(ns, world_size * B)[0], device = device)
         lo, hi = rank * B, (rank + 1) * B
 
         def em(xx, pp, sync, rescale):
@@ -266,7 +267,7 @@ def _ddp_denom_worker(rank, world_size, init_file, errdir):
             if sync:
                 pc_i.sync_param_flows()
             fp = pc_i.param_flows.detach().clone()
-            fm = ns_i.external_params.materialize_denom_flows(
+            fm = ns_i.parameterization.materialize_denom_flows(
                 ns_i, pc_i.params, pc_i.denom_param_flows,
                 pc_i._denom_correction_nss()[ns_i]).detach().clone()
             pc_i.mini_batch_em(step_size = 1.0, pseudocount = 0.01,
@@ -355,7 +356,7 @@ def test_sync_denom_param_flows_noop_without_dist():
     B = 16
     torch.manual_seed(7)
     x = torch.randint(0, 5, (B, 2), device = device)
-    phi = torch.randn(ns.external_params.tensor_shapes(ns, B)[0], device = device)
+    phi = torch.randn(ns.parameterization.tensor_shapes(ns, B)[0], device = device)
     pc(x, sum_external_params = {ns: phi})
     pc.backward(x, sum_external_params = {ns: phi}, logspace_flows = True,
                 flows_memory = 0.0, allow_modify_flows = False)

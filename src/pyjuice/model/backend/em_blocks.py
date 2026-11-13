@@ -118,13 +118,17 @@ def _em_node_block_one_pass_kernel(stored_ptr, master, param_flows, cum_pflows, 
         shifted = pflows + pseudocount / nch
         tot = tl.sum(tl.where(mask & (old != 0.0), shifted, 0.0), axis = 0)
         tl.store(cum_pflows + gnid + offs_n, tot, mask = offs_n < nv)
-        new_param = shifted / tot[None, :]
-        upd = tl.where(old == 0.0, 0.0, (1.0 - step_size) * old + step_size * new_param)
+        den = tot[None, :]
+        new_param = shifted / den
     else:
         tot = tl.sum(pflows, axis = 0)
         tl.store(cum_pflows + gnid + offs_n, tot, mask = offs_n < nv)
-        new_param = (pflows + pseudocount / nch) / (tot[None, :] + pseudocount)
-        upd = (1.0 - step_size) * old + step_size * new_param
+        den = tot[None, :] + pseudocount
+        new_param = (pflows + pseudocount / nch) / den
+    # A node no flow reached, without a pseudocount (its total 0: 0 / 0), keeps its parameters
+    upd = tl.where(den == 0.0, old, (1.0 - step_size) * old + step_size * new_param)
+    if KEEP_ZERO:
+        upd = tl.where(old == 0.0, 0.0, upd)
     if HAS_MASTER:
         tl.store(master + par0 + rel, upd, mask = mask)
     tl.store(stored_ptr + par0 + rel, upd.to(stored_ptr.dtype.element_ty), mask = mask)
@@ -186,13 +190,14 @@ def _em_block_kernel(stored_ptr, master, param_flows, cum_pflows, t_par, t_pflow
         else:
             old = tl.load(stored_ptr + par0 + rel, mask = mask, other = 0).to(tl.float32)
         if KEEP_ZERO:
-            new_param = (pflows + pseudocount / nch) / tot[None, :]
+            den = tot[None, :]
         else:
-            new_param = (pflows + pseudocount / nch) / (tot[None, :] + pseudocount)
+            den = tot[None, :] + pseudocount
+        new_param = (pflows + pseudocount / nch) / den
+        # A node no flow reached, without a pseudocount (its total 0: 0 / 0), keeps its parameters
+        upd = tl.where(den == 0.0, old, (1.0 - step_size) * old + step_size * new_param)
         if KEEP_ZERO:
-            upd = tl.where(old == 0.0, 0.0, (1.0 - step_size) * old + step_size * new_param)
-        else:
-            upd = (1.0 - step_size) * old + step_size * new_param
+            upd = tl.where(old == 0.0, 0.0, upd)
         if HAS_MASTER:
             tl.store(master + par0 + rel, upd, mask = mask)
         tl.store(stored_ptr + par0 + rel, upd.to(stored_ptr.dtype.element_ty), mask = mask)
@@ -290,13 +295,14 @@ def _em_split_update_kernel(stored_ptr, master, param_flows, cum_pflows, t_par, 
             else:
                 old = tl.load(stored_ptr + par0 + rel, mask = mask, other = 0).to(tl.float32)
             if KEEP_ZERO:
-                new_param = (pflows + pseudocount / nch) / tot[None, :]
+                den = tot[None, :]
             else:
-                new_param = (pflows + pseudocount / nch) / (tot[None, :] + pseudocount)
+                den = tot[None, :] + pseudocount
+            new_param = (pflows + pseudocount / nch) / den
+            # A node no flow reached, without a pseudocount (its total 0: 0 / 0), keeps its parameters
+            upd = tl.where(den == 0.0, old, (1.0 - step_size) * old + step_size * new_param)
             if KEEP_ZERO:
-                upd = tl.where(old == 0.0, 0.0, (1.0 - step_size) * old + step_size * new_param)
-            else:
-                upd = (1.0 - step_size) * old + step_size * new_param
+                upd = tl.where(old == 0.0, 0.0, upd)
             if HAS_MASTER:
                 tl.store(master + par0 + rel, upd, mask = mask)
             tl.store(stored_ptr + par0 + rel, upd.to(stored_ptr.dtype.element_ty), mask = mask)

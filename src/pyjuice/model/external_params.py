@@ -7,6 +7,7 @@ written back in the layout they came in.
 
 from __future__ import annotations
 
+import itertools
 import math
 import torch
 from typing import Optional, Sequence
@@ -14,8 +15,19 @@ from typing import Optional, Sequence
 from pyjuice.nodes import CircuitNodes
 from pyjuice.layer import StagedExternalParams, EXTERNAL_PARAMS_KWARG, EXTERNAL_PARAMS_GRAD_KWARG, \
                           EXTERNAL_PARAMS_BUFFER_KWARG, EXTERNAL_PARAMS_GRAD_BUFFER_KWARG
-from pyjuice.layer.external_sum_layer import validate_external_tensors
-from pyjuice.nodes.external_params.external_params import ExternalSumParams
+from pyjuice.layer.parameterized_sum_layer import validate_external_tensors
+from pyjuice.parameterizations.sum_parameterization import SumParameterization
+
+
+def _inner_contiguous(t: torch.Tensor) -> bool:
+    """Whether every axis of `t` past the first (the batch) is laid out contiguously -- a sample's block one run --,
+    whatever the batch stride (checked from the strides: no view made)."""
+    expect = 1
+    for d in range(t.dim() - 1, 0, -1):
+        if t.size(d) != 1 and t.stride(d) != expect:
+            return False
+        expect *= t.size(d)
+    return t.dim() >= 2
 
 
 def _staging_transpose_fn():
@@ -28,13 +40,13 @@ def _staging_transpose_fn():
     whole GROUP hands this a flat destination, the per-node path hands it a storage-shaped one, and the
     fallback only ever handled the second.
     """
-    from pyjuice.nodes.external_params.kernels.c import get_module
+    from pyjuice.parameterizations.kernels.c import get_module
     mod = get_module()
     if mod is not None:
         return mod.staging_transpose
 
     try:
-        from pyjuice.nodes.external_params.kernels.staging import staging_transpose_triton
+        from pyjuice.parameterizations.kernels.staging import staging_transpose_triton
         return staging_transpose_triton
     except Exception:
         return None
@@ -50,7 +62,7 @@ def _staged_transposes_batched(fn, fast: list) -> bool:
     every call (a head's output, new gradient buffers) costs no more than one with stable ones, and what the
     backward launches never depends on where the allocator put them.
     """
-    from pyjuice.nodes.external_params.kernels.c import get_module
+    from pyjuice.parameterizations.kernels.c import get_module
     mod = get_module()
     batched = getattr(mod, "staging_transpose_batched", None) if mod is not None else None
     if batched is None or fn is not mod.staging_transpose:
@@ -64,10 +76,45 @@ def _staged_transposes_batched(fn, fast: list) -> bool:
             return False
         batch = src.size(0)
         n = src.numel() // max(batch, 1)
-        rows += (src.data_ptr(), dst.data_ptr(), batch, n)
+        rows += (src.data_ptr(), dst.data_ptr(), batch | n << 32, n | batch << 32)
         max_b, max_n = max(max_b, batch), max(max_n, n)
     batched(rows, max_b, max_n)
     return True
+
+
+class _GroupRows:
+    """
+    What staging a whole group takes where it is not one transpose -- several tensors a node (their slots alternate in
+    the buffer), or members that are not adjacent: a transpose a member's slot, all of them in one launch of the
+    extension's batched transpose. A member's slot is one run in every sample of the caller's concatenation, and that
+    is all the transpose needs of it, so the group is neither split into views nor validated a node at a time, which
+    with the generic copies of those strided views was the staging's cost (MEASURED, LowRank, a tied HMM of 1024
+    latents and 31 layers, batch 16: 0.36 ms of the forward's 1.3 ms of host time). Sizes and offsets only, for one
+    batch size; the addresses are the call's.
+    """
+    __slots__ = ("shapes", "to_buffer", "to_caller", "max_n")
+
+    def __init__(self, shapes, to_buffer, to_caller, max_n):
+        self.shapes = shapes                # per slot: the shape of the concatenated tensor
+        self.to_buffer = to_buffer          # per slot: per member `(offset in it, offset in the buffer, sizes, strides)`
+        self.to_caller = to_caller          # ... the other way round (sizes and strides swapped)
+        self.max_n = max_n                  # the most elements a member's slot holds in a sample
+
+    def launch(self, batched, tensors, buffer, to_buffer: bool) -> None:
+        """The transposes between the concatenated `tensors` and `buffer`, whichever way, in one launch."""
+        rows, at = [], buffer.data_ptr()
+        if to_buffer:
+            for cat, slot in zip(tensors, self.to_buffer):
+                base = cat.data_ptr()
+                for offset, slot_offset, sizes, strides in slot:
+                    rows += (base + offset, at + slot_offset, sizes, strides)
+            batched(rows, self.shapes[0][0], self.max_n)
+        else:
+            for cat, slot in zip(tensors, self.to_caller):
+                base = cat.data_ptr()
+                for offset, slot_offset, sizes, strides in slot:
+                    rows += (at + slot_offset, base + offset, sizes, strides)
+            batched(rows, self.max_n, self.shapes[0][0])
 
 
 def _staged_copy(plain_d: list, plain_s: list, fast: list) -> None:
@@ -120,7 +167,28 @@ class _ExternalParamsMixin:
         caller's tensors are in the layout they supplied the gates in. `from_storage` is what maps
         between the two, so this is the exact inverse of what staging does on the forward, batched into
         one `_foreach_copy_` rather than one op per node.
+
+        Destinations handed over unzeroed (`StagedExternalParams.fresh`) that no layer claimed are zeroed
+        first: what a node whose layers wrote nothing has for its gradient.
         """
+        fresh = self.__dict__.get("_staged_external_params_grad")
+        if fresh is not None and fresh.fresh:
+            claimed = fresh.__dict__.get("claimed", ())
+            left = {id(ts): ts for ts in fresh.values() if ts is not None and id(ts) not in claimed}
+            if left:
+                torch._foreach_zero_([t for ts in left.values() for t in ts])
+            fresh.fresh = False
+        groups = self.__dict__.get("_external_grad_groups")
+        if groups:
+            for batched, rows, cats in groups:
+                if batched == "strided":                       # (`_group_strided`: a copy a slot, the other way round)
+                    for src, dst in self._group_strided(rows, cats, cats[0].size(0) if not torch.is_tensor(cats)
+                                                        else cats.size(0), self.external_params_grad):
+                        dst.copy_(src)
+                    continue
+                rows.launch(batched, cats, self.external_params_grad, to_buffer = False)
+            self._external_grad_groups = None
+
         dsts = getattr(self, "_external_grad_dsts", None)
         if not dsts:
             return None
@@ -140,7 +208,7 @@ class _ExternalParamsMixin:
             if hit is not None and hit[0] is views:
                 src, flat = hit[1], hit[2]
             else:
-                src = ns.external_params.from_storage(ns, views)
+                src = ns.parameterization.from_storage(ns, views)
                 rotates, _ = self._ext_ns_static(ns)
                 # the storage views as `[N, B]`, the transpose's source (None where the layout is not that rotation)
                 flat = tuple(v.view(-1, v.size(-1)) for v in views) if rotates else None
@@ -189,24 +257,24 @@ class _ExternalParamsMixin:
             return layout
 
         # Two passes so that a node may share another node's slots (see
-        # `ExternalSumParams.storage_owner`): allocate for the owners first, then alias the rest onto
+        # `SumParameterization.storage_owner`): allocate for the owners first, then alias the rest onto
         # them. Aliased nodes still appear in the map, so the layers and kernels need no special case --
         # they look up their own `ns` and simply find the same memory.
         offset = 0
         ns2slots = dict()
         for ns in self.external_params_nodes:
-            if ns.external_params.storage_owner(ns) is not ns:
+            if ns.parameterization.storage_owner(ns) is not ns:
                 continue
 
             slots = []
-            for shape in ns.external_params.storage_shapes(ns, batch_size):
+            for shape in ns.parameterization.storage_shapes(ns, batch_size):
                 slots.append((offset, tuple(shape)))
                 offset += math.prod(shape)
 
             ns2slots[ns] = slots
 
         for ns in self.external_params_nodes:
-            owner = ns.external_params.storage_owner(ns)
+            owner = ns.parameterization.storage_owner(ns)
             if owner is not ns:
                 assert owner in ns2slots, \
                     f"`storage_owner` of {ns} is not itself an external-parameter node of this circuit."
@@ -301,12 +369,12 @@ class _ExternalParamsMixin:
         for ns in nodes:
             assert ns in self.external_params_nodes, \
                 f"External-parameter group '{name}' contains a node this PC did not compile with an " \
-                f"external parameterization. Construct it with `pyjuice.summate(..., external_params = ...)`."
+                f"external parameterization. Construct it with `pyjuice.summate(..., parameterization = ...)`."
             if id(ns) in seen:
                 raise AssertionError(f"External-parameter group '{name}' lists the same node twice.")
             seen.add(id(ns))
 
-        sigs = {ns.external_params.get_signature() for ns in nodes}
+        sigs = {ns.parameterization.get_signature() for ns in nodes}
         assert len(sigs) == 1, \
             f"External-parameter group '{name}' mixes parameterizations {sigs}; one concatenated " \
             f"tensor cannot serve nodes whose layouts differ."
@@ -314,7 +382,7 @@ class _ExternalParamsMixin:
         # Members that SHARE storage (a tied node and its copies) are fed once, by the owner. Handing
         # such a pair two different slices is a contradiction, and silently letting one win would apply
         # the wrong gate to the other -- so it is rejected here rather than resolved arbitrarily.
-        owners = [ns.external_params.storage_owner(ns) for ns in nodes]
+        owners = [ns.parameterization.storage_owner(ns) for ns in nodes]
         if len(set(id(o) for o in owners)) != len(owners):
             raise AssertionError(
                 f"External-parameter group '{name}' contains nodes that share one external tensor "
@@ -324,7 +392,7 @@ class _ExternalParamsMixin:
 
         # Shapes must agree everywhere except along `dim`. Checked once, at registration, on a nominal
         # batch of 1: the shapes are affine in the batch, so the comparison holds for every batch.
-        shapes = [ns.external_params.tensor_shapes(ns, 1) for ns in nodes]
+        shapes = [ns.parameterization.tensor_shapes(ns, 1) for ns in nodes]
         n_slots = len(shapes[0])
         assert all(len(sh) == n_slots for sh in shapes), \
             f"External-parameter group '{name}' mixes nodes with different numbers of tensors."
@@ -344,12 +412,20 @@ class _ExternalParamsMixin:
                     )
 
         self.external_params_groups[name] = (list(nodes), int(dim))
+        self._forget_group_plans()
 
     def unregister_external_params_group(self, name: str) -> None:
         """Remove a group registered by :func:`register_external_params_group`."""
         assert name in self.external_params_groups, \
             f"No external-parameter group named '{name}'."
         del self.external_params_groups[name]
+        self._forget_group_plans()
+
+    def _forget_group_plans(self) -> None:
+        """Drop what is kept per group name (its rows, its in-place split, its storage owners) and per set of names
+        supplied (the in-place staging's plan): a name registered again may name other nodes."""
+        for memo in ("_ext_group_rows", "_ext_group_in_place", "_ext_owner_sets", "_ext_in_place_plans"):
+            self.__dict__.pop(memo, None)
 
     def _group_fast_stage(self, name: str, tensors, views: dict, batch_size: int,
                           buffer: Optional[torch.Tensor] = None):
@@ -375,10 +451,10 @@ class _ExternalParamsMixin:
         if dim != 1 or len(nodes) < 2:
             return None
 
-        ep = nodes[0].external_params
+        ep = nodes[0].parameterization
         perm = ep.storage_perm()
         if not (perm is not None
-                and type(ep).to_storage is ExternalSumParams.to_storage
+                and type(ep).to_storage is SumParameterization.to_storage
                 and tuple(perm) == tuple(range(1, len(perm))) + (0,)):
             return None
 
@@ -409,6 +485,109 @@ class _ExternalParamsMixin:
         start = (base.data_ptr() - buf.data_ptr()) // elem
         return buf.narrow(0, start, total), cat
 
+    def _group_rows(self, name: str, batch_size: int) -> Optional[_GroupRows]:
+        """The group's :class:`_GroupRows` at `batch_size`, or None where its members do not lend themselves: another
+        axis than the first after the batch, storage that is not the caller's with the batch moved to the end, slots
+        shared with another node. Kept per group and batch size (the layout depends on nothing else)."""
+        memo = self.__dict__.setdefault("_ext_group_rows", {})
+        key = (name, batch_size)
+        if key in memo:
+            return memo[key]
+        memo[key] = None
+        nodes, dim = self.external_params_groups[name]
+        if dim != 1 or not all(self._ext_ns_static(ns) == (True, ns) for ns in nodes):
+            return None
+        _, ns2slots = self._external_params_layout(batch_size)
+        shapes_of = [ns.parameterization.tensor_shapes(ns, batch_size) for ns in nodes]
+        cat_shapes, to_buffer, to_caller, max_n = [], [], [], 0
+        elem = 4                                    # (float32: the buffer's, and what `launch`'s callers check)
+        for slot in range(len(shapes_of[0])):
+            sizes = [tuple(shapes[slot]) for shapes in shapes_of]
+            if not all(len(sz) >= 2 and sz[0] == batch_size and sz[2:] == sizes[0][2:] for sz in sizes):
+                return None
+            inner = math.prod(sizes[0][2:])
+            total = sum(sz[1] for sz in sizes) * inner
+            if batch_size == 0 or total >= 1 << 31:
+                return None
+            rows_in, rows_out, run = [], [], 0
+            for ns, sz in zip(nodes, sizes):
+                offset, shape = ns2slots[ns][slot]
+                n = sz[1] * inner
+                if math.prod(shape) != batch_size * n:
+                    return None
+                rows_in.append((run * elem, offset * elem, batch_size | n << 32, total | batch_size << 32))
+                rows_out.append((run * elem, offset * elem, n | batch_size << 32, batch_size | total << 32))
+                run += n
+                max_n = max(max_n, n)
+            cat_shapes.append((batch_size, sum(sz[1] for sz in sizes)) + sizes[0][2:])
+            to_buffer.append(rows_in)
+            to_caller.append(rows_out)
+        memo[key] = _GroupRows(cat_shapes, to_buffer, to_caller, max_n)
+        return memo[key]
+
+    def _group_batched(self, name: str, tensors, batch_size: int, buffer: torch.Tensor):
+        """`(the batched transpose, the group's rows, its tensors)` where the group's concatenated `tensors` can go
+        between the caller and `buffer` that way -- contiguous fp32 of exactly the concatenation's shape, the extension
+        built --, else None: the per-node path takes it, and what is wrong with it, if anything, is said there."""
+        fn = _staging_transpose_fn()
+        from pyjuice.parameterizations.kernels.c import get_module
+        mod = get_module()
+        batched = getattr(mod, "staging_transpose_batched", None) if mod is not None else None
+        if batched is None or fn is not mod.staging_transpose or not buffer.is_cuda:
+            return None
+        rows = self._group_rows(name, batch_size)
+        if rows is None:
+            return None
+        if torch.is_tensor(tensors):
+            tensors = (tensors,)
+        if not isinstance(tensors, (tuple, list)) or len(tensors) != len(rows.shapes):
+            return None
+        device = buffer.device
+        for cat, shape in zip(tensors, rows.shapes):
+            if not (torch.is_tensor(cat) and cat.dtype == torch.float32 and cat.device == device
+                    and cat.is_contiguous() and tuple(cat.size()) == shape):
+                return None
+        return batched, rows, tensors
+
+    def _group_strided(self, name: str, tensors, batch_size: int, buffer: torch.Tensor):
+        """`[(the buffer's view, the caller's view)]`, a pair a slot, where the group's concatenated `tensors` go between
+        the caller and `buffer` as ONE strided copy a slot: its members stored as the caller gives them (no
+        `storage_perm`, the default `to_storage`), each its own slots, of one shape, their slots evenly spaced in the
+        buffer in the group's order (ascending) -- then a slot's members are `[T, B, n]` of the buffer (a stride a
+        member) and the concatenation's `[B, T, n]` permuted. Else None: the per-node path takes it."""
+        nodes, dim = self.external_params_groups[name]
+        if dim != 1 or len(nodes) < 2:
+            return None
+        for ns in nodes:
+            ep = ns.parameterization
+            if not (ep.storage_perm() is None and type(ep).to_storage is SumParameterization.to_storage
+                    and ep.storage_owner(ns) is ns):
+                return None
+        if torch.is_tensor(tensors):
+            tensors = (tensors,)
+        _, ns2slots = self._external_params_layout(batch_size)
+        shapes = ns2slots[nodes[0]]
+        if not isinstance(tensors, (tuple, list)) or len(tensors) != len(shapes):
+            return None
+        T, pairs = len(nodes), []
+        for slot, cat in enumerate(tensors):
+            off0, shape = shapes[slot]
+            if len(shape) < 2 or shape[0] != batch_size:
+                return None
+            if not all(tuple(ns2slots[ns][slot][1]) == tuple(shape) for ns in nodes):
+                return None
+            step = ns2slots[nodes[1]][slot][0] - off0
+            if step <= 0 or any(ns2slots[ns][slot][0] != off0 + k * step for k, ns in enumerate(nodes)):
+                return None                                    # (members not in the buffer's order, or not evenly)
+            want = (batch_size, T * shape[1]) + tuple(shape[2:])
+            if not (torch.is_tensor(cat) and cat.dtype == buffer.dtype and cat.device == buffer.device
+                    and cat.is_contiguous() and tuple(cat.size()) == want):
+                return None
+            per = math.prod(shape[1:])
+            pairs.append((buffer.as_strided((T, batch_size, per), (step, per, 1), off0),
+                          cat.view(batch_size, T, per).permute(1, 0, 2)))
+        return pairs
+
     def _expand_external_params_groups(self, ns2tensors: dict, batch_size: int) -> dict:
         """
         Replace every group-name key with one entry per member, holding a VIEW of the caller's tensor.
@@ -437,7 +616,7 @@ class _ExternalParamsMixin:
 
             if torch.is_tensor(tensors):
                 tensors = (tensors,)
-            n_slots = len(nodes[0].external_params.tensor_shapes(nodes[0], batch_size))
+            n_slots = len(nodes[0].parameterization.tensor_shapes(nodes[0], batch_size))
             assert len(tensors) == n_slots, \
                 f"External-parameter group '{key}' expects {n_slots} concatenated tensor(s), got " \
                 f"{len(tensors)}."
@@ -446,7 +625,7 @@ class _ExternalParamsMixin:
             for slot, cat in enumerate(tensors):
                 assert torch.is_tensor(cat), \
                     f"External-parameter group '{key}', slot {slot}: expected a tensor, got {type(cat)}."
-                sizes = [ns.external_params.tensor_shapes(ns, batch_size)[slot] for ns in nodes]
+                sizes = [ns.parameterization.tensor_shapes(ns, batch_size)[slot] for ns in nodes]
                 axis = dim % len(sizes[0])
                 want = list(sizes[0])
                 want[axis] = sum(int(s[axis]) for s in sizes)
@@ -550,6 +729,38 @@ class _ExternalParamsMixin:
                     f"'{_claimed[ns]}' and '{key}'."
                 _claimed[ns] = key
 
+        # The nodes whose parameterization reads its tensors IN PLACE (`SumParameterization.reads_in_place`; the
+        # forward's own staging alone): the layers are handed views of the caller's tensors -- a group's split along
+        # its axis -- and nothing is copied; the caller's tensors' versions are noted for the backward.
+        in_place, in_place_versions = {}, []
+        if owns_forward_state:
+            keys = frozenset(ns2tensors)
+            ns2tensors, in_place, in_place_versions = self._take_in_place(
+                ns2tensors, batch_size, self.__dict__[name].device)
+            if in_place and not ns2tensors:
+                # (every entry read in place: what the steps below make of it -- the nodes whose storage group was
+                # supplied, each handed its group's tensors, in the buffer's order -- from a plan kept per (keys,
+                # batch size), no node looked at one by one)
+                memo = self.__dict__.setdefault("_ext_in_place_plans", {})
+                plan = memo.get((keys, batch_size))
+                if plan is None:
+                    member = {}
+                    for ns in in_place:
+                        member[self._ext_ns_static(ns)[1]] = ns
+                    pairs = tuple((ns, member[self._ext_ns_static(ns)[1]]) for ns in views
+                                  if self._ext_ns_static(ns)[1] in member)
+                    plan = memo[(keys, batch_size)] = (
+                        pairs, frozenset(member), all(ns.parameterization.initializes_grads(ns) for ns, _ in pairs))
+                views = StagedExternalParams({ns: in_place[m] for ns, m in plan[0]})
+                views.in_place_versions = in_place_versions
+                views.in_place_owners = set(plan[1])
+                views.in_place_plan = plan[0]
+                views.in_place_initializes = plan[2]
+                kwargs[EXTERNAL_PARAMS_KWARG] = views
+                kwargs[EXTERNAL_PARAMS_BUFFER_KWARG] = self.__dict__[name]
+                self._staged_external_params = views
+                return None
+
         group_fast, group_done, fast_keys = [], set(), set()
         for key, tensors in ns2tensors.items():
             if not isinstance(key, str):
@@ -561,6 +772,20 @@ class _ExternalParamsMixin:
                                            buffer = self.__dict__[name])
             if whole is not None:
                 group_fast.append(whole)
+                group_done.update(self.external_params_groups[key][0])
+                fast_keys.add(key)
+                continue
+            taken = self._group_batched(key, tensors, batch_size, self.__dict__[name])
+            if taken is not None:
+                batched, rows, cats = taken
+                rows.launch(batched, cats, self.__dict__[name], to_buffer = True)
+                group_done.update(self.external_params_groups[key][0])
+                fast_keys.add(key)
+                continue
+            pairs = self._group_strided(key, tensors, batch_size, self.__dict__[name])
+            if pairs is not None:
+                for dst, src in pairs:
+                    dst.copy_(src)
                 group_done.update(self.external_params_groups[key][0])
                 fast_keys.add(key)
 
@@ -578,7 +803,7 @@ class _ExternalParamsMixin:
         dsts, srcs, fast = [], [], list(group_fast)
         for ns, tensors in ns2tensors.items():
             tensors = validate_external_tensors(
-                ns, ns.external_params, tensors, batch_size, device, require_contiguous = False
+                ns, ns.parameterization, tensors, batch_size, device, require_contiguous = False
             )
 
             # The staging buffer may hold the tensors in a different LAYOUT than the caller uses --
@@ -601,7 +826,7 @@ class _ExternalParamsMixin:
                         srcs.append(tensor.permute(*range(1, tensor.dim()), 0))
                 continue
 
-            tensors = ns.external_params.to_storage(ns, tensors)
+            tensors = ns.parameterization.to_storage(ns, tensors)
 
             dsts.extend(views[ns])
             srcs.extend(tensors)
@@ -612,19 +837,97 @@ class _ExternalParamsMixin:
         # exactly the set that was staged.
         #
         # Membership is by STORAGE GROUP, not by node: when several nodes share one set of tensors (see
-        # `ExternalSumParams.storage_owner`) the caller supplies them once, and every node in that group
+        # `SumParameterization.storage_owner`) the caller supplies them once, and every node in that group
         # is staged. Comparing node-by-node would keep only the one that was named and silently turn the
         # rest into plain sum layers -- correct-looking output with the correction applied to one
         # timestep out of many.
-        supplied_groups = {self._ext_ns_static(ns)[1] for ns in (set(ns2tensors) | group_done)}
+        supplied_groups = {self._ext_ns_static(ns)[1] for ns in (set(ns2tensors) | group_done | set(in_place))}
         for ns in list(views.keys()):
             if self._ext_ns_static(ns)[1] not in supplied_groups:
                 del views[ns]
+
+        if in_place:
+            # (every node of an in-place node's storage group reads that node's tensors: one set for the group)
+            owned = {self._ext_ns_static(ns)[1]: tensors for ns, tensors in in_place.items()}
+            for ns in views:
+                hit = owned.get(self._ext_ns_static(ns)[1])
+                if hit is not None:
+                    views[ns] = hit
+            views.in_place_versions = in_place_versions
+            views.in_place_owners = set(owned)
 
         kwargs[EXTERNAL_PARAMS_KWARG] = views
         kwargs[EXTERNAL_PARAMS_BUFFER_KWARG] = self.__dict__[name]
         if owns_forward_state:
             self._staged_external_params = views
+
+    def _group_in_place_views(self, key: str, tensors, batch_size: int, device, aligned16: bool = False) -> Optional[dict]:
+        """`{ns: its views}` of a group's concatenated `tensors`, split along the group's axis -- where that is the first
+        after the batch and each tensor is fp32 on `device`, of the concatenation's exact shape, every axis past the
+        batch contiguous (so is each member's view) --, else None. The members' extents are kept per group and batch
+        size: a call checks one tensor a slot and splits it (no node's tensors validated one by one). `aligned16`: and
+        every member's view 16-byte aligned with a batch stride of a multiple of 4 floats (the concatenation's base
+        and batch stride so, each member's offset a multiple of 4 floats: kept with the extents)."""
+        memo = self.__dict__.setdefault("_ext_group_in_place", {})
+        plan = memo.get((key, batch_size))
+        if plan is None:
+            nodes, dim = self.external_params_groups[key]
+            shapes = [tuple(tuple(sh) for sh in ns.parameterization.tensor_shapes(ns, batch_size)) for ns in nodes]
+            slots = []
+            for slot in range(len(shapes[0])):
+                sizes = [sh[slot] for sh in shapes]
+                if len(sizes[0]) < 3 or dim % len(sizes[0]) != 1 or \
+                        any(sz[:1] + sz[2:] != sizes[0][:1] + sizes[0][2:] for sz in sizes):
+                    slots = None
+                    break
+                inner = math.prod(sizes[0][2:])
+                offs = itertools.accumulate([0] + [sz[1] * inner for sz in sizes[:-1]])
+                slots.append(((sizes[0][0], sum(sz[1] for sz in sizes)) + sizes[0][2:], [sz[1] for sz in sizes],
+                              all(o % 4 == 0 for o in offs)))
+            plan = memo[(key, batch_size)] = (nodes, slots) if slots else False
+        if plan is False:
+            return None
+        nodes, slots = plan
+        cats = (tensors,) if torch.is_tensor(tensors) else tuple(tensors) if isinstance(tensors, (tuple, list)) else ()
+        if len(cats) != len(slots):
+            return None
+        splits = []
+        for cat, (want, sizes, starts4) in zip(cats, slots):
+            if not (torch.is_tensor(cat) and cat.dtype == torch.float32 and cat.device == device and
+                    tuple(cat.shape) == want and cat.size(0) > 0 and _inner_contiguous(cat)):
+                return None
+            if aligned16 and not (starts4 and cat.data_ptr() % 16 == 0 and cat.stride(0) % 4 == 0):
+                return None
+            splits.append(torch.split(cat, sizes, dim = 1))
+        return dict(zip(nodes, zip(*splits)))
+
+    def _take_in_place(self, ns2tensors: dict, batch_size: int, device) -> tuple:
+        """`(the rest of ns2tensors, {ns: its tensors}, [(tensor, version)])`: the entries whose nodes all read their
+        tensors in place taken out of `ns2tensors` -- a group's split along its axis into views, one set a node --,
+        each node's tensors validated and fp32 with every axis past the batch contiguous (an entry with a tensor that
+        is not stays in the rest: it is copied), and the caller's tensors as handed over, with their versions now (a
+        view shares its base's version: an in-place write to either shows)."""
+        rest, taken, versions = {}, {}, []
+        for key, tensors in ns2tensors.items():
+            nodes = self.external_params_groups[key][0] if isinstance(key, str) else (key,)
+            # (never a graph-safe parameterization's: a replay reads the addresses the capture saw)
+            if not all(ns.parameterization.reads_in_place(ns) and not ns.parameterization.cuda_graph_safe
+                       for ns in nodes):
+                rest[key] = tensors
+                continue
+            if isinstance(key, str):
+                mine = self._group_in_place_views(key, tensors, batch_size, device)
+            else:
+                ts = validate_external_tensors(key, key.parameterization, tensors, batch_size, device,
+                                               require_contiguous = False)
+                mine = {key: ts} if all(t.size(0) > 0 and _inner_contiguous(t) for t in ts) else None
+            if mine is None:
+                rest[key] = tensors
+                continue
+            taken.update(mine)
+            for t in ((tensors,) if torch.is_tensor(tensors) else tensors):
+                versions.append((t, t._version))
+        return rest, taken, versions
 
     def _ext_ns_static(self, ns) -> tuple:
         """`(rotates_batch, storage owner)` of an external-parameter node, both fixed by its parameterization: whether
@@ -633,9 +936,9 @@ class _ExternalParamsMixin:
         memo = self.__dict__.setdefault("_ext_ns_static_memo", {})
         hit = memo.get(ns)
         if hit is None:
-            ep = ns.external_params
+            ep = ns.parameterization
             perm = ep.storage_perm()
-            rotates = (perm is not None and type(ep).to_storage is ExternalSumParams.to_storage
+            rotates = (perm is not None and type(ep).to_storage is SumParameterization.to_storage
                        and tuple(perm) == tuple(range(1, len(perm))) + (0,))
             hit = memo[ns] = (rotates, ep.storage_owner(ns))
         return hit
@@ -667,6 +970,13 @@ class _ExternalParamsMixin:
                 f"`{EXTERNAL_PARAMS_KWARG}` names a different set of nodes than the forward pass did."
 
         if staged is not None:
+            # (the tensors the forward read in place are the caller's own: a backward after one of them was written
+            # in place would interpret `node_mars` with other parameters than made it)
+            for t, version in getattr(staged, "in_place_versions", ()):
+                if t._version != version:
+                    raise RuntimeError(
+                        "An external-parameter tensor that the forward pass read in place was modified in place "
+                        "before the backward pass. Run the forward again, or hand the forward a copy.")
             kwargs[EXTERNAL_PARAMS_KWARG] = staged
             kwargs[EXTERNAL_PARAMS_BUFFER_KWARG] = self.external_params
 
@@ -694,7 +1004,86 @@ class _ExternalParamsMixin:
                     continue
                 assert ns in self.external_params_nodes, \
                     f"`{kwarg_name}` contains a node that this PC did not compile with an external " \
-                    f"parameterization: {ns}. Construct it with `pyjuice.summate(..., external_params = ...)`."
+                    f"parameterization: {ns}. Construct it with `pyjuice.summate(..., parameterization = ...)`."
+
+    def _take_in_place_grads(self, dsts: dict, batch_size: int) -> tuple:
+        """`(the rest of dsts, {ns: its destinations}, [the caller's tensors to zero])`: the destinations the layers add
+        into themselves, so no copy-out -- an entry every node of which read its tensors in place in the forward
+        (`reads_in_place`), its tensors fp32 on the buffer's device with every axis past the batch contiguous and
+        16-byte aligned runs (a group's split along its axis) --, each zeroed once before the backward. Nothing is taken
+        where a node is named twice (the paths after this say so)."""
+        owners = getattr(self._staged_external_params, "in_place_owners", None)
+        if not owners:
+            return dsts, {}, []
+        named = []
+        for key in dsts:
+            if isinstance(key, str):
+                named.extend(self.external_params_groups[key][0] if key in self.external_params_groups else ())
+            else:
+                named.append(key)
+        if len(named) != len(set(named)):
+            return dsts, {}, []
+        device = self.external_params.device
+        # (a destination sharing memory with what the forward read in place would be zeroed under the backward's feet)
+        read = {t.untyped_storage().data_ptr() for t, _ in getattr(self._staged_external_params, "in_place_versions", ())}
+        rest, taken, zero = {}, {}, []
+        for key, tensors in dsts.items():
+            if isinstance(key, str) and key not in self.external_params_groups:
+                rest[key] = tensors
+                continue
+            gown = self.__dict__.setdefault("_ext_owner_sets", {})
+            mine_owners = gown.get(key)
+            if mine_owners is None:
+                nodes = self.external_params_groups[key][0] if isinstance(key, str) else (key,)
+                mine_owners = gown[key] = frozenset(self._ext_ns_static(ns)[1] for ns in nodes)
+            cats = (tensors,) if torch.is_tensor(tensors) else tuple(tensors) if isinstance(tensors, (tuple, list)) else ()
+            if not (cats and mine_owners <= owners and
+                    all(torch.is_tensor(t) and t.dtype == torch.float32 and t.device == device and
+                        t.untyped_storage().data_ptr() not in read for t in cats)):
+                rest[key] = tensors
+                continue
+            if isinstance(key, str):
+                mine = self._group_in_place_views(key, tensors, batch_size, device, aligned16 = True)
+            else:
+                ts = validate_external_tensors(key, key.parameterization, tensors, batch_size, device,
+                                               require_contiguous = False)
+                mine = {key: ts} if all(t.size(0) > 0 and _inner_contiguous(t) and t.data_ptr() % 16 == 0 and
+                                        t.stride(0) % 4 == 0 for t in ts) else None
+            if mine is None:
+                rest[key] = tensors
+                continue
+            taken.update(mine)
+            zero.extend(cats)
+        return rest, taken, zero
+
+    def _take_whole_grad_groups(self, dsts: dict, batch_size: int) -> dict:
+        """The destinations that are whole groups going back in one launch (`_group_batched`) noted for the end of the
+        backward (`_external_grad_groups`); what is left of `dsts` returned for the per-node path. Nothing is taken where
+        a node is named twice, or a group's member got no external parameters: the per-node path says so."""
+        if not any(isinstance(k, str) for k in dsts):
+            return dsts
+        seen = {k for k in dsts if not isinstance(k, str)}
+        for key in dsts:
+            if isinstance(key, str):
+                members = self.external_params_groups[key][0] if key in self.external_params_groups else ()
+                if any(ns in seen or ns not in self._staged_external_params for ns in members):
+                    return dsts
+                seen.update(members)
+        taken, rest = [], dict()
+        for key, tensors in dsts.items():
+            whole = None
+            if isinstance(key, str) and key in self.external_params_groups:
+                whole = self._group_batched(key, tensors, batch_size, self.external_params)    # (its device: the gradient
+                                                                                                # buffer is allocated next)
+                if whole is None and self._group_strided(key, tensors, batch_size, self.external_params) is not None:
+                    whole = ("strided", key, tensors)                                           # (the views: once the
+                                                                                                # buffer exists)
+            if whole is None:
+                rest[key] = tensors
+            else:
+                taken.append(whole)
+        self._external_grad_groups = taken or None
+        return rest
 
     def _init_external_params_grads(self, kwargs: dict, batch_size: int, compute_external_grads: bool) -> None:
         """
@@ -714,6 +1103,8 @@ class _ExternalParamsMixin:
         # keeps working either way.
         dsts = kwargs.pop(EXTERNAL_PARAMS_GRAD_KWARG, None)
         self._external_grad_dsts = None
+        self._external_grad_groups = None
+        in_place_grads, zero = {}, []
         if dsts is not None:
             assert isinstance(dsts, dict), \
                 f"`{EXTERNAL_PARAMS_GRAD_KWARG}` should be a dict mapping nodes (or group names) to " \
@@ -721,12 +1112,14 @@ class _ExternalParamsMixin:
             assert self._staged_external_params is not None, \
                 f"`{EXTERNAL_PARAMS_GRAD_KWARG}` was given, but the forward pass received no external " \
                 f"parameters."
+            dsts, in_place_grads, zero = self._take_in_place_grads(dsts, batch_size)
+            dsts = self._take_whole_grad_groups(dsts, batch_size)
             dsts = self._expand_external_params_groups(dsts, batch_size)
             for ns, tensors in dsts.items():
                 assert ns in self._staged_external_params, \
                     f"`{EXTERNAL_PARAMS_GRAD_KWARG}` names {ns}, which was not given external " \
                     f"parameters in the forward pass."
-                validate_external_tensors(ns, ns.external_params, tensors, batch_size,
+                validate_external_tensors(ns, ns.parameterization, tensors, batch_size,
                                           self.external_params.device, require_contiguous = False)
             self._external_grad_dsts = dsts
             compute_external_grads = True          # asking for them is asking for them
@@ -735,14 +1128,45 @@ class _ExternalParamsMixin:
             self._staged_external_params_grad = None
             return None
 
+        # (the destinations the layers write themselves: their storage groups need nothing of the buffer -- which is
+        # not filled at all where that is every node; where the forward read every node in place and the destinations
+        # are its plan's, the views straight from them)
+        plan = getattr(self._staged_external_params, "in_place_plan", None)
+        if plan is not None and in_place_grads and all(m in in_place_grads for _, m in plan):
+            self._external_params_views(name = "external_params_grad", batch_size = batch_size, set_value = None)
+            grad_views = StagedExternalParams({ns: in_place_grads[m] for ns, m in plan})
+            if getattr(self._staged_external_params, "in_place_initializes", False):
+                grad_views.fresh = True         # (not zeroed: each destination's first writer initializes it; the end
+                                                # of the backward zeroes those none wrote, `_write_external_params_grads`)
+            else:
+                seen = {}
+                for t in zero:
+                    seen.setdefault((t.data_ptr(), tuple(t.shape), tuple(t.stride())), t)
+                torch._foreach_zero_(list(seen.values()))
+            kwargs[EXTERNAL_PARAMS_GRAD_KWARG] = grad_views
+            kwargs[EXTERNAL_PARAMS_GRAD_BUFFER_KWARG] = self.external_params_grad
+            self._staged_external_params_grad = grad_views
+            return None
+        owned = {self._ext_ns_static(ns)[1]: tensors for ns, tensors in in_place_grads.items()}
+        whole = bool(owned) and all(self._ext_ns_static(ns)[1] in owned for ns in self._staged_external_params)
         grad_views = StagedExternalParams(self._external_params_views(
-            name = "external_params_grad", batch_size = batch_size, set_value = 0.0
+            name = "external_params_grad", batch_size = batch_size, set_value = None if whole else 0.0
         ))
 
         # Only the nodes that actually got external parameters this pass
         for ns in list(grad_views.keys()):
             if ns not in self._staged_external_params:
                 del grad_views[ns]
+
+        if owned:
+            for ns in grad_views:
+                hit = owned.get(self._ext_ns_static(ns)[1])
+                if hit is not None:
+                    grad_views[ns] = hit
+            seen = {}
+            for t in zero:
+                seen.setdefault((t.data_ptr(), tuple(t.shape), tuple(t.stride())), t)
+            torch._foreach_zero_(list(seen.values()))
 
         kwargs[EXTERNAL_PARAMS_GRAD_KWARG] = grad_views
         # The flat buffer too: a kernel that writes gradients addresses it with the same compiled
@@ -787,9 +1211,9 @@ class _ExternalParamsMixin:
         # default (`compute_external_grads = True`): a parameterization that computes the element and
         # parameter flows but not its own gradient would otherwise either break every backward or hand
         # back a plausible-looking tensor of zeros.
-        if not ns.external_params.computes_external_grads:
+        if not ns.parameterization.computes_external_grads:
             raise NotImplementedError(
-                f"`{ns.external_params.get_signature()}` does not compute gradients with respect to "
+                f"`{ns.parameterization.get_signature()}` does not compute gradients with respect to "
                 f"its own parameters yet. The element and parameter flows it contributes ARE computed, "
                 f"so `pc.backward()` and the EM optimizers work; only this read is unavailable."
             )
@@ -798,4 +1222,4 @@ class _ExternalParamsMixin:
 
         # Stored in the kernels' layout; hand them back in the caller's, so they line up
         # element-for-element with the tensors that were supplied.
-        return ns.external_params.from_storage(ns, grad_tensors)
+        return ns.parameterization.from_storage(ns, grad_tensors)

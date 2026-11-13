@@ -275,7 +275,7 @@ class ConstrainedCircuit:
 
         **Per-sample inputs** -- the keyword arguments ``pc(x, ...)`` takes for the PC's layers: the soft evidence of
         ``SoftEvidenceCategorical`` input nodes (``categorical_evidence_logp``, with ``soft_evidence_cat_ids`` and
-        ``soft_evidence_value_mask``) and the gates of ``BlockScaleSumParams`` sum nodes (``sum_external_params``) --
+        ``soft_evidence_value_mask``) and the gates of ``BlockScale`` sum nodes (``sum_external_params``) --
         hold for the whole session: the decoder takes them, and every query in it runs under them, as ``pc(x, ...)``
         would::
 

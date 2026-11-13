@@ -45,7 +45,8 @@ import torch
 
 import pyjuice as juice
 import pyjuice.nodes.distributions as dists
-from pyjuice.nodes import inputs, multiply, summate, BlockScaleSumParams, SumNodes
+from pyjuice.nodes import inputs, multiply, summate, SumNodes
+from pyjuice.parameterizations import BlockScale
 from pyjuice.nodes.input_nodes import InputNodes
 
 
@@ -511,14 +512,14 @@ def test_conditional_draws_match_the_exact_posterior(circuits, name):
 # --------------------------------------------------------------------------------- gated + irregular
 
 def _gated_irregular():
-    """A `BlockScaleSumParams` node with block-sparse edges, under a root whose branches overlap --
+    """A `BlockScale` node with block-sparse edges, under a root whose branches overlap --
     the intersection of this branch's feature with the structures above."""
     with juice.set_block_size(2):
         i = [_I(v, 3, 2) for v in range(4)]
         gated = summate(multiply(i[0], i[1], edge_ids = torch.tensor([[0, 0], [1, 2], [2, 1]])),
                         edge_ids = torch.tensor([[0, 0, 1, 1, 1], [0, 2, 0, 1, 2]]),
                         num_node_blocks = 2,
-                        external_params = BlockScaleSumParams(ch_block_size = 1))
+                        parameterization = BlockScale(ch_block_size = 1))
         other = summate(multiply(i[2], i[3]), num_node_blocks = 2, block_size = 2)
         branch_a = summate(multiply(gated, other), num_node_blocks = 1, block_size = 1)
 
@@ -537,8 +538,8 @@ def _gated_irregular():
 def gated():
     torch.manual_seed(0)
     pc, ns = _gated_irregular()
-    num_node_gates = ns.num_nodes // ns.external_params.gate_sizes(ns)[0]
-    num_ch_gates = ns.num_ch_nodes // ns.external_params.gate_sizes(ns)[1]
+    num_node_gates = ns.num_nodes // ns.parameterization.gate_sizes(ns)[0]
+    num_ch_gates = ns.num_ch_nodes // ns.parameterization.gate_sizes(ns)[1]
 
     torch.manual_seed(3)
     # ONE gate held across the batch, so the gated circuit is a fixed distribution the forward pass

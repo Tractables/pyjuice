@@ -7,9 +7,9 @@ are the shared parameters; conditionally they are `theta * exp(element_mars - no
 `node_mars` doubling as the shift that keeps the terms near 1 and their sum near exactly 1.
 
 A sum layer whose parameters are modified per sample -- an
-:class:`~pyjuice.layer.ExternalParamsSumLayer` that was given external tensors -- is NOT served here.
+:class:`~pyjuice.layer.ParameterizedSumLayer` that was given external tensors -- is NOT served here.
 It is handed to its own parameterization, which owns its kernel exactly as it owns the forward and
-the backward; see :func:`pyjuice.nodes.external_params.ExternalSumParams.sample_layer`.
+the backward; see :func:`pyjuice.parameterizations.SumParameterization.sample_layer`.
 """
 
 from __future__ import annotations

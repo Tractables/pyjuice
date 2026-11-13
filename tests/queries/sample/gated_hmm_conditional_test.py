@@ -28,7 +28,8 @@ import torch
 
 import pyjuice as juice
 import pyjuice.nodes.distributions as dists
-from pyjuice.nodes import inputs, multiply, summate, BlockScaleSumParams
+from pyjuice.nodes import inputs, multiply, summate
+from pyjuice.parameterizations import BlockScale
 from pyjuice.nodes.distributions import sort_soft_evidence_candidates
 
 
@@ -44,7 +45,7 @@ def _z_bar(num_cells):
 
 
 def _gate_shape(ns):
-    node_gate_size, ch_gate_size = ns.external_params.gate_sizes(ns)
+    node_gate_size, ch_gate_size = ns.parameterization.gate_sizes(ns)
     return ns.num_nodes // node_gate_size, ns.num_ch_nodes // ch_gate_size
 
 
@@ -65,7 +66,7 @@ def _assemble_theta(ns, num_states, block_size):
 
 def _gated_transition(ns, log_gate, num_states, block_size, device):
     """`A[j, i]` proportional to `phi[g(j, i)] * theta[j, i]`, row-normalised."""
-    gate_bs, gate_cbs = ns.external_params.gate_sizes(ns)
+    gate_bs, gate_cbs = ns.parameterization.gate_sizes(ns)
     theta = _assemble_theta(ns, num_states, block_size).to(device)
     row = torch.arange(num_states, device = device) // gate_bs
     col = torch.arange(num_states, device = device) // gate_cbs
@@ -94,8 +95,8 @@ def _build_chain(T, K, C, gate_bs, gate_cbs, seed = 0):
             emit = inputs(t, num_node_blocks = 1, dist = dists.SoftEvidenceCategorical(num_cats = C))
             emits.append(emit)
             chain = summate(multiply(chain, emit), num_node_blocks = 1,
-                            external_params = BlockScaleSumParams(block_size = gate_bs,
-                                                                  ch_block_size = gate_cbs))
+                            parameterization = BlockScale(block_size = gate_bs,
+                                                          ch_block_size = gate_cbs))
             transitions.append(chain)
         root = summate(multiply(chain), num_node_blocks = 1, block_size = 1)
 
@@ -192,8 +193,8 @@ def test_a_deep_gated_chain_under_soft_evidence_matches_the_exact_recursion():
             emit = inputs(t, num_node_blocks = 1, dist = dists.SoftEvidenceCategorical(num_cats = C))
             emits.append(emit)
             chain = summate(multiply(chain, emit), num_node_blocks = 1,
-                            external_params = BlockScaleSumParams(block_size = gate_bs,
-                                                                  ch_block_size = gate_cbs))
+                            parameterization = BlockScale(block_size = gate_bs,
+                                                          ch_block_size = gate_cbs))
             transitions.append(chain)
         root = summate(multiply(chain), num_node_blocks = 1, block_size = 1)
 
@@ -277,8 +278,8 @@ def test_a_multi_block_gated_transition_matches_its_exact_posterior():
     i1 = inputs(1, num_node_blocks = num_blocks, block_size = block_size,
                 dist = dists.SoftEvidenceCategorical(num_cats = C))
     gated = summate(multiply(i0, i1), num_node_blocks = num_blocks, block_size = block_size,
-                    external_params = BlockScaleSumParams(block_size = gate_bs,
-                                                          ch_block_size = gate_cbs))
+                    parameterization = BlockScale(block_size = gate_bs,
+                                                  ch_block_size = gate_cbs))
     root = summate(multiply(gated), num_node_blocks = 1, block_size = 1)
     root.init_parameters(perturbation = 3.0)
 
@@ -361,8 +362,8 @@ def test_top_k_soft_evidence_with_a_conditional_gated_draw():
         i0 = inputs(0, num_node_blocks = 1, dist = dists.SoftEvidenceCategorical(num_cats = C))
         i1 = inputs(1, num_node_blocks = 1, dist = dists.SoftEvidenceCategorical(num_cats = C))
         gated = summate(multiply(i0, i1), num_node_blocks = 1,
-                        external_params = BlockScaleSumParams(block_size = gate_bs,
-                                                              ch_block_size = gate_cbs))
+                        parameterization = BlockScale(block_size = gate_bs,
+                                                      ch_block_size = gate_cbs))
         root = summate(multiply(gated), num_node_blocks = 1, block_size = 1)
     root.init_parameters(perturbation = 3.0)
 
@@ -452,8 +453,8 @@ def test_a_ragged_gated_topology_matches_its_exact_posterior():
     edges = torch.tensor([[0, 0, 1, 1, 1, 2], [0, 2, 0, 1, 2, 1]], dtype = torch.long)
     gated = summate(multiply(i0, i1), edge_ids = edges, num_node_blocks = num_blocks,
                     block_size = block_size,
-                    external_params = BlockScaleSumParams(block_size = gate_bs,
-                                                          ch_block_size = gate_cbs))
+                    parameterization = BlockScale(block_size = gate_bs,
+                                                  ch_block_size = gate_cbs))
     root = summate(multiply(gated), num_node_blocks = 1, block_size = 1)
     root.init_parameters(perturbation = 3.0)
 

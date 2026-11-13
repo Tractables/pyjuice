@@ -6,7 +6,7 @@ circuit, make a gate tensor, draw unconditionally, draw conditionally on evidenc
 rules spelled out where they are easy to get wrong. The thorough tests live in `queries/sample/`;
 nothing here tries to be exhaustive.
 
-**What a `BlockScaleSumParams` node does.** An ordinary sum node weighs its edges by one parameter
+**What a `BlockScale` node does.** An ordinary sum node weighs its edges by one parameter
 vector shared across the batch. A gated one multiplies each edge by a per-sample factor:
 
     theta'[b, n, c]  proportional to  phi[b, g(n, c)] * theta[n, c]
@@ -27,7 +27,8 @@ import torch
 
 import pyjuice as juice
 import pyjuice.nodes.distributions as dists
-from pyjuice.nodes import inputs, multiply, summate, BlockScaleSumParams
+from pyjuice.nodes import inputs, multiply, summate
+from pyjuice.parameterizations import BlockScale
 
 
 cuda_only = pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs a GPU")
@@ -53,7 +54,7 @@ def _build_gated_hmm():
 
             # `external_params` is all that distinguishes this from a plain `summate`
             chain = summate(multiply(chain, emit), num_node_blocks = NUM_BLOCKS,
-                            external_params = BlockScaleSumParams(ch_block_size = BLOCK_SIZE))
+                            parameterization = BlockScale(ch_block_size = BLOCK_SIZE))
             transitions.append(chain)
 
         root = summate(multiply(chain), num_node_blocks = 1, block_size = 1)
@@ -64,7 +65,7 @@ def _build_gated_hmm():
 
 def _gate_shape(ns):
     """The `[num_node_gates, num_ch_gates]` this node expects, asked of the node itself."""
-    node_gate_size, ch_gate_size = ns.external_params.gate_sizes(ns)
+    node_gate_size, ch_gate_size = ns.parameterization.gate_sizes(ns)
     return ns.num_nodes // node_gate_size, ns.num_ch_nodes // ch_gate_size
 
 

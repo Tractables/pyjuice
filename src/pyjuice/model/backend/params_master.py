@@ -144,15 +144,17 @@ def _em_par_update_master_kernel(master, stored, param_flows, cum_pflows, nchs, 
     nflows = tl.load(cum_pflows + global_nid, mask = mask_m, other = 1)
     nch = tl.load(nchs + offs_m, mask = mask_m, other = 1)
 
+    # The update's denominator: the node's total (with `keep_zero_params`, its share of the pseudocount in it)
     if keep_zero_params:
-        new_param = (pflows + pseudocount / nch[:,None]) / nflows[:,None]
+        den = nflows[:,None]
     else:
-        new_param = (pflows + pseudocount / nch[:,None]) / (nflows[:,None] + pseudocount)
+        den = nflows[:,None] + pseudocount
+    new_param = (pflows + pseudocount / nch[:,None]) / den
 
+    # A node no flow reached, without a pseudocount (its total 0: 0 / 0), keeps its parameters
+    updated_params = tl.where(den == 0.0, old_param, (1.0 - step_size) * old_param + step_size * new_param)
     if keep_zero_params:
-        updated_params = tl.where(old_param == 0.0, 0.0, (1.0 - step_size) * old_param + step_size * new_param)
-    else:
-        updated_params = (1.0 - step_size) * old_param + step_size * new_param
+        updated_params = tl.where(old_param == 0.0, 0.0, updated_params)
 
     tl.store(master + offs_par, updated_params, mask = mask_pflow)
     tl.store(stored + offs_par, updated_params.to(stored.dtype.element_ty), mask = mask_pflow)

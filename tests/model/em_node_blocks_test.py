@@ -134,6 +134,55 @@ def test_every_form_is_the_update(cfg, dtype, kind, monkeypatch):
 
 
 @cuda_only
+@pytest.mark.parametrize("cfg", CFGS + [("per_block",)],
+                         ids = lambda c: c[0] if len(c) == 1 else f"{c[0]}{c[1]}x{c[2]}")
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16], ids = ["fp32", "bf16"])
+@pytest.mark.parametrize("kind", ["hclt", "hmm"])
+def test_a_node_no_flow_reached_keeps_its_parameters(cfg, dtype, kind, monkeypatch):
+    """At pseudocount 0 a node no flow reached has nothing to update from: its total is 0 and its update 0 / 0 (NaN,
+    before). Every form, and the per-block kernels, leave its parameters as they are -- to the bit, the master copy's
+    and the stored values --, at a full step and a partial one, with `keep_zero_params` and without; every other
+    node's update is the one it gets with those nodes' flows in place (a node's update is its own: the same bits
+    where the form has no atomics, the per-block kernels' totals added by atomics)."""
+    if cfg[0] != "per_block":
+        def form(nch_bucket, nodes_bucket, has_master):
+            if cfg[0] == "block":
+                return ("block", nodes_bucket, cfg[2]) if nodes_bucket is not None else ("split", em_blocks.BLOCK_N, 4)
+            return cfg if cfg[0] != "one" or nch_bucket is not None else ("split", em_blocks.BLOCK_N, 4)
+        monkeypatch.setattr(em_blocks, "_form", form)
+    path = "old" if cfg[0] == "per_block" else "new"
+    ns, V, C = _circuit(kind)
+    pc, flows = _state(ns, V, C, dtype)
+    ps, pfs, bsz, bint, gnid, _, _, _ = pc.par_update_kwargs
+    ar = torch.arange(32, device = DEV)
+    m = ar[None, :] < bsz[:, None]
+    pidx = (ps[:, None] + ar[None, :] * bint[:, None])[m]
+    fidx = (pfs[:, None] + ar[None, :] * bint[:, None])[m]
+    node = gnid[:, None].expand(-1, 32)[m]
+    dead = node % 5 == 2                                       # every fifth node, in blocks of every size
+    unreached = flows.clone()
+    unreached[fidx[dead]] = 0.0
+    assert any(n.block_size >= em_blocks.MIN_BLOCK_SIZE for n in pc.root_ns if n.is_sum())
+    init = pc.params.detach().clone()                          # (each update from these: not from one before it,
+    for step_size, kz in ((1.0, False), (0.25, False), (1.0, True), (0.25, True)):    # which its flows give again)
+        start = init.clone()
+        if kz:
+            r = torch.rand(start.shape, device = DEV)
+            start[r < 0.1] = 0.0                                   # (some in the nodes no flow reached as well)
+        got, cum = _run(pc, unreached, start, step_size, 0.0, kz, (), path)
+        full, _ = _run(pc, flows, start, step_size, 0.0, kz, (), path)
+        assert torch.isfinite(got).all(), (step_size, kz)
+        assert bool((cum[node[dead]] == 0).all())                  # (the case: their totals are 0)
+        assert torch.equal(got[pidx[dead]], start.double()[pidx[dead]]), (step_size, kz)
+        live = pidx[~dead]
+        assert not torch.equal(got[live], start.double()[live])    # (the others were updated)
+        if path == "new":
+            assert torch.equal(got[live], full[live]), (step_size, kz)
+        else:
+            assert torch.allclose(got[live], full[live], rtol = 1e-6, atol = 1e-12), (step_size, kz)
+
+
+@cuda_only
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16], ids = ["fp32", "bf16"])
 def test_the_form_is_the_shapes_not_a_timing(dtype, monkeypatch):
     """The forms sum in different orders, so which one runs must not depend on a measurement: two processes updating

@@ -1,5 +1,5 @@
 """
-Gated sum nodes (:class:`~pyjuice.nodes.external_params.BlockScaleSumParams`) under a constraint, their gates
+Gated sum nodes (:class:`~pyjuice.parameterizations.BlockScale`) under a constraint, their gates
 (``sum_external_params``) bound to a decoder session
 (:mod:`pyjuice.constraints.inference.dfa_exact.external_params`). Sample ``b``'s sum node ``n`` weighs child ``c`` by
 ``theta[n, c] phi_b[g(n, c)] / Z_b[n]``, so the truth is pyjuice's own gated forward: under the one-state constraint
@@ -17,7 +17,8 @@ import torch
 import pyjuice as juice
 import pyjuice.constraints as jc
 import pyjuice.nodes.distributions as dists
-from pyjuice.nodes import BlockScaleSumParams, LowRankSumParams, inputs, multiply, summate
+from pyjuice.nodes import inputs, multiply, summate
+from pyjuice.parameterizations import BlockScale, LowRank
 
 V = 3
 KINDS = {"hmm": 6, "hmm_untied": 6, "hmm_block_sparse": 6, "left_linear": 6, "pd": 6, "pd_prod_dominated": 6,
@@ -47,10 +48,10 @@ def make_gates(pc, B, seed = 0, scale = 2.0, nodes = None):
     g = torch.Generator().manual_seed(seed)
     out = {}
     for ns in (pc.external_params_nodes if nodes is None else nodes):
-        owner = ns.external_params.storage_owner(ns)
+        owner = ns.parameterization.storage_owner(ns)
         if owner in out:
             continue
-        shape = ns.external_params.tensor_shapes(owner, B)[0]
+        shape = ns.parameterization.tensor_shapes(owner, B)[0]
         out[owner] = (torch.randn(shape, generator = g) * scale).to(DEV)
     return out
 
@@ -287,8 +288,8 @@ def test_gates_far_from_the_values(node_gate, child_gate):
     shifts its children before their gates scale them loses them. pyjuice's gated forward is the truth: the marginals,
     and the conditionals as its log-softmax over the completions."""
     x = [inputs(v, num_node_blocks = 1, block_size = 32, dist = dists.Categorical(num_cats = V)) for v in range(2)]
-    gate = BlockScaleSumParams(block_size = None if node_gate == 32 else node_gate, ch_block_size = child_gate)
-    s = summate(multiply(x[0], x[1]), num_node_blocks = 1, block_size = 32, external_params = gate)
+    gate = BlockScale(block_size = None if node_gate == 32 else node_gate, ch_block_size = child_gate)
+    s = summate(multiply(x[0], x[1]), num_node_blocks = 1, block_size = 32, parameterization = gate)
     root = summate(multiply(s), num_node_blocks = 1, block_size = 1)
     torch.manual_seed(0)
     root.init_parameters(perturbation = 2.0)
@@ -299,7 +300,7 @@ def test_gates_far_from_the_values(node_gate, child_gate):
         xi._params = (p / p.sum(1, keepdim = True)).reshape(-1)
     pc = juice.compile(root, verbose = False).to(DEV)
     (ns,) = pc.external_params_nodes
-    lphi = torch.zeros(ns.external_params.tensor_shapes(ns, 2)[0])
+    lphi = torch.zeros(ns.parameterization.tensor_shapes(ns, 2)[0])
     lphi[..., 1::2] = 200.0
     lphi[1] += torch.randn(lphi.shape[1:], generator = torch.Generator().manual_seed(0)) * 5
     gates = {ns: lphi.to(DEV)}
@@ -332,11 +333,11 @@ def test_log_normalizers_against_float64(kind, child_gate, node_gate, build_pc, 
     for case in ("normal", "far", "deep"):
         gates = make_gates(pc, B, seed = 1)
         for ns in pc.external_params_nodes:
-            owner = ns.external_params.storage_owner(ns)
+            owner = ns.parameterization.storage_owner(ns)
             if case == "far":
                 gates[owner][:, :, 1::2] += 200.0
             elif case == "deep":                    # a gate its row's nodes have no edge in: 1000 nats up
-                ng, cg = ns.external_params.gate_sizes(ns)
+                ng, cg = ns.parameterization.gate_sizes(ns)
                 W = reference.sum_weights(pc, ns)
                 empty = (W.view(W.size(0), -1, cg) == 0).all(dim = 2)                   # [nodes, child gates]
                 for r in range(gates[owner].size(1)):
@@ -356,9 +357,9 @@ def check_normalizers(pc, layout, gates, reference, label):
     got = block_scale.log_normalizers(pc, layout, session)
     worst = 0.0
     for ns in session.nodes:
-        ng, cg = ns.external_params.gate_sizes(ns)
+        ng, cg = ns.parameterization.gate_sizes(ns)
         W = reference.sum_weights(pc, ns).double()
-        lphi = gates[ns.external_params.storage_owner(ns)].double()
+        lphi = gates[ns.parameterization.storage_owner(ns)].double()
         g = lphi[:, torch.arange(W.size(0), device = DEV) // ng][:, :, torch.arange(W.size(1), device = DEV) // cg]
         want = torch.logsumexp(torch.log(W)[None] + g, dim = 2)                            # [B, nodes]
         first = ns._output_ind_range[0]
@@ -382,8 +383,8 @@ def test_log_normalizers_across_the_exact_threshold(nats, build_pc, reference):
     layout = jc.compile(jc.DFA.anything(V), pc).backend.program().gate_cells
     gates, raised = make_gates(pc, 3, seed = 2), 0
     for ns in pc.external_params_nodes:
-        owner = ns.external_params.storage_owner(ns)
-        ng, cg = ns.external_params.gate_sizes(ns)
+        owner = ns.parameterization.storage_owner(ns)
+        ng, cg = ns.parameterization.gate_sizes(ns)
         W = reference.sum_weights(pc, ns)
         empty = (W.view(W.size(0), -1, cg) == 0).all(dim = 2)                               # [nodes, child gates]
         for r in range(gates[owner].size(1)):
@@ -402,10 +403,10 @@ def test_children_in_another_order(reference):
     marginals and conditionals."""
     x = [inputs(v, num_node_blocks = 1, block_size = 2, dist = dists.Categorical(num_cats = V)) for v in range(3)]
     pA, pB = multiply(x[0], x[1]), multiply(x[0], x[1])
-    gate = lambda: BlockScaleSumParams(ch_block_size = 1)
-    s1 = summate(pA, pB, num_node_blocks = 1, block_size = 2, external_params = gate())
+    gate = lambda: BlockScale(ch_block_size = 1)
+    s1 = summate(pA, pB, num_node_blocks = 1, block_size = 2, parameterization = gate())
     s2 = summate(pB, pA, num_node_blocks = 1, block_size = 2, edge_ids = torch.tensor([[0, 0], [1, 0]]),
-                 external_params = gate())
+                 parameterization = gate())
     root = summate(multiply(s1, x[2]), multiply(s2, x[2]), num_node_blocks = 1, block_size = 1)
     torch.manual_seed(0)
     root.init_parameters(perturbation = 4.0)
@@ -472,7 +473,7 @@ def test_some_layers_gated(build_pc, reference):
     pc = build_pc(kind, n, V, perturbation = 4.0,
                   gates = dict(child_gate = CHILD_GATES["fine"], which = lambda ns: len(ns.scope) >= 2))
     gated_layers = [layer for lg in pc.inner_layer_groups if lg.is_sum() for layer in lg.layers
-                    if getattr(layer, "external_params", None) is not None]
+                    if getattr(layer, "parameterization", None) is not None]
     assert len(gated_layers) > 1
     some = make_gates(pc, 3, nodes = [ns for layer in gated_layers[::2] for ns in layer.nodes])
     data, m = evidence(n, 3, seed = 4)
@@ -561,7 +562,7 @@ def test_gates_checked_and_refused(build_pc):
     with pytest.raises(ValueError, match = "no external parameters"):
         jc.compile(CONSTRAINTS["contains"](), plain).decoder(sum_external_params = {next(iter(plain.root_ns.chs)): gates[ns]})
     layer = next(layer for lg in pc.inner_layer_groups if lg.is_sum() for layer in lg.layers
-                 if getattr(layer, "external_params", None) is not None and len(layer.nodes) > 1)
+                 if getattr(layer, "parameterization", None) is not None and len(layer.nodes) > 1)
     with pytest.raises(NotImplementedError, match = "all or none"):
         cc.decoder(sum_external_params = {k: v for k, v in gates.items() if k is not layer.nodes[0]})
     with cc.decoder(sum_external_params = gates) as decoder:
@@ -577,7 +578,7 @@ def test_unsupported_gates_refused_at_compile():
     """LowRank sums cannot be compiled under a constraint."""
     x = [inputs(v, num_node_blocks = 2, block_size = 4, dist = dists.Categorical(num_cats = V)) for v in range(2)]
     root = summate(multiply(x[0], x[1]), num_node_blocks = 2, block_size = 4,
-                   external_params = LowRankSumParams(rank = 2))
+                   parameterization = LowRank(rank = 2))
     root = summate(multiply(root), num_node_blocks = 1, block_size = 1)
     root.init_parameters()
     pc = juice.compile(root, verbose = False).to(DEV)

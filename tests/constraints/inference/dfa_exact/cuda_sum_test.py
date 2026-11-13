@@ -66,7 +66,7 @@ def inputs(pc, B: int, external: str, seed = 0, n = N):
     kw = dict(categorical_evidence_logp = torch.log_softmax(torch.randn(B, n, V, generator = g) * 2, dim = -1).to(DEV))
     if external != "none":
         rows = 1 if external == "shared" else B
-        shape = lambda s: s.external_params.tensor_shapes(s, rows)[0]
+        shape = lambda s: s.parameterization.tensor_shapes(s, rows)[0]
         kw["sum_external_params"] = {s: (torch.randn(shape(s), generator = g) * 2).to(DEV)
                                      for s in pc.external_params_nodes}
     return kw

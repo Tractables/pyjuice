@@ -171,18 +171,18 @@ def test_a_replayed_pass_still_reaches_every_variable():
 # ------------------------------------------------------------------ what a capture bakes in
 
 def _gated_circuit():
-    from pyjuice.nodes import BlockScaleSumParams
+    from pyjuice.parameterizations import BlockScale
 
     with juice.set_block_size(2):
         i = [inputs(v, num_node_blocks = 3, dist = dists.Categorical(num_cats = 5)) for v in range(2)]
         gated = summate(multiply(i[0], i[1]), num_node_blocks = 2,
-                        external_params = BlockScaleSumParams(ch_block_size = 1))
+                        parameterization = BlockScale(ch_block_size = 1))
         root = summate(multiply(gated), num_node_blocks = 1, block_size = 1)
     root.init_parameters(perturbation = 2.0)
 
     pc = juice.compile(root, verbose = False).to(torch.device("cuda:0"))
-    num_node_gates = gated.num_nodes // gated.external_params.gate_sizes(gated)[0]
-    num_ch_gates = gated.num_ch_nodes // gated.external_params.gate_sizes(gated)[1]
+    num_node_gates = gated.num_nodes // gated.parameterization.gate_sizes(gated)[0]
+    num_ch_gates = gated.num_ch_nodes // gated.parameterization.gate_sizes(gated)[1]
     return pc, gated, (num_node_gates, num_ch_gates)
 
 

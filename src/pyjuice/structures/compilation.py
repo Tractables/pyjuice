@@ -18,7 +18,7 @@ def BayesianTreeToHiddenRegionGraph(tree: nx.Graph,
                                     block_size: Optional[int] = None,
                                     tie_input_params: bool = False,
                                     sum_edge_ids_constructor: Optional[Callable] = None,
-                                    external_params = None) -> CircuitNodes:
+                                    parameterization = None) -> CircuitNodes:
     """
     Given a Tree Bayesian Network tree T1 (i.e. at most one parents), 
     
@@ -96,11 +96,11 @@ def BayesianTreeToHiddenRegionGraph(tree: nx.Graph,
                     else:
                         r = summate(rp, num_node_blocks = num_root_ns // block_size, block_size = block_size, sum_edge_ids_constructor = sum_edge_ids_constructor)
                 else:
-                    # `external_params`, when given, applies to the INNER sum nodes -- the root is left
+                    # `parameterization`, when given, applies to the INNER sum nodes -- the root is left
                     # alone because it is a single node of block size 1, a different shape entirely
                     r = summate(rp, num_node_blocks = num_node_blocks,
                                 sum_edge_ids_constructor = sum_edge_ids_constructor,
-                                external_params = external_params)
+                                parameterization = parameterization)
 
                 var2rnode[v] = r
 

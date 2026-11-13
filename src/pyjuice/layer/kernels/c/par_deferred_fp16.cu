@@ -1,5 +1,5 @@
 // A tied group's parameter flows, deferred to one contraction (`pyjuice.layer.deferred_par`): a regular sum layer's,
-// or a `BlockScaleSumParams` layer's with its gates (`gated`: log phi from the gate table and `ext`; a regular layer's
+// or a `BlockScale` layer's with its gates (`gated`: log phi from the gate table and `ext`; a regular layer's
 // log phi is 0 and the two are unread) -- with fp16 operands: the contraction of the TF32-operand kernels it replaced
 // (fp32 slots, mma m16n8k8 TF32; until 4f535bfd), its operands at half the bytes and its MMAs at twice the rate. The
 // capture and the flush:
@@ -30,7 +30,8 @@
 // 744 -> 532 (the flows' read-add-write alone 460 at the DRAM's rate). The training step: HMM-4096 B 128 -3.9%,
 // B 512 -11.3%, HMM-8192 B 64 -4.0%.
 //
-// Scope (the Python side checks it): blk % 64 == 0, num_edges % 64 == 0, a slot's columns W % 32 == 0 and <= 512.
+// Scope (the Python side checks it): blk % 64 == 0 (the capture here; the flush's tiles: blk % 32 == 0, a group of node
+// blocks' rows in whole node blocks or within one), num_edges % 64 == 0, a slot's columns W % 32 == 0 and <= 512.
 
 #include <torch/extension.h>
 #include "param_load.cuh"                                   // `param_ptr<TP>`, `ParamLoad<TP>`: the stored dtype
@@ -210,14 +211,20 @@ template <int BM, int BN, int BK, int WM, int WN, int ST, int EC, int MINB, bool
 __global__ void __launch_bounds__(WM * WN * 32, MINB) flush_kernel(
         float* __restrict__ pf, const __half* __restrict__ A, const __half* __restrict__ Bop,
         const float* __restrict__ fA, const float* __restrict__ fB, const long* __restrict__ pfids,
-        const long* __restrict__ pids, const TP* __restrict__ params, int blk, int ne, long Ks, int W, int S,
-        int slots) {
+        const long* __restrict__ pids, const TP* __restrict__ params, int blk, int G, int lgb, int ne, long Ks, int W,
+        int S, int slots) {
     constexpr int NT = WM * WN * 32;
-    const int e0 = blockIdx.x * BN, n0 = blockIdx.y * BM, nb = blockIdx.z, tid = threadIdx.x;
-    const __half* gA = A + ((long)nb * blk + n0) * Ks;
-    const __half* gB = Bop + ((long)nb * ne + e0) * Ks;
-    const long* pfb = pfids + (long)nb * ne + e0;
-    const long* pib = pids + (long)nb * ne + e0;
+    // program (edge tile, row tile, g): group g's G node blocks share one operand of their children (G = 1: a node
+    // block's own), its G blk rows the tile's; a tile within one node block (BM <= blk) or of whole ones (BM > blk,
+    // blk a power of two: 1 << lgb)
+    const int e0 = blockIdx.x * BN, n0 = blockIdx.y * BM, g = blockIdx.z, tid = threadIdx.x;
+    const __half* gA = A + ((long)g * G * blk + n0) * Ks;
+    const __half* gB = Bop + ((long)g * ne + e0) * Ks;
+    const long nbt = (long)g * G + n0 / blk;              // the tile's first node block, and its first node there
+    const int nt0 = n0 % blk, run = BM <= blk ? BM : blk, nrun = BM / run;
+    // a tile row's node block and node
+    auto rnb = [&](int r) -> long { return BM <= blk ? nbt : nbt + (r >> lgb); };
+    auto rnd = [&](int r) -> int { return BM <= blk ? nt0 + r : r & (blk - 1); };
 
     auto sAl = tile_to_shape(typename AtomK<BK>::L{}, make_shape(Int<BM>{}, Int<BK>{}));
     auto sBl = tile_to_shape(typename AtomK<BK>::L{}, make_shape(Int<BN>{}, Int<BK>{}));
@@ -285,10 +292,11 @@ __global__ void __launch_bounds__(WM * WN * 32, MINB) flush_kernel(
     if constexpr (BULK) {
         // theta's runs into L2 while the main loop runs (the bulk adds read no flows here): per edge a line every 128
         // bytes of its BM parameters, and their last byte
-        constexpr int PL = (BM * (int)sizeof(TP) + 127) / 128 + 1;
-        for (int i = tid; i < BN * PL; i += NT) {
-            const int e = i / PL, j = i % PL;
-            const char* p = (const char*)(params + pib[e] + n0) + min(j * 128, BM * (int)sizeof(TP) - 1);
+        const int PL = (run * (int)sizeof(TP) + 127) / 128 + 1;
+        for (int i = tid; i < BN * nrun * PL; i += NT) {
+            const int e = i / (nrun * PL), k = (i / PL) % nrun, j = i % PL;
+            const char* p = (const char*)(params + pids[(rnb(k * run)) * ne + e0 + e] + rnd(k * run)) +
+                            min(j * 128, run * (int)sizeof(TP) - 1);
             asm volatile("prefetch.global.L2 [%0];" ::"l"(p));
         }
     }
@@ -312,12 +320,14 @@ __global__ void __launch_bounds__(WM * WN * 32, MINB) flush_kernel(
     };
     int kt = 0;
     for (int slot = 0; slot < slots; slot++) {
-        const float* ra = fA + ((long)nb * S + slot) * blk + n0;   // (loaded now, used at the slot's end)
-        const float* rb = fB + ((long)nb * S + slot) * ne + e0;
+        const float* rb = fB + ((long)g * S + slot) * ne + e0;    // (loaded now, used at the slot's end)
         CUTE_UNROLL
         for (int m = 0; m < MM; m++)
             CUTE_UNROLL
-            for (int h = 0; h < 2; h++) rs[h][m] = ra[get<0>(tCcC(make_coord(0, h), m, 0))];
+            for (int h = 0; h < 2; h++) {
+                const int r = get<0>(tCcC(make_coord(0, h), m, 0));
+                rs[h][m] = fA[(rnb(r) * S + slot) * blk + rnd(r)];
+            }
         CUTE_UNROLL
         for (int n = 0; n < MN; n++)
             CUTE_UNROLL
@@ -356,7 +366,7 @@ __global__ void __launch_bounds__(WM * WN * 32, MINB) flush_kernel(
         float* sCc = sC + ((ec / EC) % NBUF) * EC * LS;
         if constexpr (BULK) {
             if (ec / EC >= NBUF) {                        // the buffer's earlier chunk read by its bulk copies
-                if (tid < EC) asm volatile("cp.async.bulk.wait_group.read %0;" ::"n"(NBUF - 1) : "memory");
+                if (tid < EC * nrun) asm volatile("cp.async.bulk.wait_group.read %0;" ::"n"(NBUF - 1) : "memory");
                 __syncthreads();
             }
         } else if (ec > 0) {
@@ -374,44 +384,50 @@ __global__ void __launch_bounds__(WM * WN * 32, MINB) flush_kernel(
             CUTE_UNROLL
             for (int u = 0; u < SUB; u++) {
                 const int idx = tid + (u0 + u) * NT, e = idx / BM, n = idx % BM;
-                tv[u] = ParamLoad<TP>::at(params + pib[ec + e] + n0 + n);
-                if constexpr (!BULK) pv[u] = pf[pfb[ec + e] + n0 + n];
+                const long q = rnb(n) * ne + e0 + ec + e;
+                tv[u] = ParamLoad<TP>::at(params + pids[q] + rnd(n));
+                if constexpr (!BULK) pv[u] = pf[pfids[q] + rnd(n)];
             }
             CUTE_UNROLL
             for (int u = 0; u < SUB; u++) {
                 const int idx = tid + (u0 + u) * NT, e = idx / BM, n = idx % BM;
                 if constexpr (BULK) sCc[e * LS + n] *= tv[u];
-                else pf[pfb[ec + e] + n0 + n] = pv[u] + tv[u] * sCc[e * LS + n];
+                else pf[pfids[rnb(n) * ne + e0 + ec + e] + rnd(n)] = pv[u] + tv[u] * sCc[e * LS + n];
             }
         }
         if constexpr (BULK) {
             asm volatile("fence.proxy.async.shared::cta;" ::: "memory");   // the writes, seen by the bulk copies
             __syncthreads();
-            if (tid < EC) {
-                const uint32_t src = (uint32_t)__cvta_generic_to_shared(sCc + tid * LS);
-                float* dst = pf + pfb[ec + tid] + n0;
-                asm volatile("cp.reduce.async.bulk.global.shared::cta.bulk_group.add.f32 [%0], [%1], %2;"
-                             ::"l"(dst), "r"(src), "n"(BM * 4) : "memory");
+            if (tid < EC * nrun) {
+                for (int i = tid; i < EC * nrun; i += NT) {   // (an edge's runs: one a node block in the tile)
+                    const int e = i / nrun, k = i % nrun;
+                    const uint32_t src = (uint32_t)__cvta_generic_to_shared(sCc + e * LS + k * run);
+                    float* dst = pf + pfids[rnb(k * run) * ne + e0 + ec + e] + rnd(k * run);
+                    asm volatile("cp.reduce.async.bulk.global.shared::cta.bulk_group.add.f32 [%0], [%1], %2;"
+                                 ::"l"(dst), "r"(src), "r"(run * 4) : "memory");
+                }
                 asm volatile("cp.async.bulk.commit_group;" ::: "memory");
             }
         }
     }
     if constexpr (BULK) {
-        if (tid < EC) asm volatile("cp.async.bulk.wait_group.read 0;" ::: "memory");   // (before the CTA's exit)
+        if (tid < EC * nrun) asm volatile("cp.async.bulk.wait_group.read 0;" ::: "memory");   // (before the exit)
     }
 }
 
 // id -> {BM, BN, BK, WM, WN, ST, EC, min CTAs an SM}: 128 x 128 (8 and 16 warps), and narrower tiles for node blocks
-// or edge counts not a multiple of 128 (also more CTAs for small grids)
+// or edge counts not a multiple of 128 (also more CTAs for small grids); 32-row tiles for node blocks of 32 that are
+// each their own operand group (a gated layer's)
 #define FLUSH_CFGS(X)                                                                  \
     X(0, 128, 128, 64, 2, 4, 3, 64, 1) X(1, 128, 128, 64, 4, 4, 3, 64, 1)             \
     X(2, 128, 64, 32, 2, 2, 3, 64, 2) X(3, 64, 128, 32, 2, 2, 3, 64, 2)               \
-    X(4, 64, 64, 32, 2, 2, 3, 64, 2)
+    X(4, 64, 64, 32, 2, 2, 3, 64, 2) X(5, 32, 128, 64, 2, 4, 3, 64, 2)                \
+    X(6, 32, 64, 32, 2, 2, 3, 64, 2)
 
 template <int BM, int BN, int BK, int WM, int WN, int ST, int EC, int MINB, bool BULK, typename TP>
 static void launch_flush(float* pf, const __half* A, const __half* Bop, const float* fA, const float* fB,
-                         const long* pfids, const long* pids, const TP* params, int nbk, int blk, int ne, long Ks,
-                         int W, int S, int slots, cudaStream_t st) {
+                         const long* pfids, const long* pids, const TP* params, int nbk, int ng, int blk, int ne,
+                         long Ks, int W, int S, int slots, cudaStream_t st) {
     constexpr int smem = ST * (BM + BN) * BK * 2;
     static_assert(smem <= 101376, "shared memory");
     auto k = flush_kernel<BM, BN, BK, WM, WN, ST, EC, MINB, BULK, TP>;
@@ -422,9 +438,11 @@ static void launch_flush(float* pf, const __half* A, const __half* Bop, const fl
         C10_CUDA_CHECK(cudaFuncSetAttribute(k, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
         if (dev < 64) set[dev] = true;
     }
-    TORCH_CHECK(blk % BM == 0 && ne % BN == 0 && W % BK == 0, "the flush's tile");
-    dim3 grid(ne / BN, blk / BM, nbk);
-    k<<<grid, WM * WN * 32, smem, st>>>(pf, A, Bop, fA, fB, pfids, pids, params, blk, ne, Ks, W, S, slots);
+    const int G = nbk / ng, lgb = 31 - __builtin_clz((unsigned)blk);
+    TORCH_CHECK(nbk % ng == 0 && ((long)G * blk) % BM == 0 && ne % BN == 0 && W % BK == 0 &&
+                (BM <= blk ? blk % BM == 0 : (blk & (blk - 1)) == 0), "the flush's tile");
+    dim3 grid(ne / BN, G * blk / BM, ng);
+    k<<<grid, WM * WN * 32, smem, st>>>(pf, A, Bop, fA, fB, pfids, pids, params, blk, G, lgb, ne, Ks, W, S, slots);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
@@ -448,7 +466,8 @@ void capture(torch::Tensor A, torch::Tensor Bop, torch::Tensor fA, torch::Tensor
     const int W = (int)(Ks / S), Mp = (int)M.size(1), cps = Mp / W;
     TORCH_CHECK(A.scalar_type() == torch::kHalf && Bop.scalar_type() == torch::kHalf && M.scalar_type() == torch::kInt32 &&
                 Ks % S == 0 && W % 32 == 0 && W <= 512 && Mp % W == 0 && Mp >= batch && slot0 + cps <= S &&
-                blk % 64 == 0 && ne % 64 == 0, "capture: the slot layout");
+                blk % 64 == 0 && ne % 64 == 0 && Bop.size(0) == nbk && fB.size(0) == nbk,
+                "capture: the slot layout (each node block its own operand)");
     cudaStream_t st = c10::cuda::getCurrentCUDAStream();
     C10_CUDA_CHECK(cudaMemsetAsync(M.data_ptr(), 0, M.numel() * 4, st));
     auto* Mord = reinterpret_cast<unsigned*>(M.data_ptr());
@@ -484,17 +503,20 @@ void capture(torch::Tensor A, torch::Tensor Bop, torch::Tensor fA, torch::Tensor
 // (pfids % 4 == 0, the caller checks) -- the L2's adds
 void flush(torch::Tensor pf, torch::Tensor A, torch::Tensor Bop, torch::Tensor fA, torch::Tensor fB, torch::Tensor pfids,
            torch::Tensor pids, torch::Tensor params, int64_t slots, int64_t cfg, bool bulk) {
-    const int nbk = (int)A.size(0), blk = (int)A.size(1), ne = (int)Bop.size(1), S = (int)fA.size(1);
+    const int nbk = (int)A.size(0), blk = (int)A.size(1), ng = (int)Bop.size(0), ne = (int)Bop.size(1),
+              S = (int)fA.size(1);
     const long Ks = A.size(2);
     const int W = (int)(Ks / S);
     TORCH_CHECK(slots >= 1 && slots <= S && (!bulk || reinterpret_cast<uintptr_t>(pf.data_ptr()) % 16 == 0),
                 "flush: the slots, the flows' alignment");
+    TORCH_CHECK(ng >= 1 && nbk % ng == 0 && fB.size(0) == ng && fA.size(0) == nbk,
+                "flush: the operand groups (Bop, fB: one a group of node blocks)");
     cudaStream_t st = c10::cuda::getCurrentCUDAStream();
     const __half* a = reinterpret_cast<const __half*>(A.data_ptr<at::Half>());
     const __half* b = reinterpret_cast<const __half*>(Bop.data_ptr<at::Half>());
     const bool bf = params.scalar_type() == torch::kBFloat16;
 #define ARGS(TP) pf.data_ptr<float>(), a, b, fA.data_ptr<float>(), fB.data_ptr<float>(), pfids.data_ptr<long>(),        \
-                 pids.data_ptr<long>(), param_ptr<TP>(params), nbk, blk, ne, Ks, W, S, (int)slots, st
+                 pids.data_ptr<long>(), param_ptr<TP>(params), nbk, ng, blk, ne, Ks, W, S, (int)slots, st
 #define X(id, bm, bn, bk, wm, wn, st_, ec, minb)                                                                       \
     case id:                                                                                                           \
         if (bf) {                                                                                                      \

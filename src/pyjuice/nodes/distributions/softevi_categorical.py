@@ -388,11 +388,11 @@ class SoftEvidenceCategorical(_KernelsMixin, Distribution):
             param = tl.load(params_ptr + s_pids + cat_id, mask = cat_mask, other = 0)
             flow = tl.load(param_flows_ptr + s_pfids + cat_id, mask = cat_mask, other = 0)
 
+            new_param = (1.0 - step_size) * param + step_size * (flow + numerate_pseudocount) / cum_flow
+            # A node no flow reached, without a pseudocount (`cum_flow` 0: 0 / 0), keeps its parameters
+            new_param = tl.where(cum_flow == 0.0, param, new_param)
             if keep_zero_params:
-                new_param = (1.0 - step_size) * param + step_size * (flow + numerate_pseudocount) / cum_flow
                 new_param = tl.where(param == 0.0, 0.0, new_param)
-            else:
-                new_param = (1.0 - step_size) * param + step_size * (flow + numerate_pseudocount) / cum_flow
 
             tl.store(params_ptr + s_pids + cat_id, new_param, mask = cat_mask)
 
@@ -432,11 +432,11 @@ class SoftEvidenceCategorical(_KernelsMixin, Distribution):
             param = tl.load(params_ptr + s_pids[:,None] + cat_ids[None,:], mask = cat_mask, other = 0)
             flow = tl.load(param_flows_ptr + s_pfids[:,None] + cat_ids[None,:], mask = cat_mask, other = 0)
 
+            new_param = (1.0 - step_size) * param + step_size * (flow + numerate_pseudocount[:,None]) / cum_flow[:,None]
+            # A node no flow reached, without a pseudocount (`cum_flow` 0: 0 / 0), keeps its parameters
+            new_param = tl.where(cum_flow[:,None] == 0.0, param, new_param)
             if keep_zero_params:
-                new_param = (1.0 - step_size) * param + step_size * (flow + numerate_pseudocount[:,None]) / cum_flow[:,None]
                 new_param = tl.where(param == 0.0, 0.0, new_param)
-            else:
-                new_param = (1.0 - step_size) * param + step_size * (flow + numerate_pseudocount[:,None]) / cum_flow[:,None]
             tl.store(params_ptr + s_pids[:,None] + cat_ids[None,:], new_param, mask = cat_mask)
 
             cat_ids += 128
@@ -466,6 +466,9 @@ class SoftEvidenceCategorical(_KernelsMixin, Distribution):
             # of beta) so they can't underflow, and reduces exactly to (F+ + pc/K)/(sum F+ + pc) when
             # p_theta is uniform (F- = beta*Gamma).
             flow = param * (flow_num + numerate_pseudocount) / (flow_denom + pseudocount * param)
+            # A category no flow reached, without a pseudocount (0 / 0), keeps its parameter: a ratio of 1
+            flow = tl.where((param * (flow_num + numerate_pseudocount) == 0.0)
+                            & (flow_denom + pseudocount * param == 0.0), param, flow)
             # Padding lanes (cat_id >= num_cats) load param/flows as 0 => 0/0 = NaN; zero them out.
             flow = tl.where(cat_mask, flow, 0.0)
 
@@ -485,6 +488,10 @@ class SoftEvidenceCategorical(_KernelsMixin, Distribution):
             flow_denom = tl.load(param_flows_ptr + s_pfids + num_cats + cat_id, mask = cat_mask, other = 0)
 
             new_param = param * ((1.0 - step_size) + step_size * (flow_num + numerate_pseudocount) / (flow_denom + pseudocount * param)) / cum_flow
+            # (a ratio of 1 where it is 0 / 0, as in the normalizer's pass)
+            new_param = tl.where((param * (flow_num + numerate_pseudocount) == 0.0)
+                                 & (flow_denom + pseudocount * param == 0.0),
+                                 param * ((1.0 - step_size) + step_size) / cum_flow, new_param)
 
             # Numerical guard: the MAP denominator self-floors only when F- is computed fresh from
             # the current beta. Under flow momentum, a stale (larger) F- is divided against a fast-
@@ -519,6 +526,9 @@ class SoftEvidenceCategorical(_KernelsMixin, Distribution):
 
             # MAP M-step (Dirichlet prior): denominator F- + pseudocount*beta (see small_ncats variant).
             flow = param * (flow_num + numerate_pseudocount[:,None]) / (flow_denom + pseudocount * param)
+            # A category no flow reached, without a pseudocount (0 / 0), keeps its parameter: a ratio of 1
+            flow = tl.where((param * (flow_num + numerate_pseudocount[:,None]) == 0.0)
+                            & (flow_denom + pseudocount * param == 0.0), param, flow)
             # Padding lanes (cat_id >= num_cats) load param/flows as 0 => 0/0 = NaN; zero them out.
             flow = tl.where(cat_mask, flow, 0.0)
 
@@ -541,6 +551,10 @@ class SoftEvidenceCategorical(_KernelsMixin, Distribution):
             flow_denom = tl.load(param_flows_ptr + s_pfids[:,None] + num_cats[:,None] + cat_ids[None,:], mask = cat_mask, other = 0)
 
             new_param = param * ((1.0 - step_size) + step_size * (flow_num + numerate_pseudocount[:,None]) / (flow_denom + pseudocount * param)) / cum_flow[:,None]
+            # (a ratio of 1 where it is 0 / 0, as in the normalizer's pass)
+            new_param = tl.where((param * (flow_num + numerate_pseudocount[:,None]) == 0.0)
+                                 & (flow_denom + pseudocount * param == 0.0),
+                                 param * ((1.0 - step_size) + step_size) / cum_flow[:,None], new_param)
 
             # Numerical guard against momentum-induced underflow (see small_ncats variant).
             new_param = tl.maximum(new_param, 1e-30)

@@ -177,7 +177,8 @@ void capture_fused(torch::Tensor A, torch::Tensor Bop, torch::Tensor fA, torch::
     const int W = (int)(Ks / S), Mp = (int)M.size(1), cps = Mp / W;
     TORCH_CHECK(A.scalar_type() == torch::kHalf && Bop.scalar_type() == torch::kHalf && M.scalar_type() == torch::kInt32 &&
                 Ks % S == 0 && W % 32 == 0 && W <= 512 && Mp % W == 0 && Mp >= batch && slot0 + cps <= S &&
-                blk % 64 == 0 && ne % 64 == 0, "capture: the slot layout");
+                blk % 64 == 0 && ne % 64 == 0 && Bop.size(0) == A.size(0) && fB.size(0) == A.size(0),
+                "capture: the slot layout (each node block its own operand)");
     TORCH_CHECK(ctab.scalar_type() == torch::kInt32 && ctab.is_contiguous() && ctab.dim() == 2 && ctab.size(1) == 2,
                 "capture fused: ctab int32 [rows, 2]");
     cudaStream_t st = c10::cuda::getCurrentCUDAStream();

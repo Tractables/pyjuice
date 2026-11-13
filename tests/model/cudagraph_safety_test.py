@@ -137,12 +137,12 @@ def test_an_option_new_on_every_call_stops_recording():
 
 def _gated_pc(device, kind):
     """One external-parameter sum layer over a product of two inputs: `kind` is "blockscale" or "lowrank"."""
-    from pyjuice.nodes import BlockScaleSumParams, LowRankSumParams
+    from pyjuice.parameterizations import BlockScale, LowRank
     torch.manual_seed(0)
     with juice.set_block_size(32):
         ni = [inputs(v, num_node_blocks = 2, dist = dists.Categorical(num_cats = 6)) for v in range(2)]
-        ext = BlockScaleSumParams(ch_block_size = 16) if kind == "blockscale" else LowRankSumParams(rank = 4)
-        ns = summate(multiply(*ni), num_node_blocks = 2, external_params = ext)
+        ext = BlockScale(ch_block_size = 16) if kind == "blockscale" else LowRank(rank = 4)
+        ns = summate(multiply(*ni), num_node_blocks = 2, parameterization = ext)
         root = summate(multiply(ns), num_node_blocks = 1, block_size = 1)
     root.init_parameters(perturbation = 2.0)
     return juice.compile(root, verbose = False).to(device), ns
@@ -151,7 +151,7 @@ def _gated_pc(device, kind):
 def _gated_inputs(ns, batch, device, seed):
     g = torch.Generator(device = device).manual_seed(seed)
     data = torch.randint(0, 6, [batch, 2], device = device, generator = g)
-    shapes = ns.external_params.tensor_shapes(ns, batch)
+    shapes = ns.parameterization.tensor_shapes(ns, batch)
     tensors = tuple(torch.randn(s, device = device, generator = g) * 0.5 - 0.5 for s in shapes)
     return data, {ns: tensors if len(tensors) > 1 else tensors[0]}
 
@@ -161,10 +161,6 @@ def test_a_replayed_forward_hands_its_own_state_to_the_backward(kind):
     """The gated forward leaves its `log Z` on the layer for the backward. A replay runs no Python, so after
     forwards at batch 32 and 16 a replayed batch-32 forward left batch 16's state for the next backward;
     the circuit now restores what the recording left."""
-    if kind == "lowrank":
-        from pyjuice.nodes.external_params.kernels.c import is_available
-        if not is_available():
-            pytest.skip("the low-rank backward needs the CUDA extension")
     device = torch.device("cuda:0")
     pc, ns = _gated_pc(device, kind)
     (xa, ea), (xb, eb) = _gated_inputs(ns, 32, device, 1), _gated_inputs(ns, 16, device, 2)
@@ -195,7 +191,7 @@ def test_a_graph_keeps_what_it_baked_in_alive(monkeypatch):
     graph recorded with a plan bakes those buffers in; once evicted, a replay would write into memory since
     handed to something else. The graph holds a reference to everything the inner layers owned when it was
     captured, so the buffer stays alive exactly as long as the graph does."""
-    import pyjuice.nodes.external_params.blockscale.forward as bs_forward
+    import pyjuice.parameterizations.blockscale.forward as bs_forward
     monkeypatch.setattr(bs_forward, "_FW_PLAN_CACHE", 1)
     device = torch.device("cuda:0")
     pc, ns = _gated_pc(device, "blockscale")
@@ -252,9 +248,9 @@ def test_inner_layers_never_read_an_input_only_kwarg():
     assert "categorical_evidence_logp" in names
 
     src = pathlib.Path(juice.__file__).parent
-    files = [src / "layer" / f for f in ("sum_layer.py", "prod_layer.py", "external_sum_layer.py",
+    files = [src / "layer" / f for f in ("sum_layer.py", "prod_layer.py", "parameterized_sum_layer.py",
                                          "layer.py", "layer_group.py")]
-    files += sorted((src / "layer" / "kernels").rglob("*.py")) + sorted((src / "nodes" / "external_params").rglob("*.py"))
+    files += sorted((src / "layer" / "kernels").rglob("*.py")) + sorted((src / "parameterizations").rglob("*.py"))
 
     found = []
     for f in files:
@@ -400,16 +396,16 @@ def test_another_threads_cuda_calls_do_not_break_a_capture():
 def test_a_parameterization_must_declare_itself_graph_safe():
     """A replay runs none of an external parameterization's Python, so one that does not set
     `cuda_graph_safe = True` keeps its circuit eager, with a warning when graphs were asked for."""
-    from pyjuice.nodes import BlockScaleSumParams
+    from pyjuice.parameterizations import BlockScale
 
-    class Undeclared(BlockScaleSumParams):
+    class Undeclared(BlockScale):
         cuda_graph_safe = False
 
     device = torch.device("cuda:0")
     torch.manual_seed(0)
     with juice.set_block_size(32):
         ni = [inputs(v, num_node_blocks = 2, dist = dists.Categorical(num_cats = 6)) for v in range(2)]
-        ns = summate(multiply(*ni), num_node_blocks = 2, external_params = Undeclared(ch_block_size = 16))
+        ns = summate(multiply(*ni), num_node_blocks = 2, parameterization = Undeclared(ch_block_size = 16))
         root = summate(multiply(ns), num_node_blocks = 1, block_size = 1)
     root.init_parameters(perturbation = 2.0)
     pc = juice.compile(root, verbose = False).to(device)
@@ -427,14 +423,14 @@ def test_a_node_axis_gate_is_captured():
     """BlockScale with several gates per node block reads a per-row stride table, whose cache key used to
     read two values back from the device on every call -- a host sync, so these passes could never be
     captured. A recorded forward and backward must replay to what eager computes."""
-    from pyjuice.nodes import BlockScaleSumParams
+    from pyjuice.parameterizations import BlockScale
     device = torch.device("cuda:0")
     torch.manual_seed(0)
     with juice.set_block_size(256):
         ni = [inputs(v, num_node_blocks = 1, dist = dists.Categorical(num_cats = 6)) for v in range(2)]
         ns = summate(multiply(*ni), num_node_blocks = 1,
-                     external_params = BlockScaleSumParams(block_size = 128, ch_block_size = 8,
-                                                           apply_z_correction = False))  # not served here
+                     parameterization = BlockScale(block_size = 128, ch_block_size = 8,
+                                                   apply_z_correction = False))  # not served here
         root = summate(multiply(ns), num_node_blocks = 1, block_size = 1)
     root.init_parameters(perturbation = 2.0)
     pc = juice.compile(root, verbose = False).to(device)

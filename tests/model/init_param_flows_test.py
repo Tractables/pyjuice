@@ -8,7 +8,8 @@ import torch
 
 import pyjuice as juice
 import pyjuice.nodes.distributions as dists
-from pyjuice.nodes import inputs, multiply, summate, BlockScaleSumParams
+from pyjuice.nodes import inputs, multiply, summate
+from pyjuice.parameterizations import BlockScale
 
 DEV = torch.device("cuda:0")
 
@@ -17,7 +18,7 @@ def _circuit(gated):
     torch.manual_seed(0)
     with juice.set_block_size(4):
         ni = [inputs(v, num_node_blocks = 2, dist = dists.Categorical(num_cats = 5)) for v in range(2)]
-        kw = {"external_params": BlockScaleSumParams(ch_block_size = 2)} if gated else {}
+        kw = {"parameterization": BlockScale(ch_block_size = 2)} if gated else {}
         ns = summate(multiply(*ni), num_node_blocks = 2, **kw)
         root = summate(multiply(ns), num_node_blocks = 1, block_size = 1)
     root.init_parameters(perturbation = 2.0)

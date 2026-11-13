@@ -6,7 +6,7 @@ import random
 from collections import OrderedDict
 from typing import Optional
 
-from pyjuice.layer.external_sum_layer import ExternalParamsSumLayer
+from pyjuice.layer.parameterized_sum_layer import ParameterizedSumLayer
 from pyjuice.model import TensorCircuit
 from pyjuice.model.tensorcircuit import device_grad_controller
 
@@ -318,7 +318,7 @@ def _scoped_top_down(pc, plan, node_samples, element_samples, seed_ptr, conditio
                 # it owns its forward and its backward. It declines (returning `False`) when no
                 # external tensors were supplied, in which case it IS a plain sum layer.
                 handled = False
-                if isinstance(layer, ExternalParamsSumLayer):
+                if isinstance(layer, ParameterizedSumLayer):
                     handled = layer.sample_layer(
                         pc.node_mars, pc.element_mars, pc.params, node_samples, element_samples,
                         rows, erows, seed_ptr, conditional = conditional, **kwargs
@@ -604,7 +604,7 @@ def _sample(pc, num_samples, conditional, use_cudagraph, fuse_top_down, _use_sco
                     # from a different distribution. It declines (returning `False`) when no external
                     # tensors were supplied for it, in which case it IS a plain sum layer.
                     handled = False
-                    if isinstance(layer, ExternalParamsSumLayer):
+                    if isinstance(layer, ParameterizedSumLayer):
                         handled = layer.sample_layer_pairs(
                             pc.node_mars, pc.element_mars, pc.params, node_samples, element_samples,
                             ind_target, ind_n, ind_b, conditional = conditional,

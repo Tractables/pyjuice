@@ -233,11 +233,11 @@ class Categorical(Distribution):
             param = tl.load(params_ptr + s_pids + cat_id, mask = cat_mask, other = 0)
             flow = tl.load(param_flows_ptr + s_pfids + cat_id, mask = cat_mask, other = 0)
 
+            new_param = (1.0 - step_size) * param + step_size * (flow + numerate_pseudocount) / cum_flow
+            # A node no flow reached, without a pseudocount (`cum_flow` 0: 0 / 0), keeps its parameters
+            new_param = tl.where(cum_flow == 0.0, param, new_param)
             if keep_zero_params:
-                new_param = (1.0 - step_size) * param + step_size * (flow + numerate_pseudocount) / cum_flow
                 new_param = tl.where(param == 0.0, 0.0, new_param)
-            else:
-                new_param = (1.0 - step_size) * param + step_size * (flow + numerate_pseudocount) / cum_flow
 
             tl.store(params_ptr + s_pids + cat_id, new_param, mask = cat_mask)
 
@@ -277,11 +277,11 @@ class Categorical(Distribution):
             param = tl.load(params_ptr + s_pids[:,None] + cat_ids[None,:], mask = cat_mask, other = 0)
             flow = tl.load(param_flows_ptr + s_pfids[:,None] + cat_ids[None,:], mask = cat_mask, other = 0)
 
+            new_param = (1.0 - step_size) * param + step_size * (flow + numerate_pseudocount[:,None]) / cum_flow[:,None]
+            # A node no flow reached, without a pseudocount (`cum_flow` 0: 0 / 0), keeps its parameters
+            new_param = tl.where(cum_flow[:,None] == 0.0, param, new_param)
             if keep_zero_params:
-                new_param = (1.0 - step_size) * param + step_size * (flow + numerate_pseudocount[:,None]) / cum_flow[:,None]
                 new_param = tl.where(param == 0.0, 0.0, new_param)
-            else:
-                new_param = (1.0 - step_size) * param + step_size * (flow + numerate_pseudocount[:,None]) / cum_flow[:,None]
             tl.store(params_ptr + s_pids[:,None] + cat_ids[None,:], new_param, mask = cat_mask)
 
             cat_ids += 128

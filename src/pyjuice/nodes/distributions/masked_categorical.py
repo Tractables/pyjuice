@@ -415,6 +415,8 @@ class MaskedCategorical(Distribution):
             flow = tl.load(param_flows_ptr + s_pfids + cat_id, mask = cat_mask, other = 0)
 
             new_param = (1.0 - step_size) * param + step_size * (flow + numerate_pseudocount) / cum_flow
+            # A node no flow reached, without a pseudocount (`cum_flow` 0: 0 / 0), keeps its parameters
+            new_param = tl.where(cum_flow == 0.0, param, new_param)
             tl.store(params_ptr + s_pids + cat_id, new_param, mask = cat_mask)
 
     @staticmethod
@@ -446,6 +448,8 @@ class MaskedCategorical(Distribution):
             flow = tl.load(param_flows_ptr + s_pfids + cat_id, mask = cat_mask, other = 0)
 
             new_param = (1.0 - step_size) * param + step_size * (flow + numerate_pseudocount) / cum_flow
+            # A node no flow reached, without a pseudocount (`cum_flow` 0: 0 / 0), keeps its parameters
+            new_param = tl.where(cum_flow == 0.0, param, new_param)
             tl.store(params_ptr + s_pids + cat_id, new_param, mask = cat_mask)
 
     @staticmethod
@@ -477,6 +481,8 @@ class MaskedCategorical(Distribution):
             flow = tl.load(param_flows_ptr + s_pfids + cat_id, mask = cat_mask, other = 0)
 
             new_param = (1.0 - step_size) * param + step_size * (flow + numerate_pseudocount) / cum_flow
+            # A node no flow reached, without a pseudocount (`cum_flow` 0: 0 / 0), keeps its parameters
+            new_param = tl.where(cum_flow == 0.0, param, new_param)
             tl.store(params_ptr + s_pids + cat_id, new_param, mask = cat_mask)
 
     def _get_constructor(self):

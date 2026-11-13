@@ -18,8 +18,13 @@
 // (ld.global.cg: MEASURED the operands' kernel 7.5 -> 15.3 us -- every warp reads the same few lines, all at once).
 // A capture may run on a side stream (`side`, `pyjuice.layer.deferred_par`'s choice): the fork is an event recorded on the
 // calling stream and waited for on the side one -- here, in C++, a few microseconds of host instead of Python's ~12.
-// Scope (the caller checks it): a slot's columns W = 32 VPL with VPL 1, 2, 4, 8 or 16, batch % 4 == 0, blk % 64 == 0,
-// num_edges % 64 == 0. What par_deferred_fp16.cu's header says of the operands holds here.
+//   * GROUPS of node blocks with the same children (`Bop.size(0)` groups of `A.size(0) / Bop.size(0)` node blocks; an
+//     HMM's node blocks one group): a step's column maxima a group's, M[g, b] = max lf over its nodes, each node's A row
+//     shifted by its group's, and the group's Bop rows once -- not once a node block (par_deferred_fp16.cu's flush takes
+//     the groups as they are; one node block a group, its own maxima and operand: the slots as before, to the bit).
+// Scope (the caller checks it): a slot's columns W = 32 VPL with VPL 1, 2, 4, 8 or 16, batch % 4 == 0, blk % 32 == 0,
+// num_edges % 64 == 0, no gates where a group has more than one node block. What par_deferred_fp16.cu's header says of
+// the operands holds here.
 //
 // MEASURED (RTX PRO 6000, HMM-4096 in 4 blocks B 128 bf16, one layer's capture as the training step left it, back to
 // back): 16.4 us a capture (memset, maxima, operands) -> 5.8.
@@ -42,11 +47,12 @@ __device__ __forceinline__ float ord2f(unsigned o) {
 __device__ __forceinline__ float pow2i(int e) { return __int_as_float((e + 127) << 23); }
 
 // ---------------- the column maxima ----------------
-// capture_m_kernel's: M[nb, b] = max_n lf over the node block (order-preserving ints, atomicMax into zeros), a block per
-// (node block, 32 columns, 64 nodes); waits for the launch before, then lets the operands' kernel launch
+// capture_m_kernel's: M[g, b] = max_n lf over node block nb's group g = nb / G (order-preserving ints, atomicMax into
+// zeros), a block per (node block, 32 columns, 64 nodes); waits for the launch before, then lets the operands' kernel
+// launch
 __global__ void __launch_bounds__(256) caps_m_kernel(const float* __restrict__ nflows, const float* __restrict__ nmars,
                                                     const long* __restrict__ nids, unsigned* __restrict__ Mord,
-                                                    int blk, int batch, int Mp) {
+                                                    int blk, int G, int batch, int Mp) {
     cudaGridDependencySynchronize();
     cudaTriggerProgrammaticLaunchCompletion();
     __shared__ float sm[8][32];
@@ -69,7 +75,7 @@ __global__ void __launch_bounds__(256) caps_m_kernel(const float* __restrict__ n
     if (w == 0) {
 #pragma unroll
         for (int q = 1; q < 8; q++) m = fmaxf(m, sm[q][threadIdx.x]);
-        if (m > -INFINITY) atomicMax(Mord + (long)nb * Mp + b, f2ord(m));
+        if (m > -INFINITY) atomicMax(Mord + (long)(nb / G) * Mp + b, f2ord(m));
     }
 }
 
@@ -111,12 +117,12 @@ __device__ __forceinline__ void stv(__half* out, const __half* h) {
     }
 }
 
-// the step's maxima of node block nb at a lane's columns (0 where every node is -inf)
+// the step's maxima of group g at a lane's columns (0 where every node is -inf)
 // (coherent loads after the wait: the launch before wrote them -- see the top)
 template <int VPL>
-__device__ __forceinline__ void ldM(const unsigned* Mord, int nb, int Mp, int b, float* M) {
+__device__ __forceinline__ void ldM(const unsigned* Mord, int g, int Mp, int b, float* M) {
     unsigned o[VPL];
-    const unsigned* p = Mord + (long)nb * Mp + b;
+    const unsigned* p = Mord + (long)g * Mp + b;
     if constexpr (VPL == 1) {
         o[0] = p[0];
     } else if constexpr (VPL == 2) {
@@ -132,7 +138,7 @@ __device__ __forceinline__ void ldM(const unsigned* Mord, int nb, int Mp, int b,
     for (int j = 0; j < VPL; j++) M[j] = (o[j] <= f2ord(-INFINITY)) ? 0.f : ord2f(o[j]);
 }
 
-// QB rows (one a node block) of a lane's VPL values: each row's max over the slot's columns (shuffles, the rows'
+// QB rows (one a group) of a lane's VPL values: each row's max over the slot's columns (shuffles, the rows'
 // interleaved), its fp16 values v 2^(15 - x) and its scale 2^x, as the capture kernels form them
 template <int VPL, int QB>
 __device__ __forceinline__ void store_rows(float (&v)[QB][VPL], int lane, __half* const* out, float* const* fs) {
@@ -163,9 +169,10 @@ __device__ __forceinline__ void store_rows(float (&v)[QB][VPL], int lane, __half
 }
 
 // ---------------- the operands ----------------
-// Rows [0, nbk blk): A's (node block r / blk), lf of the node; then, SHARED (QB > 0), [.., + ne): an edge's Bop row of
-// every node block; else [.., + nbk ne): Bop's (node block (r - nbk blk) / ne). A block's 8 R rows are all of one kind
-// (blk % 64 == 0) and one node block. FUSED: an edge's element value is its product's two children's node values
+// Rows [0, nbk blk): A's (node block r / blk), lf of the node, shifted by its group's maxima; then, SHARED (QB > 0),
+// [.., + ne): an edge's Bop row of every group; else [.., + ng ne): Bop's (group (r - nbk blk) / ne; its first node
+// block's edges, every one of the group's the same). A warp's R rows are of one kind and one node block or group
+// (blk, ne multiples of R). FUSED: an edge's element value is its product's two children's node values
 // (`ctab`, rows past `first_row`; below it the dummy rows, -inf), else `emars[cid]`. Gated: log phi from the gate
 // table and `ext` (0 without a gate row; no gate for the node block: the edge's -inf), as `capture_ab_kernel`.
 template <int R, int VPL, int QB>
@@ -174,7 +181,7 @@ __global__ void __launch_bounds__(256) caps_ab_kernel(
         const int* __restrict__ ctab, long first_row, const float* __restrict__ ext, const long* __restrict__ nids,
         const long* __restrict__ cids, const long* __restrict__ gate, const unsigned* Mord,
         __half* __restrict__ A, __half* __restrict__ Bop, float* __restrict__ fA, float* __restrict__ fB, int nbk,
-        int blk, int ne, int batch, int Mp, long Ks, int W, int S, int slot0, int node_cbs, int gate_cbs,
+        int G, int blk, int ne, int batch, int Mp, long Ks, int W, int S, int slot0, int node_cbs, int gate_cbs,
         int gate_stride, long ext_base, bool gated, bool fused) {
     const int lane = threadIdx.x % 32, c = blockIdx.z;
     const long r0 = ((long)blockIdx.x * 8 + threadIdx.x / 32) * R;
@@ -192,7 +199,7 @@ __global__ void __launch_bounds__(256) caps_ab_kernel(
         }
         cudaGridDependencySynchronize();                  // (the maxima)
         float M[VPL];
-        ldM<VPL>(Mord, nb, Mp, b, M);
+        ldM<VPL>(Mord, nb / G, Mp, b, M);
 #pragma unroll
         for (int u = 0; u < R; u++) {
             float v[1][VPL];
@@ -205,13 +212,14 @@ __global__ void __launch_bounds__(256) caps_ab_kernel(
         return;
     }
     const long er = r0 - arows;
-    const int nb0 = QB > 0 ? 0 : (int)(er / ne), e0 = (int)(er % ne);
-    // the rows' element values (node block nb0's edges: every node block's where SHARED), -inf for a dummy row
+    const int ng = nbk / G, g0 = QB > 0 ? 0 : (int)(er / ne), e0 = (int)(er % ne);
+    // the rows' element values (group g0's edges -- its first node block's --: every group's where SHARED), -inf for a
+    // dummy row
     float em[R][VPL];
     long cid[R];
 #pragma unroll
     for (int u = 0; u < R; u++) {
-        cid[u] = cids[(long)nb0 * ne + e0 + u];
+        cid[u] = cids[(long)g0 * G * ne + e0 + u];
         if (fused) {
             if (cid[u] >= first_row) {
                 const int* ct = ctab + (cid[u] - first_row) * 2;
@@ -229,7 +237,7 @@ __global__ void __launch_bounds__(256) caps_ab_kernel(
             ldv<VPL>(esrc + cid[u] * (long)batch + b, b, batch, -INFINITY, em[u]);
         }
     }
-    // a row's gate row in node block nb (-2: no gate table, log phi 0; -1: no gate, the edge -inf)
+    // a row's gate row in node block nb (-2: no gate table, log phi 0; -1: no gate, the edge -inf; gated: G == 1)
     auto grow_of = [&](int nb, int e) -> long {
         if (!gated) return -2;
         const int gcol = e / node_cbs;
@@ -238,11 +246,11 @@ __global__ void __launch_bounds__(256) caps_ab_kernel(
     };
     cudaGridDependencySynchronize();                      // (the maxima)
     constexpr int Q = QB > 0 ? QB : 1;
-    const int ngr = QB > 0 ? nbk / QB : 1;
+    const int ngr = QB > 0 ? ng / QB : 1;
     for (int g = 0; g < ngr; g++) {
         float M[Q][VPL];
 #pragma unroll
-        for (int q = 0; q < Q; q++) ldM<VPL>(Mord, nb0 + g * Q + q, Mp, b, M[q]);
+        for (int q = 0; q < Q; q++) ldM<VPL>(Mord, g0 + g * Q + q, Mp, b, M[q]);
 #pragma unroll
         for (int u = 0; u < R; u++) {
             float v[Q][VPL];
@@ -250,8 +258,8 @@ __global__ void __launch_bounds__(256) caps_ab_kernel(
             float* fs[Q];
 #pragma unroll
             for (int q = 0; q < Q; q++) {
-                const int nb = nb0 + g * Q + q;
-                const long grow = grow_of(nb, e0 + u);
+                const int gr = g0 + g * Q + q;
+                const long grow = grow_of(gr * G, e0 + u);
                 float lp[VPL];
 #pragma unroll
                 for (int j = 0; j < VPL; j++) lp[j] = 0.f;
@@ -261,8 +269,8 @@ __global__ void __launch_bounds__(256) caps_ab_kernel(
                     const float x = (grow != -1 ? em[u][j] : -INFINITY) + lp[j] + M[q][j];
                     v[q][j] = x == -INFINITY ? 0.f : __expf(x);
                 }
-                out[q] = Bop + ((long)nb * ne + e0 + u) * Ks + (long)slot * W;
-                fs[q] = fB + ((long)nb * S + slot) * ne + e0 + u;
+                out[q] = Bop + ((long)gr * ne + e0 + u) * Ks + (long)slot * W;
+                fs[q] = fB + ((long)gr * S + slot) * ne + e0 + u;
             }
             store_rows<VPL, Q>(v, lane, out, fs);
         }
@@ -295,22 +303,26 @@ static cudaEvent_t fork_event(int dev) {
     return evs[dev];
 }
 
-// `capture` / `capture_fused`'s arguments but `Ms` int32 [steps, nbk, Mp] (zeroed before the slots fill from the first;
+// `capture` / `capture_fused`'s arguments but `Ms` int32 [steps, ng, Mp] (zeroed before the slots fill from the first;
 // this step's at slot0 / cps) for their `M`, `esrc` (element_mars, or node_mars where `fused`) and `ctab` (read where
-// `fused`), `shared` (the caller verified that every node block's edges have the same children); `side` a stream
+// `fused`), `shared` (the caller verified that every node block's edges have the same children); the operand groups
+// `ng = Bop.size(0)` (one node block each, or -- shared, ungated -- of `nbk / ng` node blocks); `side` a stream
 // (`cudaStream_t` as an integer) to launch on after what the current stream has queued, or 0 for the current stream
 void capture_steps(torch::Tensor A, torch::Tensor Bop, torch::Tensor fA, torch::Tensor fB, torch::Tensor Ms,
                    torch::Tensor node_flows, torch::Tensor node_mars, torch::Tensor esrc, torch::Tensor ctab,
                    int64_t first_row, torch::Tensor ext, torch::Tensor nids, torch::Tensor cids, torch::Tensor gate,
                    int64_t batch, int64_t slot0, int64_t node_cbs, int64_t gate_cbs, int64_t ext_base, bool gated,
                    bool fused, bool shared, int64_t side) {
-    const int nbk = (int)A.size(0), blk = (int)A.size(1), ne = (int)Bop.size(1), S = (int)fA.size(1);
+    const int nbk = (int)A.size(0), blk = (int)A.size(1), ng = (int)Bop.size(0), ne = (int)Bop.size(1),
+              S = (int)fA.size(1);
     const long Ks = A.size(2);
-    const int W = (int)(Ks / S), Mp = (int)Ms.size(2), cps = Mp / W;
+    const int W = (int)(Ks / S), Mp = (int)Ms.size(2), cps = Mp / W, G = ng > 0 ? nbk / ng : 0;
     TORCH_CHECK(A.scalar_type() == torch::kHalf && Bop.scalar_type() == torch::kHalf && Ms.scalar_type() == torch::kInt32 &&
-                Ms.dim() == 3 && Ms.size(1) == nbk && Ks % S == 0 && fits(W, batch) && Mp % W == 0 && Mp >= batch &&
-                slot0 % cps == 0 && slot0 + cps <= S && slot0 / cps < Ms.size(0) && blk % 64 == 0 && ne % 64 == 0,
+                Ms.dim() == 3 && Ms.size(1) == ng && Ks % S == 0 && fits(W, batch) && Mp % W == 0 && Mp >= batch &&
+                slot0 % cps == 0 && slot0 + cps <= S && slot0 / cps < Ms.size(0) && blk % 32 == 0 && ne % 64 == 0,
                 "capture steps: the slot layout");
+    TORCH_CHECK(ng >= 1 && nbk % ng == 0 && fB.size(0) == ng && fA.size(0) == nbk && (G == 1 || (shared && !gated)),
+                "capture steps: the operand groups (more than one node block a group: shared children, no gates)");
     TORCH_CHECK(!fused || (ctab.scalar_type() == torch::kInt32 && ctab.is_contiguous() && ctab.dim() == 2 &&
                            ctab.size(1) == 2), "capture steps: ctab int32 [rows, 2]");
     const at::cuda::OptionalCUDAGuard guard(A.device());
@@ -321,12 +333,12 @@ void capture_steps(torch::Tensor A, torch::Tensor Bop, torch::Tensor fA, torch::
         st = reinterpret_cast<cudaStream_t>(side);
         C10_CUDA_CHECK(cudaStreamWaitEvent(st, ev, 0));
     }
-    auto* Mord = reinterpret_cast<unsigned*>(Ms.data_ptr()) + (long)(slot0 / cps) * nbk * Mp;
-    launch_pdl(caps_m_kernel, dim3(nbk, Mp / 32, blk / 64), dim3(256), st, node_flows.data_ptr<float>(),
-               node_mars.data_ptr<float>(), nids.data_ptr<long>(), Mord, blk, (int)batch, Mp);
+    auto* Mord = reinterpret_cast<unsigned*>(Ms.data_ptr()) + (long)(slot0 / cps) * ng * Mp;
+    launch_pdl(caps_m_kernel, dim3(nbk, Mp / 32, (blk + 63) / 64), dim3(256), st, node_flows.data_ptr<float>(),
+               node_mars.data_ptr<float>(), nids.data_ptr<long>(), Mord, blk, G, (int)batch, Mp);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     // two rows a warp where that still leaves two blocks an SM (MEASURED HMM-4096 in 4 blocks B 128: 5.8 us, one row 6.3);
-    // the node blocks' rows of an edge 4 at a time (2 from 8 columns a lane, 1 from 16: the registers)
+    // the groups' rows of an edge 4 at a time (2 from 8 columns a lane, 1 from 16: the registers)
     int dev = 0, sms = 0;
     C10_CUDA_CHECK(cudaGetDevice(&dev));
     C10_CUDA_CHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev));
@@ -334,9 +346,9 @@ void capture_steps(torch::Tensor A, torch::Tensor Bop, torch::Tensor fA, torch::
     int qb = 0;
     if (shared) {
         const int qmax = vpl <= 4 ? 4 : vpl == 8 ? 2 : 1;
-        qb = nbk % 4 == 0 && qmax >= 4 ? 4 : nbk % 2 == 0 && qmax >= 2 ? 2 : 1;
+        qb = ng % 4 == 0 && qmax >= 4 ? 4 : ng % 2 == 0 && qmax >= 2 ? 2 : 1;
     }
-    const long rows = (long)nbk * blk + (shared ? (long)ne : (long)nbk * ne);
+    const long rows = (long)nbk * blk + (shared ? (long)ne : (long)ng * ne);
     const int R = (rows / 16) * cps >= 2L * sms ? 2 : 1;
     const dim3 grid((unsigned)(rows / (8 * R)), 1, cps);
     const int* ct = fused ? ctab.data_ptr<int>() : nullptr;
@@ -345,7 +357,7 @@ void capture_steps(torch::Tensor A, torch::Tensor Bop, torch::Tensor fA, torch::
                node_mars.data_ptr<float>(), esrc.data_ptr<float>(), ct, (long)first_row, ext.data_ptr<float>(),      \
                nids.data_ptr<long>(), cids.data_ptr<long>(), gate.data_ptr<long>(), (const unsigned*)Mord,           \
                reinterpret_cast<__half*>(A.data_ptr<at::Half>()), reinterpret_cast<__half*>(Bop.data_ptr<at::Half>()), \
-               fA.data_ptr<float>(), fB.data_ptr<float>(), nbk, blk, ne, (int)batch, Mp, Ks, W, S, (int)slot0,     \
+               fA.data_ptr<float>(), fB.data_ptr<float>(), nbk, G, blk, ne, (int)batch, Mp, Ks, W, S, (int)slot0,  \
                (int)node_cbs, (int)gate_cbs, gated ? (int)gate.size(1) : 0, (long)ext_base, gated, fused)
 #define CAPS_Q(R_, V_)                                                                                                 \
     if (qb == 0) CAPS(R_, V_, 0); else if (qb == 1) CAPS(R_, V_, 1); else if (qb == 2) CAPS(R_, V_, 2);              \

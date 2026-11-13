@@ -44,9 +44,9 @@ from typing import Optional, Sequence
 import numpy as np
 import torch
 
-from pyjuice.layer import ExternalParamsSumLayer
+from pyjuice.layer import ParameterizedSumLayer
 from pyjuice.layer.fused_children import element_children
-from pyjuice.layer.external_sum_layer import EXTERNAL_PARAMS_KWARG
+from pyjuice.layer.parameterized_sum_layer import EXTERNAL_PARAMS_KWARG
 from pyjuice.utils.fast_inference import fast_inference
 
 from .. import distributions
@@ -116,7 +116,7 @@ class _Layout:
         assert (self.layer_of >= 0).all(), "the circuit's graph and its compiled layers disagree"
         self.kind, self.group, self.index = (np.array(a, dtype = np.int64) for a in (kind, group, layer_index))
 
-        self.gated = np.array([isinstance(layer, ExternalParamsSumLayer) for layer in layers])
+        self.gated = np.array([isinstance(layer, ParameterizedSumLayer) for layer in layers])
         self.has_external = bool(self.gated.any())
         self.nid_range = [layer.nid_range if kind[l] == SUM else None for l, layer in enumerate(layers)]
         self.child_prods = [[] for _ in layers]

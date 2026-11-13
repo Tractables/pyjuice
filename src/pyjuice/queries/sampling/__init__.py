@@ -7,7 +7,7 @@ draw a child of a sum node or expand the children of a product node.
 
 Everything here works on the SHARED parameters. A sum layer whose parameters are modified per sample
 is served by its own parameterization instead (see
-:func:`pyjuice.nodes.external_params.ExternalSumParams.sample_layer`), which keeps this package free
+:func:`pyjuice.parameterizations.SumParameterization.sample_layer`), which keeps this package free
 of any knowledge of what parameterizations exist.
 """
 

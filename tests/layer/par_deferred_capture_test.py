@@ -10,7 +10,10 @@ columns at -inf, dummy element rows; two steps into one group's maxima; two rows
 stream: the same flows from captures there (eager -- the side stream held back, the slots poisoned -- and replayed from
 a CUDA graph), captures that wait for the main stream (it held back, the buffers another batch's), joins as a backward
 that raised closes and before a gated layer below shifts its node values, the place chosen from the backwards'
-periods, and the captures that never go there (from `element_mars`). Skipped where the CUDA kernels cannot build.
+periods, and the captures that never go there (from `element_mars`). And groups of node blocks sharing their edges'
+operand (one maxima row and one Bop a group, blocks of 32 among them): the per-block capture's bits where a group's
+blocks are alike, its own maxima and values against float64 where they are not. Skipped where the CUDA kernels cannot
+build.
 """
 import pytest
 import torch
@@ -130,6 +133,96 @@ def test_the_operands_are_the_captures_bits(nbk, blk, ne, batch, gated, fused, s
 
 
 
+def _grouped_bufs(c, nbk, blk, ne, G):
+    """Slots where groups of G node blocks share their edges' operand (`deferred_par`'s operand groups): A and its
+    scales a node block's, Bop and its scales a group's."""
+    S, W, ng = c["S"], c["W"], nbk // G
+    return dict(A = torch.zeros(nbk, blk, S * W, device = DEV, dtype = torch.half),
+                Bop = torch.zeros(ng, ne, S * W, device = DEV, dtype = torch.half),
+                fA = torch.ones(nbk, S, blk, device = DEV), fB = torch.ones(ng, S, ne, device = DEV))
+
+
+# (node blocks, block size, edges, batch, node blocks a group): blocks of 32 among them, one group and several
+GROUPED = [(4, 32, 128, 64, 4), (8, 32, 64, 128, 8), (8, 32, 64, 32, 4), (2, 64, 128, 256, 2), (4, 64, 64, 16, 4),
+           (4, 128, 64, 512, 2)]
+GROUPED_IDS = [f"nb{s[0]}_blk{s[1]}_e{s[2]}_B{s[3]}_G{s[4]}" for s in GROUPED]
+
+
+@needs_kernels
+@pytest.mark.parametrize("fused", [False, True], ids = ["element_mars", "children"])
+@pytest.mark.parametrize("nbk,blk,ne,batch,G", GROUPED, ids = GROUPED_IDS)
+def test_a_group_of_node_blocks_alike_captures_the_per_block_bits(nbk, blk, ne, batch, G, fused):
+    """Node blocks of the same children and the same rows (every node's lf its block's in node block 0): a group's
+    column maxima are its blocks', so the grouped capture -- one maxima row and one Bop a group -- gives the per-block
+    capture's A rows and scales, and each of its blocks' Bop rows, scales and maxima, to the bit (two steps)."""
+    c = _case(nbk, blk, ne, batch, gated = False, fused = fused, shared = True, seed = nbk * 100 + blk + batch)
+    for nb in range(1, nbk):                                     # every node block's rows node block 0's
+        c["nm"][nb * blk:(nb + 1) * blk] = c["nm"][:blk]
+        c["nf"][nb * blk:(nb + 1) * blk] = c["nf"][:blk]
+    cps, W, ng = c["cps"], c["W"], nbk // G
+    per, got = c["bufs"](), _grouped_bufs(c, nbk, blk, ne, G)
+    Ms1 = torch.zeros(c["S"] // cps, nbk, cps * W, device = DEV, dtype = torch.int32)
+    Msg = torch.zeros(c["S"] // cps, ng, cps * W, device = DEV, dtype = torch.int32)
+    for step in (0, 1):
+        if step == 1:
+            c["nf"] = c["nf"] * 0.5
+        _new(c, per, Ms1, step * cps)
+        _new(c, got, Msg, step * cps)
+    torch.cuda.synchronize()
+    owner = torch.arange(nbk, device = DEV) // G
+    assert _bits(got["A"]).equal(_bits(per["A"])) and _bits(got["fA"]).equal(_bits(per["fA"]))
+    assert _bits(got["Bop"][owner]).equal(_bits(per["Bop"])), "a group's edge rows are not its blocks'"
+    assert _bits(got["fB"][owner]).equal(_bits(per["fB"]))
+    assert _bits(Msg[:, owner]).equal(_bits(Ms1)), "a group's column maxima are not its blocks'"
+
+
+@needs_kernels
+@pytest.mark.parametrize("fused", [False, True], ids = ["element_mars", "children"])
+@pytest.mark.parametrize("nbk,blk,ne,batch,G", GROUPED, ids = GROUPED_IDS)
+def test_a_group_of_node_blocks_shifts_by_its_maxima(nbk, blk, ne, batch, G, fused):
+    """Node blocks of the same children and other rows: a group's column maxima the largest of its blocks' (the
+    per-block capture's), every node's A value exp(lf - M) with its group's M, and the group's Bop values
+    exp(em + M) -- against float64, to the fp16 values' rounding (2^-11) and `__expf`'s."""
+    c = _case(nbk, blk, ne, batch, gated = False, fused = fused, shared = True, seed = nbk * 10 + blk + batch + 1)
+    cps, W, ng = c["cps"], c["W"], nbk // G
+    per, got = c["bufs"](), _grouped_bufs(c, nbk, blk, ne, G)
+    Ms1 = torch.zeros(c["S"] // cps, nbk, cps * W, device = DEV, dtype = torch.int32)
+    Msg = torch.zeros(c["S"] // cps, ng, cps * W, device = DEV, dtype = torch.int32)
+    _new(c, per, Ms1, 0)
+    _new(c, got, Msg, 0)
+    torch.cuda.synchronize()
+    # the maxima: as order-preserving (unsigned) ints, a group's the max of its blocks' (0: no column of the group finite)
+    u = lambda m: m.long() & 0xffffffff
+    assert torch.equal(u(Msg[0]), u(Ms1[0]).view(ng, G, -1).max(dim = 1).values), "a group's column maxima"
+    o = Msg[0].long() & 0xffffffff
+    bits = torch.where(o >= 0x80000000, o & 0x7fffffff, ~o & 0xffffffff).to(torch.int32)
+    Mg = torch.where(o <= 0x007fffff, torch.zeros_like(o, dtype = torch.float32),
+                     bits.view(torch.float32)).double()[:, :batch]         # [ng, batch] (0: -inf, as the kernels)
+    B = batch
+    lf = torch.where(c["nm"] == NEG, torch.full_like(c["nm"], NEG), c["nf"] - c["nm"]).double()[: nbk * blk, :B]
+    lf = lf.view(nbk, blk, B)
+    Mn = Mg.repeat_interleave(G, dim = 0)[:, None, :]                       # [nbk, 1, B]
+    want_a = torch.exp(lf - Mn)
+    got_a = got["A"][:, :, :W].double()[..., :B] * got["fA"][:, 0, :, None].double() * 2.0 ** -15
+    big = want_a > 1e-6 * want_a.amax(dim = -1, keepdim = True)
+    assert torch.allclose(got_a[big], want_a[big], rtol = 2e-3, atol = 0), \
+        float(((got_a - want_a).abs() / want_a.clamp_min(1e-300))[big].max())
+    # the group's edges: its first node block's children, shifted by the group's maxima
+    if fused:
+        cid = c["cids"][0]
+        rows = c["ctab"].long()[cid - c["first_row"]]
+        nm = c["nm"].double()
+        em = torch.where(cid[:, None] >= c["first_row"], nm[rows[:, 0], :B] + nm[rows[:, 1], :B],
+                         torch.full((ne, B), NEG, device = DEV, dtype = torch.float64))
+    else:
+        em = c["emars"].double()[c["cids"][0], :B]                          # [ne, B]
+    want_b = torch.exp(em[None] + Mg[:, None, :])                            # [ng, ne, B]
+    got_b = got["Bop"][:, :, :W].double()[..., :B] * got["fB"][:, 0, :, None].double() * 2.0 ** -15
+    big = want_b > 1e-6 * want_b.amax(dim = -1, keepdim = True)
+    assert torch.allclose(got_b[big], want_b[big], rtol = 2e-3, atol = 0), \
+        float(((got_b - want_b).abs() / want_b.clamp_min(1e-300))[big].max())
+
+
 @needs_kernels
 @pytest.mark.parametrize("fused", [False, True], ids = ["element_mars", "children"])
 @pytest.mark.parametrize("shared", [True, False], ids = ["shared", "per_block"])
@@ -197,10 +290,12 @@ def test_a_backward_defers_the_same_flows_through_either_capture(case, monkeypat
     """`deferred_par.try_defer` through `capture_steps` -- its node blocks sharing their children or taken one by one
     -- and through the old capture: the group's flows of two accumulating backwards to the bit; `flushed_mid_pass`:
     slots for two steps, so the group flushes during the pass and fills its slots and maxima from the first again;
-    `block_sparse`: node blocks of different children (found so: `shared` False)."""
+    `block_sparse`: node blocks of different children (found so: `shared` False). Each node block its own operand
+    (`GROUP_OPERANDS` off: the layout both captures take; the groups' capture is the two tests above)."""
     import pyjuice as juice
     from pyjuice.layer import deferred_par as dpar
     monkeypatch.setattr(dpar, "MIN_FLOWS", 1 << 20)
+    monkeypatch.setattr(dpar, "GROUP_OPERANDS", False)
     if case == "flushed_mid_pass":
         monkeypatch.setattr(dpar, "PAR_DEFER_MB", 1.6)          # (2 slots: blocks of 512, 1024 edges, W 128)
     torch.manual_seed(0)
@@ -316,7 +411,8 @@ def _mixed_hmm(T = 6, gated_steps = 3, B = 128):
     -- which that layer's backward shifts by log Z."""
     import pyjuice as juice
     import pyjuice.nodes.distributions as dists
-    from pyjuice.nodes import inputs, multiply, summate, BlockScaleSumParams
+    from pyjuice.nodes import inputs, multiply, summate
+    from pyjuice.parameterizations import BlockScale
     torch.manual_seed(0)
     gated, esrc, gsrc, rsrc = [], None, None, None
     with juice.set_block_size(1024):
@@ -330,7 +426,7 @@ def _mixed_hmm(T = 6, gated_steps = 3, B = 128):
             if t <= gated_steps:
                 if gsrc is None:
                     ns = gsrc = summate(prod, num_node_blocks = 4,
-                                        external_params = BlockScaleSumParams(ch_block_size = 32))
+                                        parameterization = BlockScale(ch_block_size = 32))
                 else:
                     ns = gsrc.duplicate(prod, tie_params = True)
                 gated.append(ns)
@@ -341,7 +437,7 @@ def _mixed_hmm(T = 6, gated_steps = 3, B = 128):
         root = summate(multiply(ns), num_node_blocks = 1, block_size = 1)
     root.init_parameters(perturbation = 2.0)
     pc = juice.compile(root, verbose = False, param_dtype = torch.bfloat16).to(DEV)
-    phi = {n: torch.randn(n.external_params.tensor_shapes(n, B)[0], device = DEV) for n in gated}
+    phi = {n: torch.randn(n.parameterization.tensor_shapes(n, B)[0], device = DEV) for n in gated}
     return pc, phi, torch.randint(0, 32, (B, T), device = DEV)
 
 
@@ -475,11 +571,11 @@ def test_a_backward_that_raised_joined_its_side_captures(monkeypatch):
 def test_a_gated_layer_below_joins_the_side_stream_first(monkeypatch):
     """A regular tied layer above a gated one captures from the gated layer's node values, which that layer's backward
     shifts by log Z in place (its parameterization's `pre_backward_layer`): no capture is left on the side stream at
-    any such shift (`ExternalParamsSumLayer.backward` joins it first), the gated layers' own captures (their products
+    any such shift (`ParameterizedSumLayer.backward` joins it first), the gated layers' own captures (their products
     fused too: BlockScale's split kernels steered) stay on the main stream, and the groups' flows are the main stream's
     to the bit -- the side stream held back."""
     import pyjuice.layer.kernels.c as ck
-    import pyjuice.nodes.external_params.kernels.shift_logz as sl
+    import pyjuice.parameterizations.kernels.shift_logz as sl
     from pyjuice.layer import deferred_par as dpar
     monkeypatch.setattr(dpar, "MIN_FLOWS", 1 << 20)
     _steer_fused(monkeypatch)

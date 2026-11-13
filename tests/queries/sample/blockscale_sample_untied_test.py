@@ -7,7 +7,7 @@ grid is `[batch, 1, n_ch_gates]` -- the node axis is degenerate and the per-`ns`
 taken. `blockscale_sample_test.py` does reach the node axis, but on a single gated node, so it cannot
 confuse one `ns`'s parameters with another's.
 
-Here every transition of a chain carries its OWN `BlockScaleSumParams` and is supplied as its own
+Here every transition of a chain carries its OWN `BlockScale` and is supplied as its own
 entry in `sum_external_params`, and the grid is `[batch, 3, 3]` -- so `batch`, `ns`, and the two
 within-`ns` axes are all non-degenerate and all distinguishable from each other.
 
@@ -33,7 +33,8 @@ import torch
 
 import pyjuice as juice
 import pyjuice.nodes.distributions as dists
-from pyjuice.nodes import inputs, multiply, summate, BlockScaleSumParams
+from pyjuice.nodes import inputs, multiply, summate
+from pyjuice.parameterizations import BlockScale
 
 
 cuda_only = pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs a GPU")
@@ -65,7 +66,7 @@ class Chain():
     column that decided it.
 
     The granularity is ASKED OF the parameterization rather than recomputed from what was passed in:
-    `block_size = None` means "the node's own", a default that belongs to `BlockScaleSumParams`, and
+    `block_size = None` means "the node's own", a default that belongs to `BlockScale`, and
     a test that restates it would keep agreeing with itself after the real one changed.
     """
 
@@ -73,7 +74,7 @@ class Chain():
         self.pc, self.emits, self.transitions = pc, emits, transitions
 
         ns = transitions[0]
-        self.gate_bs, self.gate_cbs = ns.external_params.gate_sizes(ns)
+        self.gate_bs, self.gate_cbs = ns.parameterization.gate_sizes(ns)
         self.num_node_gates = ns.num_nodes // self.gate_bs
         self.num_ch_gates = ns.num_ch_nodes // self.gate_cbs
 
@@ -88,8 +89,8 @@ def _build(gate_bs, gate_cbs, seed = 0):
             emit = inputs(t, num_node_blocks = NUM_BLOCKS, dist = dists.Categorical(num_cats = NUM_EMITS))
             emits.append(emit)
             ns = summate(multiply(ns, emit), num_node_blocks = NUM_BLOCKS,
-                         external_params = BlockScaleSumParams(block_size = gate_bs,
-                                                               ch_block_size = gate_cbs))
+                         parameterization = BlockScale(block_size = gate_bs,
+                                                       ch_block_size = gate_cbs))
             transitions.append(ns)
         root = summate(multiply(ns), num_node_blocks = 1, block_size = 1)
 
@@ -174,8 +175,8 @@ def test_the_grid_is_non_degenerate_on_both_within_ns_axes(chain):
     c = chain
     assert c.num_node_gates > 1 and c.num_ch_gates > 1
     for ns in c.transitions:
-        assert ns.num_nodes // ns.external_params.gate_sizes(ns)[0] == c.num_node_gates
-        assert ns.num_ch_nodes // ns.external_params.gate_sizes(ns)[1] == c.num_ch_gates
+        assert ns.num_nodes // ns.parameterization.gate_sizes(ns)[0] == c.num_node_gates
+        assert ns.num_ch_nodes // ns.parameterization.gate_sizes(ns)[1] == c.num_ch_gates
 
 
 @cuda_only

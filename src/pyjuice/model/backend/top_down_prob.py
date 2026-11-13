@@ -120,7 +120,9 @@ def sum_layer_td_backward_node_kernel(node_flows, element_flows, node_mars, elem
     cgroup_ids = c_ids // c_block_size
     offs_cnode = c_ids % c_block_size
 
-    cids_base = tl.load(chids + cgroup_ids)
+    # (masked, as every access through them below: a partition whose children do not fill the tile -- 12 of 16 --
+    # has lanes past the end of `chids`, and what lies there is no element id)
+    cids_base = tl.load(chids + cgroup_ids, mask = c_mask, other = 0)
     cids = cids_base + offs_cnode # [TILE_SIZE_C]
     
     n_ids = tl.arange(0, TILE_SIZE_N) + pid_n * TILE_SIZE_N
@@ -139,13 +141,13 @@ def sum_layer_td_backward_node_kernel(node_flows, element_flows, node_mars, elem
     epars = tl.load(mparams + pids, mask = cn_mask, other = 0.0).to(tl.float32)
 
     if not pc_is_normalized:
-        cmars = tl.load(element_mars + cids) # [TILE_SIZE_C]
+        cmars = tl.load(element_mars + cids, mask = c_mask, other = 0.0) # [TILE_SIZE_C]
         nmars = tl.load(node_mars + nids, mask = cn_mask, other = 0.0) # [TILE_SIZE_C, TILE_SIZE_N]
 
         epars = tl.exp(tl.log(epars) + cmars[:,None] - nmars)
 
     cflows = tl.sum(epars * nflows, axis = 1)
-    tl.atomic_add(element_flows + cids, cflows)
+    tl.atomic_add(element_flows + cids, cflows, mask = c_mask)
 
 
 def sum_layer_td_backward(layer, node_flows, element_flows, node_mars, element_mars, params, pc_is_normalized = True):
@@ -325,7 +327,7 @@ def eval_top_down_probs(pc, update_pflow: bool = True, scale: float = 1.0, pc_is
     denom_param_flows = getattr(pc, "denom_param_flows", None) if update_pflow else None
 
     # The denominator's own layout is generally a COMPRESSED form of `F-` (gate space, for
-    # `BlockScaleSumParams`), and the top-down term can only be expressed there when it is `theta[n,c]`
+    # `BlockScale`), and the top-down term can only be expressed there when it is `theta[n,c]`
     # times a factor with no child index. A normalized PC's term is exactly that; an unnormalized one's
     # carries `exp(cmars[c] - nmars[n])` per child and is not. Refuse rather than write a denominator
     # that does not match its numerator.
@@ -376,11 +378,11 @@ def eval_top_down_probs(pc, update_pflow: bool = True, scale: float = 1.0, pc_is
                         # ONLY layers that actually accumulate the denominator, and through their own
                         # parameterization -- the buffer is NOT a `param_flows` mirror, so the generic
                         # param-flow kernel cannot write it. The hook adds the same term in whatever
-                        # layout the parameterization keeps (for `BlockScaleSumParams`, a rank-one
+                        # layout the parameterization keeps (for `BlockScale`, a rank-one
                         # update of `W[node, gate]`).
                         if denom_param_flows is not None and \
                                 getattr(layer, "requests_denom_param_flows", False):
-                            layer.external_params.accumulate_denom_top_down(
+                            layer.parameterization.accumulate_denom_top_down(
                                 layer, node_flows, denom_param_flows, hyperparameters[0])
 
     if not hasattr(pc, "_tdp_cudagraph"):

@@ -1,11 +1,11 @@
 """
-External sum parameterizations under a constraint, in the dfa_exact backend (:mod:`pyjuice.nodes.external_params`):
+External sum parameterizations under a constraint, in the dfa_exact backend (:mod:`pyjuice.parameterizations`):
 sum node groups whose weights a query's per-sample inputs change (``pc(x, sum_external_params = ...)``), as
 :mod:`pyjuice.constraints.distributions` are the input nodes'. A decoder takes those inputs for its whole session (see
 :meth:`~pyjuice.constraints.ConstrainedCircuit.decoder`), with the library's own rules: keyed by node group, or by a
 group registered with ``pc.register_external_params_group``; a sum layer given none is a plain sum layer.
 
-One module per parameterization, named as in :mod:`pyjuice.nodes.external_params`. Each provides
+One module per parameterization, named as in :mod:`pyjuice.parameterizations`. Each provides
 
 * ``refusal(ns) -> Optional[str]``: why the backend cannot serve one of its node groups (None if it can);
 * ``cells(pc)``: where every node group's inputs are in a session's row of them, one row per sample;
@@ -22,14 +22,14 @@ Only the parameterizations in :data:`SUPPORTED` can be compiled under a constrai
 
 from typing import Optional
 
-from pyjuice.nodes.external_params import BlockScaleSumParams
+from pyjuice.parameterizations import BlockScale
 
 from . import block_scale
 
 #: the module of every supported parameterization, by exact type
-SUPPORTED = {BlockScaleSumParams: block_scale}
+SUPPORTED = {BlockScale: block_scale}
 
 
-def lookup(external_params) -> Optional[object]:
-    """The module of ``external_params``' exact type in :data:`SUPPORTED`, or None."""
-    return SUPPORTED.get(type(external_params))
+def lookup(parameterization) -> Optional[object]:
+    """The module of ``parameterization``' exact type in :data:`SUPPORTED`, or None."""
+    return SUPPORTED.get(type(parameterization))

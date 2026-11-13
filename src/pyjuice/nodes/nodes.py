@@ -172,7 +172,7 @@ class CircuitNodes():
         rebuilt -- by :func:`duplicate`, by `pyjuice.deepcopy`, or by a structural transformation.
 
         Subclasses that add required constructor arguments (for instance
-        :class:`~pyjuice.nodes.ExternalParamsSumNodes`, which requires an `external_params`
+        :class:`~pyjuice.nodes.ParameterizedSumNodes`, which requires a `parameterization`
         descriptor) should override this, so that every rebuild path preserves them without each
         call site having to know about them.
         """

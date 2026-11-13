@@ -181,6 +181,64 @@ def test_tdp_cudagraph_follows_the_buffer_not_the_python_object():
     assert torch.allclose(pc.param_flows, expected)
 
 
+@pytest.mark.parametrize("normalized", [True, False])
+def test_the_top_down_pass_stays_inside_a_partition_that_does_not_fill_its_tile(normalized):
+    """A sum layer of small blocks whose children do not fill the kernel's tile (6 of 8, 12 of 16): the tile's lanes
+    past the last child read no child id and add nothing anywhere. Shown with the layer's own tables, the child ids
+    handed over as the head of a longer tensor whose tail points past the element flows, into cells of -0.0: an
+    add of the lanes' +0.0 there turns them +0.0. (What lies past the real tensor is whatever the allocator put
+    there: MEASURED before, an illegal memory access in the rescaled step of one circuit after another's.)"""
+    import types
+    import triton
+    import pyjuice.model.backend.top_down_prob as tdp
+
+    device = torch.device("cuda:0")
+    with juice.set_block_size(2):
+        ins = [inputs(v, num_node_blocks = 3, dist = dists.Categorical(num_cats = 4)) for v in range(2)]
+        mid = summate(multiply(*ins), num_node_blocks = 6)
+        ns = summate(multiply(mid, inputs(2, num_node_blocks = 6, dist = dists.Categorical(num_cats = 4))),
+                     num_node_blocks = 1, block_size = 1)
+    ns.init_parameters()
+    pc = TensorCircuit(ns)
+    pc.to(device)
+
+    torch.manual_seed(0)
+    node_flows = torch.rand(pc.num_nodes, device = device)
+    node_mars = None if normalized else -torch.rand(pc.num_nodes, device = device)
+    element_mars = None if normalized else -torch.rand(pc.num_elements, device = device)
+    tested = 0
+    for group in pc.inner_layer_groups:
+        if not group.is_sum():
+            continue
+        for layer in group:
+            for p in range(layer.num_bk_partitions):
+                chids, cs = layer.partitioned_chids[p], layer.cs_block_sizes[p]
+                count = chids.size(0) * cs
+                if layer.block_size >= 8 and cs >= 8 or count == min(32, triton.next_power_of_2(count)):
+                    continue                                       # (the block kernel; or a tile filled)
+                one = lambda ch: types.SimpleNamespace(
+                    block_size = layer.block_size, num_bk_partitions = 1, partitioned_chids = [ch],
+                    partitioned_parids = [layer.partitioned_parids[p]],
+                    partitioned_parpids = [layer.partitioned_parpids[p]], cs_block_sizes = [cs])
+                want = torch.zeros(pc.num_elements, device = device)
+                tdp.sum_layer_td_backward(one(chids), node_flows, want, node_mars, element_mars, pc.params,
+                                          pc_is_normalized = normalized)
+                assert float(want.sum()) > 0
+
+                guard = 64
+                flows = torch.full((pc.num_elements + guard,), -0.0, device = device)
+                flows[:pc.num_elements] = 0.0
+                if element_mars is not None:
+                    element_mars = torch.cat([element_mars[:pc.num_elements], torch.zeros(guard, device = device)])
+                padded = torch.cat([chids, torch.full((32,), pc.num_elements + 8, dtype = chids.dtype, device = device)])
+                tdp.sum_layer_td_backward(one(padded[:chids.size(0)]), node_flows, flows[:pc.num_elements], node_mars,
+                                          element_mars, pc.params, pc_is_normalized = normalized)
+                assert torch.allclose(flows[:pc.num_elements], want, rtol = 1e-6, atol = 0.0)
+                assert bool(torch.signbit(flows[pc.num_elements:]).all()), "an add past the partition's children"
+                tested += 1
+    assert tested >= 2
+
+
 def test_scaled_mini_batch_em():
 
     device = torch.device("cuda:0")

@@ -2,7 +2,9 @@
 The deferred flush with its operand tiles loaded by a producer warp (layer/kernels/c/par_deferred_fp16_flush_ws.cu)
 against par_deferred_fp16.cu's flush: the flows to the bit, every config of each, the L2's bulk adds and the threads'
 read-add-write, bf16 and fp32 parameters, one and several node blocks and slots, slots of 64 to 512 columns, operand
-values from 0 to full fp16 range with power-of-two row scales far apart. Skipped where the CUDA kernels cannot build.
+values from 0 to full fp16 range with power-of-two row scales far apart; and groups of node blocks sharing their edges'
+operand (blocks of 32 among them), either flush against the per-block one with the operand repeated, to the bit.
+Skipped where the CUDA kernels cannot build.
 """
 import pytest
 import torch
@@ -67,6 +69,74 @@ def test_the_producer_warp_flush_adds_the_flushs_bits(nbk, blk, ne, W, S, slots,
         ws.flush(out, A, Bop, fA, fB, pfids, pids, params, slots, cfg, bulk)
         torch.cuda.synchronize()
         assert torch.equal(out.view(torch.int32), ref.view(torch.int32)), f"config {cfg}: the flows differ"
+
+
+def _grouped_case(nbk, G, blk, ne, W, S, dtype, aligned, seed):
+    """A flush's operands where groups of G node blocks share their edges' operand (`Bop`, `fB`: one a group), and the
+    same flush with each node block its own copy of its group's -- at node blocks of 64 or more the blocks themselves;
+    at 32, pairs of them as node blocks of 64, each pair's runs of flows and parameters adjacent (block 2k + 1's after
+    2k's): the same products, laid out for the per-block flush."""
+    g = torch.Generator(device = DEV).manual_seed(seed)
+    ng, K = nbk // G, S * W
+    def operand(n, rows):
+        v = torch.rand(n, rows, K, device = DEV, generator = g) * 32767.0
+        v = v * torch.exp2(-torch.randint(0, 40, v.shape, device = DEV, generator = g).float())
+        v[torch.rand(v.shape, device = DEV, generator = g) < 0.1] = 0.0
+        return v.half()
+    A, Bop = operand(nbk, blk), operand(ng, ne)
+    fA = torch.exp2(torch.randint(-40, 40, (nbk, S, blk), device = DEV, generator = g).float())
+    fB = torch.exp2(torch.randint(-40, 40, (ng, S, ne), device = DEV, generator = g).float())
+    off = 0 if aligned else 1
+    pair = 2 if blk < 64 else 1                                  # (node blocks of the per-block layout's one)
+    runs = torch.randperm(nbk // pair * ne, device = DEV, generator = g).view(nbk // pair, ne)
+    pruns = torch.randperm(nbk // pair * ne, device = DEV, generator = g).view(nbk // pair, ne)
+    step = torch.arange(pair, device = DEV).view(1, pair, 1) * blk
+    pfids = (runs.view(-1, 1, ne) * blk * pair + off + step).reshape(nbk, ne).long()
+    pids = (pruns.view(-1, 1, ne) * blk * pair + step).reshape(nbk, ne).long()
+    pf = torch.randn(nbk * ne * blk + off + 3, device = DEV, generator = g)
+    params = (torch.rand(nbk * ne * blk, device = DEV, generator = g) + 0.01).to(dtype)
+    # the per-block layout: node blocks of blk * pair, each its group's operand
+    nb2 = nbk // pair
+    A2 = A.view(nb2, pair * blk, K)
+    fA2 = fA.view(nb2, pair, S, blk).permute(0, 2, 1, 3).reshape(nb2, S, pair * blk).contiguous()
+    owner = torch.arange(nb2, device = DEV) * pair // G
+    per_block = (A2, Bop[owner].contiguous(), fA2, fB[owner].contiguous(), pfids[::pair].contiguous(),
+                 pids[::pair].contiguous())
+    return pf, (A, Bop, fA, fB, pfids, pids), per_block, params
+
+
+GROUPED = [(4, 4, 32, 128, 64, 2, 2), (8, 8, 32, 256, 128, 3, 2), (8, 4, 32, 128, 64, 2, 2),
+           (2, 2, 64, 128, 64, 2, 2), (4, 2, 128, 128, 128, 2, 2), (2, 2, 1024, 128, 64, 2, 1)]
+
+
+@needs_kernels
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32], ids = ["bf16", "fp32"])
+@pytest.mark.parametrize("bulk", [True, False], ids = ["bulk_adds", "threads_add"])
+@pytest.mark.parametrize("nbk,G,blk,ne,W,S,slots", GROUPED,
+                         ids = [f"nb{s[0]}_G{s[1]}_blk{s[2]}_e{s[3]}_W{s[4]}_s{s[6]}" for s in GROUPED])
+def test_a_group_of_node_blocks_adds_the_bits_of_its_operand_repeated(nbk, G, blk, ne, W, S, slots, bulk, dtype):
+    """Groups of node blocks that share their edges' operand (`deferred_par`'s operand groups; tiles of the group's
+    rows, within a node block or of whole ones -- blocks of 32 among them): the flows the per-block flush adds with each
+    node block its group's operand, to the bit -- every config of both modules that fits the group's rows."""
+    base, ws = _mods()
+    pf, grouped, per_block, params = _grouped_case(nbk, G, blk, ne, W, S, dtype, bulk, seed = nbk * 100 + blk + W + G)
+    blk2 = per_block[0].size(1)
+    ref = pf.clone()
+    cfg0 = next(i for i, (bm, bn, bk) in enumerate(base.flush_configs()) if blk2 % bm == 0 and ne % bn == 0 and W % bk == 0)
+    base.flush(ref, *per_block, params, slots, cfg0, bulk)
+    assert not torch.equal(ref, pf), "the flush added nothing"
+    tried = 0
+    for mod in (base, ws):
+        for cfg, (bm, bn, bk) in enumerate(mod.flush_configs()):
+            rows_ok = (G * blk) % bm == 0 and (blk % bm == 0 if bm <= blk else bm % blk == 0)
+            if not rows_ok or ne % bn or W % bk:
+                continue
+            out = pf.clone()
+            mod.flush(out, *grouped, params, slots, cfg, bulk)
+            torch.cuda.synchronize()
+            assert torch.equal(out.view(torch.int32), ref.view(torch.int32)), f"{mod.__name__} config {cfg}: the flows differ"
+            tried += 1
+    assert tried >= 2
 
 
 @needs_kernels

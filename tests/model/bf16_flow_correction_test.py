@@ -39,13 +39,14 @@ def _twins(kind):
         ns = juice.structures.PD(data_shape = (4, 4), num_latents = 8, split_intervals = 2,
                                  input_dist = dists.Categorical(num_cats = 16)); V, C = 16, 16
     else:
-        from pyjuice.nodes import inputs, multiply, summate, BlockScaleSumParams
+        from pyjuice.nodes import inputs, multiply, summate
+        from pyjuice.parameterizations import BlockScale
         with juice.set_block_size(32):
             chain = inputs(0, num_node_blocks = 4, dist = dists.Categorical(num_cats = 8))
             for t in range(1, 6):
                 emit = inputs(t, num_node_blocks = 4, dist = dists.Categorical(num_cats = 8))
                 chain = summate(multiply(chain, emit), num_node_blocks = 4,
-                                external_params = BlockScaleSumParams(ch_block_size = 32))
+                                parameterization = BlockScale(ch_block_size = 32))
             ns = summate(multiply(chain), num_node_blocks = 1, block_size = 1)
         V, C = 6, 8
     ns.init_parameters(perturbation = 2.0)
@@ -58,8 +59,8 @@ def _gates(pc, B):
     g = torch.Generator(device = DEV).manual_seed(2)
     gates = {}
     for ns in pc.root_ns:
-        if ns.is_sum() and getattr(ns, "external_params", None) is not None:
-            shapes = ns.external_params.tensor_shapes(ns, B)
+        if ns.is_sum() and getattr(ns, "parameterization", None) is not None:
+            shapes = ns.parameterization.tensor_shapes(ns, B)
             tensors = tuple(torch.randn(s, device = DEV, generator = g) * 0.5 - 0.5 for s in shapes)
             gates[ns] = tensors if len(tensors) > 1 else tensors[0]
     return gates
@@ -195,10 +196,10 @@ def test_dual_flow_em_takes_the_flows_to_the_master_copy(path, monkeypatch):
     """BlockScale's z-correction: the conditional M-step `theta <- normalize(theta * F+ / F-)` on `F+` taken to the
     master copy's values (`F- = theta * W` from the copy itself) -- the master copy's check in the update's own passes
     (a range past the L2: forced), in a pass of its own (the shared kernels' `ROUNDED`), and the generic torch form."""
-    from pyjuice.nodes.external_params.external_params import ExternalSumParams
-    monkeypatch.setattr(ExternalSumParams, "_fold_master", staticmethod(lambda params, n: path == "fused_passes"))
+    from pyjuice.parameterizations.sum_parameterization import SumParameterization
+    monkeypatch.setattr(SumParameterization, "_fold_master", staticmethod(lambda params, n: path == "fused_passes"))
     if path == "torch":
-        monkeypatch.setattr(ExternalSumParams, "_fused_em_correction", lambda self, *a, **k: None)
+        monkeypatch.setattr(SumParameterization, "_fused_em_correction", lambda self, *a, **k: None)
     pc32, pc16, V, C, gated = _twins("gated")
     assert len(pc16._denom_correction_nss()) > 0                         # (the conditional M-step runs)
     for step_size, pcount, kz in ((1.0, 0.1, False), (0.5, 0.1, False), (0.5, 0.1, True)):

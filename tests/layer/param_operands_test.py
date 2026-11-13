@@ -6,7 +6,7 @@ compute the same bits on it (each forced in turn, against the circuit without it
 bf16 parameters only, join them -- the forward's and the element flows': their bits are a bf16-stored twin's. Every
 other kernel reads the fp32 parameters, as without the copy -- the fp16 and fp32 element kernels, the fp32 forward forks,
 the Triton kernels, the parameter flows --, so a circuit taking no stream kernel computes the bits it computed without
-it. Tied BlockScale-gated layers too (`ExternalSumParams.reads_param_operands`): its bf16 forks on the copy, its split
+it. Tied BlockScale-gated layers too (`SumParameterization.reads_param_operands`): its bf16 forks on the copy, its split
 forward and split element backward joining them, `sigma` from the copy where the split forward summed `log Z` from it
 (the forward and the gate gradient). Nowhere else: untied layers, a parameterization that does not declare it, batches
 below 16, the "tf32" / "fp32" precisions, parameters stored in bf16. The copy is made inside each pass: a write through
@@ -114,7 +114,8 @@ def test_a_layer_whose_parameter_bases_are_not_multiples_of_8_is_not_marked():
 def _gated_chain(T = 5, L = 256, nb = 4, gcb = 32, C = 16):
     """A tied chain of BlockScale-gated sum layers (an HMM's transitions, `nb` node blocks of `L // nb`, gates of `gcb`
     children); its gated layers' nodes."""
-    from pyjuice.nodes import inputs, multiply, summate, BlockScaleSumParams
+    from pyjuice.nodes import inputs, multiply, summate
+    from pyjuice.parameterizations import BlockScale
     torch.manual_seed(0)
     gated = []
     with juice.set_block_size(L // nb):
@@ -124,7 +125,7 @@ def _gated_chain(T = 5, L = 256, nb = 4, gcb = 32, C = 16):
             emit = inputs(t, num_node_blocks = nb, dist = dists.Categorical(num_cats = C))
             if first is None:
                 chain = first = summate(multiply(chain, emit), num_node_blocks = nb,
-                                        external_params = BlockScaleSumParams(ch_block_size = gcb))
+                                        parameterization = BlockScale(ch_block_size = gcb))
             else:
                 chain = first.duplicate(multiply(chain, emit), tie_params = True)
             gated.append(chain)
@@ -135,32 +136,32 @@ def _gated_chain(T = 5, L = 256, nb = 4, gcb = 32, C = 16):
 
 def _gates(gated, B):
     g = torch.Generator(device = DEV).manual_seed(2)
-    return {n: torch.randn(n.external_params.tensor_shapes(n, B)[0], device = DEV, generator = g) * 0.5 - 0.5
+    return {n: torch.randn(n.parameterization.tensor_shapes(n, B)[0], device = DEV, generator = g) * 0.5 - 0.5
             for n in gated}
 
 
 def _gated_rows(pc):
-    from pyjuice.layer.external_sum_layer import ExternalParamsSumLayer
+    from pyjuice.layer.parameterized_sum_layer import ParameterizedSumLayer
     return [layer._layer_nid_range for group in pc.inner_layer_groups if group.is_sum() for layer in group
-            if isinstance(layer, ExternalParamsSumLayer)]
+            if isinstance(layer, ParameterizedSumLayer)]
 
 
 @cuda_only
 def test_external_parameter_layers_are_marked_if_their_parameterization_takes_it(monkeypatch):
-    """A tied gated chain: its layers take the copy (`ExternalSumParams.reads_param_operands`, BlockScale's); a
+    """A tied gated chain: its layers take the copy (`SumParameterization.reads_param_operands`, BlockScale's); a
     parameterization that does not declare it leaves its layers unmarked."""
-    from pyjuice.layer.external_sum_layer import ExternalParamsSumLayer
-    from pyjuice.nodes import BlockScaleSumParams
+    from pyjuice.layer.parameterized_sum_layer import ParameterizedSumLayer
+    from pyjuice.parameterizations import BlockScale
     root, _ = _gated_chain(L = 128)
     pc = juice.compile(root, verbose = False).to(DEV)
     pc._param_operand_plan()
     gated = [layer for group in pc.inner_layer_groups if group.is_sum() for layer in group
-             if isinstance(layer, ExternalParamsSumLayer)]
+             if isinstance(layer, ParameterizedSumLayer)]
     assert gated and all(layer.__dict__.get("_reads_param_operands") for layer in gated)
-    monkeypatch.setattr(BlockScaleSumParams, "reads_param_operands", False)
+    monkeypatch.setattr(BlockScale, "reads_param_operands", False)
     pc2 = juice.compile(root, verbose = False).to(DEV)
     pc2._param_operand_plan()
-    assert not any(isinstance(layer, ExternalParamsSumLayer) for layer in _marked(pc2))
+    assert not any(isinstance(layer, ParameterizedSumLayer) for layer in _marked(pc2))
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -301,7 +302,7 @@ def test_every_gated_fork_reads_what_its_products_take(kind, monkeypatch):
     parameters to bf16 (the CuTe fork, its pre-pass copy, the tensor-core small-batch one) read the copy, the fp32 ones
     (the per-sample and batch-tiled small-batch forks) the fp32 parameters -- every one the same node values to the
     bit. Batch 64 for the first two, 32 for the small-batch forks."""
-    import pyjuice.nodes.external_params.kernels.c as bk
+    import pyjuice.parameterizations.blockscale.kernels.c as bk
     getter, name = _FORKS[kind]
     mod = getattr(bk, getter)()
     if mod is None:
@@ -333,7 +334,7 @@ def test_every_gated_fork_reads_what_its_products_take(kind, monkeypatch):
 def test_the_gated_layers_take_the_split_forward_on_the_copy(monkeypatch):
     """On fp32 parameters BlockScale's split forward (bf16 parameters only) is not among the forward's candidates; on
     the copy it is."""
-    import pyjuice.nodes.external_params.kernels.c as bk
+    import pyjuice.parameterizations.blockscale.kernels.c as bk
     if bk.get_stream_module() is None:
         pytest.skip("no split forward on this toolchain")
     root, gated = _gated_chain()
@@ -359,7 +360,7 @@ def test_a_tied_gated_layer_computes_what_its_bf16_twin_computes(kind, monkeypat
     """The fp32 circuit's gated layers on the copy and a circuit storing the same parameters' rounding in bf16, each fork
     forced in both: their node values to the bit -- the split forward's `sigma` summed from the copy, as from the stored
     values."""
-    import pyjuice.nodes.external_params.kernels.c as bk
+    import pyjuice.parameterizations.blockscale.kernels.c as bk
     if kind == "stream" and bk.get_stream_module() is None:
         pytest.skip("no split forward on this toolchain")
     root, gated = _gated_chain()
@@ -587,7 +588,7 @@ def test_the_gated_element_kinds_read_what_their_products_take(kind, monkeypatch
     (bf16 parameters only) is given the copy; the fp16 kinds (the CuTe fork, its pre-pass copy) and the tensor-core
     small-batch one (fp32 parameters as bf16 hi + lo halves) the fp32 parameters. Batch 64, 32 for the small-batch
     kind."""
-    import pyjuice.nodes.external_params.kernels.c as bk
+    import pyjuice.parameterizations.blockscale.kernels.c as bk
     getter, name = _GATED_ELE[kind]
     mod = getattr(bk, getter)()
     if mod is None:
@@ -610,14 +611,14 @@ def test_the_gated_element_kinds_read_what_their_products_take(kind, monkeypatch
 def test_the_split_element_backwards_tuning_times_it_on_the_copy(monkeypatch):
     """The split element backward's (tile, split) choice (`_eles_code`: `autotune.pick`, its cache emptied, its trials
     run) times the kernel on the copy, as it will run: every call, the trials' among them, given bf16 parameters."""
-    import pyjuice.nodes.external_params.kernels.c as bk
+    import pyjuice.parameterizations.blockscale.kernels.c as bk
     import pyjuice.layer.kernels.c as ck
-    from pyjuice.nodes import BlockScaleSumParams
+    from pyjuice.parameterizations import BlockScale
     mod = bk.get_ele_stream_module()
     if mod is None:
         pytest.skip("no split element backward on this toolchain")
     calls, in_trials = [], []
-    real_kernel, real_code, real_kind = mod.blockscale_ele_backward_stream, BlockScaleSumParams._eles_code, ck.autotune
+    real_kernel, real_code, real_kind = mod.blockscale_ele_backward_stream, BlockScale._eles_code, ck.autotune
 
     def kernel(*a, **k):
         calls.append((bool(in_trials), a[4].dtype))
@@ -634,7 +635,7 @@ def test_the_split_element_backwards_tuning_times_it_on_the_copy(monkeypatch):
         key = next((key for key, _ in cands if isinstance(key, tuple) and key[0] == "eles"), None)
         return key if key is not None else real_kind(cands, *a, **k)
     monkeypatch.setattr(mod, "blockscale_ele_backward_stream", kernel)
-    monkeypatch.setattr(BlockScaleSumParams, "_eles_code", code)
+    monkeypatch.setattr(BlockScale, "_eles_code", code)
     monkeypatch.setattr(ck, "autotune", kind)
     monkeypatch.setattr(autotune, "_CACHE", {})
     root, gated = _gated_chain(L = 512)
@@ -692,15 +693,15 @@ def test_the_gate_gradient_sums_sigma_from_what_the_forward_summed(kind, monkeyp
     term) in the backward from the copy where the forward took the split forward on it -- the gradient of the `log Z`
     it computed -- else, as without the copy, from the fp32 parameters (the pre-pass fork's `log Z` its own
     products')."""
-    from pyjuice.nodes import BlockScaleSumParams
-    import pyjuice.nodes.external_params.kernels.c as bk
+    from pyjuice.parameterizations import BlockScale
+    import pyjuice.parameterizations.blockscale.kernels.c as bk
     if kind == "stream" and bk.get_stream_module() is None:
         pytest.skip("no split forward on this toolchain")
     root, gated = _gated_chain(L = 512)
     pc = juice.compile(root, verbose = False).to(DEV)
     dtypes = []
-    real = BlockScaleSumParams._sigma
-    monkeypatch.setattr(BlockScaleSumParams, "_sigma",
+    real = BlockScale._sigma
+    monkeypatch.setattr(BlockScale, "_sigma",
                         lambda self, layer, params, *a, **k: dtypes.append(params.dtype) or real(self, layer, params, *a, **k))
     offered = []
     _force_fork(monkeypatch, kind, offered)
@@ -953,17 +954,17 @@ def test_a_parameterization_sets_the_least_layer_that_takes_the_copy(least, monk
     """A tied gated chain whose work per layer reaches `_COPY_MIN_WORK` at batch 64 (the rule's threshold set there):
     its layers, smaller than BlockScale's `param_operands_min_edges`, are given no copy; without that minimum they
     are."""
-    from pyjuice.nodes import BlockScaleSumParams
+    from pyjuice.parameterizations import BlockScale
     monkeypatch.setattr(tcm.TensorCircuit, "_param_operands_force", None)
     if least == "none":
-        monkeypatch.setattr(BlockScaleSumParams, "param_operands_min_edges", 0)
+        monkeypatch.setattr(BlockScale, "param_operands_min_edges", 0)
     root, gated = _gated_chain(L = 512)
     pc = juice.compile(root, verbose = False).to(DEV)
     pc._param_operand_plan()
     layer = _marked(pc)[0]
     B = 64
     monkeypatch.setattr(tcm, "_COPY_MIN_WORK", layer.num_edges * B)
-    assert layer.num_edges < BlockScaleSumParams.param_operands_min_edges or least == "none"
+    assert layer.num_edges < BlockScale.param_operands_min_edges or least == "none"
     gates = _gates(gated, B)
     _step(pc, torch.randint(0, 16, (B, 5), device = DEV), sum_external_params = gates,
           sum_external_params_grad = {n: torch.zeros_like(t) for n, t in gates.items()})

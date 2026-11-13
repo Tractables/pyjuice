@@ -21,10 +21,10 @@ import torch
 
 import pyjuice as juice
 import pyjuice.nodes.distributions as dists
-from pyjuice.layer import ExternalParamsSumLayer
+from pyjuice.layer import ParameterizedSumLayer
 from pyjuice.layer import prod_layer as PL
 from pyjuice.layer import sum_layer as SL
-from pyjuice.nodes import LowRankSumParams
+from pyjuice.parameterizations import LowRank
 
 DEV = torch.device("cuda:0")
 NAN = float("nan")
@@ -429,7 +429,7 @@ def test_a_dense_partition_of_several_child_groups_takes_no_runs(monkeypatch):
 def test_what_takes_no_runs():
     with juice.set_block_size(4):
         ni0 = juice.inputs(0, num_node_blocks = 3, dist = dists.Categorical(num_cats = 5))
-        ns = juice.summate(juice.multiply(ni0), num_node_blocks = 2, external_params = LowRankSumParams(rank = 3))
+        ns = juice.summate(juice.multiply(ni0), num_node_blocks = 2, parameterization = LowRank(rank = 3))
         root = juice.summate(juice.multiply(ns), num_node_blocks = 1, block_size = 1)
     root.init_parameters()
     pc = juice.compile(root, verbose = False).to(DEV)
@@ -437,12 +437,13 @@ def test_what_takes_no_runs():
     pc(x)
     pc.backward(x, compute_param_flows = False)
     nm, em, nf, ef = pc.node_mars, pc.element_mars, pc.node_flows, pc.element_flows
-    gated = next(l for lg in pc.inner_layer_groups if lg.is_sum() for l in lg if isinstance(l, ExternalParamsSumLayer))
+    gated = next(l for lg in pc.inner_layer_groups if lg.is_sum() for l in lg if isinstance(l, ParameterizedSumLayer))
     with pytest.raises(ValueError, match = "whole partitions"):
         gated.forward(nm, em, pc.params, partition_runs = [[(0, 1)]] * gated.num_fw_partitions)
     with pytest.raises(ValueError, match = "whole partitions"):
         gated.backward(nf, ef, nm, em, pc.params, partition_runs = [[(0, 1)]] * gated.num_bk_partitions)
-    plain = next(l for lg in pc.inner_layer_groups if lg.is_sum() for l in lg if not isinstance(l, ExternalParamsSumLayer))
+    plain = next(l for lg in pc.inner_layer_groups if lg.is_sum() for l in lg
+                 if not isinstance(l, ParameterizedSumLayer))
     runs = [[(0, 1)]] * plain.num_bk_partitions
     with pytest.raises(ValueError, match = "element flows"):
         plain.backward(nf, ef, nm, em, pc.params, param_flows = torch.zeros(1, device = DEV), partition_runs = runs)

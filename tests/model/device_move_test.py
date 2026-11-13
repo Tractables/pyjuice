@@ -49,7 +49,8 @@ sys.setrecursionlimit(100000)
 import torch
 import pyjuice as juice
 import pyjuice.nodes.distributions as dists
-from pyjuice.nodes import inputs, multiply, summate, BlockScaleSumParams, LowRankSumParams
+from pyjuice.nodes import inputs, multiply, summate
+from pyjuice.parameterizations import BlockScale, LowRank
 
 C = 6
 d0, d1 = torch.device("cuda:0"), torch.device("cuda:1")
@@ -62,9 +63,9 @@ def chain(dist_fn, external = None):
         for t in range(1, 6):
             ext = dict()
             if external == "blockscale":
-                ext = dict(external_params = BlockScaleSumParams(ch_block_size = 16))
+                ext = dict(parameterization = BlockScale(ch_block_size = 16))
             elif external == "lowrank":
-                ext = dict(external_params = LowRankSumParams(rank = 4))
+                ext = dict(parameterization = LowRank(rank = 4))
             ch = summate(multiply(ch, inputs(t, num_node_blocks = 2, dist = dist_fn())), num_node_blocks = 2, **ext)
             trans.append(ch)
         root = summate(multiply(ch), num_node_blocks = 1, block_size = 1)
@@ -101,7 +102,7 @@ def run(pc, trans, kind, dev, B, V):
     if trans is not None:
         params = {}
         for ns in trans:
-            ts = tuple((torch.randn(s, generator = g) * 0.5 - 0.5).to(dev) for s in ns.external_params.tensor_shapes(ns, B))
+            ts = tuple((torch.randn(s, generator = g) * 0.5 - 0.5).to(dev) for s in ns.parameterization.tensor_shapes(ns, B))
             params[ns] = ts if len(ts) > 1 else ts[0]
         kw = dict(sum_external_params = params)
     if kind == "softevi":

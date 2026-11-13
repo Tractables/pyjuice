@@ -17,7 +17,7 @@ class Layer():
     #: Whether this layer needs the PC's denominator param-flow buffer `pc.denom_param_flows` (a second
     #: accumulator shaped like `param_flows`). `False` for every ordinary layer, so a plain PC allocates
     #: nothing and pays nothing. Overridden by layers whose M-step is a conditional dual-flow update --
-    #: see `ExternalSumParams.requests_denom_param_flows`.
+    #: see `SumParameterization.requests_denom_param_flows`.
     requests_denom_param_flows: bool = False
 
     def __init__(self, nodes: Sequence[CircuitNodes], disable_block_size_check: bool = False) -> None:

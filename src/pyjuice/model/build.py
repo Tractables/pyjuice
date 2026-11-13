@@ -11,8 +11,8 @@ import torch.nn as nn
 from tqdm import tqdm
 from typing import Optional, Sequence, Union
 
-from pyjuice.nodes import CircuitNodes, InputNodes, ExternalParamsSumNodes, summate, multiply
-from pyjuice.layer import InputLayer, ProdLayer, SumLayer, ExternalParamsSumLayer, LayerGroup
+from pyjuice.nodes import CircuitNodes, InputNodes, ParameterizedSumNodes, summate, multiply
+from pyjuice.layer import InputLayer, ProdLayer, SumLayer, ParameterizedSumLayer, LayerGroup
 from pyjuice.layer.fused_children import attach_element_children
 from pyjuice.utils import BitSet
 
@@ -177,7 +177,8 @@ class _BuildMixin:
                     # standard sum-layer kernels free of any per-call branch on the parameterization.
                     gsize2sum_nodes = dict()
                     for ns in depth2nodes[depth]["sum"]:
-                        ext_signature = ns.get_external_signature() if isinstance(ns, ExternalParamsSumNodes) else None
+                        ext_signature = (ns.get_parameterization_signature() if isinstance(ns, ParameterizedSumNodes)
+                                         else None)
                         gsize = (ns.block_size, ext_signature)
                         if gsize not in gsize2sum_nodes:
                             gsize2sum_nodes[gsize] = []
@@ -185,7 +186,7 @@ class _BuildMixin:
 
                     sum_layers = []
                     for (gsize, ext_signature), nodes in gsize2sum_nodes.items():
-                        layer_class = SumLayer if ext_signature is None else ExternalParamsSumLayer
+                        layer_class = SumLayer if ext_signature is None else ParameterizedSumLayer
 
                         sum_layer = layer_class(
                             nodes = nodes,

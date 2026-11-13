@@ -15,7 +15,7 @@
 // the pre-pass and the GEMM are that module's, copied unchanged (a new module: the kernels training runs stay as they
 // are). What the stream module's header says of the rest holds here:
 //
-// The regular copy of the BlockScale element stream (nodes/external_params/kernels/c/blockscale_ele_backward_stream.cu),
+// The regular copy of the BlockScale element stream (parameterizations/kernels/c/blockscale_ele_backward_stream.cu),
 // without gates, gradients and pieces. The other kernels walk an element block's parent tiles serially under a
 // stabilizer each, merging tile by tile. Here:
 //   pre-pass  per (group, split, PB columns): an element block's parents are cut into `split` contiguous ranges of

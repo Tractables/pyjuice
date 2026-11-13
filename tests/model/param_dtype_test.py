@@ -423,7 +423,8 @@ def test_tuned_choices_are_kept_per_parameter_dtype(monkeypatch):
 # ---------------------------------------------------------------------------------------------------------------------
 
 def _blockscale_pair(B):
-    from pyjuice.nodes import inputs, multiply, summate, BlockScaleSumParams
+    from pyjuice.nodes import inputs, multiply, summate
+    from pyjuice.parameterizations import BlockScale
     torch.manual_seed(0)
     with juice.set_block_size(32):
         chain = inputs(0, num_node_blocks = 4, dist = dists.Categorical(num_cats = 8))
@@ -431,7 +432,7 @@ def _blockscale_pair(B):
         for t in range(1, 6):
             emit = inputs(t, num_node_blocks = 4, dist = dists.Categorical(num_cats = 8))
             chain = summate(multiply(chain, emit), num_node_blocks = 4,
-                            external_params = BlockScaleSumParams(ch_block_size = 32))
+                            parameterization = BlockScale(ch_block_size = 32))
             transitions.append(chain)
         root = summate(multiply(chain), num_node_blocks = 1, block_size = 1)
     root.init_parameters(perturbation = 2.0)
@@ -441,7 +442,7 @@ def _blockscale_pair(B):
     g = torch.Generator(device = DEV).manual_seed(2)
     gates = {}
     for ns in transitions:
-        shapes = ns.external_params.tensor_shapes(ns, B)
+        shapes = ns.parameterization.tensor_shapes(ns, B)
         tensors = tuple(torch.randn(s, device = DEV, generator = g) * 0.5 - 0.5 for s in shapes)
         gates[ns] = tensors if len(tensors) > 1 else tensors[0]
     return pc32, pc16, gates
@@ -474,8 +475,8 @@ def test_blockscale_em_at_bf16_keeps_a_write_between_steps(fold, monkeypatch):
     from x -- the master copy's check in the update's own passes (a range past the L2: forced here) or a pass of its
     own -- against an fp32 twin given the same write; and `params` is the master copy's rounding after each step. The
     write is not uniform within a node's children (x1.5 / x0.5 alternating), so a renormalization cannot undo it."""
-    from pyjuice.nodes.external_params.external_params import ExternalSumParams
-    monkeypatch.setattr(ExternalSumParams, "_fold_master", staticmethod(lambda params, n: fold))
+    from pyjuice.parameterizations.sum_parameterization import SumParameterization
+    monkeypatch.setattr(SumParameterization, "_fold_master", staticmethod(lambda params, n: fold))
     B = 64
     pc32, pc16, gates = _blockscale_pair(B)
     x = torch.randint(0, 8, (2 * B, 6), device = DEV)
@@ -509,7 +510,7 @@ def test_blockscale_gate_gradients_at_bf16(B):
     (`_sigma`) -- in fp32 whatever the storage (MEASURED: summed in bf16, the gradients came out 0.4-0.5% off). The bf16
     circuits: one compiled so, one that ran its gated passes at fp32 first and was then converted (`set_param_dtype`
     drops the plans and sums built for the old tensor, whose version a new one restarts)."""
-    from pyjuice.layer.external_sum_layer import EXTERNAL_PARAMS_GRAD_KWARG
+    from pyjuice.layer.parameterized_sum_layer import EXTERNAL_PARAMS_GRAD_KWARG
     pc32, pc16, gates = _blockscale_pair(B)
     pc_conv = juice.compile(pc32.root_ns, verbose = False, param_dtype = BF16).to(DEV).set_param_dtype(torch.float32)
     x = torch.randint(0, 8, (B, 6), device = DEV)
@@ -538,8 +539,8 @@ def _codpula_pair(gated):
     """CoDD's PC in small: a homogeneous GeneralizedHMM over soft evidence (`SoftEvidenceCategorical`, its dual-flow
     backward), gated (every latent-wide sum a BlockScale node: its z-correction, the sum parameters' dual-flow EM) or
     not; at fp32 and at bf16 sum parameters, the same (rounded) values. (fp32 pc, bf16 pc, the gated nodes)."""
-    from pyjuice.nodes import BlockScaleSumParams
-    from pyjuice.nodes.external_sum_nodes import ExternalParamsSumNodes
+    from pyjuice.parameterizations import BlockScale
+    from pyjuice.nodes.parameterized_sum_nodes import ParameterizedSumNodes
     torch.manual_seed(0)
     # (blocks of 32, as Codpula's: below batch 16 BlockScale's parameter-flow backward needs them)
     ns = juice.structures.GeneralizedHMM(seq_length = 6, num_latents = 64, homogeneous = True, block_size = 32,
@@ -548,8 +549,8 @@ def _codpula_pair(gated):
     if gated:
         for s in ns:
             if s.is_sum() and s.num_nodes == 64:
-                s.__class__ = ExternalParamsSumNodes
-                s.external_params = BlockScaleSumParams(ch_block_size = 32)
+                s.__class__ = ParameterizedSumNodes
+                s.parameterization = BlockScale(ch_block_size = 32)
                 gated_ns.append(s)
     ns.init_parameters(perturbation = 2.0)
     pc32 = juice.compile(ns, verbose = False).to(DEV)
@@ -579,7 +580,7 @@ def test_codpula_dual_flows_at_bf16(gated, B):
     sum parameters through the master copy, `params` its rounding). MEASURED on CoDD's PC (32 x 1024, blocks of 32, real
     LLaDA evidence): bf16 vs fp32 flows 2e-6..2.5e-5, the gate gradient 2.6-4.7e-4, the parameters after EM 1e-4 of
     their largest; two fp32 runs 1e-7."""
-    from pyjuice.layer.external_sum_layer import EXTERNAL_PARAMS_GRAD_KWARG
+    from pyjuice.layer.parameterized_sum_layer import EXTERNAL_PARAMS_GRAD_KWARG
     pc32, pc16, gated_ns = _codpula_pair(gated)
     V, C, K = 6, 300, 24
 
@@ -588,7 +589,7 @@ def test_codpula_dual_flows_at_bf16(gated, B):
 
     def gates(i):
         g = torch.Generator(device = DEV).manual_seed(100 + i)
-        return {s: torch.randn(s.external_params.tensor_shapes(s, B)[0], device = DEV, generator = g)
+        return {s: torch.randn(s.parameterization.tensor_shapes(s, B)[0], device = DEV, generator = g)
                 for s in gated_ns}
 
     outs = {}

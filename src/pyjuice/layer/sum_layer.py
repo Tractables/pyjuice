@@ -493,7 +493,7 @@ class SumLayer(Layer, nn.Module):
 
         # Optional interception of the two CUDA backward kernels by an external parameterization.
         # `None` on every plain layer, so the fast paths below are unchanged for them. When set (by
-        # `ExternalParamsSumLayer` for the duration of one backward), the hook is called INSTEAD of the
+        # `ParameterizedSumLayer` for the duration of one backward), the hook is called INSTEAD of the
         # vanilla kernel with the very same operands plus the partition id -- which is what lets a
         # parameterization reuse this class's whole table derivation (partitioning, edge trimming,
         # `parids` reconstruction) rather than reimplement it. A hook that cannot be reached because
@@ -904,7 +904,7 @@ class SumLayer(Layer, nn.Module):
         itself: the block-sparse mode with the plain element-flow kernel (tiles of at least 8), LL propagation
         without tempering, no external parameterization (whose backward owns the element flows)."""
         if propagation_alg != "LL" or temper_eflow or params_dim != 1 \
-                or getattr(self, "external_params", None) is not None:    # an external-parameter layer
+                or getattr(self, "parameterization", None) is not None:    # an external-parameter layer
             return [False] * self.num_bk_partitions
         out = []
         for partition_id in range(self.num_bk_partitions):
@@ -1014,7 +1014,7 @@ class SumLayer(Layer, nn.Module):
         # where the decisions below read nothing but what the key holds (`kwargs` by name: their values are read by
         # the tempered kernels alone). A converted site adds one launcher per partition and kind of flow; any other
         # leaves the count short, and the call is not planned -- nor the recording around it, if one is open (a gated
-        # layer's, `ExternalParamsSumLayer.backward`, whose own sites this call's converted ones reach): so does a
+        # layer's, `ParameterizedSumLayer.backward`, whose own sites this call's converted ones reach): so does a
         # call in another regime, which records nothing.
         #
         # `defer_param_flows` (the circuit's backward sets it when no layer callback sees the flows between layers): a
@@ -1529,6 +1529,8 @@ class SumLayer(Layer, nn.Module):
                 # (With a bf16 copy, a choice of its own: the stream kernel is among the arms.)
                 tlmm_key = ("sum_fw_tlmm_cuda", num_edges) + fw_key + (() if op_params is None else ("operands",))
                 choice = autotune.cached(tlmm_key)
+                if choice is not None and not cuda_kernels.tlmm_arm_loaded(choice[0]):
+                    choice = None                   # (stored where its module loaded, not here: measured again)
                 if choice is None and runs is not None:
                     choice = ("triton", -1)              # not measured yet: the reference (see `runs`)
                 elif choice is None:
@@ -1708,6 +1710,8 @@ class SumLayer(Layer, nn.Module):
                 sb_key = (("sum_fw_smallbatch_cuda", num_edges, mma_ok) + fw_key
                           + (() if op_params is None else ("operands",)))
                 choice = autotune.cached(sb_key)
+                if choice is not None and not cuda_kernels.smallbatch_fw_arm_loaded(choice[0]):
+                    choice = None                   # (stored where its module loaded, not here: measured again)
                 if choice is None:
                     mma_arms = (cuda_kernels.smallbatch_fw_mma_arms(self.block_size, batch_size, num_edges, nids.numel(),
                                                                      self._sb_mma_grouped(signature, self._cached_fw_cuda[signature][0], sb_pbase))
@@ -3010,9 +3014,9 @@ class SumLayer(Layer, nn.Module):
         return TILE_SIZE_M, TILE_SIZE_K, TILE_SIZE_B
 
     def param_flow_slot_ranges(self, partition_id: int) -> np.ndarray:
-        """The `param_flows` slots a backward partition writes, as sorted disjoint `[start, end)` ranges (int64
-        [n, 2], host): every real edge block (child row not 0) writes the `block_size` slots from its `pfids` entry.
-        Computed once per partition."""
+        """The `param_flows` slots a parameter-flow partition (a forward one) writes, as sorted disjoint `[start, end)`
+        ranges (int64 [n, 2], host): every real edge block (child row not 0) writes the `block_size` slots from its
+        `pfids` entry. Computed once per partition."""
         cache = self.__dict__.setdefault("_pf_slot_ranges", {})
         ranges = cache.get(partition_id)
         if ranges is None:
@@ -3038,21 +3042,23 @@ class SumLayer(Layer, nn.Module):
 
     def param_flow_slot_plan(self, batch_size: int, pflow_temperature: float, propagation_alg: str, defer: bool,
                              mode = None):
-        """Per backward partition `(ranges, capable)`: the slots it writes (`param_flow_slot_ranges`) and whether its
+        """Per parameter-flow partition -- the forward's (`partitioned_pfids`: the parameter flows are computed over
+        them, `backward`) -- `(ranges, capable)`: the slots it writes (`param_flow_slot_ranges`) and whether its
         kernel can STORE them -- the pass's first writer of a slot then folds the buffer's reset into its write, and
         the circuit zeroes only what no storing writer covers (`TensorCircuit._plan_param_flow_stores`). Capable: the
         block-sparse regime (batch at least `_BLOCK_SPARSE_PAR_MIN_BATCH`; 16 with an external hook, which keeps the
         small-batch path), no external-parameter hook (its kernels accumulate), untempered flows, tiles of 8 or more
         (the dot kernels; csmm2 adds atomically), collision-free slots (the read-add-store kernel, or the CUDA kernel's
-        store mode) and no deferral (a deferred tied group's flush adds at the end of the pass). The same conditions
+        store mode) and, for a layer with tied nodes, no deferral (a deferred tied group's flush adds at the end of the
+        pass). The same conditions
         the dispatch applies, so a partition told to store runs a storing kernel; a path it mispredicts resets the slots
         itself (`_pf_reset`). An external-parameter layer's partitions (its hooks accumulate) and a backward forced to
         another `mode` are never capable."""
         out = []
         alg_id = self.propagation_alg_mapping[propagation_alg]
-        if getattr(self, "external_params", None) is not None or (mode is not None and mode != "block_sparse"):
-            return [(self.param_flow_slot_ranges(p), False) for p in range(self.num_bk_partitions)]
-        for partition_id in range(self.num_bk_partitions):
+        if getattr(self, "parameterization", None) is not None or (mode is not None and mode != "block_sparse"):
+            return [(self.param_flow_slot_ranges(p), False) for p in range(self.num_fw_partitions)]
+        for partition_id in range(self.num_fw_partitions):
             ranges = self.param_flow_slot_ranges(partition_id)
             nids, cids, pids, pfids = (self.partitioned_nids[partition_id], self.partitioned_cids[partition_id],
                                        self.partitioned_pids[partition_id], self.partitioned_pfids[partition_id])
@@ -3064,7 +3070,9 @@ class SumLayer(Layer, nn.Module):
             if capable:
                 tm, tk, tb = self._par_tile_sizes(batch_size, num_edges, alg_id)
                 capable = tm >= 8 and tk >= 8 and tb >= 8
-            if capable and defer:
+            if capable and defer and any(ns.is_tied() for ns in self.nodes):
+                # (a tied layer's group may defer: its flush adds at the pass's end. An untied layer stores -- a source
+                # whose copies' group it joins after all resets its slots first, `_defer`, as a mispredicted path does)
                 ctx = dict(partition_id = partition_id, batch_size = batch_size, block_size = self.block_size,
                            num_edges = num_edges, nids = nids, cids = cids, pids = pids, pfids = pfids)
                 capable = not deferred_par.may_defer(cuda_kernels.get_par_deferred_module(), ctx, 1)
@@ -3331,11 +3339,22 @@ class SumLayer(Layer, nn.Module):
         # autotune timing runs never corrupt the live param_flows (the kernel is read-accumulate-write).
         # Only intercepts when CUDA wins; Triton / unsupported shapes fall through to the dispatch below
         # (which keeps the OOM-retry path). See BACKWARD_PAR_FLOW_CUDA.
-        if (BACKWARD_PAR_FLOW_CUDA and propagation_alg_id == 0 and abs(pflow_temperature - 1.0) < 1e-6
-                and allow_modify_flows == 0 and logspace_flows and not allow_neg_flows and not negate_pflows
-                and not force_use_fp32
-                and self.block_size % 64 == 0 and num_edges % 128 == 0 and batch_size % 32 == 0
-                and node_flows.is_cuda and cuda_kernels.par_is_available()):
+        # The tied deferral below (`deferred_par`) takes the same regime and tables, at shapes of its own: edges in 64s,
+        # node blocks in 64s or -- one operand group of node blocks of the same children -- in 32s, at any batch
+        # (`deferred_par.may_defer`: its slots pad the batch) -- where only those hold,
+        # the path is taken for the deferral alone, the per-step kernel the Triton one (MEASURED, a tied HMM-8192 in
+        # blocks of 64 or 128 at batch 16, the CUDA kernel's `batch % 32` short: never deferred, `try_defer` not called)
+        par_regime = (BACKWARD_PAR_FLOW_CUDA and propagation_alg_id == 0 and abs(pflow_temperature - 1.0) < 1e-6
+                      and allow_modify_flows == 0 and logspace_flows and not allow_neg_flows and not negate_pflows
+                      and not force_use_fp32 and node_flows.is_cuda)
+        par_cuda_shape = (par_regime and self.block_size % 64 == 0 and num_edges % 128 == 0 and batch_size % 32 == 0
+                          and cuda_kernels.par_is_available())
+        par_defer_only = (par_regime and not par_cuda_shape and self.block_size % 32 == 0 and num_edges % 64 == 0
+                          and self._ext_bw_par_hook is None and self._ext_bw_par_triton_hook is None
+                          and deferred_par.may_defer(cuda_kernels.get_par_deferred_module(),
+                                                     dict(batch_size = batch_size, block_size = self.block_size,
+                                                          num_edges = num_edges, nids = nids, cids = cids), 1))
+        if par_cuda_shape or par_defer_only:
             par_sig = id(pfids)
             cache = self._cached_bk_par_cuda.get(par_sig)
             if cache is None:
@@ -3391,6 +3410,8 @@ class SumLayer(Layer, nn.Module):
 
                 def _choice(param_flows, t):
                     """The faster of the CUDA kernel and the Triton default, measured once per (partition, batch)."""
+                    if not par_cuda_shape:
+                        return "triton"                     # (the deferral's shapes alone: not the CUDA kernel's)
                     choice = self._cached_bk_par_choice.get(choice_key)
                     if choice is None:
                         # autotune into a scratch clone (corruption-safe; the kernel is read-accumulate-write).
@@ -3420,12 +3441,14 @@ class SumLayer(Layer, nn.Module):
                 blk = self.block_size
 
                 def _defer(param_flows, t):
-                    if defers and pf_planned:
-                        self._pf_reset(partition_id, param_flows)   # (the deferred flush accumulates at the pass's end)
                     sc = self.__dict__.get("_bk_stream_children")
                     done = defers and deferred_par.try_defer(pd_mod, self, dict(ctx, param_flows = param_flows,
                                                                                 children = sc, **t),
                                                              None, None, blk, blk, 0, 1)
+                    if done and pf_planned:
+                        # (the deferred flush accumulates at the pass's end: slots the plan left to this partition's
+                        # store reset -- once the deferral took the call; one it declines stores them, as planned)
+                        self._pf_reset(partition_id, param_flows)
                     if sc is not None and not done:
                         # (the product layer below fused, these flows not deferred after all -- a call whose deferral
                         # declines: the per-step kernels read the element values, formed here as its forward forms
@@ -3832,7 +3855,7 @@ class SumLayer(Layer, nn.Module):
         # The EXTERNAL hook is offered before `_par_flow_collision_free` is consulted, unlike the
         # shared-parameter kernel below it. That predicate decides whether THIS layer's own kernel may
         # use its non-atomic write; an external parameterization owns its write and decides for itself
-        # (`BlockScaleSumParams` picks a padding mask and/or an atomic accumulate from the same
+        # (`BlockScale` picks a padding mask and/or an atomic accumulate from the same
         # information). Leaving the hook behind the test meant the two things that defeat it --
         # parameter tying, and the padding of a ragged layer -- made the gated backward RAISE at
         # batch < 16 rather than be served, even though the descriptor could serve it. A homogeneous

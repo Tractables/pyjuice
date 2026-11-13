@@ -1,7 +1,7 @@
 """
 The decoder against a hand computation: small circuits built from explicit parameters -- an HMM, and a tree whose root
 has two groups of children -- their polynomials written out in float64 numpy, every completion of the free positions
-enumerated and filtered by the constraint. Gated sums (:class:`~pyjuice.nodes.external_params.BlockScaleSumParams`,
+enumerated and filtered by the constraint. Gated sums (:class:`~pyjuice.parameterizations.BlockScale`,
 node and child gates of a block or finer) and :class:`~pyjuice.nodes.distributions.SoftEvidenceCategorical` inputs
 (dense, top-k, value mask), per row or one row for all.
 
@@ -24,7 +24,8 @@ import torch
 import pyjuice as juice
 import pyjuice.constraints as jc
 import pyjuice.nodes.distributions as dists
-from pyjuice.nodes import BlockScaleSumParams, inputs, multiply, summate
+from pyjuice.nodes import inputs, multiply, summate
+from pyjuice.parameterizations import BlockScale
 
 V, N_VARS, B = 3, 4, 3
 DEV = torch.device("cuda:0")
@@ -51,9 +52,9 @@ class _Sum:
         self.C = sum(c.num_nodes for c in chs)
         self.theta = _softmax_rows(rng.normal(size = (N, self.C)) * 1.5)
         self.gate = gate
-        ext = None if gate is None else BlockScaleSumParams(block_size = None if gate[0] == bs else gate[0],
+        ext = None if gate is None else BlockScale(block_size = None if gate[0] == bs else gate[0],
                                                              ch_block_size = gate[1])
-        self.ns = summate(*chs, num_node_blocks = N // bs, block_size = bs, external_params = ext)
+        self.ns = summate(*chs, num_node_blocks = N // bs, block_size = bs, parameterization = ext)
         self.ns.set_params(torch.tensor(self.theta, dtype = torch.float32))
 
     def weights(self, lphi):

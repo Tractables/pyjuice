@@ -2,6 +2,7 @@ import pyjuice.graph
 import pyjuice.nodes
 import pyjuice.distributions
 import pyjuice.layer
+import pyjuice.parameterizations
 import pyjuice.structures
 import pyjuice.optim
 import pyjuice.transformations
@@ -14,7 +15,7 @@ import pyjuice.constraints
 from pyjuice.model import compile, TensorCircuit
 
 # TensorCircuit layers
-from pyjuice.layer import InputLayer, ProdLayer, SumLayer, ExternalParamsSumLayer
+from pyjuice.layer import InputLayer, ProdLayer, SumLayer, ParameterizedSumLayer
 
 # Kernel launch-config autotuning (on by default; see `layer/kernels/autotune.py`)
 from pyjuice.layer import set_autotune
