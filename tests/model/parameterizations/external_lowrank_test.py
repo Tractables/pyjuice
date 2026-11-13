@@ -836,8 +836,18 @@ def _same(x, y, rtol, atol, grad_scale = None):
 
 
 #: The fused exp_sum kernels' tolerances against the torch passes: `precision = "fp32"` (three-term TF32) as fp32;
-#: the default (bf16 products) the same but for the gradients, a share of their largest entry
-FUSED_TOL = {"fp32": dict(rtol = 2e-4, atol = 2e-5), "auto": dict(rtol = 2e-4, atol = 2e-5, grad_scale = 2e-2)}
+#: the default (bf16 products) the same but for the gradients, a share of their largest entry; the default at rank 16
+#: (`"h"`: the exp_sum of the fp16-ROUNDED factors, `lowrank_exp_sum_h.cu` -- each phi ~2^-11 |A| |B| off the
+#: unrounded one's: values ~1e-3 nats a layer, F+ and W ~5e-3, the gradients a few 1e-3 of their largest entry; the
+#: kernels against the rounded factors' float64 are tested on their own, tightly)
+FUSED_TOL = {"fp32": dict(rtol = 2e-4, atol = 2e-5), "auto": dict(rtol = 2e-4, atol = 2e-5, grad_scale = 2e-2),
+             "h": dict(rtol = 1e-2, atol = 2e-3, grad_scale = 1e-2)}
+
+
+def _fused_tol(rank, precision):
+    """`FUSED_TOL` for a run of the fused kernels at `rank` and `precision`: the fp16-rounded factors' at rank 16 and
+    the default precision (`lowrank.forward.exp_sum_h`)."""
+    return FUSED_TOL["h" if rank == 16 and precision != "fp32" else precision]
 
 
 @needs_virtual
@@ -3302,20 +3312,31 @@ needs_fused = pytest.mark.skipif(not _fused_available(), reason = "the exp_sum f
 
 
 def _fused_calls(monkeypatch):
-    """Every call of the fused kernels from now on, by name (the module wrapped where both passes look it up)."""
+    """Every call of the fused kernels from now on, by name -- the fp16-rounded factors' (`exp_sum_h_forward`, ...)
+    and the others' (`exp_sum_forward`, ...) -- the modules wrapped where both passes look them up."""
     import pyjuice.parameterizations.lowrank.forward as lr_forward
     import pyjuice.parameterizations.lowrank.backward as lr_backward
-    real, calls = lr_forward.exp_sum_module(), []
+    calls = []
 
     class Spy:
+        def __init__(self, real):
+            self.real = real
+
         def __getattr__(self, name):
-            fn = getattr(real, name)
+            fn = getattr(self.real, name)
             return lambda *a, **k: calls.append(name) or fn(*a, **k)
 
-    spy = Spy()
+    spy, real_h = Spy(lr_forward.exp_sum_module()), lr_forward.exp_sum_h_module()
+    spy_h = Spy(real_h) if real_h is not None else None
     monkeypatch.setattr(lr_forward, "exp_sum_module", lambda: spy)
     monkeypatch.setattr(lr_backward, "exp_sum_module", lambda: spy)
+    monkeypatch.setattr(lr_forward, "exp_sum_h_module", lambda: spy_h)
     return calls
+
+
+def _n_fused(calls, kind):
+    """The calls of either kernel family's `kind` ("forward", "backward") among `calls`."""
+    return calls.count(f"exp_sum_{kind}") + calls.count(f"exp_sum_h_{kind}")
 
 
 @needs_fused
@@ -3342,19 +3363,21 @@ def test_the_fused_exp_sum_is_the_torch_pass(name, rank, batch, precision, monke
         layer = pc.external_params_nodes[a]
         desc = _source(a).parameterization
         gridded += desc._geometry(layer, desc._info(layer, a), dev)["grid"] is not None
-    assert calls.count("exp_sum_forward") == gridded and calls.count("exp_sum_backward") == gridded, (calls, gridded)
+    assert _n_fused(calls, "forward") == gridded and _n_fused(calls, "backward") == gridded, (calls, gridded)
+    assert all(("_h_" in c) == (rank == 16 and precision != "fp32") for c in calls), calls
     monkeypatch.setattr(lr_forward, "EXP_SUM_FUSED", False)
     del calls[:]
     want = _passes(pc, sums, data, ext)
     assert calls == []
-    _same(got, want, **FUSED_TOL[precision])
+    _same(got, want, **_fused_tol(rank, precision))
 
     # Without parameter flows: the element flows and the gradients alone, nothing accumulated -- the gradients those
     # of the run with them, to the bit (the same kernels' products and sums)
     monkeypatch.setattr(lr_forward, "EXP_SUM_FUSED", True)
     again = _passes(pc, sums, data, ext, param_flows = False)
     assert float(again["fp"].abs().sum()) == 0.0 and float(pc.denom_param_flows.abs().sum()) == 0.0
-    assert torch.allclose(again["flows"].exp(), want["flows"].exp(), rtol = 2e-4, atol = 2e-5)
+    tol = _fused_tol(rank, precision)
+    assert torch.allclose(again["flows"].exp(), want["flows"].exp(), rtol = tol["rtol"], atol = tol["atol"])
     for k in ("dA", "dB"):
         for a, b in zip(again[k], got[k]):
             assert torch.allclose(a, b, rtol = 1e-5, atol = 1e-7)
@@ -3404,15 +3427,15 @@ def test_the_fused_exp_sum_on_many_tiles(L, bs, rank, batch, zsplit, precision, 
     ext = {a: _factors(a, rank, batch, dev, spread = 0.6, seed = 80 + i) for i, a in enumerate(sums)}
     calls = _fused_calls(monkeypatch)
     got = _passes(pc, sums, data, ext)
-    assert calls.count("exp_sum_forward") == len(sums) and calls.count("exp_sum_backward") == len(sums), calls
+    assert _n_fused(calls, "forward") == len(sums) and _n_fused(calls, "backward") == len(sums), calls
     monkeypatch.setattr(lr_forward, "EXP_SUM_FUSED", False)
     want = _passes(pc, sums, data, ext)
-    _same(got, want, **FUSED_TOL[precision])
+    _same(got, want, **_fused_tol(rank, precision))
 
 
 @needs_fused
 @pytest.mark.parametrize("precision", ["auto", "fp32"])
-@pytest.mark.parametrize("rank", [4, 24])
+@pytest.mark.parametrize("rank", [4, 16, 24])
 def test_the_fused_exp_sum_reads_bf16_parameters(rank, precision, monkeypatch):
     """A circuit whose parameters are bf16 (`param_dtype`): the fused kernels read them as the torch passes do (the
     same values, widened) -- values, flows, denominators and gradients those of the torch passes."""
@@ -3428,10 +3451,10 @@ def test_the_fused_exp_sum_reads_bf16_parameters(rank, precision, monkeypatch):
     ext = {a: _factors(a, rank, 6, dev, spread = 0.5, seed = 90 + i) for i, a in enumerate(sums)}
     calls = _fused_calls(monkeypatch)
     got = _passes(pc, sums, data, ext)
-    assert calls.count("exp_sum_forward") == len(sums) and calls.count("exp_sum_backward") == len(sums), calls
+    assert _n_fused(calls, "forward") == len(sums) and _n_fused(calls, "backward") == len(sums), calls
     monkeypatch.setattr(lr_forward, "EXP_SUM_FUSED", False)
     want = _passes(pc, sums, data, ext)
-    _same(got, want, **FUSED_TOL[precision])
+    _same(got, want, **_fused_tol(rank, precision))
 
 
 @needs_fused
@@ -3588,6 +3611,262 @@ def test_the_fused_exp_sum_forward_with_mostly_zero_parameters(rank, batch, prec
     assert torch.isfinite(nmars).all() and torch.isfinite(lzs).all()
     assert float((nmars.t().double().cpu() - ln).abs().max()) < 1e-3
     assert float((lzs.t().double().cpu() - lz).abs().max()) < 1e-3
+
+
+def _fused_h_module():
+    """The fp16-rounded factors' kernels (`lowrank_exp_sum_h.cu`), or None (no GPU, not built)."""
+    if not torch.cuda.is_available():
+        return None
+    from pyjuice.parameterizations.lowrank.kernels.c import get_exp_sum_h_module
+    return get_exp_sum_h_module()
+
+
+needs_fused_h = pytest.mark.skipif(not torch.cuda.is_available(), reason = "the fp16 exp_sum kernels need a GPU")
+LOG2E, LN2 = 1.4426950408889634, 0.6931471805599453
+
+
+def _h_case(M, N, B, bs = 32, cbs = 32, gain = 1.0, pdtype = torch.float32, theta_zero = 0.0, seed = 0):
+    """A node vector's inputs at rank 16 on the GPU: theta ~ softmax(4 randn) (a share zeroed, every node keeping its
+    first child) block-major in `params` from 448 on, router-like factors (B centered over the children, each A row
+    at `gain` standard deviations of phi), child values ~ N(0, 9), node flows Dirichlet(1) a sample."""
+    dev = torch.device("cuda:0")
+    g = torch.Generator(device = dev).manual_seed(seed)
+    f64 = torch.float64
+    theta = torch.softmax(4.0 * torch.randn(M, N, device = dev, generator = g, dtype = f64), dim = -1)
+    if theta_zero > 0:
+        theta = theta * (torch.rand(M, N, device = dev, generator = g, dtype = f64) > theta_zero)
+        theta[:, 0] += 0.01
+    Bf = 4.0 * torch.randn(B, 16, N, device = dev, generator = g, dtype = f64)
+    Bf = Bf - Bf.mean(-1, keepdim = True)
+    A = torch.randn(B, M, 16, device = dev, generator = g, dtype = f64)
+    C = Bf @ Bf.transpose(-1, -2) / N
+    A = gain * A / torch.sqrt(((A @ C) * A).sum(-1, keepdim = True))
+    Nb = N // cbs
+    ii, jj = torch.meshgrid(torch.arange(M, device = dev), torch.arange(N, device = dev), indexing = "ij")
+    off = ((ii // bs) * Nb + jj // cbs) * (cbs * bs) + (jj % cbs) * bs + ii % bs
+    p0 = 448
+    params = torch.zeros(p0 + M * N, device = dev, dtype = f64)
+    params[p0 + off.reshape(-1)] = theta.reshape(-1)
+    params = params.to(pdtype)
+    emars = torch.full([N + 5, B], -float("inf"), device = dev)
+    emars[3:3 + N] = (3.0 * torch.randn(B, N, device = dev, generator = g, dtype = f64)).t().float()
+    lf = torch.log(torch.distributions.Dirichlet(torch.ones(M, device = dev, dtype = f64)).sample((B,)))
+    return dict(A = A.float().contiguous(), Bf = Bf.float().contiguous(), params = params, p0 = p0, Nb = Nb, cbs = cbs,
+                bs = bs, emars = emars, rows = torch.arange(N, device = dev) + 3, M = M, N = N, B = B, off = off,
+                theta = params[p0 + off.reshape(-1)].double().view(M, N), c = emars[3:3 + N].double().t(), lf = lf)
+
+
+def _h_run(mod, d, A = None, Bf = None, grads = None):
+    """The fp16 forward then backward on `_h_case`'s inputs (A, B as given: in place where they are views; the
+    gradients added into `grads`): (node values [B, M], log Z [B, M], log element flows [B, N], F+ [M, N], W [M, N],
+    dA, dB)."""
+    A = d["A"] if A is None else A
+    Bf = d["Bf"] if Bf is None else Bf
+    M, N, B, dev = d["M"], d["N"], d["B"], d["A"].device
+    nm = torch.full([11 + M, B], 123.0, device = dev)
+    lz = mod.exp_sum_h_forward(A, Bf, d["params"], d["p0"], d["Nb"], d["cbs"], d["bs"], d["emars"], d["rows"], nm, 11,
+                               M, N, 16, 64, [])
+    assert bool((nm[:11] == 123.0).all())                  # (only the node vector's rows written)
+    nflows = torch.full_like(nm, -float("inf"))
+    nflows[11:11 + M] = d["lf"].t().float()
+    ef = torch.full_like(d["emars"], -float("inf"))
+    pf = torch.zeros(d["p0"] + M * N, device = dev)
+    dn = torch.zeros_like(pf)
+    gA, gB = grads if grads is not None else (torch.zeros(B, M, 16, device = dev), torch.zeros(B, 16, N, device = dev))
+    mod.exp_sum_h_backward(A, Bf, d["params"], d["p0"], d["Nb"], d["cbs"], d["bs"], d["emars"], d["rows"], nflows, nm,
+                           11, lz.contiguous(), ef, pf, 0, dn, 0, gA, gB, M, N, 16)
+    off = d["off"]                                          # (F+ and W from offset 0 of their buffers)
+    return nm[11:].t(), lz.t(), ef[3:3 + N].t(), pf[off], dn[off], gA, gB
+
+
+def _h_reference(d):
+    """`_h_run`'s outputs in float64 from the same fp16-rounded factors: A' = log2 e A, B rounded once."""
+    A2 = (d["A"] * LOG2E).half().double()
+    Bf = d["Bf"].half().double()
+    th = d["theta"]
+    lt = torch.where(th > 0, th.log(), torch.full_like(th, -float("inf")))
+    lw = (A2 @ Bf) * LN2 + lt[None]                         # natural log of theta exp(phi)
+    lz = torch.logsumexp(lw, dim = 2)
+    ls = torch.logsumexp(lw + d["c"][:, None, :], dim = 2)
+    ln = ls - lz
+    lf = d["lf"]
+    q = torch.exp(lw + (lf - ls)[:, :, None] + d["c"][:, None, :])
+    t = torch.exp(lw + (lf - lz)[:, :, None])
+    W = torch.where(th > 0, t.sum(0) / th, torch.zeros_like(th))
+    G = q - t
+    return ln, lz, torch.log(q.sum(1)), q.sum(0), W, G @ Bf.transpose(1, 2), (A2 * LN2).transpose(1, 2) @ G
+
+
+@needs_fused_h
+@pytest.mark.parametrize("case", [dict(M = 512, N = 512, B = 8), dict(M = 512, N = 512, B = 6, pdtype = torch.bfloat16),
+                                  dict(M = 500, N = 488, B = 5, bs = 4, cbs = 8), dict(M = 256, N = 384, B = 4, gain = 3.0),
+                                  dict(M = 256, N = 512, B = 4, theta_zero = 0.7)])
+def test_the_fp16_exp_sum_is_the_rounded_factors_exp_sum(case):
+    """The default precision's kernels at rank 16 (`lowrank_exp_sum_h.cu`) compute the exp_sum of the fp16-ROUNDED
+    factors with fp32 sums: every output against float64 from the same rounded factors -- node values and log Z,
+    element flows, F+, W to fp32 rounding (the shifted forward, the per-sample flow scale), the gradients to the
+    fp16 products' (G, B, A' fp16 in their MMAs) -- on fp32 and bf16 parameters, ragged tiles (500 x 488 in blocks
+    of 4 x 8), large phi (`gain`), 70% of theta 0."""
+    mod = _fused_h_module()
+    if mod is None:
+        pytest.skip("the fp16 exp_sum kernels are not built")
+    d = _h_case(**case)
+    got = _h_run(mod, d)
+    want = _h_reference(d)
+    for k, name in enumerate(("values", "log Z", "element flows")):
+        x, y = got[k].double(), want[k]
+        assert torch.equal(torch.isfinite(x), torch.isfinite(y)), name
+        fin = torch.isfinite(y)
+        assert float((x - y)[fin].abs().max()) < 2e-5, (name, float((x - y)[fin].abs().max()))
+    for k, name in ((3, "F+"), (4, "W")):
+        x, y = got[k].double(), want[k]
+        sig = y.abs() > 1e-6 * y.abs().max()
+        r = ((x - y).abs() / y.abs())[sig]
+        assert float(r.median()) < 1e-5 and float(r.max()) < 2e-4, (name, float(r.median()), float(r.max()))
+        if bool((~sig).any()):
+            assert float(x[~sig].abs().max()) <= 2e-6 * float(y.abs().max()), name
+    for k, name in ((5, "dA"), (6, "dB")):
+        x, y = got[k].double(), want[k]
+        assert float((x - y).abs().max()) <= 2e-3 * float(y.abs().max()), (name, float((x - y).abs().max() / y.abs().max()))
+
+
+@needs_fused_h
+def test_the_fp16_exp_sum_reads_the_callers_tensors_where_they_lie():
+    """The fp16 kernels take the factors and add the gradients where the caller's tensors lie -- views at a sample
+    stride past their block (read in place, `LowRank.reads_in_place`) -- the outputs those of contiguous copies: the
+    forward's bit for bit, the atomically summed ones (element flows, F+ and W where a tile's samples are split
+    between CTAs, the gradients) to their order's rounding; nothing outside the views touched."""
+    mod = _fused_h_module()
+    if mod is None:
+        pytest.skip("the fp16 exp_sum kernels are not built")
+    d = _h_case(500, 488, 5, bs = 4, cbs = 8)
+    B, M, N = d["B"], d["M"], d["N"]
+    dev = d["A"].device
+    bigA = torch.randn(B, M + 5, 16, device = dev)
+    bigA[:, 3:3 + M] = d["A"]
+    bigB = torch.randn(B, 18, N, device = dev)
+    bigB[:, 1:17] = d["Bf"]
+    gbA = torch.full((B, M + 5, 16), 7.0, device = dev)
+    gbB = torch.full((B, 18, N), 7.0, device = dev)
+    gA, gB = gbA[:, 3:3 + M], gbB[:, 1:17]
+    gA.zero_()
+    gB.zero_()
+    assert not bigA[:, 3:3 + M].is_contiguous() and not gB.is_contiguous()
+    got = _h_run(mod, d, A = bigA[:, 3:3 + M], Bf = bigB[:, 1:17], grads = (gA, gB))
+    want = _h_run(mod, d)
+    for k in (0, 1):
+        assert torch.equal(got[k], want[k]), k
+    for k in (3, 4):
+        assert float((got[k] - want[k]).abs().max()) <= 1e-5 * float(want[k].abs().max()), k
+    fin = torch.isfinite(want[2])
+    assert torch.equal(torch.isfinite(got[2]), fin) and float((got[2] - want[2])[fin].abs().max()) < 1e-5
+    for k in (5, 6):
+        assert float((got[k] - want[k]).abs().max()) <= 1e-5 * float(want[k].abs().max()), k
+    for rest in (gbA[:, :3], gbA[:, 3 + M:], gbB[:, 0], gbB[:, 17]):
+        assert bool((rest == 7.0).all())
+
+
+@needs_fused_h
+@pytest.mark.parametrize("batch", [4, 100])
+def test_the_fp16_exp_sum_forward_off_its_frames(batch):
+    """The fp16 forward's rare paths: a tile whose large weights and large child values sit on different children
+    (rank 0 puts every other child's scale at e^-95, every other child's value 100 nats down: the factorized S is 0
+    though S is not -- the tile made again exactly), and half the nodes' terms flushed under their row's frame or
+    past 2^100 (rank 0 at -95 or +80 for the even nodes: the shifted sums). Node values and log Z against float64 from
+    the same fp16-rounded factors."""
+    mod = _fused_h_module()
+    if mod is None:
+        pytest.skip("the fp16 exp_sum kernels are not built")
+    dev = torch.device("cuda:0")
+    M = N = 128
+    bs = cbs = 32
+    for kind in ("apart", "low", "high"):
+        g = torch.Generator(device = "cpu").manual_seed(3)
+        A = 0.3 * torch.randn(batch, M, 16, generator = g)
+        Bm = 0.3 * torch.randn(batch, 16, N, generator = g)
+        emars = -5.0 + torch.randn(N, batch, generator = g)
+        if kind == "apart":
+            A[:, :, 0] = 1.0
+            Bm[:, 0, 0::2] = -95.0
+            Bm[:, 0, 1::2] = 0.0
+            emars[1::2] -= 100.0
+        else:
+            A[:, :, 0] = 0.0
+            A[:, 0::2, 0] = 1.0
+            Bm[:, 0, :] = -95.0 if kind == "low" else 80.0
+        theta = torch.rand(M, N, generator = g).add_(0.05)
+        theta = theta / theta.sum(1, keepdim = True)
+        params = theta.view(M // bs, bs, N // cbs, cbs).permute(0, 2, 3, 1).contiguous().view(-1).to(dev)
+        nmars = torch.empty(M, batch, device = dev)
+        lzs = mod.exp_sum_h_forward(A.to(dev).contiguous(), Bm.to(dev).contiguous(), params, 0, N // cbs, cbs, bs,
+                                    emars.to(dev).contiguous(), torch.arange(N, device = dev), nmars, 0, M, N, 16, 64, [])
+        A2 = (A * LOG2E).half().double()
+        lw = torch.bmm(A2, Bm.half().double()) * LN2 + theta.double().log()[None]
+        lz = torch.logsumexp(lw, 2)
+        ln = torch.logsumexp(lw + emars.t().double()[:, None, :], 2) - lz
+        assert torch.isfinite(nmars).all() and torch.isfinite(lzs).all(), kind
+        assert float((nmars.t().double().cpu() - ln).abs().max()) < 1e-4, (kind, float((nmars.t().double().cpu() - ln).abs().max()))
+        assert float(((lzs.t().double().cpu() - lz) / lz.abs().clamp_min(1.0)).abs().max()) < 1e-5, kind
+
+
+@needs_fused
+def test_the_fp16_forward_makes_a_runs_theta_once_a_pass(monkeypatch):
+    """The fp16 forward's tiles' theta fragments are made once a forward pass for the node vectors reading the same
+    parameters (tied copies: `exp_sum_h_theta`, kept on the pass's staged tensors), again the next pass -- the
+    outputs those of fragments made for each node vector."""
+    import pyjuice.parameterizations.lowrank.forward as lr_forward
+
+    if _fused_h_module() is None:
+        pytest.skip("the fp16 exp_sum kernels are not built")
+    pc, sums, _, _, _, _ = _pair(_hmm_blocks(160, 32), "exp_sum", rank = 16)
+    dev = pc.params.device
+    torch.manual_seed(13)
+    data = torch.randint(0, NUM_CATS, (6, pc.num_vars), device = dev)
+    ext = {a: _factors(a, 16, 6, dev, spread = 0.6, seed = 70 + i) for i, a in enumerate(sums)}
+    calls = _fused_calls(monkeypatch)
+    got = _passes(pc, sums, data, ext)
+    assert calls.count("exp_sum_h_theta") == 1 and calls.count("exp_sum_h_forward") == len(sums) > 1, calls
+    for a in sums:                                         # (rank 16: the factors read in place, the caller's own)
+        assert all(t.data_ptr() == u.data_ptr() for t, u in zip(pc._staged_external_params[a], ext[a]))
+    del calls[:]
+    again = _passes(pc, sums, data, ext)
+    assert calls.count("exp_sum_h_theta") == 1, calls
+    real = lr_forward.exp_sum_h_theta
+    monkeypatch.setattr(lr_forward, "exp_sum_h_theta", lambda geo, params, kwargs: real(geo, params, {}))
+    del calls[:]
+    alone = _passes(pc, sums, data, ext)
+    assert calls.count("exp_sum_h_theta") == len(sums), calls
+    for k in ("lls", "mars"):
+        assert torch.equal(got[k], alone[k]) and torch.equal(again[k], alone[k]), k
+
+
+@needs_fused_h
+def test_the_fp16_exp_sum_in_chunks_is_the_whole_batchs():
+    """A batch whose working set exceeds the L2 runs the fp16 passes a chunk of samples at a time: every output
+    against the same passes over the batch's slices -- the forward's node values and log Z bit for bit (a sample's
+    work is the same in any chunk; the tiles' theta made once a call), the backward's sums over samples and tiles to
+    fp32 (atomic adds in any order)."""
+    mod = _fused_h_module()
+    if mod is None:
+        pytest.skip("the fp16 exp_sum kernels are not built")
+    d = _h_case(1024, 1024, 420)
+    whole = _h_run(mod, d)
+    parts = []
+    for lo, hi in ((0, 140), (140, 280), (280, 420)):
+        e = dict(d, A = d["A"][lo:hi].contiguous(), Bf = d["Bf"][lo:hi].contiguous(), B = hi - lo,
+                 emars = d["emars"][:, lo:hi].contiguous(), lf = d["lf"][lo:hi])
+        parts.append(_h_run(mod, e))
+    for k in (0, 1):
+        assert torch.equal(whole[k], torch.cat([p[k] for p in parts], 0)), k
+    ef = torch.cat([p[2] for p in parts], 0)
+    fin = torch.isfinite(ef)
+    assert torch.equal(torch.isfinite(whole[2]), fin) and float((whole[2] - ef)[fin].abs().max()) < 1e-5
+    for k in (3, 4):
+        want = sum(p[k] for p in parts)
+        assert float((whole[k] - want).abs().max()) <= 1e-5 * float(want.abs().max()), k
+    for k in (5, 6):
+        want = torch.cat([p[k] for p in parts], 0)
+        assert float((whole[k] - want).abs().max()) <= 1e-5 * float(want.abs().max()), k
 
 
 @needs_virtual

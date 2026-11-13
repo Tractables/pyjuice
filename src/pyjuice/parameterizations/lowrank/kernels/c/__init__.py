@@ -83,6 +83,47 @@ def get_exp_sum_module():
     return _exp_sum_module
 
 
+_exp_sum_h_module = None
+_exp_sum_h_attempted = False
+
+
+def get_exp_sum_h_module():
+    """The "exp_sum" form's fused passes at the default precision from fp16-rounded factors (`lowrank_exp_sum_h.cu`:
+    phi one fp16 MMA a tile), or None if unavailable (warns once; silently below compute capability 9.0, whose bulk
+    copies and tensor-map reduces they take): the bf16 three-term passes of `lowrank_exp_sum.cu` then serve. Plain
+    CUDA."""
+    global _exp_sum_h_module, _exp_sum_h_attempted
+
+    if _exp_sum_h_attempted:
+        return _exp_sum_h_module
+
+    _exp_sum_h_attempted = True
+
+    if not ENABLE_CUDA_KERNELS:
+        return None
+
+    import torch
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() < (9, 0):
+        return None
+
+    flags = _compile_flags()
+    if flags is None:
+        return None
+
+    from pyjuice.utils.cuda_ext import jit_load
+    try:
+        _exp_sum_h_module = jit_load(
+            "pyjuice_lowrank_exp_sum_h_cuda",
+            sources = [os.path.join(_THIS_DIR, "lowrank_exp_sum_h.cu")],
+            extra_cuda_cflags = flags, verbose = False)
+    except Exception as e:
+        warnings.warn(
+            f"pyjuice CUDA kernel 'pyjuice_lowrank_exp_sum_h_cuda' failed to compile ({type(e).__name__}: {e}). "
+            "The exp_sum form keeps its bf16 three-term passes.", RuntimeWarning)
+        _exp_sum_h_module = None
+    return _exp_sum_h_module
+
+
 _fp8_module = None
 _fp8_attempted = False
 

@@ -4,6 +4,7 @@ import torch
 from typing import Optional
 
 from .sum_parameterization import SumParameterization
+from .lowrank import forward as lowrank_forward
 from .lowrank import virtual as lowrank_virtual
 from .lowrank.backward import _BackwardMixin
 from .lowrank.denominators import _DenominatorsMixin
@@ -168,8 +169,10 @@ class LowRank(_ForwardMixin, _BackwardMixin, _DenominatorsMixin, SumParameteriza
 
     def storage_shapes(self, ns, batch_size: int):
         """Stored as the caller gives them, `A [B, M, K]`, `B [B, K, N]`, either form, and the gradients in the same
-        layout. `"exp_sum"`: its fused kernels take a sample's block whole (`lowrank/kernels/c/lowrank_exp_sum.cu`),
-        the staging copy a plain copy. `"sum_exp"`: read IN PLACE by the forward (`reads_in_place`): the kernels that
+        layout. `"exp_sum"`: read IN PLACE at rank 16 (`reads_in_place`: its fp16-rounded factors' kernels take a
+        sample's block where it lies, `lowrank/kernels/c/lowrank_exp_sum_h.cu`), else the staging copy a plain copy
+        (its other fused kernels take a sample's block whole). `"sum_exp"`: read IN PLACE by the forward
+        (`reads_in_place`): the kernels that
         serve its one-launch forms take the caller's tensors as they are, the rest a batch-innermost copy -- `A [M, K,
         B]`, `B [K, N, B]`, as the circuit's own buffers are: their threads run over the samples -- made when first
         asked for in the pass (`lowrank/virtual.py`'s `_inner`), their gradients back the same way."""
@@ -179,8 +182,12 @@ class LowRank(_ForwardMixin, _BackwardMixin, _DenominatorsMixin, SumParameteriza
         return None
 
     def reads_in_place(self, ns) -> bool:
-        """`"sum_exp"`: the forward's staging hands the layers the caller's tensors themselves (no copy), where the
-        virtual batch can serve it (the CUDA extension built: `lowrank/virtual.py`); `"exp_sum"` copies."""
+        """The forward's staging hands the layers the caller's tensors themselves (no copy): `"sum_exp"` where the
+        virtual batch can serve it (the CUDA extension built: `lowrank/virtual.py`); `"exp_sum"` at rank 16 where the
+        fp16-rounded factors' kernels are built (`lowrank/forward.py`'s `exp_sum_h`: they take each sample's block
+        where it lies; at `precision = "fp32"` the TF32 kernels then take a contiguous copy), other ranks copied."""
+        if self.form == "exp_sum":
+            return lowrank_forward.EXP_SUM_H and self.rank == 16 and lowrank_forward.exp_sum_h_module() is not None
         return self.form == "sum_exp" and lowrank_virtual._module() is not None
 
     def initializes_grads(self, ns) -> bool:

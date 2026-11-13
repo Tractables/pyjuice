@@ -25,6 +25,12 @@ EXP_SUM_FUSED_RANK_MOST = 64
 #: atomically, a CTA holding them for its samples only) -- ranks to 8 and the TF32 path; the bf16 big tiles (ranks 9 ..
 #: 64) take it as their persistent CTAs' count at most (0: the GPU's)
 EXP_SUM_ZSPLIT = 0
+#: At rank 16 and the default precision, the kernels of the exp_sum of the fp16-ROUNDED factors
+#: (`kernels/c/lowrank_exp_sum_h.cu`: A' = log2 e A and B rounded to fp16 once, one MMA a 16 x 8 tile, fp32 sums) where
+#: the fused kernels serve (`exp_sum_h`); off, the bf16 three-term kernels of the unrounded factors
+EXP_SUM_H = True
+#: ... their forward's tiles' children (64 or 128)
+EXP_SUM_H_TN = 64
 
 
 def exp_sum_bf16(kwargs) -> bool:
@@ -38,11 +44,48 @@ def exp_sum_module():
     return get_exp_sum_module()
 
 
+def exp_sum_h_module():
+    """The fp16-rounded factors' kernels' module, or None (the bf16 three-term kernels then)."""
+    from .kernels.c import get_exp_sum_h_module
+    return get_exp_sum_h_module()
+
+
+def exp_sum_h(desc, kwargs) -> bool:
+    """Whether a node vector the fused kernels take (`exp_sum_fused`) goes through the fp16-rounded factors' kernels:
+    rank 16, the default precision, their module built (`EXP_SUM_H`)."""
+    return EXP_SUM_H and desc.rank == 16 and exp_sum_bf16(kwargs) and exp_sum_h_module() is not None
+
+
+def exp_sum_h_theta(geo, params, kwargs) -> list:
+    """The fp16 forward's tiles' theta fragments of a node vector's parameters (`exp_sum_h_theta`), made once a forward
+    pass for every node vector reading the same run -- tied copies -- and kept on the pass's staged-tensors mapping
+    (one a call: gone with it); keyed by the run, the geometry and the parameters' version. Not staged: made for the
+    node vector alone."""
+    from pyjuice.layer.parameterized_sum_layer import EXTERNAL_PARAMS_KWARG, StagedExternalParams
+    _, _, Nb, cbs, bs = geo["grid"]
+    make = lambda: exp_sum_h_module().exp_sum_h_theta(params, geo["p0"], Nb, cbs, bs, geo["M"], geo["N"], EXP_SUM_H_TN)
+    holder = kwargs.get(EXTERNAL_PARAMS_KWARG)
+    if not isinstance(holder, StagedExternalParams):
+        return make()
+    cache = holder.__dict__.setdefault("_lr_h_theta", {})
+    key = (params.data_ptr(), params._version, params.dtype, geo["p0"], geo["M"], geo["N"], Nb, cbs, bs, EXP_SUM_H_TN)
+    frags = cache.get(key)
+    if frags is None:
+        frags = cache[key] = make()
+    return frags
+
+
+def samples_contiguous(t: torch.Tensor) -> bool:
+    """`[B, X, Y]` whose samples each lie contiguous, at any batch stride: the caller's tensors as read in place."""
+    return t.dim() == 3 and (t.size(2) <= 1 or t.stride(2) == 1) and (t.size(1) <= 1 or t.stride(1) == t.size(2))
+
+
 def exp_sum_fused(desc, geo, tensors, params, node_mars, element_mars) -> bool:
     """Whether a node vector's pass goes through the "exp_sum" form's fused kernels: the form, a rank they hold, the
     shared parameters block-major in one run (`LowRank._geometry`'s grid), the circuit's buffers fp32 on a GPU of
-    compute capability 8.0 on (the kernels' MMAs), the parameters fp32 or bf16, the staged factors fp32 and
-    contiguous, and the module built."""
+    compute capability 8.0 on (the kernels' MMAs), the parameters fp32 or bf16, the factors fp32 with each sample's
+    block contiguous (the caller's, read in place: the bf16 / TF32 kernels take a contiguous copy), and the module
+    built."""
     if not (EXP_SUM_FUSED and desc.form == "exp_sum" and desc.rank <= EXP_SUM_FUSED_RANK_MOST
             and geo["grid"] is not None and node_mars.is_cuda):
         return False
@@ -51,7 +94,7 @@ def exp_sum_fused(desc, geo, tensors, params, node_mars, element_mars) -> bool:
     if node_mars.dtype != torch.float32 or element_mars.dtype != torch.float32 \
             or params.dtype not in (torch.float32, torch.bfloat16):
         return False
-    if not all(t.dtype == torch.float32 and t.is_contiguous() for t in tensors):
+    if not all(t.dtype == torch.float32 and samples_contiguous(t) for t in tensors):
         return False
     return exp_sum_module() is not None
 
@@ -94,13 +137,22 @@ class _ForwardMixin:
             form_elements(element_mars, node_mars, children)
 
         state = layer.__dict__["_lr_state"] = dict()
+        rounded = layer.__dict__["_lr_h"] = set()              # (the node vectors the fp16-rounded kernels took)
         for ns_info, tensors in ns_tensors:
             geo = self._geometry(layer, ns_info, node_mars.device)
             if exp_sum_fused(self, geo, tensors, params, node_mars, element_mars):
                 _, _, Nb, cbs, bs = geo["grid"]
-                lzs = exp_sum_module().exp_sum_forward(tensors[0], tensors[1], params, geo["p0"], Nb, cbs, bs,
-                                                       element_mars, geo["rows"], node_mars, ns_info.nid_start,
-                                                       geo["M"], geo["N"], self.rank, exp_sum_bf16(kwargs))
+                if exp_sum_h(self, kwargs):
+                    lzs = exp_sum_h_module().exp_sum_h_forward(tensors[0], tensors[1], params, geo["p0"], Nb, cbs, bs,
+                                                               element_mars, geo["rows"], node_mars, ns_info.nid_start,
+                                                               geo["M"], geo["N"], self.rank, EXP_SUM_H_TN,
+                                                               exp_sum_h_theta(geo, params, kwargs))
+                    rounded.add(id(ns_info.ns))
+                else:
+                    lzs = exp_sum_module().exp_sum_forward(tensors[0].contiguous(), tensors[1].contiguous(), params,
+                                                           geo["p0"], Nb, cbs, bs, element_mars, geo["rows"],
+                                                           node_mars, ns_info.nid_start, geo["M"], geo["N"],
+                                                           self.rank, exp_sum_bf16(kwargs))
                 state[id(ns_info.ns)] = lzs.t()                 # (`[B, M]` as the torch passes keep it: a view)
                 continue
             A, Bm = self._as_given(tensors)
