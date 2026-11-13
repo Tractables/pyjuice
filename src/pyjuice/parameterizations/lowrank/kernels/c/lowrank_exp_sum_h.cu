@@ -134,6 +134,9 @@ __device__ __forceinline__ void mbar_arrive(uint32_t a) {
 __device__ __forceinline__ void mbar_expect(uint32_t a, int bytes) {
     asm volatile("mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _, [%0], %1;" ::"r"(a), "r"(bytes) : "memory");
 }
+__device__ __forceinline__ void st_shared(uint32_t a, unsigned v) {
+    asm volatile("st.shared.u32 [%0], %1;" ::"r"(a), "r"(v) : "memory");
+}
 __device__ __forceinline__ void mbar_wait(uint32_t a, int parity) {
     asm volatile("{\n .reg .pred p;\n W_%=:\n mbarrier.try_wait.parity.shared::cta.b64 p, [%0], %1;\n @!p bra W_%=;\n}\n"
                  ::"r"(a), "r"(parity) : "memory");
@@ -149,20 +152,8 @@ __device__ __forceinline__ void tma_load_3d(uint32_t dst, const CUtensorMap* m, 
 }
 
 // ldmatrix / stmatrix (8 x 8 b16 matrices; lane i addresses row i % 8 of matrix i / 8)
+// (at shared addresses: one base and lane offsets, the steps' offsets immediates)
 __device__ __forceinline__ unsigned smem_u32(const void* p) { return (unsigned)__cvta_generic_to_shared(p); }
-__device__ __forceinline__ void ldsm4(unsigned (&r)[4], const void* p) {
-    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];"
-                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(smem_u32(p)) : "memory");
-}
-__device__ __forceinline__ void ldsm4t(unsigned (&r)[4], const void* p) {
-    asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];"
-                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(smem_u32(p)) : "memory");
-}
-__device__ __forceinline__ void ldsm2t(unsigned (&r)[2], const void* p) {
-    asm volatile("ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%0, %1}, [%2];"
-                 : "=r"(r[0]), "=r"(r[1]) : "r"(smem_u32(p)) : "memory");
-}
-// (the same at a shared address)
 __device__ __forceinline__ void ldsm4(unsigned (&r)[4], uint32_t a) {
     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];"
                  : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(a) : "memory");
@@ -174,9 +165,9 @@ __device__ __forceinline__ void ldsm4t(unsigned (&r)[4], uint32_t a) {
 __device__ __forceinline__ void ldsm2t(unsigned (&r)[2], uint32_t a) {
     asm volatile("ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%0, %1}, [%2];" : "=r"(r[0]), "=r"(r[1]) : "r"(a) : "memory");
 }
-__device__ __forceinline__ void stsm4t(void* p, unsigned a, unsigned b, unsigned c, unsigned d) {
+__device__ __forceinline__ void stsm4t(uint32_t p, unsigned a, unsigned b, unsigned c, unsigned d) {
     asm volatile("stmatrix.sync.aligned.m8n8.x4.trans.shared.b16 [%0], {%1, %2, %3, %4};"
-                 ::"r"(smem_u32(p)), "r"(a), "r"(b), "r"(c), "r"(d) : "memory");
+                 ::"r"(p), "r"(a), "r"(b), "r"(c), "r"(d) : "memory");
 }
 
 // node_mars[nid0 + i, b] = (log2 S - log2 Z) ln 2 (-inf where S is 0), lzs[i, b] = log2 Z ln 2, from the column
@@ -470,7 +461,7 @@ __global__ void __launch_bounds__((HNW + 1) * 32, 2) hf_fw_kernel(
     extern __shared__ __align__(128) unsigned char smraw[];
     const uint32_t sraw = (uint32_t)__cvta_generic_to_shared(smraw), sbase = (sraw + 1023u) & ~1023u;
     unsigned char* const sm = smraw + (sbase - sraw);         // (the stages 1024-byte aligned: the swizzles' frame)
-    const uint32_t bfull = sbase + NST * Gm::ST, bempty = bfull + NST * 8;
+    const uint32_t bfull = sbase + NST * Gm::ST, bempty = bfull + NST * 8, sguard = bempty + NST * 8;
     const int tid = threadIdx.x, lane = tid & 31, w = tid >> 5, g = lane >> 2, tq = lane & 3, lr = lane & 7, lq = lane >> 3;
     const long it0 = (long)blockIdx.x * total / gridDim.x, it1 = (long)(blockIdx.x + 1) * total / gridDim.x;
     if (it0 >= it1) return;
@@ -538,7 +529,8 @@ __global__ void __launch_bounds__((HNW + 1) * 32, 2) hf_fw_kernel(
     float lt[NT8][4], cm[2];
     bool live[2];
     int cur, jt, rA, rB, j0;
-    float4* pw;                                               // (row rA's partial of the item: part[b][jt][rA])
+    int pw;                                                   // (row rA's partial of the item: part[pw] = [b][jt][rA])
+    const int pstep = njt * Mp;
     int tile = (int)(it0 / B), b = (int)(it0 - (long)tile * B), st = 0, ph = 0;   // (counters: no division an item)
     const uint32_t a_ln = hf_a_at(16 * w + 8 * (lq & 1) + lr, lq >> 1);             // (the lane's ldmatrix rows)
     const uint32_t b_ln = Gm::A_BYTES + hf_b_base(8 * (lq & 1) + lr, lq >> 1);
@@ -549,7 +541,7 @@ __global__ void __launch_bounds__((HNW + 1) * 32, 2) hf_fw_kernel(
         j0 = jt * TN;
         rA = (tile / njt) * HTM + 16 * w + g;
         rB = rA + 8;
-        pw = part + ((long)b * njt + jt) * Mp + rA;
+        pw = (b * njt + jt) * Mp + rA;
         const float4* lp = LTF + ((long)tile * HNW + w) * NT8 * 32 + lane;
 #pragma unroll
         for (int t = 0; t < NT8; t++) {
@@ -605,18 +597,22 @@ __global__ void __launch_bounds__((HNW + 1) * 32, 2) hf_fw_kernel(
                 z[0] += __shfl_xor_sync(0xffffffffu, z[0], dd); z[1] += __shfl_xor_sync(0xffffffffu, z[1], dd);
                 s[0] += __shfl_xor_sync(0xffffffffu, s[0], dd); s[1] += __shfl_xor_sync(0xffffffffu, s[1], dd);
             }
-            bool nd = false;                                  // (2^-92: a row's largest term over 2^-97, so any term
-#pragma unroll                                                //  flushed under 2^-126 is under 2^-29 of it)
-            for (int r = 0; r < 2; r++)                       // (z, s >= 0: their bits compared as integers; NaN,
-                nd |= live[r] && (hf_out(z[r]) || (mc > NEG && __float_as_int(s[r]) < 0x11800000));   // inf: out)
-            need |= (nd ? 1u : 0u) << (int)(it - s0);
+            unsigned nd = 0;                                  // (2^-92: a row's largest term over 2^-97, so any term
+            const unsigned mcl = mc > NEG;                    //  flushed under 2^-126 is under 2^-29 of it; z, s >= 0:
+#pragma unroll                                                //  their bits compared as integers, NaN / inf out --
+            for (int r = 0; r < 2; r++)                       //  bitwise, no branch)
+                nd |= (unsigned)live[r] & ((unsigned)hf_out(z[r]) | (mcl & (unsigned)(__float_as_int(s[r]) < 0x11800000)));
+            need |= nd << (int)(it - s0);
             __syncwarp();
-            if (lane == 0) mbar_arrive(bempty + 8 * st);
-            if (tq == 0) {
-                if (rA < M) pw[0] = make_float4(z[0] > 0.f ? cm[0] : NEG, z[0], s[0] > 0.f ? cm[0] + mc : NEG, s[0]);
-                if (rB < M) pw[8] = make_float4(z[1] > 0.f ? cm[1] : NEG, z[1], s[1] > 0.f ? cm[1] + mc : NEG, s[1]);
+            if (lane == 0) {                                  // (the stage released after its reads return: ptxas
+                st_shared(sguard + 4 * w, __float_as_uint(s[0]) ^ __float_as_uint(mc));   //  issues an arrive with
+                mbar_arrive(bempty + 8 * st);                 //  loads in flight -- a store of their values first)
             }
-            pw += (long)njt * Mp;                             // (the next sample's; a tile change sets it anew)
+            if (tq == 0) {
+                if (rA < M) part[pw] = make_float4(z[0] > 0.f ? cm[0] : NEG, z[0], s[0] > 0.f ? cm[0] + mc : NEG, s[0]);
+                if (rB < M) part[pw + 8] = make_float4(z[1] > 0.f ? cm[1] : NEG, z[1], s[1] > 0.f ? cm[1] + mc : NEG, s[1]);
+            }
+            pw += pstep;                                      // (the next sample's; a tile change sets it anew)
             if (++b == B) { b = 0; tile++; }
             if (++st == NST) { st = 0; ph ^= 1; }
         }
@@ -628,7 +624,8 @@ __global__ void __launch_bounds__((HNW + 1) * 32, 2) hf_fw_kernel(
 
 // ================================================================================================= backward
 // `lowrank_exp_sum.cu`'s big-tile backward (`bf_bw2_kernel`, its head has the design) at rank 16 with phi from ONE fp16
-// MMA (the forward's rounded factors) and G, B, A' fp16 in the dA / dB products: a CTA of 8 warps a tile of 128 nodes x
+// MMA (the forward's rounded factors; log2 theta its C operand: lw' straight from the tensor pipe, one n-tile pair
+// ahead of the element terms) and G, B, A' fp16 in the dA / dB products: a CTA of 8 warps a tile of 128 nodes x
 // 64 children over a run of (tile, sample) units, F+ and W in registers over a tile's samples. PIPELINED, one barrier
 // a sample: iteration b (parity par) makes phi_b, b's element terms -- each n-tile with one k-step of dB of sample
 // b - 1 (from the other parity's G^T / A', every warp's written a barrier back), each second n-tile with b's dA
@@ -672,31 +669,33 @@ __device__ __forceinline__ void red4(float* p, float4 v) {
     asm volatile("red.global.add.v4.f32 [%0], {%1, %2, %3, %4};" ::"l"(p), "f"(v.x), "f"(v.y), "f"(v.z), "f"(v.w)
                  : "memory");
 }
-// fp32 bulk adds from shared memory into global (the L2's adds), a bulk group each; the issuing thread waits for its
-// groups' reads before their buffer is written again
-__device__ __forceinline__ void bulk_add_f(void* gdst, const void* ssrc, int bytes) {
-    asm volatile("cp.reduce.async.bulk.global.shared::cta.bulk_group.add.f32 [%0], [%1], %2;"
-                 ::"l"(gdst), "r"((unsigned)__cvta_generic_to_shared(ssrc)), "r"(bytes) : "memory");
-    asm volatile("cp.async.bulk.commit_group;" ::: "memory");
-}
-// a box of a 3-D tensor (its map a kernel parameter) added from shared memory (128-byte aligned, the box's layout)
-__device__ __forceinline__ void tma_add_3d(const CUtensorMap* m, const void* ssrc, int c0, int c1, int c2) {
-    asm volatile("cp.reduce.async.bulk.tensor.3d.global.shared::cta.add.tile.bulk_group [%0, {%2, %3, %4}], [%1];"
-                 ::"l"(m), "r"((unsigned)__cvta_generic_to_shared(ssrc)), "r"(c0), "r"(c1), "r"(c2) : "memory");
-    asm volatile("cp.async.bulk.commit_group;" ::: "memory");
-}
-__device__ __forceinline__ void bulk_wait_read0() { asm volatile("cp.async.bulk.wait_group.read 0;" ::: "memory"); }
 __device__ __forceinline__ void bulk_wait_all() { asm volatile("cp.async.bulk.wait_group 0;" ::: "memory"); }
 // (a thread's shared-memory writes made visible to the async proxy: before the barrier ahead of a bulk add)
 __device__ __forceinline__ void fence_async_smem() { asm volatile("fence.proxy.async.shared::cta;" ::: "memory"); }
-__device__ __forceinline__ void cp_async16(void* smem, const void* gmem) {
-    const unsigned sa = (unsigned)__cvta_generic_to_shared(smem);
+// (zeros where not live: nothing read)
+__device__ __forceinline__ void cp_async16z(uint32_t sa, const void* gmem, bool live) {
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" ::"r"(sa), "l"(gmem), "r"(live ? 16 : 0) : "memory");
+}
+__device__ __forceinline__ void cp_async16(uint32_t sa, const void* gmem) {
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" ::"r"(sa), "l"(gmem) : "memory");
 }
-// (zeros where not live: nothing read)
-__device__ __forceinline__ void cp_async16z(void* smem, const void* gmem, bool live) {
-    const unsigned sa = (unsigned)__cvta_generic_to_shared(smem);
-    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" ::"r"(sa), "l"(gmem), "r"(live ? 16 : 0) : "memory");
+// fp32 bulk adds from shared memory into global (the L2's adds), a bulk group each -- a run of a buffer, or a box of a
+// 3-D tensor (its map a kernel parameter; 128-byte aligned, the box's layout) --, the issuing thread waiting for its
+// groups' reads before their buffer is written again. Predicated (`on`: one thread's): no branch around them
+__device__ __forceinline__ void bulk_wait_read0_if(bool on) {
+    asm volatile("{\n .reg .pred p;\n setp.ne.b32 p, %0, 0;\n @p cp.async.bulk.wait_group.read 0;\n}\n" ::"r"((int)on)
+                 : "memory");
+}
+__device__ __forceinline__ void bulk_add_f_if(bool on, void* gdst, uint32_t ssrc, int bytes) {
+    asm volatile("{\n .reg .pred p;\n setp.ne.b32 p, %0, 0;\n"
+                 " @p cp.reduce.async.bulk.global.shared::cta.bulk_group.add.f32 [%1], [%2], %3;\n"
+                 " @p cp.async.bulk.commit_group;\n}\n" ::"r"((int)on), "l"(gdst), "r"(ssrc), "r"(bytes) : "memory");
+}
+__device__ __forceinline__ void tma_add_3d_if(bool on, const CUtensorMap* m, uint32_t ssrc, int c0, int c1, int c2) {
+    asm volatile("{\n .reg .pred p;\n setp.ne.b32 p, %0, 0;\n"
+                 " @p cp.reduce.async.bulk.tensor.3d.global.shared::cta.add.tile.bulk_group [%1, {%3, %4, %5}], [%2];\n"
+                 " @p cp.async.bulk.commit_group;\n}\n"
+                 ::"r"((int)on), "l"(m), "r"(ssrc), "r"(c0), "r"(c1), "r"(c2) : "memory");
 }
 __device__ __forceinline__ void cp_async_commit() { asm volatile("cp.async.commit_group;" ::: "memory"); }
 template <int N> __device__ __forceinline__ void cp_async_wait() { asm volatile("cp.async.wait_group %0;" ::"n"(N) : "memory"); }
@@ -838,73 +837,96 @@ __global__ void __launch_bounds__(256, 1) hb_bw_kernel(
     unsigned* const sT2 = reinterpret_cast<unsigned*>(sL + 2 * Gm::SL);    // [par][child][TROW]: G^T (fp16 pairs)
     float* const sE2 = reinterpret_cast<float*>(sT2 + 2 * Gm::ST);         // [par][SE]
     const int tid = threadIdx.x, lane = tid & 31, w = tid >> 5, g = lane >> 2, tq = lane & 3;
+    const int wu = __shfl_sync(0xffffffffu, w, 0);             // (the warp's index, provably uniform: uniform branches)
     const int lr = lane & 7, lq = lane >> 3;                   // (ldmatrix / stmatrix: the row a lane addresses, its matrix)
     const bool issuer = GRADS && tid == 0;                     // (the bulk adds' thread)
     const int njt = Np / BN;
     const long u0 = (long)blockIdx.x * units / gridDim.x, u1 = (long)(blockIdx.x + 1) * units / gridDim.x;
+    // Shared addresses: one base and the lanes' byte offsets into each buffer (no address conversion an access, the
+    // k-steps' and n-tiles' offsets immediates)
+    const uint32_t uDA = smem_u32(smw), uDB = uDA + 2 * Gm::SDA * 4, uAh = uDB + 2 * Gm::SDB * 4;
+    const uint32_t uBh = uAh + 3 * Gm::SAH * 4, uL = uBh + 2 * Gm::SBH * 4, uT2 = uL + 2 * Gm::SL * 4;
+    const uint32_t oA = ((16 * w + 8 * (lq & 1) + lr) * Gm::AROW + 4 * (lq >> 1)) * 4;     // phi's A' rows
+    const uint32_t oB = ((8 * (lq & 1) + lr) * Gm::BROW + 4 * (lq >> 1)) * 4;             // phi's B, + 16 t2
+    const uint32_t oBt = ((8 * (lq >> 1) + lr) * Gm::BROW + 4 * (lq & 1)) * 4;            // dA's B^T, + 32 kk
+    const uint32_t oT = ((8 * (lq >> 1) + lr) * Gm::TROW + 8 * w + 4 * (lq & 1)) * 4;    // G^T's rows, + 64 TROW kk
+    const uint32_t oTa = ((16 * (w & 3) + 8 * (lq & 1) + lr) * Gm::TROW + 4 * (lq >> 1)) * 4;   // dB's G^T, + 32 kw
+    const uint32_t oAb = ((8 * (lq & 1) + lr) * Gm::AROW + 4 * (w >> 2)) * 4;             // dB's A', + 64 AROW kw
     // sample b's operands into stage (ab: A' buffer, par: B and terms; row tile its, child tile jcs): the tile's 128
-    // A rows (a thread a 16-byte half row; zeros from row am), B's 16 rank rows of its 64 children (threads < 128: 16
-    // bytes each, rows bk halves apart; zeros from child bn), the terms (LU rows, the 2 jt's LC, SC: threads 128 ..)
-    auto stage = [&](int b, int ab, int par, int jcs, int its) {
-        {
-            const int row = tid >> 1, half = tid & 1, i = its * TM2 + row;
-            cp_async16z(sAh + ab * Gm::SAH + row * Gm::AROW + 4 * half,
-                        AP + (long)b * sAb + (long)min(i, am - 1) * HK + 8 * half, i < am);
-        }
-        if (tid < 128) {
+    // A rows (a thread a 16-byte half row; zeros from row am), B's 16 rank rows of its 64 children (warps 0 .. 3: 16
+    // bytes a thread, rows bk halves apart; zeros from child bn), the terms (LU rows, the 2 jt's LC, SC: warps 4 .. 6).
+    // A thread's sources a tile's base and its sample's stride: `src` of the tile, then base + b stride a sample
+    struct Src { const char* a; const char* r; long ra; bool al, rl; };
+    auto srcs = [&](int jcs, int its) {
+        Src q;
+        const int row = tid >> 1, half = tid & 1, i = its * TM2 + row;
+        q.a = reinterpret_cast<const char*>(AP + (long)min(i, am - 1) * HK + 8 * half);
+        q.al = i < am;
+        q.r = nullptr; q.ra = 0; q.rl = false;
+        if (wu < 4) {
             const int rk = tid >> 3, ch = tid & 7, j = jcs * TN2 + 8 * ch;
-            cp_async16z(sBh + par * Gm::SBH + rk * Gm::BROW + 4 * ch,
-                        BP + (long)b * sBb + (long)rk * bk + min(j, bn - 8), j < bn);
-        } else if (tid < 128 + 83) {
+            q.r = reinterpret_cast<const char*>(BP + (long)rk * bk + min(j, bn - 8));
+            q.ra = sBb * 2;
+            q.rl = j < bn;
+        } else if (wu < 7) {
             const int r = tid - 128;
-            const float* src = r < 64 ? LU + ((long)b * Mp + (long)its * TM2) * 2 + r * 4
-                             : r < 82 ? LC + ((long)b * njt + 2 * jcs) * 36 + (r - 64) * 4
-                                      : reinterpret_cast<const float*>(SC + b);
-            cp_async16(sL + par * Gm::SL + r * 4, src);
+            q.rl = r < 83;
+            q.r = reinterpret_cast<const char*>(r < 64 ? LU + (long)its * TM2 * 2 + r * 4
+                                                : r < 82 ? LC + (long)2 * jcs * 36 + (r - 64) * 4
+                                                         : reinterpret_cast<const float*>(SC));
+            q.ra = r < 64 ? (long)Mp * 2 * 4 : r < 82 ? (long)njt * 36 * 4 : 16;
         }
+        return q;
+    };
+    const uint32_t dA0 = uAh + ((tid >> 1) * Gm::AROW + 4 * (tid & 1)) * 4;
+    const uint32_t dR0 = wu < 4 ? uBh + ((tid >> 3) * Gm::BROW + 4 * (tid & 7)) * 4 : uL + (tid - 128) * 16;
+    const uint32_t dRs = wu < 4 ? Gm::SBH * 4 : Gm::SL * 4;
+    auto stage = [&](const Src& q, int b, int ab, int par) {
+        cp_async16z(dA0 + ab * (Gm::SAH * 4), q.a + (long)b * sAb * 2, q.al);
+        if (wu < 4) cp_async16z(dR0 + par * dRs, q.r + b * q.ra, q.rl);
+        else if (wu < 7 && q.rl) cp_async16(dR0 + par * dRs, q.r + b * q.ra);
         cp_async_commit();
     };
     // dB of a sample from parity pp's G^T and A' buffer ab (all 8 warps' blocks written, a barrier back): unit w =
     // (child m-tile w & 3, rank tile w >> 2), k-step kw the 8 warps' 16-node blocks; A operand G^T [child][node] by
     // ldmatrix, B operand A' [node][rank] by ldmatrix.trans
     auto dB_step = [&](int pp, int ab, int kw, float (&acc)[4]) {
-        const int mg = w & 3, nt = w >> 2;
         unsigned aa[4], bb[2];
-        ldsm4(aa, sT2 + pp * Gm::ST + (16 * mg + 8 * (lq & 1) + lr) * Gm::TROW + (16 * kw + 8 * (lq >> 1)) / 2);
-        ldsm2t(bb, sAh + ab * Gm::SAH + (16 * kw + 8 * (lq & 1) + lr) * Gm::AROW + 4 * nt);
+        ldsm4(aa, uT2 + pp * (Gm::ST * 4) + oTa + 32 * kw);
+        ldsm2t(bb, uAh + ab * (Gm::SAH * 4) + oAb + 64 * Gm::AROW * kw);
         mma_h16(acc, aa[0], aa[1], aa[2], aa[3], bb[0], bb[1]);
     };
-    auto dB_mma = [&](int pp, int ab, float (&dq)[2][4]) {
+    auto dB_mma = [&](int pp, int ab, float (&dq)[4]) {
 #pragma unroll
-        for (int h = 0; h < 2; h++)
+        for (int c = 0; c < 4; c++) dq[c] = 0.f;
 #pragma unroll
-            for (int c = 0; c < 4; c++) dq[h][c] = 0.f;
-#pragma unroll
-        for (int kw = 0; kw < NW2; kw++) dB_step(pp, ab, kw, dq[kw & 1]);
+        for (int kw = 0; kw < NW2; kw++) dB_step(pp, ab, kw, dq);
     };
     // its unit's sums (G in units of 2^E, A' carrying log2 e: times scz = ln 2 2^E; 2^E of the caller's A) into
     // parity pp's [rank][child] rows (children 16 mg + g / + 8, ranks 8 nt + 2 tq / + 1)
-    auto dB_out = [&](int pp, const float (&dq)[2][4], float scz) {
+    auto dB_out = [&](int pp, const float (&dq)[4], float scz) {
         const int mg = w & 3, nt = w >> 2, ch = 16 * mg + g, rk = 8 * nt + 2 * tq;
         float* const db = sDB + pp * Gm::SDB;
-        db[rk * TN2 + ch] = (dq[0][0] + dq[1][0]) * scz;
-        db[(rk + 1) * TN2 + ch] = (dq[0][1] + dq[1][1]) * scz;
-        db[rk * TN2 + ch + 8] = (dq[0][2] + dq[1][2]) * scz;
-        db[(rk + 1) * TN2 + ch + 8] = (dq[0][3] + dq[1][3]) * scz;
+        db[rk * TN2 + ch] = dq[0] * scz;
+        db[(rk + 1) * TN2 + ch] = dq[1] * scz;
+        db[rk * TN2 + ch + 8] = dq[2] * scz;
+        db[(rk + 1) * TN2 + ch + 8] = dq[3] * scz;
         fence_async_smem();
     };
     // the bulk adds of a sample's dA rows (the tile's 128, clipped at ma) and dB's box (16 ranks x 64 children at
     // child j0, sample b; children past the map's dropped), from parity pp (written and fenced a barrier back)
-    auto out_dA = [&](int pp, int b, int i0) {
-        const int rows = min(TM2, ma - i0);
-        if (issuer && rows > 0) bulk_add_f(gA + (long)b * sgA + (long)i0 * HK, sDA + pp * Gm::SDA, rows * HK * 4);
+    auto out_dA = [&](int pp, int b, int i0) {             // (warp 0's: its lane 0 by predicate)
+        if (wu == 0) {
+            const int rows = min(TM2, ma - i0);
+            bulk_add_f_if(issuer && rows > 0, gA + (long)b * sgA + (long)i0 * HK, uDA + pp * (Gm::SDA * 4), rows * HK * 4);
+        }
     };
     auto out_dB = [&](int pp, int b, int j0) {
-        if (issuer) tma_add_3d(&tmB, sDB + pp * Gm::SDB, j0, 0, b);
+        if (wu == 0) tma_add_3d_if(issuer, &tmB, uDB + pp * (Gm::SDB * 4), j0, 0, b);
     };
     // the element flows of a sample from parity pp's partials (its 8 warps' sums), one add
     auto flows_out = [&](int pp, int b, int j0, float scy) {
-        if (tid < TN2) {
+        if (wu < TN2 / 32) {
             const float* const sE = sE2 + pp * Gm::SE;
             float s = 0.f;
 #pragma unroll
@@ -915,7 +937,7 @@ __global__ void __launch_bounds__(256, 1) hb_bw_kernel(
     int pc = 0, pa = 0;                                        // the sample's B / terms parity, its A' buffer (mod 3)
     if (u0 < u1) {                                             // the run's first sample: its stage
         const int t = (int)(u0 / B), b = (int)(u0 - (long)t * B), it = t / nct;
-        stage(b, 0, 0, t - it * nct, it);
+        stage(srcs(t - it * nct, it), b, 0, 0);
     }
 #pragma unroll 1
     for (long u = u0; u < u1;) {
@@ -926,6 +948,7 @@ __global__ void __launch_bounds__(256, 1) hb_bw_kernel(
         const int it = t / nct, jc = t - it * nct;
         const int i0 = it * TM2, j0 = jc * TN2;
         const int rA = i0 + 16 * w + g, rB = rA + 8;
+        const Src sq = srcs(jc, it);                           // (this tile's sources)
 
         // the tile's theta (its log2 taken under the first sample's phi), F+, W: element e = 4 nf + c -> row
         // c & 2 ? rB : rA, child j0 + 8 nf + 2 tq + (c & 1)
@@ -943,20 +966,19 @@ __global__ void __launch_bounds__(256, 1) hb_bw_kernel(
         for (int b = b0; b < b1; b++, pc ^= 1, pa = pa == 2 ? 0 : pa + 1) {
             const int par = pc, pap = pa == 0 ? 2 : pa - 1, pan = pa == 2 ? 0 : pa + 1;
             cp_async_wait<0>();
-            if (issuer) bulk_wait_read0();                     // (the adds issued at the last [A] have read their rows)
+            if (wu == 0) bulk_wait_read0_if(issuer);           // (the adds issued at the last [A] have read their rows)
             __syncthreads();                                   // [A] b's stage; b - 1's G^T / partials written
             if (GRADS) {
                 if (b > b0) out_dA(par ^ 1, b - 1, i0);
                 if (b > b0 + 1) out_dB(par, b - 2, j0);
             }
             if (b > b0) flows_out(par ^ 1, b - 1, j0, scy_prev);
-            if (b + 1 < b1) stage(b + 1, pan, par ^ 1, jc, it);   // (its buffers' last readers: before [A])
+            if (b + 1 < b1) stage(sq, b + 1, pan, par ^ 1);    // (its buffers' last readers: before [A])
             else if (more) {                                   // (the next tile's first sample)
                 const int itn = (t + 1) / nct;
-                stage(0, pan, par ^ 1, t + 1 - itn * nct, itn);
+                stage(srcs(t + 1 - itn * nct, itn), 0, pan, par ^ 1);
             }
-            const unsigned* const sah = sAh + pa * Gm::SAH;
-            const unsigned* const sbh = sBh + par * Gm::SBH;
+            const uint32_t uah = uAh + pa * (Gm::SAH * 4), ubh = uBh + par * (Gm::SBH * 4);
             const float* const sl = sL + par * Gm::SL;
             // the sample's scale 2^E: q, t, G in its units (lu', lv' less E), F+ / W / the sums times 2^E
             const float4 scl = *reinterpret_cast<const float4*>(sl + 2 * TM2 + 72);
@@ -971,37 +993,30 @@ __global__ void __launch_bounds__(256, 1) hb_bw_kernel(
                 lcv[8 * jl + 0] = c0.x; lcv[8 * jl + 1] = c0.y; lcv[8 * jl + 2] = c0.z; lcv[8 * jl + 3] = c0.w;
                 lcv[8 * jl + 4] = c1.x; lcv[8 * jl + 5] = c1.y; lcv[8 * jl + 6] = c1.z; lcv[8 * jl + 7] = c1.w;
             }
-            // ---- phi_b (one fp16 term): the warp's A' fragment (ldmatrix of its 16 rows), B's (ldmatrix.trans of
-            // the rank rows: k pairs along the ranks)
-            float S[8][4];
-#pragma unroll
-            for (int nf = 0; nf < 8; nf++)
-#pragma unroll
-                for (int c = 0; c < 4; c++) S[nf][c] = 0.f;
-            {
-                unsigned ah[4];
-                ldsm4(ah, sah + (16 * w + 8 * (lq & 1) + lr) * Gm::AROW + 4 * (lq >> 1));
-                if (scaleA) {                                  // (the caller's A: A' as the forward made it)
-#pragma unroll
-                    for (int r = 0; r < 4; r++) ah[r] = scale_h2(ah[r]);
-                }
-#pragma unroll
-                for (int t2 = 0; t2 < 8; t2 += 2) {
-                    unsigned bh[4];                            // (n-tiles t2, t2 + 1: their k halves)
-                    ldsm4t(bh, sbh + (8 * (lq & 1) + lr) * Gm::BROW + 4 * (t2 + (lq >> 1)));
-                    mma_h16(S[t2], ah[0], ah[1], ah[2], ah[3], bh[0], bh[1]);
-                    mma_h16(S[t2 + 1], ah[0], ah[1], ah[2], ah[3], bh[2], bh[3]);
-                }
-            }
-            float dq[2][4];                                    // (dB of sample b - 1, its k-steps in the loop below)
-#pragma unroll
-            for (int h = 0; h < 2; h++)
-#pragma unroll
-                for (int c = 0; c < 4; c++) dq[h][c] = 0.f;
-            if (b == b0) {                                     // (theta's loads under the first phi)
+            if (b == b0) {                                     // (the tile's log2 theta: the phi MMAs' C operand)
 #pragma unroll
                 for (int e = 0; e < 32; e++) lt[e] = lt[e] > 0.f ? __log2f(lt[e]) : NEG;
             }
+            // ---- lw_b = phi_b + log2 theta (one fp16 term, theta the C operand): the warp's A' fragment (ldmatrix of
+            // its 16 rows), B's (ldmatrix.trans of the rank rows: k pairs along the ranks), a pair of n-tiles at a
+            // time, one pair ahead of the element terms (its registers live a pair at a time, not all eight)
+            unsigned ah[4];
+            ldsm4(ah, uah + oA);
+            if (scaleA) {                                      // (the caller's A: A' as the forward made it)
+#pragma unroll
+                for (int r = 0; r < 4; r++) ah[r] = scale_h2(ah[r]);
+            }
+            float S[8][4];
+            auto phi_pair = [&](int t2) {                      // (n-tiles t2, t2 + 1: their k halves)
+                unsigned bh[4];
+                ldsm4t(bh, ubh + oB + 16 * t2);
+                const uint4 a4 = make_uint4(ah[0], ah[1], ah[2], ah[3]);
+                mma_h_c(S[t2], a4, bh[0], bh[1], *reinterpret_cast<const float(*)[4]>(lt + 4 * t2));
+                mma_h_c(S[t2 + 1], a4, bh[2], bh[3], *reinterpret_cast<const float(*)[4]>(lt + 4 * t2 + 4));
+            };
+            phi_pair(0);
+            float dq[4] = {0.f, 0.f, 0.f, 0.f};                // (dB of sample b - 1, its k-steps in the loop below:
+                                                               //  one chain, its MMAs an n-tile's work apart)
             // ---- the element terms of b: q = 2^(lw' + lu' + lc'), t = 2^(lw' + lv'); each n-tile with dB_{b-1}'s
             // k-step nf, each pair of n-tiles followed by b's dA k-step and G^T m-tile
             unsigned R[8][2];                                  // (q - t) as fp16 pairs: (n-tile, node half)
@@ -1013,11 +1028,12 @@ __global__ void __launch_bounds__(256, 1) hb_bw_kernel(
                 for (int c = 0; c < 4; c++) dd[nt][c] = 0.f;
 #pragma unroll
             for (int nf = 0; nf < 8; nf++) {
-                if (GRADS && b > b0) dB_step(par ^ 1, pap, nf, dq[nf & 1]);
+                if ((nf & 1) == 0 && nf + 2 < 8) phi_pair(nf + 2);
+                if (GRADS && b > b0) dB_step(par ^ 1, pap, nf, dq);
                 float gq[4], qq[4];
 #pragma unroll
                 for (int c = 0; c < 4; c++) {
-                    const float lw = S[nf][c] + lt[4 * nf + c];
+                    const float lw = S[nf][c];
                     const float q = exp2f(lw + (c & 2 ? tB.x : tA.x) + lcv[2 * nf + (c & 1)]);
                     const float tt = exp2f(lw + (c & 2 ? tB.y : tA.y));
                     if (FLOWS) fp[4 * nf + c] = fmaf(q, scl.y, fp[4 * nf + c]);
@@ -1034,11 +1050,11 @@ __global__ void __launch_bounds__(256, 1) hb_bw_kernel(
                     // R[2 kk + 1][1]; B^T by ldmatrix of B's rank rows (k pairs along the children), both rank tiles
                     const int kk = nf >> 1;
                     unsigned bt[4];
-                    ldsm4(bt, sbh + (8 * (lq >> 1) + lr) * Gm::BROW + (16 * kk + 8 * (lq & 1)) / 2);
+                    ldsm4(bt, ubh + oBt + 32 * kk);
                     mma_h16(dd[0], R[2 * kk][0], R[2 * kk][1], R[2 * kk + 1][0], R[2 * kk + 1][1], bt[0], bt[1]);
                     mma_h16(dd[1], R[2 * kk][0], R[2 * kk][1], R[2 * kk + 1][0], R[2 * kk + 1][1], bt[2], bt[3]);
                     // dB's G^T (children 16 kk .. 16 kk + 15, the warp's 16 nodes) by stmatrix.trans into parity par
-                    stsm4t(sT2 + par * Gm::ST + (16 * kk + 8 * (lq >> 1) + lr) * Gm::TROW + (16 * w + 8 * (lq & 1)) / 2,
+                    stsm4t(uT2 + par * (Gm::ST * 4) + oT + 64 * Gm::TROW * kk,
                            R[2 * kk][0], R[2 * kk][1], R[2 * kk + 1][0], R[2 * kk + 1][1]);
                 }
             }
@@ -1087,7 +1103,7 @@ __global__ void __launch_bounds__(256, 1) hb_bw_kernel(
         }
         // the tile's drain: the last sample's G^T / partials published, its dB and element flows, then F+ / W
         const int pl = pc ^ 1, pal = pa == 0 ? 2 : pa - 1;     // (the last sample's parity, its A' buffer)
-        if (issuer) bulk_wait_read0();
+        if (wu == 0) bulk_wait_read0_if(issuer);
         __syncthreads();
         if (GRADS) {
             out_dA(pl, b1 - 1, i0);
@@ -1095,7 +1111,7 @@ __global__ void __launch_bounds__(256, 1) hb_bw_kernel(
         }
         flows_out(pl, b1 - 1, j0, scy_prev);
         if (GRADS) {
-            float dq[2][4];
+            float dq[4];
             dB_mma(pl, pal, dq);
             dB_out(pl, dq, scz_prev);                          // (pl's dB rows: their last add waited before the drain)
         }
@@ -1270,7 +1286,7 @@ void launch_hf_fw(cudaStream_t stream, const CUtensorMap& tma, const CUtensorMap
                   const float* lc, const TP* pp, long p0, int Nb, int cbs, int bs, const float4* ltf, const float4* cmf,
                   float4* part, int M, int N, int Mp, int Np, int Bc, int njt, long total) {
     using Gm = HfGeo<NT8>;
-    constexpr int bytes = NST * Gm::ST + 2 * NST * 8 + 1024;  // (+ the stages' alignment)
+    constexpr int bytes = NST * Gm::ST + 2 * NST * 8 + 4 * HNW + 1024;   // (+ the stages' alignment)
     auto kern = hf_fw_kernel<TP, NT8, NST>;
     static int per_sm[64] = {0};                              // (a device's CTAs an SM; 0: not asked yet)
     const int dev = at::cuda::current_device();
