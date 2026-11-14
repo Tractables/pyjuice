@@ -54,9 +54,8 @@ class _BackwardMixin:
                                             node_mars, element_mars, params, param_flows, denom_param_flows, kwargs,
                                             stream_children = layer.__dict__.get("_bk_stream_children"))
         gviews = kwargs.get("sum_external_params_grad")
-        if getattr(gviews, "fresh", False):                     # (destinations not zeroed: these passes add into them)
-            for grads in ns_grad_tensors:
-                gviews.init_grads(grads)
+        fresh = getattr(gviews, "fresh", False)                 # (destinations not zeroed: each one's first writer here
+                                                                #  initializes it -- `init` below)
         geos = [self._geometry(layer, ns_info, dev) for ns_info, _ in ns_tensors]
         for geo in geos:
             element_flows[geo["kids"], :] = -float("inf")
@@ -65,8 +64,9 @@ class _BackwardMixin:
 
         for (ns_info, tensors), grads, geo in zip(ns_tensors, ns_grad_tensors, geos):
             denom = denom_param_flows if want_denom else None
+            init = fresh and gviews.claim(grads)                # (the node vector its destination's first writer)
             if self._exp_sum_backward_fused(layer, ns_info, tensors, grads, geo, node_flows, element_flows, node_mars,
-                                            element_mars, params, param_flows, denom, exp_sum_bf16(kwargs)):
+                                            element_mars, params, param_flows, denom, exp_sum_bf16(kwargs), init):
                 continue
             A, Bm = (t.float() for t in self._as_given(tensors))  # (fp16 factors as float32; views as they lie)
             theta = self._dense_params(geo, params)
@@ -91,18 +91,20 @@ class _BackwardMixin:
                 self._scatter_add(geo, denom_param_flows, off, Fm)
             if grads is not None:                                   # (the buffers in the storage's layout)
                 gA, gB = self._to_stored(dA, dB)
-                grads[0].add_(gA)
-                grads[1].add_(gB)
+                (grads[0].copy_ if init else grads[0].add_)(gA)
+                (grads[1].copy_ if init else grads[1].add_)(gB)
 
         return None
 
     def _exp_sum_backward_fused(self, layer, ns_info, tensors, grads, geo, node_flows, element_flows, node_mars,
-                                element_mars, params, param_flows, denom, bf16) -> bool:
+                                element_mars, params, param_flows, denom, bf16, init = False) -> bool:
         """A node vector's backward through the "exp_sum" form's fused kernels, where they serve (`exp_sum_fused`, the
         flow buffers fp32, the gradient buffers fp32 with each sample's block contiguous): its element flows
         log-added into `element_flows` (set to -inf by the caller), F+, W (with `denom`) and the gradients added into
         their buffers -- what the torch pass computes, without the `[B, M, N]` grids -- by the kernels its forward took
-        (the fp16-rounded factors' where `forward_layer` noted it). False: nothing done."""
+        (the fp16-rounded factors' where `forward_layer` noted it). `init`: the gradient buffers hold anything, written
+        rather than added into (the fp16 kernels zero a chunk's slice ahead of their adds, in the L2; the others' are
+        zeroed first). False: nothing done."""
         if not exp_sum_fused(self, geo, tensors, params, node_mars, element_mars):
             return False
         if node_flows.dtype != torch.float32 or element_flows.dtype != torch.float32:
@@ -127,10 +129,12 @@ class _BackwardMixin:
                 tensors[0], tensors[1], params, geo["p0"], Nb, cbs, bs, element_mars, geo["rows"], node_flows,
                 node_mars, ns_info.nid_start, lz.t().contiguous(), element_flows, pf, pf0, dn, dn0,
                 gd[0] if grads is not None else empty, gd[1] if grads is not None else empty, geo["M"], geo["N"],
-                self.rank, copy)
+                self.rank, copy, init)
         else:                                                   # (the bf16 / TF32 kernels: contiguous fp32 blocks)
             gd = grads if grads is None or all(g.is_contiguous() for g in grads) else \
                 tuple(torch.zeros(g.shape, dtype = g.dtype, device = g.device) for g in grads)
+            if init and gd is grads:
+                torch._foreach_zero_(list(grads))
             exp_sum_module().exp_sum_backward(
                 lowrank_forward.as_f32(tensors[0]), lowrank_forward.as_f32(tensors[1]), params, geo["p0"], Nb, cbs, bs,
                 element_mars, geo["rows"], node_flows, node_mars, ns_info.nid_start, lz.t().contiguous(),
@@ -139,7 +143,7 @@ class _BackwardMixin:
                 bf16)
         if grads is not None and gd is not grads:               # (the kernels added into their own buffers: theirs)
             for g, t in zip(grads, gd):
-                g.add_(t)
+                (g.copy_ if init else g.add_)(t)
         return True
 
     @staticmethod

@@ -723,10 +723,22 @@ __global__ void __launch_bounds__(256) hb_bw_prep_kernel(
         float* __restrict__ LU, float* __restrict__ LC, float* __restrict__ ef, float4* __restrict__ SC,
         const float* __restrict__ nflows, const float* __restrict__ nmars, long nid0,
         const float* __restrict__ lzs, const float* __restrict__ emars, const long* __restrict__ rows, int M, int N,
-        int Mp, int Np, int nbA, int nbB, int Bc, int Bs, int b0, long sA, long sB) {
+        int Mp, int Np, int nbA, int nbB, int Bc, int Bs, int b0, long sA, long sB, float4* __restrict__ zA, long szA,
+        float4* __restrict__ zB, long szB, int nbZ) {
     __shared__ float2 tile[32][33];                            // [sample][row] (padded)
     const int njt = Np / BN, nbg = (Bc + 31) / 32, lane = threadIdx.x & 31, wq = threadIdx.x >> 5;
     int blk = blockIdx.x;
+    if (blk < nbZ * Bc) {                                      // the gradients' zeros (`init`: their first writer): a
+        const int nA4 = M * (HK / 4), n4 = nA4 + N * (HK / 4), s = blk / nbZ;   // sample's dA then dB rows, 4096
+        const int e1 = min(n4, (blk - s * nbZ + 1) * 4096);    // float4s a block -- in the L2 when the main kernel's
+        const float4 z4 = make_float4(0.f, 0.f, 0.f, 0.f);     // adds come (their DRAM round trip of zeros saved)
+        for (int e = (blk - s * nbZ) * 4096 + threadIdx.x; e < e1; e += 256) {
+            if (e < nA4) zA[s * szA + e] = z4;
+            else zB[s * szB + (e - nA4)] = z4;
+        }
+        return;
+    }
+    blk -= nbZ * Bc;
     if (blk < (nbA + nbB) * Bc) {                              // the copy: a sample's blocks
         conv_copy(blk % (nbA + nbB), nbA, nbB, A, Bm, AP, BP, blk / (nbA + nbB), M, N, Mp, Np, sA, sB);
         return;
@@ -1479,12 +1491,13 @@ void launch_hb_bw(cudaStream_t stream, const HbOps& op, const TP* pp, long p0, i
 // from `pf0`, W into `denom` from `dn0`, dLL/dA and dLL/dB into the gradient buffers (fp32, the caller's layout, [B,
 // M, K], [B, K, N]): `lowrank_exp_sum.cu`'s `exp_sum_backward` at rank 16 with phi of the fp16-rounded factors. Its
 // operands: `copy` = the forward's {AP, BP} where given, else the factors in place (fp16, aligned: `h_in_place`), else
-// converted here a chunk at a time
+// converted here a chunk at a time. `init`: the gradient buffers hold anything (their first writer: every element
+// written, not added into)
 void exp_sum_h_backward(torch::Tensor A, torch::Tensor Bm, torch::Tensor params, int64_t p0, int64_t Nb, int64_t cbs,
                         int64_t bs, torch::Tensor emars, torch::Tensor rows, torch::Tensor node_flows,
                         torch::Tensor node_mars, int64_t nid0, torch::Tensor lzs, torch::Tensor element_flows,
                         torch::Tensor pflows, int64_t pf0, torch::Tensor denom, int64_t dn0, torch::Tensor gA,
-                        torch::Tensor gB, int64_t M, int64_t N, int64_t K, std::vector<torch::Tensor> copy) {
+                        torch::Tensor gB, int64_t M, int64_t N, int64_t K, std::vector<torch::Tensor> copy, bool init) {
     const int64_t B = node_mars.size(1);
     check_common(A, Bm, params, emars, rows, M, N, K, B);
     TORCH_CHECK(node_mars.scalar_type() == torch::kFloat32 && node_mars.is_contiguous(), "node_mars");
@@ -1551,12 +1564,21 @@ void exp_sum_h_backward(torch::Tensor A, torch::Tensor Bm, torch::Tensor params,
         while ((1 << lbc) < Bc) lbc++;
         unsigned* ap = convert ? reinterpret_cast<unsigned*>(AP2.data_ptr<at::Half>()) : nullptr;
         unsigned* bp = convert ? reinterpret_cast<unsigned*>(BP2.data_ptr<at::Half>()) : nullptr;
-        const int nbg = (Bc + 31) / 32, nprep = (nbA2 + nbB2) * Bc + (Mp2 / 32 + njt2) * nbg + (Bc + 7) / 8;
+        // (`init`: the chunk's slices of the caller's gradient buffers zeroed by the prep kernel, just ahead of the
+        // adds -- their lines in the L2 when the adds come, no DRAM round trip of zeros: the previous chunk's final
+        // lines leave as they come in (in the main kernel's background instead: as slow, its L2 shared); through
+        // temporaries, those copied in rather than added)
+        const int nbZ = init && grads && dgrad ? (int)((K / 4 * (M + N) + 4095) / 4096) : 0;
+        float4* zA = nbZ ? reinterpret_cast<float4*>(gA.data_ptr<float>() + b0 * gA.stride(0)) : nullptr;
+        float4* zB = nbZ ? reinterpret_cast<float4*>(gB.data_ptr<float>() + b0 * gB.stride(0)) : nullptr;
+        const int nbg = (Bc + 31) / 32;
+        const long nprep = (long)(nbZ + nbA2 + nbB2) * Bc + (Mp2 / 32 + njt2) * nbg + (Bc + 7) / 8;
         HF_TI_SWITCH(A, Bm, b0, hb_bw_prep_kernel<TI><<<(unsigned)nprep, 256, 0, stream>>>(
             ai, bi, ap, bp, LU2.data_ptr<float>(), LC2.data_ptr<float>(), efs2.data_ptr<float>(), sc2,
             node_flows.data_ptr<float>(), node_mars.data_ptr<float>(), nid0, lzs.data_ptr<float>(),
             emars.data_ptr<float>(), rw, (int)M, (int)N, Mp2, Np2, nbA2, nbB2, Bc, (int)B, (int)b0,
-            (long)A.stride(0), (long)Bm.stride(0)));
+            (long)A.stride(0), (long)Bm.stride(0), zA, nbZ ? gA.stride(0) / 4 : 0L, zB, nbZ ? gB.stride(0) / 4 : 0L,
+            nbZ));
         C10_CUDA_KERNEL_LAUNCH_CHECK();
         if (grads && !dgrad) {
             tA2.zero_();
@@ -1588,8 +1610,13 @@ void exp_sum_h_backward(torch::Tensor A, torch::Tensor Bm, torch::Tensor params,
             efs2.data_ptr<float>(), rw, element_flows.data_ptr<float>(), (int)N, Np2, Bc, lbc, (int)B, (int)b0);
         C10_CUDA_KERNEL_LAUNCH_CHECK();
         if (grads && !dgrad) {                                 // (the temporaries' sums into the caller's buffers)
-            gA.narrow(0, b0, Bc).add_(tA2.narrow(0, 0, Bc).narrow(1, 0, M));
-            gB.narrow(0, b0, Bc).add_(tB2.narrow(0, 0, Bc).narrow(2, 0, N));
+            if (init) {
+                gA.narrow(0, b0, Bc).copy_(tA2.narrow(0, 0, Bc).narrow(1, 0, M));
+                gB.narrow(0, b0, Bc).copy_(tB2.narrow(0, 0, Bc).narrow(2, 0, N));
+            } else {
+                gA.narrow(0, b0, Bc).add_(tA2.narrow(0, 0, Bc).narrow(1, 0, M));
+                gB.narrow(0, b0, Bc).add_(tB2.narrow(0, 0, Bc).narrow(2, 0, N));
+            }
         }
     }
 }

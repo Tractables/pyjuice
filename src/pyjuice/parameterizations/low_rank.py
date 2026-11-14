@@ -201,9 +201,11 @@ class LowRank(_ForwardMixin, _BackwardMixin, _DenominatorsMixin, SumParameteriza
         return (torch.float32,)
 
     def initializes_grads(self, ns) -> bool:
-        """`"sum_exp"`: its backward claims each gradient destination it writes in place -- the one-launch form
-        storing into all of it, the other paths zeroing it before they add (`lowrank/virtual.py`, `backward.py`)."""
-        return self.form == "sum_exp"
+        """Both forms: the backward claims each gradient destination it writes in place -- `"sum_exp"`'s one-launch
+        form storing into all of it, `"exp_sum"`'s fp16 kernels zeroing a chunk's slice ahead of their adds (in the
+        L2: no DRAM round trip of zeros), the torch passes copying, the other paths zeroing it before they add
+        (`lowrank/virtual.py`, `backward.py`)."""
+        return True
 
     def storage_offsets(self, ns):
         """Where an edge block's entries begin in each slot, in per-batch units (the layer's tables; the passes here

@@ -3656,10 +3656,11 @@ def _h_case(M, N, B, bs = 32, cbs = 32, gain = 1.0, pdtype = torch.float32, thet
                 theta = params[p0 + off.reshape(-1)].double().view(M, N), c = emars[3:3 + N].double().t(), lf = lf)
 
 
-def _h_run(mod, d, A = None, Bf = None, grads = None, keep = False):
+def _h_run(mod, d, A = None, Bf = None, grads = None, keep = False, init = False):
     """The fp16 forward then backward on `_h_case`'s inputs (A, B as given -- fp32 or fp16, in place where they are
     views --; the gradients added into `grads`; `keep`: the backward reads the forward's fp16 copy of the factors where
-    it made one): (node values [B, M], log Z [B, M], log element flows [B, N], F+ [M, N], W [M, N], dA, dB)."""
+    it made one; `init`: it takes `grads` as their first writer, whatever they hold): (node values [B, M], log Z [B,
+    M], log element flows [B, N], F+ [M, N], W [M, N], dA, dB)."""
     A = d["A"] if A is None else A
     Bf = d["Bf"] if Bf is None else Bf
     M, N, B, dev = d["M"], d["N"], d["B"], d["A"].device
@@ -3675,7 +3676,7 @@ def _h_run(mod, d, A = None, Bf = None, grads = None, keep = False):
     dn = torch.zeros_like(pf)
     gA, gB = grads if grads is not None else (torch.zeros(B, M, 16, device = dev), torch.zeros(B, 16, N, device = dev))
     mod.exp_sum_h_backward(A, Bf, d["params"], d["p0"], d["Nb"], d["cbs"], d["bs"], d["emars"], d["rows"], nflows, nm,
-                           11, lz.contiguous(), ef, pf, 0, dn, 0, gA, gB, M, N, 16, copy if keep else [])
+                           11, lz.contiguous(), ef, pf, 0, dn, 0, gA, gB, M, N, 16, copy if keep else [], init)
     off = d["off"]                                          # (F+ and W from offset 0 of their buffers)
     return nm[11:].t(), lz.t(), ef[3:3 + N].t(), pf[off], dn[off], gA, gB
 
@@ -3893,6 +3894,30 @@ def test_the_fp16_exp_sum_in_chunks_is_the_whole_batchs():
     for k in (5, 6):
         want = torch.cat([p[k] for p in parts], 0)
         assert float((whole[k] - want).abs().max()) <= 1e-5 * float(want.abs().max()), k
+
+
+@needs_fused_h
+@pytest.mark.parametrize("case", [dict(M = 512, N = 512, B = 8), dict(M = 500, N = 490, B = 5, bs = 4, cbs = 10),
+                                  dict(M = 1024, N = 1024, B = 420)])
+def test_the_fp16_backward_initializes_its_gradient_buffers(case):
+    """`init` (the gradient buffers' first writer: `LowRank.initializes_grads`): buffers holding anything -- NaN here
+    -- come back what zeroed buffers the backward adds into do, every element written: the slices of each chunk of
+    samples (420: two) zeroed by the prep kernel ahead of the adds where those go to the caller's buffers, the
+    temporaries copied in where they do not (N = 490: rows not 16-byte multiples). To fp32's order of the adds."""
+    mod = _fused_h_module()
+    if mod is None:
+        pytest.skip("the fp16 exp_sum kernels are not built")
+    d = _h_case(**case)
+    B, M, N, dev = d["B"], d["M"], d["N"], d["A"].device
+    added = _h_run(mod, d, grads = (torch.zeros(B, M, 16, device = dev), torch.zeros(B, 16, N, device = dev)))
+    nan = (torch.full((B, M, 16), float("nan"), device = dev), torch.full((B, 16, N), float("nan"), device = dev))
+    got = _h_run(mod, d, grads = nan, init = True)
+    for k in (5, 6):
+        assert bool(torch.isfinite(got[k]).all()), k
+        assert float((got[k] - added[k]).abs().max()) <= 1e-5 * float(added[k].abs().max()), k
+    for k in (0, 1, 3, 4):
+        assert torch.equal(got[k], added[k]) or float((got[k] - added[k]).abs().max()) <= 1e-5 * \
+            float(added[k].abs().max()), k
 
 
 @needs_fused_h
