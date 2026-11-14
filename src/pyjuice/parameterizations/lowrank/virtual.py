@@ -604,6 +604,10 @@ PIPELINED_V = True
 #: (`lowrank_forward_om`'s `cmo`: its converters' running max at each tile's end, the max over the tiles the same as
 #: over the children an edge reaches) instead of a launch of its own (`pe_cmax_kernel`; the same bits).
 FORWARD_CMAX = True
+#: The one-launch forward at ranks 8 and 32 (`lowrank_stream.cu`'s `lr_omk_kernel`: the rank-16 kernel's design, a
+#: warp's n-blocks whole samples of the rank, the copies' V rows formed upfront -- no side CTAs) where it serves
+#: (`omk_serves`), a candidate beside the pre-pass chain's arms; off, those or the plain path there
+OMK = True
 
 
 def _om_vctas(B: int, K: int, X: int, tiles: int, children: int, dev) -> int:
@@ -729,7 +733,11 @@ def _stream_plan(desc, layer, twin, info, node_mars, kwargs, stream_children, de
     if mod is None or op is None or op.dtype != torch.bfloat16 or twin.block_size % 32 != 0:
         return None
     chain = K <= 16 and (B * K) % 64 == 0 and B % 16 == 0
-    if not chain and not mod.om_serves(K, B, twin.block_size, 128):    # (128 blocks: whole tiles; each partition's below)
+    # (the one-launch form: rank 16's kernel, or ranks 8 and 32's -- `lowrank_forward_omk`)
+    omk = K != 16 and OMK and hasattr(mod, "omk_serves")
+    serves = (lambda r: bool(mod.omk_serves(K, B, twin.block_size, r))) if omk else \
+        (lambda r: bool(mod.om_serves(K, B, twin.block_size, r)))
+    if not chain and not serves(128):                   # (128 blocks: whole tiles; each partition's below)
         return None
     cache = layer.__dict__.setdefault("_lrv_stream", {})
     key = (dev, id(stream_children[0]) if stream_children is not None else None, B)   # (the arms fit the batch's columns)
@@ -766,7 +774,7 @@ def _stream_plan(desc, layer, twin, info, node_mars, kwargs, stream_children, de
                 arms = cuda_kernels.stream_arms(twin.block_size, B * K, knt, nids.numel(), groups[2]) if chain else []
                 # (the one-launch form: a tile of 128 nodes -- of whole blocks of one group, or inside one block)
                 om = _om_slabs(pbase, knt, twin.block_size) \
-                    if mod.om_serves(K, B, twin.block_size, nids.numel()) and \
+                    if serves(nids.numel()) and \
                     (twin.block_size >= 128 or 128 // twin.block_size <= groups[2]) else None
                 if not arms and om is None:
                     ok = False
@@ -854,6 +862,11 @@ def _stream_run(plan, info, tensors, kwargs, z, row0, vnm, kd, node_mars, elemen
                                                               node_mars.size(1), device = node_mars.device)
 
                 def fw(nv):
+                    if K != 16:                         # (ranks 8, 32: V's rows every copy's upfront, no side CTAs)
+                        mod.lowrank_forward_omk(kd, vals, cb, p["ebase"], p["jpos"], vt, row0, shift, op, p["nids"],
+                                                p["pbase"], p["groups"][0], twin.block_size, p["knt"], p["om"][0],
+                                                p["om"][1], node_mars, lz, a_om, nshift, vn0, ua[0], ua[1], cmo)
+                        return
                     mod.lowrank_forward_om(kd, vals, cb, p["ebase"], p["jpos"], vt, row0, shift, op, p["nids"],
                                            p["pbase"], p["groups"][0], twin.block_size, p["knt"], p["om"][0],
                                            p["om"][1], node_mars, lz, a_om, nshift, vn0, ua[0], ua[1], p["vtma"],

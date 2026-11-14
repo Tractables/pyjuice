@@ -1668,15 +1668,16 @@ def _stream_form(monkeypatch, form):
 @needs_virtual
 @pytest.mark.parametrize("fusion", ["fused", "unfused"])
 @pytest.mark.parametrize("form,bs,batch,rank", [("om", 32, 16, 16), ("om", 64, 16, 16), ("om", 128, 4, 16),
-                                                ("om", 32, 12, 16), ("chain", 32, 16, 16), ("chain", 64, 32, 8),
-                                                ("chain", 128, 16, 4)])
+                                                ("om", 32, 12, 16), ("om", 32, 16, 8), ("om", 64, 8, 8),
+                                                ("om", 32, 16, 32), ("om", 128, 6, 32), ("chain", 32, 16, 16),
+                                                ("chain", 64, 32, 8), ("chain", 128, 16, 4)])
 def test_the_fused_stream_forward_is_the_plain_virtual_path(form, bs, batch, rank, fusion, monkeypatch):
     """The virtual batch's fused stream forward (`virtual._stream_run`, `kernels/c/lowrank_stream.cu`: the virtual child
     values never stored), each form forced -- the pre-pass chain; the one-launch form, A by TMA in blocks of 32 and by
-    cp.async in blocks of 64 (two a tile) and 128, at batches it alone serves (4, 12) --, the product layers handed to
-    the sum layers or not: against the plain virtual path on the same circuit (bf16 products both, under other
-    shifts) every value, flow, denominator and gradient, the same bits from run to run, and the torch passes (fp32
-    parameters) within the bf16 copy's rounding."""
+    cp.async in blocks of 64 (two a tile) and 128, at batches it alone serves (4, 12, 6), at ranks 8 and 32 its kernel
+    of their own (`lr_omk_kernel`) --, the product layers handed to the sum layers or not: against the plain virtual
+    path on the same circuit (bf16 products both, under other shifts) every value, flow, denominator and gradient, the
+    same bits from run to run, and the torch passes (fp32 parameters) within the bf16 copy's rounding."""
     import pyjuice.parameterizations.lowrank.virtual as lowrank_virtual
     from pyjuice.layer.kernels import autotune
 
