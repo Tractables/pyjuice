@@ -4763,6 +4763,75 @@ def test_the_sum_exp_takes_fp16_factors_as_their_float32_values(bs, batch, form,
 
 
 @needs_virtual
+@pytest.mark.parametrize("bs, batch, rank", [(32, 16, 16), (32, 16, 8), (64, 6, 32), (32, 16, 64)])
+def test_the_settled_forward_is_the_full_paths(bs, batch, rank, monkeypatch):
+    """A layer whose last forward took the one-launch arm takes the next from its record (`virtual._forward_settled`,
+    the layer's `_lrv_fw_fast`): neither the stream plan nor the tuner's set-up looked at (`_stream_run` not called),
+    every output the BITS of the full path's (the records dropped before every layer's forward); a call at another
+    batch takes the full path, and records it. (Two passes first: the circuit settles which product layers the sum
+    layers take fused in at its first -- a record of a call without them is made again.)"""
+    import pyjuice.parameterizations.lowrank.virtual as lowrank_virtual
+    from pyjuice.layer.kernels import autotune
+
+    pick = autotune.pick
+    monkeypatch.setattr(autotune, "pick", lambda key, cands, bench, **k: "fused"
+                        if key[0] in ("prod_stream_fusion", "prod_stream_fusion_bk") else pick(key, cands, bench, **k))
+    pc, sums, _, _, _, _ = _pair(_hmm_blocks(256, bs), "sum_exp", rank = rank)
+    monkeypatch.setattr(pc, "_param_operands_force", True, raising = False)   # (the bf16 copy: the stream path's)
+    monkeypatch.setattr(lowrank_virtual, "GEMM_BF16_WORK", 0)                # (bf16 normalizers, as at real sizes)
+    dev = pc.params.device
+
+    def inputs(b, seed):
+        torch.manual_seed(seed)
+        return torch.randint(0, NUM_CATS, (b, pc.num_vars), device = dev), \
+            {a: _factors(a, rank, b, dev, seed = seed + i) for i, a in enumerate(sums)}
+
+    # (the one-launch arm forced as `_stream_form` does, and kept as the tuner keeps its choices: what the record checks)
+    taken, choose = [], autotune.choose
+
+    def forced(key, cands, *args, **kwargs):
+        if key[0] != "lowrank_stream_fw6":
+            return choose(key, cands, *args, **kwargs)
+        monkeypatch.setitem(autotune._CACHE, autotune.full_key(key), lowrank_virtual._OM_ARM)
+        taken.append(key)
+        return lowrank_virtual._OM_ARM
+
+    monkeypatch.setattr(autotune, "choose", forced)
+    full, run = [], lowrank_virtual._stream_run
+    monkeypatch.setattr(lowrank_virtual, "_stream_run", lambda *a, **k: (full.append(1), run(*a, **k))[1])
+    data, ext = inputs(batch, 650)
+    for _ in range(2):
+        _passes(pc, sums, data, ext)                                   # (the records made, V's visit order kept)
+    layers = list({id(l): l for l in (pc.external_params_nodes[a] for a in sums)}.values())
+    assert taken and full and all(l.__dict__.get("_lrv_fw_fast") is not None for l in layers)
+    full.clear()
+    got = _passes(pc, sums, data, ext)
+    assert not full, len(full)                                         # (every layer from its record)
+    real = lowrank_virtual.forward
+
+    def unsettled(desc, layer, *a, **k):
+        layer.__dict__.pop("_lrv_fw_fast", None)
+        return real(desc, layer, *a, **k)
+
+    monkeypatch.setattr(lowrank_virtual, "forward", unsettled)
+    want = _passes(pc, sums, data, ext)
+    assert len(full) == len(sums), (len(full), len(sums))              # (the full path, every layer)
+    for k in ("lls", "mars", "flows", "fp", "fm"):
+        assert not torch.isnan(got[k]).any() and torch.equal(got[k], want[k]), k
+    for k in ("dA", "dB"):
+        assert all(not torch.isnan(a).any() and torch.equal(a, b) for a, b in zip(got[k], want[k])), k
+    monkeypatch.setattr(lowrank_virtual, "forward", real)
+    full.clear()
+    data2, ext2 = inputs(2 * batch, 660)                               # (another batch: the full path, recorded)
+    _passes(pc, sums, data2, ext2)
+    assert len(full) >= len(sums)
+    _passes(pc, sums, data2, ext2)
+    full.clear()
+    _passes(pc, sums, data2, ext2)
+    assert not full, len(full)
+
+
+@needs_virtual
 def test_the_backward_parameter_boxes_need_affine_slabs():
     """`virtual._om_bw_slabs`: the one-launch backward's parameter tiles go as TMA boxes only where every slab's base is
     `p0 + child block cstr + parent block pstr`, all in whole rows of `pbs` parents and -- blocks of fewer than 128
