@@ -604,11 +604,11 @@ PIPELINED_V = True
 #: (`lowrank_forward_om`'s `cmo`: its converters' running max at each tile's end, the max over the tiles the same as
 #: over the children an edge reaches) instead of a launch of its own (`pe_cmax_kernel`; the same bits).
 FORWARD_CMAX = True
-#: The one-launch forward at ranks 8 and 32 (`lowrank_stream.cu`'s `lr_omk_kernel`: the rank-16 kernel's design, a
-#: warp's n-blocks whole samples of the rank, the copies' V rows formed upfront -- no side CTAs) where it serves
+#: The one-launch forward at ranks 8, 32 and 64 (`lowrank_stream.cu`'s `lr_omk_kernel`: the rank-16 kernel's design,
+#: a warp's n-blocks whole samples of the rank -- rank 64's sample over both column warps) where it serves
 #: (`omk_serves`), a candidate beside the pre-pass chain's arms; off, those or the plain path there
 OMK = True
-#: The one-launch backward at ranks 8 and 32 (`lowrank_stream.cu`'s `lr_omk_bw_kernel`: rank 16's `lr_om_bw_kernel` at
+#: The one-launch backward at ranks 8, 32 and 64 (`lowrank_stream.cu`'s `lr_omk_bw_kernel`: rank 16's `lr_om_bw_kernel` at
 #: the tile's samples) where it serves (`omk_bw_serves`); off, the plain path there
 OMK_BW = True
 #: ... and its side CTAs forming the next copy's V rows, as rank 16's (`PIPELINED_V`); off, every copy's V upfront there
@@ -738,7 +738,7 @@ def _stream_plan(desc, layer, twin, info, node_mars, kwargs, stream_children, de
     if mod is None or op is None or op.dtype != torch.bfloat16 or twin.block_size % 32 != 0:
         return None
     chain = K <= 16 and (B * K) % 64 == 0 and B % 16 == 0
-    # (the one-launch form: rank 16's kernel, or ranks 8 and 32's -- `lowrank_forward_omk`)
+    # (the one-launch form: rank 16's kernel, or ranks 8, 32 and 64's -- `lowrank_forward_omk`)
     omk = K != 16 and OMK and hasattr(mod, "omk_serves")
     serves = (lambda r: bool(mod.omk_serves(K, B, twin.block_size, r))) if omk else \
         (lambda r: bool(mod.om_serves(K, B, twin.block_size, r)))
@@ -867,7 +867,7 @@ def _stream_run(plan, info, tensors, kwargs, z, row0, vnm, kd, node_mars, elemen
                                                               node_mars.size(1), device = node_mars.device)
 
                 def fw(nv):
-                    if K != 16:                         # (ranks 8, 32: `lr_omk_kernel`, no V / values boxes)
+                    if K != 16:                         # (ranks 8, 32, 64: `lr_omk_kernel`, no V / values boxes)
                         mod.lowrank_forward_omk(kd, vals, cb, p["ebase"], p["jpos"], vt, row0, shift, op, p["nids"],
                                                 p["pbase"], p["groups"][0], twin.block_size, p["knt"], p["om"][0],
                                                 p["om"][1], node_mars, lz, a_om, nshift, vn0, ua[0], ua[1],

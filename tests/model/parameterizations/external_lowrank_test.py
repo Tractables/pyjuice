@@ -1675,15 +1675,17 @@ def _stream_form(monkeypatch, form):
 @pytest.mark.parametrize("fusion", ["fused", "unfused"])
 @pytest.mark.parametrize("form,bs,batch,rank", [("om", 32, 16, 16), ("om", 64, 16, 16), ("om", 128, 4, 16),
                                                 ("om", 32, 12, 16), ("om", 32, 16, 8), ("om", 64, 8, 8),
-                                                ("om", 32, 16, 32), ("om", 128, 6, 32), ("chain", 32, 16, 16),
+                                                ("om", 32, 16, 32), ("om", 128, 6, 32), ("om", 32, 16, 64),
+                                                ("om", 128, 3, 64), ("chain", 32, 16, 16),
                                                 ("chain", 64, 32, 8), ("chain", 128, 16, 4)])
 def test_the_fused_stream_forward_is_the_plain_virtual_path(form, bs, batch, rank, fusion, monkeypatch):
     """The virtual batch's fused stream forward (`virtual._stream_run`, `kernels/c/lowrank_stream.cu`: the virtual child
     values never stored), each form forced -- the pre-pass chain; the one-launch form, A by TMA in blocks of 32 and by
-    cp.async in blocks of 64 (two a tile) and 128, at batches it alone serves (4, 12, 6), at ranks 8 and 32 its kernel
-    of their own (`lr_omk_kernel`) --, the product layers handed to the sum layers or not: against the plain virtual
-    path on the same circuit (bf16 products both, under other shifts) every value, flow, denominator and gradient, the
-    same bits from run to run, and the torch passes (fp32 parameters) within the bf16 copy's rounding."""
+    cp.async in blocks of 64 (two a tile) and 128, at batches it alone serves (4, 12, 6, 3), at ranks 8, 32 and 64 its
+    kernel of their own (`lr_omk_kernel`; rank 64 a sample over both column warps) --, the product layers handed to the
+    sum layers or not: against the plain virtual path on the same circuit (bf16 products both, under other shifts)
+    every value, flow, denominator and gradient, the same bits from run to run, and the torch passes (fp32
+    parameters) within the bf16 copy's rounding."""
     import pyjuice.parameterizations.lowrank.virtual as lowrank_virtual
     from pyjuice.layer.kernels import autotune
 
@@ -1727,7 +1729,8 @@ def test_the_fused_stream_forward_is_the_plain_virtual_path(form, bs, batch, ran
                           (32, 16, False, True, 0, 16), (64, 16, True, False, 1, 16), (32, 16, True, False, 0, 8),
                           (64, 8, True, False, 0, 8), (128, 16, False, True, 0, 8), (32, 16, True, False, 1, 8),
                           (32, 16, True, False, 0, 32), (64, 6, True, False, 0, 32), (128, 4, False, True, 0, 32),
-                          (32, 16, True, False, 1, 32)])
+                          (32, 16, True, False, 1, 32), (32, 16, True, False, 0, 64), (64, 5, True, False, 0, 64),
+                          (128, 4, False, True, 0, 64), (32, 16, True, False, 1, 64)])
 def test_the_one_launch_backward_is_the_plain_data_half(bs, batch, param_flows, plain_middle, da_ctas, rank,
                                                         monkeypatch):
     """The virtual batch's one-launch backward (`virtual.FUSED_STREAM_BK`, `kernels/c/lowrank_stream.cu`'s
@@ -1741,7 +1744,8 @@ def test_the_one_launch_backward_is_the_plain_data_half(bs, batch, param_flows, 
     withheld): its copy alone owes the normalizer half, past the normalizers' first rows -- with the parameter flows
     (U's rows every copy's: the denominators read them) and without (the owing copy's rows alone). `da_ctas`: the dA
     CTAs capped (one), so it strides over the tiles of the (node, sample) pairs (at these sizes a CTA has one tile
-    otherwise). Ranks 8 and 32: their kernel (`lowrank_backward_omk`, `lr_omk_bw_kernel`: S = 8 and 2 samples a tile)."""
+    otherwise). Ranks 8, 32 and 64: their kernel (`lowrank_backward_omk`, `lr_omk_bw_kernel`: S = 8, 2 and 1 samples a
+    tile; rank 64's pairs over two lanes each)."""
     import pyjuice.parameterizations.lowrank.virtual as lowrank_virtual
     from pyjuice.layer.kernels import autotune
 
@@ -1796,12 +1800,13 @@ def test_the_one_launch_backward_is_the_plain_data_half(bs, batch, param_flows, 
 
 
 @needs_virtual
-@pytest.mark.parametrize("rank", [16, 8, 32])
+@pytest.mark.parametrize("rank", [16, 8, 32, 64])
 def test_tied_copies_through_the_one_launch_backward_into_one_destination(rank, monkeypatch):
-    """`tie_external` through the one-launch backward (ranks 16, 8, 32, blocks of 32): every copy reads the source's factors
-    and adds its gradients into the source's one destination, handed over unzeroed (`StagedExternalParams.fresh`;
-    NaN-filled here) -- the first copy's launch stores into it (it claims it), every other one adds --: the sums of the
-    untied circuit's gradients over its copies, to fp32's order of the additions; every layer took the form."""
+    """`tie_external` through the one-launch backward (ranks 16, 8, 32, 64, blocks of 32): every copy reads the
+    source's factors and adds its gradients into the source's one destination, handed over unzeroed
+    (`StagedExternalParams.fresh`; NaN-filled here) -- the first copy's launch stores into it (it claims it), every
+    other one adds --: the sums of the untied circuit's gradients over its copies, to fp32's order of the additions;
+    every layer took the form."""
     import pyjuice.parameterizations.lowrank.virtual as lowrank_virtual
     from pyjuice.layer.kernels import autotune
 
@@ -1848,6 +1853,46 @@ def test_tied_copies_through_the_one_launch_backward_into_one_destination(rank, 
         assert torch.isfinite(gt[k]).all(), k
         err = float((gt[k].double() - want).abs().max() / want.abs().max())
         assert err < 1e-5, f"slot {k}: {err}"
+
+
+@needs_virtual
+@pytest.mark.parametrize("rank", [16, 8, 32, 64])
+def test_the_one_launch_backward_without_gradients(rank, monkeypatch):
+    """The one-launch backward with no gradient wanted (`lowrank_backward_om` / `lowrank_backward_omk` without dB and
+    dA -- what the circuit's trial of the fused backward on scratch flows runs: the stages one operand, U; rank 64's
+    barriers past an odd count of rescale factors, aligned): each launch of a pass run again so, into a copy of its
+    flows, the same bits as the pass's own launch."""
+    import pyjuice.parameterizations.lowrank.virtual as lowrank_virtual
+    from pyjuice.layer.kernels import autotune
+
+    pick = autotune.pick
+    monkeypatch.setattr(autotune, "pick", lambda key, cands, bench, **k: "fused"
+                        if key[0] in ("prod_stream_fusion", "prod_stream_fusion_bk") else pick(key, cands, bench, **k))
+    pc, sums, _, _, _, _ = _pair(_hmm_blocks(256, 32), "sum_exp", rank = rank)
+    monkeypatch.setattr(pc, "_param_operands_force", True, raising = False)   # (the bf16 copy: the stream path's)
+    monkeypatch.setattr(lowrank_virtual, "GEMM_BF16_WORK", 0)
+    dev = pc.params.device
+    torch.manual_seed(41)
+    batch = 16
+    data = torch.randint(0, NUM_CATS, (batch, pc.num_vars), device = dev)
+    ext = {a: _factors(a, rank, batch, dev, seed = 480 + i) for i, a in enumerate(sums)}
+    smod = lowrank_virtual._stream_module()
+    name = "lowrank_backward_om" if rank == 16 else "lowrank_backward_omk"
+    same, real = [], getattr(smod, name)
+
+    def twice(*args):
+        bare = list(args)
+        bare[0] = args[0].clone()                                       # (its flows into a copy)
+        bare[7] = bare[22] = bare[23] = None                            # (no dB, dA, kept differences)
+        bare[-1] = False                                                # (storing: the gradients' first writer)
+        real(*bare)
+        real(*args)
+        same.append(torch.equal(bare[0], args[0]))
+
+    monkeypatch.setattr(smod, name, twice)
+    _passes(pc, sums, data, ext)
+    torch.cuda.synchronize()
+    assert len(same) == len(sums) and all(same), same                 # (every layer took it)
 
 
 @needs_virtual
@@ -4412,13 +4457,14 @@ def test_the_one_launch_tma_boxes_change_no_bit(bs, batch, fw, bw, monkeypatch):
 
 @needs_virtual
 @pytest.mark.parametrize("N, B, copies, K", [(64, 4, 3, 16), (256, 16, 2, 16), (1024, 8, 3, 16), (1344, 4, 2, 16),
-                                             (64, 4, 3, 8), (1024, 8, 3, 8), (256, 16, 2, 32), (1344, 4, 2, 32)])
+                                             (64, 4, 3, 8), (1024, 8, 3, 8), (256, 16, 2, 32), (1344, 4, 2, 32),
+                                             (256, 16, 2, 64), (1344, 4, 2, 64)])
 def test_the_side_ctas_v_rows_are_the_operand_kernels(N, B, copies, K):
     """`lowrank_v_rows` (the one-launch forward's side-CTA code, `kernels/c/lowrank_stream.cu`'s `om_v_rows`): a copy's
     V rows and their shifts, copy by copy at their rows, the same BITS as `lowrank_z_operand_in_place`'s (every copy in
     one launch) -- factors read in place at a sample stride past their block, entries of -inf (a rank of no finite
-    entry: its shift -inf, its V 0), children past one unit's threads (N 1344); ranks 8 and 32 (a sample's 2 and 8
-    units through the 4 buffers)."""
+    entry: its shift -inf, its V 0), children past one unit's threads (N 1344); ranks 8, 32 and 64 (a sample's 2, 8
+    and 16 units through the 4 buffers; rank 64's in two rounds of 32 ranks)."""
     import pyjuice.parameterizations.lowrank.virtual as lowrank_virtual
 
     smod, mod = lowrank_virtual._stream_module(), lowrank_virtual._module()
@@ -4534,7 +4580,8 @@ class _NanEmpty:
 @pytest.mark.parametrize("bs, batch, form, nv, rank", [(32, 16, "om", 16, 16), (256, 64, "om", 24, 16),
                                                       (32, 16, "om", 0, 16), (32, 16, "chain", None, 16),
                                                       (32, 16, "plain", None, 16), (32, 16, "om", 16, 8),
-                                                      (32, 16, "om", 16, 32), (64, 6, "om", 0, 32)])
+                                                      (32, 16, "om", 16, 32), (64, 6, "om", 0, 32),
+                                                      (32, 16, "om", 16, 64)])
 def test_the_pipelined_v_rows_change_no_bit(bs, batch, form, nv, rank, monkeypatch):
     """V's rows a copy at a time (`virtual.PIPELINED_V`): once a pass left the copies' visit order, the next forms each
     copy's rows as it comes -- by the side CTAs of the one-launch forward before it (`lowrank_forward_om`'s `vnext`,

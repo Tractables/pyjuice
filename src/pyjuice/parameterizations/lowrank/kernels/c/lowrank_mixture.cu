@@ -579,60 +579,69 @@ template <typename TO, int KC>
 __global__ void __launch_bounds__(ITHREADS) inplace_operand_kernel(const ICopies copies, TO* __restrict__ out,
                                                                    float* __restrict__ shift, long rows, long row0,
                                                                    int X, int B) {
-    static_assert(KC <= 32, "a warp's lanes the ranks' maxima");
+    // (rank 64: its ranks in NRD = 2 rounds of KR = 32 -- a round's maxima a warp's lanes, a child's run the round's 32
+    // ranks --; ranks to 32 one round)
+    constexpr int KR = KC > 32 ? 32 : KC, NRD = KC / KR;
+    static_assert(KR <= 32 && KR * NRD == KC, "a warp's lanes the ranks' maxima");
     const int b = blockIdx.x, c = blockIdx.y, t = threadIdx.x, lane = t & 31, w = t >> 5;
-    const float* f = reinterpret_cast<const float*>(copies.p[c]) + (long)b * copies.sb[c];
-    const long at = row0 + (long)c * KC * B + (long)b * KC;           // the (copy, sample)'s first row
-    __shared__ float red[KC][INW];
-    __shared__ float mk[KC];
-    constexpr int IKB = IKEEP / KC;                                // children kept a rank
-    float keep[KC][IKB];                                           // B[b, r, x] at r X + x
-    float mr[KC];
-    #pragma unroll
-    for (int r = 0; r < KC; r++) {
-        float m = -INFINITY;
+    const float* f0 = reinterpret_cast<const float*>(copies.p[c]) + (long)b * copies.sb[c];
+    const long at0 = row0 + (long)c * KC * B + (long)b * KC;          // the (copy, sample)'s first row
+    __shared__ float red[KR][INW];
+    __shared__ float mk[KR];
+    constexpr int IKB = IKEEP / KR;                                // children kept a rank
+    #pragma unroll 1
+    for (int rd = 0; rd < NRD; rd++) {
+        const float* f = f0 + (long)rd * KR * X;                   // (the round's ranks)
+        const long at = at0 + (long)rd * KR;
+        float keep[KR][IKB];                                       // B[b, r, x] at r X + x
+        float mr[KR];
+        #pragma unroll
+        for (int r = 0; r < KR; r++) {
+            float m = -INFINITY;
+            #pragma unroll
+            for (int k = 0; k < IKB; k++) {
+                const int x = t + ITHREADS * k;
+                keep[r][k] = x < X ? f[(long)r * X + x] : -INFINITY;
+                m = fmaxf(m, keep[r][k]);
+            }
+            for (int x = t + ITHREADS * IKB; x < X; x += ITHREADS) m = fmaxf(m, f[(long)r * X + x]);
+            for (int off = 16; off >= 1; off >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, off));
+            mr[r] = m;
+        }
+        if (lane == 0) {
+            #pragma unroll
+            for (int r = 0; r < KR; r++) red[r][w] = mr[r];
+        }
+        __syncthreads();
+        if (t < KR) {
+            float x = red[t][0];
+            for (int i = 1; i < INW; i++) x = fmaxf(x, red[t][i]);
+            mk[t] = x;
+            shift[at + t] = x;
+        }
+        __syncthreads();
+        #pragma unroll
+        for (int r = 0; r < KR; r++) mr[r] = mk[r];
         #pragma unroll
         for (int k = 0; k < IKB; k++) {
             const int x = t + ITHREADS * k;
-            keep[r][k] = x < X ? f[(long)r * X + x] : -INFINITY;
-            m = fmaxf(m, keep[r][k]);
+            if (x < X) {
+                float v[KR];
+                #pragma unroll
+                for (int r = 0; r < KR; r++) v[r] = keep[r][k] > -INFINITY ? expf(keep[r][k] - mr[r]) : 0.0f;
+                store_run<TO, KR>(out + (long)x * rows + at, v);
+            }
         }
-        for (int x = t + ITHREADS * IKB; x < X; x += ITHREADS) m = fmaxf(m, f[(long)r * X + x]);
-        for (int off = 16; off >= 1; off >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, off));
-        mr[r] = m;
-    }
-    if (lane == 0) {
-        #pragma unroll
-        for (int r = 0; r < KC; r++) red[r][w] = mr[r];
-    }
-    __syncthreads();
-    if (t < KC) {
-        float x = red[t][0];
-        for (int i = 1; i < INW; i++) x = fmaxf(x, red[t][i]);
-        mk[t] = x;
-        shift[at + t] = x;
-    }
-    __syncthreads();
-    #pragma unroll
-    for (int r = 0; r < KC; r++) mr[r] = mk[r];
-    #pragma unroll
-    for (int k = 0; k < IKB; k++) {
-        const int x = t + ITHREADS * k;
-        if (x < X) {
-            float v[KC];
+        for (int x = t + ITHREADS * IKB; x < X; x += ITHREADS) {
+            float v[KR];
             #pragma unroll
-            for (int r = 0; r < KC; r++) v[r] = keep[r][k] > -INFINITY ? expf(keep[r][k] - mr[r]) : 0.0f;
-            store_run<TO, KC>(out + (long)x * rows + at, v);
+            for (int r = 0; r < KR; r++) {
+                const float y = f[(long)r * X + x];
+                v[r] = y > -INFINITY ? expf(y - mr[r]) : 0.0f;
+            }
+            store_run<TO, KR>(out + (long)x * rows + at, v);
         }
-    }
-    for (int x = t + ITHREADS * IKB; x < X; x += ITHREADS) {
-        float v[KC];
-        #pragma unroll
-        for (int r = 0; r < KC; r++) {
-            const float y = f[(long)r * X + x];
-            v[r] = y > -INFINITY ? expf(y - mr[r]) : 0.0f;
-        }
-        store_run<TO, KC>(out + (long)x * rows + at, v);
+        if constexpr (NRD > 1) __syncthreads();                   // (`red`, `mk`: the next round's)
     }
 }
 
@@ -1502,15 +1511,15 @@ void inplace_operand(torch::Tensor& out, torch::Tensor& shift, std::vector<torch
     TORCH_CHECK(bf || out.scalar_type() == torch::kFloat32, "lowrank mixture: the operand float32 or bfloat16");
 #define GO(KC_) if (K == KC_) { if (bf) inplace_operand_launch<__nv_bfloat16, KC_>(out, shift, fs, B);                \
                                  else inplace_operand_launch<float, KC_>(out, shift, fs, B); return; }
-    GO(4) GO(8) GO(16) GO(32)
+    GO(4) GO(8) GO(16) GO(32) GO(64)
 #undef GO
-    TORCH_CHECK(false, "lowrank mixture: the operands in place serve ranks 4, 8, 16, 32; got ", K);
+    TORCH_CHECK(false, "lowrank mixture: the operands in place serve ranks 4, 8, 16, 32, 64; got ", K);
 }
 }  // namespace
 
 // `lowrank_z_operand` / `lowrank_a_operand` from the factors IN PLACE -- each copy's `B [B, K, N]` / `A [B, M, K]` as
 // the caller gives it (`LowRank.reads_in_place`: fp32, any batch stride, a sample's block contiguous) --, the same
-// values (`inplace_operand_kernel`, `a_operand_kernel`); ranks 4, 8, 16, 32 (`lowrank_in_place_rank`)
+// values (`inplace_operand_kernel`, `a_operand_kernel`); ranks 4, 8, 16, 32, 64 (`lowrank_in_place_rank`)
 void lowrank_z_operand_in_place(torch::Tensor Vt, torch::Tensor shift, std::vector<torch::Tensor> fb, int64_t B,
                                 int64_t K) {
     inplace_operand(Vt, shift, fb, B, K);
@@ -1519,7 +1528,7 @@ void lowrank_a_operand_in_place(torch::Tensor Ut, torch::Tensor am, std::vector<
                                 int64_t K) {
     a_operand(Ut, am, fa, B, K, true);
 }
-bool lowrank_in_place_rank(int64_t K) { return K == 4 || K == 8 || K == 16 || K == 32; }
+bool lowrank_in_place_rank(int64_t K) { return K == 4 || K == 8 || K == 16 || K == 32 || K == 64; }
 
 // The data half's operands of the copies whose product layer is fused in, as `lowrank_u_operand`'s: `eid` each
 // copy's children's element rows, `table` / `first` its product layer's children table and first element row

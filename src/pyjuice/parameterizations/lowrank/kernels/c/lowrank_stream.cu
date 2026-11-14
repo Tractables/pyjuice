@@ -27,8 +27,9 @@
 // THE ONLINE-MAX FORM (`lowrank_forward_om`, `lr_om_kernel` below): one launch, the operand formed in the GEMM's own
 // stages from the normalizers' V and the children's values, each sample's shift its running max (its header). Scope
 // (`om_serves`): rank 16, B % 4 == 0, block_size % 32 == 0; the normalizers' V bf16.
-// At ranks 8 and 32 the same form in a kernel of its own (`lowrank_forward_omk`, `lr_omk_kernel`: a warp's columns
-// its samples whole, the copies' V rows formed upfront, no V / values boxes). Scope (`omk_serves`): B % (64 / K) == 0.
+// At ranks 8, 32 and 64 the same form in a kernel of its own (`lowrank_forward_omk`, `lr_omk_kernel`: a warp's
+// columns its samples whole -- rank 64's sample over both column warps --, no V / values boxes). Scope (`omk_serves`):
+// B % (64 / K) == 0.
 //
 // The collapse (`lowrank_mixture.cu`) follows either. MEASURED on the way (HMM 1024 x 1024, rank 16, B 64, us a
 // layer): the exponentials with an exact column max -- a block per (group, split, 8 samples) walking the range 78;
@@ -542,11 +543,17 @@ __device__ __forceinline__ void om_v_rows(const float* __restrict__ f0, long f_s
     };
     if (tid == 0)
         for (int u = 0; u < min(OMV_NB, nu); u++) issue(u);
+    // (rank 64: the sample's ranks in NH rounds of KH -- its units NGH a round, a child's run KH ranks a round: the
+    // registers of 32 ranks at most)
+    constexpr int KH = KC > 32 ? 32 : KC, NH = KC / KH, NGH = KH / OMV_G;
     for (int s = 0; s < nsamp; s++) {
         const int b = vi + n_v * s;
-        uint32_t acc[OMV_MAXX][KC / 2];                         // (the sample's ranks at the thread's children)
+        #pragma unroll 1
+        for (int h = 0; h < NH; h++) {
+        uint32_t acc[OMV_MAXX][KH / 2];                         // (the round's ranks at the thread's children)
         #pragma unroll
-        for (int g = 0; g < NG; g++) {                          // (unit s NG + g in buffer q)
+        for (int gg = 0; gg < NGH; gg++) {                      // (unit s NG + g in buffer q)
+            const int g = h * NGH + gg;
             const int u = s * NG + g;
             const int q = NG == OMV_NB ? g : u % OMV_NB;
             mbar_wait(&bar[q], NG == OMV_NB ? (s & 1) : ((u / OMV_NB) & 1));
@@ -582,22 +589,23 @@ __device__ __forceinline__ void om_v_rows(const float* __restrict__ f0, long f_s
                         v[r] = y > -INFINITY ? expf(y - mr[r]) : 0.0f;
                     }
                     const __nv_bfloat162 h0 = __floats2bfloat162_rn(v[0], v[1]), h1 = __floats2bfloat162_rn(v[2], v[3]);
-                    acc[i][2 * g] = *reinterpret_cast<const uint32_t*>(&h0);
-                    acc[i][2 * g + 1] = *reinterpret_cast<const uint32_t*>(&h1);
+                    acc[i][2 * gg] = *reinterpret_cast<const uint32_t*>(&h0);
+                    acc[i][2 * gg + 1] = *reinterpret_cast<const uint32_t*>(&h1);
                 }
             }
             __syncthreads();                                    // (buffer q and `red` free again)
             if (tid == 0 && u + OMV_NB < nu) issue(u + OMV_NB);
         }
         #pragma unroll
-        for (int i = 0; i < OMV_MAXX; i++) {                    // (a child's run of the sample's ranks: 32 bytes)
+        for (int i = 0; i < OMV_MAXX; i++) {                    // (a child's run of the round's ranks: 32 bytes a 16)
             const int x = tid + i * OM_THREADS;
             if (x < X) {
-                uint4* dst = reinterpret_cast<uint4*>(out + (long)x * rows + row0 + (long)b * KC);
+                uint4* dst = reinterpret_cast<uint4*>(out + (long)x * rows + row0 + (long)b * KC + h * KH);
                 #pragma unroll
-                for (int k = 0; k < KC / 8; k++)
+                for (int k = 0; k < KH / 8; k++)
                     dst[k] = make_uint4(acc[i][4 * k], acc[i][4 * k + 1], acc[i][4 * k + 2], acc[i][4 * k + 3]);
             }
+        }
         }
     }
 }
@@ -610,9 +618,12 @@ __global__ void __launch_bounds__(OM_THREADS, 1) om_v_kernel(const float* __rest
     om_v_rows<KC>(f, f_sb, out, sh, rows, row0, X, B, (int)blockIdx.x, (int)gridDim.x);
 }
 // (the rank-K forward's shared memory, `launch_omk`'s: what its side CTAs have)
+// (rank 64: a sample over both column warps -- their maxima (3 a row) and sums (2) exchanged, a float a quad and row
+// of a warp: `lr_omk_kernel`'s `xw`)
+constexpr int OMK_XW = 4 * 2 * 4 * 8 * 5;                // [WM][WN][NR][8 quads][3 + 2] floats
 __host__ __device__ constexpr long omk_smem(int KK) {
     return (long)OM_ST * ((32 * OM_BM * 2 + 2 * 32 * OM_BN * 2 + 2 * 32 * (OM_BN / KK) * 4 + 1023) / 1024 * 1024) +
-           2 * OM_ST * (OM_BN / KK) * 4 + 3 * OM_ST * 8;
+           2 * OM_ST * (OM_BN / KK) * 4 + 3 * OM_ST * 8 + (KK > 32 ? OMK_XW * 4 : 0);
 }
 
 template <int ST, bool FUSED, bool TMAA, bool VTMA>
@@ -1280,7 +1291,7 @@ __global__ void __launch_bounds__(OM_THREADS, 1) lr_omk_kernel(
     constexpr int KT = 32, NC = WM * WN * 32, NP = 128, NV = 128;
     static_assert(NC + NP + NV == OM_THREADS, "the warp roles");
     constexpr int S = BN / K;                            // the tile's samples
-    static_assert(S % 4 == 0 || S == 2, "a row's values of the tile's samples in 16-byte runs (8 at S 2)");
+    static_assert(S % 4 == 0 || S <= 2, "a row's values of the tile's samples in 16-byte runs (8 at S 2, 4 at S 1)");
     constexpr int CW = S >= 4 ? 4 : S, SC = S / CW;      // (a chunk's samples, a row's chunks)
     // a stage: A, V as copied (the normalizer's operand), u = V exp(c - m) (the converters'), the children's values
     constexpr int ABYTES = KT * BM * 2, UBYTES = KT * BN * 2, CBYTES = 2 * KT * S * 4;
@@ -1313,9 +1324,11 @@ __global__ void __launch_bounds__(OM_THREADS, 1) lr_omk_kernel(
     // NSW samples whole -- the collapse then stays in a warp, a (row, sample)'s ranks in the 4 lanes of a group -- and
     // the stage holds V and u in the tile's own column order. (Rank 8's samples interleaved over the warps, as rank
     // 16's kernel takes them -- n-block ni of warp wn sample 2 ni + wn --, came out wrong: 0.3 nats off.)
-    static_assert(WN == 2 && (K == 8 || K == 16 || K == 32), "the MMA's permutation: a warp's n-blocks whole samples");
+    static_assert(WN == 2 && (K == 8 || K == 16 || K == 32 || K == 64),
+                  "the MMA's permutation: a warp's n-blocks whole samples (rank 64: half a sample)");
     uint64_t* full = fullr + ST;                         // ... and converted (the converters')
     uint64_t* empty = full + ST;                         // ... and read (the consumers')
+    float* xw = (float*)(empty + ST);                    // (rank 64: the column warps' exchange, OMK_XW floats)
     const int tid = threadIdx.x;
     auto sAl = [&]() {                                   // (TMAA: a node block's [KT k][32 nodes] a contiguous 2 KB)
         if constexpr (TMAA) return tile_to_shape(AtomA32{}, make_shape(Int<BM>{}, Int<KT>{}), Step<_2, _1>{});
@@ -1435,7 +1448,11 @@ __global__ void __launch_bounds__(OM_THREADS, 1) lr_omk_kernel(
             for (int k = 0; k < CC; k++) asm volatile("" : "+l"(cptr[k]));
         };
         tile_bases();
-        auto prefetch = [&](int q) { asm volatile("prefetch.global.L2::evict_last [%0];" ::"l"(pfa + (long)q * a_sb)); };
+        auto prefetch = [&](int q) {                     // (a sample's K ranks: 64 / K of them a line)
+            CUTE_UNROLL
+            for (int l = 0; l < (K > 32 ? K / 32 : 1); l++)
+                asm volatile("prefetch.global.L2::evict_last [%0];" ::"l"(pfa + (long)q * a_sb + 32 * l));
+        };
         const uint32_t bar0 = (uint32_t)__cvta_generic_to_shared(&fullr[0]);
         auto issue_a = [&](int t, uint32_t ss, int st) {    // (t increasing; st = t % ST, its stage)
             if constexpr (TMAA) {
@@ -1542,9 +1559,12 @@ __global__ void __launch_bounds__(OM_THREADS, 1) lr_omk_kernel(
                     if constexpr (CW == 4)
                         asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(ss + oC[k]), "l"(src),
                                      "r"(ninf || base >= 0 ? 16u : 0u) : "memory");
-                    else
+                    else if constexpr (CW == 2)
                         asm volatile("cp.async.ca.shared.global [%0], [%1], 8, %2;\n" ::"r"(ss + oC[k]), "l"(src),
                                      "r"(ninf || base >= 0 ? 8u : 0u) : "memory");
+                    else
+                        asm volatile("cp.async.ca.shared.global [%0], [%1], 4, %2;\n" ::"r"(ss + oC[k]), "l"(src),
+                                     "r"(ninf || base >= 0 ? 4u : 0u) : "memory");
                 }
             }
             cpa_mbar_arrive(&fullr[s]);          // (tracks every copy this thread issued: the stage's A too)
@@ -1654,7 +1674,9 @@ __global__ void __launch_bounds__(OM_THREADS, 1) lr_omk_kernel(
         return;
     }
     // ---------------- consumers: a tile's k-steps into two fp32 accumulators, S_r (A u) and Z_r (A V); its collapse ----------------
-    constexpr int NBS = K / 8, NSW = 4 / NBS;             // (a sample's n-blocks, a warp's samples)
+    // (a sample's n-blocks in a warp, a warp's samples; HW the warps a sample: rank 64's over both column warps)
+    constexpr int NBS = K / 8 < 4 ? K / 8 : 4, NSW = 4 / NBS, HW = K > 32 ? K / 32 : 1;
+    static_assert(HW == 1 || (HW == 2 && WN == 2 && NSW == 1), "rank 64: a sample's two halves the two column warps");
     // (N permuted: logical column c + 8 b0 + 16 b1 + 32 b2 at the tile's column c + 32 b0 + 8 b1 + 16 b2 -- warp wn's
     // n-block ni the tile's columns 32 wn + 8 ni + [0, 8): its samples NSW wn .. NSW wn + NSW - 1, whole)
     using PermN = Layout<Shape<_8, _2, _2, _2>, Stride<_1, _32, _8, _16>>;
@@ -1744,7 +1766,7 @@ __global__ void __launch_bounds__(OM_THREADS, 1) lr_omk_kernel(
         for (int kb = 0; kb < KB; kb++) cute::gemm(mma, tCrA(_, _, kb), tCrB(_, _, kb), tCrZ);
         CUTE_UNROLL
         for (int kb = 0; kb < KB; kb++) load_b(sbase + so + ABYTES + UBYTES, kb);
-        const float* rec = srec + s * 2 * S + NSW * wn;  // the stage's record: its samples' factors (1: no rise)
+        const float* rec = srec + s * 2 * S + (HW > 1 ? 0 : NSW * wn);   // the stage's record: its samples' factors
         float fq[NSW];
         bool rose = false;
         CUTE_UNROLL
@@ -1810,6 +1832,13 @@ __global__ void __launch_bounds__(OM_THREADS, 1) lr_omk_kernel(
             CUTE_UNROLL
             for (int i = 0; i < size(tCrL); i++) { tCrL(i) = logf(tCrL(i)); tCrZ(i) = logf(tCrZ(i)); }
         };
+        // (rank 64: the other column warp's half of the sample -- its maxima, then its sums -- through `xw`, a float a
+        // (row, quad): the quad's lane 0 writes, the pair waits (named barrier 1 + wm), every lane reads; max and the
+        // sum of two are order-free: both warps the same bits)
+        const int wm_ = (tid / 32) % WM, q4 = (tid % 32) / 4;
+        auto xslot = [&](int w2, int ro, int k) { return xw + (((wm_ * 2 + w2) * NR + ro) * 8 + q4) * 5 + k; };
+        auto pair_sync = [&]() { asm volatile("bar.sync %0, 64;" ::"r"(1 + wm_) : "memory"); };
+        float amr[NR];                                   // (rank 64: A's maxima of the rows, the pair's)
         auto part1 = [&](int sg) {                       // the terms' logs (in the sums' registers), their maxima
             const int q = sg % NL;
             const float mm = mfin[sg];
@@ -1830,6 +1859,7 @@ __global__ void __launch_bounds__(OM_THREADS, 1) lr_omk_kernel(
                 }
                 ms[ro] = m1;
                 mz[ro] = m2;
+                if constexpr (HW > 1) { amr[ro] = am_; continue; }   // (rank 64: the pair's maxima first)
                 if (uaw != nullptr) {                    // (the A operand: `lowrank_mixture.cu`'s `a_operand_kernel`'s)
                     float a = fmaxf(am_, __shfl_xor_sync(FULLW, am_, 1));
                     a = fmaxf(a, __shfl_xor_sync(FULLW, a, 2));
@@ -1846,15 +1876,58 @@ __global__ void __launch_bounds__(OM_THREADS, 1) lr_omk_kernel(
                     if (head) amw[(long)irow[ro] * B + b] = a;
                 }
             }
+            if constexpr (HW > 1) {
+                CUTE_UNROLL
+                for (int d = 1; d <= 2; d <<= 1) {
+                    CUTE_UNROLL
+                    for (int ro = 0; ro < NR; ro++) {
+                        ms[ro] = fmaxf(ms[ro], __shfl_xor_sync(FULLW, ms[ro], d));
+                        mz[ro] = fmaxf(mz[ro], __shfl_xor_sync(FULLW, mz[ro], d));
+                        amr[ro] = fmaxf(amr[ro], __shfl_xor_sync(FULLW, amr[ro], d));
+                    }
+                }
+                if (head) {
+                    CUTE_UNROLL
+                    for (int ro = 0; ro < NR; ro++) {
+                        *xslot(wn, ro, 0) = ms[ro]; *xslot(wn, ro, 1) = mz[ro]; *xslot(wn, ro, 2) = amr[ro];
+                    }
+                }
+                pair_sync();
+                CUTE_UNROLL
+                for (int ro = 0; ro < NR; ro++) {
+                    ms[ro] = fmaxf(ms[ro], *xslot(1 - wn, ro, 0));
+                    mz[ro] = fmaxf(mz[ro], *xslot(1 - wn, ro, 1));
+                    amr[ro] = fmaxf(amr[ro], *xslot(1 - wn, ro, 2));
+                }
+                if (uaw != nullptr) {                    // (the A operand: the sample's max over its 64 ranks)
+                    const int b = T.b0 + c0[q] / K;
+                    CUTE_UNROLL
+                    for (int ro = 0; ro < NR; ro++) {
+                        const float a = amr[ro];
+                        const bool on = a > -INFINITY;
+                        bfloat16_t* u = uaw + (long)irow[ro] * urows + row0 + (long)b * K + c0[q] % K;
+                        CUTE_UNROLL
+                        for (int bk = 0; bk < NBS; bk++) {
+                            const float2 p = Av[q][bk][ro];
+                            const __nv_bfloat162 u0 = __floats2bfloat162_rn(on && p.x > -INFINITY ? expf(p.x - a) : 0.0f,
+                                                                            on && p.y > -INFINITY ? expf(p.y - a) : 0.0f);
+                            *reinterpret_cast<__nv_bfloat162*>(u + 8 * bk) = u0;
+                        }
+                        if (head && wn == 0) amw[(long)irow[ro] * B + b] = a;
+                    }
+                }
+            }
         };
         float ss[NR], sz[NR];
         auto part2a = [&](int sg) {
-            CUTE_UNROLL
-            for (int d = 1; d <= 2; d <<= 1) {
+            if constexpr (HW == 1) {                     // (rank 64: the pair's maxima already, part1)
                 CUTE_UNROLL
-                for (int ro = 0; ro < NR; ro++) {
-                    ms[ro] = fmaxf(ms[ro], __shfl_xor_sync(FULLW, ms[ro], d));
-                    mz[ro] = fmaxf(mz[ro], __shfl_xor_sync(FULLW, mz[ro], d));
+                for (int d = 1; d <= 2; d <<= 1) {
+                    CUTE_UNROLL
+                    for (int ro = 0; ro < NR; ro++) {
+                        ms[ro] = fmaxf(ms[ro], __shfl_xor_sync(FULLW, ms[ro], d));
+                        mz[ro] = fmaxf(mz[ro], __shfl_xor_sync(FULLW, mz[ro], d));
+                    }
                 }
             }
             CUTE_UNROLL
@@ -1882,6 +1955,18 @@ __global__ void __launch_bounds__(OM_THREADS, 1) lr_omk_kernel(
                     sz[ro] += __shfl_xor_sync(FULLW, sz[ro], d);
                 }
             }
+            if constexpr (HW > 1) {                      // (the pair's sums: the other warp's half added)
+                if (head) {
+                    CUTE_UNROLL
+                    for (int ro = 0; ro < NR; ro++) { *xslot(wn, ro, 3) = ss[ro]; *xslot(wn, ro, 4) = sz[ro]; }
+                }
+                pair_sync();
+                CUTE_UNROLL
+                for (int ro = 0; ro < NR; ro++) {
+                    ss[ro] = ss[ro] + *xslot(1 - wn, ro, 3);
+                    sz[ro] = sz[ro] + *xslot(1 - wn, ro, 4);
+                }
+            }
         };
         auto part2b = [&](int sg) {
             const int q = sg % NL;
@@ -1904,7 +1989,7 @@ __global__ void __launch_bounds__(OM_THREADS, 1) lr_omk_kernel(
                     *(float2*)(vr + 8 * bk) = make_float2(o0, o1);
                 }
             }
-            if (head) {
+            if (head && (HW == 1 || wn == 0)) {          // (rank 64: the pair's first warp)
                 CUTE_UNROLL
                 for (int ro = 0; ro < NR; ro++) {
                     node_mars[((long)irow[ro] + vn0 + nshift) * B + b] = nv[ro];
@@ -2593,11 +2678,13 @@ __global__ void __launch_bounds__(OM_THREADS, 1) lr_om_bw_kernel(
     epilogue_wait();                                     // (the log G tile handed over: the pairs are the others')
 }
 
-// ---------------- the backward's one-launch form at ranks 8 and 32 ----------------
-// `lr_om_bw_kernel`'s design at the tile's S = OM_BN / K samples (2 at rank 32, 8 at rank 8): the dA CTAs' tiles
-// 32 nodes x OMK_DTS(K) samples (16 K floats a node), the parents' rows' chunks of CW samples (8 bytes at S 2), the
-// converters' warps a sample's part at rank 32 (its first warp records the rescale factors), a consumer n-block's
-// sample (16 ni + 8 wn) / K, EPP epilogue pairs a producer and a converter (1 at rank 32, 4 at rank 8)
+// ---------------- the backward's one-launch form at ranks 8, 32 and 64 ----------------
+// `lr_om_bw_kernel`'s design at the tile's S = OM_BN / K samples (2 at rank 32, 8 at rank 8, 1 at rank 64): the dA
+// CTAs' tiles 32 nodes x OMK_DTS(K) samples (16 K floats a node; rank 64's 256 pairs fewer than the threads), the
+// parents' rows' chunks of CW samples (8 bytes at S 2, 4 at S 1), the converters' warps a sample's part at ranks 32 and
+// 64 (its first warp records the rescale factors), a consumer n-block's sample (16 ni + 8 wn) / K, EPP epilogue pair
+// parts a producer and a converter (1 at ranks 32 and 64, 4 at rank 8; rank 64's pair two adjacent lanes, 32 ranks
+// each)
 #define OMK_DTS(K) ((K) <= 16 ? 32 : 512 / (K))
 template <int KK, int ST, bool FUSED, bool GRAD, bool STORE, bool TMAA>
 __global__ void __launch_bounds__(OM_THREADS, 1) lr_omk_bw_kernel(
@@ -2619,8 +2706,10 @@ __global__ void __launch_bounds__(OM_THREADS, 1) lr_omk_bw_kernel(
         if (!GRAD) return;
         cudaGridDependencySynchronize();                 // (the node flows: the launches before's)
         constexpr int DTI = 32, DTS = OMK_DTS(K), DROW = DTS * K + 4;   // (rows padded: 16-byte aligned, off the banks)
-        constexpr int NQ = DTI * DTS * K / 4 / OM_THREADS, NE = DTI * DTS / OM_THREADS;   // (float4s, pairs a thread)
-        static_assert(NQ * OM_THREADS * 4 == DTI * DTS * K && NE * OM_THREADS == DTI * DTS, "a tile's work evenly");
+        // (float4s, pairs a thread -- rank 64's 32 x 8 pairs fewer than the threads: the others none)
+        constexpr int NQ = DTI * DTS * K / 4 / OM_THREADS, NE = (DTI * DTS + OM_THREADS - 1) / OM_THREADS;
+        constexpr bool FULL_E = NE * OM_THREADS == DTI * DTS;   // (else rank 64's: the threads past the pairs none)
+        static_assert(NQ * OM_THREADS * 4 == DTI * DTS * K && (FULL_E || NE == 1), "a tile's work evenly");
         float* sk = (float*)smem_raw;                    // [DTI][DROW]
         constexpr int DES = DTS + 1;                     // (se's rows padded: a warp's reads off one bank)
         float* se = sk + DTI * DROW;                     // [DTI][DES] a pair's exp(lf), -1 where it takes nothing
@@ -2642,7 +2731,7 @@ __global__ void __launch_bounds__(OM_THREADS, 1) lr_omk_bw_kernel(
             for (int q = 0; q < NE; q++) {
                 const int x = threadIdx.x + q * OM_THREADS, ii = x / DTS, b = s0 + x % DTS, i = i0 + ii;
                 lfv[q] = -INFINITY; lsv[q] = -INFINITY;
-                if (b < B && i < M) {
+                if ((FULL_E || x < DTI * DTS) && b < B && i < M) {
                     const long row = vn0 + nshift + i;   // the node's circuit row
                     lfv[q] = nflow[row * B + b];
                     lsv[q] = nmar[row * B + b] + lz[(long)i * B + b];   // log S = log n + log Z
@@ -2657,7 +2746,8 @@ __global__ void __launch_bounds__(OM_THREADS, 1) lr_omk_bw_kernel(
             for (int q = 0; q < NE; q++) {
                 const int x = threadIdx.x + q * OM_THREADS;
                 const float lf = lfv[q], ls = lsv[q];
-                se[(x / DTS) * DES + x % DTS] = ((lf > -INFINITY) && (ls > -INFINITY)) ? expf(lf) : -1.f;
+                if (FULL_E || x < DTI * DTS)
+                    se[(x / DTS) * DES + x % DTS] = ((lf > -INFINITY) && (ls > -INFINITY)) ? expf(lf) : -1.f;
             }
             __syncthreads();
             float4 gv[NQ];
@@ -2694,7 +2784,7 @@ __global__ void __launch_bounds__(OM_THREADS, 1) lr_omk_bw_kernel(
     constexpr int KT = 32, NC = WM * WN * 32, NP = 128, NV = 128;
     static_assert(NC + NP + NV == OM_THREADS, "the warp roles");
     constexpr int S = BN / K;                            // the tile's samples
-    static_assert(S % 4 == 0 || S == 2, "a row's values of the tile's samples in 16-byte runs (8 at S 2)");
+    static_assert(S % 4 == 0 || S <= 2, "a row's values of the tile's samples in 16-byte runs (8 at S 2, 4 at S 1)");
     constexpr int CW = S >= 4 ? 4 : S, SC = S / CW;      // (a chunk's samples, a row's chunks)
     constexpr int NU = GRAD ? 2 : 1;                     // (U; and Un, GRAD)
     constexpr int ABYTES = KT * BM * 2, UBYTES = KT * BN * 2, CBYTES = 4 * KT * S * 4;   // (flows, values, log Z, am)
@@ -2710,7 +2800,8 @@ __global__ void __launch_bounds__(OM_THREADS, 1) lr_omk_bw_kernel(
     const int SPB = pbs / KT, nk = npb * SPB;            // k-steps a parent block, all
     float* smsh = (float*)(smem_raw + ST * STAGE);       // [NU][BN] the columns' final shifts (the converters')
     float* sfac = smsh + NU * BN;                        // [NU][ST][S] a stage's rescale factors (the converters')
-    uint64_t* fullr = (uint64_t*)(sfac + NU * ST * S);
+    // (the barriers 8-byte aligned: rank 64's factors, NU ST S floats, an odd count without the gradients)
+    uint64_t* fullr = (uint64_t*)(sfac + (NU * ST * S + 1) / 2 * 2);
     uint64_t* full = fullr + ST;
     uint64_t* empty = full + ST;
     uint32_t* sflg = (uint32_t*)(empty + ST);           // [ST][NU] a stage's "a max rose": a byte a converter warp
@@ -2736,8 +2827,12 @@ __global__ void __launch_bounds__(OM_THREADS, 1) lr_omk_bw_kernel(
     // `epi_load` right after the thread's own loop -- the producers' last copies issued ST k-steps before the consumers'
     // end, the converters' last stage one or two -- the rest past the log G tile (`epi_finish`): every load before the
     // first store, as one thread a pair did. (The pieces were prefetched into L2 by the converters at the start.)
-    constexpr int EPP = BM * S / (NP + NV);               // (K 8: 4, K 32: 1)
-    static_assert(EPP >= 1 && EPP * (NP + NV) == BM * S, "the epilogue's pairs evenly over the producers and converters");
+    // (HP threads a pair -- rank 64: two adjacent lanes, KH = 32 ranks each, their flow's max and sum by a shuffle --;
+    // EPP pair parts a thread: K 8 4, K 16 2, K 32 and 64 1; part Q = P HP + h)
+    constexpr int HP = K > 32 ? 2 : 1, KH = K / HP;
+    constexpr int EPP = BM * S * HP / (NP + NV);
+    static_assert(EPP >= 1 && EPP * (NP + NV) == BM * S * HP && (NV * HP) % 2 == 0,
+                  "the epilogue's pairs evenly over the producers and converters (a pair's parts adjacent lanes)");
     float* gs = (float*)smem_raw;
     float* gn = gs + BM * GS;                            // (GRAD: log Gn)
     auto child_of = [&](int m, long& e, int& j) {         // a tile row's element row and the node vector's child
@@ -2748,9 +2843,10 @@ __global__ void __launch_bounds__(OM_THREADS, 1) lr_omk_bw_kernel(
     struct EpiPair {                                     // (a pair's pieces, loaded: `epi_load`)
         long e, ch0, ch1;
         int j;
-        float c, x[K], gv[K];
+        float c, x[KH], gv[KH];
     };
-    auto epi_load = [&](int P, EpiPair& p) {
+    auto epi_load = [&](int Q, EpiPair& p) {
+        const int P = Q / HP, h = Q % HP;               // (the pair, its part: ranks h KH .. + KH)
         const int m = P / S, sl = P % S, b = b0 + sl;
         child_of(m, p.e, p.j);
         if (p.j < 0) return;                             // (no child of the node vector)
@@ -2762,42 +2858,85 @@ __global__ void __launch_bounds__(OM_THREADS, 1) lr_omk_bw_kernel(
         } else {
             p.c = vals[p.e * B + b];
         }
-        const float* bsrc = fb + (long)b * fb_sb + p.j;  // B[b, r, j] as the caller gives it: r at a stride of N
+        // B[b, r, j] as the caller gives it: r at a stride of N (HP 2: the part's ranks)
+        const long hN = HP > 1 ? (long)(h * KH) * N : 0L;
+        const float* bsrc = fb + (long)b * fb_sb + hN + p.j;
         CUTE_UNROLL
-        for (int r = 0; r < K; r++) p.x[r] = bsrc[(long)r * N];
+        for (int r = 0; r < KH; r++) p.x[r] = bsrc[(long)r * N];
         if (GRAD) {
-            const float* g = grad_b + (long)b * gb_sb + p.j;
+            const float* g = grad_b + (long)b * gb_sb + hN + p.j;
             CUTE_UNROLL
-            for (int r = 0; r < K; r++) p.gv[r] = STORE ? 0.f : g[(long)r * N];   // (STORE: dB's first writer)
+            for (int r = 0; r < KH; r++) p.gv[r] = STORE ? 0.f : g[(long)r * N];   // (STORE: dB's first writer)
         }
     };
-    auto epi_finish = [&](int P, EpiPair& p) {
-        if (p.j < 0) return;
-        const int m = P / S, sl = P % S, b = b0 + sl;
-        const long e = p.e, ch0 = p.ch0, ch1 = p.ch1;
-        const int j = p.j;
-        const float c = p.c;
-        float* g = GRAD ? grad_b + (long)b * gb_sb + j : nullptr;
-        const float (&x)[K] = p.x;
-        const float (&gv)[K] = p.gv;
-        const float* gr = gs + m * GS + sl * K;          // (the pair's log G; log Gn GS BM on)
-        float mx = -INFINITY;
-        CUTE_UNROLL
-        for (int r = 0; r < K; r++) mx = fmaxf(mx, c + x[r] + gr[r]);
-        float sm = 0.f;
-        if (mx > -INFINITY) {
+    auto epi_finish = [&](int Q, EpiPair& p) {
+        if constexpr (HP == 1) {
+            const int P = Q;
+            if (p.j < 0) return;
+            const int m = P / S, sl = P % S, b = b0 + sl;
+            const long e = p.e, ch0 = p.ch0, ch1 = p.ch1;
+            const int j = p.j;
+            const float c = p.c;
+            float* g = GRAD ? grad_b + (long)b * gb_sb + j : nullptr;
+            const float (&x)[K] = p.x;
+            const float (&gv)[K] = p.gv;
+            const float* gr = gs + m * GS + sl * K;      // (the pair's log G; log Gn GS BM on)
+            float mx = -INFINITY;
             CUTE_UNROLL
-            for (int r = 0; r < K; r++) sm += __expf((c + x[r] + gr[r]) - mx);
-        }
-        const float lef = mx > -INFINITY ? mx + logf(sm) : -INFINITY;
-        if (FUSED) { flows[ch0 * B + b] = lef; flows[ch1 * B + b] = lef; }
-        else flows[e * B + b] = lef;
-        if (GRAD) {                                      // (the data half less the normalizer half, exp(B + log Gn))
-            CUTE_UNROLL
-            for (int r = 0; r < K; r++) {
-                const float xr = c + x[r] + gr[r], y = x[r] + gr[BM * GS + r];
-                const float nv = y > -INFINITY ? __expf(y) : 0.f;
-                g[(long)r * N] = (gv[r] + (xr > -INFINITY ? __expf(xr) : 0.f)) - nv;
+            for (int r = 0; r < K; r++) mx = fmaxf(mx, c + x[r] + gr[r]);
+            float sm = 0.f;
+            if (mx > -INFINITY) {
+                CUTE_UNROLL
+                for (int r = 0; r < K; r++) sm += __expf((c + x[r] + gr[r]) - mx);
+            }
+            const float lef = mx > -INFINITY ? mx + logf(sm) : -INFINITY;
+            if (FUSED) { flows[ch0 * B + b] = lef; flows[ch1 * B + b] = lef; }
+            else flows[e * B + b] = lef;
+            if (GRAD) {                                  // (the data half less the normalizer half, exp(B + log Gn))
+                CUTE_UNROLL
+                for (int r = 0; r < K; r++) {
+                    const float xr = c + x[r] + gr[r], y = x[r] + gr[BM * GS + r];
+                    const float nv = y > -INFINITY ? __expf(y) : 0.f;
+                    g[(long)r * N] = (gv[r] + (xr > -INFINITY ? __expf(xr) : 0.f)) - nv;
+                }
+            }
+        } else {
+            // (rank 64: part h of pair P, its lane and the pair's other part's adjacent -- both on to the shuffles)
+            const int P = Q / HP, h = Q % HP;
+            const bool on = p.j >= 0;
+            const int m = P / S, sl = P % S, b = b0 + sl;
+            const long e = p.e, ch0 = p.ch0, ch1 = p.ch1;
+            const int j = p.j;
+            const float c = p.c;
+            float* g = GRAD ? grad_b + (long)b * gb_sb + (long)(h * KH) * N + j : nullptr;
+            const float (&x)[KH] = p.x;
+            const float (&gv)[KH] = p.gv;
+            const float* gr = gs + m * GS + sl * K + h * KH;   // (the part's log G; log Gn GS BM on)
+            float mx = -INFINITY;
+            if (on) {
+                CUTE_UNROLL
+                for (int r = 0; r < KH; r++) mx = fmaxf(mx, c + x[r] + gr[r]);
+            }
+            mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, 1));   // (the pair's other part)
+            float sm = 0.f;
+            if (on && mx > -INFINITY) {
+                CUTE_UNROLL
+                for (int r = 0; r < KH; r++) sm += __expf((c + x[r] + gr[r]) - mx);
+            }
+            sm = sm + __shfl_xor_sync(0xffffffffu, sm, 1);
+            if (!on) return;
+            const float lef = mx > -INFINITY ? mx + logf(sm) : -INFINITY;
+            if (h == 0) {
+                if (FUSED) { flows[ch0 * B + b] = lef; flows[ch1 * B + b] = lef; }
+                else flows[e * B + b] = lef;
+            }
+            if (GRAD) {                                  // (the data half less the normalizer half, exp(B + log Gn))
+                CUTE_UNROLL
+                for (int r = 0; r < KH; r++) {
+                    const float xr = c + x[r] + gr[r], y = x[r] + gr[BM * GS + r];
+                    const float nv = y > -INFINITY ? __expf(y) : 0.f;
+                    g[(long)r * N] = (gv[r] + (xr > -INFINITY ? __expf(xr) : 0.f)) - nv;
+                }
             }
         }
     };
@@ -2934,7 +3073,10 @@ __global__ void __launch_bounds__(OM_THREADS, 1) lr_omk_bw_kernel(
                     for (int k = 0; k < CC; k++)
                         if (oC[k] != ~0u) {
                             if constexpr (CW == 4) cpa16(ss + oC[k], cfirst[k] + i0[u] * B_l);
-                            else asm volatile("cp.async.ca.shared.global [%0], [%1], 8;\n" ::"r"(ss + oC[k]),
+                            else if constexpr (CW == 2)
+                                asm volatile("cp.async.ca.shared.global [%0], [%1], 8;\n" ::"r"(ss + oC[k]),
+                                             "l"(cfirst[k] + i0[u] * B_l) : "memory");
+                            else asm volatile("cp.async.ca.shared.global [%0], [%1], 4;\n" ::"r"(ss + oC[k]),
                                               "l"(cfirst[k] + i0[u] * B_l) : "memory");
                         }
                     cpa_mbar_arrive(&fullr[s]);
@@ -3530,7 +3672,7 @@ static int g_tile_group = 0;
 void set_tile_group(int64_t n) { g_tile_group = (int)std::max<int64_t>(n, 0); }
 static int om_tile_group() { return g_tile_group > 0 ? g_tile_group : std::max(1, om_sms() / 4); }
 
-// The one-launch forward at ranks 8 and 32 (`lr_omk_kernel`): the rank-16 launcher's, its shared memory by S
+// The one-launch forward at ranks 8, 32 and 64 (`lr_omk_kernel`): the rank-16 launcher's, its shared memory by S
 template <int KK, bool FUSED, bool TMAA>
 static void launch_omk(const bfloat16_t* params, const long* pbase, const bfloat16_t* vt, long vrows, long row0,
                        const float* shift, const float* vals, const long* ebase, const int* cbase, const int* jpos,
@@ -3541,7 +3683,7 @@ static void launch_omk(const bfloat16_t* params, const long* pbase, const bfloat
                        cudaStream_t st) {
     constexpr int ST = OM_ST, S = OM_BN / KK;
     constexpr int STAGE = (32 * OM_BM * 2 + 2 * 32 * OM_BN * 2 + 2 * 32 * S * 4 + 1023) / 1024 * 1024;
-    constexpr int SMEM = ST * STAGE + 2 * ST * S * 4 + 3 * ST * 8;   // (the stages, their records, the barriers)
+    constexpr int SMEM = ST * STAGE + 2 * ST * S * 4 + 3 * ST * 8 + (KK > 32 ? OMK_XW * 4 : 0);   // (+ rank 64's xw)
     static_assert(SMEM <= 101376, "past sm_120's 99 KB of shared memory a block");
     static_assert(SMEM == omk_smem(KK), "omk_smem: the side CTAs' bound");
     auto kernel = lr_omk_kernel<KK, ST, FUSED, TMAA>;
@@ -3566,9 +3708,9 @@ static void launch_omk(const bfloat16_t* params, const long* pbase, const bfloat
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
-// Whether the one-launch forward serves a layer at rank 8 or 32 (`lr_omk_kernel`): `om_serves`'s conditions at its S
+// Whether the one-launch forward serves a layer at rank 8, 32 or 64 (`lr_omk_kernel`): `om_serves`'s conditions at its S
 bool omk_serves(int64_t K, int64_t B, int64_t block_size, int64_t rows) {
-    return (K == 8 || K == 32) && B % (OM_BN / K) == 0 && block_size % 32 == 0 &&
+    return (K == 8 || K == 32 || K == 64) && B % (OM_BN / K) == 0 && block_size % 32 == 0 &&
            (block_size % OM_BM == 0 || (OM_BM % block_size == 0 && (rows * block_size) % OM_BM == 0));
 }
 
@@ -3620,7 +3762,7 @@ bool om_serves(int64_t K, int64_t B, int64_t block_size, int64_t rows) {
 // (`lowrank_mixture.cu`'s `inplace_operand_kernel`'s operations: the same bits). `om_v_serves(N, K)`: whether it (and
 // the forward's side CTAs) serve N children at rank K.
 bool om_v_serves(int64_t N, int64_t K) {
-    const long smem = K == OM_K ? OM_SMEM : (K == 8 || K == 32) ? omk_smem((int)K) : 0;   // (the rank's forward's)
+    const long smem = K == OM_K ? OM_SMEM : (K == 8 || K == 32 || K == 64) ? omk_smem((int)K) : 0;   // (its forward's)
     return smem > 0 && N >= 1 && N <= OMV_MAXX * OM_THREADS && omv_smem((int)N) <= smem;
 }
 void lowrank_v_rows(torch::Tensor vt, torch::Tensor shift, torch::Tensor fb, int64_t row0) {
@@ -3653,6 +3795,7 @@ void lowrank_v_rows(torch::Tensor vt, torch::Tensor shift, torch::Tensor fb, int
     };
     if (K == 8) go(std::integral_constant<int, 8>{});
     else if (K == 32) go(std::integral_constant<int, 32>{});
+    else if (K == 64) go(std::integral_constant<int, 64>{});
     else go(std::integral_constant<int, OM_K>{});
 }
 
@@ -3776,7 +3919,7 @@ void lowrank_forward_om(torch::Tensor vnm, torch::Tensor vals, c10::optional<tor
 #undef LOWRANK_OM
 }
 
-// `lowrank_forward_om` at rank 8 or 32 (the rank from the columns): no V / values boxes
+// `lowrank_forward_om` at rank 8, 32 or 64 (the rank from the columns): no V / values boxes
 void lowrank_forward_omk(torch::Tensor vnm, torch::Tensor vals, c10::optional<torch::Tensor> cbase, torch::Tensor ebase,
                          torch::Tensor jpos, torch::Tensor vt, int64_t row0, torch::Tensor shift, torch::Tensor params,
                          torch::Tensor nids, torch::Tensor pbase, torch::Tensor ugrp, int64_t block_size, int64_t knt_,
@@ -3789,7 +3932,7 @@ void lowrank_forward_omk(torch::Tensor vnm, torch::Tensor vals, c10::optional<to
     const int num_edges = knt * BK;
     const int K = cols / std::max(B, 1);
     TORCH_CHECK(omk_serves(K, B, block_size, rows) && cols == K * B && knt >= 1,
-                "lowrank omk: rank 8 or 32, B a multiple of the tile's samples, block_size % 32 with the ", OM_BM,
+                "lowrank omk: rank 8, 32 or 64, B a multiple of the tile's samples, block_size % 32 with the ", OM_BM,
                 "-node tile dividing the node block or the blocks dividing the tile; got columns ", cols, ", B ", B,
                 ", block_size ", block_size);
     TORCH_CHECK(params.scalar_type() == torch::kBFloat16 && vt.scalar_type() == torch::kBFloat16,
@@ -3869,9 +4012,12 @@ void lowrank_forward_omk(torch::Tensor vnm, torch::Tensor vals, c10::optional<to
     if (K == 8) {
         if (fused) { if (tma) LOWRANK_OMK(8, true, true); else LOWRANK_OMK(8, true, false); }
         else { if (tma) LOWRANK_OMK(8, false, true); else LOWRANK_OMK(8, false, false); }
-    } else {
+    } else if (K == 32) {
         if (fused) { if (tma) LOWRANK_OMK(32, true, true); else LOWRANK_OMK(32, true, false); }
         else { if (tma) LOWRANK_OMK(32, false, true); else LOWRANK_OMK(32, false, false); }
+    } else {
+        if (fused) { if (tma) LOWRANK_OMK(64, true, true); else LOWRANK_OMK(64, true, false); }
+        else { if (tma) LOWRANK_OMK(64, false, true); else LOWRANK_OMK(64, false, false); }
     }
 #undef LOWRANK_OMK
 }
@@ -4093,13 +4239,13 @@ void lowrank_backward_om(torch::Tensor flows, torch::Tensor vals, c10::optional<
     }
 }
 
-// The one-launch backward at ranks 8 and 32 (`lr_omk_bw_kernel`): `om_bw_serves`'s conditions at its S
+// The one-launch backward at ranks 8, 32 and 64 (`lr_omk_bw_kernel`): `om_bw_serves`'s conditions at its S
 bool omk_bw_serves(int64_t K, int64_t B, int64_t cbs, int64_t pbs, int64_t n_cb) {
-    return (K == 8 || K == 32) && B % (OM_BN / K) == 0 && pbs % 32 == 0 && cbs > 0 &&
+    return (K == 8 || K == 32 || K == 64) && B % (OM_BN / K) == 0 && pbs % 32 == 0 && cbs > 0 &&
            (cbs % OM_BM == 0 || (OM_BM % cbs == 0 && (n_cb * cbs) % OM_BM == 0));
 }
 
-// `lowrank_backward_om` at ranks 8 and 32 (`lr_omk_bw_kernel`), its arguments the same
+// `lowrank_backward_om` at ranks 8, 32 and 64 (`lr_omk_bw_kernel`), its arguments the same
 void lowrank_backward_omk(torch::Tensor flows, torch::Tensor vals, c10::optional<torch::Tensor> table, int64_t first,
                          torch::Tensor fb, torch::Tensor jrow, int64_t e_lo, c10::optional<torch::Tensor> grad_b,
                          torch::Tensor ua, int64_t row0, torch::Tensor am, torch::Tensor node_flows,
@@ -4109,8 +4255,8 @@ void lowrank_backward_omk(torch::Tensor flows, torch::Tensor vals, c10::optional
                          int64_t a_cstr, int64_t a_pstr, bool store) {
     const int B = (int)node_flows.size(1), K = (int)fb.size(1), N = (int)fb.size(2);
     const int n_cb = (int)chids.size(0), npb = (int)ppar.size(1);
-    TORCH_CHECK(omk_bw_serves(K, B, cbs, pbs, n_cb) && fb.dim() == 3 && fb.size(0) == B, "lowrank omk backward: rank 8 "
-                "or 32, B a multiple of the tile's samples, the parents' blocks of 32, the ", OM_BM, "-child tile dividing "
+    TORCH_CHECK(omk_bw_serves(K, B, cbs, pbs, n_cb) && fb.dim() == 3 && fb.size(0) == B, "lowrank omk backward: rank 8, "
+                "32 or 64, B a multiple of the tile's samples, the parents' blocks of 32, the ", OM_BM, "-child tile dividing "
                 "the child block or the blocks dividing the tile; got rank ", K, ", B ", B, ", blocks ", cbs, " / ", pbs);
     TORCH_CHECK(params.scalar_type() == torch::kBFloat16 && ua.scalar_type() == torch::kBFloat16,
                 "lowrank omk backward: bf16 parameters and exp(A)");
@@ -4199,7 +4345,7 @@ void lowrank_backward_omk(torch::Tensor flows, torch::Tensor vals, c10::optional
         constexpr int ST = KK == 8 ? 4 : OM_ST;          // (rank 8's stages: 8 samples' rows of the parents, 4 KB)
         constexpr int NU = G ? 2 : 1;                    // (as the kernel's: U; and Un with the gradients)
         constexpr int STAGE = (32 * OM_BM * 2 + NU * 32 * OM_BN * 2 + 4 * 32 * S * 4 + 1023) / 1024 * 1024;
-        constexpr int SMEM = ST * STAGE + NU * OM_BN * 4 + NU * ST * S * 4 + 3 * ST * 8 + NU * ST * 4;
+        constexpr int SMEM = ST * STAGE + NU * OM_BN * 4 + (NU * ST * S + 1) / 2 * 2 * 4 + 3 * ST * 8 + NU * ST * 4;
         static_assert(SMEM <= 101376, "past sm_120's 99 KB of shared memory a block");
         static_assert(!G || 32 * ((DTS * KK + 4) + (DTS + 1)) * 4 <= SMEM, "the dA CTAs' tiles in the shared memory");
         auto kernel = lr_omk_bw_kernel<KK, ST, F, G, SG, TA>;
@@ -4229,9 +4375,11 @@ void lowrank_backward_omk(torch::Tensor flows, torch::Tensor vals, c10::optional
     using F_ = std::false_type;
     using K8 = std::integral_constant<int, 8>;
     using K32 = std::integral_constant<int, 32>;
+    using K64 = std::integral_constant<int, 64>;
     auto go2 = [&](auto f, auto g, auto s) {
         if (K == 8) { if (tma) go(K8{}, f, g, s, T_{}); else go(K8{}, f, g, s, F_{}); }
-        else { if (tma) go(K32{}, f, g, s, T_{}); else go(K32{}, f, g, s, F_{}); }
+        else if (K == 32) { if (tma) go(K32{}, f, g, s, T_{}); else go(K32{}, f, g, s, F_{}); }
+        else { if (tma) go(K64{}, f, g, s, T_{}); else go(K64{}, f, g, s, F_{}); }
     };
     if (fused) {
         if (!grad_b.has_value()) go2(T_{}, F_{}, F_{});
@@ -4247,15 +4395,15 @@ void lowrank_backward_omk(torch::Tensor flows, torch::Tensor vals, c10::optional
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("lowrank_forward_stream", &lowrank_forward_stream,
           "the sum_exp forward over the virtual batch: the expand fused into the stream kernel's pre-pass");
-    m.def("omk_serves", &omk_serves, "whether the one-launch forward serves a layer at rank 8 or 32");
-    m.def("lowrank_forward_omk", &lowrank_forward_omk, "the one-launch forward at rank 8 or 32");
+    m.def("omk_serves", &omk_serves, "whether the one-launch forward serves a layer at rank 8, 32 or 64");
+    m.def("lowrank_forward_omk", &lowrank_forward_omk, "the one-launch forward at rank 8, 32 or 64");
     m.def("lowrank_forward_om", &lowrank_forward_om,
           "the sum_exp forward over the virtual batch in one launch: the operand formed in the GEMM, the maxima online");
     m.def("om_serves", &om_serves, "whether the one-launch form serves a layer (rank, batch, block size, node blocks)");
     m.def("om_v_serves", &om_v_serves, "whether the side CTAs (and lowrank_v_rows) form V's rows of N children at rank K");
     m.def("lowrank_v_rows", &lowrank_v_rows, "V's rows and their shifts of one copy, its factors read in place");
-    m.def("omk_bw_serves", &omk_bw_serves, "whether the one-launch backward serves a partition at rank 8 or 32");
-    m.def("lowrank_backward_omk", &lowrank_backward_omk, "the one-launch backward at rank 8 or 32");
+    m.def("omk_bw_serves", &omk_bw_serves, "whether the one-launch backward serves a partition at rank 8, 32 or 64");
+    m.def("lowrank_backward_omk", &lowrank_backward_omk, "the one-launch backward at rank 8, 32 or 64");
     m.def("lowrank_backward_om", &lowrank_backward_om,
           "the data half of the sum_exp backward over the virtual batch in one launch: element flows and dB's data part");
     m.def("set_da_ctas_most", &set_da_ctas_most, "(tests) the backward's dA CTAs a launch at most; 0: no cap");
