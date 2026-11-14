@@ -1085,14 +1085,13 @@ def _settled_flags() -> tuple:
     return (FUSED_STREAM, OMK, PIPELINED_V, OMK_V, FORWARD_CMAX, GEMM_BF16_WORK)
 
 
-def _forward_settled(desc, layer, fast, ns_tensors, node_mars, element_mars, params, kwargs, children) -> bool:
+def _forward_settled(desc, layer, fast, ns_tensors, node_mars, element_mars, params, kwargs, children, op) -> bool:
     """`forward` of a layer whose last call took the one-launch arm, from its record (`_lrv_fw_fast`, `forward`'s): the
     same launch and bookkeeping without the choices -- the stream plan, the tuner's lookups, the arms' set-up --,
     True; or False, nothing done, where this call is not one the record answers (another batch, device, product layer,
     precision or switch; the plan or the tuner's choice gone; the pass's normalizers not bf16). Every check that can
     fail comes before any change but the pass's normalizers (`_normalizers`, which a full path then makes alike)."""
     sig, info, pkey, plan, fk, fused, nshift, K = fast
-    op = kwargs.get("op_params")
     batch = node_mars.size(1)
     if (len(ns_tensors) != 1 or ns_tensors[0][0] is not info or op is None or op.dtype != torch.bfloat16
             or sig != (batch, node_mars.get_device(), None if children is None else id(children[0]),
@@ -1227,7 +1226,7 @@ def forward(desc, layer, ns_tensors, node_mars, element_mars, params, kwargs, st
     # (a layer whose last call took the one-launch arm: that call's launch from its record, `_forward_settled`)
     fast = layer.__dict__.get("_lrv_fw_fast")
     if fast is not None and _forward_settled(desc, layer, fast, ns_tensors, node_mars, element_mars, params, kwargs,
-                                             stream_children):
+                                             stream_children, kwargs.get("op_params")):
         return None
     from pyjuice.layer.sum_layer import SumLayer
 
@@ -1267,6 +1266,7 @@ def forward(desc, layer, ns_tensors, node_mars, element_mars, params, kwargs, st
             layer.__dict__["_lrv_fw_fast"] = (
                 (batch, node_mars.get_device(), sid, kwargs.get("precision", "auto"), _settled_flags()), info0,
                 (dev, sid, batch, OMK), plan, plan["parts"][0]["tuned"][(fused, True)][2], fused, shift, K)
+            layer.__dict__["_settled_forward"] = _layer_settled_forward      # (the layer's whole call: its checks too)
     if plan is None:
         if mark is None or mark[0] is not layer:
             for info, t in ns_tensors:
@@ -1553,6 +1553,111 @@ def _pass_end_if_done(st, mod, node_flows, node_mars, params, param_flows, denom
         _flush_grads(st)                                                 # (the gradients: in the storage's layout)
 
 
+_STAGED = None
+
+
+def _staged_type():
+    """`StagedExternalParams` (imported when first asked for)"""
+    global _STAGED
+    if _STAGED is None:
+        from pyjuice.layer.parameterized_sum_layer import StagedExternalParams
+        _STAGED = StagedExternalParams
+    return _STAGED
+
+
+def _layer_settled_forward(layer, node_mars, element_mars, params, propagation_alg, op_params, kwargs) -> bool:
+    """The layer's settled forward (`ParameterizedSumLayer._settled_forward`, put on it where a forward took the
+    one-launch arm): what its full path -- the layer's checks, `LowRank.forward_layer`, `forward` -- does at a call
+    the layer's record answers (`_forward_settled`), True; else False, nothing done but the pass's normalizers (which
+    the full path makes alike). The layer's checks: the algorithm, whole partitions, its one node vector's tensors
+    staged and supplied; the copy of the parameters set in the call's options as the full path sets it."""
+    fast = layer.__dict__.get("_lrv_fw_fast")
+    if fast is None or propagation_alg != "LL" or kwargs.get("partition_runs") is not None:
+        return False
+    staged = kwargs.get(_EXTERNAL_PARAMS_KWARG)
+    if not isinstance(staged, _staged_type()):
+        return False
+    info = fast[1]
+    tensors = staged.get(info.ns)
+    desc = layer.parameterization
+    if tensors is None or not serves(desc, layer, node_mars, element_mars):
+        return False
+    if op_params is not None:
+        kwargs["op_params"] = op_params                 # (`ParameterizedSumLayer.forward`'s: its own options)
+    return _forward_settled(desc, layer, fast, [(info, tensors)], node_mars, element_mars, params, kwargs,
+                            kwargs.get("stream_children"), op_params)
+
+
+def _layer_settled_backward(layer, node_flows, element_flows, node_mars, element_mars, params, param_flows,
+                            denom_param_flows, propagation_alg, op_params, kwargs) -> bool:
+    """The layer's settled backward (`ParameterizedSumLayer._settled_backward`, put on it where a backward took the
+    one-launch branch): what its full path does at a call its record (`_lrv_bw_fast`) answers -- the layer's checks
+    (the algorithm, whole partitions, flows neither modified in place nor negated) and the hooks' (log-space flows, the
+    forward through the virtual batch at this batch), the layer's settings for the call (its gated call, the product
+    layer below, the copy of the parameters), the deferral's side stream joined --, then `backward`'s one-launch
+    branch and the pass's end where it is its last layer; True. Else False, nothing done: another batch, device or
+    product layer, the copy given or not, the stream plan made again, the tensors not the staging's."""
+    rec = layer.__dict__.get("_lrv_bw_fast")
+    if rec is None or propagation_alg != "LL" or kwargs.get("partition_runs") is not None or \
+            kwargs.get("allow_modify_flows", False) or kwargs.get("negate_pflows", False) or \
+            not kwargs.get("logspace_flows", False):
+        return False
+    sig, info, plan, shift, K = rec
+    batch = node_mars.size(1)
+    state = layer.__dict__.get("_lr_state")
+    if not (isinstance(state, tuple) and state[1] == batch):
+        return False
+    staged_t = _staged_type()
+    staged, gviews = kwargs.get(_EXTERNAL_PARAMS_KWARG), kwargs.get(_EXTERNAL_PARAMS_GRAD_KWARG)
+    if not isinstance(staged, staged_t) or (gviews is not None and not isinstance(gviews, staged_t)):
+        return False
+    tensors = staged.get(info.ns)
+    sc = kwargs.get("stream_children")
+    op = op_params if op_params is not None and layer.__dict__.get("_reads_param_operands", False) else None
+    sid = None if sc is None else id(sc[0])
+    if tensors is None or (sc is not None and not fuses_bk()) or \
+            sig != (batch, node_mars.get_device(), sid, op is not None, FUSED_STREAM_BK) or \
+            (op is None and params.dtype != torch.bfloat16):            # (no copy to read: the full path's other branch)
+        return False
+    dev = node_mars.device
+    if layer.__dict__.get("_lrv_stream_bk", _NO_PLANS).get((dev, sid, batch)) is not plan:
+        return False
+    # (the layer's settings for the call, the side stream, a recording around it failed: `ParameterizedSumLayer.backward`'s)
+    layer.__dict__.update(_bk_gated_call = True, _bk_stream_children = sc, _bk_op_params = op)
+    from pyjuice.layer import deferred_par
+    deferred_par.join_side(dev)
+    lp = _launch_plans()
+    if lp.LaunchPlans.nested():
+        lp.LaunchPlans.fail()
+    # (`backward`'s one-launch branch)
+    st = _pass(kwargs)
+    flows = st.get("flows")
+    if flows is None or flows() is not node_flows or info.ns in st["done"]:
+        st.update(done = set(), norm = dict(), flows = weakref.ref(node_flows))
+        st.pop("inner_grads", None)                                     # (a backward again: its own gradients)
+    kd = _kept(layer, _twin(layer)[0], batch * K, dev)
+    if op is None:
+        op = params                                                     # (bf16: checked above)
+    _om_backward(layer, plan, info, tensors, None if gviews is None else gviews.get(info.ns), st, kd, op, node_flows,
+                 element_flows, node_mars, element_mars, param_flows, sc, gviews, getattr(gviews, "fresh", False), K,
+                 batch, dev, shift)
+    _pass_end_if_done(st, _module(), node_flows, node_mars, params, param_flows, denom_param_flows,
+                      kwargs.get("precision", "auto"), batch, kwargs)
+    return True
+
+
+_LAUNCH_PLANS = None
+
+
+def _launch_plans():
+    """`pyjuice.utils.launch_plans` (imported when first asked for)"""
+    global _LAUNCH_PLANS
+    if _LAUNCH_PLANS is None:
+        from pyjuice.utils import launch_plans
+        _LAUNCH_PLANS = launch_plans
+    return _LAUNCH_PLANS
+
+
 def backward(desc, layer, ns_tensors, ns_grad_tensors, node_flows, element_flows, node_mars, element_mars, params,
              param_flows, denom_param_flows, kwargs, stream_children = None) -> None:
     """`stream_children`: None, or the product group below's `(table, first_row)` -- its forward (the recompute of
@@ -1588,6 +1693,12 @@ def backward(desc, layer, ns_tensors, ns_grad_tensors, node_flows, element_flows
         (info, tensors), grads = ns_tensors[0], ns_grad_tensors[0]
         _om_backward(layer, plan, info, tensors, grads, st, kd, op, node_flows, element_flows, node_mars, element_mars,
                      param_flows, stream_children, gviews, fresh, K, batch, dev, shift)
+        # (settled: the layer's next such call from a record -- `_layer_settled_backward`)
+        layer.__dict__["_lrv_bw_fast"] = ((batch, node_mars.get_device(),
+                                          None if stream_children is None else id(stream_children[0]),
+                                          layer.__dict__.get("_bk_op_params") is not None, FUSED_STREAM_BK),
+                                         info, plan, shift, K)
+        layer.__dict__["_settled_backward"] = _layer_settled_backward
     else:
         if fresh:                                                       # (the pass's end adds the scratch into them)
             for grads in ns_grad_tensors:

@@ -4764,14 +4764,17 @@ def test_the_sum_exp_takes_fp16_factors_as_their_float32_values(bs, batch, form,
 
 @needs_virtual
 @pytest.mark.parametrize("bs, batch, rank", [(32, 16, 16), (32, 16, 8), (64, 6, 32), (32, 16, 64)])
-def test_the_settled_forward_is_the_full_paths(bs, batch, rank, monkeypatch):
-    """A layer whose last forward took the one-launch arm takes the next from its record (`virtual._forward_settled`,
-    the layer's `_lrv_fw_fast`): neither the stream plan nor the tuner's set-up looked at (`_stream_run` not called),
-    every output the BITS of the full path's (the records dropped before every layer's forward); a call at another
-    batch takes the full path, and records it. (Two passes first: the circuit settles which product layers the sum
-    layers take fused in at its first -- a record of a call without them is made again.)"""
+def test_the_settled_calls_are_the_full_paths(bs, batch, rank, monkeypatch):
+    """A layer whose last forward took the one-launch arm takes the next one settled -- the layer's whole call from a
+    record (`ParameterizedSumLayer._settled_forward`: `virtual._layer_settled_forward`, `_forward_settled`), neither
+    the stream plan nor the tuner's set-up looked at (`_stream_run` not called) --, and its backward likewise
+    (`_settled_backward`: `virtual._layer_settled_backward`, the hooks not called); every output the BITS of the full
+    paths' (every layer's settled calls declining, its record dropped); a pass at another batch takes the full paths,
+    and records them. (Two passes first: the circuit settles which product layers the sum layers take fused in at its
+    first -- a record of a call without them is made again.)"""
     import pyjuice.parameterizations.lowrank.virtual as lowrank_virtual
     from pyjuice.layer.kernels import autotune
+    from pyjuice.parameterizations import LowRank
 
     pick = autotune.pick
     monkeypatch.setattr(autotune, "pick", lambda key, cands, bench, **k: "fused"
@@ -4787,48 +4790,44 @@ def test_the_settled_forward_is_the_full_paths(bs, batch, rank, monkeypatch):
             {a: _factors(a, rank, b, dev, seed = seed + i) for i, a in enumerate(sums)}
 
     # (the one-launch arm forced as `_stream_form` does, and kept as the tuner keeps its choices: what the record checks)
-    taken, choose = [], autotune.choose
+    choose = autotune.choose
 
     def forced(key, cands, *args, **kwargs):
         if key[0] != "lowrank_stream_fw6":
             return choose(key, cands, *args, **kwargs)
         monkeypatch.setitem(autotune._CACHE, autotune.full_key(key), lowrank_virtual._OM_ARM)
-        taken.append(key)
         return lowrank_virtual._OM_ARM
 
     monkeypatch.setattr(autotune, "choose", forced)
-    full, run = [], lowrank_virtual._stream_run
-    monkeypatch.setattr(lowrank_virtual, "_stream_run", lambda *a, **k: (full.append(1), run(*a, **k))[1])
+    full_fw, full_bw = [], []
+    run, pre = lowrank_virtual._stream_run, LowRank.pre_backward_layer
+    monkeypatch.setattr(lowrank_virtual, "_stream_run", lambda *a, **k: (full_fw.append(1), run(*a, **k))[1])
+    monkeypatch.setattr(LowRank, "pre_backward_layer", lambda *a, **k: (full_bw.append(1), pre(*a, **k))[1])
     data, ext = inputs(batch, 650)
     for _ in range(2):
         _passes(pc, sums, data, ext)                                   # (the records made, V's visit order kept)
     layers = list({id(l): l for l in (pc.external_params_nodes[a] for a in sums)}.values())
-    assert taken and full and all(l.__dict__.get("_lrv_fw_fast") is not None for l in layers)
-    full.clear()
+    assert all(l.__dict__.get("_settled_forward") and l.__dict__.get("_settled_backward") for l in layers)
+    full_fw.clear(); full_bw.clear()
     got = _passes(pc, sums, data, ext)
-    assert not full, len(full)                                         # (every layer from its record)
-    real = lowrank_virtual.forward
-
-    def unsettled(desc, layer, *a, **k):
-        layer.__dict__.pop("_lrv_fw_fast", None)
-        return real(desc, layer, *a, **k)
-
-    monkeypatch.setattr(lowrank_virtual, "forward", unsettled)
+    assert not full_fw and not full_bw, (len(full_fw), len(full_bw))   # (every layer's calls settled)
+    for l in layers:                                                   # (the full paths: the settled calls declining)
+        l.__dict__["_settled_forward"] = l.__dict__["_settled_backward"] = lambda *a, **k: False
+        l.__dict__.pop("_lrv_fw_fast", None)
     want = _passes(pc, sums, data, ext)
-    assert len(full) == len(sums), (len(full), len(sums))              # (the full path, every layer)
+    assert len(full_fw) == len(sums) and len(full_bw) == len(sums), (len(full_fw), len(full_bw), len(sums))
     for k in ("lls", "mars", "flows", "fp", "fm"):
         assert not torch.isnan(got[k]).any() and torch.equal(got[k], want[k]), k
     for k in ("dA", "dB"):
         assert all(not torch.isnan(a).any() and torch.equal(a, b) for a, b in zip(got[k], want[k])), k
-    monkeypatch.setattr(lowrank_virtual, "forward", real)
-    full.clear()
-    data2, ext2 = inputs(2 * batch, 660)                               # (another batch: the full path, recorded)
+    full_fw.clear(); full_bw.clear()
+    data2, ext2 = inputs(2 * batch, 660)                               # (another batch: the full paths, recorded)
     _passes(pc, sums, data2, ext2)
-    assert len(full) >= len(sums)
+    assert len(full_fw) >= len(sums) and len(full_bw) >= len(sums)
     _passes(pc, sums, data2, ext2)
-    full.clear()
+    full_fw.clear(); full_bw.clear()
     _passes(pc, sums, data2, ext2)
-    assert not full, len(full)
+    assert not full_fw and not full_bw, (len(full_fw), len(full_bw))
 
 
 @needs_virtual

@@ -377,5 +377,5 @@ class LowRank(_ForwardMixin, _BackwardMixin, _DenominatorsMixin, SumParameteriza
         super().drop_device_caches(layer)
         for name in ("_lr_geometry", "_lr_state", "_lr_denom_offsets", "_lrv_state", "_lrv_disjoint", "_lrv_link",
                      "_lrv_want", "_lrv_wasted", "_lrv_twin", "_lrv_stream", "_lrv_stream_bk", "_lrv_kd",
-                     "_lrv_fw_fast", "_lrv_serves"):
+                     "_lrv_fw_fast", "_lrv_serves", "_lrv_bw_fast"):
             layer.__dict__.pop(name, None)

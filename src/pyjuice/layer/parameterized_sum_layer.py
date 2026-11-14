@@ -254,7 +254,8 @@ class ParameterizedSumLayer(SumLayer):
     def _drop_device_caches(self) -> None:
         """The sum layer's own, and every parameterization's of the layer's node groups."""
         super()._drop_device_caches()
-        for name in ("_bk_stream_parts_g", "_bk_par_deferred_g", "_bk_fusion_ready_g"):
+        for name in ("_bk_stream_parts_g", "_bk_par_deferred_g", "_bk_fusion_ready_g", "_settled_forward",
+                     "_settled_backward"):
             self.__dict__.pop(name, None)
         for params in {id(ns.parameterization): ns.parameterization for ns in self.nodes}.values():
             params.drop_device_caches(self)
@@ -619,6 +620,14 @@ class ParameterizedSumLayer(SumLayer):
             assert not kwargs.get("negate_pflows", False), \
                 "External sum parameters are not supported with `negate_pflows = True`."
 
+    # SETTLED CALLS: a parameterization may put on a layer, as `_settled_forward(layer, node_mars, element_mars, params,
+    # propagation_alg, op_params, kwargs)` / `_settled_backward(layer, node_flows, element_flows, node_mars, element_mars,
+    # params, param_flows, denom_param_flows, propagation_alg, op_params, kwargs)`, a callable that either does at a
+    # call exactly what the full path of `forward` / `backward` does -- this layer's checks and settings, the hooks --
+    # and returns True, or changes nothing and returns False (the full path then): the host work of a call whose
+    # choices an earlier call settled, made once (LowRank's one-launch forms, `lowrank.virtual`). Dropped with the
+    # device caches.
+
     def forward(self, node_mars: torch.Tensor, element_mars: torch.Tensor, params: torch.Tensor,
                 propagation_alg: str = "LL", op_params: Optional[torch.Tensor] = None, **kwargs) -> None:
         """
@@ -629,6 +638,11 @@ class ParameterizedSumLayer(SumLayer):
         it (`SumParameterization.reads_param_operands`).
         """
 
+        # A call the layer's parameterization settled (`_settled_forward`): what the path below does at it, from a record
+        # of the choices an earlier call made -- or, returning False, nothing, the path below then
+        settled = self.__dict__.get("_settled_forward")
+        if settled is not None and settled(self, node_mars, element_mars, params, propagation_alg, op_params, kwargs):
+            return None
         if kwargs.get("partition_runs") is not None:
             raise ValueError("An external-parameter sum layer computes whole partitions: no `partition_runs`.")
         ns_tensors = self._resolve_external_tensors(kwargs, node_mars.size(1), node_mars.device)
@@ -692,6 +706,11 @@ class ParameterizedSumLayer(SumLayer):
         (`SumParameterization.reads_param_operands`).
         """
 
+        # (a call the parameterization settled, as the forward's: `_settled_backward`)
+        settled = self.__dict__.get("_settled_backward")
+        if settled is not None and settled(self, node_flows, element_flows, node_mars, element_mars, params, param_flows,
+                                           denom_param_flows, propagation_alg, op_params, kwargs):
+            return None
         if kwargs.get("partition_runs") is not None:
             raise ValueError("An external-parameter sum layer computes whole partitions: no `partition_runs`.")
         ns_tensors = self._resolve_external_tensors(kwargs, node_mars.size(1), node_mars.device)
