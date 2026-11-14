@@ -74,6 +74,24 @@ __device__ __forceinline__ void fold_ms(float& m, float& s, float m2, float s2) 
     m = n;
 }
 
+// A (shift, sum) pair made NORMAL: its sum's binary exponent moved into the shift (s = f 2^e, f in [1, 2): (m + e,
+// f); 0, subnormal, inf, NaN as they are) -- a fold of pairs so made loses no term over 2^-126 of the larger. The
+// combine's pairs need it: a main-loop tile's sums lie in [2^-92, 2^100] under its frames, a shifted tile's S down to
+// 2^-97 under Z's max; unmade, a pair 2^-132 under the other's shift flushed with its 2^(m2 - n) though its term was
+// 2^-33 of the sum, the other's sum 2^-21 (S 2.8e-4 short). (e by a float subtraction: 2^23 + ex less 2^23 + 127)
+__device__ __forceinline__ void norm_ms(float& m, float& s) {
+    const unsigned u = __float_as_uint(s), ex = u >> 23;           // (s >= 0: its biased exponent)
+    const bool nrm = ex - 1u < 254u;
+    const float e = __uint_as_float(0x4b000000u | ex) - 8388735.0f;
+    m = nrm ? m + e : m;
+    s = nrm ? __uint_as_float((u & 0x007fffffu) | 0x3f800000u) : s;
+}
+// a running (max, sum) folded with a pair made normal first
+__device__ __forceinline__ void fold_n(float& m, float& s, float m2, float s2) {
+    norm_ms(m2, s2);
+    fold_ms(m, s, m2, s2);
+}
+
 __device__ __forceinline__ unsigned pack_h2(float lo, float hi) {
     const __half2 v = __floats2half2_rn(lo, hi);
     return *reinterpret_cast<const unsigned*>(&v);
@@ -170,74 +188,6 @@ __device__ __forceinline__ void stsm4t(uint32_t p, unsigned a, unsigned b, unsig
                  ::"r"(p), "r"(a), "r"(b), "r"(c), "r"(d) : "memory");
 }
 
-// node_mars[nid0 + i, b] = (log2 S - log2 Z) ln 2 (-inf where S is 0), lzs[i, b] = log2 Z ln 2, from the column
-// tiles' base-2 (shift, sum) pairs: part2 [b][jt][row] = (z, s) under the shifts (cm, cm + mc) -- cm the row's frame in
-// the tile (CMR [tile][row]), mc the sample's largest lc' of the tile (WF's float `wmc` of its tile's `wfw`) -- or,
-// z's sign bit set, a rare item's (|z|, s) under its own shifts (a, ms) = rsh [b][jt][row]. A block of 8 warps 32 rows x 8 / LPO samples
-// of the chunk, LPO lanes an output (lane LPO row + h: tiles h, h + LPO, .. -- a load a warp's LPO 256 / LPO-byte runs
-// --, 8 loads in flight, folded in order, the lanes' folds by shuffles); the outputs [node][batch] stored through
-// shared memory, a row's samples contiguous. (A thread an output: 16 dependent folds a chain, 1.4x the old kernel at
-// B64; 32 samples a block: too few blocks there, 2.5x.) LPO 4 where 2 would leave the SMs short of blocks
-template <int LPO>
-__global__ void __launch_bounds__(256) hf_comb_kernel(const float2* __restrict__ part2, const float2* __restrict__ rsh,
-                                                      const float* __restrict__ CMR, const float* __restrict__ WF, int wfw,
-                                                      int wmc, int njt, float* __restrict__ nmars, long nid0,
-                                                      float* __restrict__ lzs, int M, int Mp, int Bc, int Bs, int b0) {
-    constexpr int RW = 32 / LPO, SPB = 8 / LPO;                // (a warp's rows; a block's samples)
-    __shared__ float2 out[32][SPB + 1];                        // [row][sample]: (node value, log Z)
-    const int lane = threadIdx.x & 31, w = threadIdx.x >> 5, h = lane % LPO;
-    const int rl = RW * (w % LPO) + lane / LPO, k = w / LPO;   // (the thread's row in the block, its sample)
-    const int i0 = blockIdx.x * 32, s0 = blockIdx.y * SPB;
-    const int ic = min(i0 + rl, M - 1), bc = min(s0 + k, Bc - 1);    // (clamped: loads in range)
-    const float* const cr = CMR + (long)(ic / HTM) * njt * HTM + ic % HTM;   // (row ic's frames: + HTM a tile)
-    const float* const wm = WF + (long)bc * njt * wfw + wmc;                 // (the sample's mc: + wfw a tile)
-    const long pb = (long)bc * njt * Mp + ic;
-    float mz = NEG, z = 0.f, ms = NEG, s = 0.f;
-    for (int t0 = h; t0 < njt; t0 += 8 * LPO) {
-        float2 v[8];
-        float c[8], mc[8];
-#pragma unroll
-        for (int u = 0; u < 8; u++) {                          // (the 8 tiles' loads issued together)
-            const int jt = t0 + LPO * u;
-            const bool in = jt < njt;
-            v[u] = in ? part2[pb + (long)jt * Mp] : make_float2(0.f, 0.f);
-            c[u] = in ? cr[jt * HTM] : 0.f;
-            mc[u] = in ? wm[jt * wfw] : NEG;
-        }
-#pragma unroll
-        for (int u = 0; u < 8; u++) {
-            float4 r;
-            if (signbit(v[u].x)) {                             // (a rare item: its own shifts)
-                const float2 a = rsh[pb + (long)(t0 + LPO * u) * Mp];
-                r = make_float4(a.x, fabsf(v[u].x), a.y, v[u].y);
-            } else {
-                r = make_float4(v[u].x > 0.f ? c[u] : NEG, v[u].x, v[u].y > 0.f ? c[u] + mc[u] : NEG, v[u].y);
-            }
-            fold_ms(mz, z, r.x, r.y);
-            fold_ms(ms, s, r.z, r.w);
-        }
-    }
-#pragma unroll
-    for (int d = 1; d < LPO; d <<= 1) {
-        fold_ms(mz, z, __shfl_xor_sync(0xffffffffu, mz, d), __shfl_xor_sync(0xffffffffu, z, d));
-        fold_ms(ms, s, __shfl_xor_sync(0xffffffffu, ms, d), __shfl_xor_sync(0xffffffffu, s, d));
-    }
-    if (h == 0) {
-        const float lz = z > 0.f ? (mz + __log2f(z)) * LN2 : NEG;
-        const float ls = s > 0.f ? (ms + __log2f(s)) * LN2 : NEG;
-        out[rl][k] = make_float2(ls > NEG ? ls - lz : ls, lz);   // (no mass: -inf, not 0 / 0)
-    }
-    __syncthreads();
-    if (threadIdx.x < 32 * SPB) {                              // (a thread an output: row e / SPB, sample e % SPB)
-        const int e = threadIdx.x, r = e / SPB, i = i0 + r, b = s0 + e % SPB;
-        if (i < M && b < Bc) {
-            const float2 o = out[r][e % SPB];
-            nmars[(nid0 + i) * Bs + b0 + b] = o.x;
-            lzs[(long)i * Bs + b0 + b] = o.y;
-        }
-    }
-}
-
 // ============================================================================================== forward
 // A stage, per (tile, sample) item: the tile's 128 rows of A' -- or of the caller's fp16 A read in place, made A' in
 // the consumers' registers (`scale_h2`) -- as [node][rank 16] fp16, a box of a tensor map of 128-byte lines (4 nodes
@@ -266,13 +216,13 @@ __device__ __forceinline__ int hf_b_base(int k, int h) { return k * 128 + 16 * (
 
 // The tiles' theta in the forward consumers' order, a block a tile (a thread a consumer lane): LTF [tile][warp][t][lane]
 // float4 = the lane's log2 theta less its row's frame (the largest log2 theta of the row in the tile; 0 for a row
-// without one), the MMA's C operand, and CMF [tile][warp][lane] = (cm of rows g, g + 8, live flags) -- the main
-// kernel's tile change two runs of 16-byte loads, no index math, no logs. Made once for every sample (and every node
-// vector of a forward pass reading the same run: `exp_sum_h_theta`)
+// without one), the MMA's C operand -- the main kernel's tile change a run of 16-byte loads, no index math, no logs --,
+// and the frames for the comb kernel, CMR [tile][row] (-inf: the row has no theta in the tile). Made once for every
+// sample (and every node vector of a forward pass reading the same run: `exp_sum_h_theta`)
 template <typename TP, int NT8>
 __global__ void __launch_bounds__(256) hf_theta_kernel(const TP* __restrict__ params, long p0, int Nb, int cbs, int bs,
-                                                       float4* __restrict__ LTF, float4* __restrict__ CMF,
-                                                       float* __restrict__ CMR, int M, int N, int Np) {
+                                                       float4* __restrict__ LTF, float* __restrict__ CMR, int M, int N,
+                                                       int Np) {
     using Gm = HfGeo<NT8>;
     const int njt = Np / Gm::TN, tile = blockIdx.x;
     {
@@ -303,10 +253,9 @@ __global__ void __launch_bounds__(256) hf_theta_kernel(const TP* __restrict__ pa
 #pragma unroll
         for (int t = 0; t < NT8; t++)
             lp[t * 32] = make_float4(lt[t][0] - cm[0], lt[t][1] - cm[0], lt[t][2] - cm[1], lt[t][3] - cm[1]);
-        CMF[((long)tile * HNW + w) * 32 + lane] = make_float4(cm[0], cm[1], live[0] ? 1.f : 0.f, live[1] ? 1.f : 0.f);
         if (tq == 0) {                                     // (the rows' frames for the comb kernel: CMR [tile][row])
-            CMR[(long)tile * HTM + 16 * w + g] = cm[0];
-            CMR[(long)tile * HTM + 16 * w + g + 8] = cm[1];
+            CMR[(long)tile * HTM + 16 * w + g] = live[0] ? cm[0] : NEG;
+            CMR[(long)tile * HTM + 16 * w + g + 8] = live[1] ? cm[1] : NEG;
         }
     }
 }
@@ -374,107 +323,122 @@ __global__ void __launch_bounds__(256) hf_fw_prep_kernel(
 // z (a sum of 2^x, >= 0) out of [2^-92, 2^100] -- or inf, NaN: its bits less 2^-92's beyond (2^100 - 2^-92)'s
 __device__ __forceinline__ bool hf_out(float z) { return (unsigned)(__float_as_int(z) - 0x11800000) > 0x60000000u; }
 
-// A warp's (shift, sum) pairs of its two rows (`hf_fw_kernel`'s registers a[r], z[r], ms[r], s[r])
-struct HfRows { float a0, z0, ms0, s0, a1, z1, ms1, s1; };
+// A main-loop item of a live row (its frame cm > -inf) is RARE where its sums are not exact to fp32: z out of
+// [2^-92, 2^100] -- or inf, NaN -- (`hf_out`), or s under 2^-92 where a child of the tile has a value (mc > -inf; 2^-92:
+// a row's largest term over 2^-97, so any term flushed under 2^-126 is under 2^-29 of it). z, s >= 0: their bits
+// compared as integers, NaN / inf out -- bitwise, no branch
+__device__ __forceinline__ bool hf_rare_z(float z, float cm) { return (cm > NEG) & hf_out(z); }
+__device__ __forceinline__ bool hf_rare_s(float s, float cm, float mc) {
+    return (cm > NEG) & (mc > NEG) & (__float_as_int(s) < 0x11800000);
+}
 
-// The forward's rare paths for one sample of a warp's rows: z out of range (the shifted path: a row max of lw') and S
-// below its range (exactly: x' = lw' + lc' under its own max) -- phi made again a tile at a time from the warp's A'
-// fragment `af` and B's rank rows of the sample at `bg` (fp16, rows bk apart, zeros from child bn), log2 theta read
-// again from the parameters, the tile's w at `wv` (global). Every lane of the warp takes it. Not in the main loop: its
-// items are deferred to a pass of their own (`hf_fw_kernel`) -- a call there, even one never taken, kept the loop's
-// values in a stack frame (local loads every item: -14% with it gone)
+// The forward's rare paths for one item -- row i of chunk sample b, the children of tile jt -- from the main loop's
+// sums (z, s) under the shifts (cm, cm + mc): `rz` the shifted path (Z's and S's sums under the row's largest lw'),
+// `rs` -- or S under 2^-97 after the shifted path -- S exactly (x' = lw' + lc' under its own max). The deferred pass's
+// arithmetic the main kernel had for its rows: lw' made again a tile at a time by the main loop's MMA, row i's A' in
+// every row of its A fragment, its log2 theta the C operand (each quad the row: a lane children 8 t + 2 tq, + 1 of
+// n-tile t), from the operands as the main kernel's stages hold them (A rows `sAg` a sample, zeros from row am, made
+// A' by scale_h2 where `scaleA`; B rank rows bk apart, `sBg` a sample, zeros from child bn), theta from the
+// parameters, w and lc' from the prologue's WF and lcs. Returns the item's (shift, sum) pairs, Z's and S's, in every
+// lane (rz, rs warp-uniform)
+template <typename TP>
+struct HfRare {                                           // (`hf_rare_row`'s operands: a comb kernel parameter)
+    const __half* Ag; long sAg; int am;
+    const __half* Bg; long sBg; int bk, bn, scaleA;
+    const float* WF; int wfw;
+    const float* lcs;
+    const TP* params; long p0; int Nb, cbs, bs, M, N, Np, njt;
+};
 template <typename TP, int NT8>
-__device__ __forceinline__ HfRows hf_fw_rare(const __half* __restrict__ bg, int bk, int bn, const float* wv, uint4 af,
-                                             const TP* __restrict__ params, long p0, int Nb, int cbs, int bs,
-                                             const float* lcb, int M, int N, int rA, int rB, int j0, bool needz,
-                                             bool needs, HfRows in) {
-    const int lane = threadIdx.x & 31, g = lane >> 2, tq = lane & 3;
-    const float mc = wv[8 * NT8];
-    auto lw = [&](int t, float (&x)[4]) {                  // lw' (unframed) of the lane's four pairs of n-tile t
+__device__ __forceinline__ float4 hf_rare_row(const HfRare<TP>& ra, int b, int jt, int i, float cm, float mc, float z,
+                                              float s, bool rz, bool rs) {
+    const int lane = threadIdx.x & 31, g = lane >> 2, tq = lane & 3, j0 = jt * 8 * NT8;
+    uint4 af;                                             // (row i's A': ranks 2 tq, + 1 and 2 tq + 8, + 9)
+    {
+        const __half* ar = ra.Ag + (long)b * ra.sAg + (long)i * HK + 2 * tq;
+        unsigned lo = i < ra.am ? *reinterpret_cast<const unsigned*>(ar) : 0u;
+        unsigned hi = i < ra.am ? *reinterpret_cast<const unsigned*>(ar + 8) : 0u;
+        if (ra.scaleA) {
+            lo = scale_h2(lo);
+            hi = scale_h2(hi);
+        }
+        af = make_uint4(lo, lo, hi, hi);
+    }
+    const __half* const bg = ra.Bg + (long)b * ra.sBg;
+    auto lw = [&](int t, float (&x)[4]) {                  // lw' (unframed) of the lane's children of n-tile t: x[0, 1]
         float c[4];
 #pragma unroll
-        for (int e = 0; e < 4; e++) {
-            const float th = theta_at(params, p0, e & 2 ? rB : rA, j0 + 8 * t + 2 * tq + (e & 1), M, N, Nb, cbs, bs);
-            c[e] = th > 0.f ? __log2f(th) : NEG;
+        for (int e = 0; e < 2; e++) {
+            const float th = theta_at(ra.params, ra.p0, i, j0 + 8 * t + 2 * tq + e, ra.M, ra.N, ra.Nb, ra.cbs, ra.bs);
+            c[e] = c[e + 2] = th > 0.f ? __log2f(th) : NEG;
         }
         const int j = j0 + 8 * t + g;                      // (n-tile t's B fragment: the lane's child, its rank pairs)
         const __half zh = __float2half_rn(0.f);
         __half v[4];
 #pragma unroll
-        for (int q = 0; q < 4; q++) v[q] = j < bn ? bg[(long)(2 * tq + (q & 1) + 8 * (q >> 1)) * bk + j] : zh;
+        for (int q = 0; q < 4; q++) v[q] = j < ra.bn ? bg[(long)(2 * tq + (q & 1) + 8 * (q >> 1)) * ra.bk + j] : zh;
         mma_h_c(x, af, pack_hh(v[0], v[1]), pack_hh(v[2], v[3]), c);
     };
-    float a[2] = {in.a0, in.a1}, z[2] = {in.z0, in.z1}, ms[2] = {in.ms0, in.ms1}, s[2] = {in.s0, in.s1};
-    if (__any_sync(0xffffffffu, needz)) {                 // (z out of range: the shifted path, a row max)
-        float am[2] = {NEG, NEG};
+    float za = z > 0.f ? cm : NEG, zs = z, sa = s > 0.f ? cm + mc : NEG, ss = s;   // (the main loop's pairs)
+    if (rz) {                                             // (the shifted path: a row max)
+        float m = NEG;
         for (int t = 0; t < NT8; t++) {
             float x[4];
             lw(t, x);
-#pragma unroll
-            for (int e = 0; e < 4; e++) am[e >> 1] = fmaxf(am[e >> 1], x[e]);
+            m = fmaxf(fmaxf(m, x[0]), x[1]);
         }
 #pragma unroll
-        for (int dd = 1; dd <= 2; dd <<= 1) {
-            am[0] = fmaxf(am[0], __shfl_xor_sync(0xffffffffu, am[0], dd));
-            am[1] = fmaxf(am[1], __shfl_xor_sync(0xffffffffu, am[1], dd));
-        }
-        const float sa0 = am[0] == NEG ? 0.f : am[0], sa1 = am[1] == NEG ? 0.f : am[1];
-        z[0] = z[1] = s[0] = s[1] = 0.f;
+        for (int d = 1; d <= 2; d <<= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, d));
+        const float sh = m == NEG ? 0.f : m;
+        const float* const wv = ra.WF + ((long)b * ra.njt + jt) * ra.wfw + tq * 2 * NT8;
+        float z2 = 0.f, s2 = 0.f;
         for (int t = 0; t < NT8; t++) {
-            const float2 ww = *reinterpret_cast<const float2*>(wv + tq * 2 * NT8 + 2 * t);
+            const float2 ww = *reinterpret_cast<const float2*>(wv + 2 * t);
             float x[4];
             lw(t, x);
-#pragma unroll
-            for (int e = 0; e < 4; e++) {
-                const float v = exp2f(x[e] - (e & 2 ? sa1 : sa0));
-                z[e >> 1] += v;
-                s[e >> 1] = fmaf(v, e & 1 ? ww.y : ww.x, s[e >> 1]);
-            }
+            const float e0 = exp2f(x[0] - sh), e1 = exp2f(x[1] - sh);
+            z2 += e0;
+            s2 = fmaf(e0, ww.x, s2);
+            z2 += e1;
+            s2 = fmaf(e1, ww.y, s2);
         }
 #pragma unroll
-        for (int dd = 1; dd <= 2; dd <<= 1) {
-            z[0] += __shfl_xor_sync(0xffffffffu, z[0], dd); z[1] += __shfl_xor_sync(0xffffffffu, z[1], dd);
-            s[0] += __shfl_xor_sync(0xffffffffu, s[0], dd); s[1] += __shfl_xor_sync(0xffffffffu, s[1], dd);
+        for (int d = 1; d <= 2; d <<= 1) {
+            z2 += __shfl_xor_sync(0xffffffffu, z2, d);
+            s2 += __shfl_xor_sync(0xffffffffu, s2, d);
         }
-        a[0] = am[0]; a[1] = am[1];
-        ms[0] = s[0] > 0.f ? am[0] + mc : NEG;
-        ms[1] = s[1] > 0.f ? am[1] + mc : NEG;
-        needs = mc > NEG && ((s[0] < 0x1p-97f && am[0] > NEG) || (s[1] < 0x1p-97f && am[1] > NEG));
+        za = m;
+        zs = z2;
+        sa = s2 > 0.f ? m + mc : NEG;
+        ss = s2;
+        rs = mc > NEG && s2 < 0x1p-97f && m > NEG;
     }
-    if (__any_sync(0xffffffffu, needs)) {                 // (S exactly: x' = lw' + lc' under its own max)
-        float m2[2] = {NEG, NEG};
+    if (rs) {                                             // (S exactly: x' = lw' + lc' under its own max)
+        const float* const lcb = ra.lcs + (long)b * ra.Np + j0 + 2 * tq;
+        float m = NEG;
         for (int t = 0; t < NT8; t++) {
             const float2 lc = *reinterpret_cast<const float2*>(lcb + 8 * t);
             float x[4];
             lw(t, x);
-#pragma unroll
-            for (int e = 0; e < 4; e++) m2[e >> 1] = fmaxf(m2[e >> 1], x[e] + (e & 1 ? lc.y : lc.x));
+            m = fmaxf(fmaxf(m, x[0] + lc.x), x[1] + lc.y);
         }
 #pragma unroll
-        for (int dd = 1; dd <= 2; dd <<= 1) {
-            m2[0] = fmaxf(m2[0], __shfl_xor_sync(0xffffffffu, m2[0], dd));
-            m2[1] = fmaxf(m2[1], __shfl_xor_sync(0xffffffffu, m2[1], dd));
-        }
-        const float sc0 = m2[0] == NEG ? 0.f : m2[0], sc1 = m2[1] == NEG ? 0.f : m2[1];
-        float s2[2] = {0.f, 0.f};
+        for (int d = 1; d <= 2; d <<= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, d));
+        const float sh = m == NEG ? 0.f : m;
+        float s3 = 0.f;
         for (int t = 0; t < NT8; t++) {
             const float2 lc = *reinterpret_cast<const float2*>(lcb + 8 * t);
             float x[4];
             lw(t, x);
-#pragma unroll
-            for (int e = 0; e < 4; e++) s2[e >> 1] += exp2f(x[e] + (e & 1 ? lc.y : lc.x) - (e & 2 ? sc1 : sc0));
+            s3 += exp2f(x[0] + lc.x - sh);
+            s3 += exp2f(x[1] + lc.y - sh);
         }
 #pragma unroll
-        for (int dd = 1; dd <= 2; dd <<= 1) {
-            s2[0] += __shfl_xor_sync(0xffffffffu, s2[0], dd);
-            s2[1] += __shfl_xor_sync(0xffffffffu, s2[1], dd);
-        }
-        ms[0] = s2[0] > 0.f ? m2[0] : NEG;
-        ms[1] = s2[1] > 0.f ? m2[1] : NEG;
-        s[0] = s2[0];
-        s[1] = s2[1];
+        for (int d = 1; d <= 2; d <<= 1) s3 += __shfl_xor_sync(0xffffffffu, s3, d);
+        sa = s3 > 0.f ? m : NEG;
+        ss = s3;
     }
-    return HfRows{a[0], z[0], ms[0], s[0], a[1], z[1], ms[1], s[1]};
+    return make_float4(za, zs, sa, ss);
 }
 
 // The forward: a persistent grid (the GPU's SMs times the CTAs an SM holds, at most one CTA an item), NW + 1 warps (the
@@ -484,17 +448,14 @@ __device__ __forceinline__ HfRows hf_fw_rare(const __half* __restrict__ bg, int 
 // its run enters the next tile). `scaleA`: the A boxes are the caller's A (made A' by scale_h2), else the copy's A'.
 // Partials part2[b][jt][row] = (z, s) -- Z's and S's base-2 sums over the tile's children under the shifts (cm, cm + mc)
 // the comb kernel knows (CMR, WF): a quad's lanes tq 0 / 1 a row each, one 8-byte store (16-byte (shift, sum) pairs by
-// the tq 0 lanes behind a branch cost 13% of the loop); a rare item's own shifts (a, ms) into rsh, z's sign set. The rare
-// paths' items (`hf_fw_rare`) a warp notes in a bit mask over a stretch of 32 items and takes after it (a vote and a
-// branch an item cost 14% in the items' serial tails), their operands from `Ag` / `Bg` (the boxes' tensors: A rows
-// `sAg` a sample, zeros from row am; B rank rows bk apart, `sBg` a sample, zeros from child bn)
-template <typename TP, int NT8, int NST>
+// the tq 0 lanes behind a branch cost 13% of the loop). No test of its own: the comb kernel finds the RARE items
+// (`hf_rare_z`, `hf_rare_s`) and makes them again -- here, a bit mask over stretches of 32 items and a pass of the
+// warp's deferred items after each cost this kernel 12-14% (the test, the pass's registers, a stack frame)
+template <int NT8, int NST>
 __global__ void __launch_bounds__((HNW + 1) * 32, 2) hf_fw_kernel(
         const __grid_constant__ CUtensorMap tmA, const __grid_constant__ CUtensorMap tmB, int scaleA,
-        const __half* __restrict__ Ag, long sAg, int am, const __half* __restrict__ Bg, long sBg, int bk, int bn,
-        const float* __restrict__ WF, const float* __restrict__ lcs, const TP* __restrict__ params, long p0, int Nb,
-        int cbs, int bs, const float4* __restrict__ LTF, const float4* __restrict__ CMF, float2* __restrict__ part2,
-        float2* __restrict__ rsh, int M, int N, int Mp, int Np, int B, int njt, long total) {
+        const float* __restrict__ WF, const float4* __restrict__ LTF, float2* __restrict__ part2, int M, int Mp, int B,
+        int njt, long total) {
     using Gm = HfGeo<NT8>;
     constexpr int TN = Gm::TN;
     extern __shared__ __align__(128) unsigned char smraw[];
@@ -529,49 +490,8 @@ __global__ void __launch_bounds__((HNW + 1) * 32, 2) hf_fw_kernel(
         return;
     }
 
-    // the deferred items of a stretch of the warp's run (bit k of `bits`: item s0 + k): each one's sums as the main loop
-    // left them in `part` (its tq 0 lanes' writes, a __syncwarp back), its operands from Ag / Bg, the rare paths
-    auto rare_pass = [&](long s0, unsigned bits) {
-        __syncwarp();
-        while (bits) {
-            const long itq = s0 + __ffs(bits) - 1;
-            bits &= bits - 1;
-            const int tl = (int)(itq / B), bq = (int)(itq - (long)tl * B), jq = tl % njt, j0q = jq * TN;
-            const int rAq = (tl / njt) * HTM + 16 * w + g, rBq = rAq + 8;
-            const float4 cv = __ldg(CMF + ((long)tl * HNW + w) * 32 + lane);
-            const float* wq = WF + ((long)bq * njt + jq) * Gm::WFW;
-            const float mcq = wq[8 * NT8];
-            float2* const pq2 = part2 + ((long)bq * njt + jq) * Mp;
-            float2* const pqs = rsh + ((long)bq * njt + jq) * Mp;
-            const float2 u0 = pq2[rAq], u1 = pq2[rBq];       // (the main loop's sums: shifts cm, cm + mc)
-            const float4 v0 = make_float4(u0.x > 0.f ? cv.x : NEG, u0.x, u0.y > 0.f ? cv.x + mcq : NEG, u0.y);
-            const float4 v1 = make_float4(u1.x > 0.f ? cv.y : NEG, u1.x, u1.y > 0.f ? cv.y + mcq : NEG, u1.y);
-            const bool l0 = cv.z != 0.f, l1 = cv.w != 0.f;
-            const bool nz = (l0 && !(v0.y >= 0x1p-92f && v0.y <= 0x1p100f)) || (l1 && !(v1.y >= 0x1p-92f && v1.y <= 0x1p100f));
-            const bool ns = mcq > NEG && ((l0 && !(v0.w >= 0x1p-92f)) || (l1 && !(v1.w >= 0x1p-92f)));
-            const __half* const aq = Ag + (long)bq * sAg;     // (the warp's A' fragment: rows rAq / rBq, rank pairs)
-            unsigned ah[4];
-#pragma unroll
-            for (int r = 0; r < 4; r++) {
-                const int row = r & 1 ? rBq : rAq, k = 2 * tq + 8 * (r >> 1);
-                ah[r] = row < am ? *reinterpret_cast<const unsigned*>(aq + (long)row * HK + k) : 0u;
-                if (scaleA) ah[r] = scale_h2(ah[r]);
-            }
-            const HfRows r = hf_fw_rare<TP, NT8>(Bg + (long)bq * sBg, bk, bn, wq, make_uint4(ah[0], ah[1], ah[2], ah[3]),
-                                                 params, p0, Nb, cbs, bs, lcs + (long)bq * Np + j0q + 2 * tq, M, N, rAq,
-                                                 rBq, j0q, nz, ns, HfRows{v0.x, v0.y, v0.z, v0.w, v1.x, v1.y, v1.z, v1.w});
-            const int rq = tq ? rBq : rAq;                     // (a row by the lane that stored its sums: its sums,
-            if (tq < 2 && rq < M) {                            //  z's sign bit set for the comb kernel, its shifts)
-                pq2[rq] = tq ? make_float2(-fabsf(r.z1), r.s1) : make_float2(-fabsf(r.z0), r.s0);
-                pqs[rq] = tq ? make_float2(r.a1, r.ms1) : make_float2(r.a0, r.ms0);
-            }
-        }
-        __syncwarp();
-    };
-
     float lt[NT8][4];
-    bool liver;                                               // (the lane's row -- tq odd: rB, else rA -- has a theta)
-    int cur, jt, rA, rB, j0;
+    int cur, rA, rB;
     int pw;                                                   // (row rA's partial of the item: part2[pw] = [b][jt][rA])
     const int pstep = njt * Mp;
     int tile = (int)(it0 / B), b = (int)(it0 - (long)tile * B), st = 0, ph = 0;   // (counters: no division an item)
@@ -580,86 +500,180 @@ __global__ void __launch_bounds__((HNW + 1) * 32, 2) hf_fw_kernel(
     // the tile's log2 theta less each row's frame cm (its largest in the tile), from the prologue's fragments
     auto set_tile = [&]() {
         cur = tile;
-        jt = tile % njt;
-        j0 = jt * TN;
         rA = (tile / njt) * HTM + 16 * w + g;
         rB = rA + 8;
-        pw = (b * njt + jt) * Mp + rA;
+        pw = (b * njt + tile % njt) * Mp + rA;
         const float4* lp = LTF + ((long)tile * HNW + w) * NT8 * 32 + lane;
 #pragma unroll
         for (int t = 0; t < NT8; t++) {
             const float4 v = __ldg(lp + t * 32);
             lt[t][0] = v.x; lt[t][1] = v.y; lt[t][2] = v.z; lt[t][3] = v.w;
         }
-        const float4 cv = __ldg(CMF + ((long)tile * HNW + w) * 32 + lane);
-        liver = (tq & 1 ? cv.w : cv.z) != 0.f;
     };
-    long it = it0;
-    while (it < it1) {                                        // stretches of up to 32 items, each one's deferred items
-        set_tile();                                           //  after it (each stretch from its own load: the tile's
-        const long s0 = it, s1 = min(it1, it + 32);           //  registers free in the deferred pass)
-        unsigned need = 0;                                    // (bit it - s0: the lane's rows of item it take the rare
-        for (; it < s1; it++) {                               //  paths)
-            if (tile != cur) set_tile();
-            mbar_wait(bfull + 8 * st, ph);
-            const unsigned char* sp = sm + st * Gm::ST;
-            const uint32_t sb = sbase + st * Gm::ST;
-            uint4 af;                                         // the warp's 16 rows of A' (ldmatrix of the half rows)
-            {
-                unsigned ah[4];
-                ldsm4(ah, sb + a_ln);
-                if (scaleA) {
+    set_tile();
+    for (long it = it0; it < it1; it++) {
+        if (tile != cur) set_tile();
+        mbar_wait(bfull + 8 * st, ph);
+        const unsigned char* sp = sm + st * Gm::ST;
+        const uint32_t sb = sbase + st * Gm::ST;
+        uint4 af;                                             // the warp's 16 rows of A' (ldmatrix of the half rows)
+        {
+            unsigned ah[4];
+            ldsm4(ah, sb + a_ln);
+            if (scaleA) {
 #pragma unroll
-                    for (int r = 0; r < 4; r++) ah[r] = scale_h2(ah[r]);
-                }
-                af = make_uint4(ah[0], ah[1], ah[2], ah[3]);
+                for (int r = 0; r < 4; r++) ah[r] = scale_h2(ah[r]);
             }
-            const float* wv = reinterpret_cast<const float*>(sp + Gm::A_BYTES + Gm::B_BYTES);
-            const float mc = wv[8 * NT8];
-            float z[2] = {0.f, 0.f}, s[2] = {0.f, 0.f};
-#pragma unroll
-            for (int t2 = 0; t2 < NT8; t2 += 2) {            // (n-tiles in pairs: an ldmatrix.trans of B, a 16-byte w)
-                unsigned bh[4];
-                ldsm4t(bh, (sb + b_ln) ^ (16u * t2));
-                const float4 ww2 = *reinterpret_cast<const float4*>(wv + tq * 2 * NT8 + 2 * t2);
-#pragma unroll
-                for (int u = 0; u < 2; u++) {
-                    const int t = t2 + u;
-                    const float wx = u ? ww2.z : ww2.x, wy = u ? ww2.w : ww2.y;
-                    float d[4];
-                    mma_h_c(d, af, bh[2 * u], bh[2 * u + 1], lt[t]);
-                    const float e0 = exp2f(d[0]), e1 = exp2f(d[1]), e2 = exp2f(d[2]), e3 = exp2f(d[3]);
-                    z[0] += e0; z[0] += e1; z[1] += e2; z[1] += e3;
-                    s[0] = fmaf(e0, wx, s[0]); s[0] = fmaf(e1, wy, s[0]);
-                    s[1] = fmaf(e2, wx, s[1]); s[1] = fmaf(e3, wy, s[1]);
-                }
-            }
-#pragma unroll
-            for (int dd = 1; dd <= 2; dd <<= 1) {
-                z[0] += __shfl_xor_sync(0xffffffffu, z[0], dd); z[1] += __shfl_xor_sync(0xffffffffu, z[1], dd);
-                s[0] += __shfl_xor_sync(0xffffffffu, s[0], dd); s[1] += __shfl_xor_sync(0xffffffffu, s[1], dd);
-            }
-            // the lane's row (tq odd: rB, else rA -- a quad's lanes hold both rows' sums): its rare-path test (2^-92: a
-            // row's largest term over 2^-97, so any term flushed under 2^-126 is under 2^-29 of it; z, s >= 0: their
-            // bits compared as integers, NaN / inf out -- bitwise, no branch) and its sums (z, s), stored by lanes tq
-            // 0 and 1 (the shifts cm, cm + mc the comb kernel's: CMR, WF)
-            const bool ro = tq & 1;
-            const float zr = ro ? z[1] : z[0], sr = ro ? s[1] : s[0];
-            const unsigned nd = (unsigned)liver & ((unsigned)hf_out(zr) |
-                                                   ((unsigned)(mc > NEG) & (unsigned)(__float_as_int(sr) < 0x11800000)));
-            need |= nd << (int)(it - s0);
-            __syncwarp();
-            if (lane == 0) {                                  // (the stage released after its reads return: ptxas
-                st_shared(sguard + 4 * w, __float_as_uint(s[0]) ^ __float_as_uint(mc));   //  issues an arrive with
-                mbar_arrive(bempty + 8 * st);                 //  loads in flight -- a store of their values first)
-            }
-            if (tq < 2 && (ro ? rB : rA) < M) part2[pw + 8 * ro] = make_float2(zr, sr);
-            pw += pstep;                                      // (the next sample's; a tile change sets it anew)
-            if (++b == B) { b = 0; tile++; }
-            if (++st == NST) { st = 0; ph ^= 1; }
+            af = make_uint4(ah[0], ah[1], ah[2], ah[3]);
         }
-        need = __reduce_or_sync(0xffffffffu, need);           // (the warp's: every lane takes each item)
-        if (need) rare_pass(s0, need);
+        const float* wv = reinterpret_cast<const float*>(sp + Gm::A_BYTES + Gm::B_BYTES);
+        const float mc = wv[8 * NT8];
+        float z[2] = {0.f, 0.f}, s[2] = {0.f, 0.f};
+#pragma unroll
+        for (int t2 = 0; t2 < NT8; t2 += 2) {                // (n-tiles in pairs: an ldmatrix.trans of B, a 16-byte w)
+            unsigned bh[4];
+            ldsm4t(bh, (sb + b_ln) ^ (16u * t2));
+            const float4 ww2 = *reinterpret_cast<const float4*>(wv + tq * 2 * NT8 + 2 * t2);
+#pragma unroll
+            for (int u = 0; u < 2; u++) {
+                const int t = t2 + u;
+                const float wx = u ? ww2.z : ww2.x, wy = u ? ww2.w : ww2.y;
+                float d[4];
+                mma_h_c(d, af, bh[2 * u], bh[2 * u + 1], lt[t]);
+                const float e0 = exp2f(d[0]), e1 = exp2f(d[1]), e2 = exp2f(d[2]), e3 = exp2f(d[3]);
+                z[0] += e0; z[0] += e1; z[1] += e2; z[1] += e3;
+                s[0] = fmaf(e0, wx, s[0]); s[0] = fmaf(e1, wy, s[0]);
+                s[1] = fmaf(e2, wx, s[1]); s[1] = fmaf(e3, wy, s[1]);
+            }
+        }
+#pragma unroll
+        for (int dd = 1; dd <= 2; dd <<= 1) {
+            z[0] += __shfl_xor_sync(0xffffffffu, z[0], dd); z[1] += __shfl_xor_sync(0xffffffffu, z[1], dd);
+            s[0] += __shfl_xor_sync(0xffffffffu, s[0], dd); s[1] += __shfl_xor_sync(0xffffffffu, s[1], dd);
+        }
+        // the lane's row (tq odd: rB, else rA -- a quad's lanes hold both rows' sums): its sums (z, s), stored by lanes
+        // tq 0 and 1 (the shifts cm, cm + mc the comb kernel's: CMR, WF)
+        const bool ro = tq & 1;
+        __syncwarp();
+        if (lane == 0) {                                      // (the stage released after its reads return: ptxas
+            st_shared(sguard + 4 * w, __float_as_uint(s[0]) ^ __float_as_uint(mc));   //  issues an arrive with loads
+            mbar_arrive(bempty + 8 * st);                     //  in flight -- a store of their values first)
+        }
+        if (tq < 2 && (ro ? rB : rA) < M) part2[pw + 8 * ro] = make_float2(ro ? z[1] : z[0], ro ? s[1] : s[0]);
+        pw += pstep;                                          // (the next sample's; a tile change sets it anew)
+        if (++b == B) { b = 0; tile++; }
+        if (++st == NST) { st = 0; ph ^= 1; }
+    }
+}
+
+// node_mars[nid0 + i, b] = (log2 S - log2 Z) ln 2 (-inf where S is 0), lzs[i, b] = log2 Z ln 2, from the column
+// tiles' base-2 sums part2 [b][jt][row] = (z, s) under the shifts (cm, cm + mc) -- cm the row's frame in the tile (CMR
+// [tile][row]; -inf: the row has no theta there), mc the sample's largest lc' of the tile (WF's float `wmc` of its
+// tile's `wfw`). A block of 8 warps 32 rows x 8 / LPO samples of the chunk, LPO lanes an output (lane LPO row + h:
+// tiles h, h + LPO, .. -- a load a warp's LPO 256 / LPO-byte runs --, 8 loads in flight, each pair made normal and
+// folded in order (`fold_n`), the lanes' folds by shuffles); the outputs [node][batch] stored through shared memory, a
+// row's samples contiguous. (A thread an output: 16 dependent folds a chain, 1.4x the old kernel at B64; 32 samples a
+// block: too few blocks there, 2.5x.) LPO 4 where 2 would leave the SMs short of blocks. The RARE items (`hf_rare_z`,
+// `hf_rare_s`) found here: an output with one made again after the block's folds by a warp, its tiles a lane each,
+// each rare one by the warp (`hf_rare_row`, its operands `ra`). (The paths' code takes this kernel from 40 registers to
+// 80, +6% at B256 .. 1024, the normal folds as much again -- the main kernel 12-13% faster without them; capped at 40
+// or 48 the folds' loop spills, +24% .. +130%; the paths a call apart: 128 registers; one exponential a fold, the
+// pairs folded as a tree, normal only where a sum lies past 2^+-30: no faster)
+template <typename TP, int NT8, int LPO>
+__global__ void __launch_bounds__(256) hf_comb_kernel(
+        const float2* __restrict__ part2, const float* __restrict__ CMR, const float* __restrict__ WF, int wfw, int wmc,
+        int njt, float* __restrict__ nmars, long nid0, float* __restrict__ lzs, int M, int Mp, int Bc, int Bs, int b0,
+        const __grid_constant__ HfRare<TP> ra) {
+    constexpr int RW = 32 / LPO, SPB = 8 / LPO;                // (a warp's rows; a block's samples)
+    __shared__ float2 out[32][SPB + 1];                        // [row][sample]: (node value, log Z)
+    __shared__ unsigned char rf[32][SPB];                      // (the output has a rare item)
+    const int lane = threadIdx.x & 31, w = threadIdx.x >> 5, h = lane % LPO;
+    const int rl = RW * (w % LPO) + lane / LPO, k = w / LPO;   // (the thread's row in the block, its sample)
+    const int i0 = blockIdx.x * 32, s0 = blockIdx.y * SPB;
+    const int ic = min(i0 + rl, M - 1), bc = min(s0 + k, Bc - 1);    // (clamped: loads in range)
+    const float* const cr = CMR + (long)(ic / HTM) * njt * HTM + ic % HTM;   // (row ic's frames: + HTM a tile)
+    const float* const wm = WF + (long)bc * njt * wfw + wmc;                 // (the sample's mc: + wfw a tile)
+    const long pb = (long)bc * njt * Mp + ic;
+    float mz = NEG, z = 0.f, ms = NEG, s = 0.f;
+    bool rare = false;
+    for (int t0 = h; t0 < njt; t0 += 8 * LPO) {
+        float2 v[8];
+        float c[8], mc[8];
+#pragma unroll
+        for (int u = 0; u < 8; u++) {                          // (the 8 tiles' loads issued together)
+            const int jt = t0 + LPO * u;
+            const bool in = jt < njt;
+            v[u] = in ? part2[pb + (long)jt * Mp] : make_float2(0.f, 0.f);
+            c[u] = in ? cr[jt * HTM] : NEG;
+            mc[u] = in ? wm[jt * wfw] : NEG;
+        }
+#pragma unroll
+        for (int u = 0; u < 8; u++) {
+            rare |= hf_rare_z(v[u].x, c[u]) | hf_rare_s(v[u].y, c[u], mc[u]);
+            fold_n(mz, z, v[u].x > 0.f ? c[u] : NEG, v[u].x);
+            fold_n(ms, s, v[u].y > 0.f ? c[u] + mc[u] : NEG, v[u].y);
+        }
+    }
+#pragma unroll
+    for (int d = 1; d < LPO; d <<= 1) {
+        fold_ms(mz, z, __shfl_xor_sync(0xffffffffu, mz, d), __shfl_xor_sync(0xffffffffu, z, d));
+        fold_ms(ms, s, __shfl_xor_sync(0xffffffffu, ms, d), __shfl_xor_sync(0xffffffffu, s, d));
+        rare |= __shfl_xor_sync(0xffffffffu, (int)rare, d) != 0;
+    }
+    rare &= i0 + rl < M && s0 + k < Bc;                        // (not the clamped loads' rows / samples)
+    if (h == 0) {
+        const float lz = z > 0.f ? (mz + __log2f(z)) * LN2 : NEG;
+        const float ls = s > 0.f ? (ms + __log2f(s)) * LN2 : NEG;
+        out[rl][k] = make_float2(ls > NEG ? ls - lz : ls, lz);   // (no mass: -inf, not 0 / 0)
+        rf[rl][k] = rare;
+    }
+    if (__syncthreads_or(rare)) {                              // (the block's outputs with rare items: a warp each)
+        for (int e = w; e < 32 * SPB; e += 8) {
+            const int r = e / SPB, kk = e % SPB;
+            if (!rf[r][kk]) continue;
+            const int i = i0 + r, b = s0 + kk;
+            const float* const cq = CMR + (long)(i / HTM) * njt * HTM + i % HTM;
+            const float* const wq = WF + (long)b * njt * wfw + wmc;
+            const long pq = (long)b * njt * Mp + i;
+            float mz2 = NEG, z2 = 0.f, ms2 = NEG, s2 = 0.f;
+            for (int u0 = 0; u0 < njt; u0 += 32) {
+                const int jt = u0 + lane;
+                const bool in = jt < njt;
+                const float2 v = in ? part2[pq + (long)jt * Mp] : make_float2(0.f, 0.f);
+                const float c = in ? cq[jt * HTM] : NEG, mc = in ? wq[jt * wfw] : NEG;
+                const bool rz = hf_rare_z(v.x, c), rs = hf_rare_s(v.y, c, mc);
+                float4 f = make_float4(v.x > 0.f ? c : NEG, v.x, v.y > 0.f ? c + mc : NEG, v.y);
+                for (unsigned bal = __ballot_sync(0xffffffffu, rz | rs); bal; bal &= bal - 1) {
+                    const int src = __ffs(bal) - 1;           // (each rare tile by the warp, its lane's pairs replaced)
+                    const float4 q = hf_rare_row<TP, NT8>(
+                            ra, b, u0 + src, i, __shfl_sync(0xffffffffu, c, src), __shfl_sync(0xffffffffu, mc, src),
+                            __shfl_sync(0xffffffffu, v.x, src), __shfl_sync(0xffffffffu, v.y, src),
+                            __shfl_sync(0xffffffffu, (int)rz, src) != 0, __shfl_sync(0xffffffffu, (int)rs, src) != 0);
+                    if (lane == src) f = q;
+                }
+                fold_n(mz2, z2, f.x, f.y);
+                fold_n(ms2, s2, f.z, f.w);
+            }
+#pragma unroll
+            for (int d = 1; d < 32; d <<= 1) {
+                fold_ms(mz2, z2, __shfl_xor_sync(0xffffffffu, mz2, d), __shfl_xor_sync(0xffffffffu, z2, d));
+                fold_ms(ms2, s2, __shfl_xor_sync(0xffffffffu, ms2, d), __shfl_xor_sync(0xffffffffu, s2, d));
+            }
+            if (lane == 0) {
+                const float lz = z2 > 0.f ? (mz2 + __log2f(z2)) * LN2 : NEG;
+                const float ls = s2 > 0.f ? (ms2 + __log2f(s2)) * LN2 : NEG;
+                out[r][kk] = make_float2(ls > NEG ? ls - lz : ls, lz);
+            }
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x < 32 * SPB) {                              // (a thread an output: row e / SPB, sample e % SPB)
+        const int e = threadIdx.x, r = e / SPB, i = i0 + r, b = s0 + e % SPB;
+        if (i < M && b < Bc) {
+            const float2 o = out[r][e % SPB];
+            nmars[(nid0 + i) * Bs + b0 + b] = o.x;
+            lzs[(long)i * Bs + b0 + b] = o.y;
+        }
     }
 }
 
@@ -1335,13 +1349,12 @@ static CUtensorMap h_map(const void* base, bool isA, int64_t ext, int64_t ss, in
 // A is the caller's (made A' in the kernels), else the copy's A'
 struct HbOps { const __half* a; long sAb; int am; const __half* b; long sBb; int bk, bn, scaleA; };
 
-template <int NT8, int NST, typename TP>
-void launch_hf_fw(cudaStream_t stream, const CUtensorMap& tma, const CUtensorMap& tmb, const HbOps& op, const float* wf,
-                  const float* lc, const TP* pp, long p0, int Nb, int cbs, int bs, const float4* ltf, const float4* cmf,
-                  float2* part2, float2* rsh, int M, int N, int Mp, int Np, int Bc, int njt, long total) {
+template <int NT8, int NST>
+void launch_hf_fw(cudaStream_t stream, const CUtensorMap& tma, const CUtensorMap& tmb, int scaleA, const float* wf,
+                  const float4* ltf, float2* part2, int M, int Mp, int Bc, int njt, long total) {
     using Gm = HfGeo<NT8>;
     constexpr int bytes = NST * Gm::ST + 2 * NST * 8 + 4 * HNW + 1024;   // (+ the stages' alignment)
-    auto kern = hf_fw_kernel<TP, NT8, NST>;
+    auto kern = hf_fw_kernel<NT8, NST>;
     static int per_sm[64] = {0};                              // (a device's CTAs an SM; 0: not asked yet)
     const int dev = at::cuda::current_device();
     int occ = dev < 64 ? per_sm[dev] : 0;
@@ -1353,12 +1366,10 @@ void launch_hf_fw(cudaStream_t stream, const CUtensorMap& tma, const CUtensorMap
     }
     const int sms = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
     const long grid = std::max<long>(1, std::min<long>(total, (long)sms * occ));
-    kern<<<(unsigned)grid, (HNW + 1) * 32, bytes, stream>>>(tma, tmb, op.scaleA, op.a, op.sAb, op.am, op.b, op.sBb, op.bk,
-                                                           op.bn, wf, lc, pp, p0, Nb, cbs, bs, ltf, cmf, part2, rsh, M,
-                                                           N, Mp, Np, Bc, njt, total);
+    kern<<<(unsigned)grid, (HNW + 1) * 32, bytes, stream>>>(tma, tmb, scaleA, wf, ltf, part2, M, Mp, Bc, njt, total);
 }
 
-// The tiles' theta fragments of a node vector (`hf_theta_kernel`): {LTF, CMF, CMR}
+// The tiles' theta fragments of a node vector (`hf_theta_kernel`): {LTF, CMR}
 template <int NT8>
 std::vector<torch::Tensor> theta_impl(torch::Tensor params, int64_t p0, int64_t Nb, int64_t cbs, int64_t bs, int64_t M,
                                       int64_t N) {
@@ -1368,13 +1379,12 @@ std::vector<torch::Tensor> theta_impl(torch::Tensor params, int64_t p0, int64_t 
     const int Mp = (int)((M + HTM - 1) / HTM * HTM), Np = (int)((N + Gm::TN - 1) / Gm::TN * Gm::TN);
     const int nbT = (Np / Gm::TN) * (Mp / HTM);
     auto LTF = torch::empty({(long)nbT * HNW * NT8 * 32 * 4}, params.options().dtype(torch::kFloat32));
-    auto CMF = torch::empty({(long)nbT * HNW * 32 * 4}, params.options().dtype(torch::kFloat32));
     auto CMR = torch::empty({(long)nbT * HTM}, params.options().dtype(torch::kFloat32));
     HF_TP_SWITCH(params, hf_theta_kernel<TP, NT8><<<(unsigned)nbT, 256, 0, stream>>>(
         pp, p0, (int)Nb, (int)cbs, (int)bs, reinterpret_cast<float4*>(LTF.template data_ptr<float>()),
-        reinterpret_cast<float4*>(CMF.template data_ptr<float>()), CMR.template data_ptr<float>(), (int)M, (int)N, Np));
+        CMR.template data_ptr<float>(), (int)M, (int)N, Np));
     C10_CUDA_KERNEL_LAUNCH_CHECK();
-    return {LTF, CMF, CMR};
+    return {LTF, CMR};
 }
 
 // The forward of one node vector: its node values into `node_mars` rows `nid0 .. nid0 + M`; returns {log Z [M, B], AP,
@@ -1384,7 +1394,7 @@ template <int NT8>
 std::vector<torch::Tensor> forward_impl(torch::Tensor A, torch::Tensor Bm, torch::Tensor params, int64_t p0, int64_t Nb,
                                         int64_t cbs, int64_t bs, torch::Tensor emars, torch::Tensor rows,
                                         torch::Tensor node_mars, int64_t nid0, int64_t M, int64_t N, torch::Tensor LTF,
-                                        torch::Tensor CMF, torch::Tensor CMR, bool keep) {
+                                        torch::Tensor CMR, bool keep) {
     using Gm = HfGeo<NT8>;
     constexpr int NST = 3, TN = Gm::TN;
     const int64_t B = node_mars.size(1);
@@ -1394,7 +1404,7 @@ std::vector<torch::Tensor> forward_impl(torch::Tensor A, torch::Tensor Bm, torch
     auto lzs = torch::empty({M, B}, emars.options());
     const long* rw = reinterpret_cast<const long*>(rows.template data_ptr<int64_t>());
     const bool direct = h_in_place(A, Bm, M, N);
-    // a sample's working set: its fp16 operands, WF, lcs, the partials (z, s; a rare item's own pairs apart)
+    // a sample's working set: its fp16 operands, WF, lcs, the partials (z, s)
     const int64_t BC = sample_chunk(B, 2.0 * HK * (Mp + Np) + 4.0 * njt * Gm::WFW + 4.0 * Np + 8.0 * njt * Mp);
     torch::Tensor AP, BP;                                      // (the converted copy: the batch's where kept)
     if (!direct) {
@@ -1405,21 +1415,17 @@ std::vector<torch::Tensor> forward_impl(torch::Tensor A, torch::Tensor Bm, torch
     auto WF = torch::empty({BC, (long)njt * Gm::WFW}, emars.options());
     auto lcs = torch::empty({BC, (long)Np}, emars.options());
     auto part2 = torch::empty({BC, (long)njt * Mp * 2}, emars.options());      // (every item's (z, s))
-    auto rshs = torch::empty({BC, (long)njt * Mp * 2}, emars.options());       // (rare items' own shifts only)
     const int nbT = njt * nit;                                 // (the tiles' theta fragments: given, or made here)
     if (LTF.numel() == 0) {
         auto tc = theta_impl<NT8>(params, p0, Nb, cbs, bs, M, N);
         LTF = tc[0];
-        CMF = tc[1];
-        CMR = tc[2];
+        CMR = tc[1];
     }
-    TORCH_CHECK(LTF.numel() == (long)nbT * HNW * NT8 * 32 * 4 && CMF.numel() == (long)nbT * HNW * 32 * 4 &&
-                CMR.numel() == (long)nbT * HTM, "theta fragments: exp_sum_h_theta's, for this node vector and tile width");
+    TORCH_CHECK(LTF.numel() == (long)nbT * HNW * NT8 * 32 * 4 && CMR.numel() == (long)nbT * HTM,
+                "theta fragments: exp_sum_h_theta's, for this node vector and tile width");
     TORCH_CHECK((int64_t)BC * njt * Mp < (int64_t)INT_MAX, "the partials' index: 32 bits");
     const float4* ltf = reinterpret_cast<const float4*>(LTF.template data_ptr<float>());
-    const float4* cmf = reinterpret_cast<const float4*>(CMF.template data_ptr<float>());
     float2* pp2 = reinterpret_cast<float2*>(part2.template data_ptr<float>());
-    float2* prs = reinterpret_cast<float2*>(rshs.template data_ptr<float>());
     const int nbA = direct ? 0 : (Mp * 8 + 255) / 256, nbB = direct ? 0 : (HK * (Np / 2) + 255) / 256;
     const int nbW = (njt + 7) / 8;
     const int64_t sA = A.stride(0), sB = Bm.stride(0);
@@ -1444,18 +1450,23 @@ std::vector<torch::Tensor> forward_impl(torch::Tensor A, torch::Tensor Bm, torch
                                 : HbOps{reinterpret_cast<const __half*>(ap), (long)Mp * HK, Mp,
                                         reinterpret_cast<const __half*>(bp), (long)HK * Np, Np, Np, 0};
         const long total = (long)njt * nit * Bc;
-        HF_TP_SWITCH(params, launch_hf_fw<NT8, NST, TP>(stream, tma, tmb, op, WF.template data_ptr<float>(),
-                                                        lcs.template data_ptr<float>(), pp, p0, (int)Nb, (int)cbs,
-                                                        (int)bs, ltf, cmf, pp2, prs, (int)M, (int)N, Mp, Np, Bc, njt,
-                                                        total));
+        launch_hf_fw<NT8, NST>(stream, tma, tmb, op.scaleA, WF.template data_ptr<float>(), ltf, pp2, (int)M, Mp, Bc, njt,
+                               total);
         C10_CUDA_KERNEL_LAUNCH_CHECK();
-        // (the combine: 2 lanes an output, 4 where that grid would leave an SM fewer than 2 blocks)
+        // (the combine, the rare items' paths: 2 lanes an output, 4 where that grid would leave an SM fewer than 2
+        // blocks)
         const int sms = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
         const bool wide = (long)((M + 31) / 32) * ((Bc + 3) / 4) < 2L * sms;
-        auto comb = wide ? hf_comb_kernel<4> : hf_comb_kernel<2>;
-        comb<<<dim3((unsigned)((M + 31) / 32), (unsigned)((Bc + (wide ? 1 : 3)) / (wide ? 2 : 4))), 256, 0, stream>>>(
-            pp2, prs, CMR.template data_ptr<float>(), WF.template data_ptr<float>(), Gm::WFW, 8 * NT8, njt,
-            node_mars.template data_ptr<float>(), nid0, lzs.template data_ptr<float>(), (int)M, Mp, Bc, (int)B, (int)b0);
+        const dim3 cg((unsigned)((M + 31) / 32), (unsigned)((Bc + (wide ? 1 : 3)) / (wide ? 2 : 4)));
+        HF_TP_SWITCH(params, {
+            auto comb = wide ? hf_comb_kernel<TP, NT8, 4> : hf_comb_kernel<TP, NT8, 2>;
+            const HfRare<TP> ra{op.a, op.sAb, op.am, op.b, op.sBb, op.bk, op.bn, op.scaleA, WF.template data_ptr<float>(),
+                                Gm::WFW, lcs.template data_ptr<float>(), pp, p0, (int)Nb, (int)cbs, (int)bs, (int)M,
+                                (int)N, Np, njt};
+            comb<<<cg, 256, 0, stream>>>(pp2, CMR.template data_ptr<float>(), WF.template data_ptr<float>(), Gm::WFW,
+                                         8 * NT8, njt, node_mars.template data_ptr<float>(), nid0,
+                                         lzs.template data_ptr<float>(), (int)M, Mp, Bc, (int)B, (int)b0, ra);
+        });
         C10_CUDA_KERNEL_LAUNCH_CHECK();
     }
     const auto none = torch::empty({0}, emars.options().dtype(torch::kHalf));
@@ -1463,7 +1474,7 @@ std::vector<torch::Tensor> forward_impl(torch::Tensor A, torch::Tensor Bm, torch
 }
 
 // The tiles' theta fragments of a node vector's parameters for the forward at tile width `tn` (made once a forward
-// pass for every node vector reading the same run: tied copies): {LTF, CMF}
+// pass for every node vector reading the same run: tied copies): {LTF, CMR}
 std::vector<torch::Tensor> exp_sum_h_theta(torch::Tensor params, int64_t p0, int64_t Nb, int64_t cbs, int64_t bs,
                                            int64_t M, int64_t N, int64_t tn) {
     TORCH_CHECK(params.scalar_type() == torch::kFloat32 || params.scalar_type() == torch::kBFloat16, "params: fp32 or bf16");
@@ -1482,11 +1493,10 @@ std::vector<torch::Tensor> exp_sum_h_forward(torch::Tensor A, torch::Tensor Bm, 
     check_common(A, Bm, params, emars, rows, M, N, K, B);
     TORCH_CHECK(node_mars.scalar_type() == torch::kFloat32 && node_mars.is_contiguous(), "node_mars");
     TORCH_CHECK(tn == 64, "tn: 64");
-    const bool given = theta.size() == 3;
+    const bool given = theta.size() == 2;
     torch::Tensor ltf = given ? theta[0] : torch::empty({0}, emars.options());
-    torch::Tensor cmf = given ? theta[1] : torch::empty({0}, emars.options());
-    torch::Tensor cmr = given ? theta[2] : torch::empty({0}, emars.options());
-    return forward_impl<8>(A, Bm, params, p0, Nb, cbs, bs, emars, rows, node_mars, nid0, M, N, ltf, cmf, cmr, keep);
+    torch::Tensor cmr = given ? theta[1] : torch::empty({0}, emars.options());
+    return forward_impl<8>(A, Bm, params, p0, Nb, cbs, bs, emars, rows, node_mars, nid0, M, N, ltf, cmr, keep);
 }
 
 

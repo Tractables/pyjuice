@@ -3837,6 +3837,53 @@ def test_the_fp16_exp_sum_forward_off_its_frames(batch):
 
 
 @needs_fused
+@pytest.mark.parametrize("path,rank,precision", [("fp16", 16, "auto"), ("bf16", 16, "auto"), ("bf16", 4, "auto"),
+                                                 ("bf16", 4, "fp32")])
+@pytest.mark.parametrize("batch", [3, 100])
+def test_the_exp_sum_forward_folds_tiles_far_apart(path, rank, precision, batch):
+    """The combine folds the column tiles' (shift, sum) pairs, a tile's sums unshifted under its frames where they lie
+    in [2^-92, 2^100]: tile 0's S 2^-90 (rank 0's phi -90 in base 2 on its children, their values 0), tile 1's S 2^60
+    under a frame 130 below (phi +60, its children's values 130 down) -- tile 1's S 2^20 times tile 0's, though its
+    factor 2^-130 against tile 0's shift flushes: the pairs made normal before they fold (`fold_n`; S was 2^20 short,
+    the node values 14 nats down). Node values and log Z against float64 (the fp16 kernels': their fp16-rounded
+    factors, exact here)."""
+    from pyjuice.parameterizations.lowrank.kernels.c import get_exp_sum_module
+    mod = _fused_h_module() if path == "fp16" else get_exp_sum_module()
+    if mod is None:
+        pytest.skip("the fp16 exp_sum kernels are not built")
+    dev = torch.device("cuda:0")
+    M = N = 128
+    bs = cbs = 32
+    g = torch.Generator(device = "cpu").manual_seed(5)
+    A = torch.zeros(batch, M, rank)
+    A[:, :, 0] = LN2                                       # (phi[i, j] = B[0, j] in base 2: log2 e A = 1)
+    Bm = torch.zeros(batch, rank, N)
+    Bm[:, 0, :64] = -90.0
+    Bm[:, 0, 64:] = 60.0
+    emars = torch.zeros(N, batch)
+    emars[64:] = -130.0 * LN2
+    theta = torch.rand(M, N, generator = g).add_(0.05)
+    theta = theta / theta.sum(1, keepdim = True)
+    params = theta.view(M // bs, bs, N // cbs, cbs).permute(0, 2, 3, 1).contiguous().view(-1).to(dev)
+    nmars = torch.empty(M, batch, device = dev)
+    args = (A.to(dev).contiguous(), Bm.to(dev).contiguous(), params, 0, N // cbs, cbs, bs, emars.to(dev).contiguous(),
+            torch.arange(N, device = dev), nmars, 0, M, N)
+    if path == "fp16":
+        lzs = mod.exp_sum_h_forward(*args, 16, 64, [], False)[0]
+        lw = torch.bmm((A * LOG2E).half().double(), Bm.half().double()) * LN2
+    else:
+        lzs = mod.exp_sum_forward(*args, rank, precision != "fp32")
+        lw = torch.bmm(A.double(), Bm.double())
+    lw = lw + theta.double().log()[None]
+    lz = torch.logsumexp(lw, 2)
+    ln = torch.logsumexp(lw + emars.t().double()[:, None, :], 2) - lz
+    assert torch.isfinite(nmars).all() and torch.isfinite(lzs).all()
+    worst = float((nmars.t().double().cpu() - ln).abs().max())
+    assert worst < (1e-4 if path == "fp16" else 1e-3), worst
+    assert float(((lzs.t().double().cpu() - lz) / lz.abs().clamp_min(1.0)).abs().max()) < 1e-5
+
+
+@needs_fused
 def test_the_fp16_forward_makes_a_runs_theta_once_a_pass(monkeypatch):
     """The fp16 forward's tiles' theta fragments are made once a forward pass for the node vectors reading the same
     parameters (tied copies: `exp_sum_h_theta`, kept on the pass's staged tensors), again the next pass -- the

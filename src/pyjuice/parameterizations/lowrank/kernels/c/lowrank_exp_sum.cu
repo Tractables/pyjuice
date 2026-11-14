@@ -128,6 +128,18 @@ __device__ __forceinline__ void fold_ms(float& m, float& s, float m2, float s2) 
     m = n;
 }
 
+// ... the other made NORMAL first: its sum's binary exponent moved into its shift (s2 = f 2^e, f in [1, 2): (m2 + e,
+// f); 0, subnormal, inf, NaN as they are) -- a fold of pairs so made loses no term over 2^-126 of the larger. The
+// combine's pairs need it: a tile's unshifted sums lie in [2^-92, 2^100] under its frames, so a tile's S 2^60 under a
+// shift 130 below another's S 2^-90 flushed with its 2^(m2 - n), S 2^20 short. (e by a float subtraction: 2^23 + ex
+// less 2^23 + 127)
+__device__ __forceinline__ void fold_n(float& m, float& s, float m2, float s2) {
+    const unsigned u = __float_as_uint(s2), ex = u >> 23;          // (s2 >= 0: its biased exponent)
+    const bool nrm = ex - 1u < 254u;
+    const float e = __uint_as_float(0x4b000000u | ex) - 8388735.0f;
+    fold_ms(m, s, nrm ? m2 + e : m2, nrm ? __uint_as_float((u & 0x007fffffu) | 0x3f800000u) : s2);
+}
+
 // TF32 MMAs (fp32 accumulation), m16n8k8 and m16n8k4; the C fragment (g = lane / 4, tq = lane % 4): c0 (g, 2 tq),
 // c1 (g, 2 tq + 1), c2 (g + 8, 2 tq), c3 (g + 8, 2 tq + 1)
 __device__ __forceinline__ void mma_tf32(float (&d)[4], unsigned a0, unsigned a1, unsigned a2, unsigned a3, unsigned b0,
@@ -203,8 +215,8 @@ __global__ void __launch_bounds__(128) fw_comb_kernel(const float4* __restrict__
             v[u] = live && t0 + u < njt ? p[(long)(t0 + u) * Mp] : make_float4(NEG, 0.f, NEG, 0.f);
 #pragma unroll
         for (int u = 0; u < 8; u++) {
-            fold_ms(mz, z, v[u].x, v[u].y);
-            fold_ms(ms, s, v[u].z, v[u].w);
+            fold_n(mz, z, v[u].x, v[u].y);
+            fold_n(ms, s, v[u].z, v[u].w);
         }
     }
 #pragma unroll
