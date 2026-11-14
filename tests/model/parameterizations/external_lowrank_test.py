@@ -795,8 +795,9 @@ needs_virtual = pytest.mark.skipif(not _virtual_available(), reason = "the low-r
 
 def _passes(pc, sums, data, ext, param_flows = True):
     """One forward and backward with gradient buffers: everything they leave. The buffers start as NaN: whatever the
-    backward does not write -- a destination it was handed unzeroed (`StagedExternalParams.fresh`) -- shows."""
-    grads = {a: (torch.full_like(ext[a][0], float("nan")), torch.full_like(ext[a][1], float("nan"))) for a in sums}
+    backward does not write -- a destination it was handed unzeroed (`StagedExternalParams.fresh`) -- shows. The
+    buffers float32 whatever the factors' type (fp16 factors: their gradients float32)."""
+    grads = {a: tuple(torch.full(t.shape, float("nan"), device = t.device) for t in ext[a]) for a in sums}
     lls = pc(data, sum_external_params = ext).clone()
     pc.init_param_flows(flows_memory = 0.0)
     pc.backward(data, allow_modify_flows = False, logspace_flows = True, compute_param_flows = param_flows,
@@ -4503,13 +4504,15 @@ def test_the_one_launch_tma_boxes_change_no_bit(bs, batch, fw, bw, monkeypatch):
 @pytest.mark.parametrize("N, B, copies, K", [(64, 4, 3, 16), (256, 16, 2, 16), (1024, 8, 3, 16), (1344, 4, 2, 16),
                                              (64, 4, 3, 8), (1024, 8, 3, 8), (256, 16, 2, 32), (1344, 4, 2, 32),
                                              (256, 16, 2, 64), (1344, 4, 2, 64)])
-def test_the_side_ctas_v_rows_are_the_operand_kernels(N, B, copies, K):
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
+def test_the_side_ctas_v_rows_are_the_operand_kernels(N, B, copies, K, dtype):
     """`lowrank_v_rows` (the one-launch forward's side-CTA code, `kernels/c/lowrank_stream.cu`'s `om_v_rows`): a copy's
     V rows and their shifts, copy by copy at their rows, the same BITS as `lowrank_z_operand_in_place`'s (every copy in
     one launch) -- factors read in place at a sample stride past their block, entries of -inf (a rank of no finite
     entry: its shift -inf, its V 0), children past one unit's threads (N 1344); ranks 8, 32 and 64 (a sample's 2, 8
     and 16 units through the 4 buffers; rank 64's in two rounds of 32 ranks); few children, a sample's round one unit,
-    several in flight (`om_v_rows_whole`: N 64 and 256, and rank 8's 1024)."""
+    several in flight (`om_v_rows_whole`: N 64 and 256, and rank 8's 1024). fp16 factors: the bits of float32 ones
+    of the same values, both kernels."""
     import pyjuice.parameterizations.lowrank.virtual as lowrank_virtual
 
     smod, mod = lowrank_virtual._stream_module(), lowrank_virtual._module()
@@ -4519,7 +4522,7 @@ def test_the_side_ctas_v_rows_are_the_operand_kernels(N, B, copies, K):
     torch.manual_seed(N + B)
     fbs = []
     for c in range(copies):
-        big = torch.randn(B, K * N + 8, device = dev) * 4.0             # (a sample's stride past its block)
+        big = (torch.randn(B, K * N + 8, device = dev) * 4.0).to(dtype)   # (a sample's stride past its block)
         f = big[:, :K * N].view(B, K, N)
         f[:, 3, ::5] = -float("inf")
         f[0, 7, :] = -float("inf")
@@ -4528,6 +4531,11 @@ def test_the_side_ctas_v_rows_are_the_operand_kernels(N, B, copies, K):
     want = torch.empty(N, rows, dtype = torch.bfloat16, device = dev)
     wsh = torch.empty(rows, device = dev)
     mod.lowrank_z_operand_in_place(want, wsh, fbs, B, K)
+    if dtype is torch.float16:                                         # (the float32 factors of the same values)
+        w32 = torch.empty_like(want)
+        s32 = torch.empty_like(wsh)
+        mod.lowrank_z_operand_in_place(w32, s32, [f.float() for f in fbs], B, K)
+        assert torch.equal(w32.view(torch.int16), want.view(torch.int16)) and torch.equal(s32, wsh)
     got = torch.full_like(want, float("nan"))
     gsh = torch.full_like(wsh, float("nan"))
     for c in reversed(range(copies)):
@@ -4688,6 +4696,66 @@ def test_the_pipelined_v_rows_change_no_bit(bs, batch, form, nv, rank, monkeypat
         assert not torch.isnan(got[k]).any() and torch.equal(got[k], want[k]), k
     for k in ("dA", "dB"):
         assert all(not torch.isnan(a).any() and torch.equal(a, b) for a, b in zip(got[k], want[k])), k
+
+@needs_virtual
+@pytest.mark.parametrize("bs, batch, form, nv, rank", [(32, 16, "om", None, 16), (32, 16, "om", 0, 16),
+                                                      (256, 64, "om", None, 16), (32, 16, "om", None, 8),
+                                                      (32, 16, "om", None, 32), (64, 6, "om", 0, 32),
+                                                      (32, 16, "om", None, 64), (32, 16, "chain", None, 16),
+                                                      (32, 16, "plain", None, 16)])
+@pytest.mark.parametrize("mixed", [False, True])
+def test_the_sum_exp_takes_fp16_factors_as_their_float32_values(bs, batch, form, nv, rank, mixed, monkeypatch):
+    """"sum_exp" with fp16 factors (`LowRank.external_dtypes`): read in place by the one-launch forward and backward,
+    their side CTAs (`nv` forced; None: the rule) and the operands' kernels as float32 -- the conversion exact --, from
+    float32 copies on the other paths (the pre-pass chain's and the plain kernels' batch-innermost ones): every output
+    the BITS of float32 factors of the same values, the gradients float32. `mixed`: A fp16 and B float32 at one copy,
+    the reverse at another (the operands' kernels then take every copy's float32 copies, `virtual._one_type`; the side
+    CTAs none where the next copy's B is not of A's type)."""
+    import pyjuice.parameterizations.lowrank.virtual as lowrank_virtual
+    from pyjuice.layer.kernels import autotune
+
+    pick = autotune.pick
+    monkeypatch.setattr(autotune, "pick", lambda key, cands, bench, **k: "fused"
+                        if key[0] in ("prod_stream_fusion", "prod_stream_fusion_bk") else pick(key, cands, bench, **k))
+    if nv is not None:
+        monkeypatch.setattr(lowrank_virtual, "_om_vctas", lambda *a: nv)
+    pc, sums, _, _, _, _ = _pair(_hmm_blocks(256, bs), "sum_exp", rank = rank)
+    monkeypatch.setattr(pc, "_param_operands_force", True, raising = False)   # (the bf16 copy: the stream path's)
+    monkeypatch.setattr(lowrank_virtual, "GEMM_BF16_WORK", 0)                # (bf16 normalizers, as at real sizes)
+    dev = pc.params.device
+    torch.manual_seed(64)
+    data = torch.randint(0, NUM_CATS, (batch, pc.num_vars), device = dev)
+    half = {a: tuple(t.half() for t in _factors(a, rank, batch, dev, seed = 640 + i)) for i, a in enumerate(sums)}
+    if mixed:
+        a0, a1 = sums[0], sums[1]
+        half[a0] = (half[a0][0], half[a0][1].float())
+        half[a1] = (half[a1][0].float(), half[a1][1])
+    full = {a: tuple(t.float() for t in ts) for a, ts in half.items()}
+    if form == "plain":
+        monkeypatch.setattr(lowrank_virtual, "FUSED_STREAM", False)
+    taken = _stream_form(monkeypatch, form) if form != "plain" else None
+    smod = lowrank_virtual._stream_module()
+    fwd = "lowrank_forward_om" if rank == 16 else "lowrank_forward_omk"
+    bwd = "lowrank_backward_om" if rank == 16 else "lowrank_backward_omk"
+    seen = []
+    for name, at in ((fwd, 18), (bwd, 4)):                               # (A / B as the one-launch kernels took them)
+        f = getattr(smod, name)
+        monkeypatch.setattr(smod, name, lambda *a, f = f, at = at, name = name: (seen.append((name, a[at].dtype)),
+                                                                                f(*a))[1])
+    _passes(pc, sums, data, full)                                        # (the copies' visit order: V pipelined)
+    want = _passes(pc, sums, data, full)
+    seen.clear()
+    got = _passes(pc, sums, data, half)
+    assert form == "plain" or taken and all((c == lowrank_virtual._OM_ARM) == (form == "om") for c, _ in taken)
+    if form == "om":
+        kinds = {dt for _, dt in seen}
+        assert seen and (kinds == {torch.float16, torch.float32} if mixed else kinds == {torch.float16}), seen
+    assert all(t.dtype == torch.float32 for k in ("dA", "dB") for t in got[k])
+    for k in ("lls", "mars", "flows", "fp", "fm"):
+        assert not torch.isnan(got[k]).any() and torch.equal(got[k], want[k]), k
+    for k in ("dA", "dB"):
+        assert all(not torch.isnan(a).any() and torch.equal(a, b) for a, b in zip(got[k], want[k])), k
+
 
 @needs_virtual
 def test_the_backward_parameter_boxes_need_affine_slabs():

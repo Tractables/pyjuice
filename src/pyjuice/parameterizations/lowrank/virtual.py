@@ -255,7 +255,7 @@ def _transposes(pairs, inverse: bool = False) -> None:
     for dst, src in pairs:
         caller = dst if inverse else src
         b, n, sb = caller.size(0), caller[0].numel(), caller.stride(0)
-        if batched is None or max(sb, n, b) >= 1 << 31:
+        if batched is None or max(sb, n, b) >= 1 << 31 or dst.dtype != src.dtype:   # (fp16 factors: converted)
             if inverse:
                 dst.copy_(src.permute(src.dim() - 1, *range(src.dim() - 1)))
             else:
@@ -272,11 +272,28 @@ def _transposes(pairs, inverse: bool = False) -> None:
 
 
 def _om_a(a: torch.Tensor) -> torch.Tensor:
-    """The one-launch forms' A `[B, M, K]` in place: as the storage holds it where its runs are 16-byte aligned (its
-    base and its batch stride), else a contiguous copy."""
-    if a.stride(2) == 1 and a.stride(1) == a.size(2) and a.stride(0) % 4 == 0 and a.data_ptr() % 16 == 0:
+    """The one-launch forms' A `[B, M, K]` (fp32 or fp16) in place: as the storage holds it where its runs are 16-byte
+    aligned (its base and its batch stride), else a contiguous copy."""
+    if a.stride(2) == 1 and a.stride(1) == a.size(2) and a.stride(0) % (16 // a.element_size()) == 0 and \
+            a.data_ptr() % 16 == 0:
         return a                                                        # (a sample's [M, K] block contiguous)
     return a.contiguous()
+
+
+def _one_type(ts) -> list:
+    """A source's copies' factors for the kernels that take every copy in a launch (`lowrank_z_operand_in_place`,
+    `lowrank_a_operand_in_place`: one type a launch): as they are where they are of one type, else the fp16 ones as
+    float32 copies."""
+    if len({t.dtype for t in ts}) <= 1:
+        return list(ts)
+    return [t if t.dtype == torch.float32 else t.float() for t in ts]
+
+
+def _v_rows_ok(fbs, N: int) -> bool:
+    """Whether `lowrank_v_rows` (the side CTAs' code) takes these factors as they lie: float32, or float16 of an even
+    count of children in 16-byte aligned sample blocks (its bulk copies)."""
+    return all(f.dtype == torch.float32 or (N % 2 == 0 and f.stride(0) % 8 == 0 and f.data_ptr() % 16 == 0)
+               for f in fbs)
 
 
 def _inner(kwargs, tensors, every: bool = False) -> tuple:
@@ -527,7 +544,7 @@ def _normalizers(desc, layer, info, st, kwargs, params, batch, dev) -> dict:
         mine = [(c, t if ip else _inner(kwargs, t)) for c, t in kwargs[_EXTERNAL_PARAMS_KWARG].items()
                 if _source(c) is source]
         copies = [(c, t[1]) for c, t in mine]
-        fbs = [fb for _, fb in copies]
+        fbs = _one_type([fb for _, fb in copies])
         dtype = _dtype(kwargs.get("precision", "auto"), len(copies) * batch * K * geo["M"] * geo["N"])
         # (`flow_precision = "fp8"`: V's twin besides gives each (child, copy, sample)'s largest V over the ranks, what
         # the pass's end's e4m3 operands take their rows' scales from -- `gv`; V the same bits)
@@ -540,7 +557,7 @@ def _normalizers(desc, layer, info, st, kwargs, params, batch, dev) -> dict:
             Vt = torch.empty(geo["N"], rows, dtype = dtype, device = dev)
             shift = torch.empty(rows, device = dev)
             gv = torch.empty(geo["N"], rows // K, device = dev)
-            _fp8_module().lowrank_z_operand_in_place_g(Vt, shift, gv, fbs, batch, K)
+            _fp8_module().lowrank_z_operand_in_place_g(Vt, shift, gv, [f.float() for f in fbs], batch, K)
             Vc, G = [Vt], len(fbs)                       # (the e4m3 pass's end's operands: one chunk)
         else:
             # (pipelined: the copies' rows formed as they come, where an earlier pass left the order it visited every
@@ -549,7 +566,7 @@ def _normalizers(desc, layer, info, st, kwargs, params, batch, dev) -> dict:
             smod = _stream_module() if PIPELINED_V else None
             pipe = smod is not None and ip and dtype is torch.bfloat16 and order is not None and \
                 len(order) == len(copies) and set(order) == {c for c, _ in copies} and \
-                bool(smod.om_v_serves(geo["N"], K)) and (K == 16 or OMK_V)
+                bool(smod.om_v_serves(geo["N"], K)) and (K == 16 or OMK_V) and _v_rows_ok(fbs, geo["N"])
             if pipe:
                 Vc = [torch.empty(geo["N"], len(fbs[q0:q0 + G]) * batch * K, dtype = dtype, device = dev)
                       for q0 in range(0, len(fbs), G)]
@@ -561,7 +578,7 @@ def _normalizers(desc, layer, info, st, kwargs, params, batch, dev) -> dict:
         hit = zs[source] = dict(zt = None, zt_done = set(), row = {c: at * batch * K for at, (c, _) in enumerate(copies)},
                                 Vc = Vc, vg = G, shift = shift, dtype = dtype, fb = fbs, theta = theta,
                                 cols = batch * K,
-                                fa = [t[0] for _, t in mine], in_place = ip, gv = gv,
+                                fa = _one_type([t[0] for _, t in mine]), in_place = ip, gv = gv,
                                 v_ready = set() if pipe else None, v_order = list(order) if pipe else None,
                                 v_seen = [])
     # (the copies' visit order, kept on the source once a pass visited every copy: the next pass's pipelined V)
@@ -987,7 +1004,7 @@ def _stream_run(plan, info, tensors, kwargs, z, row0, vnm, kd, node_mars, elemen
                     if fbn is not None and nv == 0:
                         V2, sh2, r2 = _vchunk(z, z["row"][nxt])
                         mod.lowrank_v_rows(V2, sh2, fbn, r2)
-                if nxt is None or not near:
+                if nxt is None or not near or fbn.dtype != a_om.dtype:   # (the side CTAs' B of A's type)
                     fw(0)
                 else:
                     B = node_mars.size(1)

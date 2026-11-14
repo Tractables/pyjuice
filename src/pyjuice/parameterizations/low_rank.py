@@ -203,9 +203,15 @@ class LowRank(_ForwardMixin, _BackwardMixin, _DenominatorsMixin, SumParameteriza
         more from fp16 A (`lowrank/kernels/c/lowrank_exp_sum_h.cu`'s `scale_h2`) -- with no copy, the others (bf16
         ones, an autocast head's; fp16 ones of other ranks) through their fp16 copy, as float32 ones; the bf16 / TF32
         kernels (the other ranks, `precision = "fp32"`) take any of the three as they lie, their values exactly
-        (`lowrank_exp_sum.cu`'s prologues)."""
+        (`lowrank_exp_sum.cu`'s prologues). float32 and float16 where the "sum_exp" form reads them in place: its
+        one-launch forward and backward, their side CTAs and the operands' kernels take fp16 factors as they lie, read
+        as float32 -- the conversion exact: the bits of float32 factors of those values --, its other paths (the plain
+        kernels' batch-innermost copies, the e4m3 pass's end, the copies of a source of factors of both types) float32
+        copies; the gradients float32 either way."""
         if self.form == "exp_sum" and self.reads_in_place(ns):
             return (torch.float32, torch.float16, torch.bfloat16)
+        if self.form == "sum_exp" and self.reads_in_place(ns):
+            return (torch.float32, torch.float16)
         return (torch.float32,)
 
     def initializes_grads(self, ns) -> bool:
