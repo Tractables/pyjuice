@@ -1282,7 +1282,9 @@ def test_the_rule_on_the_copy_reckons_the_virtual_columns(monkeypatch):
     layer's work, and the 16 columns it takes the copy from, on the columns its plain kernels run at -- `rank` a
     sample (`LowRank.param_operand_columns`) --, not the batch: rank 4 at batch 4 is 16 columns, given the copy where
     the layer's parameters times 16 reach `_COPY_MIN_WORK` (set here), the batch alone below it; batch 3 (12 columns)
-    never; the work's bound kept (16 columns short of a threshold of 32, batch 8 reaching it). The twins are handed
+    never; the mixture form given it whatever the work (`LowRank.param_operands_min_work`: 16 columns short of a
+    threshold of 32), the circuit's bound on the work kept for a parameterization that sets none (batch 8 reaching
+    it). The twins are handed
     the copy, the values, flows and gradients within bf16's rounding of the torch passes'. The `exp_sum` form's
     layers, whose torch passes read `params`, are not marked. A group of a plain layer and a mixture-form one takes
     the least of their columns, the plain layer's batch: none of its layers handed the copy at batch 4, both at 16.
@@ -1338,6 +1340,9 @@ def test_the_rule_on_the_copy_reckons_the_virtual_columns(monkeypatch):
     assert not run(3) and pc._param_operands(3) is None and not pc._param_operand_groups(3)
     pc.__dict__.pop("_param_operand_rule_")                               # (the rule again, at another threshold)
     monkeypatch.setattr(tcm, "_COPY_MIN_WORK", edges * 32)
+    assert run(4)                                                         # (the mixture form: whatever the work)
+    pc.__dict__.pop("_param_operand_rule_")
+    monkeypatch.setattr(LowRank, "param_operands_min_work", None)         # (none set: the circuit's bound on the work)
     assert not run(4) and pc._param_operands(4) is not None              # (16 columns: it applies, not given)
     assert run(8)
 

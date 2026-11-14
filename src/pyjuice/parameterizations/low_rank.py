@@ -120,6 +120,16 @@ class LowRank(_ForwardMixin, _BackwardMixin, _DenominatorsMixin, SumParameteriza
         """The mixture form's plain kernels run on `rank` columns a sample (the virtual batch)."""
         return batch_size * self.rank if self.form == "sum_exp" else batch_size
 
+    @property
+    def param_operands_min_work(self):
+        """The mixture form takes the circuit's bf16 copy whatever its layers' work (`TensorCircuit._param_operand_groups`,
+        16 columns at least): its one-launch kernels read their parameters from the copy alone, and without it its
+        layers take the plain path. MEASURED (toast, HMM of 31 layers, step ms, the circuit's bound on the work -> the
+        copy whatever the work): L128 rank 16 B256 4.96 -> 2.28, B64 4.41 -> 2.20; L256 rank 16 B64 4.51 -> 2.25; L128
+        rank 32 B256 9.64 -> 2.47 (the plain path's ~440 launches a step against ~95). The `exp_sum` form: the
+        circuit's bound."""
+        return 0 if self.form == "sum_exp" else None
+
     def __init__(self, rank: int, form: str = "exp_sum", apply_z_correction: bool = True, tie_external: bool = False,
                  flow_precision: str = "bf16"):
         super(LowRank, self).__init__()

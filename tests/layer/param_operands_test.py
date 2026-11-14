@@ -973,6 +973,34 @@ def test_a_parameterization_sets_the_least_layer_that_takes_the_copy(least, monk
 
 
 @cuda_only
+@pytest.mark.parametrize("work", ["circuit", "parameterization"])
+def test_a_parameterization_sets_the_least_work_that_takes_the_copy(work, monkeypatch):
+    """A tied gated chain whose work per layer is half the rule's threshold (`_COPY_MIN_WORK` set there, the layers'
+    `param_operands_min_edges` off): given no copy by the circuit's bound; given it where its parameterization takes the
+    copy from less work (`SumParameterization.param_operands_min_work`, 0 here). A group's bound is the least of its
+    layers' parameterizations', the circuit's for a plain layer and one that sets none."""
+    from pyjuice.parameterizations import BlockScale
+    monkeypatch.setattr(tcm.TensorCircuit, "_param_operands_force", None)
+    monkeypatch.setattr(BlockScale, "param_operands_min_edges", 0)
+    if work == "parameterization":
+        monkeypatch.setattr(BlockScale, "param_operands_min_work", 0)
+    root, gated = _gated_chain(L = 512)
+    pc = juice.compile(root, verbose = False).to(DEV)
+    pc._param_operand_plan()
+    layer = _marked(pc)[0]
+    B = 64
+    monkeypatch.setattr(tcm, "_COPY_MIN_WORK", layer.num_edges * B * 2)
+    gates = _gates(gated, B)
+    _step(pc, torch.randint(0, 16, (B, 5), device = DEV), sum_external_params = gates,
+          sum_external_params_grad = {n: torch.zeros_like(t) for n, t in gates.items()})
+    taken = work == "parameterization"
+    assert pc.__dict__["_param_operands_made"] is taken and (layer.__dict__["_bk_op_params"] is not None) is taken
+    lowers = type("P", (), {"param_operands_min_work": 5})()
+    assert tcm._operand_min_work((None, lowers)) == 5 and tcm._operand_min_work((None,)) == tcm._COPY_MIN_WORK
+    assert tcm._operand_min_work((type("Q", (), {})(),)) == tcm._COPY_MIN_WORK
+
+
+@cuda_only
 def test_below_the_work_the_forward_makes_no_copy(monkeypatch):
     """Below `_COPY_MIN_WORK` neither pass makes the copy or hands it to a layer: not even its buffer is made."""
     monkeypatch.setattr(tcm.TensorCircuit, "_param_operands_force", None)

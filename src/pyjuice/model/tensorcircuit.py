@@ -50,6 +50,14 @@ def _calls_its_forward(module: nn.Module) -> bool:
 _COPY_MIN_WORK = 1 << 28
 
 
+def _operand_min_work(readers) -> int:
+    """The least work a layer group takes the bf16 copy from: the least of its layers' parameterizations'
+    (`SumParameterization.param_operands_min_work`; `readers`: None for a plain layer), the circuit's `_COPY_MIN_WORK`
+    for a plain layer and for one that sets none."""
+    return min(_COPY_MIN_WORK if p is None or getattr(p, "param_operands_min_work", None) is None
+               else p.param_operands_min_work for p in readers)
+
+
 def _operand_columns(readers, batch_size: int) -> int:
     """The columns a layer group's kernels on the bf16 copy run at, the least over its layers': the batch for a plain
     layer's, what its parameterization widens it to for another (`readers`: the layers' parameterizations, None for a
@@ -425,8 +433,10 @@ class TensorCircuit(_BuildMixin, _CudaGraphsMixin, _ExternalParamsMixin, _Learni
         """The groups (`_param_operand_plan`'s, by id) a pass at this batch size gives the bf16 copy (`_param_operands`,
         where it applies; none: no copy made): those whose layers read enough parameters for the batch to make them
         GPU-bound -- the parameters such a layer reads a sample (their mean over the group) times the columns its
-        kernels run at at least `_COPY_MIN_WORK`, those columns 16 at least -- and at least what their parameterizations
-        take it from (`SumParameterization.param_operands_min_edges`). The columns: the least over the group's layers --
+        kernels run at at least `_COPY_MIN_WORK` (or the least a parameterization of the group takes it from,
+        `SumParameterization.param_operands_min_work`: LowRank's "sum_exp" form, whose kernels read the copy alone, 0),
+        those columns 16 at least -- and at least what their parameterizations take it from
+        (`SumParameterization.param_operands_min_edges`). The columns: the least over the group's layers --
         the batch for a plain layer, what a parameterization widens it to for another
         (`SumParameterization.param_operand_columns`: LowRank's virtual batch, `rank` columns a sample) --, so no layer
         is handed the copy below 16 columns of its own (a plain layer's small-batch kernels read it too). The kernels
@@ -454,8 +464,8 @@ class TensorCircuit(_BuildMixin, _CudaGraphsMixin, _ExternalParamsMixin, _Learni
                     for g, (_, _, readers) in self.__dict__["_param_operand_sizes_"].items()}
             wide = frozenset(g for g, c in cols.items() if c >= 16)
             hit = cache[batch_size] = (wide, frozenset(
-                g for g, (edges, least, _) in self.__dict__["_param_operand_sizes_"].items()
-                if g in wide and edges >= least and edges * cols[g] >= _COPY_MIN_WORK))
+                g for g, (edges, least, readers) in self.__dict__["_param_operand_sizes_"].items()
+                if g in wide and edges >= least and edges * cols[g] >= _operand_min_work(readers)))
         return hit
 
     def _param_operands(self, batch_size: int, refresh: Optional[bool] = True) -> Optional[torch.Tensor]:
