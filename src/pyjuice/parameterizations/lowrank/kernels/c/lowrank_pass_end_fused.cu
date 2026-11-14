@@ -12,8 +12,8 @@
 // its K-chunk shared in the L2); 8 warps (2 x 4, a 64 x 64 warp tile, 128 fp32 accumulators; 2 a sub-partition: up to
 // 255 registers -- a 9th warp caps them at 168); thread 0 issuing the TMA boxes (k32 x 4 stages, the 64-byte swizzle);
 // a stage scaled by every warp during the stage before's second MMA half (MEASURED: past its MMAs 8 points of the
-// peak slower), then a named barrier; the splits' partials summed in split order through a turnstile a tile
-// (deterministic). MEASURED (croissant, the reference HMM's shapes: M = N = 1024, rows 31 x B x 16, 47 splits; % of
+// peak slower), then a named barrier; the splits' partials summed in split order (deterministic) through a turnstile a
+// tile, or, where the tiles are few, through a scratch and a launch of their sum (`pe_product`'s rule). MEASURED (croissant, the reference HMM's shapes: M = N = 1024, rows 31 x B x 16, 47 splits; % of
 // the mma.sync peak 443 TF/s): the plain GEMM 89% at B1024 / 80% at B256 (cuBLAS 73-79% / 80%), W 81% / 72%, F+ 68%
 // / 64%.
 #include <torch/extension.h>
@@ -179,13 +179,14 @@ __global__ void pe_tables_kernel(const Copies copies, float* __restrict__ fd, fl
 }
 
 // ---------------- the GEMM: out = (A fA sK) (B fB)^T over the copies' rows, split-K ----------------
-template <bool SB>
+template <bool SB, bool PART>
 __global__ void __launch_bounds__(NTH, 1) pe_gemm_kernel(const __grid_constant__ CUtensorMap tA,
                                                        const __grid_constant__ CUtensorMap tB, float* __restrict__ out,
                                                        int* __restrict__ turn, const Rows row0, int M,
                                                        int N, int nks, int spc, int kper, int splits,
                                                        const float* __restrict__ fA, const float* __restrict__ fB,
-                                                       const float* __restrict__ sK, int B, int lk) {
+                                                       const float* __restrict__ sK, int B, int lk,
+                                                       float* __restrict__ part) {
     extern __shared__ __align__(1024) unsigned char smem[];
     uint64_t* full = (uint64_t*)(smem + ST * STAGE);
     uint64_t* empty = full + ST;
@@ -335,6 +336,18 @@ __global__ void __launch_bounds__(NTH, 1) pe_gemm_kernel(const __grid_constant__
             head((t + 1) % ST);
         }
     }
+    // ---- PART: the split's partial tile into the scratch [splits][tiles][BM][BN] as it stands -- their sum in split
+    // order by `pe_reduce_kernel` (a tile of few, its splits' turn in line one after another was the cost)
+    if constexpr (PART) {
+        float* o = part + ((long)split * ntiles + tile) * (BM * BN);
+        constexpr int NE = size(decltype(tCrC){});
+        CUTE_UNROLL
+        for (int i = 0; i < NE; i += 2) {
+            const int r = get<0>(tCcC(i)), cl = get<1>(tCcC(i));
+            __stcg(reinterpret_cast<float2*>(o + r * BN + cl), make_float2(tCrC(i), tCrC(i + 1)));
+        }
+        return;
+    }
     // ---- the tile's sum, in split order (the turnstile: split s adds once split s - 1 has, split 0 stores; the last
     // sets it back to 0 for the next launch)
     if (tid == 0) {
@@ -379,6 +392,32 @@ __global__ void __launch_bounds__(NTH, 1) pe_gemm_kernel(const __grid_constant__
     }
 }
 
+// The splits' partial tiles summed in split order -- split 0's, then each next one added: the turnstile's own
+// order, the same bits -- into `out` [M, N]: a thread two adjacent columns of a row (one at an odd N's last)
+__global__ void __launch_bounds__(256) pe_reduce_kernel(const float* __restrict__ part, float* __restrict__ out,
+                                                        int splits, int ntiles, int M, int N) {
+    const int ntn = (N + BN - 1) / BN;
+    const long x = (long)blockIdx.x * 256 + threadIdx.x, half = ((long)N + 1) / 2;
+    if (x >= (long)M * half) return;
+    const int m = (int)(x / half), n = (int)(x % half) * 2;
+    const int tile = (m / BM) * ntn + n / BN, r = m % BM, c = n % BN;
+    const float* p = part + (long)tile * (BM * BN) + r * BN + c;
+    const long sstride = (long)ntiles * (BM * BN);
+    float2 acc = __ldcg(reinterpret_cast<const float2*>(p));
+    if ((N & 1) == 0) { acc.x = 0.f + acc.x; acc.y = 0.f + acc.y; }   // (the turnstile's split 0: 0 + its partial)
+    for (int s = 1; s < splits; s++) {
+        const float2 v = __ldcg(reinterpret_cast<const float2*>(p + s * sstride));
+        acc.x = acc.x + v.x;
+        acc.y = acc.y + v.y;
+    }
+    float* q = out + (long)m * N + n;
+    if (n + 1 < N && (N & 1) == 0) *reinterpret_cast<float2*>(q) = acc;
+    else {
+        q[0] = acc.x;
+        if (n + 1 < N) q[1] = acc.y;
+    }
+}
+
 CUtensorMap kmap(const torch::Tensor& t, int rows_box) {
     CUtensorMap m;
     cuuint64_t gdim[2] = {(cuuint64_t)t.size(1), (cuuint64_t)t.size(0)};
@@ -403,10 +442,11 @@ int sms() {
 }
 
 // One product into `out` [M, N] fp32: the copies' rows of `a` [M, rows] scaled by fA [slots B, M] x sK [slots B K], of
-// `b` [N, rows] by fB [slots B, N] (or not: W), summed over the slots' rows (`row0` [slots]: each slot's B K rows)
+// `b` [N, rows] by fB [slots B, N] (or not: W), summed over the slots' rows (`row0` [slots]: each slot's B K rows);
+// `reduce` the splits' sum: -1 the rule below, 0 the turnstile, 1 the partials
 void pe_product(torch::Tensor& out, const torch::Tensor& a, const torch::Tensor& b, const Rows& row0, int slots,
              const torch::Tensor& fA, const c10::optional<torch::Tensor>& fB, const torch::Tensor& sK, int B, int K,
-             torch::Tensor& turn, cudaStream_t st) {
+             torch::Tensor& turn, int reduce, cudaStream_t st) {
     const int M = (int)a.size(0), N = (int)b.size(0);
     const int spc = B * K / KT, nks = slots * spc;
     int lk = 0;
@@ -414,15 +454,27 @@ void pe_product(torch::Tensor& out, const torch::Tensor& a, const torch::Tensor&
     TORCH_CHECK((1 << lk) == K && K >= 8, "lowrank fused pass's end: the rank a power of 2, 8 or more");
     const int ntiles = ((M + BM - 1) / BM) * ((N + BN - 1) / BN);
     // the splits: whole waves of the SMs, up to 8 of them, at least 128 k-steps a split (a wave's splits of a tile add
-    // in turn at its end: its share of the wave kept small)
-    const long waves = std::max<long>(1, std::min<long>(8, (long)nks * ntiles / ((long)sms() * 128)));
+    // in turn at its end: its share of the wave kept small) -- or, where that turn in line is the cost, the splits'
+    // partial tiles into a scratch and their sum in split order by a launch of its own (`pe_reduce_kernel`), over up to
+    // 2 waves: where a wave holds more than 6 splits of a tile (few tiles: a tile's splits finish together, each then
+    // waiting on the one before -- a 128 x 256 fp32 round trip through the L2, ~5 us, one after another) or the waves
+    // are 2 at most (the turns all at the launch's end). MEASURED (toast, the backward's wall ms, HMM 31 layers of L
+    // nodes, turnstile -> partials): L128 r16 B1024 3.85 -> 1.86, L256 r16 B256 2.72 -> 1.32, L256 r32 B1024 7.41 ->
+    // 5.62, L512 r16 B256 2.37 -> 2.03, L512 r32 B1024 11.86 -> 11.55, L1024 r16 B64 1.73 -> 1.65; at L1024's 32 tiles
+    // and 5-8 waves parity (r16 B256 / B1024, r64 B256) or the partials' 2 waves slower (r32 B1024 33.6 -> 34.1: a wave
+    // 87% full)
+    const long fill = std::max<long>(1, (long)nks * ntiles / ((long)sms() * 128));
+    const bool partial = reduce >= 0 ? reduce == 1 : ((long)ntiles * 6 < sms() || fill <= 2);
+    const long waves = std::min<long>(partial ? 2 : 8, fill);
     const int splits = (int)std::max<long>(1, std::min<long>(nks, waves * sms() / ntiles));
     const int kper = (nks + splits - 1) / splits;
     TORCH_CHECK(turn.numel() >= ntiles, "lowrank fused pass's end: the turnstiles");
     const CUtensorMap ta = kmap(a, BM), tb = kmap(b, BN);
-    auto go = [&](auto sbv) {
-        constexpr bool SB_ = decltype(sbv)::value;
-        auto k = pe_gemm_kernel<SB_>;
+    torch::Tensor scratch;
+    if (partial && splits > 1) scratch = torch::empty({(long)splits * ntiles * BM * BN}, out.options());
+    auto go = [&](auto sbv, auto pv) {
+        constexpr bool SB_ = decltype(sbv)::value, PT_ = decltype(pv)::value;
+        auto k = pe_gemm_kernel<SB_, PT_>;
         static bool attr[64] = {};
         int dev = 0;
         C10_CUDA_CHECK(cudaGetDevice(&dev));
@@ -432,11 +484,19 @@ void pe_product(torch::Tensor& out, const torch::Tensor& a, const torch::Tensor&
         }
         k<<<dim3((unsigned)(ntiles * splits)), NTH, SMEM, st>>>(
             ta, tb, out.data_ptr<float>(), turn.data_ptr<int>(), row0, M, N, nks, spc, kper, splits,
-            fA.data_ptr<float>(), SB_ ? fB->data_ptr<float>() : (const float*)nullptr, sK.data_ptr<float>(), B, lk);
+            fA.data_ptr<float>(), SB_ ? fB->data_ptr<float>() : (const float*)nullptr, sK.data_ptr<float>(), B, lk,
+            PT_ ? scratch.data_ptr<float>() : (float*)nullptr);
         C10_CUDA_KERNEL_LAUNCH_CHECK();
+        if constexpr (PT_) {
+            const long pairs = (long)M * ((N + 1) / 2);
+            pe_reduce_kernel<<<dim3((unsigned)((pairs + 255) / 256)), 256, 0, st>>>(
+                scratch.data_ptr<float>(), out.data_ptr<float>(), splits, ntiles, M, N);
+            C10_CUDA_KERNEL_LAUNCH_CHECK();
+        }
     };
-    if (fB.has_value()) go(std::true_type{});
-    else go(std::false_type{});
+    const bool pt = partial && splits > 1;
+    if (fB.has_value()) { if (pt) go(std::true_type{}, std::true_type{}); else go(std::true_type{}, std::false_type{}); }
+    else { if (pt) go(std::false_type{}, std::true_type{}); else go(std::false_type{}, std::false_type{}); }
 }
 
 void check(const torch::Tensor& t, const char* what, at::ScalarType dt, long numel) {
@@ -449,7 +509,8 @@ using namespace lrpe;
 
 // The fused pass's end (the copies as `lowrank_kept_operands` takes them; `drow0[c]` >= 0: the copy in F+, `un[c]`: in
 // W): F+ into `F` [M, N] and W into `W` [M, N] (fp32, written), neither operand written. `cmo[c]` (or none): the
-// copy's one-launch forward's tile maxima [node tiles, B] (`lowrank_forward_om`'s), its c_m then theirs.
+// copy's one-launch forward's tile maxima [node tiles, B] (`lowrank_forward_om`'s), its c_m then theirs. `reduce`: the
+// splits' sum as `pe_product`'s rule takes it (-1), by the turnstile (0) or through the partials (1).
 void lowrank_pass_end_fused(c10::optional<torch::Tensor> F, c10::optional<torch::Tensor> W, torch::Tensor ua,
                             torch::Tensor am, torch::Tensor vt, torch::Tensor shb, torch::Tensor node_flows,
                             torch::Tensor node_mars, std::vector<torch::Tensor> lz, std::vector<int64_t> nid0,
@@ -457,7 +518,7 @@ void lowrank_pass_end_fused(c10::optional<torch::Tensor> F, c10::optional<torch:
                             std::vector<c10::optional<torch::Tensor>> table, std::vector<int64_t> first,
                             std::vector<int64_t> row0, std::vector<int64_t> drow0, std::vector<int64_t> un, int64_t M,
                             int64_t K, std::vector<c10::optional<torch::Tensor>> cv,
-                            std::vector<c10::optional<torch::Tensor>> cmo) {
+                            std::vector<c10::optional<torch::Tensor>> cmo, int64_t reduce) {
     const int B = (int)node_flows.size(1), N = (int)vt.size(0);
     const long rows = ua.size(1), P = (long)lz.size(), R = (long)B * K;
     TORCH_CHECK(P <= 64, "lowrank fused pass's end: at most 64 copies");
@@ -474,6 +535,7 @@ void lowrank_pass_end_fused(c10::optional<torch::Tensor> F, c10::optional<torch:
     const at::cuda::OptionalCUDAGuard guard(ua.device());
     cudaStream_t st = c10::cuda::getCurrentCUDAStream();
     TORCH_CHECK((long)cmo.size() == P, "lowrank fused pass's end: cmo a copy");
+    TORCH_CHECK(reduce >= -1 && reduce <= 1, "lowrank fused pass's end: reduce -1, 0 or 1");
     Copies copies;
     std::vector<int64_t> rd, rn;
     bool cmax = false;                                   // (a copy in F+ whose c_m `pe_cmax` makes)
@@ -536,7 +598,7 @@ void lowrank_pass_end_fused(c10::optional<torch::Tensor> F, c10::optional<torch:
         for (long q = 0; q < Pd; q++) r0.r[q] = rd[q];
         TORCH_CHECK(F->scalar_type() == torch::kFloat32 && F->is_contiguous() && F->size(0) == M && F->size(1) == N,
                     "lowrank fused pass's end: F");
-        pe_product(*F, ua, vt, r0, (int)Pd, fd, gd, skd, B, (int)K, turns[dev], st);
+        pe_product(*F, ua, vt, r0, (int)Pd, fd, gd, skd, B, (int)K, turns[dev], (int)reduce, st);
     } else if (F.has_value()) {
         F->zero_();
     }
@@ -545,7 +607,7 @@ void lowrank_pass_end_fused(c10::optional<torch::Tensor> F, c10::optional<torch:
         for (long q = 0; q < Pn; q++) r0.r[q] = rn[q];
         TORCH_CHECK(W->scalar_type() == torch::kFloat32 && W->is_contiguous() && W->size(0) == M && W->size(1) == N,
                     "lowrank fused pass's end: W");
-        pe_product(*W, ua, vt, r0, (int)Pn, fn, c10::nullopt, skn, B, (int)K, turns[dev], st);
+        pe_product(*W, ua, vt, r0, (int)Pn, fn, c10::nullopt, skn, B, (int)K, turns[dev], (int)reduce, st);
     } else if (W.has_value()) {
         W->zero_();
     }

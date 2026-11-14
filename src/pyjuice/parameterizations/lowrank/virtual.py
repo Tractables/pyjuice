@@ -35,6 +35,7 @@ rescaling of it), the virtual buffers within `VIRTUAL_BYTES_MOST`. Every other c
 
 from __future__ import annotations
 
+import itertools
 import weakref
 from typing import Optional
 
@@ -88,13 +89,17 @@ def _bytes(node_rows: int, element_mars: torch.Tensor, cols: int) -> int:
 
 
 def serves(desc, layer, node_mars: torch.Tensor, element_mars: torch.Tensor) -> bool:
-    """Whether this layer's pass at this batch goes through the virtual batch."""
-    if not ENABLED or desc.form != "sum_exp" or not node_mars.is_cuda or node_mars.dtype != torch.float32:
-        return False
-    if _module() is None or not _disjoint(desc, layer, node_mars.device):
-        return False
-    rows = _twin(layer)[0]._layer_nid_range[1]
-    return _bytes(rows, element_mars, _columns(layer, node_mars)) <= VIRTUAL_BYTES_MOST
+    """Whether this layer's pass at this batch goes through the virtual batch (kept on the layer per what it reads: a
+    layer's pass asks it every call)."""
+    key = (ENABLED, VIRTUAL_BYTES_MOST, node_mars.is_cuda, node_mars.dtype, node_mars.size(1), element_mars.size(0))
+    hit = layer.__dict__.get("_lrv_serves")
+    if hit is not None and hit[0] == key:
+        return hit[1]
+    ok = ENABLED and desc.form == "sum_exp" and node_mars.is_cuda and node_mars.dtype == torch.float32 and \
+        _module() is not None and _disjoint(desc, layer, node_mars.device) and \
+        _bytes(_twin(layer)[0]._layer_nid_range[1], element_mars, _columns(layer, node_mars)) <= VIRTUAL_BYTES_MOST
+    layer.__dict__["_lrv_serves"] = (key, ok)
+    return ok
 
 
 def note_compiled(layer) -> None:
@@ -241,7 +246,10 @@ def _pass(kwargs) -> dict:
 
 
 def _source(ns):
-    return ns.get_source_ns() if ns.is_tied() else ns
+    """A node's source of tied copies (`CircuitNodes.get_source_ns`), itself where untied: one attribute read (asked a
+    few times a layer's pass)."""
+    src = ns._source_node
+    return ns if src is None else src
 
 
 def _transposes(pairs, inverse: bool = False) -> None:
@@ -255,7 +263,7 @@ def _transposes(pairs, inverse: bool = False) -> None:
     for dst, src in pairs:
         caller = dst if inverse else src
         b, n, sb = caller.size(0), caller[0].numel(), caller.stride(0)
-        if batched is None or max(sb, n, b) >= 1 << 31:
+        if batched is None or max(sb, n, b) >= 1 << 31 or dst.dtype != src.dtype:   # (fp16 factors: converted)
             if inverse:
                 dst.copy_(src.permute(src.dim() - 1, *range(src.dim() - 1)))
             else:
@@ -272,11 +280,28 @@ def _transposes(pairs, inverse: bool = False) -> None:
 
 
 def _om_a(a: torch.Tensor) -> torch.Tensor:
-    """The one-launch forms' A `[B, M, K]` in place: as the storage holds it where its runs are 16-byte aligned (its
-    base and its batch stride), else a contiguous copy."""
-    if a.stride(2) == 1 and a.stride(1) == a.size(2) and a.stride(0) % 4 == 0 and a.data_ptr() % 16 == 0:
+    """The one-launch forms' A `[B, M, K]` (fp32 or fp16) in place: as the storage holds it where its runs are 16-byte
+    aligned (its base and its batch stride), else a contiguous copy."""
+    st = a.stride()
+    if st[2] == 1 and st[1] == a.size(2) and st[0] % (16 // a.element_size()) == 0 and a.data_ptr() % 16 == 0:
         return a                                                        # (a sample's [M, K] block contiguous)
     return a.contiguous()
+
+
+def _one_type(ts) -> list:
+    """A source's copies' factors for the kernels that take every copy in a launch (`lowrank_z_operand_in_place`,
+    `lowrank_a_operand_in_place`: one type a launch): as they are where they are of one type, else the fp16 ones as
+    float32 copies."""
+    if len({t.dtype for t in ts}) <= 1:
+        return list(ts)
+    return [t if t.dtype == torch.float32 else t.float() for t in ts]
+
+
+def _v_rows_ok(fbs, N: int) -> bool:
+    """Whether `lowrank_v_rows` (the side CTAs' code) takes these factors as they lie: float32, or float16 of an even
+    count of children in 16-byte aligned sample blocks (its bulk copies)."""
+    return all(f.dtype == torch.float32 or (N % 2 == 0 and f.stride(0) % 8 == 0 and f.data_ptr() % 16 == 0)
+               for f in fbs)
 
 
 def _inner(kwargs, tensors, every: bool = False) -> tuple:
@@ -466,6 +491,51 @@ def _v_rows(mod, fbs, N, K, batch, dtype, dev, in_place: bool = False) -> tuple:
     return Vt, shift
 
 
+def _v_chunks(mod, fbs, N, K, batch, dtype, dev, in_place, G) -> tuple:
+    """`_v_rows` in chunks of G copies: `([V^T of chunk c's copies [N, their rows]], every row's shift)` (one chunk:
+    `_v_rows`' own)."""
+    if G >= len(fbs):
+        Vt, shift = _v_rows(mod, fbs, N, K, batch, dtype, dev, in_place)
+        return [Vt], shift
+    cols = batch * K
+    shift = torch.empty(len(fbs) * cols, device = dev)
+    Vc = []
+    for q0 in range(0, len(fbs), G):
+        f = fbs[q0:q0 + G]
+        Vc.append(torch.empty(N, len(f) * cols, dtype = dtype, device = dev))
+        (mod.lowrank_z_operand_in_place if in_place else mod.lowrank_z_operand)(
+            Vc[-1], shift[q0 * cols:(q0 + len(f)) * cols], f, batch, K)
+    return Vc, shift
+
+
+def _vchunk(z, row) -> tuple:
+    """`(V's chunk holding row `row` -- a copy's first --, the chunk's rows' shifts, the row in the chunk)` (the chunks'
+    views of the shifts made once a pass: a slice is ~1 us of host time, a layer's forward takes two)"""
+    g = z["vg"] * z["cols"]
+    c, r = divmod(row, g)
+    shc = z.get("shc")
+    if shc is None:
+        shc = z["shc"] = [z["shift"][q * g:q * g + V.size(1)] for q, V in enumerate(z["Vc"])]
+    return z["Vc"][c], shc[c], r
+
+
+def _uchunk(z, ua, row) -> tuple:
+    """`(the A operand's chunk holding row `row`, its copies' `am`, the row in the chunk)` (`ua`: `_ua_buffers`'; the
+    chunks' views of `am` made once a pass)"""
+    c, r = divmod(row, z["vg"] * z["cols"])
+    amc = z.get("amc")
+    if amc is None or amc[0] is not ua[1]:
+        G = z["vg"]
+        amc = z["amc"] = (ua[1], [ua[1][q * G:q * G + U.size(1) // z["cols"]] for q, U in enumerate(ua[0])])
+    return ua[0][c], amc[1][c], r
+
+
+def _whole(chunks):
+    """A chunked operand as one tensor [rows of every copy] (one chunk: itself; else a copy -- the paths that take every
+    copy's rows at once but the fused pass's end)"""
+    return chunks[0] if len(chunks) == 1 else torch.cat(chunks, dim = 1)
+
+
 def _normalizers(desc, layer, info, st, kwargs, params, batch, dev) -> dict:
     """What a pass keeps of a node vector's source, made when the first of its copies runs. For every tied copy the pass
     was given, each rank's normalizer is a matrix product `theta @ exp(B - shift)` over the rows `(copy, sample, rank)`,
@@ -488,18 +558,21 @@ def _normalizers(desc, layer, info, st, kwargs, params, batch, dev) -> dict:
         mine = [(c, t if ip else _inner(kwargs, t)) for c, t in kwargs[_EXTERNAL_PARAMS_KWARG].items()
                 if _source(c) is source]
         copies = [(c, t[1]) for c, t in mine]
-        fbs = [fb for _, fb in copies]
+        fbs = _one_type([fb for _, fb in copies])
         dtype = _dtype(kwargs.get("precision", "auto"), len(copies) * batch * K * geo["M"] * geo["N"])
         # (`flow_precision = "fp8"`: V's twin besides gives each (child, copy, sample)'s largest V over the ranks, what
         # the pass's end's e4m3 operands take their rows' scales from -- `gv`; V the same bits)
         gv, pipe, order = None, False, None
+        # (the chunks' copies: CHUNK_COLS' worth, the bf16 operands read in place; else every copy one chunk)
+        G = max(1, min(len(fbs), CHUNK_COLS // (batch * K))) if ip and dtype is torch.bfloat16 else len(fbs)
         if ip and dtype is torch.bfloat16 and getattr(desc, "flow_precision", "bf16") == "fp8" and \
                 _fp8_module() is not None:
             rows = len(fbs) * batch * K
             Vt = torch.empty(geo["N"], rows, dtype = dtype, device = dev)
             shift = torch.empty(rows, device = dev)
             gv = torch.empty(geo["N"], rows // K, device = dev)
-            _fp8_module().lowrank_z_operand_in_place_g(Vt, shift, gv, fbs, batch, K)
+            _fp8_module().lowrank_z_operand_in_place_g(Vt, shift, gv, [f.float() for f in fbs], batch, K)
+            Vc, G = [Vt], len(fbs)                       # (the e4m3 pass's end's operands: one chunk)
         else:
             # (pipelined: the copies' rows formed as they come, where an earlier pass left the order it visited every
             # one of these copies in; else every copy's now)
@@ -507,23 +580,25 @@ def _normalizers(desc, layer, info, st, kwargs, params, batch, dev) -> dict:
             smod = _stream_module() if PIPELINED_V else None
             pipe = smod is not None and ip and dtype is torch.bfloat16 and order is not None and \
                 len(order) == len(copies) and set(order) == {c for c, _ in copies} and \
-                bool(smod.om_v_serves(geo["N"], K))
+                bool(smod.om_v_serves(geo["N"], K)) and (K == 16 or OMK_V) and _v_rows_ok(fbs, geo["N"])
             if pipe:
-                Vt = torch.empty(geo["N"], len(fbs) * batch * K, dtype = dtype, device = dev)
-                shift = torch.empty(Vt.size(1), device = dev)
+                Vc = [torch.empty(geo["N"], len(fbs[q0:q0 + G]) * batch * K, dtype = dtype, device = dev)
+                      for q0 in range(0, len(fbs), G)]
+                shift = torch.empty(len(fbs) * batch * K, device = dev)
             else:
-                Vt, shift = _v_rows(mod, fbs, geo["N"], K, batch, dtype, dev, ip)
+                Vc, shift = _v_chunks(mod, fbs, geo["N"], K, batch, dtype, dev, ip, G)
         op = kwargs.get("op_params")
         theta = desc._dense_params(geo, op if op is not None and dtype is torch.bfloat16 else params, dtype)
         hit = zs[source] = dict(zt = None, zt_done = set(), row = {c: at * batch * K for at, (c, _) in enumerate(copies)},
-                                V = Vt, shift = shift, dtype = dtype, fb = fbs, theta = theta, cols = batch * K,
-                                fa = [t[0] for _, t in mine], in_place = ip, gv = gv,
+                                Vc = Vc, vg = G, shift = shift, dtype = dtype, fb = fbs, theta = theta,
+                                cols = batch * K,
+                                fa = _one_type([t[0] for _, t in mine]), in_place = ip, gv = gv,
                                 v_ready = set() if pipe else None, v_order = list(order) if pipe else None,
-                                v_seen = [])
+                                v_seen = dict())
     # (the copies' visit order, kept on the source once a pass visited every copy: the next pass's pipelined V)
     seen = hit["v_seen"]
     if info.ns not in seen:
-        seen.append(info.ns)
+        seen[info.ns] = None
         if len(seen) == len(hit["row"]):
             source.__dict__["_lr_vorder"] = list(seen)
     _v_ensure(hit, (info.ns,))
@@ -539,7 +614,8 @@ def _v_ensure(z, copies) -> None:
     for ns in copies:
         if ns not in ready:
             at = z["row"][ns]
-            _stream_module().lowrank_v_rows(z["V"], z["shift"], z["fb"][at // z["cols"]], at)
+            V, sh, r = _vchunk(z, at)
+            _stream_module().lowrank_v_rows(V, sh, z["fb"][at // z["cols"]], r)
             ready.add(ns)
 
 
@@ -550,13 +626,16 @@ def _zt_rows(z, ns, every: bool = True) -> None:
         return
     _v_ensure(z, z["row"] if every and not z["zt_done"] else (ns,))
     if z["zt"] is None:
-        z["zt"] = torch.empty(z["theta"].size(0), z["V"].size(1), device = z["V"].device)
+        z["zt"] = torch.empty(z["theta"].size(0), len(z["row"]) * z["cols"], device = z["theta"].device)
     if every and not z["zt_done"]:
-        z["zt"].copy_(_product(z["theta"], z["V"], z["dtype"]))
+        g = z["vg"] * z["cols"]
+        for c, V in enumerate(z["Vc"]):
+            z["zt"][:, c * g:c * g + V.size(1)] = _product(z["theta"], V, z["dtype"])
         z["zt_done"].update(z["row"])
         return
     a, b = z["row"][ns], z["row"][ns] + z["cols"]
-    z["zt"][:, a:b] = _product(z["theta"], z["V"][:, a:b], z["dtype"])
+    V, _, r = _vchunk(z, a)
+    z["zt"][:, a:b] = _product(z["theta"], V[:, r:r + z["cols"]], z["dtype"])
     z["zt_done"].add(ns)
 
 
@@ -581,6 +660,16 @@ def _above(layer, kwargs, node_mars, element_mars):
 
 
 _STREAM = "unset"
+_AUTOTUNE = None
+
+
+def _autotune():
+    """`pyjuice.layer.kernels.autotune` (imported when first asked for: an import statement costs ~0.5 us a call)"""
+    global _AUTOTUNE
+    if _AUTOTUNE is None:
+        from pyjuice.layer.kernels import autotune
+        _AUTOTUNE = autotune
+    return _AUTOTUNE
 #: The most split ranges a row of the fused stream forward's GEMM takes (`lowrank_stream.cu`'s MAX_SPLIT)
 _STREAM_MAX_SPLIT = 12
 #: The pass's end forms its products' bf16 operands from the exponentials the pass keeps (`lowrank_kept_operands`:
@@ -600,28 +689,90 @@ _OM_ARM = 4096
 #: formed first where nothing formed it yet -- instead of every copy's by a launch of their own before the first
 #: (`lowrank_v_rows`, the forward's `vnext`; the same bits). `False`: every copy upfront.
 PIPELINED_V = True
+#: The pass's V operand and A operand of a source's copies (`_normalizers`, `_ua_buffers`) in chunks of whole copies,
+#: at most this many columns a chunk -- as many copies as fit, every copy in one where they do: the layout as before.
+#: MEASURED (toast, HMM L 1024 x 31 layers, rank 64, B1024: 2M columns): the fused pass's end's GEMMs' cost a row grows
+#: with the operands' row pitch past 2 MB -- 0.42-0.43 ms a copy a GEMM at 8-16 copies (<= 2 MB rows), 0.53 at 20, 0.72
+#: at 31 (3.9 MB), 0.74 at 32 (a power of 2: not the pitch's alignment) --; the same copies' operands in two chunks of
+#: their own: the GEMMs 44.3 -> 27.0 ms (rank 32 at B2048 the same). The bf16 operands read in place only (the
+#: one-launch forms'); else one chunk.
+CHUNK_COLS = 1 << 20
 #: The fused pass's end's c_m (each copy's and sample's largest child value) from the one-launch forward's tile maxima
 #: (`lowrank_forward_om`'s `cmo`: its converters' running max at each tile's end, the max over the tiles the same as
 #: over the children an edge reaches) instead of a launch of its own (`pe_cmax_kernel`; the same bits).
 FORWARD_CMAX = True
+#: The one-launch forward at ranks 8, 32 and 64 (`lowrank_stream.cu`'s `lr_omk_kernel`: the rank-16 kernel's design,
+#: a warp's n-blocks whole samples of the rank -- rank 64's sample over both column warps) where it serves
+#: (`omk_serves`), a candidate beside the pre-pass chain's arms; off, those or the plain path there
+OMK = True
+#: The one-launch backward at ranks 8, 32 and 64 (`lowrank_stream.cu`'s `lr_omk_bw_kernel`: rank 16's `lr_om_bw_kernel` at
+#: the tile's samples) where it serves (`omk_bw_serves`); off, the plain path there
+OMK_BW = True
+#: ... and its side CTAs forming the next copy's V rows, as rank 16's (`PIPELINED_V`); off, every copy's V upfront there
+OMK_V = True
+
+
+#: The one-launch forward's side CTAs' cost model where they form V in whole rounds (`_om_vctas`), us: a side CTA's
+#: sample (its K x X factors in, V's rows out) and a tile (its k range of `children`). MEASURED (toast, HMM of 31
+#: layers in blocks of 32, rank 16, B1024, the forward's wall time at forced counts): a sample 0.83 / 1.24 / 2.1 us at
+#: 128 / 256 / 512 children, 15% more charged for the tiles' traffic beside it; a tile ~9 us + 1 us a 64 children
+#: with V's CTAs beside.
+OM_V_SAMPLE_US, OM_V_RANK_CHILD_US, OM_V_BESIDE, OM_V_SLACK = 0.35, 0.000225, 1.15, 1.05
+OM_TILE_US, OM_TILE_CHILD_US = 9.0, 1.0 / 64
+
+_OM_VCTAS = dict()
+
+
+def _sms(dev) -> int:
+    """The device's SM count (kept: asked for every layer of a pass)."""
+    n = _OM_VCTAS.get(("sms", dev))
+    if n is None:
+        n = _OM_VCTAS[("sms", dev)] = torch.cuda.get_device_properties(dev).multi_processor_count
+    return n
 
 
 def _om_vctas(B: int, K: int, X: int, tiles: int, children: int, dev) -> int:
     """The one-launch forward's side CTAs forming the next copy's V rows (`B` samples, rank `K`, `X` children; the
-    launch's `tiles`, `children` a tile's k range): 16 where the tiles take at most 12 rounds of the SMs, 20 past (the
-    tiles long enough that more of V's work keeps up), a quarter of the SMs at most; 0, none -- the copy's rows by a
-    launch of their own after the forward -- where the side CTAs' units (4 ranks of a sample, ~0.05 of a tile's time a
-    child: ~1.15 us for 1024 children against ~24 us) would take more than twice the tiles' rounds. MEASURED
-    (croissant, HMM 1024 x 31 in blocks of 32, rank 16, step ms, every copy's V upfront -> 12 / 16 / 20 / 24 side
-    CTAs): B64 2.569 -> 2.504 / 2.506 / 2.520 / 2.532, B256 7.990 -> 8.024 / 7.507 / 8.141 / 8.166, B1024 27.69 ->
-    28.50 / 26.67 / 26.78 / 26.89, B2048 55.88 -> 58.23 / 54.49 / 53.83 / 54.00. Not tuned: the tuner's runs (the
-    same launch again and again, its data warm in L2) took 0 at B256 and B2048 (+2-3% there)."""
-    sms = torch.cuda.get_device_properties(dev).multi_processor_count
-    nv = min(16 if tiles <= 12 * sms else 20, sms // 4)
-    if nv == 0:
-        return 0
-    side = -(-(B * K // 4) // nv) * X * 0.05
-    return nv if side <= 2 * -(-tiles // max(1, sms - nv)) * children else 0
+    launch's `tiles`, `children` a tile's k range), a quarter of the SMs at most, kept per shape.
+
+    Where they form V in whole rounds (`lowrank_stream.cu`'s `om_v_rows_whole`: a sample's round of ranks fits twice
+    in the shared memory -- `om_v_whole`), the count of the least time by the cost model above -- the tiles' rounds
+    over the SMs the side CTAs leave, `ceil(tiles / (sms - n)) t_tile`, against the side CTAs' samples,
+    `ceil(B / n) t_sample` --, the least count within 5% of it (OM_V_SLACK: rank 8's 1024 children at B1024 16 of
+    them, 5.69 ms, not 1%'s 17, 5.74). MEASURED (toast, HMM of 31 layers in blocks of 32, the forward's wall ms, the
+    rule below at the units -> this one with the whole rounds): rank 16 128 children B1024 1.51 -> 1.16, 256 B1024
+    2.25 -> 1.98, 512 B1024 4.37 -> 3.83, 512 B256 1.84 -> 1.41; rank 32 128 B1024 2.45 -> 1.98, 256 B1024 4.15 ->
+    3.91; rank 8 256 B1024 1.72 -> 1.35, 1024 B1024 5.67 -> 5.70; rank 64 256 B256 2.45 -> 2.06.
+
+    Where they form it in 4-rank units (many children): 16 where the tiles take at most 12 rounds of the SMs, 20 past
+    (the tiles long enough that more of V's work keeps up); 0, none -- the copy's rows by a launch of their own after
+    the forward -- where the units (~0.05 of a tile's time a child: ~1.15 us for 1024 children against ~24 us) would
+    take more than twice the tiles' rounds. MEASURED (croissant, HMM 1024 x 31 in blocks of 32, rank 16, step ms,
+    every copy's V upfront -> 12 / 16 / 20 / 24 side CTAs): B64 2.569 -> 2.504 / 2.506 / 2.520 / 2.532, B256 7.990 ->
+    8.024 / 7.507 / 8.141 / 8.166, B1024 27.69 -> 28.50 / 26.67 / 26.78 / 26.89, B2048 55.88 -> 58.23 / 54.49 / 53.83
+    / 54.00 (toast, the forward's wall ms at B2048, 16 / 17 / 20 / 24: 19.2 / 19.1 / 18.55 / 18.7 -- the model above
+    took 17 there).
+
+    Not tuned: the tuner's runs (the same launch again and again, its data warm in L2) took 0 at B256 and B2048 (+2-3%
+    there)."""
+    sms = _sms(dev)
+    key = (B, K, X, tiles, children, sms)
+    hit = _OM_VCTAS.get(key)
+    if hit is None:
+        mod = _stream_module()
+        if mod is not None and hasattr(mod, "om_v_whole") and bool(mod.om_v_whole(X, K)):
+            t_samp = OM_V_BESIDE * (OM_V_SAMPLE_US + OM_V_RANK_CHILD_US * K * X)
+            t_tile = OM_TILE_US + OM_TILE_CHILD_US * children
+            ts = [(max(-(-tiles // (sms - n)) * t_tile, -(-B // n) * t_samp), n)
+                  for n in range(1, max(1, sms // 4) + 1) if n < sms]
+            best = min(t for t, _ in ts) if ts else 0.0
+            hit = next((n for t, n in ts if t <= OM_V_SLACK * best), 0)
+        else:
+            nv = min(16 if tiles <= 12 * sms else 20, sms // 4)
+            side = -(-(B * K // 4) // max(1, nv)) * X * 0.05
+            hit = nv if nv > 0 and side <= 2 * -(-tiles // max(1, sms - nv)) * children else 0
+        _OM_VCTAS[key] = hit
+    return hit
 
 
 def _stream_module():
@@ -728,12 +879,18 @@ def _stream_plan(desc, layer, twin, info, node_mars, kwargs, stream_children, de
     K, B = desc.rank, node_mars.size(1)
     if mod is None or op is None or op.dtype != torch.bfloat16 or twin.block_size % 32 != 0:
         return None
-    chain = K <= 16 and (B * K) % 64 == 0 and B % 16 == 0
-    if not chain and not mod.om_serves(K, B, twin.block_size, 128):    # (128 blocks: whole tiles; each partition's below)
-        return None
     cache = layer.__dict__.setdefault("_lrv_stream", {})
-    key = (dev, id(stream_children[0]) if stream_children is not None else None, B)   # (the arms fit the batch's columns)
+    key = (dev, id(stream_children[0]) if stream_children is not None else None, B, OMK)   # (the arms fit the columns)
     plan = cache.get(key)
+    if plan is not None:                                # (made: the checks below passed at this key)
+        return plan or None
+    chain = K <= 16 and (B * K) % 64 == 0 and B % 16 == 0
+    # (the one-launch form: rank 16's kernel, or ranks 8, 32 and 64's -- `lowrank_forward_omk`)
+    omk = K != 16 and OMK and hasattr(mod, "omk_serves")
+    serves = (lambda r: bool(mod.omk_serves(K, B, twin.block_size, r))) if omk else \
+        (lambda r: bool(mod.om_serves(K, B, twin.block_size, r)))
+    if not chain and not serves(128):                   # (128 blocks: whole tiles; each partition's below)
+        return None
     if plan is None:
         from pyjuice.layer.kernels import c as cuda_kernels
         from pyjuice.layer.sum_layer import SumLayer
@@ -766,7 +923,7 @@ def _stream_plan(desc, layer, twin, info, node_mars, kwargs, stream_children, de
                 arms = cuda_kernels.stream_arms(twin.block_size, B * K, knt, nids.numel(), groups[2]) if chain else []
                 # (the one-launch form: a tile of 128 nodes -- of whole blocks of one group, or inside one block)
                 om = _om_slabs(pbase, knt, twin.block_size) \
-                    if mod.om_serves(K, B, twin.block_size, nids.numel()) and \
+                    if serves(nids.numel()) and \
                     (twin.block_size >= 128 or 128 // twin.block_size <= groups[2]) else None
                 if not arms and om is None:
                     ok = False
@@ -785,13 +942,59 @@ def _stream_plan(desc, layer, twin, info, node_mars, kwargs, stream_children, de
                                   groups = groups, arms = arms, om = om, cbase = cbase, tuned = dict(), vtma = vtma,
                                   jpos = jpos.reshape(groups[1].numel(), -1).contiguous(), cmax = cmax))
             if ok:
-                plan = dict(parts = parts, jrow = jrow, e_lo = e_lo)
+                plan = dict(parts = parts, jrow = jrow, e_lo = e_lo, cb_all = all(p["cbase"] is not None for p in parts))
         cache[key] = plan
     return plan or None
 
 
+def _om_launch(mod, p, z, info, row0, kd, vals, cb, vt, vsh, vr0, op, bs, node_mars, lz, a_om, nshift, vn0, K,
+               dev) -> None:
+    """The one-launch forward of a layer of one partition `p` (`lowrank_forward_om`; ranks 8, 32, 64:
+    `lowrank_forward_omk`, no V / values boxes): this copy's rows of the A operand where the factors are read in place
+    (the backward's, `_a_rows`), the next copy's V rows in the visit order by its side CTAs (`_om_vctas`; 0, or that
+    copy's rows in another chunk of V: by a launch of its own after this one), the tile maxima the fused pass's end
+    takes its c_m from ([node tiles, B]) -- what `_stream_run`'s one-launch arm launches, its tuner's trials as its
+    settled calls."""
+    B = node_mars.size(1)
+    ua = _uchunk(z, _ua_buffers(z, B, K, dev), row0)[:2] if z["in_place"] else (None, None)
+    nxt, ready, order = None, z.get("v_ready"), z.get("v_order")
+    if ready is not None and order is not None:
+        pos = z.get("v_pos")                            # (each copy's place in the order, once a pass)
+        if pos is None:
+            pos = z["v_pos"] = {c: i for i, c in enumerate(order)}
+        at = pos.get(info.ns)
+        if at is not None:
+            nxt = next((c for c in itertools.islice(order, at + 1, None) if c not in ready), None)
+    fbn = None if nxt is None else z["fb"][z["row"][nxt] // z["cols"]]
+    # (the side CTAs write the next copy's rows into this copy's chunk -- the same chunk of V as this copy's row --, B of
+    # A's type)
+    g = z["vg"] * z["cols"]
+    side = nxt is not None and z["row"][nxt] // g == row0 // g and fbn.dtype == a_om.dtype
+    nr0 = z["row"][nxt] - row0 + vr0 if side else 0
+    cmo = None
+    if FORWARD_CMAX:
+        cmo = z.setdefault("cmo", dict()).get(info.ns)
+        if cmo is None:
+            cmo = z["cmo"][info.ns] = torch.empty(p["nids"].numel() * bs // 128, B, device = dev)
+    nv = _om_vctas(B, K, vt.size(0), (K * B // 64) * max(1, info.ns.num_nodes // 128), p["knt"] * 64, dev) \
+        if side else 0
+    if K != 16:                                         # (ranks 8, 32, 64: `lr_omk_kernel`, no V / values boxes)
+        mod.lowrank_forward_omk(kd, vals, cb, p["ebase"], p["jpos"], vt, vr0, vsh, op, p["nids"], p["pbase"],
+                                p["groups"][0], bs, p["knt"], p["om"][0], p["om"][1], node_mars, lz, a_om, nshift, vn0,
+                                ua[0], ua[1], fbn if nv > 0 else None, nr0 if nv > 0 else 0, nv, cmo)
+    else:
+        mod.lowrank_forward_om(kd, vals, cb, p["ebase"], p["jpos"], vt, vr0, vsh, op, p["nids"], p["pbase"],
+                               p["groups"][0], bs, p["knt"], p["om"][0], p["om"][1], node_mars, lz, a_om, nshift, vn0,
+                               ua[0], ua[1], p["vtma"], fbn if nv > 0 else None, nr0 if nv > 0 else 0, nv, cmo)
+    if fbn is not None and nv == 0:
+        V2, sh2, r2 = _vchunk(z, z["row"][nxt])
+        mod.lowrank_v_rows(V2, sh2, fbn, r2)
+    if nxt is not None:
+        ready.add(nxt)
+
+
 def _stream_run(plan, info, tensors, kwargs, z, row0, vnm, kd, node_mars, element_mars, op, stream_children, twin, K,
-                lz, nshift) -> bool:
+                lz, nshift, dev = None) -> bool:
     """The fused stream forward of one node vector, the whole layer: per partition the pre-pass chain or the one-launch
     form (it takes the normalizers' V: bf16 ones), and whether it ran -- False, nothing launched: no form serves this
     call (the plain path then). The one-launch form also makes the copy's normalizers and the collapse
@@ -806,16 +1009,18 @@ def _stream_run(plan, info, tensors, kwargs, z, row0, vnm, kd, node_mars, elemen
     formed into `element_mars` first (`form_elements`), as the plain path does. `tensors`: the node vector's factors as
     the storage holds them (the caller's layout: the one-launch form reads A in place; the chain and its collapse the
     batch-innermost copies, `_inner`)."""
-    from pyjuice.layer.kernels import autotune
+    autotune = _autotune()
     mod = _stream_module()
-    vt = z["V"] if z["dtype"] is torch.bfloat16 else None
+    # (the one-launch form's V: this copy's chunk, its shifts and the copy's row in it -- `_vchunk`)
+    vt, vsh, vr0 = _vchunk(z, row0) if z["dtype"] is torch.bfloat16 else (None, None, 0)
     # (the one-launch form a layer of one partition: it collapses the node vector; the chain on several, then the
     # copy's rows of the product and the collapse once every partition's virtual node values are in)
     one = len(plan["parts"]) == 1
     om_ok = one and vt is not None and plan["parts"][0]["om"] is not None
     if not om_ok and not all(p["arms"] for p in plan["parts"]):
         return False
-    fused = stream_children is not None and all(p["cbase"] is not None for p in plan["parts"])
+    fused = stream_children is not None and plan["cb_all"]
+    dev = node_mars.device if dev is None else dev
     if stream_children is not None and not fused:
         from pyjuice.layer.fused_children import form_elements
         form_elements(element_mars, node_mars, stream_children)
@@ -823,50 +1028,32 @@ def _stream_run(plan, info, tensors, kwargs, z, row0, vnm, kd, node_mars, elemen
     shift = z["shift"]
     vn0, M = info.nid_start - nshift, info.ns.num_nodes
 
+    a_om = _om_a(tensors[0])
+    # (the one-launch arm settled -- the tuner's choice for this partition still the cache's -- one call: no candidates,
+    # no closures, the tuner's key with its device kept)
+    if om_ok:
+        p = plan["parts"][0]
+        hit = p["tuned"].get((fused, om_ok))
+        if hit is not None and hit[1] == _OM_ARM and autotune.cached_full(hit[2]) == _OM_ARM:
+            _om_launch(mod, p, z, info, row0, kd, vals, p["cbase"] if fused else None, vt, vsh, vr0, op,
+                       twin.block_size, node_mars, lz, a_om, nshift, vn0, K, dev)
+            z["zt_done"].add(info.ns)                   # (its rows not needed: nothing reads them)
+            if z["in_place"]:
+                z["ua_rows"].add(info.ns)               # (its rows of the A operand written)
+            return _OM_ARM
+
     def collapse():
         z["zt_done"].discard(info.ns)                   # (the copy's own rows: what the tuner times)
         _zt_rows(z, info.ns, every = False)
         _module().lowrank_collapse(node_mars, vnm, kd, _inner(kwargs, tensors)[0], lz, z["zt"], shift, row0,
                                    info.nid_start, vn0, M, K)
 
-    a_om = _om_a(tensors[0])
-
     for p in plan["parts"]:
         def launch(code, p = p):
             cb = p["cbase"] if fused else None
             if code == _OM_ARM:
-                # (the A operand of this copy's rows written by the collapse, where the factors are read in place: the
-                # backward's, `_a_rows`)
-                ua = _ua_buffers(z, node_mars.size(1), K, node_mars.device) if z["in_place"] else (None, None)
-                # (pipelined V: the next copy not yet formed, in the visit order, by this launch's side CTAs --
-                # `_om_vctas`; 0: by a launch of its own after this one)
-                nxt, ready, order = None, z.get("v_ready"), z.get("v_order")
-                if ready is not None and order is not None and info.ns in order:
-                    nxt = next((c for c in order[order.index(info.ns) + 1:] if c not in ready), None)
-                fbn = None if nxt is None else z["fb"][z["row"][nxt] // z["cols"]]
-
-                # (the tile maxima for the fused pass's end's c_m: [node tiles, B])
-                cmo = None
-                if FORWARD_CMAX:
-                    cmo = z.setdefault("cmo", dict()).get(info.ns)
-                    if cmo is None:
-                        cmo = z["cmo"][info.ns] = torch.empty(p["nids"].numel() * twin.block_size // 128,
-                                                              node_mars.size(1), device = node_mars.device)
-
-                def fw(nv):
-                    mod.lowrank_forward_om(kd, vals, cb, p["ebase"], p["jpos"], vt, row0, shift, op, p["nids"],
-                                           p["pbase"], p["groups"][0], twin.block_size, p["knt"], p["om"][0],
-                                           p["om"][1], node_mars, lz, a_om, nshift, vn0, ua[0], ua[1], p["vtma"],
-                                           fbn if nv > 0 else None, z["row"][nxt] if nv > 0 else 0, nv, cmo)
-                    if fbn is not None and nv == 0:
-                        mod.lowrank_v_rows(z["V"], z["shift"], fbn, z["row"][nxt])
-                if nxt is None:
-                    fw(0)
-                else:
-                    B = node_mars.size(1)
-                    fw(_om_vctas(B, K, z["V"].size(0), (K * B // 64) * max(1, info.ns.num_nodes // 128),
-                                 p["knt"] * 64, node_mars.device))
-                    ready.add(nxt)
+                _om_launch(mod, p, z, info, row0, kd, vals, cb, vt, vsh, vr0, op, twin.block_size, node_mars, lz,
+                           a_om, nshift, vn0, K, dev)
             else:
                 fb = _inner(kwargs, tensors)[1]
                 mod.lowrank_forward_stream(vnm, vals, cb, p["ebase"], p["jpos"], fb, shift, row0, op, p["nids"],
@@ -875,14 +1062,14 @@ def _stream_run(plan, info, tensors, kwargs, z, row0, vnm, kd, node_mars, elemen
                 if one:                                 # (as the arm costs: the tuner times it so)
                     collapse()
         hit = p["tuned"].get((fused, om_ok))
-        if hit is None or autotune.cached(hit[0]) != hit[1]:
+        if hit is None or autotune.cached_full(hit[2]) != hit[1]:
             key = ("lowrank_stream_fw6", info.ns.num_nodes, info.ns.num_ch_nodes, K, node_mars.size(1),
                    twin.block_size, p["knt"], p["nids"].numel(), p["groups"][2], fused, om_ok, len(plan["parts"]))
             cands = [(c, autotune.charged(lambda c = c: launch(c), 2 * autotune.LAUNCH_S)) for c in p["arms"]]
             if om_ok:
                 cands.append((_OM_ARM, lambda: launch(_OM_ARM)))
             code = autotune.choose(key, cands)
-            hit = p["tuned"][(fused, om_ok)] = (key, code)
+            hit = p["tuned"][(fused, om_ok)] = (key, code, autotune.full_key(key))
         launch(hit[1])
         if hit[1] == _OM_ARM:
             z["zt_done"].add(info.ns)                   # (its rows not needed: nothing reads them)
@@ -890,7 +1077,60 @@ def _stream_run(plan, info, tensors, kwargs, z, row0, vnm, kd, node_mars, elemen
                 z["ua_rows"].add(info.ns)               # (its rows of the A operand written)
     if not one:
         collapse()
+    return _OM_ARM if one and hit[1] == _OM_ARM else True
+
+
+def _settled_flags() -> tuple:
+    """The module's switches a settled forward's record holds (`_forward_settled`): what the full path's choices read."""
+    return (FUSED_STREAM, OMK, PIPELINED_V, OMK_V, FORWARD_CMAX, GEMM_BF16_WORK)
+
+
+def _forward_settled(desc, layer, fast, ns_tensors, node_mars, element_mars, params, kwargs, children, op) -> bool:
+    """`forward` of a layer whose last call took the one-launch arm, from its record (`_lrv_fw_fast`, `forward`'s): the
+    same launch and bookkeeping without the choices -- the stream plan, the tuner's lookups, the arms' set-up --,
+    True; or False, nothing done, where this call is not one the record answers (another batch, device, product layer,
+    precision or switch; the plan or the tuner's choice gone; the pass's normalizers not bf16). Every check that can
+    fail comes before any change but the pass's normalizers (`_normalizers`, which a full path then makes alike)."""
+    sig, info, pkey, plan, fk, fused, nshift, K = fast
+    batch = node_mars.size(1)
+    if (len(ns_tensors) != 1 or ns_tensors[0][0] is not info or op is None or op.dtype != torch.bfloat16
+            or sig != (batch, node_mars.get_device(), None if children is None else id(children[0]),
+                       kwargs.get("precision", "auto"), _settled_flags())
+            or layer.__dict__.get("_lrv_stream", _NO_PLANS).get(pkey) is not plan
+            or _autotune().cached_full(fk) != _OM_ARM):
+        return False
+    dev = node_mars.device
+    st = _pass(kwargs)
+    z = _normalizers(desc, layer, info, st, kwargs, params, batch, dev)
+    if z["dtype"] is not torch.bfloat16:
+        return False
+    # (the mark the layer below left: `forward`'s)
+    mark = st.pop("ahead", None)
+    if mark is not None:
+        if mark[0] is not layer and mark[1] is not layer and layer._layer_nid_range[0] > mark[1]._layer_nid_range[0]:
+            mark[0].__dict__["_lrv_wasted"] = mark[0].__dict__.get("_lrv_wasted", 0) + 1
+        if mark[0] is layer:
+            mark[1].__dict__.pop("_lrv_link", None)
+    if children is not None and not fused:
+        from pyjuice.layer.fused_children import form_elements
+        form_elements(element_mars, node_mars, children)
+    twin = _twin(layer)[0]
+    row0 = z["row"][info.ns]
+    vt, vsh, vr0 = _vchunk(z, row0)
+    p = plan["parts"][0]
+    _om_launch(_stream_module(), p, z, info, row0, _kept(layer, twin, batch * K, dev), node_mars if fused else element_mars,
+               p["cbase"] if fused else None, vt, vsh, vr0, op, twin.block_size, node_mars, _lz(layer, info, batch, dev),
+               _om_a(ns_tensors[0][1][0]), nshift, info.nid_start - nshift, K, dev)
+    z["zt_done"].add(info.ns)                           # (its rows not needed: nothing reads them)
+    if z["in_place"]:
+        z["ua_rows"].add(info.ns)                       # (its rows of the A operand written)
+    st["ran"][info.ns] = True
+    node_mars.__dict__.setdefault("_lowrank_layers", dict())[id(layer)] = layer
+    layer.__dict__["_lr_state"] = ("virtual", batch)
     return True
+
+
+_NO_PLANS = dict()
 
 
 def _stream_plan_bk(desc, layer, twin, info, node_mars, stream_children, dev):
@@ -924,7 +1164,9 @@ def _stream_plan_bk(desc, layer, twin, info, node_mars, stream_children, dev):
                 chids, ppar, ppid = (t[p].data.to(torch.int64).contiguous()
                                      for t in (twin.partitioned_chids, twin.partitioned_parids, twin.partitioned_parpids))
                 cbs, pbs = int(twin.cs_block_sizes[p]), twin.block_size
-                if ppar.dim() != 2 or not mod.om_bw_serves(K, B, cbs, pbs, chids.numel()):
+                serves = mod.omk_bw_serves if K != 16 and OMK_BW and hasattr(mod, "omk_bw_serves") else \
+                    mod.om_bw_serves
+                if ppar.dim() != 2 or not serves(K, B, cbs, pbs, chids.numel()):
                     ok = False
                     break
                 bpt = 128 // cbs if cbs < 128 else 1
@@ -956,10 +1198,10 @@ def _ua_buffers(z, batch, K, dev):
     are written (by their one-launch forward, `_stream_run`)."""
     buf = z.get("ua_buf")
     if buf is None:
-        fas, ip = z["fa"], z["in_place"]
+        fas, ip, G = z["fa"], z["in_place"], z["vg"]
         M = fas[0].size(1 if ip else 0)
-        buf = z["ua_buf"] = (torch.empty(M, len(fas) * batch * K, dtype = torch.bfloat16, device = dev),
-                             torch.empty(len(fas), M, batch, device = dev))
+        buf = z["ua_buf"] = ([torch.empty(M, len(fas[q0:q0 + G]) * batch * K, dtype = torch.bfloat16, device = dev)
+                              for q0 in range(0, len(fas), G)], torch.empty(len(fas), M, batch, device = dev))
         z["ua_rows"] = set()
     return buf
 
@@ -972,13 +1214,20 @@ def _a_rows(mod, z, batch, K, dev):
     if hit is None:
         Ut, am = _ua_buffers(z, batch, K, dev)
         if z["ua_rows"] != set(z["row"]):
-            fas, ip = z["fa"], z["in_place"]
-            (mod.lowrank_a_operand_in_place if ip else mod.lowrank_a_operand)(Ut, am, fas, batch, K)
+            fas, ip, G = z["fa"], z["in_place"], z["vg"]
+            for c, U in enumerate(Ut):
+                (mod.lowrank_a_operand_in_place if ip else mod.lowrank_a_operand)(
+                    U, am[c * G:c * G + U.size(1) // (batch * K)], fas[c * G:(c + 1) * G], batch, K)
         hit = z["ua"] = (Ut, am)
     return hit
 
 
 def forward(desc, layer, ns_tensors, node_mars, element_mars, params, kwargs, stream_children = None) -> None:
+    # (a layer whose last call took the one-launch arm: that call's launch from its record, `_forward_settled`)
+    fast = layer.__dict__.get("_lrv_fw_fast")
+    if fast is not None and _forward_settled(desc, layer, fast, ns_tensors, node_mars, element_mars, params, kwargs,
+                                             stream_children, kwargs.get("op_params")):
+        return None
     from pyjuice.layer.sum_layer import SumLayer
 
     mod, K, batch, dev = _module(), desc.rank, node_mars.size(1), node_mars.device
@@ -1007,9 +1256,17 @@ def forward(desc, layer, ns_tensors, node_mars, element_mars, params, kwargs, st
         info0, t0 = ns_tensors[0]
         z0 = _normalizers(desc, layer, info0, st, kwargs, params, batch, dev)    # (its shifts, its V: the operands')
         # (the whole layer, its collapse too)
-        if not _stream_run(plan, info0, t0, kwargs, z0, z0["row"][info0.ns], vnm, kd, node_mars, element_mars,
-                           kwargs["op_params"], stream_children, twin, K, _lz(layer, info0, batch, dev), shift):
+        arm = _stream_run(plan, info0, t0, kwargs, z0, z0["row"][info0.ns], vnm, kd, node_mars, element_mars,
+                          kwargs["op_params"], stream_children, twin, K, _lz(layer, info0, batch, dev), shift, dev)
+        if not arm:
             plan = None                                                 # (no form serves this call: the plain path)
+        elif arm == _OM_ARM:                                            # (settled: the next such call from a record)
+            fused = stream_children is not None and plan["cb_all"]
+            sid = None if stream_children is None else id(stream_children[0])
+            layer.__dict__["_lrv_fw_fast"] = (
+                (batch, node_mars.get_device(), sid, kwargs.get("precision", "auto"), _settled_flags()), info0,
+                (dev, sid, batch, OMK), plan, plan["parts"][0]["tuned"][(fused, True)][2], fused, shift, K)
+            layer.__dict__["_settled_forward"] = _layer_settled_forward      # (the layer's whole call: its checks too)
     if plan is None:
         if mark is None or mark[0] is not layer:
             for info, t in ns_tensors:
@@ -1107,17 +1364,27 @@ def _end_of_pass(mod, z, copies, node_flows, node_mars, params, param_flows, den
     cols = batch * K
     kept = KEPT_OPERANDS and dtype is torch.bfloat16 and z["dtype"] is torch.bfloat16
     _v_ensure(z, z["row"])
-    Vt, shift = (z["V"], z["shift"]) if dtype is z["dtype"] else _v_rows(mod, z["fb"], N, K, batch, dtype, dev,
-                                                                           z["in_place"])
+    # (V whole for the paths taking every copy's rows at once -- a copy of its chunks where there are several, made
+    # where one of them runs: `vwhole` --; the fused pass's end its chunks)
+    rows = len(z["row"]) * cols
+    Vt, shift = (None, z["shift"]) if dtype is z["dtype"] else _v_rows(mod, z["fb"], N, K, batch, dtype, dev,
+                                                                        z["in_place"])
+
+    def vwhole():
+        nonlocal Vt
+        if Vt is None:
+            Vt = _whole(z["Vc"])
+        return Vt
     zeros = want_denom and len(copies) < len(z["row"])
     # `flow_precision = "fp8"`: the statistics' two products -- F+'s, W's -- from the kept operands in e4m3 (a
     # power-of-2 scale a row) with fp32 accumulation, where the bf16 kept operands serve and every dimension is a
     # multiple of 16 (the e4m3 product's); the gradients' (`owed`: theta^T U, dB's normalizer half) as the default's
     fp8 = kept and getattr(desc, "flow_precision", "bf16") == "fp8" and M % 16 == 0 and N % 16 == 0 and \
-        Vt.size(1) % 16 == 0 and (len(fp) * cols) % 16 == 0 and (fp or want_denom) and _fp8_module() is not None
+        rows % 16 == 0 and (len(fp) * cols) % 16 == 0 and (fp or want_denom) and _fp8_module() is not None
     if fp8:
         f8 = torch.float8_e4m3fn
         ua, am = _a_rows(mod, z, batch, K, dev)
+        ua = _whole(ua)
         at = {id(c): k * cols for k, c in enumerate(fp)}
         un = {id(c) for c in copies} if want_denom else set()
         sel = [c for c in copies if id(c) in at or id(c) in un]
@@ -1125,11 +1392,11 @@ def _end_of_pass(mod, z, copies, node_flows, node_mars, params, param_flows, den
         Ud8 = torch.empty(M, len(fp) * cols, dtype = f8, device = dev) if fp else None
         Vd8 = torch.empty(N, len(fp) * cols, dtype = f8, device = dev) if fp else None
         # (a copy of the source the pass did not bring: its columns of both 0, as Ut's are)
-        Un8 = (torch.zeros if zeros else torch.empty)(M, Vt.size(1), dtype = f8, device = dev) if want_denom else None
-        Vt8 = (torch.zeros if zeros else torch.empty)(N, Vt.size(1), dtype = f8, device = dev) if want_denom else None
+        Un8 = (torch.zeros if zeros else torch.empty)(M, rows, dtype = f8, device = dev) if want_denom else None
+        Vt8 = (torch.zeros if zeros else torch.empty)(N, rows, dtype = f8, device = dev) if want_denom else None
         sc = torch.empty(2 * M + 2 * N, device = dev)
         _fp8_module().lowrank_kept_operands_fp8(
-            Ud8, Vd8, Un8, Vt8, sc, ua, am, Vt, shift, node_flows, node_mars, [c[3] for c in sel],
+            Ud8, Vd8, Un8, Vt8, sc, ua, am, vwhole(), shift, node_flows, node_mars, [c[3] for c in sel],
             [c[1].nid_start for c in sel], geos, [c[5][0] if id(c) in at else None for c in sel],
             [c[5][1] if id(c) in at else 0 for c in sel], [z["row"][c[1].ns] for c in sel],
             [at.get(id(c), -1) for c in sel], [int(id(c) in un) for c in sel], M, K,
@@ -1148,38 +1415,56 @@ def _end_of_pass(mod, z, copies, node_flows, node_mars, params, param_flows, den
     # kept operands never written (`lowrank_kept_operands`), the copies the pass did not bring in neither product (their
     # rows of Un 0 above)
     fused = FUSED_PASS_END and kept and not owed and K >= 8 and K & (K - 1) == 0 and cols % 32 == 0 and \
-        Vt.size(1) % 8 == 0 and len(copies) <= 64 and (fp or want_denom) and _fused_end_module() is not None
+        rows % 8 == 0 and len(copies) <= 64 and (fp or want_denom) and _fused_end_module() is not None
     if fused:
         ua, am = _a_rows(mod, z, batch, K, dev)
         at = {id(c): k * cols for k, c in enumerate(fp)}
         un = {id(c) for c in rows_of}
         sel = [c for c in copies if id(c) in at or id(c) in un]
-        geos = [desc._geometry(c[0], c[1], dev)["rows"] if id(c) in at else None for c in sel]
         F = torch.empty(M, N, device = dev) if fp else None
         W = torch.empty(M, N, device = dev) if want_denom else None
-        _fused_end_module().lowrank_pass_end_fused(
-            F, W, ua, am, Vt, shift, node_flows, node_mars, [c[3] for c in sel], [c[1].nid_start for c in sel], geos,
-            [c[5][0] if id(c) in at else None for c in sel], [c[5][1] if id(c) in at else 0 for c in sel],
-            [z["row"][c[1].ns] for c in sel], [at.get(id(c), -1) for c in sel], [int(id(c) in un) for c in sel], M, K,
-            [c[5][2] if id(c) in at else None for c in sel],
-            [z.get("cmo", dict()).get(c[1].ns) if id(c) in at and FORWARD_CMAX else None for c in sel])
+        # (a launch a chunk of the operands, its copies' rows in it: the first writes F and W, the others' added in --
+        # a launch whose copies take no part in one zeroes it)
+        g, done = z["vg"] * cols, False
+        for ci, U in enumerate(ua):
+            part = [c for c in sel if z["row"][c[1].ns] // g == ci]
+            if not part:
+                continue
+            V, sh, _ = _vchunk(z, ci * g)
+            Fc = None if F is None else torch.empty_like(F) if done else F
+            Wc = None if W is None else torch.empty_like(W) if done else W
+            _fused_end_module().lowrank_pass_end_fused(
+                Fc, Wc, U, am[ci * z["vg"]:ci * z["vg"] + U.size(1) // cols], V, sh, node_flows, node_mars,
+                [c[3] for c in part], [c[1].nid_start for c in part],
+                [desc._geometry(c[0], c[1], dev)["rows"] if id(c) in at else None for c in part],
+                [c[5][0] if id(c) in at else None for c in part], [c[5][1] if id(c) in at else 0 for c in part],
+                [z["row"][c[1].ns] - ci * g for c in part], [at.get(id(c), -1) for c in part],
+                [int(id(c) in un) for c in part], M, K, [c[5][2] if id(c) in at else None for c in part],
+                [z.get("cmo", dict()).get(c[1].ns) if id(c) in at and FORWARD_CMAX else None for c in part], -1)
+            if done:
+                if F is not None:
+                    F.add_(Fc)
+                if W is not None:
+                    W.add_(Wc)
+            done = True
         if fp:
             desc._scatter_add(geo, param_flows, fp[0][1].ns._param_flow_range[0], F, params)
         if want_denom:
             desc._scatter_add(geo, denom_param_flows, desc._denom_offsets(layer0)[id(info0.ns)][0], W)
         return
-    Ut = (torch.zeros if zeros else torch.empty)(M, Vt.size(1), dtype = dtype, device = dev) if rows_of else None
+    Ut = (torch.zeros if zeros else torch.empty)(M, rows, dtype = dtype, device = dev) if rows_of else None
     Ud = Vd = None
     if fp:
         Ud = torch.empty(M, len(fp) * cols, dtype = dtype, device = dev)
         Vd = torch.empty(N, len(fp) * cols, dtype = dtype, device = dev)
     if kept:
         ua, am = _a_rows(mod, z, batch, K, dev)
+        ua = _whole(ua)
         at = {id(c): k * cols for k, c in enumerate(fp)}
         un = {id(c) for c in rows_of}
         sel = [c for c in copies if id(c) in at or id(c) in un]
         geos = [desc._geometry(c[0], c[1], dev)["rows"] if id(c) in at else None for c in sel]
-        mod.lowrank_kept_operands(Ud, Vd, Ut, ua, am, Vt, shift, node_flows, node_mars, [c[3] for c in sel],
+        mod.lowrank_kept_operands(Ud, Vd, Ut, ua, am, vwhole(), shift, node_flows, node_mars, [c[3] for c in sel],
                                   [c[1].nid_start for c in sel], geos, [c[5][0] if id(c) in at else None for c in sel],
                                   [c[5][1] if id(c) in at else 0 for c in sel], [z["row"][c[1].ns] for c in sel],
                                   [at.get(id(c), -1) for c in sel], [int(id(c) in un) for c in sel], M, K,
@@ -1198,17 +1483,179 @@ def _end_of_pass(mod, z, copies, node_flows, node_mars, params, param_flows, den
                           _product_nt(Ud, Vd) if dtype is torch.bfloat16 else _product(Ud, Vd.t(), dtype), params)
     if want_denom:
         desc._scatter_add(geo, denom_param_flows, desc._denom_offsets(layer0)[id(info0.ns)][0],
-                          _product_nt(Ut, Vt) if dtype is torch.bfloat16 else _product(Ut, Vt.t(), dtype))
+                          _product_nt(Ut, vwhole()) if dtype is torch.bfloat16 else _product(Ut, vwhole().t(), dtype))
     if owed:
         theta = z["theta"] if z["theta"].dtype == dtype else desc._dense_params(geo, params, dtype)
         if len(owed) == len(z["row"]):
             Gt = _product(theta.t(), Ut, dtype)                              # [N, rows]: (U theta)^T
         else:                                                                # (the owed copies' rows alone)
-            Gt = torch.empty(N, Vt.size(1), device = dev)
+            Gt = torch.empty(N, rows, device = dev)
             for c in owed:
                 a = z["row"][c[1].ns]
                 Gt[:, a:a + cols] = _product(theta.t(), Ut[:, a:a + cols], dtype)
-        mod.lowrank_normalizer_grads([c[4][1] for c in owed], [z["row"][c[1].ns] for c in owed], Vt, Gt, batch, K)
+        mod.lowrank_normalizer_grads([c[4][1] for c in owed], [z["row"][c[1].ns] for c in owed], vwhole(), Gt, batch,
+                                     K)
+
+
+def _om_backward(layer, plan, info, tensors, grads, st, kd, op, node_flows, element_flows, node_mars, element_mars,
+                 param_flows, stream_children, gviews, fresh, K, batch, dev, shift) -> None:
+    """The one-launch backward of a layer's node vector `info` (`backward`'s branch where it serves, `plan` its
+    `_stream_plan_bk`'s; and its launch plan's launcher): dA from the kept responsibilities, then the data half's element
+    flows (as the products' children's node flows where the product layer below is fused in) and dB's data part in one
+    launch a partition, the pass's records of it for its end."""
+    # (B and the gradients as the storage holds them -- the caller's layout: read and written in place)
+    smod = _stream_module()
+    fa, fb = tensors
+    lz = _lz(layer, info, batch, dev)
+    src = _source(info.ns)
+    z = st["z"][src]
+    ua, am, row0 = _uchunk(z, _a_rows(_module(), z, batch, K, dev), z["row"][info.ns])   # (this copy's chunk, the row)
+    # (the launches write every element of dA and dB where every child of the node vector is a tile's: they store into a
+    # destination they claim first)
+    store = fresh and grads is not None and plan["covers"] and gviews.claim(grads)
+    if fresh and not store:
+        gviews.init_grads(grads)
+    # (the product layer fused in: its children's node flows written, its children's values read from theirs; else the
+    # element flows written and the children's values read from `element_mars` -- kept for the pass's end where it
+    # forms the parameter flows: the layers after this one write `element_mars`)
+    if stream_children is not None:
+        out, vals, table, first, kids = node_flows, node_mars, stream_children[0], stream_children[1], None
+    else:
+        out, vals, table, first = element_flows, element_mars, None, 0
+        kids = element_mars[plan["rows"]] if param_flows is not None else None
+        if kids is not None and plan["orphans"] is not None:
+            kids[plan["orphans"]] = -float("inf")                       # (a child no edge reaches: no value)
+    launch = smod.lowrank_backward_omk if K != 16 else smod.lowrank_backward_om
+    for at, part in enumerate(plan["parts"]):
+        # (dA by the first partition's launch: its grid's first CTAs)
+        da = grads is not None and at == 0
+        launch(out, vals, table, first, fb, plan["jrow"], plan["e_lo"], None if grads is None else grads[1], ua, row0,
+               am, node_flows, node_mars, lz, shift, plan["vn0"], op, part["chids"], part["ppar"], part["ppid"],
+               part["cbs"], part["pbs"], grads[0] if da else None, kd if da else None, *part["atma"], store)
+    # (dB's normalizer half taken off by the launches: `grads` given; the parameter flows at the pass's end)
+    st["norm"].setdefault(src, []).append((layer, info, (fa, fb), lz, grads, (table, first, kids), grads is not None))
+    st["done"].add(info.ns)
+
+
+def _pass_end_if_done(st, mod, node_flows, node_mars, params, param_flows, denom_param_flows, precision, batch,
+                      kwargs) -> None:
+    """The pass's end where every node vector its forward ran has had its backward: every source's products, all of its
+    copies at once (each source's own parameterization: its rank, whether it keeps a denominator), then the gradients
+    in the storage's layout."""
+    if len(st["done"]) == len(st["ran"]):
+        for src, copies in st.pop("norm").items():
+            own = copies[0][0].parameterization
+            denom = param_flows is not None and denom_param_flows is not None and own.apply_z_correction
+            grads = any(c[4] is not None and not c[6] for c in copies)          # (dB's normalizer half still owed)
+            _end_of_pass(mod, st["z"][src], copies, node_flows, node_mars, params, param_flows, denom_param_flows,
+                         denom, grads, precision, batch, lambda t: _inner(kwargs, t))
+        st["norm"] = dict()
+        _flush_grads(st)                                                 # (the gradients: in the storage's layout)
+
+
+_STAGED = None
+
+
+def _staged_type():
+    """`StagedExternalParams` (imported when first asked for)"""
+    global _STAGED
+    if _STAGED is None:
+        from pyjuice.layer.parameterized_sum_layer import StagedExternalParams
+        _STAGED = StagedExternalParams
+    return _STAGED
+
+
+def _layer_settled_forward(layer, node_mars, element_mars, params, propagation_alg, op_params, kwargs) -> bool:
+    """The layer's settled forward (`ParameterizedSumLayer._settled_forward`, put on it where a forward took the
+    one-launch arm): what its full path -- the layer's checks, `LowRank.forward_layer`, `forward` -- does at a call
+    the layer's record answers (`_forward_settled`), True; else False, nothing done but the pass's normalizers (which
+    the full path makes alike). The layer's checks: the algorithm, whole partitions, its one node vector's tensors
+    staged and supplied; the copy of the parameters set in the call's options as the full path sets it."""
+    fast = layer.__dict__.get("_lrv_fw_fast")
+    if fast is None or propagation_alg != "LL" or kwargs.get("partition_runs") is not None:
+        return False
+    staged = kwargs.get(_EXTERNAL_PARAMS_KWARG)
+    if not isinstance(staged, _staged_type()):
+        return False
+    info = fast[1]
+    tensors = staged.get(info.ns)
+    desc = layer.parameterization
+    if tensors is None or not serves(desc, layer, node_mars, element_mars):
+        return False
+    if op_params is not None:
+        kwargs["op_params"] = op_params                 # (`ParameterizedSumLayer.forward`'s: its own options)
+    return _forward_settled(desc, layer, fast, [(info, tensors)], node_mars, element_mars, params, kwargs,
+                            kwargs.get("stream_children"), op_params)
+
+
+def _layer_settled_backward(layer, node_flows, element_flows, node_mars, element_mars, params, param_flows,
+                            denom_param_flows, propagation_alg, op_params, kwargs) -> bool:
+    """The layer's settled backward (`ParameterizedSumLayer._settled_backward`, put on it where a backward took the
+    one-launch branch): what its full path does at a call its record (`_lrv_bw_fast`) answers -- the layer's checks
+    (the algorithm, whole partitions, flows neither modified in place nor negated) and the hooks' (log-space flows, the
+    forward through the virtual batch at this batch), the layer's settings for the call (its gated call, the product
+    layer below, the copy of the parameters), the deferral's side stream joined --, then `backward`'s one-launch
+    branch and the pass's end where it is its last layer; True. Else False, nothing done: another batch, device or
+    product layer, the copy given or not, the stream plan made again, the tensors not the staging's."""
+    rec = layer.__dict__.get("_lrv_bw_fast")
+    if rec is None or propagation_alg != "LL" or kwargs.get("partition_runs") is not None or \
+            kwargs.get("allow_modify_flows", False) or kwargs.get("negate_pflows", False) or \
+            not kwargs.get("logspace_flows", False):
+        return False
+    sig, info, plan, shift, K = rec
+    batch = node_mars.size(1)
+    state = layer.__dict__.get("_lr_state")
+    if not (isinstance(state, tuple) and state[1] == batch):
+        return False
+    staged_t = _staged_type()
+    staged, gviews = kwargs.get(_EXTERNAL_PARAMS_KWARG), kwargs.get(_EXTERNAL_PARAMS_GRAD_KWARG)
+    if not isinstance(staged, staged_t) or (gviews is not None and not isinstance(gviews, staged_t)):
+        return False
+    tensors = staged.get(info.ns)
+    sc = kwargs.get("stream_children")
+    op = op_params if op_params is not None and layer.__dict__.get("_reads_param_operands", False) else None
+    sid = None if sc is None else id(sc[0])
+    if tensors is None or (sc is not None and not fuses_bk()) or \
+            sig != (batch, node_mars.get_device(), sid, op is not None, FUSED_STREAM_BK) or \
+            (op is None and params.dtype != torch.bfloat16):            # (no copy to read: the full path's other branch)
+        return False
+    dev = node_mars.device
+    if layer.__dict__.get("_lrv_stream_bk", _NO_PLANS).get((dev, sid, batch)) is not plan:
+        return False
+    # (the layer's settings for the call, the side stream, a recording around it failed: `ParameterizedSumLayer.backward`'s)
+    layer.__dict__.update(_bk_gated_call = True, _bk_stream_children = sc, _bk_op_params = op)
+    from pyjuice.layer import deferred_par
+    deferred_par.join_side(dev)
+    lp = _launch_plans()
+    if lp.LaunchPlans.nested():
+        lp.LaunchPlans.fail()
+    # (`backward`'s one-launch branch)
+    st = _pass(kwargs)
+    flows = st.get("flows")
+    if flows is None or flows() is not node_flows or info.ns in st["done"]:
+        st.update(done = set(), norm = dict(), flows = weakref.ref(node_flows))
+        st.pop("inner_grads", None)                                     # (a backward again: its own gradients)
+    kd = _kept(layer, _twin(layer)[0], batch * K, dev)
+    if op is None:
+        op = params                                                     # (bf16: checked above)
+    _om_backward(layer, plan, info, tensors, None if gviews is None else gviews.get(info.ns), st, kd, op, node_flows,
+                 element_flows, node_mars, element_mars, param_flows, sc, gviews, getattr(gviews, "fresh", False), K,
+                 batch, dev, shift)
+    _pass_end_if_done(st, _module(), node_flows, node_mars, params, param_flows, denom_param_flows,
+                      kwargs.get("precision", "auto"), batch, kwargs)
+    return True
+
+
+_LAUNCH_PLANS = None
+
+
+def _launch_plans():
+    """`pyjuice.utils.launch_plans` (imported when first asked for)"""
+    global _LAUNCH_PLANS
+    if _LAUNCH_PLANS is None:
+        from pyjuice.utils import launch_plans
+        _LAUNCH_PLANS = launch_plans
+    return _LAUNCH_PLANS
 
 
 def backward(desc, layer, ns_tensors, ns_grad_tensors, node_flows, element_flows, node_mars, element_mars, params,
@@ -1243,39 +1690,15 @@ def backward(desc, layer, ns_tensors, ns_grad_tensors, node_flows, element_flows
     gviews = kwargs.get(_EXTERNAL_PARAMS_GRAD_KWARG)
     fresh = getattr(gviews, "fresh", False)
     if plan is not None:
-        # (B and the gradients as the storage holds them -- the caller's layout: read and written in place)
-        smod = _stream_module()
-        (info, (fa, fb)), grads = ns_tensors[0], ns_grad_tensors[0]
-        lz = _lz(layer, info, batch, dev)
-        z = st["z"][_source(info.ns)]
-        row0 = z["row"][info.ns]
-        ua, am = _a_rows(mod, z, batch, K, dev)
-        # (the launches write every element of dA and dB where every child of the node vector is a tile's: they store
-        # into a destination they claim first)
-        store = fresh and grads is not None and plan["covers"] and gviews.claim(grads)
-        if fresh and not store:
-            gviews.init_grads(grads)
-        # (the product layer fused in: its children's node flows written, its children's values read from theirs; else
-        # the element flows written and the children's values read from `element_mars` -- kept for the pass's end where
-        # it forms the parameter flows: the layers after this one write `element_mars`)
-        if stream_children is not None:
-            out, vals, table, first, kids = node_flows, node_mars, stream_children[0], stream_children[1], None
-        else:
-            out, vals, table, first = element_flows, element_mars, None, 0
-            kids = element_mars[plan["rows"]] if param_flows is not None else None
-            if kids is not None and plan["orphans"] is not None:
-                kids[plan["orphans"]] = -float("inf")                   # (a child no edge reaches: no value)
-        for at, part in enumerate(plan["parts"]):
-            # (dA by the first partition's launch: its grid's first CTAs)
-            da = grads is not None and at == 0
-            smod.lowrank_backward_om(out, vals, table, first, fb, plan["jrow"], plan["e_lo"],
-                                     None if grads is None else grads[1], ua, row0, am, node_flows, node_mars, lz,
-                                     shift, plan["vn0"], op, part["chids"], part["ppar"], part["ppid"], part["cbs"],
-                                     part["pbs"], grads[0] if da else None, kd if da else None, *part["atma"], store)
-        # (dB's normalizer half taken off by the launches: `grads` given; the parameter flows at the pass's end)
-        st["norm"].setdefault(_source(info.ns), []).append((layer, info, (fa, fb), lz, grads, (table, first, kids),
-                                                            grads is not None))
-        st["done"].add(info.ns)
+        (info, tensors), grads = ns_tensors[0], ns_grad_tensors[0]
+        _om_backward(layer, plan, info, tensors, grads, st, kd, op, node_flows, element_flows, node_mars, element_mars,
+                     param_flows, stream_children, gviews, fresh, K, batch, dev, shift)
+        # (settled: the layer's next such call from a record -- `_layer_settled_backward`)
+        layer.__dict__["_lrv_bw_fast"] = ((batch, node_mars.get_device(),
+                                          None if stream_children is None else id(stream_children[0]),
+                                          layer.__dict__.get("_bk_op_params") is not None, FUSED_STREAM_BK),
+                                         info, plan, shift, K)
+        layer.__dict__["_settled_backward"] = _layer_settled_backward
     else:
         if fresh:                                                       # (the pass's end adds the scratch into them)
             for grads in ns_grad_tensors:
@@ -1285,18 +1708,7 @@ def backward(desc, layer, ns_tensors, ns_grad_tensors, node_flows, element_flows
                        element_mars, params, param_flows, kwargs, stream_children, bufs, kd, st, mod, K, batch, dev,
                        precision)
 
-    # The pass's last node vector: every source's products, all of its copies at once (each source's own
-    # parameterization: its rank, whether it keeps a denominator)
-    if len(st["done"]) == len(st["ran"]):
-        for src, copies in st.pop("norm").items():
-            own = copies[0][0].parameterization
-            denom = param_flows is not None and denom_param_flows is not None and own.apply_z_correction
-            grads = any(c[4] is not None and not c[6] for c in copies)          # (dB's normalizer half still owed)
-            _end_of_pass(mod, st["z"][src], copies, node_flows, node_mars, params, param_flows, denom_param_flows,
-                         denom, grads, precision, batch, lambda t: _inner(kwargs, t))
-        st["norm"] = dict()
-        _flush_grads(st)                                                 # (the gradients: in the storage's layout)
-
+    _pass_end_if_done(st, mod, node_flows, node_mars, params, param_flows, denom_param_flows, precision, batch, kwargs)
     return None
 
 

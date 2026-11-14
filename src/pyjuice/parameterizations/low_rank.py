@@ -4,6 +4,7 @@ import torch
 from typing import Optional
 
 from .sum_parameterization import SumParameterization
+from .lowrank import forward as lowrank_forward
 from .lowrank import virtual as lowrank_virtual
 from .lowrank.backward import _BackwardMixin
 from .lowrank.denominators import _DenominatorsMixin
@@ -119,6 +120,16 @@ class LowRank(_ForwardMixin, _BackwardMixin, _DenominatorsMixin, SumParameteriza
         """The mixture form's plain kernels run on `rank` columns a sample (the virtual batch)."""
         return batch_size * self.rank if self.form == "sum_exp" else batch_size
 
+    @property
+    def param_operands_min_work(self):
+        """The mixture form takes the circuit's bf16 copy whatever its layers' work (`TensorCircuit._param_operand_groups`,
+        16 columns at least): its one-launch kernels read their parameters from the copy alone, and without it its
+        layers take the plain path. MEASURED (toast, HMM of 31 layers, step ms, the circuit's bound on the work -> the
+        copy whatever the work): L128 rank 16 B256 4.96 -> 2.28, B64 4.41 -> 2.20; L256 rank 16 B64 4.51 -> 2.25; L128
+        rank 32 B256 9.64 -> 2.47 (the plain path's ~440 launches a step against ~95). The `exp_sum` form: the
+        circuit's bound."""
+        return 0 if self.form == "sum_exp" else None
+
     def __init__(self, rank: int, form: str = "exp_sum", apply_z_correction: bool = True, tie_external: bool = False,
                  flow_precision: str = "bf16"):
         super(LowRank, self).__init__()
@@ -168,8 +179,10 @@ class LowRank(_ForwardMixin, _BackwardMixin, _DenominatorsMixin, SumParameteriza
 
     def storage_shapes(self, ns, batch_size: int):
         """Stored as the caller gives them, `A [B, M, K]`, `B [B, K, N]`, either form, and the gradients in the same
-        layout. `"exp_sum"`: its fused kernels take a sample's block whole (`lowrank/kernels/c/lowrank_exp_sum.cu`),
-        the staging copy a plain copy. `"sum_exp"`: read IN PLACE by the forward (`reads_in_place`): the kernels that
+        layout. `"exp_sum"`: read IN PLACE at rank 16 (`reads_in_place`: its fp16-rounded factors' kernels take a
+        sample's block where it lies, `lowrank/kernels/c/lowrank_exp_sum_h.cu`), else the staging copy a plain copy
+        (its other fused kernels take a sample's block whole). `"sum_exp"`: read IN PLACE by the forward
+        (`reads_in_place`): the kernels that
         serve its one-launch forms take the caller's tensors as they are, the rest a batch-innermost copy -- `A [M, K,
         B]`, `B [K, N, B]`, as the circuit's own buffers are: their threads run over the samples -- made when first
         asked for in the pass (`lowrank/virtual.py`'s `_inner`), their gradients back the same way."""
@@ -179,14 +192,44 @@ class LowRank(_ForwardMixin, _BackwardMixin, _DenominatorsMixin, SumParameteriza
         return None
 
     def reads_in_place(self, ns) -> bool:
-        """`"sum_exp"`: the forward's staging hands the layers the caller's tensors themselves (no copy), where the
-        virtual batch can serve it (the CUDA extension built: `lowrank/virtual.py`); `"exp_sum"` copies."""
+        """The forward's staging hands the layers the caller's tensors themselves (no copy): `"sum_exp"` where the
+        virtual batch can serve it (the CUDA extension built: `lowrank/virtual.py`); `"exp_sum"` where its fused
+        kernels can (`lowrank/forward.py`'s `exp_sum_fused`: a rank they hold, their extension built -- the
+        fp16-rounded factors' kernels at the ranks they hold, `exp_sum_h`, the bf16 / TF32 ones at the others and at
+        `precision = "fp32"`, all taking each sample's block where it lies and adding into the gradients where they
+        lie), other ranks copied."""
+        if self.form == "exp_sum":
+            if lowrank_forward.EXP_SUM_H and self.rank <= lowrank_forward.EXP_SUM_H_RANK_MOST and \
+                    lowrank_forward.exp_sum_h_module() is not None:
+                return True
+            return lowrank_forward.EXP_SUM_FUSED and self.rank <= lowrank_forward.EXP_SUM_FUSED_RANK_MOST and \
+                lowrank_forward.exp_sum_module() is not None
         return self.form == "sum_exp" and lowrank_virtual._module() is not None
 
+    def external_dtypes(self, ns):
+        """float32, and float16 / bfloat16 where the "exp_sum" form's fused kernels read the factors in place
+        (`reads_in_place`): the fp16 kernels (`lowrank/forward.py`'s `exp_sum_h`) take fp16 factors of their padded
+        ranks (16, 32, 64) as they lie -- the rounding they make of float32 ones anyway, `A' = log2 e A` rounded once
+        more from fp16 A (`lowrank/kernels/c/lowrank_exp_sum_h.cu`'s `scale_h2`) -- with no copy, the others (bf16
+        ones, an autocast head's; fp16 ones of other ranks) through their fp16 copy, as float32 ones; the bf16 / TF32
+        kernels (the other ranks, `precision = "fp32"`) take any of the three as they lie, their values exactly
+        (`lowrank_exp_sum.cu`'s prologues). float32 and float16 where the "sum_exp" form reads them in place: its
+        one-launch forward and backward, their side CTAs and the operands' kernels take fp16 factors as they lie, read
+        as float32 -- the conversion exact: the bits of float32 factors of those values --, its other paths (the plain
+        kernels' batch-innermost copies, the e4m3 pass's end, the copies of a source of factors of both types) float32
+        copies; the gradients float32 either way."""
+        if self.form == "exp_sum" and self.reads_in_place(ns):
+            return (torch.float32, torch.float16, torch.bfloat16)
+        if self.form == "sum_exp" and self.reads_in_place(ns):
+            return (torch.float32, torch.float16)
+        return (torch.float32,)
+
     def initializes_grads(self, ns) -> bool:
-        """`"sum_exp"`: its backward claims each gradient destination it writes in place -- the one-launch form
-        storing into all of it, the other paths zeroing it before they add (`lowrank/virtual.py`, `backward.py`)."""
-        return self.form == "sum_exp"
+        """Both forms: the backward claims each gradient destination it writes in place -- `"sum_exp"`'s one-launch
+        form storing into all of it, `"exp_sum"`'s fp16 kernels zeroing a chunk's slice ahead of their adds (in the
+        L2: no DRAM round trip of zeros), the torch passes copying, the other paths zeroing it before they add
+        (`lowrank/virtual.py`, `backward.py`)."""
+        return True
 
     def storage_offsets(self, ns):
         """Where an edge block's entries begin in each slot, in per-batch units (the layer's tables; the passes here
@@ -332,6 +375,7 @@ class LowRank(_ForwardMixin, _BackwardMixin, _DenominatorsMixin, SumParameteriza
 
     def drop_device_caches(self, layer) -> None:
         super().drop_device_caches(layer)
-        for name in ("_lr_geometry", "_lr_state", "_lr_denom_offsets", "_lrv_state", "_lrv_disjoint", "_lrv_link",
-                     "_lrv_want", "_lrv_wasted", "_lrv_twin", "_lrv_stream", "_lrv_stream_bk", "_lrv_kd"):
+        for name in ("_lr_geometry", "_lr_state", "_lr_denom_offsets", "_lr_kids_own", "_lr_succ", "_lrv_state",
+                     "_lrv_disjoint", "_lrv_link", "_lrv_want", "_lrv_wasted", "_lrv_twin", "_lrv_stream",
+                     "_lrv_stream_bk", "_lrv_kd", "_lrv_fw_fast", "_lrv_serves", "_lrv_bw_fast"):
             layer.__dict__.pop(name, None)

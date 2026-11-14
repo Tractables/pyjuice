@@ -52,6 +52,7 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 #include <math_constants.h>
 
 namespace {
@@ -65,6 +66,9 @@ constexpr float LN2 = 0.6931471805599453f;
 template <typename TP> __device__ __forceinline__ float to_f(TP v);
 template <> __device__ __forceinline__ float to_f<float>(float v) { return v; }
 template <> __device__ __forceinline__ float to_f<__nv_bfloat16>(__nv_bfloat16 v) { return __bfloat162float(v); }
+template <> __device__ __forceinline__ float to_f<__half>(__half v) { return __half2float(v); }
+// a factor as float: the caller's fp32, fp16 or bf16, read where it lies
+template <typename TI> __device__ __forceinline__ float ldf(const TI* p) { return to_f(__ldg(p)); }
 
 // The offset of theta[i, j] (and of its flow, its denominator) in the node vector's block-major run
 __device__ __forceinline__ long grid_at(int i, int j, int Nb, int cbs, int bs) {
@@ -126,6 +130,18 @@ __device__ __forceinline__ void fold_ms(float& m, float& s, float m2, float s2) 
     if (n == NEG) return;
     s = s * exp2f(m - n) + s2 * exp2f(m2 - n);
     m = n;
+}
+
+// ... the other made NORMAL first: its sum's binary exponent moved into its shift (s2 = f 2^e, f in [1, 2): (m2 + e,
+// f); 0, subnormal, inf, NaN as they are) -- a fold of pairs so made loses no term over 2^-126 of the larger. The
+// combine's pairs need it: a tile's unshifted sums lie in [2^-92, 2^100] under its frames, so a tile's S 2^60 under a
+// shift 130 below another's S 2^-90 flushed with its 2^(m2 - n), S 2^20 short. (e by a float subtraction: 2^23 + ex
+// less 2^23 + 127)
+__device__ __forceinline__ void fold_n(float& m, float& s, float m2, float s2) {
+    const unsigned u = __float_as_uint(s2), ex = u >> 23;          // (s2 >= 0: its biased exponent)
+    const bool nrm = ex - 1u < 254u;
+    const float e = __uint_as_float(0x4b000000u | ex) - 8388735.0f;
+    fold_ms(m, s, nrm ? m2 + e : m2, nrm ? __uint_as_float((u & 0x007fffffu) | 0x3f800000u) : s2);
 }
 
 // TF32 MMAs (fp32 accumulation), m16n8k8 and m16n8k4; the C fragment (g = lane / 4, tq = lane % 4): c0 (g, 2 tq),
@@ -203,8 +219,8 @@ __global__ void __launch_bounds__(128) fw_comb_kernel(const float4* __restrict__
             v[u] = live && t0 + u < njt ? p[(long)(t0 + u) * Mp] : make_float4(NEG, 0.f, NEG, 0.f);
 #pragma unroll
         for (int u = 0; u < 8; u++) {
-            fold_ms(mz, z, v[u].x, v[u].y);
-            fold_ms(ms, s, v[u].z, v[u].w);
+            fold_n(mz, z, v[u].x, v[u].y);
+            fold_n(ms, s, v[u].z, v[u].w);
         }
     }
 #pragma unroll
@@ -252,12 +268,14 @@ template <int KP> struct BfGeo {
 // a permutation within 16-node (32-child) blocks -- reads and writes both along the sample's own run.
 //   AF, BF (hi, lo) in the fragment order above; WF [B, njt, 36]: per tq the 8 factors w_j = 2^(lc'_j - mc) of the
 //   lane's children (8 nf + 2 tq + p), then mc, the tile's max lc' (-inf: no edge reaches the tile's children);
-//   lcs [B, Np] = lc' (the exact fallback's). A grid row a sample.
+//   lcs [B, Np] = lc' (the exact fallback's). A grid row a sample; the factors fp32, fp16 or bf16 where they lie, each
+//   sample's block contiguous, samples `sA`, `sB` elements apart.
+template <typename TI>
 __global__ void __launch_bounds__(256) bf_fw_prep_kernel(
-        const float* __restrict__ A, const float* __restrict__ Bm, unsigned* __restrict__ AFh, unsigned* __restrict__ AFl,
+        const TI* __restrict__ A, const TI* __restrict__ Bm, unsigned* __restrict__ AFh, unsigned* __restrict__ AFl,
         unsigned* __restrict__ BFh, unsigned* __restrict__ BFl, float* __restrict__ WF, float* __restrict__ lcs,
         const float* __restrict__ emars, const long* __restrict__ rows, int M, int N, int Mp, int Np, int K, int KP,
-        int B, int nbA, int nbB, int Bs, int b0) {
+        int B, int nbA, int nbB, int Bs, int b0, long sA, long sB) {
     const int b = blockIdx.y;
     const bool k8 = KP <= 8;
     const int KS = k8 ? 1 : KP / 16, NRA = k8 ? 2 : 4, NRB = k8 ? 4 : 8;
@@ -270,9 +288,9 @@ __global__ void __launch_bounds__(256) bf_fw_prep_kernel(
         const int g = lane >> 2, tq = lane & 3;
         const int i = k8 ? 16 * rg + g + 8 * r : 16 * rg + g + 8 * (r & 1);
         const int k = k8 ? 2 * tq : 16 * ks + 2 * tq + 8 * (r >> 1);
-        const float* src = A + ((long)b * M + i) * K + k;
-        const float v0 = (i < M && k < K) ? __ldg(src) * LOG2E : 0.f;
-        const float v1 = (i < M && k + 1 < K) ? __ldg(src + 1) * LOG2E : 0.f;
+        const TI* src = A + (long)b * sA + (long)min(i, M - 1) * K + k;
+        const float v0 = (i < M && k < K) ? ldf(src) * LOG2E : 0.f;
+        const float v1 = (i < M && k + 1 < K) ? ldf(src + 1) * LOG2E : 0.f;
         unsigned h, l;
         split_bf16(v0, v1, h, l);
         AFh[(long)b * na + e] = h;
@@ -287,9 +305,9 @@ __global__ void __launch_bounds__(256) bf_fw_prep_kernel(
         const int g = lane >> 2, tq = lane & 3;
         const int nf = k8 ? u : u >> 1, j = BN * jt + 8 * nf + g;
         const int k = k8 ? 2 * tq : 16 * ks + 2 * tq + 8 * (u & 1);
-        const float* src = Bm + ((long)b * K + k) * N + j;
-        const float v0 = (j < N && k < K) ? __ldg(src) : 0.f;
-        const float v1 = (j < N && k + 1 < K) ? __ldg(src + N) : 0.f;
+        const TI* src = Bm + (long)b * sB + (long)k * N + min(j, N - 1);
+        const float v0 = (j < N && k < K) ? ldf(src) : 0.f;
+        const float v1 = (j < N && k + 1 < K) ? ldf(src + N) : 0.f;
         unsigned h, l;
         split_bf16(v0, v1, h, l);
         BFh[(long)b * nb + e] = h;
@@ -556,13 +574,14 @@ __global__ void __launch_bounds__(128) bf_fw2_kernel(
 // The bf16 backward's prologue, one launch, a grid row a sample: AF, BF (hi, lo) as the forward makes them (its
 // fragments again: nothing kept between the passes), the nodes' terms LU [B, Mp, 2] = (lu', lv') -- lu' = log2 (f /
 // (n Z)), lv' = log2 (f / Z), -inf for a node without flow --, the children's LC [B, njt, 36] (per tq the lane's 8
-// children's lc', as WF's factors) and the element-flow scratch ef [B, Np] zeroed
+// children's lc', as WF's factors) and the element-flow scratch ef [B, Np] zeroed; the factors as bf_fw_prep_kernel's
+template <typename TI>
 __global__ void __launch_bounds__(256) bf_bw_prep_kernel(
-        const float* __restrict__ A, const float* __restrict__ Bm, unsigned* __restrict__ AFh, unsigned* __restrict__ AFl,
+        const TI* __restrict__ A, const TI* __restrict__ Bm, unsigned* __restrict__ AFh, unsigned* __restrict__ AFl,
         unsigned* __restrict__ BFh, unsigned* __restrict__ BFl, float* __restrict__ LU, float* __restrict__ LC,
         float* __restrict__ ef, const float* __restrict__ nflows, const float* __restrict__ nmars, long nid0,
         const float* __restrict__ lzs, const float* __restrict__ emars, const long* __restrict__ rows, int M, int N,
-        int Mp, int Np, int K, int KP, int B, int nbA, int nbB, int Bs, int b0) {
+        int Mp, int Np, int K, int KP, int B, int nbA, int nbB, int Bs, int b0, long sA, long sB) {
     const int b = blockIdx.y, njt = Np / BN;
     const bool k8 = KP <= 8;
     const int KS = k8 ? 1 : KP / 16, NRA = k8 ? 2 : 4, NRB = k8 ? 4 : 8;
@@ -575,9 +594,9 @@ __global__ void __launch_bounds__(256) bf_bw_prep_kernel(
         const int g = lane >> 2, tq = lane & 3;
         const int i = k8 ? 16 * rg + g + 8 * r : 16 * rg + g + 8 * (r & 1);
         const int k = k8 ? 2 * tq : 16 * ks + 2 * tq + 8 * (r >> 1);
-        const float* src = A + ((long)b * M + i) * K + k;
-        const float v0 = (i < M && k < K) ? __ldg(src) * LOG2E : 0.f;
-        const float v1 = (i < M && k + 1 < K) ? __ldg(src + 1) * LOG2E : 0.f;
+        const TI* src = A + (long)b * sA + (long)min(i, M - 1) * K + k;
+        const float v0 = (i < M && k < K) ? ldf(src) * LOG2E : 0.f;
+        const float v1 = (i < M && k + 1 < K) ? ldf(src + 1) * LOG2E : 0.f;
         unsigned h, l;
         split_bf16(v0, v1, h, l);
         AFh[(long)b * na + e] = h;
@@ -592,9 +611,9 @@ __global__ void __launch_bounds__(256) bf_bw_prep_kernel(
         const int g = lane >> 2, tq = lane & 3;
         const int nf = k8 ? u : u >> 1, j = BN * jt + 8 * nf + g;
         const int k = k8 ? 2 * tq : 16 * ks + 2 * tq + 8 * (u & 1);
-        const float* src = Bm + ((long)b * K + k) * N + j;
-        const float v0 = (j < N && k < K) ? __ldg(src) : 0.f;
-        const float v1 = (j < N && k + 1 < K) ? __ldg(src + N) : 0.f;
+        const TI* src = Bm + (long)b * sB + (long)k * N + min(j, N - 1);
+        const float v0 = (j < N && k < K) ? ldf(src) : 0.f;
+        const float v1 = (j < N && k + 1 < K) ? ldf(src + N) : 0.f;
         unsigned h, l;
         split_bf16(v0, v1, h, l);
         BFh[(long)b * nb + e] = h;
@@ -635,7 +654,7 @@ __global__ void __launch_bounds__(128) bf_bw_kernel(
         const unsigned* __restrict__ BFl, const TP* __restrict__ params, long p0, int Nb, int cbs, int bs, const float* __restrict__ LU,
         const float* __restrict__ LC, float* __restrict__ ef, float* __restrict__ pflows, long pf0,
         float* __restrict__ denom, long dn0, float* __restrict__ gA, float* __restrict__ gB, int M, int N, int Mp,
-        int Np, int K, int B, int bper) {
+        int Np, int K, int B, int bper, long sgA, long sgB) {
     using Gm = BfGeo<KP>;
     constexpr int KS = Gm::KS, NRA = Gm::NRA, NRB = Gm::NRB, NT = KP / 8;
     constexpr bool K8 = Gm::K8;
@@ -801,8 +820,8 @@ __global__ void __launch_bounds__(128) bf_bw_kernel(
                 // (node g / g + 8, ranks 8 nt + 2 tq, + 1)
                 const int k = 8 * nt + 2 * tq;                 // (into gA [B, M, K]: ranks past K padding)
                 if (k < K) {
-                    if (rA < M) add_pair(gA + ((long)b * M + rA) * K + k, d[0], d[1], k + 1 < K);
-                    if (rB < M) add_pair(gA + ((long)b * M + rB) * K + k, d[2], d[3], k + 1 < K);
+                    if (rA < M) add_pair(gA + (long)b * sgA + (long)rA * K + k, d[0], d[1], k + 1 < K);
+                    if (rB < M) add_pair(gA + (long)b * sgA + (long)rB * K + k, d[2], d[3], k + 1 < K);
                 }
             }
             // ---- dB^T += G^T A' over the CTA's 64 nodes: each warp stages its G^T blocks (child g, nodes 2 tq ..)
@@ -851,7 +870,7 @@ __global__ void __launch_bounds__(128) bf_bw_kernel(
                     const float4 v = *reinterpret_cast<const float4*>(wq + rk * 20 + c4);
                     __syncwarp();
                     if (k < K) {
-                        float* p = gB + ((long)b * K + k) * N + jc;
+                        float* p = gB + (long)b * sgB + (long)k * N + jc;
                         if (jc + 3 < N && (reinterpret_cast<unsigned long>(p) & 15) == 0) red4(p, v);
                         else {
                             if (jc < N) red1(p, v.x);
@@ -945,7 +964,7 @@ __global__ void __launch_bounds__(256, 1) bf_bw2_kernel(
         const unsigned* __restrict__ BFl, const TP* __restrict__ params, long p0, int Nb, int cbs, int bs,
         const float* __restrict__ LU, const float* __restrict__ LC, float* __restrict__ ef, float* __restrict__ pflows,
         long pf0, float* __restrict__ denom, long dn0, float* __restrict__ gA, float* __restrict__ gB, int M, int N,
-        int Mp, int Np, int K, int B, int nct, long units) {
+        int Mp, int Np, int K, int B, int nct, long units, long sgA, long sgB) {
     using Gm = Bw2Geo<KP>;
     constexpr int KS = Gm::KS, NT = Gm::NT, PW = Gm::PW, UM = Gm::UM, UW = Gm::UW;
     extern __shared__ __align__(16) unsigned smw[];
@@ -1149,7 +1168,7 @@ __global__ void __launch_bounds__(256, 1) bf_bw2_kernel(
                             const int row = r0 + rr, i = i0 + 16 * w + row;
                             const float4 val = *reinterpret_cast<const float4*>(pw + row * (PW + 4) + c4);
                             if (i < M && k < K) {
-                                float* p = gA + ((long)b * M + i) * K + k;
+                                float* p = gA + (long)b * sgA + (long)i * K + k;
                                 if (k + 3 < K && (reinterpret_cast<unsigned long>(p) & 15) == 0) red4(p, val);
                                 else {
                                     red1(p, val.x);
@@ -1235,7 +1254,7 @@ __global__ void __launch_bounds__(256, 1) bf_bw2_kernel(
                         const int rk = r0 + rr, k = 8 * nt + rk;
                         const float4 val = *reinterpret_cast<const float4*>(qw + rk * UW + c4);
                         if (k < K) {
-                            float* p = gB + ((long)b * K + k) * N + jc4;
+                            float* p = gB + (long)b * sgB + (long)k * N + jc4;
                             if (jc4 + 3 < N && (reinterpret_cast<unsigned long>(p) & 15) == 0) red4(p, val);
                             else {
                                 if (jc4 < N) red1(p, val.x);
@@ -1306,11 +1325,13 @@ template <int KP> struct Fw3Geo {
 };
 
 // The TF32 forward's prologue (the caller's factors, A [B, M, K], B [B, K, N]): AF [B, Mp / 16, NKS, 32, NA], BF [B,
-// Np / BN, NKS, 32, NB] fp32 in fragment order; WF, lcs as the bf16 path's. A grid row a sample
+// Np / BN, NKS, 32, NB] fp32 in fragment order; WF, lcs as the bf16 path's. A grid row a sample; the factors as
+// bf_fw_prep_kernel's
+template <typename TI>
 __global__ void __launch_bounds__(256) tf_fw_prep_kernel(
-        const float* __restrict__ A, const float* __restrict__ Bm, float* __restrict__ AF, float* __restrict__ BF, float* __restrict__ WF, float* __restrict__ lcs,
+        const TI* __restrict__ A, const TI* __restrict__ Bm, float* __restrict__ AF, float* __restrict__ BF, float* __restrict__ WF, float* __restrict__ lcs,
         const float* __restrict__ emars, const long* __restrict__ rows, int M, int N, int Mp, int Np, int K, int lkp,
-        int B, int nA, int nB) {
+        int B, int nA, int nB, long sA, long sB) {
     const int b = blockIdx.y, KP = 1 << lkp;
     const bool k4 = KP == 4;
     const int NA = k4 ? 2 : 4, NB = k4 ? 4 : 8, NKS = k4 ? 1 : KP / 8;
@@ -1321,7 +1342,7 @@ __global__ void __launch_bounds__(256) tf_fw_prep_kernel(
         const int u = e % NA, lane = (e / NA) & 31, ks = (e / (NA * 32)) % NKS, rg = e / (NA * 32 * NKS);
         const int g = lane >> 2, tq = lane & 3;
         const int i = 16 * rg + g + (u & 1) * 8, k = k4 ? tq : 8 * ks + tq + (u >> 1) * 4;
-        AF[(long)b * Mp * KP + e] = (k < K && i < M) ? A[((long)b * M + i) * K + k] * LOG2E : 0.f;
+        AF[(long)b * Mp * KP + e] = (k < K && i < M) ? to_f(A[(long)b * sA + (long)i * K + k]) * LOG2E : 0.f;
         return;
     }
     blk -= nA;
@@ -1331,7 +1352,7 @@ __global__ void __launch_bounds__(256) tf_fw_prep_kernel(
         const int u = e % NB, lane = (e / NB) & 31, ks = (e / (NB * 32)) % NKS, jt = e / (NB * 32 * NKS);
         const int g = lane >> 2, tq = lane & 3;
         const int nf = k4 ? u : u >> 1, k = k4 ? tq : 8 * ks + tq + (u & 1) * 4, j = BN * jt + 8 * nf + g;
-        BF[(long)b * Np * KP + e] = (k < K && j < N) ? Bm[((long)b * K + k) * N + j] : 0.f;
+        BF[(long)b * Np * KP + e] = (k < K && j < N) ? to_f(Bm[(long)b * sB + (long)k * N + j]) : 0.f;
         return;
     }
     blk -= nB;                                                 // (the column tiles: a warp each, a child a lane)
@@ -1871,26 +1892,29 @@ void launch_tf_bw(dim3 grid, cudaStream_t st, const float* At, const float* Bt, 
 // The backward's prologue, one launch, a sample a grid row (blockIdx.y): padded to whole tiles (Mp nodes, Np children,
 // KP ranks; zeros and -inf past the real ones) -- A' = log2 e A [B, Mp, KP], B [B, KP, Np], the nodes' terms
 // lu' = log2 (f / (n Z)) and lv' = log2 (f / Z) [B, Mp] (-inf for a node without flow), the children's lc' = log2 c
-// [B, Np] -- and (row 0) the scratch the main kernel adds into zeroed. nA, nB, nT: the blocks a sample's A', B, terms take
+// [B, Np] -- and (row 0) the scratch the main kernel adds into zeroed. nA, nB, nT: the blocks a sample's A', B, terms
+// take; the factors as bf_fw_prep_kernel's
+template <typename TI>
 __global__ void __launch_bounds__(256) tf_bw_prep_kernel(
-        const float* __restrict__ A, const float* __restrict__ Bm, float* __restrict__ At, float* __restrict__ Bt,
+        const TI* __restrict__ A, const TI* __restrict__ Bm, float* __restrict__ At, float* __restrict__ Bt,
         float* __restrict__ terms, float* __restrict__ zero, int grads, const float* __restrict__ nflows,
         const float* __restrict__ nmars, long nid0, const float* __restrict__ lzs, const float* __restrict__ emars,
-        const long* __restrict__ rows, int M, int N, int Mp, int Np, int K, int lkp, int B, int nA, int nB, int nT) {
+        const long* __restrict__ rows, int M, int N, int Mp, int Np, int K, int lkp, int B, int nA, int nB, int nT,
+        long sA, long sB) {
     const int b = blockIdx.y, KP = 1 << lkp;
     int blk = blockIdx.x;
     if (blk < nA) {                                            // A'[b, i, k] = log2 e A[b, i, k]
         const int e = blk * 256 + threadIdx.x;
         if (e >= Mp * KP) return;
         const int i = e >> lkp, k = e & (KP - 1);
-        At[(long)b * Mp * KP + e] = (k < K && i < M) ? A[((long)b * M + i) * K + k] * LOG2E : 0.f;
+        At[(long)b * Mp * KP + e] = (k < K && i < M) ? to_f(A[(long)b * sA + (long)i * K + k]) * LOG2E : 0.f;
         return;
     }
     blk -= nA;
     if (blk < nB) {                                            // B[b, k, j], padded: a block within one k
         const int per = (Np + 255) / 256, k = blk / per, j = (blk - k * per) * 256 + threadIdx.x;
         if (j >= Np) return;
-        Bt[((long)b * KP + k) * Np + j] = (k < K && j < N) ? Bm[((long)b * K + k) * N + j] : 0.f;
+        Bt[((long)b * KP + k) * Np + j] = (k < K && j < N) ? to_f(Bm[(long)b * sB + (long)k * N + j]) : 0.f;
         return;
     }
     blk -= nB;
@@ -1933,7 +1957,7 @@ __global__ void __launch_bounds__(256) tf_bw_prep_kernel(
 __global__ void __launch_bounds__(256) tf_bw_epi_kernel(
         const float* __restrict__ ef, const long* __restrict__ rows, float* __restrict__ eflows,
         const float* __restrict__ dAt, const float* __restrict__ dBt, float* __restrict__ gA, float* __restrict__ gB,
-        int M, int N, int Mp, int Np, int K, int KP, int B, int lb, int grads) {
+        int M, int N, int Mp, int Np, int K, int KP, int B, int lb, int grads, long sgA, long sgB) {
     long t = (long)blockIdx.x * 256 + threadIdx.x;
     const long nE = (long)N << lb;
     if (t < nE) {
@@ -1954,13 +1978,13 @@ __global__ void __launch_bounds__(256) tf_bw_epi_kernel(
     const long nAo = (long)B * M * K;
     if (t < nAo) {                                             // gA[b, i, k]
         const int k = (int)(t % K), i = (int)((t / K) % M), b = (int)(t / ((long)M * K));
-        gA[t] += dAt[((long)b * Mp + i) * KP + k];
+        gA[(long)b * sgA + (long)i * K + k] += dAt[((long)b * Mp + i) * KP + k];
         return;
     }
     t -= nAo;
     if (t < (long)B * K * N) {                                 // gB[b, k, j]
         const int j = (int)(t % N), k = (int)((t / N) % K), b = (int)(t / ((long)K * N));
-        gB[t] += dBt[((long)b * KP + k) * Np + j] * LN2;
+        gB[(long)b * sgB + (long)k * N + j] += dBt[((long)b * KP + k) * Np + j] * LN2;
     }
 }
 
@@ -1972,10 +1996,21 @@ int grid_z(int ctas, int B) {
     return std::max(1, std::min(z, B));
 }
 
+// A [B, X, Y] whose samples each lie contiguous (any batch stride: the caller's tensors read in place)
+static bool inner_contiguous(const torch::Tensor& t) {
+    return t.dim() == 3 && (t.size(2) <= 1 || t.stride(2) == 1) && (t.size(1) <= 1 || t.stride(1) == t.size(2));
+}
+
+// A sample's stride (elements): a single sample's whatever its own, the dense one
+static int64_t sstride(const torch::Tensor& t) { return t.size(0) <= 1 ? t.size(1) * t.size(2) : t.stride(0); }
+
 void check_common(const torch::Tensor& A, const torch::Tensor& Bm, const torch::Tensor& params,
                   const torch::Tensor& emars, const torch::Tensor& rows, int64_t M, int64_t N, int64_t K, int64_t B) {
-    TORCH_CHECK(A.is_cuda() && A.scalar_type() == torch::kFloat32 && A.is_contiguous(), "A: contiguous fp32 [B, M, K]");
-    TORCH_CHECK(Bm.is_cuda() && Bm.scalar_type() == torch::kFloat32 && Bm.is_contiguous(), "B: contiguous fp32 [B, K, N]");
+    TORCH_CHECK(A.is_cuda() && (A.scalar_type() == torch::kFloat32 || A.scalar_type() == torch::kHalf ||
+                                A.scalar_type() == torch::kBFloat16) && inner_contiguous(A),
+                "A: fp32, fp16 or bf16 [B, M, K], a sample's contiguous");
+    TORCH_CHECK(Bm.is_cuda() && Bm.scalar_type() == A.scalar_type() && inner_contiguous(Bm),
+                "B: [B, K, N] of A's dtype, a sample's contiguous");
     TORCH_CHECK(A.dim() == 3 && A.size(0) == B && A.size(1) == M && A.size(2) == K, "A's shape");
     TORCH_CHECK(Bm.dim() == 3 && Bm.size(0) == B && Bm.size(1) == K && Bm.size(2) == N, "B's shape");
     TORCH_CHECK(params.scalar_type() == torch::kFloat32 || params.scalar_type() == torch::kBFloat16, "params: fp32 or bf16");
@@ -2005,6 +2040,24 @@ int rank_pad(int64_t K, int least) {                          // the MMAs' ranks
     } else {                                                                                                       \
         using TP = __nv_bfloat16;                                                                                  \
         const TP* pp = reinterpret_cast<const TP*>(PARAMS.data_ptr<at::BFloat16>());                              \
+        __VA_ARGS__;                                                                                               \
+    }
+// the factors' element type (TI) and their data at samples OA, OB elements in
+#define EXP_SUM_TI_SWITCH(A, Bm, OA, OB, ...)                                                                       \
+    if (A.scalar_type() == torch::kHalf) {                                                                         \
+        using TI = __half;                                                                                         \
+        const TI* ai = reinterpret_cast<const TI*>(A.data_ptr<at::Half>()) + (OA);                                 \
+        const TI* bi = reinterpret_cast<const TI*>(Bm.data_ptr<at::Half>()) + (OB);                                \
+        __VA_ARGS__;                                                                                               \
+    } else if (A.scalar_type() == torch::kBFloat16) {                                                              \
+        using TI = __nv_bfloat16;                                                                                  \
+        const TI* ai = reinterpret_cast<const TI*>(A.data_ptr<at::BFloat16>()) + (OA);                             \
+        const TI* bi = reinterpret_cast<const TI*>(Bm.data_ptr<at::BFloat16>()) + (OB);                            \
+        __VA_ARGS__;                                                                                               \
+    } else {                                                                                                       \
+        using TI = float;                                                                                          \
+        const TI* ai = A.data_ptr<float>() + (OA);                                                                 \
+        const TI* bi = Bm.data_ptr<float>() + (OB);                                                                \
         __VA_ARGS__;                                                                                               \
     }
 #define EXP_SUM_FLAGS_SWITCH(FLOWS, DN, GRADS, ...)                                                                \
@@ -2044,16 +2097,17 @@ torch::Tensor exp_sum_forward(torch::Tensor A, torch::Tensor Bm, torch::Tensor p
     const at::cuda::CUDAGuard guard(A.device());
     auto stream = at::cuda::getCurrentCUDAStream();
     const int Mp = (int)((M + TBM - 1) / TBM * TBM), Np = (int)((N + BN - 1) / BN * BN), njt = Np / BN, nit = Mp / TBM;
-    auto lzs = torch::empty({M, B}, A.options());
+    auto lzs = torch::empty({M, B}, A.options().dtype(torch::kFloat32));
     const long* rw = reinterpret_cast<const long*>(rows.data_ptr<int64_t>());
     const int nbW = (njt + 7) / 8;
+    const long sA = (long)sstride(A), sB = (long)sstride(Bm);  // (the factors where they lie)
     if (bf16) {                                                // a chunk of samples at a time (`sample_chunk`)
         const int KPb = rank_pad(K, 8);
         const int64_t BC = sample_chunk(B, 4.0 * (Mp + Np) * KPb + 4.0 * K * (M + N) + 16.0 * njt * Mp);
         const long na = (long)Mp * KPb / 2, nb = (long)Np * KPb / 2;
-        auto WF = torch::empty({BC, njt, 36}, A.options());
-        auto lcs = torch::empty({BC, Np}, A.options());
-        auto part = torch::empty({BC, njt, Mp, 4}, A.options());
+        auto WF = torch::empty({BC, njt, 36}, A.options().dtype(torch::kFloat32));
+        auto lcs = torch::empty({BC, Np}, A.options().dtype(torch::kFloat32));
+        auto part = torch::empty({BC, njt, Mp, 4}, A.options().dtype(torch::kFloat32));
         auto AF = torch::empty({2, BC, na}, A.options().dtype(torch::kInt32));
         auto BF = torch::empty({2, BC, nb}, A.options().dtype(torch::kInt32));
         float4* pp4 = reinterpret_cast<float4*>(part.data_ptr<float>());
@@ -2064,10 +2118,11 @@ torch::Tensor exp_sum_forward(torch::Tensor A, torch::Tensor Bm, torch::Tensor p
             const int Bc = (int)std::min<int64_t>(BC, B - b0);
             const int z = grid_z(njt * nit, Bc), bper = (Bc + z - 1) / z;
             const dim3 grid(njt, nit, (unsigned)((Bc + bper - 1) / bper));
-            bf_fw_prep_kernel<<<dim3(nbA + nbB + nbW, (unsigned)Bc), 256, 0, stream>>>(
-                A.data_ptr<float>() + b0 * M * K, Bm.data_ptr<float>() + b0 * K * N, afh, afh + BC * na, bfh,
-                bfh + BC * nb, WF.data_ptr<float>(), lcs.data_ptr<float>(), emars.data_ptr<float>(), rw, (int)M, (int)N,
-                Mp, Np, (int)K, KPb, Bc, nbA, nbB, (int)B, (int)b0);
+            EXP_SUM_TI_SWITCH(A, Bm, b0 * sA, b0 * sB,
+                bf_fw_prep_kernel<TI><<<dim3(nbA + nbB + nbW, (unsigned)Bc), 256, 0, stream>>>(
+                    ai, bi, afh, afh + BC * na, bfh, bfh + BC * nb, WF.data_ptr<float>(), lcs.data_ptr<float>(),
+                    emars.data_ptr<float>(), rw, (int)M, (int)N, Mp, Np, (int)K, KPb, Bc, nbA, nbB, (int)B, (int)b0, sA,
+                    sB));
             C10_CUDA_KERNEL_LAUNCH_CHECK();
             EXP_SUM_KP_SWITCH(KPb, if constexpr (KP >= 8) { EXP_SUM_TP_SWITCH(params,
                 bf_fw2_kernel<KP, TP><<<grid, 128, 0, stream>>>(afh, afh + BC * na, bfh, bfh + BC * nb, pp, p0, (int)Nb,
@@ -2081,20 +2136,20 @@ torch::Tensor exp_sum_forward(torch::Tensor A, torch::Tensor Bm, torch::Tensor p
         }
         return lzs;
     }
-    auto WF = torch::empty({B, njt, 36}, A.options());
-    auto lcs = torch::empty({B, Np}, A.options());
-    auto part = torch::empty({B, njt, Mp, 4}, A.options());
+    auto WF = torch::empty({B, njt, 36}, A.options().dtype(torch::kFloat32));
+    auto lcs = torch::empty({B, Np}, A.options().dtype(torch::kFloat32));
+    auto part = torch::empty({B, njt, Mp, 4}, A.options().dtype(torch::kFloat32));
     const int z = grid_z(njt * nit, (int)B), bper = (int)((B + z - 1) / z);
     const dim3 grid(njt, nit, (unsigned)((B + bper - 1) / bper));
     float4* pp4 = reinterpret_cast<float4*>(part.data_ptr<float>());
     {
         const int KPf = rank_pad(K, 4), lkp = __builtin_ctz((unsigned)KPf);
-        auto AF = torch::empty({B, (long)Mp * KPf}, A.options());
-        auto BF = torch::empty({B, (long)Np * KPf}, A.options());
+        auto AF = torch::empty({B, (long)Mp * KPf}, A.options().dtype(torch::kFloat32));
+        auto BF = torch::empty({B, (long)Np * KPf}, A.options().dtype(torch::kFloat32));
         const int nA = (int)(((long)Mp * KPf + 255) / 256), nB = (int)(((long)Np * KPf + 255) / 256);
-        tf_fw_prep_kernel<<<dim3(nA + nB + nbW, (unsigned)B), 256, 0, stream>>>(
-            A.data_ptr<float>(), Bm.data_ptr<float>(), AF.data_ptr<float>(), BF.data_ptr<float>(), WF.data_ptr<float>(),
-            lcs.data_ptr<float>(), emars.data_ptr<float>(), rw, (int)M, (int)N, Mp, Np, (int)K, lkp, (int)B, nA, nB);
+        EXP_SUM_TI_SWITCH(A, Bm, 0, 0, tf_fw_prep_kernel<TI><<<dim3(nA + nB + nbW, (unsigned)B), 256, 0, stream>>>(
+            ai, bi, AF.data_ptr<float>(), BF.data_ptr<float>(), WF.data_ptr<float>(), lcs.data_ptr<float>(),
+            emars.data_ptr<float>(), rw, (int)M, (int)N, Mp, Np, (int)K, lkp, (int)B, nA, nB, sA, sB));
         C10_CUDA_KERNEL_LAUNCH_CHECK();
         EXP_SUM_KP_SWITCH(KPf, EXP_SUM_TP_SWITCH(params,
             tf_fw_kernel<KP, TP><<<grid, 128, 0, stream>>>(AF.data_ptr<float>(), BF.data_ptr<float>(), pp, p0, (int)Nb,
@@ -2114,7 +2169,7 @@ template <int KP, typename TP, bool FL, bool DE, bool GR>
 void launch_bf_bw2(cudaStream_t stream, const unsigned* afh, const unsigned* afl, const unsigned* bfh, const unsigned* bfl,
                    const TP* pp, long p0, int Nb, int cbs, int bs, const float* LU, const float* LC, float* ef, float* pf,
                    long pf0, float* dnp, long dn0, float* ga, float* gb, int M, int N, int Mp, int Np, int K, int B,
-                   int nct, long units, int cap) {
+                   int nct, long units, int cap, long sgA, long sgB) {
     constexpr int bytes = Bw2Geo<KP>::WORDS * 4;
     auto kern = bf_bw2_kernel<KP, TP, FL, DE, GR>;
     constexpr int NDEV = 64;
@@ -2132,7 +2187,7 @@ void launch_bf_bw2(cudaStream_t stream, const unsigned* afh, const unsigned* afl
     if (cap > 0) grid = std::min<long>(grid, cap);
     kern<<<(unsigned)std::max<long>(grid, 1), 256, bytes, stream>>>(afh, afl, bfh, bfl, pp, p0, Nb, cbs, bs, LU, LC, ef,
                                                                    pf, pf0, dnp, dn0, ga, gb, M, N, Mp, Np, K, B, nct,
-                                                                   units);
+                                                                   units, sgA, sgB);
 }
 
 // The backward of one node vector: the element flows of its children log-added into `element_flows` (the caller sets
@@ -2159,9 +2214,13 @@ void exp_sum_backward(torch::Tensor A, torch::Tensor Bm, torch::Tensor params, i
     if (dn) TORCH_CHECK(denom.scalar_type() == torch::kFloat32 && denom.is_contiguous(), "denominators");
     if (grads) {
         TORCH_CHECK(gB.numel() > 0, "both gradients or neither");
-        TORCH_CHECK(gA.scalar_type() == torch::kFloat32 && gA.is_contiguous() && gA.sizes() == A.sizes(), "dA: [B, M, K]");
-        TORCH_CHECK(gB.scalar_type() == torch::kFloat32 && gB.is_contiguous() && gB.sizes() == Bm.sizes(), "dB: [B, K, N]");
+        TORCH_CHECK(gA.scalar_type() == torch::kFloat32 && inner_contiguous(gA) && gA.sizes() == A.sizes(),
+                    "dA: fp32 [B, M, K], a sample's contiguous");
+        TORCH_CHECK(gB.scalar_type() == torch::kFloat32 && inner_contiguous(gB) && gB.sizes() == Bm.sizes(),
+                    "dB: fp32 [B, K, N], a sample's contiguous");
     }
+    const long sA = (long)sstride(A), sB = (long)sstride(Bm);  // (the factors and the gradients where they lie)
+    const long sgA = grads ? (long)sstride(gA) : 0, sgB = grads ? (long)sstride(gB) : 0;
     const at::cuda::CUDAGuard guard(A.device());
     auto stream = at::cuda::getCurrentCUDAStream();
     const int Mp = (int)((M + TBM - 1) / TBM * TBM), Np = (int)((N + BN - 1) / BN * BN), njt = Np / BN, nit = Mp / TBM;
@@ -2182,9 +2241,9 @@ void exp_sum_backward(torch::Tensor A, torch::Tensor Bm, torch::Tensor params, i
             const long na2 = (long)Mp2 * KPb / 2, nb2 = (long)Np2 * KPb / 2;
             auto AF2 = torch::empty({2, BC, na2}, A.options().dtype(torch::kInt32));
             auto BF2 = torch::empty({2, BC, nb2}, A.options().dtype(torch::kInt32));
-            auto LU2 = torch::empty({BC, Mp2, 2}, A.options());
-            auto LC2 = torch::empty({BC, njt2, 36}, A.options());
-            auto efs2 = torch::empty({BC, Np2}, A.options());
+            auto LU2 = torch::empty({BC, Mp2, 2}, A.options().dtype(torch::kFloat32));
+            auto LC2 = torch::empty({BC, njt2, 36}, A.options().dtype(torch::kFloat32));
+            auto efs2 = torch::empty({BC, Np2}, A.options().dtype(torch::kFloat32));
             unsigned* afh2 = reinterpret_cast<unsigned*>(AF2.data_ptr<int>());
             unsigned* bfh2 = reinterpret_cast<unsigned*>(BF2.data_ptr<int>());
             const int nbA2 = (int)((na2 + 255) / 256), nbB2 = (int)((nb2 + 255) / 256);
@@ -2193,19 +2252,21 @@ void exp_sum_backward(torch::Tensor A, torch::Tensor Bm, torch::Tensor params, i
                 const int Bc = (int)std::min<int64_t>(BC, B - b0);
                 int lbc = 0;
                 while ((1 << lbc) < Bc) lbc++;
-                bf_bw_prep_kernel<<<dim3(nbA2 + nbB2 + nT2, (unsigned)Bc), 256, 0, stream>>>(
-                    A.data_ptr<float>() + b0 * M * K, Bm.data_ptr<float>() + b0 * K * N, afh2, afh2 + BC * na2, bfh2,
-                    bfh2 + BC * nb2, LU2.data_ptr<float>(), LC2.data_ptr<float>(), efs2.data_ptr<float>(),
-                    node_flows.data_ptr<float>(), node_mars.data_ptr<float>(), nid0, lzs.data_ptr<float>(),
-                    emars.data_ptr<float>(), rw, (int)M, (int)N, Mp2, Np2, (int)K, KPb, Bc, nbA2, nbB2, (int)B, (int)b0);
+                EXP_SUM_TI_SWITCH(A, Bm, b0 * sA, b0 * sB,
+                    bf_bw_prep_kernel<TI><<<dim3(nbA2 + nbB2 + nT2, (unsigned)Bc), 256, 0, stream>>>(
+                        ai, bi, afh2, afh2 + BC * na2, bfh2, bfh2 + BC * nb2, LU2.data_ptr<float>(), LC2.data_ptr<float>(),
+                        efs2.data_ptr<float>(), node_flows.data_ptr<float>(), node_mars.data_ptr<float>(), nid0,
+                        lzs.data_ptr<float>(), emars.data_ptr<float>(), rw, (int)M, (int)N, Mp2, Np2, (int)K, KPb, Bc,
+                        nbA2, nbB2, (int)B, (int)b0, sA, sB));
                 C10_CUDA_KERNEL_LAUNCH_CHECK();
-                float* ga2 = grads ? gA.data_ptr<float>() + b0 * M * K : nullptr;
-                float* gb2 = grads ? gB.data_ptr<float>() + b0 * K * N : nullptr;
+                float* ga2 = grads ? gA.data_ptr<float>() + b0 * sgA : nullptr;
+                float* gb2 = grads ? gB.data_ptr<float>() + b0 * sgB : nullptr;
                 const long units = (long)nit2 * nct * Bc;
                 EXP_SUM_KP_SWITCH(KPb, if constexpr (KP >= 16) { EXP_SUM_TP_SWITCH(params, EXP_SUM_FLAGS_SWITCH(flows, dn, grads,
                     launch_bf_bw2<KP, TP, FL, DE, GR>(stream, afh2, afh2 + BC * na2, bfh2, bfh2 + BC * nb2, pp, p0, (int)Nb,
                         (int)cbs, (int)bs, LU2.data_ptr<float>(), LC2.data_ptr<float>(), efs2.data_ptr<float>(), pf, pf0,
-                        dnp, dn0, ga2, gb2, (int)M, (int)N, Mp2, Np2, (int)K, Bc, nct, units, (int)zsplit))) })
+                        dnp, dn0, ga2, gb2, (int)M, (int)N, Mp2, Np2, (int)K, Bc, nct, units, (int)zsplit, sgA,
+                        sgB))) })
                 C10_CUDA_KERNEL_LAUNCH_CHECK();
                 ef_epi_kernel<<<(unsigned)((((long)N << lbc) + 255) / 256), 256, 0, stream>>>(
                     efs2.data_ptr<float>(), rw, element_flows.data_ptr<float>(), (int)N, Np2, Bc, lbc, (int)B, (int)b0);
@@ -2217,24 +2278,23 @@ void exp_sum_backward(torch::Tensor A, torch::Tensor Bm, torch::Tensor params, i
         const long na = (long)Mp * KPb / 2, nb = (long)Np * KPb / 2;
         auto AF = torch::empty({2, B, na}, A.options().dtype(torch::kInt32));
         auto BF = torch::empty({2, B, nb}, A.options().dtype(torch::kInt32));
-        auto LU = torch::empty({B, Mp, 2}, A.options());
-        auto LC = torch::empty({B, njt, 36}, A.options());
-        auto efs = torch::empty({B, Np}, A.options());
+        auto LU = torch::empty({B, Mp, 2}, A.options().dtype(torch::kFloat32));
+        auto LC = torch::empty({B, njt, 36}, A.options().dtype(torch::kFloat32));
+        auto efs = torch::empty({B, Np}, A.options().dtype(torch::kFloat32));
         unsigned* afh = reinterpret_cast<unsigned*>(AF.data_ptr<int>());
         unsigned* bfh = reinterpret_cast<unsigned*>(BF.data_ptr<int>());
         const int nbA = (int)((na + 255) / 256), nbB = (int)((nb + 255) / 256), nT = (Mp + njt * 36 + Np + 255) / 256;
-        bf_bw_prep_kernel<<<dim3(nbA + nbB + nT, (unsigned)B), 256, 0, stream>>>(
-            A.data_ptr<float>(), Bm.data_ptr<float>(), afh, afh + B * na, bfh, bfh + B * nb, LU.data_ptr<float>(),
-            LC.data_ptr<float>(), efs.data_ptr<float>(), node_flows.data_ptr<float>(), node_mars.data_ptr<float>(), nid0,
-            lzs.data_ptr<float>(), emars.data_ptr<float>(), rw, (int)M, (int)N, Mp, Np, (int)K, KPb, (int)B, nbA, nbB,
-            (int)B, 0);
+        EXP_SUM_TI_SWITCH(A, Bm, 0, 0, bf_bw_prep_kernel<TI><<<dim3(nbA + nbB + nT, (unsigned)B), 256, 0, stream>>>(
+            ai, bi, afh, afh + B * na, bfh, bfh + B * nb, LU.data_ptr<float>(), LC.data_ptr<float>(),
+            efs.data_ptr<float>(), node_flows.data_ptr<float>(), node_mars.data_ptr<float>(), nid0, lzs.data_ptr<float>(),
+            emars.data_ptr<float>(), rw, (int)M, (int)N, Mp, Np, (int)K, KPb, (int)B, nbA, nbB, (int)B, 0, sA, sB));
         C10_CUDA_KERNEL_LAUNCH_CHECK();
         float* ga = grads ? gA.data_ptr<float>() : nullptr;
         float* gb = grads ? gB.data_ptr<float>() : nullptr;
         EXP_SUM_KP_SWITCH(KPb, if constexpr (KP == 8) { EXP_SUM_TP_SWITCH(params, EXP_SUM_FLAGS_SWITCH(flows, dn, grads,
             bf_bw_kernel<KP, TP, FL, DE, GR><<<grid, 128, 0, stream>>>(afh, afh + B * na, bfh, bfh + B * nb, pp, p0,
                 (int)Nb, (int)cbs, (int)bs, LU.data_ptr<float>(), LC.data_ptr<float>(), efs.data_ptr<float>(), pf, pf0,
-                dnp, dn0, ga, gb, (int)M, (int)N, Mp, Np, (int)K, (int)B, bper))) })
+                dnp, dn0, ga, gb, (int)M, (int)N, Mp, Np, (int)K, (int)B, bper, sgA, sgB))) })
         C10_CUDA_KERNEL_LAUNCH_CHECK();
         ef_epi_kernel<<<(unsigned)((((long)N << lb) + 255) / 256), 256, 0, stream>>>(
             efs.data_ptr<float>(), rw, element_flows.data_ptr<float>(), (int)N, Np, (int)B, lb, (int)B, 0);
@@ -2242,11 +2302,11 @@ void exp_sum_backward(torch::Tensor A, torch::Tensor Bm, torch::Tensor params, i
         return;
     }
     const int KPv = rank_pad(K, 8), lkp = __builtin_ctz((unsigned)KPv);
-    auto At = torch::empty({B, Mp, KPv}, A.options());
-    auto Bt = torch::empty({B, KPv, Np}, A.options());
-    auto terms = torch::empty({B, 2L * Mp + Np}, A.options());
+    auto At = torch::empty({B, Mp, KPv}, A.options().dtype(torch::kFloat32));
+    auto Bt = torch::empty({B, KPv, Np}, A.options().dtype(torch::kFloat32));
+    auto terms = torch::empty({B, 2L * Mp + Np}, A.options().dtype(torch::kFloat32));
     const long nscr = (long)B * Np + (grads ? (long)B * Mp * KPv + (long)B * KPv * Np : 0);
-    auto scr = torch::empty({nscr}, A.options());              // ef [B, Np], then dAt [B, Mp, KP], dBt [B, KP, Np]
+    auto scr = torch::empty({nscr}, A.options().dtype(torch::kFloat32));              // ef [B, Np], then dAt [B, Mp, KP], dBt [B, KP, Np]
     float* efp = scr.data_ptr<float>();
     float* dat = grads ? efp + (long)B * Np : nullptr;
     float* dbt = grads ? dat + (long)B * Mp * KPv : nullptr;
@@ -2254,10 +2314,10 @@ void exp_sum_backward(torch::Tensor A, torch::Tensor Bm, torch::Tensor params, i
         const int nA = (Mp * KPv + 255) / 256, nB = KPv * ((Np + 255) / 256), nT = (2 * Mp + Np + 255) / 256;
         const long per = (long)Np + (grads ? (long)Mp * KPv + (long)KPv * Np : 0);
         const int nZ = (int)std::min<long>((per + 255) / 256, 64);
-        tf_bw_prep_kernel<<<dim3(nA + nB + nT + nZ, (unsigned)B), 256, 0, stream>>>(
-            A.data_ptr<float>(), Bm.data_ptr<float>(), At.data_ptr<float>(), Bt.data_ptr<float>(),
-            terms.data_ptr<float>(), efp, grads ? 1 : 0, node_flows.data_ptr<float>(), node_mars.data_ptr<float>(), nid0,
-            lzs.data_ptr<float>(), emars.data_ptr<float>(), rw, (int)M, (int)N, Mp, Np, (int)K, lkp, (int)B, nA, nB, nT);
+        EXP_SUM_TI_SWITCH(A, Bm, 0, 0, tf_bw_prep_kernel<TI><<<dim3(nA + nB + nT + nZ, (unsigned)B), 256, 0, stream>>>(
+            ai, bi, At.data_ptr<float>(), Bt.data_ptr<float>(), terms.data_ptr<float>(), efp, grads ? 1 : 0,
+            node_flows.data_ptr<float>(), node_mars.data_ptr<float>(), nid0, lzs.data_ptr<float>(),
+            emars.data_ptr<float>(), rw, (int)M, (int)N, Mp, Np, (int)K, lkp, (int)B, nA, nB, nT, sA, sB));
         C10_CUDA_KERNEL_LAUNCH_CHECK();
     }
     const int sp = nz > 1 ? 1 : 0;
@@ -2269,7 +2329,8 @@ void exp_sum_backward(torch::Tensor A, torch::Tensor Bm, torch::Tensor params, i
     const long tot = ((long)N << lb) + (grads ? (long)B * M * K + (long)B * K * N : 0);
     tf_bw_epi_kernel<<<(unsigned)((tot + 255) / 256), 256, 0, stream>>>(
         efp, rw, element_flows.data_ptr<float>(), dat, dbt, grads ? gA.data_ptr<float>() : nullptr,
-        grads ? gB.data_ptr<float>() : nullptr, (int)M, (int)N, Mp, Np, (int)K, KPv, (int)B, lb, grads ? 1 : 0);
+        grads ? gB.data_ptr<float>() : nullptr, (int)M, (int)N, Mp, Np, (int)K, KPv, (int)B, lb, grads ? 1 : 0, sgA,
+        sgB);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 

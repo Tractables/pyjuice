@@ -863,11 +863,12 @@ class _ExternalParamsMixin:
 
     def _group_in_place_views(self, key: str, tensors, batch_size: int, device, aligned16: bool = False) -> Optional[dict]:
         """`{ns: its views}` of a group's concatenated `tensors`, split along the group's axis -- where that is the first
-        after the batch and each tensor is fp32 on `device`, of the concatenation's exact shape, every axis past the
-        batch contiguous (so is each member's view) --, else None. The members' extents are kept per group and batch
-        size: a call checks one tensor a slot and splits it (no node's tensors validated one by one). `aligned16`: and
-        every member's view 16-byte aligned with a batch stride of a multiple of 4 floats (the concatenation's base
-        and batch stride so, each member's offset a multiple of 4 floats: kept with the extents)."""
+        after the batch and each tensor is fp32 (values: or a dtype every member takes, `external_dtypes`) on `device`,
+        of the concatenation's exact shape, every axis past the batch contiguous (so is each member's view) --, else
+        None. The members' extents are kept per group and batch size: a call checks one tensor a slot and splits it (no
+        node's tensors validated one by one). `aligned16`: and every member's view 16-byte aligned with a batch stride
+        of a multiple of 4 floats (the concatenation's base and batch stride so, each member's offset a multiple of 4
+        floats: kept with the extents)."""
         memo = self.__dict__.setdefault("_ext_group_in_place", {})
         plan = memo.get((key, batch_size))
         if plan is None:
@@ -893,9 +894,12 @@ class _ExternalParamsMixin:
             return None
         splits = []
         for cat, (want, sizes, starts4) in zip(cats, slots):
-            if not (torch.is_tensor(cat) and cat.dtype == torch.float32 and cat.device == device and
-                    tuple(cat.shape) == want and cat.size(0) > 0 and _inner_contiguous(cat)):
+            if not (torch.is_tensor(cat) and cat.device == device and tuple(cat.shape) == want and cat.size(0) > 0 and
+                    _inner_contiguous(cat)):
                 return None
+            if cat.dtype != torch.float32 and (aligned16 or not all(cat.dtype in ns.parameterization.external_dtypes(ns)
+                                                                     for ns in nodes)):
+                return None                     # (another dtype: values only, where every member's kernels read it)
             if aligned16 and not (starts4 and cat.data_ptr() % 16 == 0 and cat.stride(0) % 4 == 0):
                 return None
             splits.append(torch.split(cat, sizes, dim = 1))
@@ -904,9 +908,10 @@ class _ExternalParamsMixin:
     def _take_in_place(self, ns2tensors: dict, batch_size: int, device) -> tuple:
         """`(the rest of ns2tensors, {ns: its tensors}, [(tensor, version)])`: the entries whose nodes all read their
         tensors in place taken out of `ns2tensors` -- a group's split along its axis into views, one set a node --,
-        each node's tensors validated and fp32 with every axis past the batch contiguous (an entry with a tensor that
-        is not stays in the rest: it is copied), and the caller's tensors as handed over, with their versions now (a
-        view shares its base's version: an in-place write to either shows)."""
+        each node's tensors validated (fp32, or a dtype its parameterization takes: `external_dtypes`) with every axis
+        past the batch contiguous (an entry with a tensor that is not stays in the rest: it is copied), and the
+        caller's tensors as handed over, with their versions now (a view shares its base's version: an in-place write
+        to either shows)."""
         rest, taken, versions = {}, {}, []
         for key, tensors in ns2tensors.items():
             nodes = self.external_params_groups[key][0] if isinstance(key, str) else (key,)

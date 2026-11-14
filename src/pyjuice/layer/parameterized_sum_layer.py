@@ -11,6 +11,12 @@ from pyjuice.utils import launch_plans
 from pyjuice.utils.launch_plans import LaunchPlans
 from pyjuice.utils.parameter_list import FastParamList
 from . import deferred_par
+
+# (a backward's context where it records no launch plan: one, reused -- `nullcontext` keeps no state)
+_NULL_CONTEXT = contextlib.nullcontext()
+# (the standard backward's hooks a parameterization may set for a call, all unset after it)
+_NO_BW_HOOKS = dict(_ext_bw_ele_hook = None, _ext_bw_par_hook = None, _ext_bw_par_sb_hook = None,
+                    _ext_bw_par_triton_hook = None)
 from .sum_layer import SumLayer
 from .fused_children import form_elements, scatter_flows
 
@@ -162,8 +168,9 @@ def validate_external_tensors(ns, parameterization, tensors: Any, batch_size: in
         assert torch.is_tensor(tensor), f"External tensor {idx} should be a `torch.Tensor`."
         assert tuple(tensor.size()) == tuple(shape), \
             f"External tensor {idx} should be of shape {tuple(shape)}, got {tuple(tensor.size())}."
-        assert tensor.dtype == torch.float32, \
-            f"External tensor {idx} should be of dtype `torch.float32`, got {tensor.dtype}."
+        assert tensor.dtype == torch.float32 or tensor.dtype in parameterization.external_dtypes(ns), \
+            f"External tensor {idx} should be of dtype " \
+            f"{' or '.join(f'`{d}`' for d in parameterization.external_dtypes(ns))}, got {tensor.dtype}."
         if require_contiguous:
             assert tensor.is_contiguous(), f"External tensor {idx} should be contiguous."
         assert tensor.device == device, \
@@ -247,7 +254,8 @@ class ParameterizedSumLayer(SumLayer):
     def _drop_device_caches(self) -> None:
         """The sum layer's own, and every parameterization's of the layer's node groups."""
         super()._drop_device_caches()
-        for name in ("_bk_stream_parts_g", "_bk_par_deferred_g", "_bk_fusion_ready_g"):
+        for name in ("_bk_stream_parts_g", "_bk_par_deferred_g", "_bk_fusion_ready_g", "_settled_forward",
+                     "_settled_backward"):
             self.__dict__.pop(name, None)
         for params in {id(ns.parameterization): ns.parameterization for ns in self.nodes}.values():
             params.drop_device_caches(self)
@@ -612,6 +620,14 @@ class ParameterizedSumLayer(SumLayer):
             assert not kwargs.get("negate_pflows", False), \
                 "External sum parameters are not supported with `negate_pflows = True`."
 
+    # SETTLED CALLS: a parameterization may put on a layer, as `_settled_forward(layer, node_mars, element_mars, params,
+    # propagation_alg, op_params, kwargs)` / `_settled_backward(layer, node_flows, element_flows, node_mars, element_mars,
+    # params, param_flows, denom_param_flows, propagation_alg, op_params, kwargs)`, a callable that either does at a
+    # call exactly what the full path of `forward` / `backward` does -- this layer's checks and settings, the hooks --
+    # and returns True, or changes nothing and returns False (the full path then): the host work of a call whose
+    # choices an earlier call settled, made once (LowRank's one-launch forms, `lowrank.virtual`). Dropped with the
+    # device caches.
+
     def forward(self, node_mars: torch.Tensor, element_mars: torch.Tensor, params: torch.Tensor,
                 propagation_alg: str = "LL", op_params: Optional[torch.Tensor] = None, **kwargs) -> None:
         """
@@ -622,6 +638,11 @@ class ParameterizedSumLayer(SumLayer):
         it (`SumParameterization.reads_param_operands`).
         """
 
+        # A call the layer's parameterization settled (`_settled_forward`): what the path below does at it, from a record
+        # of the choices an earlier call made -- or, returning False, nothing, the path below then
+        settled = self.__dict__.get("_settled_forward")
+        if settled is not None and settled(self, node_mars, element_mars, params, propagation_alg, op_params, kwargs):
+            return None
         if kwargs.get("partition_runs") is not None:
             raise ValueError("An external-parameter sum layer computes whole partitions: no `partition_runs`.")
         ns_tensors = self._resolve_external_tensors(kwargs, node_mars.size(1), node_mars.device)
@@ -648,12 +669,13 @@ class ParameterizedSumLayer(SumLayer):
         if not gated:
             return None
 
-        self._assert_supported(propagation_alg, is_backward = False, **kwargs)
+        self._assert_supported(propagation_alg, is_backward = False)   # (the forward's checks read no option)
 
+        # (`kwargs` is this call's own dict -- a call's `**kwargs` is made for it --: set in place, not copied, ~1 us)
         if op_params is not None and self.parameterization.reads_param_operands:
-            kwargs = dict(kwargs, op_params = op_params)
+            kwargs["op_params"] = op_params
         if takes and sc is not None:
-            kwargs = dict(kwargs, stream_children = sc)
+            kwargs["stream_children"] = sc
         self.parameterization.forward_layer(
             self, ns_tensors, node_mars, element_mars, params,
             propagation_alg = propagation_alg, **kwargs
@@ -684,6 +706,11 @@ class ParameterizedSumLayer(SumLayer):
         (`SumParameterization.reads_param_operands`).
         """
 
+        # (a call the parameterization settled, as the forward's: `_settled_backward`)
+        settled = self.__dict__.get("_settled_backward")
+        if settled is not None and settled(self, node_flows, element_flows, node_mars, element_mars, params, param_flows,
+                                           denom_param_flows, propagation_alg, op_params, kwargs):
+            return None
         if kwargs.get("partition_runs") is not None:
             raise ValueError("An external-parameter sum layer computes whole partitions: no `partition_runs`.")
         ns_tensors = self._resolve_external_tensors(kwargs, node_mars.size(1), node_mars.device)
@@ -727,7 +754,9 @@ class ParameterizedSumLayer(SumLayer):
         op = op_params if op_params is not None and self.__dict__.get("_reads_param_operands", False) else None
         self.__dict__["_bk_op_params"] = op
 
-        self._assert_supported(propagation_alg, is_backward = True, **kwargs)
+        self._assert_supported(propagation_alg, is_backward = True,   # (what it reads: not every option repacked)
+                               allow_modify_flows = kwargs.get("allow_modify_flows", False),
+                               negate_pflows = kwargs.get("negate_pflows", False))
 
         # Resolve the gradient buffers BEFORE anything runs: `pre_backward` may put the shared buffers
         # into an intermediate form that only `post_backward` undoes, so a validation failure raised
@@ -764,7 +793,7 @@ class ParameterizedSumLayer(SumLayer):
             LaunchPlans.fail()                     # (a recording around this call cannot capture what it launches)
 
         with (LaunchPlans.record(self.parameterization.BACKWARD_PLAN_TAG) if pkey is not None
-              else contextlib.nullcontext()) as rec:
+              else _NULL_CONTEXT) as rec:
             try:
                 self.parameterization.pre_backward_layer(
                     self, ns_tensors, node_flows, element_flows, node_mars, element_mars, params,
@@ -794,8 +823,7 @@ class ParameterizedSumLayer(SumLayer):
                 # gated kernel against a stale plan.
                 # (Plain attributes, written past `nn.Module.__setattr__`: its registration checks, ~1.5 us a write, on
                 # every gated layer's every backward.)
-                self.__dict__.update(_ext_bw_ele_hook = None, _ext_bw_par_hook = None, _ext_bw_par_sb_hook = None,
-                                     _ext_bw_par_triton_hook = None)
+                self.__dict__.update(_NO_BW_HOOKS)
 
         if pkey is not None:
             LaunchPlans.of(self).store(pkey, rec, expected)

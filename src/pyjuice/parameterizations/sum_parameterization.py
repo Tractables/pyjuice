@@ -85,6 +85,12 @@ class SumParameterization():
     #: kernels on the copy whose host cost only a large layer's GPU savings repay. 0 -- the default -- adds none.
     param_operands_min_edges: int = 0
 
+    #: The least work -- the parameters a layer reads a sample times the columns its kernels run at -- from which a layer
+    #: of this parameterization takes that copy (`TensorCircuit._param_operand_groups`), in place of the circuit's own
+    #: bound (`_COPY_MIN_WORK`: a host-bound step's guard), for kernels that read their parameters from the copy alone; a
+    #: layer group takes the least of its layers'. None -- the default -- the circuit's.
+    param_operands_min_work: Optional[int] = None
+
     def param_operand_columns(self, batch_size: int) -> int:
         """The columns this parameterization's kernels on that copy run at, for a pass of `batch_size` samples -- what
         the circuit's rule on the copy reckons a layer's work with, and its least columns (16: below them the kernels
@@ -208,6 +214,14 @@ class SumParameterization():
         only the staging buffer keeps (such a node is copied whatever this returns).
         """
         return False
+
+    def external_dtypes(self, ns) -> Tuple[torch.dtype, ...]:
+        """
+        The dtypes `ns`'s external tensors may come in: float32 alone by default. A parameterization whose
+        kernels read another where the tensors lie (:func:`reads_in_place`) lists it too; a tensor of it that
+        is copied into the staging buffer instead is converted to float32 there.
+        """
+        return (torch.float32,)
 
     def validate_ns(self, ns) -> None:
         """
