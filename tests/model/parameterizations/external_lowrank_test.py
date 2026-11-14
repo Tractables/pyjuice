@@ -1896,6 +1896,44 @@ def test_the_one_launch_backward_without_gradients(rank, monkeypatch):
 
 
 @needs_virtual
+@pytest.mark.parametrize("rank,batch", [(16, 16), (8, 16), (32, 16), (64, 8)])
+def test_the_operands_in_chunks_are_the_one_chunk(rank, batch, monkeypatch):
+    """The pass's V and A operands in chunks of whole copies (`virtual.CHUNK_COLS` made two copies' columns: chunks of
+    two copies, the last of one): every value, node flow and gradient the same bits as one chunk's, the parameter flows
+    and denominators (the fused pass's end a launch a chunk, their sums added) to fp32's order -- over two passes, the
+    second's V pipelined (the side CTAs within a chunk, a chunk's first copy by a launch of its own)."""
+    import pyjuice.parameterizations.lowrank.virtual as lowrank_virtual
+    from pyjuice.layer.kernels import autotune
+
+    pick = autotune.pick
+    monkeypatch.setattr(autotune, "pick", lambda key, cands, bench, **k: "fused"
+                        if key[0] in ("prod_stream_fusion", "prod_stream_fusion_bk") else pick(key, cands, bench, **k))
+    pc, sums, _, _, _, _ = _pair(_hmm_blocks(256, 32), "sum_exp", rank = rank)
+    assert len(sums) == 3
+    monkeypatch.setattr(pc, "_param_operands_force", True, raising = False)   # (the bf16 copy: the stream path's)
+    monkeypatch.setattr(lowrank_virtual, "GEMM_BF16_WORK", 0)                # (bf16 normalizers, as at real sizes)
+    dev = pc.params.device
+    torch.manual_seed(43)
+    data = torch.randint(0, NUM_CATS, (batch, pc.num_vars), device = dev)
+    ext = {a: _factors(a, rank, batch, dev, seed = 490 + i) for i, a in enumerate(sums)}
+    one = [_passes(pc, sums, data, ext) for _ in range(2)]
+    chunks = []
+    vchunk = lowrank_virtual._vchunk
+    monkeypatch.setattr(lowrank_virtual, "_vchunk", lambda z, row: (chunks.append(len(z["Vc"])), vchunk(z, row))[1])
+    monkeypatch.setattr(lowrank_virtual, "CHUNK_COLS", 2 * batch * rank)
+    got = [_passes(pc, sums, data, ext) for _ in range(2)]
+    assert chunks and set(chunks) == {2}, set(chunks)                   # (two chunks: of 2 copies and of 1)
+    for g, w in zip(got, one):
+        for k in ("lls", "mars", "flows"):
+            assert torch.equal(g[k], w[k]), k
+        for k in ("dA", "dB"):
+            assert all(torch.equal(a, b) for a, b in zip(g[k], w[k])), k
+        for k in ("fp", "fm"):
+            assert torch.allclose(g[k], w[k], rtol = 1e-5, atol = 1e-6), \
+                f"{k}: {float((g[k] - w[k]).abs().max())}"
+
+
+@needs_virtual
 def test_copies_in_layers_of_several_node_vectors(monkeypatch):
     """Two tied chains side by side: every layer holds two node vectors, each with copies in the pass. One plain
     backward a layer (the data half of both), the normalizer products once a source: two."""
