@@ -3495,6 +3495,61 @@ def test_the_fused_exp_sum_forward_far_below_its_shift(rank, batch, precision):
 
 
 @needs_fused
+@pytest.mark.parametrize("rank", [4, 8, 32, 64])
+@pytest.mark.parametrize("precision", ["auto", "fp32"])
+def test_the_bf16_exp_sum_reads_the_callers_tensors_where_they_lie(rank, precision):
+    """The bf16 / TF32 kernels take the factors and add the gradients where the caller's tensors lie -- views at a
+    sample stride past their block, fp32, fp16 or bf16 factors -- no copy: the outputs those of contiguous fp32
+    copies, the forward's bit for bit, the atomically summed ones (element flows, F+, W, the gradients) to their
+    order's rounding; nothing outside the gradients' views touched."""
+    from pyjuice.parameterizations.lowrank.kernels.c import get_exp_sum_module
+    mod, dev = get_exp_sum_module(), torch.device("cuda:0")
+    M, N, B, K = 192, 160, 5, rank
+    bs = cbs = 32
+    g = torch.Generator(device = "cpu").manual_seed(11)
+    theta = torch.rand(M, N, generator = g).add_(0.05)
+    theta = theta / theta.sum(1, keepdim = True)
+    params = theta.view(M // bs, bs, N // cbs, cbs).permute(0, 2, 3, 1).contiguous().view(-1).to(dev)
+    A = (0.3 * torch.randn(B, M, K, generator = g)).to(dev)
+    Bm = (0.3 * torch.randn(B, K, N, generator = g)).to(dev)
+    emars = (-5.0 + torch.randn(N, B, generator = g)).to(dev)
+    nflows = (torch.randn(M + 3, B, generator = g) - 7.0).to(dev)
+    rows = torch.arange(N, device = dev)
+
+    def run(A, Bm, gA, gB):
+        nm = torch.full((M + 3, B), 123.0, device = dev)
+        lz = mod.exp_sum_forward(A, Bm, params, 0, N // cbs, cbs, bs, emars, rows, nm, 3, M, N, K,
+                                 precision != "fp32")
+        ef = torch.full((N, B), -float("inf"), device = dev)
+        pf, dn = torch.zeros(M * N, device = dev), torch.zeros(M * N, device = dev)
+        mod.exp_sum_backward(A, Bm, params, 0, N // cbs, cbs, bs, emars, rows, nflows, nm, 3, lz, ef, pf, 0, dn, 0,
+                             gA, gB, M, N, K, 0, precision != "fp32")
+        return nm, lz, ef, pf, dn, gA, gB
+
+    for dt in (torch.float32, torch.float16, torch.bfloat16):
+        Ad, Bd = A.to(dt), Bm.to(dt)
+        want = run(Ad.float(), Bd.float(), torch.zeros(B, M, K, device = dev), torch.zeros(B, K, N, device = dev))
+        bigA = torch.randn(B, M + 5, K, device = dev).to(dt)
+        bigA[:, 3:3 + M] = Ad
+        bigB = torch.randn(B, K + 2, N, device = dev).to(dt)
+        bigB[:, 1:1 + K] = Bd
+        gbA = torch.full((B, M + 5, K), 7.0, device = dev)
+        gbB = torch.full((B, K + 2, N), 7.0, device = dev)
+        gA, gB = gbA[:, 3:3 + M], gbB[:, 1:1 + K]
+        gA.zero_()
+        gB.zero_()
+        assert not bigA[:, 3:3 + M].is_contiguous() and not gB.is_contiguous()
+        got = run(bigA[:, 3:3 + M], bigB[:, 1:1 + K], gA, gB)
+        assert torch.equal(got[0], want[0]) and torch.equal(got[1], want[1]), dt
+        fin = torch.isfinite(want[2])
+        assert torch.equal(torch.isfinite(got[2]), fin) and float((got[2] - want[2])[fin].abs().max()) < 1e-5, dt
+        for k in (3, 4, 5, 6):
+            assert float((got[k] - want[k]).abs().max()) <= 1e-5 * float(want[k].abs().max()), (dt, k)
+        for rest in (gbA[:, :3], gbA[:, 3 + M:], gbB[:, 0], gbB[:, 1 + K:]):
+            assert bool((rest == 7.0).all()), dt
+
+
+@needs_fused
 @pytest.mark.parametrize("rank,batch,nslice", [(64, 160, 4), (16, 300, 3)])
 def test_a_batch_past_the_l2_runs_the_bf16_passes_in_chunks(rank, batch, nslice):
     """A batch whose working set exceeds the L2 runs the bf16 passes a chunk of samples at a time (`sample_chunk`: at

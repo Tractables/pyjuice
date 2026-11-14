@@ -122,28 +122,21 @@ class _BackwardMixin:
         dn0 = self._denom_offsets(layer)[id(ns_info.ns)][0] + off if denom is not None else 0
         rounded = layer.__dict__.get("_lr_h", {})
         if id(ns_info.ns) in rounded:                           # (the forward's kernels: the fp16-rounded factors')
-            gd = grads
             copy = rounded[id(ns_info.ns)]                      # (the forward's fp16 copy of the factors, read once:
             rounded[id(ns_info.ns)] = []                        #  freed with this backward, another one converts)
             lowrank_forward.exp_sum_h_module().exp_sum_h_backward(
                 tensors[0], tensors[1], params, geo["p0"], Nb, cbs, bs, element_mars, geo["rows"], node_flows,
                 node_mars, ns_info.nid_start, lz.t().contiguous(), element_flows, pf, pf0, dn, dn0,
-                gd[0] if grads is not None else empty, gd[1] if grads is not None else empty, geo["M"], geo["N"],
-                self.rank, copy, init)
-        else:                                                   # (the bf16 / TF32 kernels: contiguous fp32 blocks)
-            gd = grads if grads is None or all(g.is_contiguous() for g in grads) else \
-                tuple(torch.zeros(g.shape, dtype = g.dtype, device = g.device) for g in grads)
-            if init and gd is grads:
+                grads[0] if grads is not None else empty, grads[1] if grads is not None else empty, geo["M"],
+                geo["N"], self.rank, copy, init)
+        else:                                                   # (the bf16 / TF32 kernels: the factors and the
+            if init and grads is not None:                      #  gradients where they lie, the latter zeroed first)
                 torch._foreach_zero_(list(grads))
             exp_sum_module().exp_sum_backward(
-                lowrank_forward.as_f32(tensors[0]), lowrank_forward.as_f32(tensors[1]), params, geo["p0"], Nb, cbs, bs,
-                element_mars, geo["rows"], node_flows, node_mars, ns_info.nid_start, lz.t().contiguous(),
-                element_flows, pf, pf0, dn, dn0, gd[0] if grads is not None else empty,
-                gd[1] if grads is not None else empty, geo["M"], geo["N"], self.rank, lowrank_forward.EXP_SUM_ZSPLIT,
-                bf16)
-        if grads is not None and gd is not grads:               # (the kernels added into their own buffers: theirs)
-            for g, t in zip(grads, gd):
-                (g.copy_ if init else g.add_)(t)
+                tensors[0], tensors[1], params, geo["p0"], Nb, cbs, bs, element_mars, geo["rows"], node_flows,
+                node_mars, ns_info.nid_start, lz.t().contiguous(), element_flows, pf, pf0, dn, dn0,
+                grads[0] if grads is not None else empty, grads[1] if grads is not None else empty, geo["M"],
+                geo["N"], self.rank, lowrank_forward.EXP_SUM_ZSPLIT, bf16)
         return True
 
     @staticmethod
