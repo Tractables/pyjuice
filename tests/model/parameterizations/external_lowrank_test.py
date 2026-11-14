@@ -4508,7 +4508,8 @@ def test_the_side_ctas_v_rows_are_the_operand_kernels(N, B, copies, K):
     V rows and their shifts, copy by copy at their rows, the same BITS as `lowrank_z_operand_in_place`'s (every copy in
     one launch) -- factors read in place at a sample stride past their block, entries of -inf (a rank of no finite
     entry: its shift -inf, its V 0), children past one unit's threads (N 1344); ranks 8, 32 and 64 (a sample's 2, 8
-    and 16 units through the 4 buffers; rank 64's in two rounds of 32 ranks)."""
+    and 16 units through the 4 buffers; rank 64's in two rounds of 32 ranks); few children, a sample's round one unit,
+    several in flight (`om_v_rows_whole`: N 64 and 256, and rank 8's 1024)."""
     import pyjuice.parameterizations.lowrank.virtual as lowrank_virtual
 
     smod, mod = lowrank_virtual._stream_module(), lowrank_virtual._module()
@@ -4537,23 +4538,37 @@ def test_the_side_ctas_v_rows_are_the_operand_kernels(N, B, copies, K):
 
 @needs_virtual
 def test_the_side_ctas_count(monkeypatch):
-    """`virtual._om_vctas`, the one-launch forward's side CTAs forming the next copy's V rows: 16 where the tiles take
-    at most 12 rounds of the SMs, 20 past (the HMM's layers of 1024 nodes and children, rank 16: 2 B tiles of 1024
-    children); none where their units would take more than twice the tiles' rounds (a layer of 128 nodes: an eighth
-    of the tiles, V's work the same); a quarter of the SMs at most (a GPU of 20)."""
+    """`virtual._om_vctas`, the one-launch forward's side CTAs forming the next copy's V rows. Where they form it in
+    4-rank units (the HMM's layers of 1024 nodes and children, rank 16: 2 B tiles of 1024 children): 16 where the tiles
+    take at most 12 rounds of the SMs, 20 past; none where the units would take more than twice the tiles' rounds (a
+    layer of 128 nodes: an eighth of the tiles, V's work the same). Where they form it in whole rounds (few children,
+    `om_v_whole`), by the cost model: more the fewer the children (a sample of V cheaper against the tiles' rounds: 512
+    down to 128 children at B1024, the nodes as many), one at least. A quarter of the SMs at most (a GPU of 20); kept
+    per shape."""
     import pyjuice.parameterizations.lowrank.virtual as lowrank_virtual
 
     dev = torch.device("cuda")
+    smod = lowrank_virtual._stream_module()
     sms = torch.cuda.get_device_properties(dev).multi_processor_count
-    if sms < 96:
+    if smod is None or sms < 96:
         pytest.skip("the counts below are a GPU of 96 SMs or more's")
-    count = lambda B, nodes = 1024: lowrank_virtual._om_vctas(B, 16, 1024, (16 * B // 64) * (nodes // 128), 1024, dev)
+    assert not smod.om_v_whole(1024, 16) and all(smod.om_v_whole(n, 16) for n in (128, 256, 512))
+    count = lambda B, nodes = 1024, n = 1024, K = 16: lowrank_virtual._om_vctas(B, K, n, (K * B // 64) * (nodes // 128),
+                                                                              n, dev)
     assert [count(B) for B in (64, 3 * sms, 6 * sms)] == [16, 16, 16]
     assert [count(B) for B in (6 * sms + 4, 12 * sms)] == [20, 20]
     assert count(6 * sms, nodes = 128) == 0 and count(64, nodes = 128) == 16
+    few = [count(1024, n, n) for n in (128, 256, 512)]
+    assert few == sorted(few, reverse = True) and few[0] > few[-1] and few[-1] >= 16, few
+    assert all(1 <= count(B, n, n, K) <= sms // 4 for B in (16, 64, 1024) for n in (64, 256) for K in (8, 16, 32, 64))
+    lowrank_virtual._OM_VCTAS.clear()
     props = type("P", (), {"multi_processor_count": 20})()
     monkeypatch.setattr(torch.cuda, "get_device_properties", lambda d: props)
-    assert count(1024) == 5 and count(64) == 5
+    try:
+        assert count(1024) == 5 and count(64) == 5
+        assert 1 <= count(1024, 256, 256) <= 5
+    finally:
+        lowrank_virtual._OM_VCTAS.clear()
 
 
 @needs_virtual

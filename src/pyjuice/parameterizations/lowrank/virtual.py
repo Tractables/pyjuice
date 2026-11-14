@@ -671,22 +671,67 @@ OMK_BW = True
 OMK_V = True
 
 
+#: The one-launch forward's side CTAs' cost model where they form V in whole rounds (`_om_vctas`), us: a side CTA's
+#: sample (its K x X factors in, V's rows out) and a tile (its k range of `children`). MEASURED (toast, HMM of 31
+#: layers in blocks of 32, rank 16, B1024, the forward's wall time at forced counts): a sample 0.83 / 1.24 / 2.1 us at
+#: 128 / 256 / 512 children, 15% more charged for the tiles' traffic beside it; a tile ~9 us + 1 us a 64 children
+#: with V's CTAs beside.
+OM_V_SAMPLE_US, OM_V_RANK_CHILD_US, OM_V_BESIDE, OM_V_SLACK = 0.35, 0.000225, 1.15, 1.05
+OM_TILE_US, OM_TILE_CHILD_US = 9.0, 1.0 / 64
+
+_OM_VCTAS = dict()
+
+
+def _sms(dev) -> int:
+    """The device's SM count (kept: asked for every layer of a pass)."""
+    n = _OM_VCTAS.get(("sms", dev))
+    if n is None:
+        n = _OM_VCTAS[("sms", dev)] = torch.cuda.get_device_properties(dev).multi_processor_count
+    return n
+
+
 def _om_vctas(B: int, K: int, X: int, tiles: int, children: int, dev) -> int:
     """The one-launch forward's side CTAs forming the next copy's V rows (`B` samples, rank `K`, `X` children; the
-    launch's `tiles`, `children` a tile's k range): 16 where the tiles take at most 12 rounds of the SMs, 20 past (the
-    tiles long enough that more of V's work keeps up), a quarter of the SMs at most; 0, none -- the copy's rows by a
-    launch of their own after the forward -- where the side CTAs' units (4 ranks of a sample, ~0.05 of a tile's time a
-    child: ~1.15 us for 1024 children against ~24 us) would take more than twice the tiles' rounds. MEASURED
-    (croissant, HMM 1024 x 31 in blocks of 32, rank 16, step ms, every copy's V upfront -> 12 / 16 / 20 / 24 side
-    CTAs): B64 2.569 -> 2.504 / 2.506 / 2.520 / 2.532, B256 7.990 -> 8.024 / 7.507 / 8.141 / 8.166, B1024 27.69 ->
-    28.50 / 26.67 / 26.78 / 26.89, B2048 55.88 -> 58.23 / 54.49 / 53.83 / 54.00. Not tuned: the tuner's runs (the
-    same launch again and again, its data warm in L2) took 0 at B256 and B2048 (+2-3% there)."""
-    sms = torch.cuda.get_device_properties(dev).multi_processor_count
-    nv = min(16 if tiles <= 12 * sms else 20, sms // 4)
-    if nv == 0:
-        return 0
-    side = -(-(B * K // 4) // nv) * X * 0.05
-    return nv if side <= 2 * -(-tiles // max(1, sms - nv)) * children else 0
+    launch's `tiles`, `children` a tile's k range), a quarter of the SMs at most, kept per shape.
+
+    Where they form V in whole rounds (`lowrank_stream.cu`'s `om_v_rows_whole`: a sample's round of ranks fits twice
+    in the shared memory -- `om_v_whole`), the count of the least time by the cost model above -- the tiles' rounds
+    over the SMs the side CTAs leave, `ceil(tiles / (sms - n)) t_tile`, against the side CTAs' samples,
+    `ceil(B / n) t_sample` --, the least count within 5% of it (OM_V_SLACK: rank 8's 1024 children at B1024 16 of
+    them, 5.69 ms, not 1%'s 17, 5.74). MEASURED (toast, HMM of 31 layers in blocks of 32, the forward's wall ms, the
+    rule below at the units -> this one with the whole rounds): rank 16 128 children B1024 1.51 -> 1.16, 256 B1024
+    2.25 -> 1.98, 512 B1024 4.37 -> 3.83, 512 B256 1.84 -> 1.41; rank 32 128 B1024 2.45 -> 1.98, 256 B1024 4.15 ->
+    3.91; rank 8 256 B1024 1.72 -> 1.35, 1024 B1024 5.67 -> 5.70; rank 64 256 B256 2.45 -> 2.06.
+
+    Where they form it in 4-rank units (many children): 16 where the tiles take at most 12 rounds of the SMs, 20 past
+    (the tiles long enough that more of V's work keeps up); 0, none -- the copy's rows by a launch of their own after
+    the forward -- where the units (~0.05 of a tile's time a child: ~1.15 us for 1024 children against ~24 us) would
+    take more than twice the tiles' rounds. MEASURED (croissant, HMM 1024 x 31 in blocks of 32, rank 16, step ms,
+    every copy's V upfront -> 12 / 16 / 20 / 24 side CTAs): B64 2.569 -> 2.504 / 2.506 / 2.520 / 2.532, B256 7.990 ->
+    8.024 / 7.507 / 8.141 / 8.166, B1024 27.69 -> 28.50 / 26.67 / 26.78 / 26.89, B2048 55.88 -> 58.23 / 54.49 / 53.83
+    / 54.00 (toast, the forward's wall ms at B2048, 16 / 17 / 20 / 24: 19.2 / 19.1 / 18.55 / 18.7 -- the model above
+    took 17 there).
+
+    Not tuned: the tuner's runs (the same launch again and again, its data warm in L2) took 0 at B256 and B2048 (+2-3%
+    there)."""
+    sms = _sms(dev)
+    key = (B, K, X, tiles, children, sms)
+    hit = _OM_VCTAS.get(key)
+    if hit is None:
+        mod = _stream_module()
+        if mod is not None and hasattr(mod, "om_v_whole") and bool(mod.om_v_whole(X, K)):
+            t_samp = OM_V_BESIDE * (OM_V_SAMPLE_US + OM_V_RANK_CHILD_US * K * X)
+            t_tile = OM_TILE_US + OM_TILE_CHILD_US * children
+            ts = [(max(-(-tiles // (sms - n)) * t_tile, -(-B // n) * t_samp), n)
+                  for n in range(1, max(1, sms // 4) + 1) if n < sms]
+            best = min(t for t, _ in ts) if ts else 0.0
+            hit = next((n for t, n in ts if t <= OM_V_SLACK * best), 0)
+        else:
+            nv = min(16 if tiles <= 12 * sms else 20, sms // 4)
+            side = -(-(B * K // 4) // max(1, nv)) * X * 0.05
+            hit = nv if nv > 0 and side <= 2 * -(-tiles // max(1, sms - nv)) * children else 0
+        _OM_VCTAS[key] = hit
+    return hit
 
 
 def _stream_module():

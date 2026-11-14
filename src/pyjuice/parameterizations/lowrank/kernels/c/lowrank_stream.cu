@@ -514,10 +514,107 @@ constexpr int OMV_G = 4, OMV_NB = 4, OMV_MAXX = 3, OMV_NW = OM_THREADS / 32;
 constexpr long OM_SMEM = (long)OM_ST * ((32 * OM_BM * 2 + 2 * 32 * OM_BN * 2 + 2 * 32 * (OM_BN / OM_K) * 4 + 1023) / 1024 *
                                        1024) + 2 * OM_ST * (OM_BN / OM_K) * 4 + 3 * OM_ST * 8;
 __host__ __device__ constexpr long omv_smem(int X) { return (long)OMV_NB * OMV_G * X * 4 + 8 * OMV_NB + 4 * 64; }
+__host__ __device__ constexpr long omk_smem(int KK);
+// WHOLE ROUNDS (`om_v_rows_whole`): where a sample's round of ranks (KH of them: all its ranks, rank 64's 32) fits in
+// the forward's shared memory twice or more -- few children --, the round is ONE unit, one bulk copy of its KH X
+// floats, up to OMV_WNB of them in flight, two barriers a round: the 4-rank units' two barriers a unit and one unit in
+// flight a buffer left a side CTA ~2.5 us a sample at 128 children (its loads' round trips and barriers, not its
+// work). The same operations: the same bits. `omv_whole_nb`: the buffers (0: the units' form).
+constexpr int OMV_WNB = 8;
+template <int KC>
+__host__ __device__ constexpr int omv_whole_nb(int X) {
+    constexpr int KH = KC > 32 ? 32 : KC;
+    const long n = ((KC == OM_K ? OM_SMEM : omk_smem(KC)) - 256) / ((long)KH * X * 4 + 8);
+    return n >= 2 ? (int)(n < OMV_WNB ? n : OMV_WNB) : 0;
+}
+template <int KC>
+__host__ __device__ constexpr long omv_whole_smem(int X) {
+    return (long)omv_whole_nb<KC>(X) * ((long)(KC > 32 ? 32 : KC) * X * 4 + 8) + 256;
+}
+template <int KC>
+__device__ __forceinline__ void om_v_rows_whole(const float* __restrict__ f0, long f_sb, bfloat16_t* __restrict__ out,
+                                                float* __restrict__ sh, long rows, long row0, int X, int B, int vi,
+                                                int n_v, int nbs) {
+    constexpr int KH = KC > 32 ? 32 : KC, NH = KC / KH;       // (a round's ranks; a sample's rounds)
+    constexpr int WPR = KH >= OMV_NW ? 1 : OMV_NW / KH, RPW = KH >= OMV_NW ? KH / OMV_NW : 1;   // (warps a rank, ranks a warp)
+    static_assert(KH % 8 == 0 && (KH >= OMV_NW ? KH % OMV_NW == 0 : OMV_NW % KH == 0), "a round's ranks over the warps");
+    const long ub = (long)KH * X;                               // (a round's floats)
+    float* buf = (float*)smem_raw;                              // [nbs][KH X]
+    uint64_t* bar = (uint64_t*)(smem_raw + (long)nbs * ub * 4);
+    float* red = (float*)(bar + nbs);                           // [KH][WPR]
+    const int tid = threadIdx.x, lane = tid & 31, w = tid >> 5;
+    const int nsamp = (B - vi + n_v - 1) / n_v, nu = nsamp * NH;
+    if (tid == 0) {
+        for (int q = 0; q < nbs; q++) mbar_init(&bar[q], 1);
+        asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+    }
+    __syncthreads();
+    const uint32_t bytes = (uint32_t)(ub * 4);
+    auto issue = [&](int u) {                                   // (thread 0: round u into buffer u % nbs)
+        const int q = u % nbs, b = vi + n_v * (u / NH), h = u % NH;
+        const uint32_t ba = (uint32_t)__cvta_generic_to_shared(&bar[q]);
+        const uint32_t da = (uint32_t)__cvta_generic_to_shared(buf + (long)q * ub);
+        asm volatile("mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _, [%0], %1;" ::"r"(ba), "r"(bytes) : "memory");
+        asm volatile("cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];"
+                     ::"r"(da), "l"(f0 + (long)b * f_sb + (long)h * ub), "r"(bytes), "r"(ba) : "memory");
+    };
+    if (tid == 0)
+        for (int u = 0; u < min(nbs, nu); u++) issue(u);
+    #pragma unroll 1
+    for (int u = 0; u < nu; u++) {
+        const int q = u % nbs, b = vi + n_v * (u / NH), h = u % NH;
+        mbar_wait(&bar[q], (u / nbs) & 1);
+        const float* in = buf + (long)q * ub;
+        #pragma unroll
+        for (int j = 0; j < RPW; j++) {                         // rank r's largest over its children (WPR warps a rank)
+            const int r = w / WPR + j * (OMV_NW / WPR), p = w % WPR;
+            float m = -INFINITY;
+            for (int x = p * 32 + lane; x < X; x += 32 * WPR) m = fmaxf(m, in[(long)r * X + x]);
+            for (int off = 16; off >= 1; off >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, off));
+            if (lane == 0) red[r * WPR + p] = m;
+        }
+        __syncthreads();
+        float mr[KH];
+        #pragma unroll
+        for (int r = 0; r < KH; r++) {
+            float m = red[r * WPR];
+            #pragma unroll
+            for (int i = 1; i < WPR; i++) m = fmaxf(m, red[r * WPR + i]);
+            mr[r] = m;
+        }
+        if (tid < KH) {                                         // (its own rank's max again: no array indexed by tid)
+            float m = red[tid * WPR];
+            for (int i = 1; i < WPR; i++) m = fmaxf(m, red[tid * WPR + i]);
+            sh[row0 + (long)b * KC + h * KH + tid] = m;
+        }
+        for (int x = tid; x < X; x += OM_THREADS) {             // (a child's run of the round's ranks at once)
+            uint4* dst = reinterpret_cast<uint4*>(out + (long)x * rows + row0 + (long)b * KC + h * KH);
+            #pragma unroll
+            for (int k = 0; k < KH / 8; k++) {
+                uint32_t pk[4];
+                #pragma unroll
+                for (int e = 0; e < 4; e++) {
+                    const int r = 8 * k + 2 * e;
+                    const float y0 = in[(long)r * X + x], y1 = in[(long)(r + 1) * X + x];
+                    const __nv_bfloat162 hv = __floats2bfloat162_rn(y0 > -INFINITY ? expf(y0 - mr[r]) : 0.0f,
+                                                                    y1 > -INFINITY ? expf(y1 - mr[r + 1]) : 0.0f);
+                    pk[e] = *reinterpret_cast<const uint32_t*>(&hv);
+                }
+                dst[k] = make_uint4(pk[0], pk[1], pk[2], pk[3]);
+            }
+        }
+        __syncthreads();                                        // (buffer q and `red` free again)
+        if (tid == 0 && u + nbs < nu) issue(u + nbs);
+    }
+}
 template <int KC>
 __device__ __forceinline__ void om_v_rows(const float* __restrict__ f0, long f_sb, bfloat16_t* __restrict__ out,
                                           float* __restrict__ sh, long rows, long row0, int X, int B, int vi,
                                           int n_v) {
+    {
+        const int nbs = omv_whole_nb<KC>(X);
+        if (nbs >= 2) { om_v_rows_whole<KC>(f0, f_sb, out, sh, rows, row0, X, B, vi, n_v, nbs); return; }
+    }
     static_assert(KC % OMV_G == 0 && OMV_NW % OMV_G == 0, "a unit's ranks; its warps a rank");
     constexpr int NG = KC / OMV_G, WPR = OMV_NW / OMV_G;      // (units a sample; warps a rank)
     static_assert(OMV_G == 4 && KC % 8 == 0, "a unit 2 bf16 pairs");
@@ -3765,6 +3862,15 @@ bool om_v_serves(int64_t N, int64_t K) {
     const long smem = K == OM_K ? OM_SMEM : (K == 8 || K == 32 || K == 64) ? omk_smem((int)K) : 0;   // (its forward's)
     return smem > 0 && N >= 1 && N <= OMV_MAXX * OM_THREADS && omv_smem((int)N) <= smem;
 }
+// Whether the side CTAs (and `lowrank_v_rows`) form N children's V rows at rank K in whole rounds (`om_v_rows_whole`)
+bool om_v_whole(int64_t N, int64_t K) {
+    if (N < 1 || N > OMV_MAXX * OM_THREADS) return false;
+    if (K == OM_K) return omv_whole_nb<OM_K>((int)N) >= 2;
+    if (K == 8) return omv_whole_nb<8>((int)N) >= 2;
+    if (K == 32) return omv_whole_nb<32>((int)N) >= 2;
+    if (K == 64) return omv_whole_nb<64>((int)N) >= 2;
+    return false;
+}
 void lowrank_v_rows(torch::Tensor vt, torch::Tensor shift, torch::Tensor fb, int64_t row0) {
     const long X = vt.size(0), rows = vt.size(1), B = fb.size(0), K = fb.size(1);
     TORCH_CHECK(om_v_serves(X, K) && vt.is_cuda() && vt.scalar_type() == torch::kBFloat16 && vt.is_contiguous() &&
@@ -3776,10 +3882,10 @@ void lowrank_v_rows(torch::Tensor vt, torch::Tensor shift, torch::Tensor fb, int
                 row0 + K * B <= rows, "lowrank v rows: B fp32 [B, K, N] in place (16-byte runs), V bf16 [N, rows]");
     if (B == 0) return;
     const at::cuda::OptionalCUDAGuard guard(vt.device());
-    const int smem = (int)omv_smem((int)X);
     const int grid = (int)std::min<long>(B, om_sms());
     auto go = [&](auto kc) {
         constexpr int KC = decltype(kc)::value;
+        const int smem = (int)(omv_whole_nb<KC>((int)X) >= 2 ? omv_whole_smem<KC>((int)X) : omv_smem((int)X));
         static bool attr_set[64] = {};
         int dev = 0;
         C10_CUDA_CHECK(cudaGetDevice(&dev));
@@ -4401,6 +4507,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "the sum_exp forward over the virtual batch in one launch: the operand formed in the GEMM, the maxima online");
     m.def("om_serves", &om_serves, "whether the one-launch form serves a layer (rank, batch, block size, node blocks)");
     m.def("om_v_serves", &om_v_serves, "whether the side CTAs (and lowrank_v_rows) form V's rows of N children at rank K");
+    m.def("om_v_whole", &om_v_whole, "whether the side CTAs form V's rows of N children at rank K in whole rounds");
     m.def("lowrank_v_rows", &lowrank_v_rows, "V's rows and their shifts of one copy, its factors read in place");
     m.def("omk_bw_serves", &omk_bw_serves, "whether the one-launch backward serves a partition at rank 8, 32 or 64");
     m.def("lowrank_backward_omk", &lowrank_backward_omk, "the one-launch backward at rank 8, 32 or 64");
