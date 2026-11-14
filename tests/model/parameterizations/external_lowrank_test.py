@@ -1721,11 +1721,15 @@ def test_the_fused_stream_forward_is_the_plain_virtual_path(form, bs, batch, ran
 
 
 @needs_virtual
-@pytest.mark.parametrize("bs,batch,param_flows,plain_middle,da_ctas", [(32, 16, True, False, 0), (64, 16, True, False, 0),
-                                                                        (128, 4, True, False, 0), (32, 12, True, False, 0),
-                                                                        (32, 16, False, False, 0), (32, 16, True, True, 0),
-                                                                        (32, 16, False, True, 0), (64, 16, True, False, 1)])
-def test_the_one_launch_backward_is_the_plain_data_half(bs, batch, param_flows, plain_middle, da_ctas, monkeypatch):
+@pytest.mark.parametrize("bs,batch,param_flows,plain_middle,da_ctas,rank",
+                         [(32, 16, True, False, 0, 16), (64, 16, True, False, 0, 16), (128, 4, True, False, 0, 16),
+                          (32, 12, True, False, 0, 16), (32, 16, False, False, 0, 16), (32, 16, True, True, 0, 16),
+                          (32, 16, False, True, 0, 16), (64, 16, True, False, 1, 16), (32, 16, True, False, 0, 8),
+                          (64, 8, True, False, 0, 8), (128, 16, False, True, 0, 8), (32, 16, True, False, 1, 8),
+                          (32, 16, True, False, 0, 32), (64, 6, True, False, 0, 32), (128, 4, False, True, 0, 32),
+                          (32, 16, True, False, 1, 32)])
+def test_the_one_launch_backward_is_the_plain_data_half(bs, batch, param_flows, plain_middle, da_ctas, rank,
+                                                        monkeypatch):
     """The virtual batch's one-launch backward (`virtual.FUSED_STREAM_BK`, `kernels/c/lowrank_stream.cu`'s
     `lr_om_bw_kernel`: the data half's element flows -- the product layer below handed to the backward, so its children's
     node flows --, dB's data half and its normalizer half, and, by the grid's first CTAs, dA), where it serves -- blocks of
@@ -1737,14 +1741,13 @@ def test_the_one_launch_backward_is_the_plain_data_half(bs, batch, param_flows, 
     withheld): its copy alone owes the normalizer half, past the normalizers' first rows -- with the parameter flows
     (U's rows every copy's: the denominators read them) and without (the owing copy's rows alone). `da_ctas`: the dA
     CTAs capped (one), so it strides over the tiles of the (node, sample) pairs (at these sizes a CTA has one tile
-    otherwise)."""
+    otherwise). Ranks 8 and 32: their kernel (`lowrank_backward_omk`, `lr_omk_bw_kernel`: S = 8 and 2 samples a tile)."""
     import pyjuice.parameterizations.lowrank.virtual as lowrank_virtual
     from pyjuice.layer.kernels import autotune
 
     pick = autotune.pick
     monkeypatch.setattr(autotune, "pick", lambda key, cands, bench, **k: "fused"
                         if key[0] in ("prod_stream_fusion", "prod_stream_fusion_bk") else pick(key, cands, bench, **k))
-    rank = 16
     pc, sums, _, _, _, _ = _pair(_hmm_blocks(256, bs), "sum_exp", rank = rank)
     monkeypatch.setattr(pc, "_param_operands_force", True, raising = False)   # (the bf16 copy: the stream path's)
     monkeypatch.setattr(lowrank_virtual, "GEMM_BF16_WORK", 0)                # (bf16 normalizers, as at real sizes)
@@ -1762,13 +1765,14 @@ def test_the_one_launch_backward_is_the_plain_data_half(bs, batch, param_flows, 
     monkeypatch.setattr(lowrank_virtual, "FUSED_STREAM_BK", False)
     plain = _passes(pc, sums, data, ext, param_flows = param_flows)
     smod = lowrank_virtual._stream_module()
-    calls, real = [], smod.lowrank_backward_om
+    name = "lowrank_backward_om" if rank == 16 else "lowrank_backward_omk"
+    calls, real = [], getattr(smod, name)
 
     def counted(*args):
         calls.append(args[22] is not None)                              # (whether it took dA: `grad_a`)
         return real(*args)
 
-    monkeypatch.setattr(smod, "lowrank_backward_om", counted)
+    monkeypatch.setattr(smod, name, counted)
     smod.set_da_ctas_most(da_ctas)
     if plain_middle:
         middle, plan_bk = pc.external_params_nodes[sums[len(sums) // 2]], lowrank_virtual._stream_plan_bk
@@ -1792,8 +1796,9 @@ def test_the_one_launch_backward_is_the_plain_data_half(bs, batch, param_flows, 
 
 
 @needs_virtual
-def test_tied_copies_through_the_one_launch_backward_into_one_destination(monkeypatch):
-    """`tie_external` through the one-launch backward (rank 16, blocks of 32): every copy reads the source's factors
+@pytest.mark.parametrize("rank", [16, 8, 32])
+def test_tied_copies_through_the_one_launch_backward_into_one_destination(rank, monkeypatch):
+    """`tie_external` through the one-launch backward (ranks 16, 8, 32, blocks of 32): every copy reads the source's factors
     and adds its gradients into the source's one destination, handed over unzeroed (`StagedExternalParams.fresh`;
     NaN-filled here) -- the first copy's launch stores into it (it claims it), every other one adds --: the sums of the
     untied circuit's gradients over its copies, to fp32's order of the additions; every layer took the form."""
@@ -1804,7 +1809,7 @@ def test_tied_copies_through_the_one_launch_backward_into_one_destination(monkey
     monkeypatch.setattr(autotune, "pick", lambda key, cands, bench, **k: "fused"
                         if key[0] in ("prod_stream_fusion", "prod_stream_fusion_bk") else pick(key, cands, bench, **k))
     monkeypatch.setattr(lowrank_virtual, "GEMM_BF16_WORK", 0)
-    rank, batch = 16, 8
+    batch = 8
     pc_t, sums_t, _, _, _, _ = _pair(_hmm_blocks(256, 32), "sum_exp", rank = rank, tie_external = True)
     pc_a, sums_a, _, _, _, _ = _pair(_hmm_blocks(256, 32), "sum_exp", rank = rank)
     for pc in (pc_t, pc_a):
@@ -1814,13 +1819,14 @@ def test_tied_copies_through_the_one_launch_backward_into_one_destination(monkey
     data = torch.randint(0, NUM_CATS, (batch, pc_t.num_vars), device = dev)
     A, B = _factors(sums_t[0], rank, batch, dev)
     smod = lowrank_virtual._stream_module()
-    stores, real = [], smod.lowrank_backward_om
+    name = "lowrank_backward_om" if rank == 16 else "lowrank_backward_omk"
+    stores, real = [], getattr(smod, name)
 
     def counted(*args):
         stores.append(args[-1])                                       # (whether the launch stored)
         return real(*args)
 
-    monkeypatch.setattr(smod, "lowrank_backward_om", counted)
+    monkeypatch.setattr(smod, name, counted)
     nan = float("nan")
     for _ in range(2):                                                # (the circuit settles its choices at the first)
         gt = (torch.full_like(A, nan), torch.full_like(B, nan))
@@ -4405,15 +4411,17 @@ def test_the_one_launch_tma_boxes_change_no_bit(bs, batch, fw, bw, monkeypatch):
 
 
 @needs_virtual
-@pytest.mark.parametrize("N, B, copies", [(64, 4, 3), (256, 16, 2), (1024, 8, 3), (1344, 4, 2)])
-def test_the_side_ctas_v_rows_are_the_operand_kernels(N, B, copies):
+@pytest.mark.parametrize("N, B, copies, K", [(64, 4, 3, 16), (256, 16, 2, 16), (1024, 8, 3, 16), (1344, 4, 2, 16),
+                                             (64, 4, 3, 8), (1024, 8, 3, 8), (256, 16, 2, 32), (1344, 4, 2, 32)])
+def test_the_side_ctas_v_rows_are_the_operand_kernels(N, B, copies, K):
     """`lowrank_v_rows` (the one-launch forward's side-CTA code, `kernels/c/lowrank_stream.cu`'s `om_v_rows`): a copy's
     V rows and their shifts, copy by copy at their rows, the same BITS as `lowrank_z_operand_in_place`'s (every copy in
     one launch) -- factors read in place at a sample stride past their block, entries of -inf (a rank of no finite
-    entry: its shift -inf, its V 0), children past one unit's threads (N 1344)."""
+    entry: its shift -inf, its V 0), children past one unit's threads (N 1344); ranks 8 and 32 (a sample's 2 and 8
+    units through the 4 buffers)."""
     import pyjuice.parameterizations.lowrank.virtual as lowrank_virtual
 
-    smod, mod, K = lowrank_virtual._stream_module(), lowrank_virtual._module(), 16
+    smod, mod = lowrank_virtual._stream_module(), lowrank_virtual._module()
     if smod is None or not smod.om_v_serves(N, K):
         pytest.skip("the side CTAs do not serve this shape")
     dev = torch.device("cuda")
@@ -4523,9 +4531,11 @@ class _NanEmpty:
 
 
 @needs_virtual
-@pytest.mark.parametrize("bs, batch, form, nv", [(32, 16, "om", 16), (256, 64, "om", 24), (32, 16, "om", 0),
-                                                (32, 16, "chain", None), (32, 16, "plain", None)])
-def test_the_pipelined_v_rows_change_no_bit(bs, batch, form, nv, monkeypatch):
+@pytest.mark.parametrize("bs, batch, form, nv, rank", [(32, 16, "om", 16, 16), (256, 64, "om", 24, 16),
+                                                      (32, 16, "om", 0, 16), (32, 16, "chain", None, 16),
+                                                      (32, 16, "plain", None, 16), (32, 16, "om", 16, 8),
+                                                      (32, 16, "om", 16, 32), (64, 6, "om", 0, 32)])
+def test_the_pipelined_v_rows_change_no_bit(bs, batch, form, nv, rank, monkeypatch):
     """V's rows a copy at a time (`virtual.PIPELINED_V`): once a pass left the copies' visit order, the next forms each
     copy's rows as it comes -- by the side CTAs of the one-launch forward before it (`lowrank_forward_om`'s `vnext`,
     as many as `virtual._om_vctas` gives: `nv`; 0, none: by a launch of its own after it), else by a launch of its own
@@ -4540,7 +4550,6 @@ def test_the_pipelined_v_rows_change_no_bit(bs, batch, form, nv, monkeypatch):
                         if key[0] in ("prod_stream_fusion", "prod_stream_fusion_bk") else pick(key, cands, bench, **k))
     if nv is not None:
         monkeypatch.setattr(lowrank_virtual, "_om_vctas", lambda *a: nv)
-    rank = 16
     pc, sums, _, _, _, _ = _pair(_hmm_blocks(256, bs), "sum_exp", rank = rank)
     monkeypatch.setattr(pc, "_param_operands_force", True, raising = False)   # (the bf16 copy: the stream path's)
     monkeypatch.setattr(lowrank_virtual, "GEMM_BF16_WORK", 0)                # (bf16 normalizers, as at real sizes)
@@ -4553,8 +4562,9 @@ def test_the_pipelined_v_rows_change_no_bit(bs, batch, form, nv, monkeypatch):
         monkeypatch.setattr(lowrank_virtual, "FUSED_STREAM", False)
     taken = _stream_form(monkeypatch, form) if form != "plain" else None
     side, own = [], []
-    fw, vr = smod.lowrank_forward_om, smod.lowrank_v_rows
-    monkeypatch.setattr(smod, "lowrank_forward_om", lambda *a: (side.append(a[-4] is not None), fw(*a))[1])
+    name = "lowrank_forward_om" if rank == 16 else "lowrank_forward_omk"   # (ranks 8, 32: `lr_omk_kernel`'s side CTAs)
+    fw, vr = getattr(smod, name), smod.lowrank_v_rows
+    monkeypatch.setattr(smod, name, lambda *a: (side.append(a[-4] is not None), fw(*a))[1])
     monkeypatch.setattr(smod, "lowrank_v_rows", lambda *a: (own.append(a[-1]), vr(*a))[1])
     monkeypatch.setattr(lowrank_virtual, "PIPELINED_V", False)
     want = _passes(pc, sums, data, ext)                                  # (every copy upfront; the order kept)

@@ -507,7 +507,7 @@ def _normalizers(desc, layer, info, st, kwargs, params, batch, dev) -> dict:
             smod = _stream_module() if PIPELINED_V else None
             pipe = smod is not None and ip and dtype is torch.bfloat16 and order is not None and \
                 len(order) == len(copies) and set(order) == {c for c, _ in copies} and \
-                bool(smod.om_v_serves(geo["N"], K))
+                bool(smod.om_v_serves(geo["N"], K)) and (K == 16 or OMK_V)
             if pipe:
                 Vt = torch.empty(geo["N"], len(fbs) * batch * K, dtype = dtype, device = dev)
                 shift = torch.empty(Vt.size(1), device = dev)
@@ -608,6 +608,11 @@ FORWARD_CMAX = True
 #: warp's n-blocks whole samples of the rank, the copies' V rows formed upfront -- no side CTAs) where it serves
 #: (`omk_serves`), a candidate beside the pre-pass chain's arms; off, those or the plain path there
 OMK = True
+#: The one-launch backward at ranks 8 and 32 (`lowrank_stream.cu`'s `lr_omk_bw_kernel`: rank 16's `lr_om_bw_kernel` at
+#: the tile's samples) where it serves (`omk_bw_serves`); off, the plain path there
+OMK_BW = True
+#: ... and its side CTAs forming the next copy's V rows, as rank 16's (`PIPELINED_V`); off, every copy's V upfront there
+OMK_V = True
 
 
 def _om_vctas(B: int, K: int, X: int, tiles: int, children: int, dev) -> int:
@@ -862,15 +867,16 @@ def _stream_run(plan, info, tensors, kwargs, z, row0, vnm, kd, node_mars, elemen
                                                               node_mars.size(1), device = node_mars.device)
 
                 def fw(nv):
-                    if K != 16:                         # (ranks 8, 32: V's rows every copy's upfront, no side CTAs)
+                    if K != 16:                         # (ranks 8, 32: `lr_omk_kernel`, no V / values boxes)
                         mod.lowrank_forward_omk(kd, vals, cb, p["ebase"], p["jpos"], vt, row0, shift, op, p["nids"],
                                                 p["pbase"], p["groups"][0], twin.block_size, p["knt"], p["om"][0],
-                                                p["om"][1], node_mars, lz, a_om, nshift, vn0, ua[0], ua[1], cmo)
-                        return
-                    mod.lowrank_forward_om(kd, vals, cb, p["ebase"], p["jpos"], vt, row0, shift, op, p["nids"],
-                                           p["pbase"], p["groups"][0], twin.block_size, p["knt"], p["om"][0],
-                                           p["om"][1], node_mars, lz, a_om, nshift, vn0, ua[0], ua[1], p["vtma"],
-                                           fbn if nv > 0 else None, z["row"][nxt] if nv > 0 else 0, nv, cmo)
+                                                p["om"][1], node_mars, lz, a_om, nshift, vn0, ua[0], ua[1],
+                                                fbn if nv > 0 else None, z["row"][nxt] if nv > 0 else 0, nv, cmo)
+                    else:
+                        mod.lowrank_forward_om(kd, vals, cb, p["ebase"], p["jpos"], vt, row0, shift, op, p["nids"],
+                                               p["pbase"], p["groups"][0], twin.block_size, p["knt"], p["om"][0],
+                                               p["om"][1], node_mars, lz, a_om, nshift, vn0, ua[0], ua[1], p["vtma"],
+                                               fbn if nv > 0 else None, z["row"][nxt] if nv > 0 else 0, nv, cmo)
                     if fbn is not None and nv == 0:
                         mod.lowrank_v_rows(z["V"], z["shift"], fbn, z["row"][nxt])
                 if nxt is None:
@@ -937,7 +943,9 @@ def _stream_plan_bk(desc, layer, twin, info, node_mars, stream_children, dev):
                 chids, ppar, ppid = (t[p].data.to(torch.int64).contiguous()
                                      for t in (twin.partitioned_chids, twin.partitioned_parids, twin.partitioned_parpids))
                 cbs, pbs = int(twin.cs_block_sizes[p]), twin.block_size
-                if ppar.dim() != 2 or not mod.om_bw_serves(K, B, cbs, pbs, chids.numel()):
+                serves = mod.omk_bw_serves if K != 16 and OMK_BW and hasattr(mod, "omk_bw_serves") else \
+                    mod.om_bw_serves
+                if ppar.dim() != 2 or not serves(K, B, cbs, pbs, chids.numel()):
                     ok = False
                     break
                 bpt = 128 // cbs if cbs < 128 else 1
@@ -1281,7 +1289,8 @@ def backward(desc, layer, ns_tensors, ns_grad_tensors, node_flows, element_flows
         for at, part in enumerate(plan["parts"]):
             # (dA by the first partition's launch: its grid's first CTAs)
             da = grads is not None and at == 0
-            smod.lowrank_backward_om(out, vals, table, first, fb, plan["jrow"], plan["e_lo"],
+            (smod.lowrank_backward_omk if K != 16 else smod.lowrank_backward_om)(
+                                     out, vals, table, first, fb, plan["jrow"], plan["e_lo"],
                                      None if grads is None else grads[1], ua, row0, am, node_flows, node_mars, lz,
                                      shift, plan["vn0"], op, part["chids"], part["ppar"], part["ppid"], part["cbs"],
                                      part["pbs"], grads[0] if da else None, kd if da else None, *part["atma"], store)
