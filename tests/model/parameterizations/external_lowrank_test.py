@@ -2832,7 +2832,8 @@ def test_the_fused_pass_end_is_the_kept_operands_products(structure, rank, batch
                                                       (130, 40, 16, 2, 2, True),    # M past a tile; the kept values
                                                       (6, 33, 32, 1, 5, False),     # rank 32: a sample a k32 step
                                                       (8, 8, 16, 2, 40, False)])    # many copies: the K splits over them
-def test_the_fused_pass_end_follows_the_kept_operands(M, N, K, B, copies, kept):
+@pytest.mark.parametrize("reduce", [-1, 0, 1])
+def test_the_fused_pass_end_follows_the_kept_operands(M, N, K, B, copies, kept, reduce):
     """`lowrank_pass_end_fused` (the fused pass's end: F+ and W each one split-K GEMM scaling the kept exponentials in
     its stages) against `lowrank_kept_operands`' operands multiplied in fp32: on the inputs of
     `test_the_kept_operands_follow_their_formulas` -- a child no edge reaches, a child without mass, a node without
@@ -2840,7 +2841,8 @@ def test_the_fused_pass_end_follows_the_kept_operands(M, N, K, B, copies, kept):
     half, W over those whose U is asked
     for, to the operands' last bits (the factors split: an entry's bf16 rounding may land a step the other way), never
     NaN, the same bits from run to run; ranks 8, 16, 32, M and N ragged under and past a tile (128 x 256), the copies'
-    children's values from the table or kept."""
+    children's values from the table or kept. `reduce`: the splits' sum by the rule (-1), the turnstile (0), the
+    partials and their launch (1) -- the last two at the same splits here (a wave's worth): the same bits."""
     import pyjuice.parameterizations.lowrank.virtual as lowrank_virtual
 
     mod, fmod, dev = lowrank_virtual._module(), lowrank_virtual._fused_end_module(), torch.device("cuda")
@@ -2897,12 +2899,14 @@ def test_the_fused_pass_end_follows_the_kept_operands(M, N, K, B, copies, kept):
             continue
         w = cvs[c] if cvs[c] is not None else _kept_children(node_mars, table, first, eids[c])
         cmos.append(torch.stack([p.max(0).values for p in w.tensor_split(3)]).contiguous())
-    outs = []
-    for cmo in ([None] * copies, [None] * copies, cmos):
+    outs, calls = [], [([None] * copies, reduce), ([None] * copies, reduce), (cmos, reduce)]
+    if reduce >= 0:                                                    # (the other sum beside it)
+        calls.append(([None] * copies, 1 - reduce))
+    for cmo, red in calls:
         F = torch.full((M, N), float("nan"), device = dev)
         W = torch.full((M, N), float("nan"), device = dev)
         fmod.lowrank_pass_end_fused(F, W, Ua, am, Vt, shb, node_flows, node_mars, lz, nid0, eid_of, tables,
-                                    [first if not kept else 0] * copies, row0, drow0, un, M, K, cvs, cmo)
+                                    [first if not kept else 0] * copies, row0, drow0, un, M, K, cvs, cmo, red)
         outs.append((F, W))
     torch.cuda.synchronize()
     for (got, want), name in zip(zip(outs[0], (want_f, want_w)), ("F+", "W")):
@@ -2912,6 +2916,8 @@ def test_the_fused_pass_end_follows_the_kept_operands(M, N, K, B, copies, kept):
             (name, float((got - want).abs().max()), float(want.abs().max()))
     assert torch.equal(outs[0][0], outs[1][0]) and torch.equal(outs[0][1], outs[1][1]), "run to run"
     assert torch.equal(outs[0][0], outs[2][0]) and torch.equal(outs[0][1], outs[2][1]), "c_m from tile maxima"
+    if len(outs) > 3:                                                  # (the turnstile and the partials: one order)
+        assert torch.equal(outs[0][0], outs[3][0]) and torch.equal(outs[0][1], outs[3][1]), "turnstile / partials"
 
 
 def _fp8_rows(q8, scales):
@@ -4579,7 +4585,7 @@ def test_the_forward_tile_maxima_change_no_bit(bs, batch, monkeypatch):
     monkeypatch.setattr(smod, "lowrank_forward_om", lambda *a: (given.append(a[-1] is not None), fw(*a))[1])
     took, args = [], []
     monkeypatch.setattr(fmod, "lowrank_pass_end_fused",
-                        lambda *a: (took.append(sum(t is not None for t in a[-1])), args.append(a), pe(*a))[2])
+                        lambda *a: (took.append(sum(t is not None for t in a[19])), args.append(a), pe(*a))[2])
     monkeypatch.setattr(lowrank_virtual, "FORWARD_CMAX", False)
     want = _passes(pc, sums, data, ext)
     assert taken and not any(given) and took and not any(took)

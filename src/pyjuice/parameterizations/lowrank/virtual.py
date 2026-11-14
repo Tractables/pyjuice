@@ -1271,7 +1271,7 @@ def _end_of_pass(mod, z, copies, node_flows, node_mars, params, param_flows, den
                 [c[5][0] if id(c) in at else None for c in part], [c[5][1] if id(c) in at else 0 for c in part],
                 [z["row"][c[1].ns] - ci * g for c in part], [at.get(id(c), -1) for c in part],
                 [int(id(c) in un) for c in part], M, K, [c[5][2] if id(c) in at else None for c in part],
-                [z.get("cmo", dict()).get(c[1].ns) if id(c) in at and FORWARD_CMAX else None for c in part])
+                [z.get("cmo", dict()).get(c[1].ns) if id(c) in at and FORWARD_CMAX else None for c in part], -1)
             if done:
                 if F is not None:
                     F.add_(Fc)
