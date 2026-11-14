@@ -161,6 +161,21 @@ def test_a_choice_not_offered_any_more_is_measured_again(store_dir, monkeypatch)
     assert len(calls) == 1
 
 
+def test_a_gate_not_offering_the_cached_choice_measures_again(store_dir, monkeypatch):
+    """A gate's choice read from the store by `cached` is another process's; where its arm does not run here, the gate
+    leaves it out of the arms it offers `choose`, which measures again among those (it returned the cached one, and the
+    gate ran an arm whose module was None)."""
+    key = ("gate", 2)
+    counted(("cuda_pipe", 1), monkeypatch)
+    assert A.choose(key, [(("triton", -1), lambda: None), (("cuda_pipe", 1), lambda: None)]) == ("cuda_pipe", 1)
+    fresh_process(monkeypatch)
+    assert A.cached(key) == ("cuda_pipe", 1)                    # (the store's, this process's from now on)
+    calls = counted(("cuda", 3), monkeypatch)
+    arms = [(("triton", -1), lambda: None), (("cuda", 3), lambda: None)]
+    assert A.choose(key, arms) == ("cuda", 3) and calls == [[("triton", -1), ("cuda", 3)]]
+    assert A.choose(key, arms) == ("cuda", 3) and A.cached(key) == ("cuda", 3) and len(calls) == 1
+
+
 def test_nothing_that_ran_is_nothing_to_go_by(store_dir, monkeypatch):
     calls = counted(None, monkeypatch)
     assert A.pick(("nothing ran", 1), ["a", "b"], lambda c: None) == "a"

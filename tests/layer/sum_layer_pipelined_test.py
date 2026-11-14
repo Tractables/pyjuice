@@ -113,9 +113,27 @@ def test_a_stored_choice_of_the_pipelined_forward_runs(module, monkeypatch):
     kernel's module not loaded yet, which only the making of the gate's candidates does -- the forward taking a stored
     ``("cuda_pipe", c)`` loads it first (it called the kernel with the module None: AttributeError), the values the
     plain CUDA kernel's to the bit; where the module does not load (another toolchain wrote the store), the choice is
-    measured again among the arms that run here, the values the plain kernel's to the arms' agreement."""
+    measured again among the arms that run here, the values the plain kernel's to the arms' agreement.
+
+    There this process's tuner holds the pipelined arm for the shape too, as it does once `cached` has read the
+    store: the warm-up below measures with the pipelined arm winning (a tuner of its own, nothing kept on disk). The
+    gate measures again, not takes it (`autotune.choose` returned a cached choice it was not offered: the test
+    failed whenever the arm won the warm-up's timing, AttributeError)."""
     if not (ck.is_available() and ck.pipe_is_available()):
         pytest.skip("the CUDA kernels are not available here")
+    if module == "not_loadable_here":
+        monkeypatch.setattr(autotune, "_CACHE", {})
+        monkeypatch.setattr(autotune, "_LOOKED_UP", set())
+        monkeypatch.setattr(autotune, "_store", lambda name: None)
+        real = autotune.best_of
+
+        def prefer_pipe(cands, *args, **kwargs):
+            for c, run in cands:
+                if isinstance(c, tuple) and c and c[0] == "cuda_pipe":
+                    run()
+                    return c
+            return real(cands, *args, **kwargs)
+        monkeypatch.setattr(autotune, "best_of", prefer_pipe)
     pc, V, C = _hmm()
     B = 64
     x = torch.randint(0, C, (B, V), device = DEV)

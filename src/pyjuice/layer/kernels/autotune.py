@@ -440,11 +440,19 @@ def choose(key, candidates: list):
     Unlike `pick`, it measures whatever `ENABLED` says, as these gates always have. During a CUDA graph capture
     an unmeasured key takes the reference, uncached (measuring synchronizes). The reference too when no
     candidate can run.
+
+    A choice cached for `key` that is not among `candidates` is measured again: one `cached` read from the store
+    (another process's) whose arm does not run here -- the gate left it out, its module not loading -- was
+    returned as it was, and the gate ran that arm (the tlmm gate's pipelined kernel, its module None:
+    AttributeError). The gates call this only where `cached` gave them nothing they run, so the check costs nothing
+    on the steady path.
     """
     key = _full_key(key)
     choice = _CACHE.get(key)
     if choice is not None:
-        return choice
+        if any(choice == c for c, _ in candidates):
+            return choice
+        del _CACHE[key]
     if _from_store(key, [c for c, _ in candidates]) is not None:
         return _CACHE[key]
     if _capturing():
