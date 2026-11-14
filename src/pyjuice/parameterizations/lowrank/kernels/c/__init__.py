@@ -89,9 +89,9 @@ _exp_sum_h_attempted = False
 
 def get_exp_sum_h_module():
     """The "exp_sum" form's fused passes at the default precision from fp16-rounded factors (`lowrank_exp_sum_h.cu`:
-    phi one fp16 MMA a tile), or None if unavailable (warns once; silently below compute capability 9.0, whose bulk
-    copies and tensor-map reduces they take): the bf16 three-term passes of `lowrank_exp_sum.cu` then serve. Plain
-    CUDA."""
+    phi one fp16 MMA a tile a 16 ranks, the factors' ranks padded to 16, 32 or 64), or None if unavailable (warns once;
+    silently below compute capability 9.0, whose bulk copies and tensor-map reduces they take): the bf16 three-term
+    passes of `lowrank_exp_sum.cu` then serve. Plain CUDA."""
     global _exp_sum_h_module, _exp_sum_h_attempted
 
     if _exp_sum_h_attempted:

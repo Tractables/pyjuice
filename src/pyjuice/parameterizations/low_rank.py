@@ -185,11 +185,12 @@ class LowRank(_ForwardMixin, _BackwardMixin, _DenominatorsMixin, SumParameteriza
         """The forward's staging hands the layers the caller's tensors themselves (no copy): `"sum_exp"` where the
         virtual batch can serve it (the CUDA extension built: `lowrank/virtual.py`); `"exp_sum"` where its fused
         kernels can (`lowrank/forward.py`'s `exp_sum_fused`: a rank they hold, their extension built -- the
-        fp16-rounded factors' kernels at rank 16, `exp_sum_h`, the bf16 / TF32 ones at the others and at `precision =
-        "fp32"`, all taking each sample's block where it lies and adding into the gradients where they lie), other
-        ranks copied."""
+        fp16-rounded factors' kernels at the ranks they hold, `exp_sum_h`, the bf16 / TF32 ones at the others and at
+        `precision = "fp32"`, all taking each sample's block where it lies and adding into the gradients where they
+        lie), other ranks copied."""
         if self.form == "exp_sum":
-            if lowrank_forward.EXP_SUM_H and self.rank == 16 and lowrank_forward.exp_sum_h_module() is not None:
+            if lowrank_forward.EXP_SUM_H and self.rank <= lowrank_forward.EXP_SUM_H_RANK_MOST and \
+                    lowrank_forward.exp_sum_h_module() is not None:
                 return True
             return lowrank_forward.EXP_SUM_FUSED and self.rank <= lowrank_forward.EXP_SUM_FUSED_RANK_MOST and \
                 lowrank_forward.exp_sum_module() is not None
@@ -197,10 +198,11 @@ class LowRank(_ForwardMixin, _BackwardMixin, _DenominatorsMixin, SumParameteriza
 
     def external_dtypes(self, ns):
         """float32, and float16 / bfloat16 where the "exp_sum" form's fused kernels read the factors in place
-        (`reads_in_place`): the fp16 kernels (rank 16) take fp16 factors as they lie -- the rounding they make of
-        float32 ones anyway, `A' = log2 e A` rounded once more from fp16 A (`lowrank/kernels/c/lowrank_exp_sum_h.cu`'s
-        `scale_h2`) -- with no copy, bf16 ones (an autocast head's) through their fp16 copy, as float32 ones; the bf16
-        / TF32 kernels (the other ranks, `precision = "fp32"`) take any of the three as they lie, their values exactly
+        (`reads_in_place`): the fp16 kernels (`lowrank/forward.py`'s `exp_sum_h`) take fp16 factors of their padded
+        ranks (16, 32, 64) as they lie -- the rounding they make of float32 ones anyway, `A' = log2 e A` rounded once
+        more from fp16 A (`lowrank/kernels/c/lowrank_exp_sum_h.cu`'s `scale_h2`) -- with no copy, the others (bf16
+        ones, an autocast head's; fp16 ones of other ranks) through their fp16 copy, as float32 ones; the bf16 / TF32
+        kernels (the other ranks, `precision = "fp32"`) take any of the three as they lie, their values exactly
         (`lowrank_exp_sum.cu`'s prologues)."""
         if self.form == "exp_sum" and self.reads_in_place(ns):
             return (torch.float32, torch.float16, torch.bfloat16)

@@ -836,18 +836,24 @@ def _same(x, y, rtol, atol, grad_scale = None):
 
 
 #: The fused exp_sum kernels' tolerances against the torch passes: `precision = "fp32"` (three-term TF32) as fp32;
-#: the default (bf16 products) the same but for the gradients, a share of their largest entry; the default at rank 16
-#: (`"h"`: the exp_sum of the fp16-ROUNDED factors, `lowrank_exp_sum_h.cu` -- each phi ~2^-11 |A| |B| off the
-#: unrounded one's: values ~1e-3 nats a layer, F+ and W ~5e-3, the gradients a few 1e-3 of their largest entry; the
-#: kernels against the rounded factors' float64 are tested on their own, tightly)
+#: the default (bf16 products) the same but for the gradients, a share of their largest entry; the default at the ranks
+#: the fp16 kernels hold (`"h"`: the exp_sum of the fp16-ROUNDED factors, `lowrank_exp_sum_h.cu` -- each phi ~2^-11
+#: |A| |B| off the unrounded one's: values ~1e-3 nats a layer, F+ and W ~5e-3, the gradients a few 1e-3 of their
+#: largest entry; the kernels against the rounded factors' float64 are tested on their own, tightly)
 FUSED_TOL = {"fp32": dict(rtol = 2e-4, atol = 2e-5), "auto": dict(rtol = 2e-4, atol = 2e-5, grad_scale = 2e-2),
              "h": dict(rtol = 1e-2, atol = 2e-3, grad_scale = 1e-2)}
 
 
 def _fused_tol(rank, precision):
-    """`FUSED_TOL` for a run of the fused kernels at `rank` and `precision`: the fp16-rounded factors' at rank 16 and
-    the default precision (`lowrank.forward.exp_sum_h`)."""
-    return FUSED_TOL["h" if rank == 16 and precision != "fp32" else precision]
+    """`FUSED_TOL` for a run of the fused kernels at `rank` and `precision`: the fp16-rounded factors' at the ranks they
+    hold and the default precision (`lowrank.forward.exp_sum_h`)."""
+    return FUSED_TOL["h" if _h_rank(rank) and precision != "fp32" else precision]
+
+
+def _h_rank(rank):
+    """Whether the fp16-rounded factors' kernels take `rank` at the default precision (`lowrank.forward.exp_sum_h`)."""
+    import pyjuice.parameterizations.lowrank.forward as lr_forward
+    return lr_forward.EXP_SUM_H and rank <= lr_forward.EXP_SUM_H_RANK_MOST and lr_forward.exp_sum_h_module() is not None
 
 
 @needs_virtual
@@ -3365,7 +3371,7 @@ def test_the_fused_exp_sum_is_the_torch_pass(name, rank, batch, precision, monke
         desc = _source(a).parameterization
         gridded += desc._geometry(layer, desc._info(layer, a), dev)["grid"] is not None
     assert _n_fused(calls, "forward") == gridded and _n_fused(calls, "backward") == gridded, (calls, gridded)
-    assert all(("_h_" in c) == (rank == 16 and precision != "fp32") for c in calls), calls
+    assert all(("_h_" in c) == (_h_rank(rank) and precision != "fp32") for c in calls), calls
     monkeypatch.setattr(lr_forward, "EXP_SUM_FUSED", False)
     del calls[:]
     want = _passes(pc, sums, data, ext)
@@ -3681,10 +3687,11 @@ needs_fused_h = pytest.mark.skipif(not torch.cuda.is_available(), reason = "the 
 LOG2E, LN2 = 1.4426950408889634, 0.6931471805599453
 
 
-def _h_case(M, N, B, bs = 32, cbs = 32, gain = 1.0, pdtype = torch.float32, theta_zero = 0.0, seed = 0):
-    """A node vector's inputs at rank 16 on the GPU: theta ~ softmax(4 randn) (a share zeroed, every node keeping its
-    first child) block-major in `params` from 448 on, router-like factors (B centered over the children, each A row
-    at `gain` standard deviations of phi), child values ~ N(0, 9), node flows Dirichlet(1) a sample."""
+def _h_case(M, N, B, bs = 32, cbs = 32, gain = 1.0, pdtype = torch.float32, theta_zero = 0.0, seed = 0, K = 16):
+    """A node vector's inputs at rank K (16 unless given) on the GPU: theta ~ softmax(4 randn) (a share zeroed, every
+    node keeping its first child) block-major in `params` from 448 on, router-like factors (B centered over the
+    children, each A row at `gain` standard deviations of phi), child values ~ N(0, 9), node flows Dirichlet(1) a
+    sample."""
     dev = torch.device("cuda:0")
     g = torch.Generator(device = dev).manual_seed(seed)
     f64 = torch.float64
@@ -3692,9 +3699,9 @@ def _h_case(M, N, B, bs = 32, cbs = 32, gain = 1.0, pdtype = torch.float32, thet
     if theta_zero > 0:
         theta = theta * (torch.rand(M, N, device = dev, generator = g, dtype = f64) > theta_zero)
         theta[:, 0] += 0.01
-    Bf = 4.0 * torch.randn(B, 16, N, device = dev, generator = g, dtype = f64)
+    Bf = 4.0 * torch.randn(B, K, N, device = dev, generator = g, dtype = f64)
     Bf = Bf - Bf.mean(-1, keepdim = True)
-    A = torch.randn(B, M, 16, device = dev, generator = g, dtype = f64)
+    A = torch.randn(B, M, K, device = dev, generator = g, dtype = f64)
     C = Bf @ Bf.transpose(-1, -2) / N
     A = gain * A / torch.sqrt(((A @ C) * A).sum(-1, keepdim = True))
     Nb = N // cbs
@@ -3708,7 +3715,7 @@ def _h_case(M, N, B, bs = 32, cbs = 32, gain = 1.0, pdtype = torch.float32, thet
     emars[3:3 + N] = (3.0 * torch.randn(B, N, device = dev, generator = g, dtype = f64)).t().float()
     lf = torch.log(torch.distributions.Dirichlet(torch.ones(M, device = dev, dtype = f64)).sample((B,)))
     return dict(A = A.float().contiguous(), Bf = Bf.float().contiguous(), params = params, p0 = p0, Nb = Nb, cbs = cbs,
-                bs = bs, emars = emars, rows = torch.arange(N, device = dev) + 3, M = M, N = N, B = B, off = off,
+                bs = bs, emars = emars, rows = torch.arange(N, device = dev) + 3, M = M, N = N, B = B, K = K, off = off,
                 theta = params[p0 + off.reshape(-1)].double().view(M, N), c = emars[3:3 + N].double().t(), lf = lf)
 
 
@@ -3719,10 +3726,10 @@ def _h_run(mod, d, A = None, Bf = None, grads = None, keep = False, init = False
     M], log element flows [B, N], F+ [M, N], W [M, N], dA, dB)."""
     A = d["A"] if A is None else A
     Bf = d["Bf"] if Bf is None else Bf
-    M, N, B, dev = d["M"], d["N"], d["B"], d["A"].device
+    M, N, B, K, dev = d["M"], d["N"], d["B"], d.get("K", 16), d["A"].device
     nm = torch.full([11 + M, B], 123.0, device = dev)
     lz, *copy = mod.exp_sum_h_forward(A, Bf, d["params"], d["p0"], d["Nb"], d["cbs"], d["bs"], d["emars"], d["rows"],
-                                      nm, 11, M, N, 16, 64, [], keep)
+                                      nm, 11, M, N, K, 64, [], keep)
     assert bool((nm[:11] == 123.0).all())                  # (only the node vector's rows written)
     assert (copy[0].numel() > 0) == (keep and not _h_in_place(A, Bf))
     nflows = torch.full_like(nm, -float("inf"))
@@ -3730,19 +3737,20 @@ def _h_run(mod, d, A = None, Bf = None, grads = None, keep = False, init = False
     ef = torch.full_like(d["emars"], -float("inf"))
     pf = torch.zeros(d["p0"] + M * N, device = dev)
     dn = torch.zeros_like(pf)
-    gA, gB = grads if grads is not None else (torch.zeros(B, M, 16, device = dev), torch.zeros(B, 16, N, device = dev))
+    gA, gB = grads if grads is not None else (torch.zeros(B, M, K, device = dev), torch.zeros(B, K, N, device = dev))
     mod.exp_sum_h_backward(A, Bf, d["params"], d["p0"], d["Nb"], d["cbs"], d["bs"], d["emars"], d["rows"], nflows, nm,
-                           11, lz.contiguous(), ef, pf, 0, dn, 0, gA, gB, M, N, 16, copy if keep else [], init)
+                           11, lz.contiguous(), ef, pf, 0, dn, 0, gA, gB, M, N, K, copy if keep else [], init)
     off = d["off"]                                          # (F+ and W from offset 0 of their buffers)
     return nm[11:].t(), lz.t(), ef[3:3 + N].t(), pf[off], dn[off], gA, gB
 
 
 def _h_in_place(A, Bf):
-    """Whether the fp16 kernels read the factors where they lie: fp16, each sample's block 16-byte aligned, M a
-    multiple of 4, N of 8 (`h_in_place`); else through an fp16 copy."""
+    """Whether the fp16 kernels read the factors where they lie: fp16 of a rank they pad nothing to (16, 32, 64),
+    each sample's block 16-byte aligned, M a multiple of 64 / K, N of 8 (`h_in_place`); else through an fp16 copy."""
     al = lambda t: t.data_ptr() % 16 == 0 and (t.size(0) <= 1 or t.stride(0) % 8 == 0)
-    return A.dtype == torch.float16 and Bf.dtype == torch.float16 and al(A) and al(Bf) and A.size(1) % 4 == 0 and \
-        Bf.size(2) % 8 == 0
+    K = A.size(2)
+    return A.dtype == torch.float16 and Bf.dtype == torch.float16 and K in (16, 32, 64) and al(A) and al(Bf) and \
+        A.size(1) % (64 // K) == 0 and Bf.size(2) % 8 == 0
 
 
 def _scale_h2(A16):
@@ -3790,6 +3798,67 @@ def test_the_fp16_exp_sum_is_the_rounded_factors_exp_sum(case):
         pytest.skip("the fp16 exp_sum kernels are not built")
     d = _h_case(**case)
     _h_check(_h_run(mod, d), _h_reference(d))
+
+
+@needs_fused_h
+@pytest.mark.parametrize("K", [1, 4, 7, 8, 12, 24, 32, 40, 63, 64])
+@pytest.mark.parametrize("case", [dict(M = 512, N = 512, B = 6),
+                                  dict(M = 500, N = 488, B = 5, bs = 4, cbs = 8, gain = 2.0),
+                                  dict(M = 256, N = 512, B = 4, theta_zero = 0.7, pdtype = torch.bfloat16)])
+def test_the_fp16_exp_sum_at_any_rank_is_the_rounded_factors_exp_sum(K, case):
+    """The fp16 kernels at ranks other than 16: the factors' K ranks padded with zeros to 16, 32 or 64 (the copy's,
+    `conv_copy`) -- one, two or four MMAs a 16 x 8 tile; the backward's ranks 32 and 64 their own kernel
+    (`hbk_bw_kernel`: dA's partials by a bulk add or 16-byte reductions); dB's tensor map the caller's K rank rows, dA's
+    rows of K < 16 or 32 a box of a tensor map, of a K not a multiple of 4 temporaries -- every output against float64
+    of the same rounded factors to the rank-16 tests' bars: fp32 and fp16 factors (read in place at K 32 and 64), with
+    and without the forward's kept copy."""
+    mod = _fused_h_module()
+    if mod is None:
+        pytest.skip("the fp16 exp_sum kernels are not built")
+    d = _h_case(K = K, **case)
+    for kind in ("fp32", "fp16"):
+        A, Bf = (d["A"], d["Bf"]) if kind == "fp32" else (d["A"].half(), d["Bf"].half())
+        want = _h_reference(d, None if kind == "fp32" else A)
+        for keep in (False, True):
+            _h_check(_h_run(mod, d, A = A, Bf = Bf, keep = keep), want)
+
+
+@needs_fused_h
+@pytest.mark.parametrize("K", [4, 7, 8, 12, 24, 32, 40, 63, 64])
+def test_the_fp16_exp_sum_at_any_rank_reads_the_callers_tensors_where_they_lie(K):
+    """At other ranks than 16 the fp16 kernels too take the factors and add the gradients where the caller's tensors
+    lie -- views at a sample stride past their block, fp32 (through the copy) and fp16 (in place at K 32 and 64), the
+    gradients into views (dA's rows a box of a tensor map where K < 16 or 32, 16-byte reductions at 64, temporaries
+    where K is not a multiple of 4) -- the outputs those of contiguous tensors: the forward's bit for bit, the summed
+    ones to their order's rounding; nothing outside the views touched."""
+    mod = _fused_h_module()
+    if mod is None:
+        pytest.skip("the fp16 exp_sum kernels are not built")
+    d = _h_case(500, 488, 5, bs = 4, cbs = 8, K = K)
+    B, M, N = d["B"], d["M"], d["N"]
+    dev = d["A"].device
+    for dt in (torch.float32, torch.float16):
+        A0, B0 = d["A"].to(dt), d["Bf"].to(dt)
+        bigA = torch.randn(B, M + 5, K, device = dev).to(dt)
+        bigA[:, 3:3 + M] = A0
+        bigB = torch.randn(B, K + 2, N, device = dev).to(dt)
+        bigB[:, 1:1 + K] = B0
+        gbA = torch.full((B, M + 5, K), 7.0, device = dev)
+        gbB = torch.full((B, K + 2, N), 7.0, device = dev)
+        gA, gB = gbA[:, 3:3 + M], gbB[:, 1:1 + K]
+        gA.zero_()
+        gB.zero_()
+        assert not bigA[:, 3:3 + M].is_contiguous() and not gB.is_contiguous()
+        got = _h_run(mod, d, A = bigA[:, 3:3 + M], Bf = bigB[:, 1:1 + K], grads = (gA, gB))
+        want = _h_run(mod, d, A = A0, Bf = B0)
+        for k in (0, 1):
+            assert torch.equal(got[k], want[k]), (dt, k)
+        fin = torch.isfinite(want[2])
+        assert torch.equal(torch.isfinite(got[2]), fin) and float((got[2] - want[2])[fin].abs().max()) < 1e-5, dt
+        for k in (3, 4, 5, 6):
+            assert float((got[k] - want[k]).abs().max()) <= 1e-5 * float(want[k].abs().max()), (dt, k)
+        for rest in (gbA[:, :3], gbA[:, 3 + M:], gbB[:, 0], gbB[:, 1 + K:]):
+            assert bool((rest == 7.0).all()), dt
 
 
 def _h_check(got, want):
@@ -3849,13 +3918,14 @@ def test_the_fp16_exp_sum_reads_the_callers_tensors_where_they_lie():
 
 
 @needs_fused_h
+@pytest.mark.parametrize("K", [16, 4, 32, 64])
 @pytest.mark.parametrize("batch", [4, 100])
-def test_the_fp16_exp_sum_forward_off_its_frames(batch):
+def test_the_fp16_exp_sum_forward_off_its_frames(batch, K):
     """The fp16 forward's rare paths: a tile whose large weights and large child values sit on different children
     (rank 0 puts every other child's scale at e^-95, every other child's value 100 nats down: the factorized S is 0
     though S is not -- the tile made again exactly), and half the nodes' terms flushed under their row's frame or
-    past 2^100 (rank 0 at -95 or +80 for the even nodes: the shifted sums). Node values and log Z against float64 from
-    the same fp16-rounded factors."""
+    past 2^100 (rank 0 at -95 or +80 for the even nodes: the shifted sums) -- the comb's remade items a k-step of MMAs
+    at a time at ranks 32 and 64. Node values and log Z against float64 from the same fp16-rounded factors."""
     mod = _fused_h_module()
     if mod is None:
         pytest.skip("the fp16 exp_sum kernels are not built")
@@ -3864,8 +3934,8 @@ def test_the_fp16_exp_sum_forward_off_its_frames(batch):
     bs = cbs = 32
     for kind in ("apart", "low", "high"):
         g = torch.Generator(device = "cpu").manual_seed(3)
-        A = 0.3 * torch.randn(batch, M, 16, generator = g)
-        Bm = 0.3 * torch.randn(batch, 16, N, generator = g)
+        A = 0.3 * torch.randn(batch, M, K, generator = g)
+        Bm = 0.3 * torch.randn(batch, K, N, generator = g)
         emars = -5.0 + torch.randn(N, batch, generator = g)
         if kind == "apart":
             A[:, :, 0] = 1.0
@@ -3881,7 +3951,7 @@ def test_the_fp16_exp_sum_forward_off_its_frames(batch):
         params = theta.view(M // bs, bs, N // cbs, cbs).permute(0, 2, 3, 1).contiguous().view(-1).to(dev)
         nmars = torch.empty(M, batch, device = dev)
         lzs = mod.exp_sum_h_forward(A.to(dev).contiguous(), Bm.to(dev).contiguous(), params, 0, N // cbs, cbs, bs,
-                                    emars.to(dev).contiguous(), torch.arange(N, device = dev), nmars, 0, M, N, 16, 64, [],
+                                    emars.to(dev).contiguous(), torch.arange(N, device = dev), nmars, 0, M, N, K, 64, [],
                                     False)[0]
         A2 = (A * LOG2E).half().double()
         lw = torch.bmm(A2, Bm.half().double()) * LN2 + theta.double().log()[None]
@@ -3893,8 +3963,8 @@ def test_the_fp16_exp_sum_forward_off_its_frames(batch):
 
 
 @needs_fused
-@pytest.mark.parametrize("path,rank,precision", [("fp16", 16, "auto"), ("bf16", 16, "auto"), ("bf16", 4, "auto"),
-                                                 ("bf16", 4, "fp32")])
+@pytest.mark.parametrize("path,rank,precision", [("fp16", 16, "auto"), ("fp16", 4, "auto"), ("fp16", 64, "auto"),
+                                                 ("bf16", 16, "auto"), ("bf16", 4, "auto"), ("bf16", 4, "fp32")])
 @pytest.mark.parametrize("batch", [3, 100])
 def test_the_exp_sum_forward_folds_tiles_far_apart(path, rank, precision, batch):
     """The combine folds the column tiles' (shift, sum) pairs, a tile's sums unshifted under its frames where they lie
@@ -3925,7 +3995,7 @@ def test_the_exp_sum_forward_folds_tiles_far_apart(path, rank, precision, batch)
     args = (A.to(dev).contiguous(), Bm.to(dev).contiguous(), params, 0, N // cbs, cbs, bs, emars.to(dev).contiguous(),
             torch.arange(N, device = dev), nmars, 0, M, N)
     if path == "fp16":
-        lzs = mod.exp_sum_h_forward(*args, 16, 64, [], False)[0]
+        lzs = mod.exp_sum_h_forward(*args, rank, 64, [], False)[0]
         lw = torch.bmm((A * LOG2E).half().double(), Bm.half().double()) * LN2
     else:
         lzs = mod.exp_sum_forward(*args, rank, precision != "fp32")
@@ -3971,7 +4041,8 @@ def test_the_fp16_forward_makes_a_runs_theta_once_a_pass(monkeypatch):
 
 
 @needs_fused_h
-def test_the_fp16_exp_sum_in_chunks_is_the_whole_batchs():
+@pytest.mark.parametrize("K", [16, 8, 64])
+def test_the_fp16_exp_sum_in_chunks_is_the_whole_batchs(K):
     """A batch whose working set exceeds the L2 runs the fp16 passes a chunk of samples at a time: every output
     against the same passes over the batch's slices -- the forward's node values and log Z bit for bit (a sample's
     work is the same in any chunk; the tiles' theta made once a call), the backward's sums over samples and tiles to
@@ -3979,7 +4050,7 @@ def test_the_fp16_exp_sum_in_chunks_is_the_whole_batchs():
     mod = _fused_h_module()
     if mod is None:
         pytest.skip("the fp16 exp_sum kernels are not built")
-    d = _h_case(1024, 1024, 420)
+    d = _h_case(1024, 1024, 420, K = K)
     whole = _h_run(mod, d)
     parts = []
     for lo, hi in ((0, 140), (140, 280), (280, 420)):
@@ -4000,20 +4071,22 @@ def test_the_fp16_exp_sum_in_chunks_is_the_whole_batchs():
 
 
 @needs_fused_h
+@pytest.mark.parametrize("K", [16, 8, 7, 32, 64])
 @pytest.mark.parametrize("case", [dict(M = 512, N = 512, B = 8), dict(M = 500, N = 490, B = 5, bs = 4, cbs = 10),
                                   dict(M = 1024, N = 1024, B = 420)])
-def test_the_fp16_backward_initializes_its_gradient_buffers(case):
+def test_the_fp16_backward_initializes_its_gradient_buffers(case, K):
     """`init` (the gradient buffers' first writer: `LowRank.initializes_grads`): buffers holding anything -- NaN here
     -- come back what zeroed buffers the backward adds into do, every element written: the slices of each chunk of
     samples (420: two) zeroed by the prep kernel ahead of the adds where those go to the caller's buffers, the
-    temporaries copied in where they do not (N = 490: rows not 16-byte multiples). To fp32's order of the adds."""
+    temporaries copied in where they do not (N = 490: rows not 16-byte multiples; K = 7: dA's rows not either), at
+    ranks 16, 8, 7, 32 and 64. To fp32's order of the adds."""
     mod = _fused_h_module()
     if mod is None:
         pytest.skip("the fp16 exp_sum kernels are not built")
-    d = _h_case(**case)
+    d = _h_case(K = K, **case)
     B, M, N, dev = d["B"], d["M"], d["N"], d["A"].device
-    added = _h_run(mod, d, grads = (torch.zeros(B, M, 16, device = dev), torch.zeros(B, 16, N, device = dev)))
-    nan = (torch.full((B, M, 16), float("nan"), device = dev), torch.full((B, 16, N), float("nan"), device = dev))
+    added = _h_run(mod, d, grads = (torch.zeros(B, M, K, device = dev), torch.zeros(B, K, N, device = dev)))
+    nan = (torch.full((B, M, K), float("nan"), device = dev), torch.full((B, K, N), float("nan"), device = dev))
     got = _h_run(mod, d, grads = nan, init = True)
     for k in (5, 6):
         assert bool(torch.isfinite(got[k]).all()), k

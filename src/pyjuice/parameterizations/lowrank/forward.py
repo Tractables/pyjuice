@@ -25,11 +25,14 @@ EXP_SUM_FUSED_RANK_MOST = 64
 #: atomically, a CTA holding them for its samples only) -- ranks to 8 and the TF32 path; the bf16 big tiles (ranks 9 ..
 #: 64) take it as their persistent CTAs' count at most (0: the GPU's)
 EXP_SUM_ZSPLIT = 0
-#: At rank 16 and the default precision, the kernels of the exp_sum of the fp16-ROUNDED factors
-#: (`kernels/c/lowrank_exp_sum_h.cu`: A' = log2 e A and B rounded to fp16 once, one MMA a 16 x 8 tile, fp32 sums) where
-#: the fused kernels serve (`exp_sum_h`); off, the bf16 three-term kernels of the unrounded factors. They read fp16
-#: factors where they lie (`LowRank.external_dtypes`), others (fp32, bf16) through an fp16 copy
+#: At the default precision, the kernels of the exp_sum of the fp16-ROUNDED factors (`kernels/c/lowrank_exp_sum_h.cu`:
+#: A' = log2 e A and B rounded to fp16 once, the ranks padded with zeros to 16, 32 or 64 -- one MMA a 16 x 8 tile a 16
+#: of them --, fp32 sums) where the fused kernels serve (`exp_sum_h`); off, the bf16 three-term kernels of the
+#: unrounded factors. They read fp16 factors of a padded rank where they lie (`LowRank.external_dtypes`), others (fp32,
+#: bf16, fp16 of other ranks) through an fp16 copy
 EXP_SUM_H = True
+#: ... up to this rank
+EXP_SUM_H_RANK_MOST = 64
 #: ... their forward's tiles' children
 EXP_SUM_H_TN = 64
 #: ... the forward's fp16 copy of the factors (made where they are fp32, or fp16 the kernels cannot read in place) kept
@@ -57,8 +60,8 @@ def exp_sum_h_module():
 
 def exp_sum_h(desc, kwargs) -> bool:
     """Whether a node vector the fused kernels take (`exp_sum_fused`) goes through the fp16-rounded factors' kernels:
-    rank 16, the default precision, their module built (`EXP_SUM_H`)."""
-    return EXP_SUM_H and desc.rank == 16 and exp_sum_bf16(kwargs) and exp_sum_h_module() is not None
+    a rank they hold (`EXP_SUM_H_RANK_MOST`), the default precision, their module built (`EXP_SUM_H`)."""
+    return EXP_SUM_H and desc.rank <= EXP_SUM_H_RANK_MOST and exp_sum_bf16(kwargs) and exp_sum_h_module() is not None
 
 
 def exp_sum_h_theta(geo, params, kwargs) -> list:

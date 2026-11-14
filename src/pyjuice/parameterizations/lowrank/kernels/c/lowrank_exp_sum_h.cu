@@ -1,7 +1,8 @@
 // `LowRank`'s "exp_sum" form at the default precision, its scale from fp16-ROUNDED factors: phi_b = A'_b @ B_b with
-// A' = log2 e A and B each rounded to fp16 once, the product exact in fp32 accumulation (one m16n8k16 MMA a 16 x 8 tile)
-// -- the exp_sum of the rounded factors, the forward's and the backward's alike -- where `lowrank_exp_sum.cu`'s bf16 path
-// splits each factor into hi + lo (three MMAs) to make the unrounded one. The rest is that file's formulation:
+// A' = log2 e A and B each rounded to fp16 once, the product exact in fp32 accumulation (one m16n8k16 MMA a 16 x 8 tile
+// a 16 ranks: the factors' K padded with zeros to KP = 16, 32 or 64) -- the exp_sum of the rounded factors, the
+// forward's and the backward's alike -- where `lowrank_exp_sum.cu`'s bf16 path splits each factor into hi + lo (three
+// MMAs) to make the unrounded one. The rest is that file's formulation:
 //
 //     lw_b[i, j] = phi_b[i, j] + log theta[i, j]                    (-inf where theta is 0)
 //     Z_b[i] = sum_j exp(lw_b[i, j])        S_b[i] = sum_j exp(lw_b[i, j] + c_b[j])        node value S / Z
@@ -12,22 +13,26 @@
 // pairs, folded over the column tiles by the combine.
 //
 // THE FACTORS, fp32, fp16 or bf16 as the caller gives them, A [B, M, K], B [B, K, N] (a sample's block contiguous, any
-// batch stride). fp16 ones are read IN PLACE where each sample's block is 16-byte aligned, M a multiple of 4 and N of 8
-// (`h_in_place`), A made A' in the kernels' registers (`scale_h2`); others -- fp32, bf16, or fp16 not so aligned --
-// through a COPY in fp16 the prologues make (AP [B, Mp, 16] = A', BP [B, 16, Np] = B, zero-padded: `conv_copy`), the
-// forward's kept for the backward where asked (`keep`). Both kernels read either as they lie: plain row-major fp16, no
-// fragment order -- ldmatrix of the staged rows.
+// batch stride; K 1 .. 64). fp16 ones of a padded rank (K = KP) are read IN PLACE where each sample's block is 16-byte
+// aligned, M a multiple of 64 / KP and N of 8 (`h_in_place`), A made A' in the kernels' registers (`scale_h2`); others
+// -- fp32, bf16, fp16 of another rank or not so aligned -- through a COPY in fp16 the prologues make (AP [B, Mp, KP] =
+// A', BP [B, KP, Np] = B, zero-padded: `conv_copy`), the forward's kept for the backward where asked (`keep`). The
+// kernels read either as they lie: plain row-major fp16, no fragment order -- ldmatrix of the staged rows.
 //
 // FORWARD (`hf_fw_kernel`): a CTA holds a tile of 128 nodes x TN children (TN = 8 NT8 = 64) -- eight consumer warps of
-// 16 nodes, each warp all TN children (NT8 n-tiles of 8), its pairs' log2 theta (less the row's frame) in registers, the
-// first MMA's C operand -- and loops over its samples; a producer warp streams each sample's operands into an
-// NST-stage ring of shared memory (full / empty mbarriers): A's 128 rows and B's 64 children as boxes of tensor maps
-// (TMA, 128-byte swizzled: ldmatrix rows conflict-free), their factors w and the tile's mc (`hf_fw_prep_kernel`'s WF)
-// by a bulk copy.
+// 16 nodes, each warp all TN children (NT8 n-tiles of 8, KP / 16 k-steps each), its pairs' log2 theta (less the row's
+// frame) in registers, the first MMA's C operand -- and loops over its samples; a producer warp streams each sample's
+// operands into an NST-stage ring of shared memory (full / empty mbarriers): A's 128 rows and B's 64 children as boxes
+// of tensor maps (TMA, 128-byte swizzled: ldmatrix rows conflict-free), their factors w and the tile's mc
+// (`hf_fw_prep_kernel`'s WF) by a bulk copy. Two CTAs an SM at KP 16 and 32, one at 64 (its 25 KB stages). Bound by its
+// compute, not its loads: the A / B boxes skipped, KP 64 -15%, 32 -10%, 16 -8% (B1024; KP 64 ~1.45x its tensor floor).
+//
+// BACKWARD: KP 16 `hb_bw_kernel` (pipelined: dB of a sample inside the next one's element loop), KP 32 and 64
+// `hbk_bw_kernel` (two barriers a sample: the 16-rank pipeline's buffers do not fit beside the wider operands).
 //
 // Layouts: the circuit's buffers [rows, batch], batch innermost; the shared parameters block-major
 // (`LowRank._geometry`'s grid), edge block (i / bs, j / cbs) from `p0 + ((i / bs) Nb + j / cbs) cbs bs` on, child then
-// node within it. Rank 16; node and child counts padded to whole tiles (zeros, -inf past the real ones).
+// node within it. Ranks padded to KP; node and child counts padded to whole tiles (zeros, -inf past the real ones).
 
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -41,7 +46,7 @@
 
 namespace {
 
-constexpr int HK = 16;                         // the rank these kernels take
+constexpr int HK = 16;                         // the rank `hb_bw_kernel` takes (the others: KP template arguments)
 constexpr int HTM = 128;                       // a forward tile's nodes (eight warps of 16)
 constexpr int HNW = 8;                         // the forward's consumer warps
 #define NEG (-CUDART_INF_F)                    // (device code only)
@@ -113,16 +118,20 @@ __device__ __forceinline__ unsigned scale_h2(unsigned a) {
 }
 
 // The converted copy's words (`AP`: A' = log2 e A, a pair of ranks of a node; `BP`: B, a pair of children of a rank)
-// from the caller's fp32 or bf16 (A' rounded once from fp32) or fp16 factors (scale_h2); zero where not live (scalar
-// loads: a view may be 4-byte aligned)
-__device__ __forceinline__ unsigned conv_a(const float* src, bool live) {
-    return live ? pack_h2(__ldg(src) * LOG2E, __ldg(src + 1) * LOG2E) : 0u;
+// from the caller's fp32 or bf16 (A' rounded once from fp32) or fp16 factors (scale_h2); zero where not live -- each
+// of the pair's two ranks apart (a rank past the factors' K: their padding) -- (scalar loads: a view may be 4-byte
+// aligned)
+// (the second rank's address src + 1 only where it is live: a rank row's last element may end the tensor)
+__device__ __forceinline__ unsigned conv_a(const float* src, bool l0, bool l1) {
+    return pack_h2(l0 ? __ldg(src) * LOG2E : 0.f, l1 ? __ldg(src + (l1 ? 1 : 0)) * LOG2E : 0.f);
 }
-__device__ __forceinline__ unsigned conv_a(const __half* src, bool live) {
-    return live ? scale_h2(pack_hh(src[0], src[1])) : 0u;
+__device__ __forceinline__ unsigned conv_a(const __half* src, bool l0, bool l1) {
+    const __half z = __float2half_rn(0.f);
+    return scale_h2(pack_hh(l0 ? src[0] : z, l1 ? src[l1 ? 1 : 0] : z));
 }
-__device__ __forceinline__ unsigned conv_a(const __nv_bfloat16* src, bool live) {
-    return live ? pack_h2(__bfloat162float(src[0]) * LOG2E, __bfloat162float(src[1]) * LOG2E) : 0u;
+__device__ __forceinline__ unsigned conv_a(const __nv_bfloat16* src, bool l0, bool l1) {
+    return pack_h2(l0 ? __bfloat162float(src[0]) * LOG2E : 0.f,
+                   l1 ? __bfloat162float(src[l1 ? 1 : 0]) * LOG2E : 0.f);
 }
 __device__ __forceinline__ unsigned conv_b(const float* src, bool l0, bool l1) {
     return pack_h2(l0 ? __ldg(src) : 0.f, l1 ? __ldg(src + 1) : 0.f);
@@ -143,6 +152,13 @@ __device__ __forceinline__ void mma_h_c(float (&d)[4], const uint4& a, unsigned 
         : "r"(a.x), "r"(a.y), "r"(a.z), "r"(a.w), "r"(b0), "r"(b1), "f"(c[0]), "f"(c[1]), "f"(c[2]), "f"(c[3]));
 }
 
+// fp16 m16n8k16 accumulating into D (the four A registers given apart)
+__device__ __forceinline__ void mma_h16(float (&d)[4], unsigned a0, unsigned a1, unsigned a2, unsigned a3, unsigned b0,
+                                        unsigned b1) {
+    asm("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+        : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+}
 __device__ __forceinline__ void mbar_init(uint32_t a, int cnt) {
     asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;" ::"r"(a), "r"(cnt) : "memory");
 }
@@ -190,24 +206,39 @@ __device__ __forceinline__ void stsm4t(uint32_t p, unsigned a, unsigned b, unsig
 
 // ============================================================================================== forward
 // A stage, per (tile, sample) item: the tile's 128 rows of A' -- or of the caller's fp16 A read in place, made A' in
-// the consumers' registers (`scale_h2`) -- as [node][rank 16] fp16, a box of a tensor map of 128-byte lines (4 nodes
-// a line: a box of 32-byte rows costs the copy engine a request a row, 4x the lines'); its TN children of B as [rank
-// 16][child TN]; both 128-byte swizzled (each lane's ldmatrix row in a bank group of its own); and WF
+// the consumers' registers (`scale_h2`) -- as [node][rank KP] fp16, a box of a tensor map of 128-byte lines (64 / KP
+// nodes a line: a box of 32-byte rows costs the copy engine a request a row, 4x the lines'); its TN children of B as
+// [rank KP][child TN]; both 128-byte swizzled (each lane's ldmatrix row in a bank group of its own); and WF
 // [jt][72] float: [tq][2 NT8] the factors w_j = 2^(lc'_j - mc) of a lane's children (TN jt + 8 t + 2 tq + p at 2 t + p),
-// then mc (the tile's largest lc'; -inf: no child of the tile has a value) at 8 NT8, padded to 16 bytes
-template <int NT8>
+// then mc (the tile's largest lc'; -inf: no child of the tile has a value) at 8 NT8, padded to 16 bytes. KP: the
+// factors' rank padded (16, 32, 64: KP / 16 k-steps of the MMAs; zero ranks past the factors' K)
+template <int KP, int NT8>
 struct HfGeo {
     static_assert(NT8 == 8, "a tile's children: one 128-byte swizzled box");
+    static_assert(KP == 16 || KP == 32 || KP == 64, "ranks padded to 16, 32 or 64");
     static constexpr int TN = 8 * NT8;
+    static constexpr int KS = KP / 16;                                       // the MMAs' k-steps
     static constexpr int WFW = 4 * 2 * NT8 + 4;                              // WF floats a tile (mc at 8 NT8)
-    static constexpr int A_BYTES = HTM * HK * 2, B_BYTES = HK * TN * 2, W_BYTES = WFW * 4;
+    static constexpr int A_BYTES = HTM * KP * 2, B_BYTES = KP * TN * 2, W_BYTES = WFW * 4;
     static constexpr int ST = (A_BYTES + B_BYTES + W_BYTES + 1023) / 1024 * 1024;   // a stage (the boxes 1024-aligned)
+    static constexpr int NST = 3;                                            // the ring's stages
+    static constexpr int CTAS = KP == 64 ? 1 : 2;                           // an SM's (the stages' shared memory)
 };
 
 // Where the 16 bytes an ldmatrix row reads lie in a stage's 128-byte swizzled boxes (a line's 16-byte piece c at c ^
-// line % 8): A's half row h of node `row` (line row / 4, piece 2 (row % 4) + h) and B's children 8 c .. 8 c + 7 of
-// rank row k (line k, piece c)
-__device__ __forceinline__ int hf_a_at(int row, int h) { return (row >> 2) * 128 + (((2 * (row & 3) + h) ^ (row >> 2)) & 7) * 16; }
+// line % 8): A's 16-byte piece h of node `row` (line row / RPL, piece (row % RPL) KP / 8 + h; k-step s's pieces 2 s,
+// 2 s + 1: the address of s = 0's XOR 32 s) and B's children 8 c .. 8 c + 7 of rank row k (line k, piece c; k-step s
+// rows 16 s on: + 2048 s)
+template <int KP>
+__device__ __forceinline__ int hf_a_at(int row, int h) {
+    if constexpr (KP == 16) {
+        return (row >> 2) * 128 + (((2 * (row & 3) + h) ^ (row >> 2)) & 7) * 16;
+    } else {
+        constexpr int RPL = 64 / KP, LR = RPL == 2 ? 1 : 0;
+        const int line = row >> LR;
+        return line * 128 + ((((row & (RPL - 1)) * (KP / 8) + h) ^ line) & 7) * 16;
+    }
+}
 __device__ __forceinline__ int hf_b_at(int k, int c) { return k * 128 + ((c ^ k) & 7) * 16; }
 // ... B's pieces of the n-tile pairs t2 = 0, 2, 4, 6 a lane reads (ldmatrix.trans: rank row k = 8 (lq & 1) + lr, piece
 // t2 + (lq >> 1)): this base XOR 16 t2 -- (t2 + h) ^ k = (t2 ^ (k & 6)) | ((h ^ k) & 1), the base's bits 5, 6 those of
@@ -223,7 +254,7 @@ template <typename TP, int NT8>
 __global__ void __launch_bounds__(256) hf_theta_kernel(const TP* __restrict__ params, long p0, int Nb, int cbs, int bs,
                                                        float4* __restrict__ LTF, float* __restrict__ CMR, int M, int N,
                                                        int Np) {
-    using Gm = HfGeo<NT8>;
+    using Gm = HfGeo<16, NT8>;                             // (the tile's children: any rank's)
     const int njt = Np / Gm::TN, tile = blockIdx.x;
     {
         const int w = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, tq = lane & 3;
@@ -261,25 +292,29 @@ __global__ void __launch_bounds__(256) hf_theta_kernel(const TP* __restrict__ pa
 }
 
 // A block of sample b's converted copy (the factors' fp16 operands where they are not read in place, the forward's and
-// the backward's alike): blocks 0 .. nbA over AP [Mp, 16] = A' (a thread a pair of ranks of a node), then nbB over BP
-// [16, Np] = B (a thread a pair of children of a rank); zero past the node vector's nodes / children. False: blk is
-// past them
-template <typename TI>
+// the backward's alike) at KP ranks (the factors' K padded: 16, 32, 64): blocks 0 .. nbA over AP [Mp, KP] = A' (a
+// thread a pair of ranks of a node), then nbB over BP [KP, Np] = B (a thread a pair of children of a rank); zero past
+// the node vector's nodes / children and past the factors' K ranks. False: blk is past them
+template <int KP, typename TI>
 __device__ __forceinline__ bool conv_copy(int blk, int nbA, int nbB, const TI* __restrict__ A, const TI* __restrict__ Bm,
-                                          unsigned* __restrict__ AP, unsigned* __restrict__ BP, int b, int M, int N,
+                                          unsigned* __restrict__ AP, unsigned* __restrict__ BP, int b, int M, int N, int K,
                                           int Mp, int Np, long sA, long sB) {
+    constexpr int KW = KP / 2;                               // (a row's words)
     if (blk < nbA) {
-        const int e = blk * 256 + threadIdx.x, i = e >> 3;   // (e = 8 i + kp)
-        if (e < Mp * 8)
-            AP[(long)b * Mp * 8 + e] = conv_a(A + (long)b * sA + (long)min(i, M - 1) * HK + 2 * (e & 7), i < M);
+        const int e = blk * 256 + threadIdx.x, i = e / KW, k = 2 * (e % KW);   // (e = KW i + k / 2)
+        if (e < Mp * KW) {
+            const bool l0 = i < M && k < K, l1 = i < M && k + 1 < K;
+            AP[(long)b * Mp * KW + e] = conv_a(A + (long)b * sA + (long)min(i, M - 1) * K + (l0 ? k : 0), l0, l1);
+        }
         return true;
     }
     blk -= nbA;
     if (blk < nbB) {
         const int e = blk * 256 + threadIdx.x;               // (e = k Np / 2 + jp)
-        if (e < HK * (Np / 2)) {
+        if (e < KP * (Np / 2)) {
             const int k = e / (Np / 2), j = 2 * (e - k * (Np / 2));
-            BP[(long)b * HK * (Np / 2) + e] = conv_b(Bm + (long)b * sB + (long)k * N + min(j, N - 1), j < N, j + 1 < N);
+            BP[(long)b * KP * (Np / 2) + e] = conv_b(Bm + (long)b * sB + (long)min(k, K - 1) * N + min(j, N - 1),
+                                                     j < N && k < K, j + 1 < N && k < K);
         }
         return true;
     }
@@ -288,15 +323,15 @@ __device__ __forceinline__ bool conv_copy(int blk, int nbA, int nbB, const TI* _
 
 // The prologue of a chunk, a grid row a sample: the converted copy's blocks (none where the factors are read in
 // place), then WF's tiles (a warp a tile) with lcs [B, Np] = lc' (the exact fallback's)
-template <typename TI, int NT8>
+template <int KP, typename TI, int NT8>
 __global__ void __launch_bounds__(256) hf_fw_prep_kernel(
         const TI* __restrict__ A, const TI* __restrict__ Bm, unsigned* __restrict__ AP, unsigned* __restrict__ BP,
         float* __restrict__ WF, float* __restrict__ lcs, const float* __restrict__ emars, const long* __restrict__ rows,
-        int M, int N, int Mp, int Np, int nbA, int nbB, int Bs, int b0, long sA, long sB) {
-    using Gm = HfGeo<NT8>;
+        int M, int N, int K, int Mp, int Np, int nbA, int nbB, int Bs, int b0, long sA, long sB) {
+    using Gm = HfGeo<KP, NT8>;
     const int b = blockIdx.y, njt = Np / Gm::TN;
     const int blk = blockIdx.x;
-    if (conv_copy(blk, nbA, nbB, A, Bm, AP, BP, b, M, N, Mp, Np, sA, sB)) return;
+    if (conv_copy<KP>(blk, nbA, nbB, A, Bm, AP, BP, b, M, N, K, Mp, Np, sA, sB)) return;
     const int jt = (blk - nbA - nbB) * 8 + (threadIdx.x >> 5), lane = threadIdx.x & 31;   // WF: a lane NT8 / 4 children
     if (jt >= njt) return;
     constexpr int PER = Gm::TN / 32;
@@ -349,20 +384,22 @@ struct HfRare {                                           // (`hf_rare_row`'s op
     const float* lcs;
     const TP* params; long p0; int Nb, cbs, bs, M, N, Np, njt;
 };
-template <typename TP, int NT8>
+template <typename TP, int KP, int NT8>
 __device__ __forceinline__ float4 hf_rare_row(const HfRare<TP>& ra, int b, int jt, int i, float cm, float mc, float z,
                                               float s, bool rz, bool rs) {
+    constexpr int KS = KP / 16;
     const int lane = threadIdx.x & 31, g = lane >> 2, tq = lane & 3, j0 = jt * 8 * NT8;
-    uint4 af;                                             // (row i's A': ranks 2 tq, + 1 and 2 tq + 8, + 9)
-    {
-        const __half* ar = ra.Ag + (long)b * ra.sAg + (long)i * HK + 2 * tq;
+    uint4 af[KS];                                         // (row i's A' of k-step s: ranks 16 s + 2 tq, + 1, + 8, + 9)
+#pragma unroll
+    for (int ks = 0; ks < KS; ks++) {
+        const __half* ar = ra.Ag + (long)b * ra.sAg + (long)i * KP + 16 * ks + 2 * tq;
         unsigned lo = i < ra.am ? *reinterpret_cast<const unsigned*>(ar) : 0u;
         unsigned hi = i < ra.am ? *reinterpret_cast<const unsigned*>(ar + 8) : 0u;
         if (ra.scaleA) {
             lo = scale_h2(lo);
             hi = scale_h2(hi);
         }
-        af = make_uint4(lo, lo, hi, hi);
+        af[ks] = make_uint4(lo, lo, hi, hi);
     }
     const __half* const bg = ra.Bg + (long)b * ra.sBg;
     auto lw = [&](int t, float (&x)[4]) {                  // lw' (unframed) of the lane's children of n-tile t: x[0, 1]
@@ -374,10 +411,15 @@ __device__ __forceinline__ float4 hf_rare_row(const HfRare<TP>& ra, int b, int j
         }
         const int j = j0 + 8 * t + g;                      // (n-tile t's B fragment: the lane's child, its rank pairs)
         const __half zh = __float2half_rn(0.f);
-        __half v[4];
 #pragma unroll
-        for (int q = 0; q < 4; q++) v[q] = j < ra.bn ? bg[(long)(2 * tq + (q & 1) + 8 * (q >> 1)) * ra.bk + j] : zh;
-        mma_h_c(x, af, pack_hh(v[0], v[1]), pack_hh(v[2], v[3]), c);
+        for (int ks = 0; ks < KS; ks++) {
+            __half v[4];
+#pragma unroll
+            for (int q = 0; q < 4; q++)
+                v[q] = j < ra.bn ? bg[(long)(16 * ks + 2 * tq + (q & 1) + 8 * (q >> 1)) * ra.bk + j] : zh;
+            if (ks == 0) mma_h_c(x, af[0], pack_hh(v[0], v[1]), pack_hh(v[2], v[3]), c);
+            else mma_h16(x, af[ks].x, af[ks].y, af[ks].z, af[ks].w, pack_hh(v[0], v[1]), pack_hh(v[2], v[3]));
+        }
     };
     float za = z > 0.f ? cm : NEG, zs = z, sa = s > 0.f ? cm + mc : NEG, ss = s;   // (the main loop's pairs)
     if (rz) {                                             // (the shifted path: a row max)
@@ -451,12 +493,12 @@ __device__ __forceinline__ float4 hf_rare_row(const HfRare<TP>& ra, int b, int j
 // the tq 0 lanes behind a branch cost 13% of the loop). No test of its own: the comb kernel finds the RARE items
 // (`hf_rare_z`, `hf_rare_s`) and makes them again -- here, a bit mask over stretches of 32 items and a pass of the
 // warp's deferred items after each cost this kernel 12-14% (the test, the pass's registers, a stack frame)
-template <int NT8, int NST>
-__global__ void __launch_bounds__((HNW + 1) * 32, 2) hf_fw_kernel(
+template <int KP, int NT8, int NST>
+__global__ void __launch_bounds__((HNW + 1) * 32, HfGeo<KP, NT8>::CTAS) hf_fw_kernel(
         const __grid_constant__ CUtensorMap tmA, const __grid_constant__ CUtensorMap tmB, int scaleA,
         const float* __restrict__ WF, const float4* __restrict__ LTF, float2* __restrict__ part2, int M, int Mp, int B,
         int njt, long total) {
-    using Gm = HfGeo<NT8>;
+    using Gm = HfGeo<KP, NT8>;
     constexpr int TN = Gm::TN;
     extern __shared__ __align__(128) unsigned char smraw[];
     const uint32_t sraw = (uint32_t)__cvta_generic_to_shared(smraw), sbase = (sraw + 1023u) & ~1023u;
@@ -480,7 +522,7 @@ __global__ void __launch_bounds__((HNW + 1) * 32, 2) hf_fw_kernel(
                 mbar_wait(bempty + 8 * st, ph ^ 1);
                 const uint32_t dst = sbase + st * Gm::ST, bar = bfull + 8 * st;
                 mbar_expect(bar, Gm::A_BYTES + Gm::B_BYTES + Gm::W_BYTES);
-                tma_load_3d(dst, &tmA, 0, rt * (HTM / 4), b, bar);
+                tma_load_3d(dst, &tmA, 0, rt * (HTM * KP / 64), b, bar);   // (a row tile's 128-byte lines)
                 tma_load_3d(dst + Gm::A_BYTES, &tmB, jt * TN, 0, b, bar);
                 bulk_g2s(dst + Gm::A_BYTES + Gm::B_BYTES, WF + b * wstr + (long)jt * Gm::WFW, Gm::W_BYTES, bar);
                 if (++b == B) { b = 0; if (++jt == njt) { jt = 0; rt++; } }
@@ -495,7 +537,7 @@ __global__ void __launch_bounds__((HNW + 1) * 32, 2) hf_fw_kernel(
     int pw;                                                   // (row rA's partial of the item: part2[pw] = [b][jt][rA])
     const int pstep = njt * Mp;
     int tile = (int)(it0 / B), b = (int)(it0 - (long)tile * B), st = 0, ph = 0;   // (counters: no division an item)
-    const uint32_t a_ln = hf_a_at(16 * w + 8 * (lq & 1) + lr, lq >> 1);             // (the lane's ldmatrix rows)
+    const uint32_t a_ln = hf_a_at<KP>(16 * w + 8 * (lq & 1) + lr, lq >> 1);         // (the lane's ldmatrix rows)
     const uint32_t b_ln = Gm::A_BYTES + hf_b_base(8 * (lq & 1) + lr, lq >> 1);
     // the tile's log2 theta less each row's frame cm (its largest in the tile), from the prologue's fragments
     auto set_tile = [&]() {
@@ -516,30 +558,35 @@ __global__ void __launch_bounds__((HNW + 1) * 32, 2) hf_fw_kernel(
         mbar_wait(bfull + 8 * st, ph);
         const unsigned char* sp = sm + st * Gm::ST;
         const uint32_t sb = sbase + st * Gm::ST;
-        uint4 af;                                             // the warp's 16 rows of A' (ldmatrix of the half rows)
-        {
+        uint4 af[Gm::KS];                                     // the warp's 16 rows of A' (ldmatrix of the half rows),
+#pragma unroll                                                //  a k-step's
+        for (int ks = 0; ks < Gm::KS; ks++) {
             unsigned ah[4];
-            ldsm4(ah, sb + a_ln);
+            ldsm4(ah, (sb + a_ln) ^ (32u * ks));
             if (scaleA) {
 #pragma unroll
                 for (int r = 0; r < 4; r++) ah[r] = scale_h2(ah[r]);
             }
-            af = make_uint4(ah[0], ah[1], ah[2], ah[3]);
+            af[ks] = make_uint4(ah[0], ah[1], ah[2], ah[3]);
         }
         const float* wv = reinterpret_cast<const float*>(sp + Gm::A_BYTES + Gm::B_BYTES);
         const float mc = wv[8 * NT8];
         float z[2] = {0.f, 0.f}, s[2] = {0.f, 0.f};
 #pragma unroll
-        for (int t2 = 0; t2 < NT8; t2 += 2) {                // (n-tiles in pairs: an ldmatrix.trans of B, a 16-byte w)
-            unsigned bh[4];
-            ldsm4t(bh, (sb + b_ln) ^ (16u * t2));
+        for (int t2 = 0; t2 < NT8; t2 += 2) {                // (n-tiles in pairs: an ldmatrix.trans of B a k-step, a
+            unsigned bh[Gm::KS][4];                           //  16-byte w)
+#pragma unroll
+            for (int ks = 0; ks < Gm::KS; ks++) ldsm4t(bh[ks], (sb + b_ln + 2048u * ks) ^ (16u * t2));
             const float4 ww2 = *reinterpret_cast<const float4*>(wv + tq * 2 * NT8 + 2 * t2);
 #pragma unroll
             for (int u = 0; u < 2; u++) {
                 const int t = t2 + u;
                 const float wx = u ? ww2.z : ww2.x, wy = u ? ww2.w : ww2.y;
                 float d[4];
-                mma_h_c(d, af, bh[2 * u], bh[2 * u + 1], lt[t]);
+                mma_h_c(d, af[0], bh[0][2 * u], bh[0][2 * u + 1], lt[t]);
+#pragma unroll
+                for (int ks = 1; ks < Gm::KS; ks++)
+                    mma_h16(d, af[ks].x, af[ks].y, af[ks].z, af[ks].w, bh[ks][2 * u], bh[ks][2 * u + 1]);
                 const float e0 = exp2f(d[0]), e1 = exp2f(d[1]), e2 = exp2f(d[2]), e3 = exp2f(d[3]);
                 z[0] += e0; z[0] += e1; z[1] += e2; z[1] += e3;
                 s[0] = fmaf(e0, wx, s[0]); s[0] = fmaf(e1, wy, s[0]);
@@ -579,7 +626,7 @@ __global__ void __launch_bounds__((HNW + 1) * 32, 2) hf_fw_kernel(
 // 80, +6% at B256 .. 1024, the normal folds as much again -- the main kernel 12-13% faster without them; capped at 40
 // or 48 the folds' loop spills, +24% .. +130%; the paths a call apart: 128 registers; one exponential a fold, the
 // pairs folded as a tree, normal only where a sum lies past 2^+-30: no faster)
-template <typename TP, int NT8, int LPO>
+template <typename TP, int KP, int NT8, int LPO>
 __global__ void __launch_bounds__(256) hf_comb_kernel(
         const float2* __restrict__ part2, const float* __restrict__ CMR, const float* __restrict__ WF, int wfw, int wmc,
         int njt, float* __restrict__ nmars, long nid0, float* __restrict__ lzs, int M, int Mp, int Bc, int Bs, int b0,
@@ -645,7 +692,7 @@ __global__ void __launch_bounds__(256) hf_comb_kernel(
                 float4 f = make_float4(v.x > 0.f ? c : NEG, v.x, v.y > 0.f ? c + mc : NEG, v.y);
                 for (unsigned bal = __ballot_sync(0xffffffffu, rz | rs); bal; bal &= bal - 1) {
                     const int src = __ffs(bal) - 1;           // (each rare tile by the warp, its lane's pairs replaced)
-                    const float4 q = hf_rare_row<TP, NT8>(
+                    const float4 q = hf_rare_row<TP, KP, NT8>(
                             ra, b, u0 + src, i, __shfl_sync(0xffffffffu, c, src), __shfl_sync(0xffffffffu, mc, src),
                             __shfl_sync(0xffffffffu, v.x, src), __shfl_sync(0xffffffffu, v.y, src),
                             __shfl_sync(0xffffffffu, (int)rz, src) != 0, __shfl_sync(0xffffffffu, (int)rs, src) != 0);
@@ -755,17 +802,11 @@ __device__ __forceinline__ void tma_add_3d_if(bool on, const CUtensorMap* m, uin
 }
 __device__ __forceinline__ void cp_async_commit() { asm volatile("cp.async.commit_group;" ::: "memory"); }
 template <int N> __device__ __forceinline__ void cp_async_wait() { asm volatile("cp.async.wait_group %0;" ::"n"(N) : "memory"); }
-// fp16 m16n8k16 accumulating into D (the four A registers given apart)
-__device__ __forceinline__ void mma_h16(float (&d)[4], unsigned a0, unsigned a1, unsigned a2, unsigned a3, unsigned b0,
-                                        unsigned b1) {
-    asm("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
-        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
-        : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
-}
 
-// The backward's prologue, one launch: the converted copy's blocks where the forward's is not at hand and the factors
-// are not read in place (`conv_copy`, (nbA + nbB) a sample: AP [B, Mp, 16] = A', BP [B, 16, Np] = B in fp16, zero
-// past the node vector's nodes / children); then, in tiles of 32 rows x 32 samples (the circuit's [rows, batch] read a
+// The backward's prologue, one launch: the gradients' zeros where asked (nA4 + nB4 float4s a sample: its dA then dB
+// rows); the converted copy's blocks where the forward's is not at hand and the factors are not read in place
+// (`conv_copy`, (nbA + nbB) a sample: AP [B, Mp, KP] = A', BP [B, KP, Np] = B in fp16, zero past the node vector's
+// nodes / children and the factors' K ranks); then, in tiles of 32 rows x 32 samples (the circuit's [rows, batch] read a
 // row's 32 samples a warp's 128 bytes, the tile turned through shared memory, written a sample's row at a time -- a
 // thread a node read the rows 4 bytes a 32-byte sector, 4x the bytes: 65 us at B1024), the nodes' terms LU [B, Mp, 2]
 // = (lu', lv') -- lu' = log2 (f / (n Z)), lv' = log2 (f / Z), -inf for a node without flow --, the children's LC [B,
@@ -773,19 +814,19 @@ __device__ __forceinline__ void mma_h16(float (&d)[4], unsigned a0, unsigned a1,
 // samples' scales SC [B]: E = ceil(log2 max_i f_i) -> (E, 2^E, ln 2 2^E, 0). The main kernel takes q and t (so G, the
 // fp16 operand of the dA / dB products) in units of 2^E -- |G| <= 1: fp16's range whatever the flows' scale, a
 // sample's common scale carried apart in fp32 -- and its sums back by 2^E
-template <typename TI>
+template <int KP, typename TI>
 __global__ void __launch_bounds__(256) hb_bw_prep_kernel(
         const TI* __restrict__ A, const TI* __restrict__ Bm, unsigned* __restrict__ AP, unsigned* __restrict__ BP,
         float* __restrict__ LU, float* __restrict__ LC, float* __restrict__ ef, float4* __restrict__ SC,
         const float* __restrict__ nflows, const float* __restrict__ nmars, long nid0,
         const float* __restrict__ lzs, const float* __restrict__ emars, const long* __restrict__ rows, int M, int N,
-        int Mp, int Np, int nbA, int nbB, int Bc, int Bs, int b0, long sA, long sB, float4* __restrict__ zA, long szA,
-        float4* __restrict__ zB, long szB, int nbZ) {
+        int K, int Mp, int Np, int nbA, int nbB, int Bc, int Bs, int b0, long sA, long sB, float4* __restrict__ zA,
+        long szA, int nA4, float4* __restrict__ zB, long szB, int nB4, int nbZ) {
     __shared__ float2 tile[32][33];                            // [sample][row] (padded)
     const int njt = Np / BN, nbg = (Bc + 31) / 32, lane = threadIdx.x & 31, wq = threadIdx.x >> 5;
     int blk = blockIdx.x;
     if (blk < nbZ * Bc) {                                      // the gradients' zeros (`init`: their first writer): a
-        const int nA4 = M * (HK / 4), n4 = nA4 + N * (HK / 4), s = blk / nbZ;   // sample's dA then dB rows, 4096
+        const int n4 = nA4 + nB4, s = blk / nbZ;               // sample's dA then dB rows, 4096
         const int e1 = min(n4, (blk - s * nbZ + 1) * 4096);    // float4s a block -- in the L2 when the main kernel's
         const float4 z4 = make_float4(0.f, 0.f, 0.f, 0.f);     // adds come (their DRAM round trip of zeros saved)
         for (int e = (blk - s * nbZ) * 4096 + threadIdx.x; e < e1; e += 256) {
@@ -796,7 +837,7 @@ __global__ void __launch_bounds__(256) hb_bw_prep_kernel(
     }
     blk -= nbZ * Bc;
     if (blk < (nbA + nbB) * Bc) {                              // the copy: a sample's blocks
-        conv_copy(blk % (nbA + nbB), nbA, nbB, A, Bm, AP, BP, blk / (nbA + nbB), M, N, Mp, Np, sA, sB);
+        conv_copy<KP>(blk % (nbA + nbB), nbA, nbB, A, Bm, AP, BP, blk / (nbA + nbB), M, N, K, Mp, Np, sA, sB);
         return;
     }
     blk -= (nbA + nbB) * Bc;
@@ -887,13 +928,14 @@ __global__ void __launch_bounds__(256) hb_ef_epi_kernel(const float* __restrict_
     *p = o == NEG ? lv : fmaxf(o, lv) + log1pf(__expf(-fabsf(o - lv)));
 }
 
-template <typename TP, bool FLOWS, bool DENOM, bool GRADS>
+// (DMAP: dA's rows through a box of tmA -- the caller's rows of K < 16 ranks --, else one run of the tile's rows)
+template <typename TP, bool FLOWS, bool DENOM, bool GRADS, bool DMAP>
 __global__ void __launch_bounds__(256, 1) hb_bw_kernel(
         const __half* __restrict__ AP, long sAb, int am, const __half* __restrict__ BP, long sBb, int bk, int bn,
         int scaleA, const TP* __restrict__ params, long p0, int Nb, int cbs, int bs, const float* __restrict__ LU, const float* __restrict__ LC, float* __restrict__ ef,
         float* __restrict__ pflows, long pf0, float* __restrict__ denom, long dn0, float* __restrict__ gA, long sgA,
-        int ma, const __grid_constant__ CUtensorMap tmB, const float4* __restrict__ SC, int M, int N, int Mp, int Np,
-        int B, int nct, long units) {
+        int ma, const __grid_constant__ CUtensorMap tmB, const __grid_constant__ CUtensorMap tmA,
+        const float4* __restrict__ SC, int M, int N, int Mp, int Np, int B, int nct, long units) {
     using Gm = Hb2Geo;
     constexpr int NT = Gm::NT;
     extern __shared__ __align__(128) unsigned smw[];
@@ -981,12 +1023,18 @@ __global__ void __launch_bounds__(256, 1) hb_bw_kernel(
         db[(rk + 1) * TN2 + ch + 8] = dq[3] * scz;
         fence_async_smem();
     };
-    // the bulk adds of a sample's dA rows (the tile's 128, clipped at ma) and dB's box (16 ranks x 64 children at
-    // child j0, sample b; children past the map's dropped), from parity pp (written and fenced a barrier back)
+    // the bulk adds of a sample's dA rows (the tile's 128, clipped at ma; DMAP: a box of tmA, the caller's rows of
+    // K < 16 ranks -- ranks and rows past its extents dropped) and dB's box (K ranks x 64 children at child j0, sample
+    // b; children past the map's dropped), from parity pp (written and fenced a barrier back)
     auto out_dA = [&](int pp, int b, int i0) {             // (warp 0's: its lane 0 by predicate)
         if (wu == 0) {
-            const int rows = min(TM2, ma - i0);
-            bulk_add_f_if(issuer && rows > 0, gA + (long)b * sgA + (long)i0 * HK, uDA + pp * (Gm::SDA * 4), rows * HK * 4);
+            if constexpr (DMAP) {
+                tma_add_3d_if(issuer, &tmA, uDA + pp * (Gm::SDA * 4), 0, i0, b);
+            } else {
+                const int rows = min(TM2, ma - i0);
+                bulk_add_f_if(issuer && rows > 0, gA + (long)b * sgA + (long)i0 * HK, uDA + pp * (Gm::SDA * 4),
+                              rows * HK * 4);
+            }
         }
     };
     auto out_dB = [&](int pp, int b, int j0) {
@@ -1234,6 +1282,418 @@ __global__ void __launch_bounds__(256, 1) hb_bw_kernel(
 }
 
 
+// ======================================================================= backward at ranks padded to 32 and 64
+// The rank-16 backward's tile (128 nodes x 64 children, 8 warps of 16 nodes, F+ / W / theta of the tile in registers
+// over its samples, the operands staged by cp.async, G and the flows scaled by the sample's 2^E) at KP = 32 or 64
+// ranks: phi KP / 16 MMAs a 16 x 8 tile (log2 theta the first's C operand), b's element terms as at rank 16 (G^T
+// stmatrix'd, the element-flow partials), then -- after a second barrier [B] -- b's dA (the warp's own G rows by B^T)
+// and dB (every warp's G^T by A', KP / 2 units of 16 children x 8 ranks a CTA) out of registers and shared memory, their
+// partials added at the next sample's [A]. The rank-16 kernel's pipeline (dB of b - 1 inside b's element loop: G^T, A'
+// a sample deeper, the partials by parity) would take 131 KB (KP 32) / 214 KB (64) of shared memory; this form ~75 /
+// ~92 KB: one buffer of G^T, of the element-flow and fp32 partials (the issuer's bulk reads waited before [B]), two of
+// A' / B / terms. dA's partials: KP 32 through shared memory, one bulk add of the tile's rows (a box of `tmA` where the
+// caller's rows are K < 32 wide); KP 64 by 16-byte reductions from registers -- its 32 KB of shared memory do not fit
+// --, a lane 4 ranks of a row (a quad's value pairs transposed: a warp's reduction 8 rows x 64 bytes, 2.6 TB/s of L2
+// adds where 16 rows x 32 bytes made 1.9: -15% at B256). BOUND BY THE PARTIALS' ADDS (fp32: dA's 16 an element over the
+// column tiles, dB's 8 over the row tiles -- 48 / 24 KB a CTA-sample at KP 64 / 32): a node vector at B256, adds alone
+// (no MMAs, no exponentials) 690 of 765 us at KP 64, 367 of 391 at 32, compute alone 531 / 311 -- ~2.3 TB/s of L2 adds
+// in situ. Tried at KP 64: dA by a warp's 2 KB bulk slots (rows swizzled instead of padded, no sE): +2%; dB before dA
+// after [B]: 0.
+template <int KP>
+struct HbkGeo {
+    static_assert(KP == 32 || KP == 64, "ranks padded to 32 or 64");
+    static constexpr int KS = KP / 16, NT = KP / 8, NPW = NT / 2;   // k-steps; rank n-tiles; dB's n-tiles a warp
+    static constexpr bool DA_SMEM = KP == 32;                  // (dA's partials through shared memory, one bulk add)
+    static constexpr int AROW = KP / 2 + 4, BROW = 36, TROW = 68;   // (words; rows padded: conflict-free ldmatrix)
+    static constexpr int SAH = TM2 * AROW, SBH = KP * BROW, SL = 2 * TM2 + 2 * 36 + 4, ST = TN2 * TROW, SE = NW2 * TN2;
+    static constexpr int SDA = DA_SMEM ? TM2 * KP : 0, SDB = KP * TN2;
+    static constexpr int FLUSH = NW2 * 16 * 20;                // F+ / W: [warp][child 16][node 16 + 4], a quarter at a time
+    static constexpr int WORDS = SDA + SDB + 2 * SAH + 2 * SBH + 2 * SL + ST + SE;
+    static_assert(FLUSH <= ST, "the F+ / W flush within the G^T buffer");
+    static_assert(WORDS * 4 <= 101376, "a CTA's shared memory");
+    static_assert(SDA % 32 == 0 && SDB % 32 == 0 && SAH % 4 == 0 && SBH % 4 == 0 && SL % 4 == 0 && ST % 4 == 0,
+                  "aligned pieces");
+};
+
+// gA, gB: the gradients' destinations (dA rows `ka` floats, `kv` of them live, `ma` rows, samples `sgA` apart; dB by
+// the tensor map tmB); `dmap` (KP 32): dA's rows through a box of tmA
+template <int KP, typename TP, bool FLOWS, bool DENOM, bool GRADS>
+__global__ void __launch_bounds__(256, 1) hbk_bw_kernel(
+        const __half* __restrict__ AP, long sAb, int am, const __half* __restrict__ BP, long sBb, int bk, int bn,
+        int scaleA, const TP* __restrict__ params, long p0, int Nb, int cbs, int bs, const float* __restrict__ LU,
+        const float* __restrict__ LC, float* __restrict__ ef, float* __restrict__ pflows, long pf0,
+        float* __restrict__ denom, long dn0, float* __restrict__ gA, long sgA, int ma, int ka, int kv,
+        const __grid_constant__ CUtensorMap tmB, const __grid_constant__ CUtensorMap tmA, int dmap,
+        const float4* __restrict__ SC, int M, int N, int Mp, int Np, int B, int nct, long units) {
+    using Gm = HbkGeo<KP>;
+    constexpr int KS = Gm::KS, NPW = Gm::NPW;
+    extern __shared__ __align__(128) unsigned smw[];
+    float* const sDA = reinterpret_cast<float*>(smw);          // [node 128][rank KP] (KP 32)
+    float* const sDB = sDA + Gm::SDA;                          // [rank KP][child 64]
+    unsigned* const sAh = reinterpret_cast<unsigned*>(sDB + Gm::SDB);   // [par][node][AROW]: A' rows (fp16 pairs)
+    unsigned* const sBh = sAh + 2 * Gm::SAH;                   // [par][rank][BROW]: B (fp16 pairs of children)
+    float* const sL = reinterpret_cast<float*>(sBh + 2 * Gm::SBH);         // [par][SL]: LU, LC, SC
+    unsigned* const sT = reinterpret_cast<unsigned*>(sL + 2 * Gm::SL);     // [child][TROW]: G^T (fp16 pairs)
+    float* const sE = reinterpret_cast<float*>(sT + Gm::ST);   // [warp][64]: element-flow partials
+    const int tid = threadIdx.x, lane = tid & 31, w = tid >> 5, g = lane >> 2, tq = lane & 3;
+    const int wu = __shfl_sync(0xffffffffu, w, 0);             // (the warp's index, provably uniform: uniform branches)
+    const int lr = lane & 7, lq = lane >> 3;                   // (ldmatrix / stmatrix: the row a lane addresses, its matrix)
+    const bool issuer = GRADS && tid == 0;                     // (the bulk adds' thread)
+    const int njt = Np / BN;
+    const long u0 = (long)blockIdx.x * units / gridDim.x, u1 = (long)(blockIdx.x + 1) * units / gridDim.x;
+    const uint32_t uDA = smem_u32(smw), uDB = uDA + Gm::SDA * 4, uAh = uDB + Gm::SDB * 4;
+    const uint32_t uBh = uAh + 2 * Gm::SAH * 4, uL = uBh + 2 * Gm::SBH * 4, uT = uL + 2 * Gm::SL * 4;
+    const uint32_t oA = ((16 * w + 8 * (lq & 1) + lr) * Gm::AROW + 4 * (lq >> 1)) * 4;    // phi's A' rows, + 32 ks
+    const uint32_t oB = ((8 * (lq & 1) + lr) * Gm::BROW + 4 * (lq >> 1)) * 4;  // phi's B, + 16 t2, + 64 BROW ks
+    const uint32_t oBt = ((8 * (lq >> 1) + lr) * Gm::BROW + 4 * (lq & 1)) * 4; // dA's B^T, + 32 kk, + 64 BROW p
+    const uint32_t oT = ((8 * (lq >> 1) + lr) * Gm::TROW + 8 * w + 4 * (lq & 1)) * 4;    // G^T's rows, + 64 TROW kk
+    const uint32_t oTa = ((16 * (w & 3) + 8 * (lq & 1) + lr) * Gm::TROW + 4 * (lq >> 1)) * 4;   // dB's G^T, + 32 kw
+    const int nb = NPW * (w >> 2);                             // (dB: the warp's first rank n-tile, its child m-tile w & 3)
+    const uint32_t oAb = ((8 * (lq & 1) + lr) * Gm::AROW + 4 * (nb + (lq >> 1))) * 4;    // dB's A', + 64 AROW kw, + 32 p
+    // sample b's operands into stage par (row tile its, child tile jcs): the tile's 128 A' rows (a thread KP / 16
+    // 16-byte pieces: rows tid / (KP / 8) + RP s, zeros from row am), B's KP rank rows of its 64 children (KP / 32
+    // pieces: rank rows tid / 8 + 32 s, bk halves apart; zeros from child bn), the terms (LU rows, the 2 jt's LC, SC:
+    // threads 0 .. 82). A thread's sources a tile's base and its sample's stride
+    constexpr int CPR = KP / 8, RP = 256 / CPR;                // (A': a row's pieces, the rows a pass)
+    struct Src { const char* a; const char* r; const char* t; long ta; bool rl, tl; };
+    auto srcs = [&](int jcs, int its) {
+        Src q;
+        q.a = reinterpret_cast<const char*>(AP + 8 * (tid % CPR));   // (row 0's piece: a row's offset a pass)
+        const int j = jcs * TN2 + 8 * (tid & 7);
+        q.r = reinterpret_cast<const char*>(BP + (long)(tid >> 3) * bk + min(j, bn - 8));
+        q.rl = j < bn;
+        const int r = tid;
+        q.tl = r < 83;
+        q.t = reinterpret_cast<const char*>(r < 64 ? LU + (long)its * TM2 * 2 + r * 4
+                                            : r < 82 ? LC + (long)2 * jcs * 36 + (r - 64) * 4
+                                                     : reinterpret_cast<const float*>(SC));
+        q.ta = r < 64 ? (long)Mp * 2 * 4 : r < 82 ? (long)njt * 36 * 4 : 16;
+        return q;
+    };
+    const uint32_t dA0 = uAh + ((tid / CPR) * Gm::AROW + 4 * (tid % CPR)) * 4;
+    const uint32_t dB0 = uBh + ((tid >> 3) * Gm::BROW + 4 * (tid & 7)) * 4;
+    const uint32_t dT0 = uL + tid * 16;
+    auto stage = [&](const Src& q, int its, int b, int par) {
+        const int i = its * TM2 + tid / CPR;
+#pragma unroll
+        for (int s = 0; s < KS; s++) {                         // (rows past am: zeros, row am - 1's address)
+            const int row = i + RP * s;
+            cp_async16z(dA0 + par * (Gm::SAH * 4) + s * (RP * Gm::AROW * 4),
+                        q.a + ((long)b * sAb + (long)min(row, am - 1) * KP) * 2, row < am);
+        }
+#pragma unroll
+        for (int s = 0; s < KP / 32; s++)
+            cp_async16z(dB0 + par * (Gm::SBH * 4) + s * (32 * Gm::BROW * 4), q.r + (long)b * sBb * 2 + (long)s * 32 * bk * 2,
+                        q.rl);
+        if (q.tl) cp_async16(dT0 + par * (Gm::SL * 4), q.t + b * q.ta);
+        cp_async_commit();
+    };
+    // the bulk adds of a sample's dA rows (KP 32: the tile's 128, clipped at ma; `dmap`: a box of tmA) and dB's box (the
+    // destination's ranks x 64 children at child j0, sample b; children past the map's dropped), from their buffers
+    // (written and fenced a barrier back)
+    auto out_dA = [&](int b, int i0) {
+        if constexpr (Gm::DA_SMEM) {
+            if (wu == 0) {
+                if (dmap) tma_add_3d_if(issuer, &tmA, uDA, 0, i0, b);
+                else {
+                    const int rows = min(TM2, ma - i0);
+                    bulk_add_f_if(issuer && rows > 0, gA + (long)b * sgA + (long)i0 * KP, uDA, rows * KP * 4);
+                }
+            }
+        }
+    };
+    auto out_dB = [&](int b, int j0) {
+        if (wu == 0) tma_add_3d_if(issuer, &tmB, uDB, j0, 0, b);
+    };
+    int pc = 0;                                                // the sample's operands' parity
+    if (u0 < u1) {                                             // the run's first sample: its stage
+        const int t = (int)(u0 / B), b = (int)(u0 - (long)t * B), it = t / nct;
+        stage(srcs(t - it * nct, it), it, b, 0);
+    }
+#pragma unroll 1
+    for (long u = u0; u < u1;) {
+        const int t = (int)(u / B), b0 = (int)(u - (long)t * B);
+        const int b1 = (int)min((long)B, (long)b0 + (u1 - u));
+        u += b1 - b0;
+        const bool more = u < u1;                              // (the run's next tile: t + 1, from its sample 0)
+        const int it = t / nct, jc = t - it * nct;
+        const int i0 = it * TM2, j0 = jc * TN2;
+        const int rA = i0 + 16 * w + g, rB = rA + 8;
+        const Src sq = srcs(jc, it);                           // (this tile's sources)
+
+        // the tile's theta (its log2 taken under the first sample's phi), F+, W: element e = 4 nf + c -> row
+        // c & 2 ? rB : rA, child j0 + 8 nf + 2 tq + (c & 1)
+        float lt[32], fp[32], tw[32];
+#pragma unroll
+        for (int e = 0; e < 32; e++) {
+            const int nf = e >> 2, c = e & 3, i = c & 2 ? rB : rA, j = j0 + 8 * nf + 2 * tq + (c & 1);
+            lt[e] = theta_at(params, p0, i, j, M, N, Nb, cbs, bs);
+            fp[e] = 0.f;
+            tw[e] = 0.f;
+        }
+
+#pragma unroll 1
+        for (int b = b0; b < b1; b++, pc ^= 1) {
+            const int par = pc;
+            cp_async_wait<0>();
+            __syncthreads();                                   // [A] b's stage; b - 1's partials written
+            if (GRADS && b > b0) {
+                out_dA(b - 1, i0);
+                out_dB(b - 1, j0);
+            }
+            if (b + 1 < b1) stage(sq, it, b + 1, par ^ 1);    // (its buffers' last readers: b - 1's, before [A])
+            else if (more) {                                   // (the next tile's first sample)
+                const int itn = (t + 1) / nct;
+                stage(srcs(t + 1 - itn * nct, itn), itn, 0, par ^ 1);
+            }
+            const uint32_t uah = uAh + par * (Gm::SAH * 4), ubh = uBh + par * (Gm::SBH * 4);
+            const float* const sl = sL + par * Gm::SL;
+            // the sample's scale 2^E: q, t, G in its units (lu', lv' less E), F+ / W / the sums times 2^E
+            const float4 scl = *reinterpret_cast<const float4*>(sl + 2 * TM2 + 72);
+            float2 tA = reinterpret_cast<const float2*>(sl)[16 * w + g], tB = reinterpret_cast<const float2*>(sl)[16 * w + g + 8];
+            tA.x -= scl.x; tA.y -= scl.x; tB.x -= scl.x; tB.y -= scl.x;
+            float lcv[16];                                     // lc' of children j0 + 8 nf + 2 tq + p at 2 nf + p
+#pragma unroll
+            for (int jl = 0; jl < 2; jl++) {
+                const float* lc0 = sl + 2 * TM2 + jl * 36 + tq * 8;
+                const float4 c0 = *reinterpret_cast<const float4*>(lc0);
+                const float4 c1 = *reinterpret_cast<const float4*>(lc0 + 4);
+                lcv[8 * jl + 0] = c0.x; lcv[8 * jl + 1] = c0.y; lcv[8 * jl + 2] = c0.z; lcv[8 * jl + 3] = c0.w;
+                lcv[8 * jl + 4] = c1.x; lcv[8 * jl + 5] = c1.y; lcv[8 * jl + 6] = c1.z; lcv[8 * jl + 7] = c1.w;
+            }
+            if (b == b0) {                                     // (the tile's log2 theta: the phi MMAs' C operand)
+#pragma unroll
+                for (int e = 0; e < 32; e++) lt[e] = lt[e] > 0.f ? __log2f(lt[e]) : NEG;
+            }
+            // ---- lw_b = phi_b + log2 theta (KS fp16 k-steps, theta the first's C operand): the warp's A' fragments
+            // (ldmatrix of its 16 rows, a k-step's), B's (ldmatrix.trans of the rank rows), a pair of n-tiles at a time,
+            // one pair ahead of the element terms
+            unsigned ah[KS][4];
+#pragma unroll
+            for (int ks = 0; ks < KS; ks++) {
+                ldsm4(ah[ks], uah + oA + 32 * ks);
+                if (scaleA) {                                  // (the caller's A: A' as the forward made it)
+#pragma unroll
+                    for (int r = 0; r < 4; r++) ah[ks][r] = scale_h2(ah[ks][r]);
+                }
+            }
+            float S[8][4];
+            auto phi_pair = [&](int t2) {                      // (n-tiles t2, t2 + 1: their k halves, a k-step's)
+#pragma unroll
+                for (int ks = 0; ks < KS; ks++) {
+                    unsigned bh[4];
+                    ldsm4t(bh, ubh + oB + 16 * t2 + 64 * Gm::BROW * ks);
+                    const uint4 a4 = make_uint4(ah[ks][0], ah[ks][1], ah[ks][2], ah[ks][3]);
+                    if (ks == 0) {
+                        mma_h_c(S[t2], a4, bh[0], bh[1], *reinterpret_cast<const float(*)[4]>(lt + 4 * t2));
+                        mma_h_c(S[t2 + 1], a4, bh[2], bh[3], *reinterpret_cast<const float(*)[4]>(lt + 4 * t2 + 4));
+                    } else {
+                        mma_h16(S[t2], a4.x, a4.y, a4.z, a4.w, bh[0], bh[1]);
+                        mma_h16(S[t2 + 1], a4.x, a4.y, a4.z, a4.w, bh[2], bh[3]);
+                    }
+                }
+            };
+            phi_pair(0);
+            // ---- the element terms of b: q = 2^(lw' + lu' + lc'), t = 2^(lw' + lv'); G^T a pair of n-tiles at a time
+            unsigned R[8][2];                                  // (q - t) as fp16 pairs: (n-tile, node half)
+            float v[16];                                       // q over the lane's two rows, its children 2 nf + p
+#pragma unroll
+            for (int nf = 0; nf < 8; nf++) {
+                if ((nf & 1) == 0 && nf + 2 < 8) phi_pair(nf + 2);
+                float gq[4], qq[4];
+#pragma unroll
+                for (int c = 0; c < 4; c++) {
+                    const float lw = S[nf][c];
+                    const float q = exp2f(lw + (c & 2 ? tB.x : tA.x) + lcv[2 * nf + (c & 1)]);
+                    const float tt = exp2f(lw + (c & 2 ? tB.y : tA.y));
+                    if (FLOWS) fp[4 * nf + c] = fmaf(q, scl.y, fp[4 * nf + c]);
+                    if (DENOM) tw[4 * nf + c] = fmaf(tt, scl.y, tw[4 * nf + c]);
+                    qq[c] = q;
+                    gq[c] = q - tt;
+                }
+                v[2 * nf] = qq[0] + qq[2];
+                v[2 * nf + 1] = qq[1] + qq[3];
+                R[nf][0] = pack_h2(gq[0], gq[1]);
+                R[nf][1] = pack_h2(gq[2], gq[3]);
+                if (GRADS && (nf & 1)) {                       // (dB's G^T: children 16 kk .., the warp's 16 nodes)
+                    const int kk = nf >> 1;
+                    stsm4t(uT + oT + 64 * Gm::TROW * kk, R[2 * kk][0], R[2 * kk][1], R[2 * kk + 1][0], R[2 * kk + 1][1]);
+                }
+            }
+            // ---- the element flows: each child's sum over the warp's 16 nodes, a reduce-scatter over the 8 lanes of a tq
+            {
+                const bool h2 = g & 4, h1 = g & 2, h0 = g & 1;
+                float u8[8], u4[4], u2[2];
+#pragma unroll
+                for (int m = 0; m < 8; m++) {
+                    const float send = h2 ? v[m] : v[m + 8], keep = h2 ? v[m + 8] : v[m];
+                    u8[m] = keep + __shfl_xor_sync(0xffffffffu, send, 16);
+                }
+#pragma unroll
+                for (int m = 0; m < 4; m++) {
+                    const float send = h1 ? u8[m] : u8[m + 4], keep = h1 ? u8[m + 4] : u8[m];
+                    u4[m] = keep + __shfl_xor_sync(0xffffffffu, send, 8);
+                }
+#pragma unroll
+                for (int m = 0; m < 2; m++) {
+                    const float send = h0 ? u4[m] : u4[m + 2], keep = h0 ? u4[m + 2] : u4[m];
+                    u2[m] = keep + __shfl_xor_sync(0xffffffffu, send, 4);
+                }
+                const int base = (h2 ? 8 : 0) + (h1 ? 4 : 0) + (h0 ? 2 : 0);   // v's indices this lane holds: base, + 1
+#pragma unroll
+                for (int m = 0; m < 2; m++) {
+                    const int idx = base + m;
+                    sE[w * TN2 + 8 * (idx >> 1) + 2 * tq + (idx & 1)] = u2[m];
+                }
+            }
+            if (wu == 0) bulk_wait_read0_if(issuer);           // (the adds issued at [A] have read their partials)
+            __syncthreads();                                   // [B] b's G^T, element-flow partials written
+            if (wu < TN2 / 32) {                               // b's element flows: the 8 warps' partials, one add
+                float s = 0.f;
+#pragma unroll
+                for (int ww = 0; ww < NW2; ww++) s += sE[ww * TN2 + tid];
+                if (s != 0.f && j0 + tid < N) red1(ef + (long)b * Np + j0 + tid, s * scl.y);
+            }
+            if (GRADS) {
+                // ---- dA_b = G B^T over the tile's children (the warp's rows; units of 2^E: times 2^E), a pair of rank
+                // n-tiles at a time: the A operand R[2 kk][0], R[2 kk][1], R[2 kk + 1][0], R[2 kk + 1][1]; B^T by
+                // ldmatrix of B's rank rows (k pairs along the children)
+#pragma unroll
+                for (int p = 0; p < KP / 16; p++) {
+                    float dd[2][4];
+#pragma unroll
+                    for (int nt = 0; nt < 2; nt++)
+#pragma unroll
+                        for (int c = 0; c < 4; c++) dd[nt][c] = 0.f;
+#pragma unroll
+                    for (int kk = 0; kk < 4; kk++) {
+                        unsigned bt[4];
+                        ldsm4(bt, ubh + oBt + 32 * kk + 64 * Gm::BROW * p);
+                        mma_h16(dd[0], R[2 * kk][0], R[2 * kk][1], R[2 * kk + 1][0], R[2 * kk + 1][1], bt[0], bt[1]);
+                        mma_h16(dd[1], R[2 * kk][0], R[2 * kk][1], R[2 * kk + 1][0], R[2 * kk + 1][1], bt[2], bt[3]);
+                    }
+                    if constexpr (Gm::DA_SMEM) {               // (nodes g / g + 8, ranks 16 p + 8 nt + 2 tq, + 1)
+#pragma unroll
+                        for (int nt = 0; nt < 2; nt++) {
+                            const int rk = 16 * p + 8 * nt + 2 * tq;
+                            *reinterpret_cast<float2*>(sDA + (16 * w + g) * KP + rk) =
+                                make_float2(dd[nt][0] * scl.y, dd[nt][1] * scl.y);
+                            *reinterpret_cast<float2*>(sDA + (16 * w + g + 8) * KP + rk) =
+                                make_float2(dd[nt][2] * scl.y, dd[nt][3] * scl.y);
+                        }
+                    } else {
+                        // (a quad's pairs transposed: lane tq holds pair tq of n-tile 2p (ranks 16 p + 2 tq, + 1) and
+                        // pair 4 + tq of n-tile 2p + 1 and takes pairs 2 tq, 2 tq + 1 -- 4 ranks of a row, a 16-byte
+                        // reduction; a warp instruction 8 rows x 64 bytes: 2.6 TB/s of L2 adds where 16 rows x 32
+                        // bytes made 1.9). Round A: lanes 0, 2 offer their n-tile 2p + 1 pair, 1, 3 their n-tile 2p
+                        // pair, lane tq reads lane {1, 3, 0, 2}[tq]; round B: lane 1 offers its n-tile 2p + 1 pair,
+                        // lane 2 its n-tile 2p pair, read by each other
+                        const int qb = lane & ~3;
+                        const int srcA = qb + ((0x2031 >> (4 * tq)) & 0xf), srcB = qb + ((0x3120 >> (4 * tq)) & 0xf);
+#pragma unroll
+                        for (int h = 0; h < 2; h++) {          // (row g, then g + 8)
+                            const float a0 = dd[0][2 * h], a1 = dd[0][2 * h + 1], b0v = dd[1][2 * h], b1v = dd[1][2 * h + 1];
+                            const float oa0 = (tq & 1) ? a0 : b0v, oa1 = (tq & 1) ? a1 : b1v;
+                            const float ob0 = tq == 1 ? b0v : a0, ob1 = tq == 1 ? b1v : a1;
+                            const float ra0 = __shfl_sync(0xffffffffu, oa0, srcA), ra1 = __shfl_sync(0xffffffffu, oa1, srcA);
+                            const float rb0 = __shfl_sync(0xffffffffu, ob0, srcB), rb1 = __shfl_sync(0xffffffffu, ob1, srcB);
+                            const float l0 = tq == 0 ? a0 : tq == 1 ? rb0 : ra0, l1 = tq == 0 ? a1 : tq == 1 ? rb1 : ra1;
+                            const float h0 = tq == 2 ? rb0 : tq == 3 ? b0v : ra0, h1 = tq == 2 ? rb1 : tq == 3 ? b1v : ra1;
+                            const float4 v4 = make_float4(l0 * scl.y, l1 * scl.y, h0 * scl.y, h1 * scl.y);
+                            const int row = rA + 8 * h, rk = 16 * p + 4 * tq;
+                            if (row < ma && rk < kv) red4(gA + (long)b * sgA + (long)row * ka + rk, v4);
+                        }
+                    }
+                }
+                // ---- dB_b = A'^T G over the tile's nodes (k-steps kw: the 8 warps' 16-node blocks of G^T): the warp's
+                // units (child m-tile w & 3, rank n-tiles nb ..), the G^T fragment shared, A' by ldmatrix.trans of the
+                // node rows (two n-tiles a load); into [rank][child] rows (units of 2^E, A' carrying log2 e: times
+                // ln 2 2^E; 2^E for the caller's A itself)
+                float dq[NPW][4];
+#pragma unroll
+                for (int x = 0; x < NPW; x++)
+#pragma unroll
+                    for (int c = 0; c < 4; c++) dq[x][c] = 0.f;
+#pragma unroll
+                for (int kw = 0; kw < NW2; kw++) {
+                    unsigned aa[4];
+                    ldsm4(aa, uT + oTa + 32 * kw);
+#pragma unroll
+                    for (int pp = 0; pp < NPW / 2; pp++) {
+                        unsigned bb[4];
+                        ldsm4t(bb, uah + oAb + 64 * Gm::AROW * kw + 32 * pp);
+                        mma_h16(dq[2 * pp], aa[0], aa[1], aa[2], aa[3], bb[0], bb[1]);
+                        mma_h16(dq[2 * pp + 1], aa[0], aa[1], aa[2], aa[3], bb[2], bb[3]);
+                    }
+                }
+                const float scz = scaleA ? scl.y : scl.z;
+                const int ch = 16 * (w & 3) + g;
+#pragma unroll
+                for (int x = 0; x < NPW; x++) {
+                    const int rk = 8 * (nb + x) + 2 * tq;
+                    sDB[rk * TN2 + ch] = dq[x][0] * scz;
+                    sDB[(rk + 1) * TN2 + ch] = dq[x][1] * scz;
+                    sDB[rk * TN2 + ch + 8] = dq[x][2] * scz;
+                    sDB[(rk + 1) * TN2 + ch + 8] = dq[x][3] * scz;
+                }
+                fence_async_smem();                            // (the partials to the bulk adds after the next barrier)
+            }
+        }
+        // the tile's drain: the last sample's partials added; then F+ / W
+        __syncthreads();
+        if (GRADS) {
+            out_dA(b1 - 1, i0);
+            out_dB(b1 - 1, j0);
+        }
+        // F+ and W of the warp's 16 x 64 cells, a quarter of the children at a time through its own rows of the G^T
+        // buffer (the next tile's first stage lands meanwhile in A' / B / terms): a lane four consecutive nodes of a
+        // child, one 16-byte add (scalar adds where the node blocks are under 4 or the runs unaligned)
+        if (FLOWS || DENOM) {
+            float* const st = reinterpret_cast<float*>(sT) + w * (16 * 20);   // [child 16][node 16 + 4]
+            const bool vec = (bs & 3) == 0 && ((pf0 | dn0) & 3) == 0;
+#pragma unroll
+            for (int pass = 0; pass < 2; pass++) {
+                if ((pass == 0 && !FLOWS) || (pass == 1 && !DENOM)) continue;
+                float* const dst = pass == 0 ? pflows + pf0 : denom + dn0;
+#pragma unroll
+                for (int qq = 0; qq < 4; qq++) {
+#pragma unroll
+                    for (int e8 = 0; e8 < 8; e8++) {
+                        const int e = 8 * qq + e8, nf = e >> 2, c = e & 3;
+                        float val = pass == 0 ? fp[e] : tw[e];
+                        if (pass == 1) {
+                            const float th = exp2f(lt[e]);
+                            val = th > 0.f ? val / th : 0.f;
+                        }
+                        st[(8 * (nf - 2 * qq) + 2 * tq + (c & 1)) * 20 + g + 8 * (c >> 1)] = val;
+                    }
+                    __syncwarp();
+#pragma unroll
+                    for (int uu = 0; uu < 2; uu++) {           // (8 children an instruction, 4 lanes a child)
+                        const int col = 8 * uu + (lane >> 2), r4 = 4 * (lane & 3), i = i0 + 16 * w + r4;
+                        const int j = j0 + 16 * qq + col;
+                        const float4 vv = *reinterpret_cast<const float4*>(st + col * 20 + r4);
+                        if (j >= N || i >= M) continue;
+                        const long o = grid_at(i, j, Nb, cbs, bs);
+                        if (vec && i + 3 < M) {
+                            if (vv.x != 0.f || vv.y != 0.f || vv.z != 0.f || vv.w != 0.f) red4(dst + o, vv);
+                        } else {
+                            const float v4[4] = {vv.x, vv.y, vv.z, vv.w};
+#pragma unroll
+                            for (int q = 0; q < 4; q++)
+                                if (i + q < M && v4[q] != 0.f) red1(dst + grid_at(i + q, j, Nb, cbs, bs), v4[q]);
+                        }
+                    }
+                    __syncwarp();
+                }
+            }
+        }
+        __syncthreads();                                       // (the flush's rows: the next tile's G^T)
+    }
+    if (issuer) bulk_wait_all();                               // (the partials' last reads before the CTA ends)
+}
+
+
 // Samples a pass takes at once: its per-sample working set `per` (bytes) kept within the L2, the batch split evenly
 static int64_t sample_chunk(int64_t B, double per) {
     constexpr int NDEV = 64;
@@ -1257,15 +1717,19 @@ static bool inner_contiguous(const torch::Tensor& t) {
 // A sample's stride (halves or floats): a single sample's whatever its own, the dense one
 static int64_t sstride(const torch::Tensor& t) { return t.size(0) <= 1 ? t.size(1) * t.size(2) : t.stride(0); }
 
-// Whether the factors are read in place: fp16, each sample's block 16-byte aligned (the base, the batch stride a
-// multiple of 8 halves), A's rows whole 128-byte lines (M a multiple of 4) and B's rank rows whole 8-child pieces (N a
-// multiple of 8) -- the TMA boxes', the cp.async pieces' alignment. Else the kernels read a converted copy (`conv_copy`)
-static bool h_in_place(const torch::Tensor& A, const torch::Tensor& Bm, int64_t M, int64_t N) {
+// The factors' rank K padded to the kernels' (16, 32 or 64: zero ranks past K)
+static int rank_pad_h(int64_t K) { return K <= 16 ? 16 : K <= 32 ? 32 : 64; }
+
+// Whether the factors are read in place: fp16, their rank the kernels' (K = KP: no padding), each sample's block
+// 16-byte aligned (the base, the batch stride a multiple of 8 halves), A's rows whole 128-byte lines (M a multiple of
+// 64 / KP) and B's rank rows whole 8-child pieces (N a multiple of 8) -- the TMA boxes', the cp.async pieces'
+// alignment. Else the kernels read a converted copy (`conv_copy`)
+static bool h_in_place(const torch::Tensor& A, const torch::Tensor& Bm, int64_t M, int64_t N, int64_t K, int KP) {
     const auto ok = [](const torch::Tensor& t) {
         return t.scalar_type() == torch::kHalf && reinterpret_cast<uintptr_t>(t.data_ptr()) % 16 == 0 &&
                sstride(t) % 8 == 0;
     };
-    return ok(A) && ok(Bm) && M % 4 == 0 && N % 8 == 0;
+    return K == KP && ok(A) && ok(Bm) && M % (64 / KP) == 0 && N % 8 == 0;
 }
 
 void check_common(const torch::Tensor& A, const torch::Tensor& Bm, const torch::Tensor& params,
@@ -1280,7 +1744,7 @@ void check_common(const torch::Tensor& A, const torch::Tensor& Bm, const torch::
     TORCH_CHECK(params.scalar_type() == torch::kFloat32 || params.scalar_type() == torch::kBFloat16, "params: fp32 or bf16");
     TORCH_CHECK(emars.scalar_type() == torch::kFloat32 && emars.is_contiguous() && emars.size(1) == B, "element_mars");
     TORCH_CHECK(rows.scalar_type() == torch::kInt64 && rows.numel() == N, "rows: int64 [N]");
-    TORCH_CHECK(K == HK, "the fp16 exp_sum kernels take rank 16");
+    TORCH_CHECK(K >= 1 && K <= 64, "the fp16 exp_sum kernels take ranks 1 .. 64");
 }
 
 #define HF_TP_SWITCH(PARAMS, ...)                                                                                  \
@@ -1326,15 +1790,17 @@ static PFN_cuTensorMapEncodeTiled_v12000 tmap_encode() {
     return fn;
 }
 
-// The forward's operands as tensor maps of fp16 in 128-byte swizzled boxes, zeros past the extents: A [bc][rows][16]
-// (rows contiguous -- `rows` a multiple of 4 --, samples `ss` halves apart) as lines of 4 rows, boxes of 32 lines (128
-// rows); B [bc][16][n] (rank rows of n children contiguous) in boxes of 64 children
+// The forward's operands as tensor maps of fp16 in 128-byte swizzled boxes, zeros past the extents: A [bc][rows][KP]
+// (rows contiguous -- `rows` a multiple of 64 / KP --, samples `ss` halves apart) as lines of 64 / KP rows, boxes of
+// 2 KP lines (128 rows); B [bc][KP][n] (rank rows of n children contiguous) in boxes of 64 children
+template <int KP>
 static CUtensorMap h_map(const void* base, bool isA, int64_t ext, int64_t ss, int64_t bc) {
+    constexpr int RPL = 64 / KP;
     CUtensorMap m;
-    cuuint64_t dimA[3] = {64, (cuuint64_t)ext / 4, (cuuint64_t)bc};
-    cuuint64_t dimB[3] = {(cuuint64_t)ext, (cuuint64_t)HK, (cuuint64_t)bc};
+    cuuint64_t dimA[3] = {64, (cuuint64_t)ext / RPL, (cuuint64_t)bc};
+    cuuint64_t dimB[3] = {(cuuint64_t)ext, (cuuint64_t)KP, (cuuint64_t)bc};
     cuuint64_t strA[2] = {128, (cuuint64_t)ss * 2}, strB[2] = {(cuuint64_t)ext * 2, (cuuint64_t)ss * 2};
-    cuuint32_t boxA[3] = {64, (cuuint32_t)HTM / 4, 1}, boxB[3] = {64, (cuuint32_t)HK, 1};
+    cuuint32_t boxA[3] = {64, (cuuint32_t)HTM / RPL, 1}, boxB[3] = {64, (cuuint32_t)KP, 1};
     cuuint32_t es[3] = {1, 1, 1};
     const CUresult r = tmap_encode()(&m, CU_TENSOR_MAP_DATA_TYPE_FLOAT16, 3, const_cast<void*>(base), isA ? dimA : dimB,
                                      isA ? strA : strB, isA ? boxA : boxB, es, CU_TENSOR_MAP_INTERLEAVE_NONE,
@@ -1344,17 +1810,17 @@ static CUtensorMap h_map(const void* base, bool isA, int64_t ext, int64_t ss, in
     return m;
 }
 
-// The factors' fp16 operands as the kernels read them (the forward's deferred items, the backward's stages): A rows (16
+// The factors' fp16 operands as the kernels read them (the comb's rare items, the backward's stages): A rows (KP
 // halves) `sAb` apart a sample, zeros from row am; B rank rows `bk` apart, `sBb` a sample, zeros from child bn; scaleA:
 // A is the caller's (made A' in the kernels), else the copy's A'
 struct HbOps { const __half* a; long sAb; int am; const __half* b; long sBb; int bk, bn, scaleA; };
 
-template <int NT8, int NST>
+template <int KP, int NT8, int NST>
 void launch_hf_fw(cudaStream_t stream, const CUtensorMap& tma, const CUtensorMap& tmb, int scaleA, const float* wf,
                   const float4* ltf, float2* part2, int M, int Mp, int Bc, int njt, long total) {
-    using Gm = HfGeo<NT8>;
+    using Gm = HfGeo<KP, NT8>;
     constexpr int bytes = NST * Gm::ST + 2 * NST * 8 + 4 * HNW + 1024;   // (+ the stages' alignment)
-    auto kern = hf_fw_kernel<NT8, NST>;
+    auto kern = hf_fw_kernel<KP, NT8, NST>;
     static int per_sm[64] = {0};                              // (a device's CTAs an SM; 0: not asked yet)
     const int dev = at::cuda::current_device();
     int occ = dev < 64 ? per_sm[dev] : 0;
@@ -1373,7 +1839,7 @@ void launch_hf_fw(cudaStream_t stream, const CUtensorMap& tma, const CUtensorMap
 template <int NT8>
 std::vector<torch::Tensor> theta_impl(torch::Tensor params, int64_t p0, int64_t Nb, int64_t cbs, int64_t bs, int64_t M,
                                       int64_t N) {
-    using Gm = HfGeo<NT8>;
+    using Gm = HfGeo<16, NT8>;                                 // (the tile's children: any rank's)
     const at::cuda::CUDAGuard guard(params.device());
     auto stream = at::cuda::getCurrentCUDAStream();
     const int Mp = (int)((M + HTM - 1) / HTM * HTM), Np = (int)((N + Gm::TN - 1) / Gm::TN * Gm::TN);
@@ -1387,30 +1853,30 @@ std::vector<torch::Tensor> theta_impl(torch::Tensor params, int64_t p0, int64_t 
     return {LTF, CMR};
 }
 
-// The forward of one node vector: its node values into `node_mars` rows `nid0 .. nid0 + M`; returns {log Z [M, B], AP,
-// BP}: the converted copy of the factors where they are not read in place and `keep` (the backward's operands then:
-// AP [B, Mp, 16] = A', BP [B, 16, Np] = B in fp16), else empty
-template <int NT8>
+// The forward of one node vector at KP ranks (its K padded): its node values into `node_mars` rows `nid0 .. nid0 + M`;
+// returns {log Z [M, B], AP, BP}: the converted copy of the factors where they are not read in place and `keep` (the
+// backward's operands then: AP [B, Mp, KP] = A', BP [B, KP, Np] = B in fp16), else empty
+template <int KP, int NT8>
 std::vector<torch::Tensor> forward_impl(torch::Tensor A, torch::Tensor Bm, torch::Tensor params, int64_t p0, int64_t Nb,
                                         int64_t cbs, int64_t bs, torch::Tensor emars, torch::Tensor rows,
-                                        torch::Tensor node_mars, int64_t nid0, int64_t M, int64_t N, torch::Tensor LTF,
-                                        torch::Tensor CMR, bool keep) {
-    using Gm = HfGeo<NT8>;
-    constexpr int NST = 3, TN = Gm::TN;
+                                        torch::Tensor node_mars, int64_t nid0, int64_t M, int64_t N, int64_t K,
+                                        torch::Tensor LTF, torch::Tensor CMR, bool keep) {
+    using Gm = HfGeo<KP, NT8>;
+    constexpr int NST = Gm::NST, TN = Gm::TN;
     const int64_t B = node_mars.size(1);
     const at::cuda::CUDAGuard guard(A.device());
     auto stream = at::cuda::getCurrentCUDAStream();
     const int Mp = (int)((M + HTM - 1) / HTM * HTM), Np = (int)((N + TN - 1) / TN * TN), njt = Np / TN, nit = Mp / HTM;
     auto lzs = torch::empty({M, B}, emars.options());
     const long* rw = reinterpret_cast<const long*>(rows.template data_ptr<int64_t>());
-    const bool direct = h_in_place(A, Bm, M, N);
+    const bool direct = h_in_place(A, Bm, M, N, K, KP);
     // a sample's working set: its fp16 operands, WF, lcs, the partials (z, s)
-    const int64_t BC = sample_chunk(B, 2.0 * HK * (Mp + Np) + 4.0 * njt * Gm::WFW + 4.0 * Np + 8.0 * njt * Mp);
+    const int64_t BC = sample_chunk(B, 2.0 * KP * (Mp + Np) + 4.0 * njt * Gm::WFW + 4.0 * Np + 8.0 * njt * Mp);
     torch::Tensor AP, BP;                                      // (the converted copy: the batch's where kept)
     if (!direct) {
         const int64_t cb = keep ? B : BC;
-        AP = torch::empty({cb, (long)Mp, HK}, emars.options().dtype(torch::kHalf));
-        BP = torch::empty({cb, HK, (long)Np}, emars.options().dtype(torch::kHalf));
+        AP = torch::empty({cb, (long)Mp, KP}, emars.options().dtype(torch::kHalf));
+        BP = torch::empty({cb, KP, (long)Np}, emars.options().dtype(torch::kHalf));
     }
     auto WF = torch::empty({BC, (long)njt * Gm::WFW}, emars.options());
     auto lcs = torch::empty({BC, (long)Np}, emars.options());
@@ -1426,32 +1892,32 @@ std::vector<torch::Tensor> forward_impl(torch::Tensor A, torch::Tensor Bm, torch
     TORCH_CHECK((int64_t)BC * njt * Mp < (int64_t)INT_MAX, "the partials' index: 32 bits");
     const float4* ltf = reinterpret_cast<const float4*>(LTF.template data_ptr<float>());
     float2* pp2 = reinterpret_cast<float2*>(part2.template data_ptr<float>());
-    const int nbA = direct ? 0 : (Mp * 8 + 255) / 256, nbB = direct ? 0 : (HK * (Np / 2) + 255) / 256;
+    const int nbA = direct ? 0 : (Mp * (KP / 2) + 255) / 256, nbB = direct ? 0 : (KP * (Np / 2) + 255) / 256;
     const int nbW = (njt + 7) / 8;
     const int64_t sA = A.stride(0), sB = Bm.stride(0);
     for (int64_t b0 = 0; b0 < B; b0 += BC) {
         const int Bc = (int)std::min<int64_t>(BC, B - b0);
         const int64_t c0 = keep ? b0 : 0;                      // (the chunk's first sample in the copy)
-        unsigned* ap = direct ? nullptr : reinterpret_cast<unsigned*>(AP.data_ptr<at::Half>()) + c0 * Mp * 8;
-        unsigned* bp = direct ? nullptr : reinterpret_cast<unsigned*>(BP.data_ptr<at::Half>()) + c0 * HK * (Np / 2);
-        HF_TI_SWITCH(A, Bm, b0, hf_fw_prep_kernel<TI, NT8><<<dim3(nbA + nbB + nbW, (unsigned)Bc), 256, 0, stream>>>(
+        unsigned* ap = direct ? nullptr : reinterpret_cast<unsigned*>(AP.data_ptr<at::Half>()) + c0 * Mp * (KP / 2);
+        unsigned* bp = direct ? nullptr : reinterpret_cast<unsigned*>(BP.data_ptr<at::Half>()) + c0 * KP * (Np / 2);
+        HF_TI_SWITCH(A, Bm, b0, hf_fw_prep_kernel<KP, TI, NT8><<<dim3(nbA + nbB + nbW, (unsigned)Bc), 256, 0, stream>>>(
             ai, bi, ap, bp, WF.template data_ptr<float>(), lcs.template data_ptr<float>(), emars.template data_ptr<float>(),
-            rw, (int)M, (int)N, Mp, Np, nbA, nbB, (int)B, (int)b0, (long)sA, (long)sB));
+            rw, (int)M, (int)N, (int)K, Mp, Np, nbA, nbB, (int)B, (int)b0, (long)sA, (long)sB));
         C10_CUDA_KERNEL_LAUNCH_CHECK();
-        const CUtensorMap tma = direct ? h_map(reinterpret_cast<const __half*>(A.data_ptr<at::Half>()) + b0 * sA, true, M,
-                                               sstride(A), Bc)
-                                       : h_map(ap, true, Mp, (int64_t)Mp * HK, Bc);
-        const CUtensorMap tmb = direct ? h_map(reinterpret_cast<const __half*>(Bm.data_ptr<at::Half>()) + b0 * sB, false,
-                                               N, sstride(Bm), Bc)
-                                       : h_map(bp, false, Np, (int64_t)HK * Np, Bc);
+        const CUtensorMap tma = direct ? h_map<KP>(reinterpret_cast<const __half*>(A.data_ptr<at::Half>()) + b0 * sA, true,
+                                                   M, sstride(A), Bc)
+                                       : h_map<KP>(ap, true, Mp, (int64_t)Mp * KP, Bc);
+        const CUtensorMap tmb = direct ? h_map<KP>(reinterpret_cast<const __half*>(Bm.data_ptr<at::Half>()) + b0 * sB,
+                                                   false, N, sstride(Bm), Bc)
+                                       : h_map<KP>(bp, false, Np, (int64_t)KP * Np, Bc);
         const HbOps op = direct ? HbOps{reinterpret_cast<const __half*>(A.data_ptr<at::Half>()) + b0 * sA, (long)sstride(A),
                                         (int)M, reinterpret_cast<const __half*>(Bm.data_ptr<at::Half>()) + b0 * sB,
                                         (long)sstride(Bm), (int)N, (int)N, 1}
-                                : HbOps{reinterpret_cast<const __half*>(ap), (long)Mp * HK, Mp,
-                                        reinterpret_cast<const __half*>(bp), (long)HK * Np, Np, Np, 0};
+                                : HbOps{reinterpret_cast<const __half*>(ap), (long)Mp * KP, Mp,
+                                        reinterpret_cast<const __half*>(bp), (long)KP * Np, Np, Np, 0};
         const long total = (long)njt * nit * Bc;
-        launch_hf_fw<NT8, NST>(stream, tma, tmb, op.scaleA, WF.template data_ptr<float>(), ltf, pp2, (int)M, Mp, Bc, njt,
-                               total);
+        launch_hf_fw<KP, NT8, NST>(stream, tma, tmb, op.scaleA, WF.template data_ptr<float>(), ltf, pp2, (int)M, Mp, Bc,
+                                   njt, total);
         C10_CUDA_KERNEL_LAUNCH_CHECK();
         // (the combine, the rare items' paths: 2 lanes an output, 4 where that grid would leave an SM fewer than 2
         // blocks)
@@ -1459,7 +1925,7 @@ std::vector<torch::Tensor> forward_impl(torch::Tensor A, torch::Tensor Bm, torch
         const bool wide = (long)((M + 31) / 32) * ((Bc + 3) / 4) < 2L * sms;
         const dim3 cg((unsigned)((M + 31) / 32), (unsigned)((Bc + (wide ? 1 : 3)) / (wide ? 2 : 4)));
         HF_TP_SWITCH(params, {
-            auto comb = wide ? hf_comb_kernel<TP, NT8, 4> : hf_comb_kernel<TP, NT8, 2>;
+            auto comb = wide ? hf_comb_kernel<TP, KP, NT8, 4> : hf_comb_kernel<TP, KP, NT8, 2>;
             const HfRare<TP> ra{op.a, op.sAb, op.am, op.b, op.sBb, op.bk, op.bn, op.scaleA, WF.template data_ptr<float>(),
                                 Gm::WFW, lcs.template data_ptr<float>(), pp, p0, (int)Nb, (int)cbs, (int)bs, (int)M,
                                 (int)N, Np, njt};
@@ -1496,7 +1962,14 @@ std::vector<torch::Tensor> exp_sum_h_forward(torch::Tensor A, torch::Tensor Bm, 
     const bool given = theta.size() == 2;
     torch::Tensor ltf = given ? theta[0] : torch::empty({0}, emars.options());
     torch::Tensor cmr = given ? theta[1] : torch::empty({0}, emars.options());
-    return forward_impl<8>(A, Bm, params, p0, Nb, cbs, bs, emars, rows, node_mars, nid0, M, N, ltf, cmr, keep);
+    switch (rank_pad_h(K)) {                                   // (the factors' rank padded: 16, 32, 64)
+        case 16: return forward_impl<16, 8>(A, Bm, params, p0, Nb, cbs, bs, emars, rows, node_mars, nid0, M, N, K, ltf, cmr,
+                                            keep);
+        case 32: return forward_impl<32, 8>(A, Bm, params, p0, Nb, cbs, bs, emars, rows, node_mars, nid0, M, N, K, ltf, cmr,
+                                            keep);
+        default: return forward_impl<64, 8>(A, Bm, params, p0, Nb, cbs, bs, emars, rows, node_mars, nid0, M, N, K, ltf,
+                                            cmr, keep);
+    }
 }
 
 
@@ -1510,13 +1983,14 @@ std::vector<torch::Tensor> exp_sum_h_forward(torch::Tensor A, torch::Tensor Bm, 
     else if (GRADS) { constexpr bool FL = false, DE = false, GR = true; __VA_ARGS__; }                             \
     else { constexpr bool FL = false, DE = false, GR = false; __VA_ARGS__; }
 
-// dB's destination as a 3-D tensor of fp32 -- n children (a rank's row, contiguous), 16 ranks `ldb` apart, bc samples
-// `sgb` apart (in floats; 16-byte multiples) -- in boxes of the backward's 64 children x 16 ranks x 1 sample
-static CUtensorMap db_map(float* base, int64_t n, int64_t ldb, int64_t sgb, int64_t bc) {
+// dB's destination as a 3-D tensor of fp32 -- n children (a rank's row, contiguous), k ranks `ldb` apart, bc samples
+// `sgb` apart (in floats; 16-byte multiples) -- in boxes of the backward's 64 children x k ranks x 1 sample (the first
+// k rows of a CTA's partial [KP][64]: the caller's ranks, or all KP of a temporary)
+static CUtensorMap db_map(float* base, int64_t n, int64_t k, int64_t ldb, int64_t sgb, int64_t bc) {
     CUtensorMap m;
-    cuuint64_t dim[3] = {(cuuint64_t)n, (cuuint64_t)HK, (cuuint64_t)bc};
+    cuuint64_t dim[3] = {(cuuint64_t)n, (cuuint64_t)k, (cuuint64_t)bc};
     cuuint64_t str[2] = {(cuuint64_t)ldb * 4, (cuuint64_t)sgb * 4};
-    cuuint32_t box[3] = {(cuuint32_t)TN2, (cuuint32_t)HK, 1};
+    cuuint32_t box[3] = {(cuuint32_t)TN2, (cuuint32_t)k, 1};
     cuuint32_t es[3] = {1, 1, 1};
     const CUresult r = tmap_encode()(&m, CU_TENSOR_MAP_DATA_TYPE_FLOAT32, 3, base, dim, str, box, es,
                                      CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE,
@@ -1525,15 +1999,32 @@ static CUtensorMap db_map(float* base, int64_t n, int64_t ldb, int64_t sgb, int6
     return m;
 }
 
+// dA's destination where its rows are narrower than a CTA's partial rows (the caller's K < KP ranks, K a multiple of
+// 4): fp32 [bc][m][K] (rows K floats, samples `sga` floats apart), in boxes of KP ranks x 128 rows x 1 sample -- the
+// partial [128][KP] as it lies, its ranks past K and rows past m dropped
+static CUtensorMap da_map(float* base, int64_t m, int64_t K, int64_t sga, int64_t bc, int KP) {
+    CUtensorMap mp;
+    cuuint64_t dim[3] = {(cuuint64_t)K, (cuuint64_t)m, (cuuint64_t)bc};
+    cuuint64_t str[2] = {(cuuint64_t)K * 4, (cuuint64_t)sga * 4};
+    cuuint32_t box[3] = {(cuuint32_t)KP, (cuuint32_t)TM2, 1};
+    cuuint32_t es[3] = {1, 1, 1};
+    const CUresult r = tmap_encode()(&mp, CU_TENSOR_MAP_DATA_TYPE_FLOAT32, 3, base, dim, str, box, es,
+                                     CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE,
+                                     CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+    TORCH_CHECK(r == CUDA_SUCCESS, "dA's tensor map: cuTensorMapEncodeTiled failed (", (int)r, ")");
+    return mp;
+}
+
 
 // The backward on its persistent grid: the GPU's SMs times the CTAs an SM holds (asked once a device), at most a CTA a
 // unit
-template <typename TP, bool FL, bool DE, bool GR>
+template <typename TP, bool FL, bool DE, bool GR, bool DM>
 void launch_hb_bw(cudaStream_t stream, const HbOps& op, const TP* pp, long p0, int Nb, int cbs, int bs, const float* LU,
                   const float* LC, float* ef, float* pf, long pf0, float* dnp, long dn0, float* ga, long sga, int ma,
-                  const CUtensorMap& tmb, const float4* sc, int M, int N, int Mp, int Np, int B, int nct, long units) {
+                  const CUtensorMap& tmb, const CUtensorMap& tma, const float4* sc, int M, int N, int Mp, int Np, int B,
+                  int nct, long units) {
     constexpr int bytes = Hb2Geo::WORDS * 4;
-    auto kern = hb_bw_kernel<TP, FL, DE, GR>;
+    auto kern = hb_bw_kernel<TP, FL, DE, GR, DM>;
     static int per_sm[64] = {0};
     const int dev = at::cuda::current_device();
     int occ = dev < 64 ? per_sm[dev] : 0;
@@ -1546,17 +2037,173 @@ void launch_hb_bw(cudaStream_t stream, const HbOps& op, const TP* pp, long p0, i
     const int sms = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
     const long grid = std::max<long>(1, std::min<long>(units, (long)sms * occ));
     kern<<<(unsigned)grid, 256, bytes, stream>>>(op.a, op.sAb, op.am, op.b, op.sBb, op.bk, op.bn, op.scaleA, pp, p0, Nb,
-                                                cbs, bs, LU, LC, ef, pf, pf0, dnp, dn0, ga, sga, ma, tmb, sc, M, N, Mp, Np,
-                                                B, nct, units);
+                                                cbs, bs, LU, LC, ef, pf, pf0, dnp, dn0, ga, sga, ma, tmb, tma, sc, M, N, Mp,
+                                                Np, B, nct, units);
+}
+
+// ... at ranks padded to 32 or 64 (`hbk_bw_kernel`)
+template <int KP, typename TP, bool FL, bool DE, bool GR>
+void launch_hbk_bw(cudaStream_t stream, const HbOps& op, const TP* pp, long p0, int Nb, int cbs, int bs, const float* LU,
+                   const float* LC, float* ef, float* pf, long pf0, float* dnp, long dn0, float* ga, long sga, int ma,
+                   int ka, int kv, const CUtensorMap& tmb, const CUtensorMap& tma, int dmap, const float4* sc, int M,
+                   int N, int Mp, int Np, int B, int nct, long units) {
+    constexpr int bytes = HbkGeo<KP>::WORDS * 4;
+    auto kern = hbk_bw_kernel<KP, TP, FL, DE, GR>;
+    static int per_sm[64] = {0};
+    const int dev = at::cuda::current_device();
+    int occ = dev < 64 ? per_sm[dev] : 0;
+    if (occ == 0) {
+        C10_CUDA_CHECK(cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes));
+        C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, kern, 256, bytes));
+        occ = std::max(occ, 1);
+        if (dev < 64) per_sm[dev] = occ;
+    }
+    const int sms = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
+    const long grid = std::max<long>(1, std::min<long>(units, (long)sms * occ));
+    kern<<<(unsigned)grid, 256, bytes, stream>>>(op.a, op.sAb, op.am, op.b, op.sBb, op.bk, op.bn, op.scaleA, pp, p0, Nb,
+                                                cbs, bs, LU, LC, ef, pf, pf0, dnp, dn0, ga, sga, ma, ka, kv, tmb, tma, dmap,
+                                                sc, M, N, Mp, Np, B, nct, units);
+}
+
+// The backward of one node vector at KP ranks (its K padded; see exp_sum_h_backward)
+template <int KP>
+void backward_impl(const torch::Tensor& A, const torch::Tensor& Bm, const torch::Tensor& params, int64_t p0, int64_t Nb,
+                   int64_t cbs, int64_t bs, const torch::Tensor& emars, const torch::Tensor& rows,
+                   const torch::Tensor& node_flows, const torch::Tensor& node_mars, int64_t nid0, const torch::Tensor& lzs,
+                   const torch::Tensor& element_flows, const torch::Tensor& pflows, int64_t pf0, const torch::Tensor& denom,
+                   int64_t dn0, const torch::Tensor& gA, const torch::Tensor& gB, int64_t M, int64_t N, int64_t K,
+                   const std::vector<torch::Tensor>& copy, bool init) {
+    const int64_t B = node_mars.size(1);
+    const bool flows = pflows.numel() > 0, dn = denom.numel() > 0, grads = gA.numel() > 0;
+    const at::cuda::CUDAGuard guard(A.device());
+    auto stream = at::cuda::getCurrentCUDAStream();
+    const long* rw = reinterpret_cast<const long*>(rows.data_ptr<int64_t>());
+    float* pf = flows ? pflows.data_ptr<float>() : nullptr;
+    float* dnp = dn ? denom.data_ptr<float>() : nullptr;
+    const int Mp2 = (int)((M + TM2 - 1) / TM2 * TM2), Np2 = (int)((N + TN2 - 1) / TN2 * TN2), njt2 = Np2 / BN;
+    const int nct = Np2 / TN2, nit2 = Mp2 / TM2;
+    const bool given = copy.size() == 2 && copy[0].numel() > 0;
+    if (given)
+        TORCH_CHECK(copy[0].scalar_type() == torch::kHalf && copy[0].is_contiguous() && copy[0].numel() == B * Mp2 * KP &&
+                    copy[1].scalar_type() == torch::kHalf && copy[1].is_contiguous() && copy[1].numel() == B * KP * Np2,
+                    "copy: the forward's {AP [B, Mp, KP], BP [B, KP, Np]} of these factors");
+    const bool direct = !given && h_in_place(A, Bm, M, N, K, KP), convert = !given && !direct;
+    // (a chunk's operands within the L2 beside its fp32 traffic -- the gradients' adds, a conversion's reads -- however
+    // they come: read from the copy or in place, the operands of a chunk the whole batch's would be evicted between
+    // their 16 / 8 readers, +28% at B1024)
+    const int64_t BC = sample_chunk(B, 2.0 * KP * (Mp2 + Np2) + 8.0 * K * (M + N));
+    torch::Tensor AP2, BP2;                                    // (converted here: a chunk's copy)
+    if (convert) {
+        AP2 = torch::empty({BC, (long)Mp2 * KP}, emars.options().dtype(torch::kHalf));
+        BP2 = torch::empty({BC, (long)KP * Np2}, emars.options().dtype(torch::kHalf));
+    }
+    auto LU2 = torch::empty({BC, Mp2, 2}, emars.options());
+    auto LC2 = torch::empty({BC, njt2, 36}, emars.options());
+    auto efs2 = torch::empty({BC, Np2}, emars.options());
+    auto SC2 = torch::empty({BC, 4}, emars.options());          // (the samples' scales)
+    float4* sc2 = reinterpret_cast<float4*>(SC2.data_ptr<float>());
+    const int nbA2 = convert ? (int)(((long)Mp2 * (KP / 2) + 255) / 256) : 0;
+    const int nbB2 = convert ? (int)(((long)KP * (Np2 / 2) + 255) / 256) : 0;
+    // the gradients' bulk adds take the caller's buffers where each sample's rows lie 16-byte aligned -- dA's [M, K]
+    // rows (K a multiple of 4: KP wide, one run of the tile's rows; narrower, a box of a tensor map, `dmap`), dB's K rank
+    // rows of N --; else padded temporaries [B, Mp2, KP], [B, KP, Np2], added in afterwards
+    const auto al16 = [](const torch::Tensor& t) { return reinterpret_cast<uintptr_t>(t.data_ptr()) % 16 == 0; };
+    const bool dga = grads && al16(gA) && gA.stride(0) % 4 == 0 && K % 4 == 0;
+    const bool dgb = grads && al16(gB) && gB.stride(0) % 4 == 0 && N % 4 == 0;
+    const int dmap = dga && K < KP && KP <= 32;                // (KP 64: dA by reductions from registers, any K)
+    torch::Tensor tA2, tB2;
+    if (grads && !dga) tA2 = torch::zeros({BC, Mp2, KP}, emars.options());
+    if (grads && !dgb) tB2 = torch::zeros({BC, KP, Np2}, emars.options());
+    const long sga = !grads ? 0L : dga ? (long)gA.stride(0) : (long)Mp2 * KP;
+    const long sgb = !grads ? 0L : dgb ? (long)gB.stride(0) : (long)KP * Np2;
+    const int ma = dga ? (int)M : Mp2, ldb = dgb ? (int)N : Np2, nbw = dgb ? (int)N : Np2, kb = dgb ? (int)K : KP;
+    const int ka = dga ? (int)K : KP;                          // (dA's destination rows, their live ranks)
+    for (int64_t b0 = 0; b0 < B; b0 += BC) {
+        const int Bc = (int)std::min<int64_t>(BC, B - b0);
+        int lbc = 0;
+        while ((1 << lbc) < Bc) lbc++;
+        unsigned* ap = convert ? reinterpret_cast<unsigned*>(AP2.data_ptr<at::Half>()) : nullptr;
+        unsigned* bp = convert ? reinterpret_cast<unsigned*>(BP2.data_ptr<at::Half>()) : nullptr;
+        // (`init`: the chunk's slices of the caller's gradient buffers zeroed by the prep kernel, just ahead of the
+        // adds -- their lines in the L2 when the adds come, no DRAM round trip of zeros: the previous chunk's final
+        // lines leave as they come in (in the main kernel's background instead: as slow, its L2 shared); through
+        // temporaries, those copied in rather than added)
+        const int nA4 = init && dga ? (int)(M * K / 4) : 0, nB4 = init && dgb ? (int)(K * N / 4) : 0;
+        const int nbZ = (nA4 + nB4 + 4095) / 4096;
+        float4* zA = nA4 ? reinterpret_cast<float4*>(gA.data_ptr<float>() + b0 * gA.stride(0)) : nullptr;
+        float4* zB = nB4 ? reinterpret_cast<float4*>(gB.data_ptr<float>() + b0 * gB.stride(0)) : nullptr;
+        const int nbg = (Bc + 31) / 32;
+        const long nprep = (long)(nbZ + nbA2 + nbB2) * Bc + (Mp2 / 32 + njt2) * nbg + (Bc + 7) / 8;
+        HF_TI_SWITCH(A, Bm, b0, hb_bw_prep_kernel<KP, TI><<<(unsigned)nprep, 256, 0, stream>>>(
+            ai, bi, ap, bp, LU2.data_ptr<float>(), LC2.data_ptr<float>(), efs2.data_ptr<float>(), sc2,
+            node_flows.data_ptr<float>(), node_mars.data_ptr<float>(), nid0, lzs.data_ptr<float>(),
+            emars.data_ptr<float>(), rw, (int)M, (int)N, (int)K, Mp2, Np2, nbA2, nbB2, Bc, (int)B, (int)b0,
+            (long)A.stride(0), (long)Bm.stride(0), zA, nA4 ? gA.stride(0) / 4 : 0L, nA4, zB, nB4 ? gB.stride(0) / 4 : 0L,
+            nB4, nbZ));
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+        if (tA2.defined()) tA2.zero_();
+        if (tB2.defined()) tB2.zero_();
+        HbOps op;
+        if (given)
+            op = HbOps{reinterpret_cast<const __half*>(copy[0].data_ptr<at::Half>()) + b0 * Mp2 * KP, (long)Mp2 * KP, Mp2,
+                       reinterpret_cast<const __half*>(copy[1].data_ptr<at::Half>()) + b0 * KP * Np2, (long)KP * Np2,
+                       Np2, Np2, 0};
+        else if (direct)
+            op = HbOps{reinterpret_cast<const __half*>(A.data_ptr<at::Half>()) + b0 * A.stride(0), (long)sstride(A),
+                       (int)M, reinterpret_cast<const __half*>(Bm.data_ptr<at::Half>()) + b0 * Bm.stride(0),
+                       (long)sstride(Bm), (int)N, (int)N, 1};
+        else
+            op = HbOps{reinterpret_cast<const __half*>(ap), (long)Mp2 * KP, Mp2, reinterpret_cast<const __half*>(bp),
+                       (long)KP * Np2, Np2, Np2, 0};
+        float* ga2 = !grads ? nullptr : dga ? gA.data_ptr<float>() + b0 * gA.stride(0) : tA2.data_ptr<float>();
+        float* gb2 = !grads ? nullptr : dgb ? gB.data_ptr<float>() + b0 * gB.stride(0) : tB2.data_ptr<float>();
+        CUtensorMap tmb, tma;
+        if (grads) tmb = db_map(gb2, nbw, kb, ldb, sgb, Bc);
+        else std::memset(&tmb, 0, sizeof(tmb));
+        if (dmap) tma = da_map(ga2, M, K, sga, Bc, KP);
+        else std::memset(&tma, 0, sizeof(tma));
+        const long units = (long)nit2 * nct * Bc;
+        if constexpr (KP == 16) {
+            if (dmap) {                                        // (the gradients wanted: dmap needs them)
+                HF_TP_SWITCH(params, HB_FLAGS_SWITCH(flows, dn, true, launch_hb_bw<TP, FL, DE, true, true>(stream, op,
+                    pp, p0, (int)Nb, (int)cbs, (int)bs, LU2.data_ptr<float>(), LC2.data_ptr<float>(),
+                    efs2.data_ptr<float>(), pf, pf0, dnp, dn0, ga2, sga, ma, tmb, tma, sc2, (int)M, (int)N, Mp2, Np2, Bc,
+                    nct, units)))
+            } else {
+                HF_TP_SWITCH(params, HB_FLAGS_SWITCH(flows, dn, grads, launch_hb_bw<TP, FL, DE, GR, false>(stream, op,
+                    pp, p0, (int)Nb, (int)cbs, (int)bs, LU2.data_ptr<float>(), LC2.data_ptr<float>(),
+                    efs2.data_ptr<float>(), pf, pf0, dnp, dn0, ga2, sga, ma, tmb, tma, sc2, (int)M, (int)N, Mp2, Np2, Bc,
+                    nct, units)))
+            }
+        } else {
+            HF_TP_SWITCH(params, HB_FLAGS_SWITCH(flows, dn, grads, launch_hbk_bw<KP, TP, FL, DE, GR>(stream, op, pp, p0,
+                (int)Nb, (int)cbs, (int)bs, LU2.data_ptr<float>(), LC2.data_ptr<float>(), efs2.data_ptr<float>(), pf, pf0,
+                dnp, dn0, ga2, sga, ma, ka, ka, tmb, tma, dmap, sc2, (int)M, (int)N, Mp2, Np2, Bc, nct, units)))
+        }
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+        hb_ef_epi_kernel<<<(unsigned)((((long)N << lbc) + 255) / 256), 256, 0, stream>>>(
+            efs2.data_ptr<float>(), rw, element_flows.data_ptr<float>(), (int)N, Np2, Bc, lbc, (int)B, (int)b0);
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+        if (tA2.defined()) {                                   // (the temporaries' sums into the caller's buffers)
+            auto src = tA2.narrow(0, 0, Bc).narrow(1, 0, M).narrow(2, 0, K);
+            if (init) gA.narrow(0, b0, Bc).copy_(src);
+            else gA.narrow(0, b0, Bc).add_(src);
+        }
+        if (tB2.defined()) {
+            auto src = tB2.narrow(0, 0, Bc).narrow(1, 0, K).narrow(2, 0, N);
+            if (init) gB.narrow(0, b0, Bc).copy_(src);
+            else gB.narrow(0, b0, Bc).add_(src);
+        }
+    }
 }
 
 // The backward of one node vector: the element flows of its children log-added into `element_flows` (the caller sets
 // them to -inf first, once a layer), and -- each where its tensor is given (not empty) -- F+ added into `param_flows`
 // from `pf0`, W into `denom` from `dn0`, dLL/dA and dLL/dB into the gradient buffers (fp32, the caller's layout, [B,
-// M, K], [B, K, N]): `lowrank_exp_sum.cu`'s `exp_sum_backward` at rank 16 with phi of the fp16-rounded factors. Its
-// operands: `copy` = the forward's {AP, BP} where given, else the factors in place (fp16, aligned: `h_in_place`), else
-// converted here a chunk at a time. `init`: the gradient buffers hold anything (their first writer: every element
-// written, not added into)
+// M, K], [B, K, N]): `lowrank_exp_sum.cu`'s `exp_sum_backward` with phi of the fp16-rounded factors (their K ranks
+// padded to 16, 32 or 64). Its operands: `copy` = the forward's {AP, BP} where given, else the factors in place (fp16,
+// aligned: `h_in_place`), else converted here a chunk at a time. `init`: the gradient buffers hold anything (their
+// first writer: every element written, not added into)
 void exp_sum_h_backward(torch::Tensor A, torch::Tensor Bm, torch::Tensor params, int64_t p0, int64_t Nb, int64_t cbs,
                         int64_t bs, torch::Tensor emars, torch::Tensor rows, torch::Tensor node_flows,
                         torch::Tensor node_mars, int64_t nid0, torch::Tensor lzs, torch::Tensor element_flows,
@@ -1581,107 +2228,13 @@ void exp_sum_h_backward(torch::Tensor A, torch::Tensor Bm, torch::Tensor params,
         TORCH_CHECK(gB.scalar_type() == torch::kFloat32 && inner_contiguous(gB) && gB.sizes() == Bm.sizes(),
                     "dB: fp32 [B, K, N], a sample's contiguous");
     }
-    const at::cuda::CUDAGuard guard(A.device());
-    auto stream = at::cuda::getCurrentCUDAStream();
-    const long* rw = reinterpret_cast<const long*>(rows.data_ptr<int64_t>());
-    float* pf = flows ? pflows.data_ptr<float>() : nullptr;
-    float* dnp = dn ? denom.data_ptr<float>() : nullptr;
-    const int Mp2 = (int)((M + TM2 - 1) / TM2 * TM2), Np2 = (int)((N + TN2 - 1) / TN2 * TN2), njt2 = Np2 / BN;
-    const int nct = Np2 / TN2, nit2 = Mp2 / TM2;
-    const bool given = copy.size() == 2 && copy[0].numel() > 0;
-    if (given)
-        TORCH_CHECK(copy[0].scalar_type() == torch::kHalf && copy[0].is_contiguous() && copy[0].numel() == B * Mp2 * HK &&
-                    copy[1].scalar_type() == torch::kHalf && copy[1].is_contiguous() && copy[1].numel() == B * HK * Np2,
-                    "copy: the forward's {AP [B, Mp, 16], BP [B, 16, Np]} of these factors");
-    const bool direct = !given && h_in_place(A, Bm, M, N), convert = !given && !direct;
-    // (a chunk's operands within the L2 beside its fp32 traffic -- the gradients' adds, a conversion's reads -- however
-    // they come: read from the copy or in place, the operands of a chunk the whole batch's would be evicted between
-    // their 16 / 8 readers, +28% at B1024)
-    const int64_t BC = sample_chunk(B, 2.0 * HK * (Mp2 + Np2) + 8.0 * K * (M + N));
-    torch::Tensor AP2, BP2;                                    // (converted here: a chunk's copy)
-    if (convert) {
-        AP2 = torch::empty({BC, (long)Mp2 * HK}, emars.options().dtype(torch::kHalf));
-        BP2 = torch::empty({BC, (long)HK * Np2}, emars.options().dtype(torch::kHalf));
-    }
-    auto LU2 = torch::empty({BC, Mp2, 2}, emars.options());
-    auto LC2 = torch::empty({BC, njt2, 36}, emars.options());
-    auto efs2 = torch::empty({BC, Np2}, emars.options());
-    auto SC2 = torch::empty({BC, 4}, emars.options());          // (the samples' scales)
-    float4* sc2 = reinterpret_cast<float4*>(SC2.data_ptr<float>());
-    const int nbA2 = convert ? (int)(((long)Mp2 * 8 + 255) / 256) : 0;
-    const int nbB2 = convert ? (int)(((long)HK * (Np2 / 2) + 255) / 256) : 0;
-    // the gradients' bulk adds take the caller's buffers where each sample's rows lie 16-byte aligned (dA's [M, 16]
-    // rows, dB's 16 rank rows of N); else padded temporaries [B, Mp2, 16], [B, 16, Np2], added in afterwards
-    const auto al16 = [](const torch::Tensor& t) { return reinterpret_cast<uintptr_t>(t.data_ptr()) % 16 == 0; };
-    const bool dgrad = !grads || (al16(gA) && gA.stride(0) % 4 == 0 && al16(gB) && gB.stride(0) % 4 == 0 && N % 4 == 0);
-    torch::Tensor tA2, tB2;
-    if (grads && !dgrad) {
-        tA2 = torch::zeros({BC, Mp2, HK}, emars.options());
-        tB2 = torch::zeros({BC, HK, Np2}, emars.options());
-    }
-    const long sga = !grads ? 0L : dgrad ? (long)gA.stride(0) : (long)Mp2 * HK;
-    const long sgb = !grads ? 0L : dgrad ? (long)gB.stride(0) : (long)HK * Np2;
-    const int ma = dgrad ? (int)M : Mp2, ldb = dgrad ? (int)N : Np2, nbw = dgrad ? (int)N : Np2;
-    for (int64_t b0 = 0; b0 < B; b0 += BC) {
-        const int Bc = (int)std::min<int64_t>(BC, B - b0);
-        int lbc = 0;
-        while ((1 << lbc) < Bc) lbc++;
-        unsigned* ap = convert ? reinterpret_cast<unsigned*>(AP2.data_ptr<at::Half>()) : nullptr;
-        unsigned* bp = convert ? reinterpret_cast<unsigned*>(BP2.data_ptr<at::Half>()) : nullptr;
-        // (`init`: the chunk's slices of the caller's gradient buffers zeroed by the prep kernel, just ahead of the
-        // adds -- their lines in the L2 when the adds come, no DRAM round trip of zeros: the previous chunk's final
-        // lines leave as they come in (in the main kernel's background instead: as slow, its L2 shared); through
-        // temporaries, those copied in rather than added)
-        const int nbZ = init && grads && dgrad ? (int)((K / 4 * (M + N) + 4095) / 4096) : 0;
-        float4* zA = nbZ ? reinterpret_cast<float4*>(gA.data_ptr<float>() + b0 * gA.stride(0)) : nullptr;
-        float4* zB = nbZ ? reinterpret_cast<float4*>(gB.data_ptr<float>() + b0 * gB.stride(0)) : nullptr;
-        const int nbg = (Bc + 31) / 32;
-        const long nprep = (long)(nbZ + nbA2 + nbB2) * Bc + (Mp2 / 32 + njt2) * nbg + (Bc + 7) / 8;
-        HF_TI_SWITCH(A, Bm, b0, hb_bw_prep_kernel<TI><<<(unsigned)nprep, 256, 0, stream>>>(
-            ai, bi, ap, bp, LU2.data_ptr<float>(), LC2.data_ptr<float>(), efs2.data_ptr<float>(), sc2,
-            node_flows.data_ptr<float>(), node_mars.data_ptr<float>(), nid0, lzs.data_ptr<float>(),
-            emars.data_ptr<float>(), rw, (int)M, (int)N, Mp2, Np2, nbA2, nbB2, Bc, (int)B, (int)b0,
-            (long)A.stride(0), (long)Bm.stride(0), zA, nbZ ? gA.stride(0) / 4 : 0L, zB, nbZ ? gB.stride(0) / 4 : 0L,
-            nbZ));
-        C10_CUDA_KERNEL_LAUNCH_CHECK();
-        if (grads && !dgrad) {
-            tA2.zero_();
-            tB2.zero_();
-        }
-        HbOps op;
-        if (given)
-            op = HbOps{reinterpret_cast<const __half*>(copy[0].data_ptr<at::Half>()) + b0 * Mp2 * HK, (long)Mp2 * HK, Mp2,
-                       reinterpret_cast<const __half*>(copy[1].data_ptr<at::Half>()) + b0 * HK * Np2, (long)HK * Np2,
-                       Np2, Np2, 0};
-        else if (direct)
-            op = HbOps{reinterpret_cast<const __half*>(A.data_ptr<at::Half>()) + b0 * A.stride(0), (long)sstride(A),
-                       (int)M, reinterpret_cast<const __half*>(Bm.data_ptr<at::Half>()) + b0 * Bm.stride(0),
-                       (long)sstride(Bm), (int)N, (int)N, 1};
-        else
-            op = HbOps{reinterpret_cast<const __half*>(ap), (long)Mp2 * HK, Mp2, reinterpret_cast<const __half*>(bp),
-                       (long)HK * Np2, Np2, Np2, 0};
-        float* ga2 = !grads ? nullptr : dgrad ? gA.data_ptr<float>() + b0 * gA.stride(0) : tA2.data_ptr<float>();
-        float* gb2 = !grads ? nullptr : dgrad ? gB.data_ptr<float>() + b0 * gB.stride(0) : tB2.data_ptr<float>();
-        CUtensorMap tmb;
-        if (grads) tmb = db_map(gb2, nbw, ldb, sgb, Bc);
-        else std::memset(&tmb, 0, sizeof(tmb));
-        const long units = (long)nit2 * nct * Bc;
-        HF_TP_SWITCH(params, HB_FLAGS_SWITCH(flows, dn, grads, launch_hb_bw<TP, FL, DE, GR>(stream, op, pp, p0, (int)Nb,
-            (int)cbs, (int)bs, LU2.data_ptr<float>(), LC2.data_ptr<float>(), efs2.data_ptr<float>(), pf, pf0, dnp, dn0,
-            ga2, sga, ma, tmb, sc2, (int)M, (int)N, Mp2, Np2, Bc, nct, units)))
-        C10_CUDA_KERNEL_LAUNCH_CHECK();
-        hb_ef_epi_kernel<<<(unsigned)((((long)N << lbc) + 255) / 256), 256, 0, stream>>>(
-            efs2.data_ptr<float>(), rw, element_flows.data_ptr<float>(), (int)N, Np2, Bc, lbc, (int)B, (int)b0);
-        C10_CUDA_KERNEL_LAUNCH_CHECK();
-        if (grads && !dgrad) {                                 // (the temporaries' sums into the caller's buffers)
-            if (init) {
-                gA.narrow(0, b0, Bc).copy_(tA2.narrow(0, 0, Bc).narrow(1, 0, M));
-                gB.narrow(0, b0, Bc).copy_(tB2.narrow(0, 0, Bc).narrow(2, 0, N));
-            } else {
-                gA.narrow(0, b0, Bc).add_(tA2.narrow(0, 0, Bc).narrow(1, 0, M));
-                gB.narrow(0, b0, Bc).add_(tB2.narrow(0, 0, Bc).narrow(2, 0, N));
-            }
-        }
+    switch (rank_pad_h(K)) {
+        case 16: backward_impl<16>(A, Bm, params, p0, Nb, cbs, bs, emars, rows, node_flows, node_mars, nid0, lzs,
+                                   element_flows, pflows, pf0, denom, dn0, gA, gB, M, N, K, copy, init); break;
+        case 32: backward_impl<32>(A, Bm, params, p0, Nb, cbs, bs, emars, rows, node_flows, node_mars, nid0, lzs,
+                                   element_flows, pflows, pf0, denom, dn0, gA, gB, M, N, K, copy, init); break;
+        default: backward_impl<64>(A, Bm, params, p0, Nb, cbs, bs, emars, rows, node_flows, node_mars, nid0, lzs,
+                                   element_flows, pflows, pf0, denom, dn0, gA, gB, M, N, K, copy, init); break;
     }
 }
 
