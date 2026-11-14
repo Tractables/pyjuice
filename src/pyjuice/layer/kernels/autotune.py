@@ -349,6 +349,17 @@ def set_autotune(enabled: bool = True, clear_cache: bool = False):
     return was
 
 
+def full_key(key):
+    """`key` as the cache keys it: with the current device (what `cached` and `pick` read off it a call, ~0.4 us)."""
+    return _full_key(key)
+
+
+def cached_full(full):
+    """`cached` for a key already with its device (`full_key`'s): what a call site that keeps the key it tuned under
+    asks each call to learn the choice still stands -- a cleared or retuned cache is a choice to make again."""
+    return _known(full) if ENABLED else _CACHE.get(full)
+
+
 def cached(key):
     """The config already chosen for `key`, or None if this key still has to go through `pick`.
     Lets a call site skip setting up for a benchmark (allocating a scratch output) on the steady

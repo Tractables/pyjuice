@@ -11,6 +11,12 @@ from pyjuice.utils import launch_plans
 from pyjuice.utils.launch_plans import LaunchPlans
 from pyjuice.utils.parameter_list import FastParamList
 from . import deferred_par
+
+# (a backward's context where it records no launch plan: one, reused -- `nullcontext` keeps no state)
+_NULL_CONTEXT = contextlib.nullcontext()
+# (the standard backward's hooks a parameterization may set for a call, all unset after it)
+_NO_BW_HOOKS = dict(_ext_bw_ele_hook = None, _ext_bw_par_hook = None, _ext_bw_par_sb_hook = None,
+                    _ext_bw_par_triton_hook = None)
 from .sum_layer import SumLayer
 from .fused_children import form_elements, scatter_flows
 
@@ -649,12 +655,13 @@ class ParameterizedSumLayer(SumLayer):
         if not gated:
             return None
 
-        self._assert_supported(propagation_alg, is_backward = False, **kwargs)
+        self._assert_supported(propagation_alg, is_backward = False)   # (the forward's checks read no option)
 
+        # (`kwargs` is this call's own dict -- a call's `**kwargs` is made for it --: set in place, not copied, ~1 us)
         if op_params is not None and self.parameterization.reads_param_operands:
-            kwargs = dict(kwargs, op_params = op_params)
+            kwargs["op_params"] = op_params
         if takes and sc is not None:
-            kwargs = dict(kwargs, stream_children = sc)
+            kwargs["stream_children"] = sc
         self.parameterization.forward_layer(
             self, ns_tensors, node_mars, element_mars, params,
             propagation_alg = propagation_alg, **kwargs
@@ -728,7 +735,9 @@ class ParameterizedSumLayer(SumLayer):
         op = op_params if op_params is not None and self.__dict__.get("_reads_param_operands", False) else None
         self.__dict__["_bk_op_params"] = op
 
-        self._assert_supported(propagation_alg, is_backward = True, **kwargs)
+        self._assert_supported(propagation_alg, is_backward = True,   # (what it reads: not every option repacked)
+                               allow_modify_flows = kwargs.get("allow_modify_flows", False),
+                               negate_pflows = kwargs.get("negate_pflows", False))
 
         # Resolve the gradient buffers BEFORE anything runs: `pre_backward` may put the shared buffers
         # into an intermediate form that only `post_backward` undoes, so a validation failure raised
@@ -765,7 +774,7 @@ class ParameterizedSumLayer(SumLayer):
             LaunchPlans.fail()                     # (a recording around this call cannot capture what it launches)
 
         with (LaunchPlans.record(self.parameterization.BACKWARD_PLAN_TAG) if pkey is not None
-              else contextlib.nullcontext()) as rec:
+              else _NULL_CONTEXT) as rec:
             try:
                 self.parameterization.pre_backward_layer(
                     self, ns_tensors, node_flows, element_flows, node_mars, element_mars, params,
@@ -795,8 +804,7 @@ class ParameterizedSumLayer(SumLayer):
                 # gated kernel against a stale plan.
                 # (Plain attributes, written past `nn.Module.__setattr__`: its registration checks, ~1.5 us a write, on
                 # every gated layer's every backward.)
-                self.__dict__.update(_ext_bw_ele_hook = None, _ext_bw_par_hook = None, _ext_bw_par_sb_hook = None,
-                                     _ext_bw_par_triton_hook = None)
+                self.__dict__.update(_NO_BW_HOOKS)
 
         if pkey is not None:
             LaunchPlans.of(self).store(pkey, rec, expected)

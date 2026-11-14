@@ -42,6 +42,23 @@ def _calls_its_forward(module: nn.Module) -> bool:
                 or torch._C._get_tracing_state())
 
 
+def _group_forward(group):
+    """What a pass calls for a layer group's forward: the group itself where calling it runs more than its `forward`
+    (hooks: `_calls_its_forward`), else its one layer's `forward` where it holds one (`LayerGroup.forward` calls each
+    layer's with the group's arguments: one frame and a repacking of them, ~1.5 us, the less), else its `forward`."""
+    if not _calls_its_forward(group):
+        return group
+    layers = group.layers
+    return layers[0].forward if len(layers) == 1 else group.forward
+
+
+def _group_backward(group):
+    """`_group_forward` for a group's `backward` (a method the pass calls itself: no hooks run): its one layer's where it
+    holds one."""
+    layers = group.layers
+    return layers[0].backward if len(layers) == 1 else group.backward
+
+
 # The work per layer from which the layers reading only shared fp32 parameters take their bf16 copy
 # (`TensorCircuit._param_operand_groups`): the parameters such a layer reads a sample, times the batch. MEASURED
 # (training steps of tied HMMs, the copy forced off and on): slower with it to 2^27 (HMM-1024 B 32 / 128 +2.4 / +2.2%,
@@ -754,7 +771,7 @@ class TensorCircuit(_BuildMixin, _CudaGraphsMixin, _ExternalParamsMixin, _Learni
                 op = self._param_operands(node_mars.size(1)) if op_groups else None
                 given = op_groups if op is not None else ()
                 for layer_id, layer_group in enumerate(self.inner_layer_groups):
-                    run = layer_group.forward if _calls_its_forward(layer_group) else layer_group
+                    run = _group_forward(layer_group)
                     if layer_group.is_prod():
                         # Prod layer (none where the sum group above forms its values: `_stream_fusion_groups`)
                         if layer_id not in fused:
@@ -1028,54 +1045,54 @@ class TensorCircuit(_BuildMixin, _CudaGraphsMixin, _ExternalParamsMixin, _Learni
                 op = self._param_operands(B, refresh = False) if op_groups else None
                 given = op_groups if op is not None else ()
 
+                # (the buffers, the parameters and the groups looked up once, as the forward's loop does -- nothing in
+                # the pass rebinds them --, and the callbacks' arguments made only where a callback is given: two calls a
+                # sum group, ~3 us of host time each, for none)
+                node_flows, element_flows = self.node_flows, self.element_flows
+                node_mars, element_mars, params = self.node_mars, self.element_mars, self.params
+                groups = list(self.inner_layer_groups)
+                callbacks = sum_layer_pre_backward_callback is not None or sum_layer_post_backward_callback is not None
+                cb_args = dict(node_flows = node_flows, element_flows = element_flows, node_mars = node_mars,
+                               element_mars = element_mars, params = params,
+                               param_flows = self.param_flows if hasattr(self, "param_flows") else None) \
+                    if callbacks else None
+
                 # Backward pass for inner layers
-                for layer_id in range(len(self.inner_layer_groups) - 1, -1, -1):
-                    layer_group = self.inner_layer_groups[layer_id]
+                for layer_id in range(len(groups) - 1, -1, -1):
+                    layer_group = groups[layer_id]
 
                     if layer_group.is_prod():
                         # Prod layer (none where the sum group above wrote its children's flows: `_stream_fusion_bk_groups`)
                         if layer_id not in fused_bk:
-                            layer_group.backward(self.node_flows, self.element_flows, logspace_flows = logspace_flows)
+                            _group_backward(layer_group)(node_flows, element_flows, logspace_flows = logspace_flows)
 
                     elif layer_group.is_sum():
                         # Sum layer
 
                         # First recompute the previous product layer (none where this group forms its values itself)
                         if layer_id - 1 not in fused_bk:
-                            self.inner_layer_groups[layer_id-1].forward(self.node_mars, self.element_mars)
+                            prod = groups[layer_id - 1]
+                            (prod.layers[0].forward if len(prod.layers) == 1 else prod.forward)(node_mars, element_mars)
 
                         # Execute pre-backward callback
-                        layer_group.callback(
-                            sum_layer_pre_backward_callback, 
-                            node_flows = self.node_flows,
-                            element_flows = self.element_flows,
-                            node_mars = self.node_mars,
-                            element_mars = self.element_mars,
-                            params = self.params,
-                            param_flows = self.param_flows if hasattr(self, "param_flows") else None
-                        )
+                        if sum_layer_pre_backward_callback is not None:
+                            layer_group.callback(sum_layer_pre_backward_callback, **cb_args)
 
                         # Backward sum layer
                         alg = propagation_alg if isinstance(propagation_alg, str) else propagation_alg[layer_id]
                         extra = sum_opts if layer_id - 1 not in fused_bk else \
                             dict(sum_opts, stream_children = self.__dict__["_fused_child_tables"][layer_id - 1])
+                        run = _group_backward(layer_group)
                         if id(layer_group) in given:
-                            layer_group.backward(self.node_flows, self.element_flows, self.node_mars, self.element_mars,
-                                                 self.params, propagation_alg = alg, op_params = op, **extra)
+                            run(node_flows, element_flows, node_mars, element_mars, params, propagation_alg = alg,
+                                op_params = op, **extra)
                         else:
-                            layer_group.backward(self.node_flows, self.element_flows, self.node_mars, self.element_mars,
-                                                 self.params, propagation_alg = alg, **extra)
+                            run(node_flows, element_flows, node_mars, element_mars, params, propagation_alg = alg,
+                                **extra)
 
                         # Execute post-backward callback
-                        layer_group.callback(
-                            sum_layer_post_backward_callback, 
-                            node_flows = self.node_flows,
-                            element_flows = self.element_flows,
-                            node_mars = self.node_mars,
-                            element_mars = self.element_mars,
-                            params = self.params,
-                            param_flows = self.param_flows if hasattr(self, "param_flows") else None
-                        )
+                        if sum_layer_post_backward_callback is not None:
+                            layer_group.callback(sum_layer_post_backward_callback, **cb_args)
 
                     else:
                         raise ValueError(f"Unknown layer type {type(layer)}.")
