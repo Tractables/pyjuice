@@ -13,6 +13,17 @@ from . import forward as lowrank_forward
 from .forward import exp_sum_bf16, exp_sum_fused, exp_sum_module
 
 
+_EMPTY = {}
+
+
+def _empty(device) -> torch.Tensor:
+    """An empty fp32 tensor on `device` (the kernels' "not wanted"), made once a device."""
+    e = _EMPTY.get(device)
+    if e is None:
+        e = _EMPTY[device] = torch.empty(0, dtype = torch.float32, device = device)
+    return e
+
+
 class _BackwardMixin:
     """The backward of :class:`~pyjuice.parameterizations.low_rank.LowRank`, a base of it."""
 
@@ -57,8 +68,31 @@ class _BackwardMixin:
         fresh = getattr(gviews, "fresh", False)                 # (destinations not zeroed: each one's first writer here
                                                                 #  initializes it -- `init` below)
         geos = [self._geometry(layer, ns_info, dev) for ns_info, _ in ns_tensors]
-        for geo in geos:
-            element_flows[geo["kids"], :] = -float("inf")
+        # (the product group below handed over: its children's values read and their flows written by the fp16
+        #  kernels, else formed / scattered here)
+        sc = layer.__dict__.get("_bk_stream_children")
+        if sc is not None and not all(self._h_bk_ok(layer, ns_info, grads, node_flows, element_flows)
+                                      for (ns_info, _), grads in zip(ns_tensors, ns_grad_tensors)):
+            from pyjuice.layer.fused_children import form_elements, scatter_flows
+            form_elements(element_mars, node_mars, sc)
+            self._post_backward(layer, ns_tensors, ns_grad_tensors, geos, None, node_flows, element_flows, node_mars,
+                                element_mars, params, param_flows, denom_param_flows, gviews, fresh, kwargs)
+            scatter_flows(node_flows, element_flows, sc, layer._element_rows())
+            return None
+        return self._post_backward(layer, ns_tensors, ns_grad_tensors, geos, sc, node_flows, element_flows, node_mars,
+                                   element_mars, params, param_flows, denom_param_flows, gviews, fresh, kwargs)
+
+    def _post_backward(self, layer, ns_tensors, ns_grad_tensors, geos, sc, node_flows, element_flows, node_mars,
+                       element_mars, params, param_flows, denom_param_flows, gviews, fresh, kwargs) -> None:
+        """`post_backward_layer`'s node vectors; `sc`: the product group below handed to the fp16 kernels (every node
+        vector theirs: `_h_bk_ok`), whose element flows they write as its children's node flows."""
+        dev = node_flows.device
+        state = layer._lr_state
+        own = sc is not None or self._kids_own(layer, dev)    # (each node vector's element flows its pass's alone:
+        if not own:                                             #  written by it, no -inf fill first -- else filled
+            for geo in geos:                                    #  here, then log-added. A fill, not an index_put of
+                element_flows.index_fill_(0, geo["kids"], -float("inf"))    # a host scalar: its copy to the GPU
+                                                                #  synchronized every layer)
 
         want_denom = param_flows is not None and denom_param_flows is not None and self.apply_z_correction
 
@@ -66,8 +100,11 @@ class _BackwardMixin:
             denom = denom_param_flows if want_denom else None
             init = fresh and gviews.claim(grads)                # (the node vector its destination's first writer)
             if self._exp_sum_backward_fused(layer, ns_info, tensors, grads, geo, node_flows, element_flows, node_mars,
-                                            element_mars, params, param_flows, denom, exp_sum_bf16(kwargs), init):
+                                            element_mars, params, param_flows, denom, exp_sum_bf16(kwargs), init, own,
+                                            sc):
                 continue
+            if own:
+                element_flows.index_fill_(0, geo["kids"], -float("inf"))
             A, Bm = (t.float() for t in self._as_given(tensors))  # (fp16 factors as float32; views as they lie)
             theta = self._dense_params(geo, params)
             lc = self._child_values(geo, element_mars)
@@ -96,23 +133,49 @@ class _BackwardMixin:
 
         return None
 
+    def _h_bk_ok(self, layer, ns_info, grads, node_flows, element_flows) -> bool:
+        """Whether a node vector's backward goes through the fp16 kernels (`_exp_sum_backward_fused`): its forward took
+        them, the flow buffers fp32, the gradient buffers fp32 with each sample's block contiguous."""
+        if id(ns_info.ns) not in layer.__dict__.get("_lr_h", {}):
+            return False
+        if node_flows.dtype != torch.float32 or element_flows.dtype != torch.float32:
+            return False
+        return grads is None or all(g.dtype == torch.float32 and lowrank_forward.samples_contiguous(g) for g in grads)
+
+    def _h_stream_bk(self, layer, batch_size: int) -> bool:
+        """`stream_fusion_bk` for the fp16 exp_sum kernels: this layer's last forward went through them for every node
+        vector (`_lr_h`), at this batch, no child reached by two of them -- whose backward then reads each product's
+        value from its two children and writes its flow as theirs (`_post_backward`'s `sc`)."""
+        state, rounded = layer.__dict__.get("_lr_state"), layer.__dict__.get("_lr_h")
+        if not (lowrank_forward.EXP_SUM_H_STREAM and isinstance(state, dict) and isinstance(rounded, dict)):
+            return False
+        infos = layer.external_node_infos
+        if not infos or not all(id(i.ns) in rounded and id(i.ns) in state and state[id(i.ns)].size(0) == batch_size
+                                for i in infos):
+            return False
+        return self._kids_own(layer, state[id(infos[0].ns)].device)
+
     def _exp_sum_backward_fused(self, layer, ns_info, tensors, grads, geo, node_flows, element_flows, node_mars,
-                                element_mars, params, param_flows, denom, bf16, init = False) -> bool:
+                                element_mars, params, param_flows, denom, bf16, init = False, own = False,
+                                sc = None) -> bool:
         """A node vector's backward through the "exp_sum" form's fused kernels, where they serve (`exp_sum_fused`, the
         flow buffers fp32, the gradient buffers fp32 with each sample's block contiguous): its element flows
         log-added into `element_flows` (set to -inf by the caller), F+, W (with `denom`) and the gradients added into
         their buffers -- what the torch pass computes, without the `[B, M, N]` grids -- by the kernels its forward took
         (the fp16-rounded factors' where `forward_layer` noted it). `init`: the gradient buffers hold anything, written
         rather than added into (the fp16 kernels zero a chunk's slice ahead of their adds, in the L2; the others' are
-        zeroed first). False: nothing done."""
-        if not exp_sum_fused(self, geo, tensors, params, node_mars, element_mars):
-            return False
+        zeroed first). `own`: no other node vector of the layer reaches its children, whose element flows are then
+        written (the fp16 kernels' epilogue) or filled with -inf first (the others) -- else the caller filled them.
+        False: nothing done."""
+        rounded = layer.__dict__.get("_lr_h", {})
+        if id(ns_info.ns) not in rounded and not exp_sum_fused(self, geo, tensors, params, node_mars, element_mars):
+            return False                                        # (the fp16 path's forward checked these: the same)
         if node_flows.dtype != torch.float32 or element_flows.dtype != torch.float32:
             return False
         if grads is not None and not all(g.dtype == torch.float32 and lowrank_forward.samples_contiguous(g)
                                          for g in grads):
             return False
-        empty = torch.empty(0, dtype = torch.float32, device = node_flows.device)
+        empty = _empty(node_flows.device)
         off = geo["grid"][0]
         _, _, Nb, cbs, bs = geo["grid"]
         lz = layer._lr_state[id(ns_info.ns)]                    # [B, M] (the fused forward's: a view of [M, B])
@@ -120,7 +183,6 @@ class _BackwardMixin:
         pf0 = ns_info.ns._param_flow_range[0] + off if param_flows is not None else 0
         dn = denom if denom is not None else empty
         dn0 = self._denom_offsets(layer)[id(ns_info.ns)][0] + off if denom is not None else 0
-        rounded = layer.__dict__.get("_lr_h", {})
         if id(ns_info.ns) in rounded:                           # (the forward's kernels: the fp16-rounded factors')
             copy = rounded[id(ns_info.ns)]                      # (the forward's fp16 copy of the factors, read once:
             rounded[id(ns_info.ns)] = []                        #  freed with this backward, another one converts)
@@ -128,16 +190,28 @@ class _BackwardMixin:
                 tensors[0], tensors[1], params, geo["p0"], Nb, cbs, bs, element_mars, geo["rows"], node_flows,
                 node_mars, ns_info.nid_start, lz.t().contiguous(), element_flows, pf, pf0, dn, dn0,
                 grads[0] if grads is not None else empty, grads[1] if grads is not None else empty, geo["M"],
-                geo["N"], self.rank, copy, init)
+                geo["N"], self.rank, copy, init, own, lowrank_forward.EXP_SUM_H_PDL,
+                *((sc[0], sc[1]) if sc is not None else (None, 0)), lowrank_forward.EXP_SUM_H_ONE)
         else:                                                   # (the bf16 / TF32 kernels: the factors and the
             if init and grads is not None:                      #  gradients where they lie, the latter zeroed first)
                 torch._foreach_zero_(list(grads))
+            if own:
+                element_flows.index_fill_(0, geo["kids"], -float("inf"))
             exp_sum_module().exp_sum_backward(
                 tensors[0], tensors[1], params, geo["p0"], Nb, cbs, bs, element_mars, geo["rows"], node_flows,
                 node_mars, ns_info.nid_start, lz.t().contiguous(), element_flows, pf, pf0, dn, dn0,
                 grads[0] if grads is not None else empty, grads[1] if grads is not None else empty, geo["M"],
                 geo["N"], self.rank, lowrank_forward.EXP_SUM_ZSPLIT, bf16)
         return True
+
+    def _kids_own(self, layer, device) -> bool:
+        """Whether no child of the layer is reached by two of its node vectors (each node vector's element flows its
+        own pass's alone). Asked once a layer."""
+        ok = layer.__dict__.get("_lr_kids_own")
+        if ok is None:
+            rows = torch.cat([self._geometry(layer, info, device)["kids"] for info in layer.external_node_infos])
+            ok = layer.__dict__["_lr_kids_own"] = bool(torch.unique(rows).numel() == rows.numel())
+        return ok
 
     @staticmethod
     def _log_ratio(a, b):

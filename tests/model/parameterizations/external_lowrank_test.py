@@ -4918,3 +4918,208 @@ def test_the_pass_ends_products_in_rounds_are_torch_mms(rounds, monkeypatch):
             f"{k}: {float((got[k] - want[k]).abs().max())} against {top}"
     for k in ("lls", "mars", "flows"):
         assert torch.equal(got[k], want[k]), k
+
+
+# ================================================================ exp_sum below 1024 latents (xs round, 2026-11-14)
+# The fp16 exp_sum kernels' launches and the circuit around them at small node vectors: the backward synchronizes
+# nothing, the next node vector's factors converted under this one's forward (`EXP_SUM_H_AHEAD`), the launches chained
+# by programmatic dependent launch (`EXP_SUM_H_PDL`), the forward's children's factors made by its producer
+# (`EXP_SUM_H_WP`), the product layer below taken over by the backward (`EXP_SUM_H_STREAM`): each the bits it replaces.
+
+def _h_calls(monkeypatch):
+    """Every call of the fp16 kernels' entries from now on: `(name, args, kwargs)`."""
+    import pyjuice.parameterizations.lowrank.forward as lr_forward
+    real, calls = lr_forward.exp_sum_h_module(), []
+
+    class Spy:
+        def __getattr__(self, name):
+            fn = getattr(real, name)
+            return lambda *a, **k: calls.append((name, a, k)) or fn(*a, **k)
+
+    spy = Spy()
+    monkeypatch.setattr(lr_forward, "exp_sum_h_module", lambda: spy)
+    return calls
+
+
+def _h_xs_case(L = 256, T = 5, rank = 16, batch = 9, seed = 0):
+    pc, sums, _, _, _, _ = _pair(_hmm_blocks(L, 32, T = T), "exp_sum", rank = rank, seed = seed)
+    dev = pc.params.device
+    torch.manual_seed(seed + 31)
+    data = torch.randint(0, NUM_CATS, (batch, pc.num_vars), device = dev)
+    ext = {a: _factors(a, rank, batch, dev, seed = 900 + seed + i) for i, a in enumerate(sums)}
+    return pc, sums, data, ext
+
+
+@needs_fused_h
+def test_the_exp_sum_passes_synchronize_nothing():
+    """A forward and a backward through the fp16 kernels, once the circuit's choices settled, synchronize nothing with
+    the host -- an element-flow fill by indexing with a host scalar copied the scalar to the GPU and waited every layer
+    (the GPU idle ~25 us a layer while the host caught up)."""
+    if _fused_h_module() is None:
+        pytest.skip("the fp16 exp_sum kernels are not built")
+    pc, sums, data, ext = _h_xs_case(L = 128, T = 4, batch = 6)
+    for _ in range(3):
+        _passes(pc, sums, data, ext)
+    torch.cuda.synchronize()
+    grads = {a: tuple(torch.zeros_like(t) for t in ext[a]) for a in sums}
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        pc(data, sum_external_params = ext)
+        pc.backward(data, allow_modify_flows = False, logspace_flows = True, sum_external_params_grad = grads)
+    finally:
+        torch.cuda.set_sync_debug_mode(0)
+    torch.cuda.synchronize()
+
+
+@needs_fused_h
+@pytest.mark.parametrize("L,rank,batch", [(256, 16, 9), (128, 32, 5), (256, 64, 3)])
+def test_the_next_node_vectors_conversion_made_ahead(L, rank, batch, monkeypatch):
+    """From a pass on that learned the order, each transition's forward converts the next one's fp32 factors under its
+    main kernel (`ahead`), and that one takes the copy (`given`) instead of converting its own: the pass's node values
+    the bits of converting each where it is used, its flows and gradients within the atomics' order."""
+    import pyjuice.parameterizations.lowrank.forward as lr_forward
+    if _fused_h_module() is None:
+        pytest.skip("the fp16 exp_sum kernels are not built")
+    out = {}
+    for ahead in (False, True):
+        monkeypatch.setattr(lr_forward, "EXP_SUM_H_AHEAD", ahead)
+        pc, sums, data, ext = _h_xs_case(L = L, T = 5, rank = rank, batch = batch)
+        _passes(pc, sums, data, ext)                               # (the order learned)
+        calls = _h_calls(monkeypatch)
+        out[ahead] = _passes(pc, sums, data, ext)
+        fws = [(a, k) for n, a, k in calls if n == "exp_sum_h_forward"]
+        made = sum(1 for a, k in fws if len(a) > 18 and len(a[18]) == 2)
+        taken = sum(1 for a, k in fws if len(a) > 17 and len(a[17]) == 2)
+        assert len(fws) == len(sums)
+        assert (made, taken) == ((len(sums) - 1, len(sums) - 1) if ahead else (0, 0)), (made, taken)
+        monkeypatch.undo()
+    for k in ("lls", "mars"):
+        assert torch.equal(out[True][k], out[False][k]), k
+    _same(out[True], out[False], rtol = 1e-5, atol = 1e-6)
+
+
+@needs_fused_h
+@pytest.mark.parametrize("switch", ["EXP_SUM_H_PDL", "EXP_SUM_H_WP"])
+def test_chained_launches_and_the_producers_factors_change_no_bits(switch, monkeypatch):
+    """The launches chained by programmatic dependent launch, and the forward's children's factors (WF, lcs) made by its
+    main kernel's producer instead of the prologue: the node values the bits of plain launches and the prologue's, the
+    flows and gradients within the atomics' order."""
+    import pyjuice.parameterizations.lowrank.forward as lr_forward
+    if _fused_h_module() is None:
+        pytest.skip("the fp16 exp_sum kernels are not built")
+    out = {}
+    for on in (False, True):
+        monkeypatch.setattr(lr_forward, switch, on)
+        pc, sums, data, ext = _h_xs_case(L = 256, T = 4, batch = 7, seed = 3)
+        _passes(pc, sums, data, ext)
+        out[on] = _passes(pc, sums, data, ext)
+    for k in ("lls", "mars"):
+        assert torch.equal(out[True][k], out[False][k]), k
+    _same(out[True], out[False], rtol = 1e-5, atol = 1e-6)
+
+
+@needs_fused_h
+@pytest.mark.parametrize("name,offered", [("hmm_tied", True), ("two_chains", True), ("hmm_side", True),
+                                          ("two_disjoint", False), ("sparse", False)])
+def test_the_exp_sum_backward_with_the_product_layer_fused_in(name, offered, monkeypatch):
+    """Where the circuit leaves the product layer below to this layer's backward (its tuner's choice, forced here after
+    its trials on scratch flows), the fp16 kernels read every product's value from its two children in their prologue
+    and write the product's flow as theirs: node flows, both parameter flows and the gradients those of the product
+    layer's recompute and backward, pass after pass (the parameter flows and gradients within the atomics' order);
+    products of three children (`sparse`) or a child of two products (`two_disjoint`) never handed over."""
+    import pyjuice.layer.kernels.autotune as autotune
+    if _fused_h_module() is None:
+        pytest.skip("the fp16 exp_sum kernels are not built")
+    pick = autotune.pick
+    choice = ["fused"]
+
+    def forced(key, cands, bench, **kw):
+        if key[0] == "prod_stream_fusion_bk":
+            for trial in ("fused", "unfused", "fused"):           # (the circuit's trials: scratch flows)
+                bench(trial)
+            return choice[0]
+        return pick(key, cands, bench, **kw)
+
+    monkeypatch.setattr(autotune, "pick", forced)
+    calls = _h_calls(monkeypatch)
+    out = {}
+    for which in ("unfused", "fused"):
+        choice[0] = which
+        pc, sums, _, _, _, _ = _pair(name, "exp_sum", rank = 4)
+        dev = pc.params.device
+        torch.manual_seed(29)
+        data = torch.randint(0, NUM_CATS, (6, pc.num_vars), device = dev)
+        ext = {a: _factors(a, 4, 6, dev, seed = 310 + i) for i, a in enumerate(sums)}
+        first = _passes(pc, sums, data, ext)
+        _passes(pc, sums, data, ext)                               # (the circuit decides at its second backward)
+        calls.clear()
+        passes = [_passes(pc, sums, data, ext) for _ in range(2)]
+        handed = [a for n, a, k in calls if n == "exp_sum_h_backward"
+                  and ((len(a) > 27 and a[27] is not None) or k.get("children") is not None)]
+        assert not offered or any(n == "exp_sum_h_backward" for n, _, _ in calls)
+        assert (len(handed) > 0) == (which == "fused" and offered), (which, len(handed))
+        for got in passes:
+            for k in ("lls", "mars"):
+                assert torch.equal(got[k], first[k]), k
+            _same(got, first, rtol = 1e-5, atol = 1e-6)
+        out[which] = passes[-1]
+    for k in ("lls", "mars"):
+        assert torch.equal(out["fused"][k], out["unfused"][k]), k
+    _same(out["fused"], out["unfused"], rtol = 1e-5, atol = 1e-6)
+
+
+@needs_fused_h
+def test_a_conversion_ahead_where_the_kernels_cannot_make_one():
+    """The forward handed the next node vector's factors (`ahead`) makes its copy where its blocks are the copy's
+    element for element -- fp32 of a padded rank, whole tiles, aligned --: the copy that node vector's own forward
+    makes, bit for bit; elsewhere (another rank, ragged tiles, fp16) nothing, and the forward's outputs unchanged."""
+    mod = _fused_h_module()
+    if mod is None:
+        pytest.skip("the fp16 exp_sum kernels are not built")
+    dev = torch.device("cuda:0")
+
+    def fwd(d, A, Bf, given = [], ahead = []):
+        nm = torch.full([11 + d["M"], d["B"]], 123.0, device = dev)
+        out = mod.exp_sum_h_forward(A, Bf, d["params"], d["p0"], d["Nb"], d["cbs"], d["bs"], d["emars"], d["rows"], nm,
+                                    11, d["M"], d["N"], d["K"], 64, [], True, given, ahead)
+        return nm, out
+
+    for (M2, N2, K2, half) in [(256, 128, 16, False), (128, 192, 32, False), (256, 256, 8, False),
+                               (320, 256, 16, False), (256, 224, 16, False), (256, 256, 16, True)]:
+        d = _h_case(256, 256, 5, seed = 1)
+        d2 = _h_case(M2, N2, 5, seed = 2, K = K2)
+        A2, B2 = (d2["A"].half(), d2["Bf"].half()) if half else (d2["A"], d2["Bf"])
+        nm, o = fwd(d, d["A"], d["Bf"], ahead = [A2, B2])
+        nm0, o0 = fwd(d, d["A"], d["Bf"])
+        assert torch.equal(nm, nm0) and torch.equal(o[0], o0[0])
+        flat = not half and K2 in (16, 32, 64) and M2 % 128 == 0 and N2 % 64 == 0
+        assert (o[3].numel() > 0) == flat, (M2, N2, K2, half)
+        if flat:
+            nm2, o2 = fwd(d2, A2, B2)
+            assert torch.equal(o[3], o2[1]) and torch.equal(o[4], o2[2])
+            nm3, o3 = fwd(d2, A2, B2, given = [o[3], o[4]])
+            assert torch.equal(nm3, nm2) and torch.equal(o3[0], o2[0])
+
+
+def test_a_copy_made_ahead_is_taken_only_of_unchanged_factors():
+    """A copy made ahead (`_ahead_next`) is taken (`_ahead_take`) only where the factors are still those it was made
+    from -- the same storage, no write since (their version counters): a mapping of staged tensors handed to a later
+    pass after an in-place update of the factors takes none."""
+    import pyjuice.parameterizations.lowrank.forward as lr_forward
+
+    class Holder(dict):
+        pass
+
+    holder, ns = Holder(), object()
+    A, B = torch.zeros(2, 4, 3), torch.zeros(2, 3, 5)
+    copy = [torch.empty(1), torch.empty(1)]
+    holder.__dict__["_lr_ahead"] = {id(ns): (copy, lr_forward._ahead_key((A, B)))}
+    assert lr_forward._ahead_take(holder, ns, (A, B)) is copy
+    assert lr_forward._ahead_take(holder, ns, (A, B)) == []              # (taken once)
+    holder.__dict__["_lr_ahead"] = {id(ns): (copy, lr_forward._ahead_key((A, B)))}
+    A.add_(1.0)
+    assert lr_forward._ahead_take(holder, ns, (A, B)) == []
+    holder.__dict__["_lr_ahead"] = {id(ns): (copy, lr_forward._ahead_key((A, B)))}
+    assert lr_forward._ahead_take(holder, ns, (A.clone(), B)) == []
+    assert lr_forward._ahead_take(None, ns, (A, B)) == []
+# ============================================================ end of the exp_sum below 1024 latents block (xs round)
