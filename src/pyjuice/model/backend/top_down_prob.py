@@ -362,12 +362,20 @@ def eval_top_down_probs(pc, update_pflow: bool = True, scale: float = 1.0, pc_is
                 for layer in prod_layer_group:
                     prod_layer_partition_fn(layer, node_mars, element_mars, params)
 
+            # The element flows are zeroed once a sum GROUP, not once a layer: its layers (one a block size and
+            # parameterization) all add into the product layer below, and zeroing ahead of each left the products only
+            # the LAST layer's share -- every node under the others got no top-down probability, and with a step size
+            # below 1 the update took its `(1 - step_size) * P_td * theta` term as 0 (MEASURED on a circuit with a
+            # `LowRank` layer and a plain one at every depth: one step of 0.08 moved the transitions 6x further than
+            # the same step on the equivalent single-layer circuit; a step of 1, which has no such term, agreed).
+            if layer_group.is_sum():
+                element_flows[:] = 0.0
+
             for layer in layer_group:
                 if layer.is_prod():
                     prod_layer_td_backward(layer, node_flows, element_flows)
 
                 elif layer.is_sum():
-                    element_flows[:] = 0.0
                     sum_layer_td_backward(layer, node_flows, element_flows, node_mars, element_mars, params, 
                                           pc_is_normalized = pc_is_normalized)
 
