@@ -177,9 +177,7 @@ class _BuildMixin:
                     # standard sum-layer kernels free of any per-call branch on the parameterization.
                     gsize2sum_nodes = dict()
                     for ns in depth2nodes[depth]["sum"]:
-                        ext_signature = (ns.get_parameterization_signature() if isinstance(ns, ParameterizedSumNodes)
-                                         else None)
-                        gsize = (ns.block_size, ext_signature)
+                        gsize = self._sum_layer_key(ns)
                         if gsize not in gsize2sum_nodes:
                             gsize2sum_nodes[gsize] = []
                         gsize2sum_nodes[gsize].append(ns)
@@ -308,6 +306,11 @@ class _BuildMixin:
                              pseudocount)
         params.copy_(on_device)
 
+    @staticmethod
+    def _sum_layer_key(ns):
+        """The sum layer of its depth a sum node vector goes to: (block size, external-parameter signature)."""
+        return (ns.block_size, ns.get_parameterization_signature() if isinstance(ns, ParameterizedSumNodes) else None)
+
     def _create_node_layers(self):
         depth2nodes = dict()
         nodes2depth = dict()
@@ -370,17 +373,32 @@ class _BuildMixin:
 
         dfs(self.root_ns)
 
-        pns2layer = dict()
+        # A product node vector is given to ONE sum layer. Every sum layer's backward STORES the element flows of its
+        # children (the sum over ITS nodes), so a product shared by sum nodes that land in different sum layers of the
+        # depth -- split by `_sum_layer_key`: another block size, or a parameterization -- kept only the last layer's
+        # flow, and everything below it received too little (MEASURED: a product under a `LowRank` sum and a plain one
+        # passed 0.54 of the flow on, under two plain sums of block sizes 4 and 2, 0.36; the forward is unaffected).
+        # Each further layer gets its own copy of the product: the same children and edges, no parameters, its values
+        # the same; the children's flows add up over the copies as over any products.
+        pns2layer, pns2key, pns_copies = dict(), dict(), dict()
         for layer in range(1, len(depth2nodes)):
             for ns in depth2nodes[layer]["sum"]:
-                for cs in ns.chs:
+                key = self._sum_layer_key(ns)
+                for idx, cs in enumerate(ns.chs):
                     if cs.is_prod():
                         if id(cs) in pns2layer:
                             assert pns2layer[id(cs)] == layer, "Disallowed circumstance: a product node requested by sum nodes at different layers."
+                            if pns2key[id(cs)] != key:
+                                if (id(cs), key) not in pns_copies:
+                                    copy = cs.duplicate()
+                                    pns_copies[(id(cs), key)] = copy
+                                    depth2nodes[layer]["prod"].append(copy)
+                                    pns2layer[id(copy)], pns2key[id(copy)] = layer, key
+                                ns.chs[idx] = pns_copies[(id(cs), key)]
                         else:
                             depth2nodes[layer]["prod"].append(cs)
 
-                            pns2layer[id(cs)] = layer
+                            pns2layer[id(cs)], pns2key[id(cs)] = layer, key
 
         return depth2nodes, num_layers, max_node_block_size, max_ele_block_size
 
