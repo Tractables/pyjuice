@@ -424,8 +424,9 @@ def test_the_fused_leaf_is_the_torch_passes(C):
 def test_the_backward_kernels_are_the_reference():
     """The sums' backward by the kernels (`lowrank/top_k_backward.py`: 128 nodes, 128 children) against the reference
     (`_sum_backward_terms`) -- the forward passes the torch references in both, the leaves too --: the differentiable
-    conditional's gradients (one call, the map; the kernels' W from the forward's fp16 logits: ~1e-3) and a backward's
-    node flows without gradients or EM statistics (the element flows alone)."""
+    conditional's gradients (one call, the map; the kernels' W from the forward's fp16 logits: ~1e-3), a backward's
+    node flows without gradients or EM statistics (the element flows alone), and the EM statistics of a backward on
+    the all-observed pass and on the visible-only one (the sums' F+, F- / theta and the leaves')."""
     import pyjuice.parameterizations.lowrank.top_k_fused as tkf
     import pyjuice.parameterizations.lowrank.top_k_leaf_fused as tlf
     import pyjuice.parameterizations.lowrank.top_k_backward as tkb
@@ -454,7 +455,18 @@ def test_the_backward_kernels_are_the_reference():
             pc(x, missing_mask = miss, external_params = pext, categorical_evidence_logp = lp, soft_evidence_cat_ids = ids)
         pc.backward(x, missing_mask = miss, compute_param_flows = False, logspace_flows = True, allow_modify_flows = False,
                     external_params = pext, categorical_evidence_logp = lp, soft_evidence_cat_ids = ids)
-        return out + [pc.node_flows.clone()]
+        out.append(pc.node_flows.clone())
+        for m_ in (None, miss):
+            pc.init_param_flows(flows_memory = 0.0)
+            with torch.no_grad():
+                pc(x, missing_mask = m_, external_params = pext, categorical_evidence_logp = lp, soft_evidence_cat_ids = ids)
+            pc.backward(x, missing_mask = m_, compute_param_flows = True, flows_memory = 1.0, logspace_flows = True,
+                        allow_modify_flows = False, external_params = pext, categorical_evidence_logp = lp,
+                        soft_evidence_cat_ids = ids)
+            out += [pc.param_flows.clone(), pc.input_layer_group[0].param_flows.clone()]
+            if pc.denom_param_flows is not None:
+                out.append(pc.denom_param_flows.clone())
+        return out
 
     try:
         tkf.TOP_K_FUSED = False
@@ -464,12 +476,15 @@ def test_the_backward_kernels_are_the_reference():
     finally:
         tkf.TOP_K_FUSED = True
         tkf.sum_forward, tlf.leaf_forward, tkb.terms = real_sum, real_leaf, real_terms
-    assert len(ran) == 2 * (T - 1), len(ran)                                       # (the kernels: every transition, twice)
+    assert len(ran) == 4 * (T - 1), len(ran)                              # (the kernels: every transition, every backward)
     for name, a, r_ in zip(("A", "B", "G", "U", "D", "lp"), got[:6], ref[:6]):
         assert _rel(a, r_) < 5e-3, (name, _rel(a, r_))
     fin = torch.isfinite(ref[6])
     assert bool((torch.isfinite(got[6]) == fin).all())
     assert float((got[6][fin] - ref[6][fin]).abs().max()) < 5e-3, float((got[6][fin] - ref[6][fin]).abs().max())
+    assert len(got) == len(ref) and len(got) > 7
+    for k, (a, r_) in enumerate(zip(got[7:], ref[7:])):                    # (the EM statistics: the sums', the leaves')
+        assert _rel(a, r_) < 5e-3, (k, _rel(a, r_))
 
 
 def test_zero_tensors_are_the_plain_circuit():

@@ -8,8 +8,9 @@
   tokens' values, and where the token is missing and a sum reads it, the slots' log-weights that sum takes in its
   forward and its backward (`slot_rows`) -- the forward's state, kept on the layer for the passes that follow;
 * a reading sum's backward hands the leaf its posterior counts of those slots (`add_counts`);
-* the backward (`leaf_backward`): the evidence's gradient (summed over the nodes) and the tilt's, every sample; the
-  parameters' EM statistics (`compute_param_flows`) by torch passes, from the same counts.
+* the backward (`leaf_backward`): the evidence's gradient (summed over the nodes) and the tilt's, every sample, and the
+  parameters' EM statistics (`compute_param_flows`): F+ and F- into transposed buffers a block of parameters, then
+  added into the layer's flows.
 
 Measured precision (fp32 sums in log2 units, `ex2.approx`) against float64: ~1e-5 nats on the values and the slot
 weights, ~1e-6 relative on the gradients.
@@ -45,18 +46,20 @@ def _plan(layer) -> dict:
         return plan
     from .top_k import _leaf_rows
     readers = layer.__dict__.get("_read_by_sums", {})
-    nodes, tables, keys = [], [], {}
+    nodes, tables, flows, keys = [], [], [], {}
+    l0 = layer._output_ind_range[0]
     for ns in layer.nodes:
         s, e, v, lvid, spids = _leaf_rows(layer, ns)
         key = (int(spids[0]), e - s)
         if key not in keys:
             keys[key] = len(tables)
             tables.append(spids.contiguous())
+            flows.append(layer.s_pfids[s - l0:e - l0].contiguous())
         nodes.append(dict(ns = ns, s = s, e = e, v = v, lvid = lvid, tab = keys[key],
                           K = sorted({pz.top_k for pz in readers.get(id(ns), ())})))
     i32 = lambda xs: torch.tensor(xs, dtype = torch.int32, device = dev)
     plan = layer.__dict__["_lr_top_k_leaf_plan"] = dict(
-        device = dev, nodes = nodes, tables = tables, index = {id(n["ns"]): t for t, n in enumerate(nodes)},
+        device = dev, nodes = nodes, tables = tables, flows = flows, index = {id(n["ns"]): t for t, n in enumerate(nodes)},
         nv_tab = i32([n["tab"] for n in nodes]), nv_lvid = i32([n["lvid"] for n in nodes]),
         nv_row0 = i32([n["s"] for n in nodes]), vars = torch.tensor([n["v"] for n in nodes], dtype = torch.long, device = dev),
         read = torch.tensor([len(n["K"]) > 0 for n in nodes], dtype = torch.bool, device = dev),
@@ -67,9 +70,11 @@ def _plan(layer) -> dict:
 def serves(desc, layer, node_mars: torch.Tensor, kwargs: dict, staged) -> bool:
     """Whether the kernels take the layer's forward (and so its other passes): every node vector given a tilt, the
     same number of nodes (a multiple of 128) and one top_k for the sums that read them."""
+    pf = layer.param_flows
     if not (top_k_fused.TOP_K_FUSED and node_mars.is_cuda and node_mars.dtype == torch.float32 and
             node_mars.is_contiguous() and kwargs.get("precision", "auto") != "fp32" and
-            layer.params.dtype == torch.float32 and module() is not None):
+            layer.params.dtype == torch.float32 and (pf is None or (pf.dtype == torch.float32 and pf.is_contiguous()))
+            and module() is not None):
         return False
     ids, lp = kwargs.get("soft_evidence_cat_ids"), kwargs.get("categorical_evidence_logp")
     if ids is None or lp is None or ids.dim() != 3 or lp.shape != ids.shape or not staged:
@@ -189,11 +194,20 @@ def leaf_backward(desc, layer, data, node_flows: torch.Tensor, kwargs: dict, log
     glp = None
     if glp_out is not None:
         glp = glp_out if glp_out.dtype == torch.float32 and glp_out.is_contiguous() else torch.zeros_like(st["lp"])
-    counts = st["counts"] if st["counts"] is not None else torch.empty(0, device = node_flows.device)
+    dev = node_flows.device
+    none = torch.empty(0, device = dev)
+    counts = st["counts"] if st["counts"] is not None else none
+    em = compute_param_flows and layer.param_flows is not None
+    fpT, fmT = (torch.zeros_like(st["tab"]), torch.zeros_like(st["tab"])) if em else (none, none)
     dtau = mod.top_k_leaf_backward(st["tab"], plan["nv_tab"], st["tau"], st["emap"], st["ids"], st["lp"], plan["nv_lvid"],
                                    plan["nv_row0"], st["lz"], st["lb"], st["place"], node_flows, logspace_flows,
-                                   st["wrow"], st["logw"], counts, st["S"], st["K"],
-                                   glp if glp is not None else torch.empty(0, device = node_flows.device))
+                                   st["wrow"], st["logw"], counts, st["S"], st["K"], glp if glp is not None else none,
+                                   fpT, fmT)
+    if em:                                                                              # (F+ then F- of each block's rows)
+        V = nodes[0]["ns"].dist.num_cats
+        for k, spf in enumerate(plan["flows"]):
+            mod.top_k_leaf_fold(fpT[k], spf, layer.param_flows, 0)
+            mod.top_k_leaf_fold(fmT[k], spf, layer.param_flows, V)
     if glp is not None and glp is not glp_out:
         glp_out += glp.to(glp_out.dtype)
     if gviews is not None:
@@ -205,49 +219,5 @@ def leaf_backward(desc, layer, data, node_flows: torch.Tensor, kwargs: dict, log
             A, Bt = (x.float() for x in per_sample(staged[n["ns"]], emap))
             D = dtau[t].transpose(1, 2)                                                     # [B, M, S]
             _store(gviews, fresh, grads, [torch.bmm(D, Bt.transpose(1, 2)), torch.bmm(A.transpose(1, 2), D)])
-    if compute_param_flows and layer.param_flows is not None:
-        _param_flows(desc, layer, st, node_flows, kwargs, logspace_flows)
     st["counts"] = None
     return True
-
-
-def _param_flows(desc, layer, st, node_flows, kwargs, logspace_flows) -> None:
-    """The parameters' EM statistics by torch passes (`top_k.leaf_backward`'s and `_leaf_terms`'): F+ and F- of the
-    observed tokens (f at the token, f P), of the missing ones a sum reads (its posterior counts rho, f P) and of the
-    others (f P both)."""
-    from .top_k import leaf_log_probs, per_sample, external_rows, _staged, _d
-    plan = _plan(layer)
-    pf, l0 = layer.param_flows, layer._output_ind_range[0]
-    staged, emap = _staged(kwargs), external_rows(kwargs)
-    lp, ids = kwargs["categorical_evidence_logp"], kwargs["soft_evidence_cat_ids"]
-    K = st["K"]
-    for t, n in enumerate(plan["nodes"]):
-        ns, s, e, lvid = n["ns"], n["s"], n["e"], n["lvid"]
-        V = ns.dist.num_cats
-        f = _d(node_flows[s:e, :].t())
-        f = f.exp() if logspace_flows else f
-        logp = leaf_log_probs(layer, ns, lp[:, lvid, :], ids[:, lvid, :], per_sample(staged[ns], emap), desc.top_k)
-        P = logp.exp()                                                                      # [B, M, C]
-        place = st["place"][t].long()
-        fo = f * (place >= 0)[:, None]
-        C = P.size(2)
-        Fp = torch.zeros_like(P).scatter_(2, place.clamp(min = 0)[:, None, None].expand(-1, P.size(1), 1), fo[:, :, None])
-        Fm = fo[:, :, None] * P
-        miss = st["miss"][t]
-        o0, o1 = st["offs"][t], st["offs"][t + 1]
-        if o1 > o0:                                                                         # missing, a sum reads it
-            rows, a = st["rows"][o0:o1], _d(st["counts"][o0:o1]) if st["counts"] is not None else None
-            if a is not None:
-                k = torch.arange(C, device = P.device)
-                lw = _d(st["logw"][o0:o1])
-                rho = torch.where((k < K)[None, None, :], a[:, :, k.clamp(max = K)],
-                                  a[:, :, K:K + 1] * (logp[rows] - lw[:, :, K:K + 1]).exp().nan_to_num(0.0))
-                Fp[rows] = rho
-                Fm[rows] = a.sum(dim = 2, keepdim = True) * P[rows]
-        other = miss & ~plan["read"][t]                                                     # missing, no one reads it
-        if bool(other.any()):
-            fP = (f * other[:, None])[:, :, None] * P
-            Fp, Fm = Fp + fP, Fm + fP
-        idx = layer.s_pfids[s - l0:e - l0][None, :, None] + ids[:, lvid, :].long()[:, None, :]   # [B, M, C]
-        pf.index_add_(0, idx.reshape(-1), Fp.reshape(-1).to(pf.dtype))
-        pf.index_add_(0, (idx + V).reshape(-1), Fm.reshape(-1).to(pf.dtype))

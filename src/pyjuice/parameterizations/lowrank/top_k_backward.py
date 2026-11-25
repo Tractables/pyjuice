@@ -288,12 +288,45 @@ if triton is not None:
             tl.store(DA + (b * M + rows[:, None]) * R + k1[None, :], dA1, mask = (k1 < R)[None, :])
 
 
-def serves(desc, M: int, N: int, r: int, device, want_flows: bool, kwargs: dict) -> bool:
-    """Whether the kernels take a node vector's backward (its gradients and element flows; not the EM statistics)."""
+    @triton.jit
+    def _bw_em_kernel(AH, BH, L2T, E, EV, ALPHA, BETA, MROW, SLOT, EMAP, FP, FM, M, N, B,
+                      KP: tl.constexpr, K0: tl.constexpr, K1: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr):
+        """a CTA a 64 x 64 tile of the parameters: over the samples, F+ = sum_b Q, F- = sum_b T ([M, N]: q, t summed
+        over the slots)"""
+        rows = tl.program_id(0) * BM + tl.arange(0, BM)
+        cols = tl.program_id(1) * BN + tl.arange(0, BN)
+        s = tl.arange(0, 64)
+        Fp = tl.zeros([BM, BN], tl.float32)
+        Fm = tl.zeros([BM, BN], tl.float32)
+        for b in range(0, B):
+            b64 = b.to(tl.int64)
+            eb = tl.load(EMAP + b64).to(tl.int64)
+            so = tl.load(SLOT + b64).to(tl.int64)
+            W = tl.exp2(_logits(AH, BH, L2T, eb, rows, cols, M, N, KP, K0, K1) - tl.load(MROW + b64 * M + rows)[:, None])
+            ev = tl.load(EV + b64 * N + cols)
+            base = (b64 * M + rows) * 65
+            if so >= 0:
+                es = tl.load(E + (eb * 65 + so) * N + cols)
+                X = tl.load(ALPHA + base)[:, None] * es[None, :]
+                Y = tl.load(BETA + base)[:, None] * es[None, :]
+            else:
+                Es = tl.load(E + (eb * 65 + s[:, None]) * N + cols[None, :])
+                er = tl.load(E + (eb * 65 + 64) * N + cols)
+                X = tl.dot(_tf32(tl.load(ALPHA + base[:, None] + s[None, :])), Es, input_precision = "tf32") + \
+                    tl.load(ALPHA + base + 64)[:, None] * er[None, :]
+                Y = tl.dot(_tf32(tl.load(BETA + base[:, None] + s[None, :])), Es, input_precision = "tf32") + \
+                    tl.load(BETA + base + 64)[:, None] * er[None, :]
+            Fp += W * X * ev[None, :]
+            Fm += W * Y
+        tl.store(FP + rows[:, None] * N + cols[None, :], Fp)
+        tl.store(FM + rows[:, None] * N + cols[None, :], Fm)
+
+
+def serves(desc, M: int, N: int, r: int, device, kwargs: dict) -> bool:
+    """Whether the kernels take a node vector's backward: its element flows, gradients and EM statistics."""
     from . import top_k_fused
-    return (triton is not None and top_k_fused.TOP_K_FUSED and device.type == "cuda" and not want_flows and
-            desc.top_k == 64 and M % BM == 0 and N % BN == 0 and _parts(r) is not None and
-            kwargs.get("precision", "auto") != "fp32")
+    return (triton is not None and top_k_fused.TOP_K_FUSED and device.type == "cuda" and desc.top_k == 64 and
+            M % BM == 0 and N % BN == 0 and _parts(r) is not None and kwargs.get("precision", "auto") != "fp32")
 
 
 def _tf32_round(x: torch.Tensor) -> torch.Tensor:
@@ -307,11 +340,12 @@ def _shifted_exp(x: torch.Tensor, dim: int) -> torch.Tensor:
     return (x - big).exp()
 
 
-def terms(A, Bm, G, ltheta, lc, slot, rows, logw_rows, f, emap, want_grads: bool):
+def terms(A, Bm, G, ltheta, lc, slot, rows, logw_rows, f, emap, want_grads: bool, want_flows: bool = False):
     """`top_k._sum_backward_terms`' element flows `[B, N]`, the gradients' values `[dA, dB, dG]` (None unless
-    `want_grads`) and the posterior counts `a` of the masked samples `rows` `[b, M, 65]`, by the kernels: `A [Bx, M, r]`,
-    `Bm [Bx, r, N]`, `G [Bx, 65, N]` a row of tensors each, `emap [B]` the row a sample reads (None: its own); `ltheta
-    [M, N]`, `lc [B, N]`, `f [B, M]`; the observed samples' slots `slot [B]`, the masked ones' weights `logw_rows`."""
+    `want_grads`), the posterior counts `a` of the masked samples `rows` `[b, M, 65]` and the EM statistics `(F+, F-)`
+    `[M, N]` (None unless `want_flows`), by the kernels: `A [Bx, M, r]`, `Bm [Bx, r, N]`, `G [Bx, 65, N]` a row of
+    tensors each, `emap [B]` the row a sample reads (None: its own); `ltheta [M, N]`, `lc [B, N]`, `f [B, M]`; the
+    observed samples' slots `slot [B]`, the masked ones' weights `logw_rows`."""
     Bx, M, r = A.shape
     N = Bm.size(2)
     B = lc.size(0)
@@ -358,4 +392,10 @@ def terms(A, Bm, G, ltheta, lc, slot, rows, logw_rows, f, emap, want_grads: bool
     for obs in (False, True):
         _bw_db_kernel[(N // BN, B)](AH, BH, L2T, E, EV, ALPHA, BETA, MROW, LWIDX, SLOT, EMAP, ATF, EF, DB, M, N, r,
                                     OBS = obs, GRADS = want_grads, **opts)
-    return EF, vals, ACNT[:Rm]
+    flows = None
+    if want_flows:
+        FP = torch.empty(M, N, dtype = torch.float32, device = dev)
+        FM = torch.empty_like(FP)
+        _bw_em_kernel[(M // BM, N // BN)](AH, BH, L2T, E, EV, ALPHA, BETA, MROW, SLOT, EMAP, FP, FM, M, N, B, **opts)
+        flows = (FP, FM)
+    return EF, vals, ACNT[:Rm], flows
