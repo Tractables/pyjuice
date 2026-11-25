@@ -262,8 +262,12 @@ class LowRank(_ForwardMixin, _BackwardMixin, _DenominatorsMixin, SumParameteriza
         kernels can (`lowrank/forward.py`'s `exp_sum_fused`: a rank they hold, their extension built -- the
         fp16-rounded factors' kernels at the ranks they hold, `exp_sum_h`, the bf16 / TF32 ones at the others and at
         `precision = "fp32"`, all taking each sample's block where it lies and adding into the gradients where they
-        lie), other ranks copied. With `top_k`, or on a leaf: copied (the reference passes, `lowrank/top_k.py`)."""
-        if self.top_k is not None or ns.is_input():
+        lie), other ranks copied. With `top_k` (sums and leaves): read where they lie, every pass taking a node
+        vector's views as they come (the fused forward's kernels a batch stride: `lowrank/top_k_fused.py`; the
+        backward's, the leaves' and the torch passes any strides). Another leaf: copied."""
+        if self.top_k is not None:
+            return True
+        if ns.is_input():
             return False
         if self.form == "exp_sum":
             if lowrank_forward.EXP_SUM_H and self.rank <= lowrank_forward.EXP_SUM_H_RANK_MOST and \

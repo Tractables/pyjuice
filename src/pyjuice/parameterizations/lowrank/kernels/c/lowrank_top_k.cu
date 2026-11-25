@@ -235,7 +235,7 @@ struct TkArgs {
     const float* A; const __half* BP; const uint2* LTh; const float* E; const float* ev; const float* cmax;
     const int4* mitems; const int4* oitems; const int* noitems; const int* slot32; const float* logw;
     float* out; float* ws; int* flags;
-    long nid0, ostride; int r, M, N, S, Rm;
+    long nid0, ostride, sA; int r, M, N, S, Rm;                    // sA: A's batch stride (its rows contiguous)
 };
 
 // the masked item y's sums over its tile x's chunks c0 .. c1 - 1
@@ -272,7 +272,7 @@ __device__ __forceinline__ void masked_run(MState& St, const TkArgs& a, int y, i
     cp_commit();
 
     unsigned af[NK][4];
-    a_frags<NK>(af, a.A + ((long)e * a.M + node0) * a.r, a.r, t);
+    a_frags<NK>(af, a.A + (long)e * a.sA + (long)node0 * a.r, a.r, t);
     const uint2* ltp = a.LTh + ((long)(x * NW + warp) * nchunks * 8) * 32 + lane;
     uint2 lt[8];
     #pragma unroll
@@ -441,7 +441,7 @@ __device__ __forceinline__ void observed_run(OState& St, const TkArgs& a, int y,
     unsigned af[2][NK][4];
     #pragma unroll
     for (int k = 0; k < 2; ++k)
-        if (k == 0 || two) a_frags<NK>(af[k], a.A + ((long)ek[k] * a.M + node0) * a.r, a.r, t);
+        if (k == 0 || two) a_frags<NK>(af[k], a.A + (long)ek[k] * a.sA + (long)node0 * a.r, a.r, t);
     const uint2* ltp = a.LTh + ((long)(x * NW + warp) * nchunks * 8) * 32 + lane;
     uint2 lt[8];
     #pragma unroll
@@ -695,7 +695,8 @@ __global__ void __launch_bounds__(NW * 32, 1) tk_sk_kernel(const TkArgs a) {
 // The operands, one launch: blockIdx.y the task, blockIdx.x grid-stride over its items. B and G a row of tensors each
 // (Bx of them), the children's values a sample each (B).
 __global__ void tk_prep_kernel(
-        const float* __restrict__ Bm, const float* __restrict__ Gt, const float* __restrict__ em, long em_stride,
+        const float* __restrict__ Bm, long sB, const float* __restrict__ Gt, long sG, const float* __restrict__ em,
+        long em_stride,
         const long* __restrict__ eid, const bool* __restrict__ has, const float* __restrict__ theta,
         const float* __restrict__ logwin, __half* __restrict__ BP, float* __restrict__ E, float* __restrict__ ev,
         float* __restrict__ cmax, uint2* __restrict__ LTh, float* __restrict__ logw,
@@ -712,12 +713,12 @@ __global__ void tk_prep_kernel(
             const int k = (int)(bk % KP);
             const long bb = bk / KP;
             float2 v = make_float2(0.f, 0.f);
-            if (k < r) v = reinterpret_cast<const float2*>(Bm + (bb * r + k) * N)[j2];
+            if (k < r) v = reinterpret_cast<const float2*>(Bm + bb * sB + (long)k * N)[j2];
             reinterpret_cast<__half2*>(BP)[q] = __floats2half2_rn(v.x, v.y);
         }
     } else if (task == 1) {                                                  // E = exp(G - max) in TF32, a warp a row
         for (long row = wid; row < (long)Bx * S; row += nwarp) {
-            const float* gr = Gt + row * N;
+            const float* gr = Gt + (row / S) * sG + (row % S) * N;
             float mx = NEG;
             for (int j = lane; j < N; j += 32) mx = fmaxf(mx, gr[j]);
             mx = warp_max(mx);
@@ -857,6 +858,13 @@ void check(const torch::Tensor& x, at::ScalarType dt, const char* name) {
                 " must be a contiguous CUDA tensor of ", dt);
 }
 
+// a [batch, rows, n] tensor whose rows are contiguous and adjacent (any batch stride: a view of a group's tensor)
+void check_rows(const torch::Tensor& x, at::ScalarType dt, const char* name) {
+    TORCH_CHECK(x.is_cuda() && x.dim() == 3 && x.scalar_type() == dt && x.stride(2) == 1 && x.stride(1) == x.size(2) &&
+                x.stride(0) % 4 == 0 && reinterpret_cast<uintptr_t>(x.data_ptr()) % 16 == 0, "top_k: ", name,
+                " must be a CUDA tensor of ", dt, " with contiguous rows, 16-byte aligned (batch stride a multiple of 4)");
+}
+
 int padded_rank(int r) { return r <= 32 ? 32 : (r <= 64 ? 64 : (r <= 96 ? 96 : 128)); }
 
 template <typename K>
@@ -878,7 +886,7 @@ std::vector<torch::Tensor> top_k_prep(torch::Tensor Bm, torch::Tensor G, torch::
                                       torch::Tensor has, torch::Tensor theta, torch::Tensor slot64, torch::Tensor emap,
                                       torch::Tensor rows, torch::Tensor logwin) {
     const c10::cuda::CUDAGuard guard(Bm.device());
-    check(Bm, at::kFloat, "B"); check(G, at::kFloat, "G"); check(theta, at::kFloat, "theta");
+    check_rows(Bm, at::kFloat, "B"); check_rows(G, at::kFloat, "G"); check(theta, at::kFloat, "theta");
     check(eid, at::kLong, "eid"); check(slot64, at::kLong, "slot"); check(rows, at::kLong, "rows");
     TORCH_CHECK(em.is_cuda() && em.scalar_type() == at::kFloat && em.dim() == 2 && em.stride(1) == 1,
                 "top_k: the element values, a CUDA float32 [elements, batch] tensor, batch innermost");
@@ -914,7 +922,8 @@ std::vector<torch::Tensor> top_k_prep(torch::Tensor Bm, torch::Tensor G, torch::
     auto flags = torch::empty({2 * P}, i32);
     auto stream = at::cuda::getCurrentCUDAStream();
     tk_prep_kernel<<<dim3(296, 5), 256, 0, stream>>>(
-        Bm.data_ptr<float>(), G.data_ptr<float>(), em.data_ptr<float>(), em.stride(0), eid.data_ptr<long>(),
+        Bm.data_ptr<float>(), Bm.stride(0), G.data_ptr<float>(), G.stride(0), em.data_ptr<float>(), em.stride(0),
+        eid.data_ptr<long>(),
         full ? nullptr : has.data_ptr<bool>(), theta.data_ptr<float>(), Rm > 0 ? logwin.data_ptr<float>() : nullptr,
         reinterpret_cast<__half*>(BP.data_ptr<at::Half>()), E.data_ptr<float>(), ev.data_ptr<float>(),
         cmax.data_ptr<float>(), reinterpret_cast<uint2*>(LTh.data_ptr<int>()), logw.data_ptr<float>(),
@@ -939,7 +948,7 @@ void top_k_forward(torch::Tensor A, torch::Tensor BP, torch::Tensor E, torch::Te
                    torch::Tensor LTh, torch::Tensor mitems, torch::Tensor oitems, torch::Tensor noitems,
                    torch::Tensor slot32, torch::Tensor logw, torch::Tensor flags, torch::Tensor out, int64_t nid0) {
     const c10::cuda::CUDAGuard guard(A.device());
-    check(A, at::kFloat, "A");
+    check_rows(A, at::kFloat, "A");
     TORCH_CHECK(out.is_cuda() && out.is_contiguous() && out.scalar_type() == at::kFloat && out.size(1) == ev.size(0),
                 "top_k: the node values, a contiguous CUDA float32 [nodes, batch] tensor");
     const int M = A.size(1), r = A.size(2), KP = BP.size(1), N = BP.size(2), S = E.size(1);
@@ -953,7 +962,7 @@ void top_k_forward(torch::Tensor A, torch::Tensor BP, torch::Tensor E, torch::Te
                 cmax.data_ptr<float>(), reinterpret_cast<const int4*>(mitems.data_ptr<int>()),
                 reinterpret_cast<const int4*>(oitems.data_ptr<int>()), noitems.data_ptr<int>(), slot32.data_ptr<int>(),
                 logw.data_ptr<float>(), out.data_ptr<float>(), ws.data_ptr<float>(), flags.data_ptr<int>(),
-                (long)nid0, (long)out.size(1), r, M, N, S, Rm};
+                (long)nid0, (long)out.size(1), (long)A.stride(0), r, M, N, S, Rm};
     cudaStream_t main = at::cuda::getCurrentCUDAStream(), side = main;
     static cudaEvent_t fork[64] = {}, join[64] = {};
     const bool two = Rm > 0 && B > Rm;

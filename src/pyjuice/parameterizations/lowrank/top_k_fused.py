@@ -48,6 +48,14 @@ def _empty(device, dtype):
     return t
 
 
+def _rows(t: torch.Tensor) -> torch.Tensor:
+    """`t` [batch, rows, n] float32 as the kernels read it: its rows contiguous and adjacent, 16-byte aligned with a
+    batch stride of a multiple of 4 floats -- a view of a group's tensor as it lies, else a contiguous copy."""
+    t = t.float()
+    ok = t.stride(2) == 1 and t.stride(1) == t.size(2) and t.stride(0) % 4 == 0 and t.data_ptr() % 16 == 0
+    return t if ok else t.contiguous()
+
+
 def prep(Bm, G, element_mars, eid, has, theta, slot, rows_m, logw_m, emap = None):
     """`top_k_prep`'s operands: `B [Bx, r, N]`, `G [Bx, K + 1, N]` a row of tensors each; the children's values
     `element_mars [eid, :]` (`has` [N] bool where an edge reaches them, None where every child is reached); `theta [M,
@@ -57,14 +65,14 @@ def prep(Bm, G, element_mars, eid, has, theta, slot, rows_m, logw_m, emap = None
     dev = Bm.device
     f = lambda t: t.float().contiguous()
     return top_k_module().top_k_prep(
-        f(Bm), f(G), element_mars, eid.long().contiguous(), _empty(dev, torch.bool) if has is None else has, f(theta),
+        _rows(Bm), _rows(G), element_mars, eid.long().contiguous(), _empty(dev, torch.bool) if has is None else has, f(theta),
         slot.long().contiguous(), _empty(dev, torch.long) if emap is None else emap.long().contiguous(),
         rows_m.long().contiguous(), _empty(dev, torch.float32) if logw_m is None else logw_m.float().contiguous())
 
 
 def forward(A, ops, node_mars: torch.Tensor, nid0: int) -> None:
     """The values from the caller's `A [Bx, M, r]` and `prep`'s operands into `node_mars` from row `nid0` on."""
-    top_k_module().top_k_forward(A.float().contiguous(), *ops, node_mars, nid0)
+    top_k_module().top_k_forward(_rows(A), *ops, node_mars, nid0)
 
 
 #: the most samples whose rows of tensors the kernels share by a map (`top_k_prep`'s work items); more are gathered
