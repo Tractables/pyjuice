@@ -368,11 +368,12 @@ def test_the_fused_forward_is_the_reference():
 @pytest.mark.parametrize("C", [40, 200])                         # (fewer candidates than slots; a shared slot)
 def test_the_fused_leaf_is_the_torch_passes(C):
     """The leaves by the kernels (`lowrank/top_k_leaf_fused.py`: 128 nodes) against their torch passes -- the sums'
-    forward the torch reference in both, to see the leaves alone --: the differentiable conditional (one call, the map)
+    passes the torch reference in both, to see the leaves alone --: the differentiable conditional (one call, the map)
     and its gradients, and an EM backward's statistics on the all-observed pass and on the visible-only one (the
     missing tokens' posterior counts)."""
     import pyjuice.parameterizations.lowrank.top_k_fused as tkf
     import pyjuice.parameterizations.lowrank.top_k_leaf_fused as tlf
+    import pyjuice.parameterizations.lowrank.top_k_backward as tkb
     if tlf.module() is None:
         pytest.skip("the CUDA module did not build")
     T, N, K, r, re, b, V2 = 3, 128, 64, 20, 8, 4, 300
@@ -382,8 +383,8 @@ def test_the_fused_leaf_is_the_torch_passes(C):
     pext, lp = _pc_ext(ext, T, N), lp.float()
     rows = torch.arange(b, device = DEV).repeat(2)
     ran = []
-    real_sum, real_leaf = tkf.sum_forward, tlf.leaf_forward
-    tkf.sum_forward = lambda *a, **k: False
+    real_sum, real_leaf, real_bw = tkf.sum_forward, tlf.leaf_forward, tkb.serves
+    tkf.sum_forward, tkb.serves = (lambda *a, **k: False), (lambda *a, **k: False)
     tlf.leaf_forward = lambda *a, **k: (lambda got: (ran.append(got), got)[1])(real_leaf(*a, **k))
 
     def passes():
@@ -411,13 +412,64 @@ def test_the_fused_leaf_is_the_torch_passes(C):
         got = passes()
     finally:
         tkf.TOP_K_FUSED = True
-        tkf.sum_forward, tlf.leaf_forward = real_sum, real_leaf
+        tkf.sum_forward, tlf.leaf_forward, tkb.serves = real_sum, real_leaf, real_bw
     assert ran == [False] * 3 + [True] * 3, ran                                     # (the torch passes, then the kernels)
     assert torch.allclose(got[0], ref[0], atol = 1e-4), float((got[0] - ref[0]).abs().max())
     names = ("A", "B", "G", "U", "D", "lp", "leaf F (all observed)", "sums' F (all observed)", "leaf F (visible)",
              "sums' F (visible)")
     for name, a, r_ in zip(names, got[1:], ref[1:]):
         assert _rel(a, r_) < 1e-4, (name, _rel(a, r_))
+
+
+def test_the_backward_kernels_are_the_reference():
+    """The sums' backward by the kernels (`lowrank/top_k_backward.py`: 128 nodes, 128 children) against the reference
+    (`_sum_backward_terms`) -- the forward passes the torch references in both, the leaves too --: the differentiable
+    conditional's gradients (one call, the map; the kernels' W from the forward's fp16 logits: ~1e-3) and a backward's
+    node flows without gradients or EM statistics (the element flows alone)."""
+    import pyjuice.parameterizations.lowrank.top_k_fused as tkf
+    import pyjuice.parameterizations.lowrank.top_k_leaf_fused as tlf
+    import pyjuice.parameterizations.lowrank.top_k_backward as tkb
+    if tkb.triton is None:
+        pytest.skip("no Triton")
+    T, N, C, K, r, re, b, V2 = 3, 128, 70, 64, 20, 8, 4, 80
+    tab = _tables(N, 31, V2)
+    pc, _, _ = _hmm_pc(T, N, K, r, re, tab, V2)
+    ext, ids, lp, x, miss = _batch(b, T, N, C, K, r, re, 32, V = V2)
+    pext, lp = _pc_ext(ext, T, N), lp.float()
+    rows = torch.arange(b, device = DEV).repeat(2)
+    ran = []
+    real_sum, real_leaf, real_terms = tkf.sum_forward, tlf.leaf_forward, tkb.terms
+    tkf.sum_forward, tlf.leaf_forward = (lambda *a, **k: False), (lambda *a, **k: False)
+    tkb.terms = lambda *a, **k: (ran.append(1), real_terms(*a, **k))[1]
+
+    def passes():
+        ts = {g_: tuple(t.clone().requires_grad_(True) for t in v) for g_, v in pext.items()}
+        lpg = lp.clone().requires_grad_(True)
+        ll = pc(x.repeat(2, 1), missing_mask = torch.cat([torch.zeros_like(miss), miss]), external_params = ts,
+                external_params_rows = rows, categorical_evidence_logp = lpg.repeat(2, 1, 1),
+                soft_evidence_cat_ids = ids.repeat(2, 1, 1), differentiable = True).view(-1)
+        (-(ll[:b] - ll[b:]).sum()).backward()
+        out = [t.grad for v in ts.values() for t in v] + [lpg.grad]
+        with torch.no_grad():
+            pc(x, missing_mask = miss, external_params = pext, categorical_evidence_logp = lp, soft_evidence_cat_ids = ids)
+        pc.backward(x, missing_mask = miss, compute_param_flows = False, logspace_flows = True, allow_modify_flows = False,
+                    external_params = pext, categorical_evidence_logp = lp, soft_evidence_cat_ids = ids)
+        return out + [pc.node_flows.clone()]
+
+    try:
+        tkf.TOP_K_FUSED = False
+        ref = passes()
+        tkf.TOP_K_FUSED = True
+        got = passes()
+    finally:
+        tkf.TOP_K_FUSED = True
+        tkf.sum_forward, tlf.leaf_forward, tkb.terms = real_sum, real_leaf, real_terms
+    assert len(ran) == 2 * (T - 1), len(ran)                                       # (the kernels: every transition, twice)
+    for name, a, r_ in zip(("A", "B", "G", "U", "D", "lp"), got[:6], ref[:6]):
+        assert _rel(a, r_) < 5e-3, (name, _rel(a, r_))
+    fin = torch.isfinite(ref[6])
+    assert bool((torch.isfinite(got[6]) == fin).all())
+    assert float((got[6][fin] - ref[6][fin]).abs().max()) < 5e-3, float((got[6][fin] - ref[6][fin]).abs().max())
 
 
 def test_zero_tensors_are_the_plain_circuit():
