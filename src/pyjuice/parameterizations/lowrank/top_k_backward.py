@@ -177,11 +177,11 @@ if triton is not None:
         return W, ev, X, Y
 
     @triton.jit
-    def _db_body(AH, BH, L2T, E, EV, ALPHA, BETA, MROW, EMAP, ATF, EF, DB, M, N, R, j0, b, so,
+    def _db_body(AH, BH, L2T, E, EV, ALPHA, BETA, MROW, EMAP, ATF, EF, DB, SIGN, M, N, R, j0, b, so,
                  KP: tl.constexpr, K0: tl.constexpr, K1: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr,
                  OBS: tl.constexpr, GRADS: tl.constexpr):
         """64 children of sample b (OBS: an observed token's, its slot so): over the nodes, the element flows EF [B, N]
-        and (GRADS) dB [B, R, N] = A^T Gl"""
+        and (GRADS) dB [B, R, N] = A^T Gl, times the sample's sign SIGN[b]"""
         eb = tl.load(EMAP + b).to(tl.int64)
         cols = j0 + tl.arange(0, BN)
         k = tl.arange(0, K0)
@@ -202,13 +202,14 @@ if triton is not None:
                                  input_precision = "tf32")
         tl.store(EF + b * N + cols, ef)
         if GRADS:
-            tl.store(DB + (b * R + k[:, None]) * N + cols[None, :], dB0, mask = (k < R)[:, None])
+            sg = tl.load(SIGN + b)
+            tl.store(DB + (b * R + k[:, None]) * N + cols[None, :], dB0 * sg, mask = (k < R)[:, None])
             if K1 > 0:
                 k1 = K0 + tl.arange(0, K1)
-                tl.store(DB + (b * R + k1[:, None]) * N + cols[None, :], dB1, mask = (k1 < R)[:, None])
+                tl.store(DB + (b * R + k1[:, None]) * N + cols[None, :], dB1 * sg, mask = (k1 < R)[:, None])
 
     @triton.jit
-    def _bw_db_kernel(AH, BH, L2T, E, EV, ALPHA, BETA, MROW, SLOT, EMAP, ATF, EF, DB, M, N, R,
+    def _bw_db_kernel(AH, BH, L2T, E, EV, ALPHA, BETA, MROW, SLOT, EMAP, ATF, EF, DB, SIGN, M, N, R,
                       KP: tl.constexpr, K0: tl.constexpr, K1: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr,
                       GRADS: tl.constexpr):
         """a CTA 64 children of sample b, by its kind's body (`_db_body`)"""
@@ -216,18 +217,18 @@ if triton is not None:
         b = tl.program_id(1).to(tl.int64)
         so = tl.load(SLOT + b).to(tl.int64)
         if so >= 0:
-            _db_body(AH, BH, L2T, E, EV, ALPHA, BETA, MROW, EMAP, ATF, EF, DB, M, N, R, j0, b, so, KP, K0, K1, BM, BN, True,
-                     GRADS)
+            _db_body(AH, BH, L2T, E, EV, ALPHA, BETA, MROW, EMAP, ATF, EF, DB, SIGN, M, N, R, j0, b, so, KP, K0, K1, BM, BN,
+                     True, GRADS)
         else:
-            _db_body(AH, BH, L2T, E, EV, ALPHA, BETA, MROW, EMAP, ATF, EF, DB, M, N, R, j0, b, so, KP, K0, K1, BM, BN, False,
-                     GRADS)
+            _db_body(AH, BH, L2T, E, EV, ALPHA, BETA, MROW, EMAP, ATF, EF, DB, SIGN, M, N, R, j0, b, so, KP, K0, K1, BM, BN,
+                     False, GRADS)
 
     @triton.jit
-    def _dg_body(AH, BH, L2T, E, EV, ALPHA, BETA, MROW, EMAP, DG, M, N, j0, b, so,
+    def _dg_body(AH, BH, L2T, E, EV, ALPHA, BETA, MROW, EMAP, DG, SIGN, M, N, j0, b, so,
                  KP: tl.constexpr, K0: tl.constexpr, K1: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr,
                  OBS: tl.constexpr):
         """64 children of sample b (OBS: an observed token's, its slot so): over the nodes, dG [B, 65, N] = E (alpha^T
-        (W ev) - beta^T W) (OBS: the observed slot's row, the others 0)"""
+        (W ev) - beta^T W) (OBS: the observed slot's row, the others 0), times the sample's sign SIGN[b]"""
         eb = tl.load(EMAP + b).to(tl.int64)
         cols = j0 + tl.arange(0, BN)
         s = tl.arange(0, 64)
@@ -248,33 +249,35 @@ if triton is not None:
                 PD = tl.dot(_tf32(tl.load(ALPHA + base[None, :] + s[:, None])), _tf32(Wev), PD, input_precision = "tf32")
                 PD = tl.dot(_tf32(-tl.load(BETA + base[None, :] + s[:, None])), _tf32(W), PD, input_precision = "tf32")
                 PDr += tl.sum(Wev * tl.load(ALPHA + base + 64)[:, None] - W * tl.load(BETA + base + 64)[:, None], axis = 0)
+        sg = tl.load(SIGN + b)
         if OBS:
             s65 = tl.arange(0, 128)
             es = tl.load(E + (eb * 65 + so) * N + cols)
             tl.store(DG + (b * 65 + s65[:, None]) * N + cols[None, :],
-                     tl.where((s65 == so)[:, None], (es * PD)[None, :], 0.0), mask = (s65 < 65)[:, None])
+                     tl.where((s65 == so)[:, None], (es * PD * sg)[None, :], 0.0), mask = (s65 < 65)[:, None])
         else:
             Es = tl.load(E + (eb * 65 + s[:, None]) * N + cols[None, :])
-            tl.store(DG + (b * 65 + s[:, None]) * N + cols[None, :], Es * PD)
-            tl.store(DG + (b * 65 + 64) * N + cols, tl.load(E + (eb * 65 + 64) * N + cols) * PDr)
+            tl.store(DG + (b * 65 + s[:, None]) * N + cols[None, :], Es * PD * sg)
+            tl.store(DG + (b * 65 + 64) * N + cols, tl.load(E + (eb * 65 + 64) * N + cols) * PDr * sg)
 
     @triton.jit
-    def _bw_dg_kernel(AH, BH, L2T, E, EV, ALPHA, BETA, MROW, SLOT, EMAP, DG, M, N,
+    def _bw_dg_kernel(AH, BH, L2T, E, EV, ALPHA, BETA, MROW, SLOT, EMAP, DG, SIGN, M, N,
                       KP: tl.constexpr, K0: tl.constexpr, K1: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr):
         """a CTA 64 children of sample b, by its kind's body (`_dg_body`)"""
         j0 = tl.program_id(0) * BN
         b = tl.program_id(1).to(tl.int64)
         so = tl.load(SLOT + b).to(tl.int64)
         if so >= 0:
-            _dg_body(AH, BH, L2T, E, EV, ALPHA, BETA, MROW, EMAP, DG, M, N, j0, b, so, KP, K0, K1, BM, BN, True)
+            _dg_body(AH, BH, L2T, E, EV, ALPHA, BETA, MROW, EMAP, DG, SIGN, M, N, j0, b, so, KP, K0, K1, BM, BN, True)
         else:
-            _dg_body(AH, BH, L2T, E, EV, ALPHA, BETA, MROW, EMAP, DG, M, N, j0, b, so, KP, K0, K1, BM, BN, False)
+            _dg_body(AH, BH, L2T, E, EV, ALPHA, BETA, MROW, EMAP, DG, SIGN, M, N, j0, b, so, KP, K0, K1, BM, BN, False)
 
     @triton.jit
-    def _da_body(AH, BH, L2T, E, EV, ALPHA, BETA, MROW, EMAP, BTF, DA, M, N, R, i0, b, so,
+    def _da_body(AH, BH, L2T, E, EV, ALPHA, BETA, MROW, EMAP, BTF, DA, SIGN, M, N, R, i0, b, so,
                  KP: tl.constexpr, K0: tl.constexpr, K1: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr,
                  OBS: tl.constexpr):
-        """64 nodes of sample b (OBS: an observed token's, its slot so): over the children, dA [B, M, R] = Gl B^T"""
+        """64 nodes of sample b (OBS: an observed token's, its slot so): over the children, dA [B, M, R] = Gl B^T, times
+        the sample's sign SIGN[b]"""
         eb = tl.load(EMAP + b).to(tl.int64)
         rows = i0 + tl.arange(0, BM)
         k = tl.arange(0, K0)
@@ -288,22 +291,23 @@ if triton is not None:
             if K1 > 0:
                 k1 = K0 + tl.arange(0, K1)
                 dA1 = tl.dot(Gl, tl.load(BTF + (eb * KP + k1[None, :]) * N + cols[:, None]), dA1, input_precision = "tf32")
-        tl.store(DA + (b * M + rows[:, None]) * R + k[None, :], dA0, mask = (k < R)[None, :])
+        sg = tl.load(SIGN + b)
+        tl.store(DA + (b * M + rows[:, None]) * R + k[None, :], dA0 * sg, mask = (k < R)[None, :])
         if K1 > 0:
             k1 = K0 + tl.arange(0, K1)
-            tl.store(DA + (b * M + rows[:, None]) * R + k1[None, :], dA1, mask = (k1 < R)[None, :])
+            tl.store(DA + (b * M + rows[:, None]) * R + k1[None, :], dA1 * sg, mask = (k1 < R)[None, :])
 
     @triton.jit
-    def _bw_da_kernel(AH, BH, L2T, E, EV, ALPHA, BETA, MROW, SLOT, EMAP, BTF, DA, M, N, R,
+    def _bw_da_kernel(AH, BH, L2T, E, EV, ALPHA, BETA, MROW, SLOT, EMAP, BTF, DA, SIGN, M, N, R,
                       KP: tl.constexpr, K0: tl.constexpr, K1: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr):
         """a CTA 64 nodes of sample b, by its kind's body (`_da_body`)"""
         i0 = tl.program_id(0) * BM
         b = tl.program_id(1).to(tl.int64)
         so = tl.load(SLOT + b).to(tl.int64)
         if so >= 0:
-            _da_body(AH, BH, L2T, E, EV, ALPHA, BETA, MROW, EMAP, BTF, DA, M, N, R, i0, b, so, KP, K0, K1, BM, BN, True)
+            _da_body(AH, BH, L2T, E, EV, ALPHA, BETA, MROW, EMAP, BTF, DA, SIGN, M, N, R, i0, b, so, KP, K0, K1, BM, BN, True)
         else:
-            _da_body(AH, BH, L2T, E, EV, ALPHA, BETA, MROW, EMAP, BTF, DA, M, N, R, i0, b, so, KP, K0, K1, BM, BN, False)
+            _da_body(AH, BH, L2T, E, EV, ALPHA, BETA, MROW, EMAP, BTF, DA, SIGN, M, N, R, i0, b, so, KP, K0, K1, BM, BN, False)
 
 
     @triton.jit
@@ -424,12 +428,14 @@ def _shifted(X: torch.Tensor, log: bool = False, scale: float = 1.0, exp: bool =
     return O if X.dim() == 3 else O[0]
 
 
-def terms(A, Bm, G, theta, lc, slot, rows, logw_rows, f, emap, want_grads: bool, want_flows: bool = False):
+def terms(A, Bm, G, theta, lc, slot, rows, logw_rows, f, emap, want_grads: bool, want_flows: bool = False,
+          signs = None):
     """`top_k._sum_backward_terms`' element flows `[B, N]`, the gradients' values `[dA, dB, dG]` (None unless
     `want_grads`), the posterior counts `a` of the masked samples `rows` `[b, M, 65]` and the EM statistics `(F+, F-)`
     `[M, N]` (None unless `want_flows`), by the kernels: `A [Bx, M, r]`, `Bm [Bx, r, N]`, `G [Bx, 65, N]` a row of
     tensors each, `emap [B]` the row a sample reads (None: its own); the parameters `theta [M, N]` (0 where none),
-    `lc [B, N]`, `f [B, M]`; the observed samples' slots `slot [B]`, the masked ones' weights `logw_rows`."""
+    `lc [B, N]`, `f [B, M]`; the observed samples' slots `slot [B]`, the masked ones' weights `logw_rows`; `signs [B]`
+    (or None: 1) each sample's gradients' factor."""
     Bx, M, r = A.shape
     N = Bm.size(2)
     B = lc.size(0)
@@ -448,6 +454,7 @@ def terms(A, Bm, G, theta, lc, slot, rows, logw_rows, f, emap, want_grads: bool,
     SLOT = torch.where(LWIDX >= 0, -1, slot.to(torch.int32)).to(torch.int32).contiguous()
     LOGW = logw_rows.float().contiguous() if Rm > 0 else torch.zeros(1, M, 65, device = dev)
     F = f.float().contiguous()
+    SIGN = torch.ones(B, dtype = torch.float32, device = dev) if signs is None else signs.float().contiguous()
     ALPHA = torch.empty(B, M, 65, dtype = torch.float32, device = dev)
     BETA = torch.empty_like(ALPHA)
     ACNT = torch.empty(max(Rm, 1), M, 65, dtype = torch.float32, device = dev)
@@ -461,11 +468,11 @@ def terms(A, Bm, G, theta, lc, slot, rows, logw_rows, f, emap, want_grads: bool,
         DA = torch.empty(B, M, r, dtype = torch.float32, device = dev)
         DB = torch.empty(B, r, N, dtype = torch.float32, device = dev)
         DG = torch.empty(B, 65, N, dtype = torch.float32, device = dev)
-        _bw_dg_kernel[(N // BN, B)](AH, BH, L2T, E, EV, ALPHA, BETA, MROW, SLOT, EMAP, DG, M, N, **opts)
-        _bw_da_kernel[(M // BM, B)](AH, BH, L2T, E, EV, ALPHA, BETA, MROW, SLOT, EMAP, BTF, DA, M, N, r, **opts)
+        _bw_dg_kernel[(N // BN, B)](AH, BH, L2T, E, EV, ALPHA, BETA, MROW, SLOT, EMAP, DG, SIGN, M, N, **opts)
+        _bw_da_kernel[(M // BM, B)](AH, BH, L2T, E, EV, ALPHA, BETA, MROW, SLOT, EMAP, BTF, DA, SIGN, M, N, r, **opts)
         vals = [DA, DB, DG]
     _bw_db_kernel[(N // BN, B)](AH, BH, L2T, E, EV, ALPHA, BETA, MROW, SLOT, EMAP, ATF if want_grads else AH, EF, DB,
-                                M, N, r, GRADS = want_grads, **opts)
+                                SIGN, M, N, r, GRADS = want_grads, **opts)
     flows = None
     if want_flows:
         FP = torch.empty(M, N, dtype = torch.float32, device = dev)

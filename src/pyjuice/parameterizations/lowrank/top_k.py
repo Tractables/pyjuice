@@ -263,17 +263,24 @@ def sum_forward(desc, layer, ns_tensors, node_mars, element_mars, params, kwargs
     return None
 
 
+def fold_signs(gviews):
+    """The samples' signs where the gradient destinations fold (`StagedExternalParams.fold`) -- a writer may scale
+    its values by them and hand `_store` the values `signed` --, else None."""
+    fold = getattr(gviews, "fold", None)
+    return None if fold is None else fold[1]
+
+
 def _grads_kw(kwargs):
     from pyjuice.layer.parameterized_sum_layer import EXTERNAL_PARAMS_GRAD_KWARG
     gviews = kwargs.get(EXTERNAL_PARAMS_GRAD_KWARG)
     return gviews, getattr(gviews, "fresh", False)
 
 
-def _store(gviews, fresh, grads, values, rows = None) -> None:
+def _store(gviews, fresh, grads, values, rows = None, signed: bool = False) -> None:
     """Add `values` -- a sample each: every sample, or the samples `rows` -- into the gradient destinations `grads`;
     the destinations' first writer of the pass initializes them where they were handed over unzeroed (`fresh`). Where
     the destinations fold (`StagedExternalParams.fold`: the rows of the map, the samples' signs) each sample's value
-    goes into the row it read, times its sign."""
+    goes into the row it read, times its sign (`signed`: the values carry it already, `fold_signs`)."""
     if fresh and gviews.claim(grads):
         for g in grads:
             g.zero_()
@@ -281,7 +288,9 @@ def _store(gviews, fresh, grads, values, rows = None) -> None:
     if fold is not None:
         into, sign = fold if rows is None else (fold[0][rows], fold[1][rows])
     for g, v in zip(grads, values):
-        if fold is not None:
+        if fold is not None and signed:
+            g.index_add_(0, into, v.to(g.dtype))
+        elif fold is not None:
             g.index_add_(0, into, (v * sign.view(-1, *([1] * (v.dim() - 1))).to(v.dtype)).to(g.dtype))
         elif rows is None:
             g.add_(v.to(g.dtype))
@@ -317,10 +326,13 @@ def sum_backward(desc, layer, ns_tensors, ns_grad_tensors, node_flows, element_f
         theta = desc._dense_params(geo, params, dtype = PASSES_DTYPE)
         lc = _d(desc._child_values(geo, element_mars))
         slot, rows, logw_rows, logp, tilt = slot_parts(desc, sib, f.size(0), kwargs, dev)
+        signed = False
         if top_k_backward.serves(desc, geo["M"], geo["N"], tensors[0].size(2), dev, kwargs):
             ef, vals, a_rows, flows = top_k_backward.terms(*tensors, theta, lc, slot, rows, logw_rows, f,
-                                                           external_rows(kwargs), grads is not None, want_flows)
+                                                           external_rows(kwargs), grads is not None, want_flows,
+                                                           signs = fold_signs(gviews))
             Fp, Fm = flows if want_flows else (None, None)
+            signed = True
         else:
             A, Bm, G = (_d(t) for t in per_sample(tensors, external_rows(kwargs)))
             logw = slot_weights(slot, rows, logw_rows, f.size(0), geo["M"], desc.top_k)
@@ -331,7 +343,7 @@ def sum_backward(desc, layer, ns_tensors, ns_grad_tensors, node_flows, element_f
         kids = geo["kids"]
         element_flows[kids, :] = torch.logaddexp(element_flows[kids, :], ef.log().t()[geo["cols"], :].to(element_flows.dtype))
         if grads is not None:
-            _store(gviews, fresh, grads, vals)
+            _store(gviews, fresh, grads, vals, signed = signed)
         if want_flows:
             desc._scatter_add(geo, param_flows, ns_info.ns._param_flow_range[0], Fp.float())
         if want_denom:

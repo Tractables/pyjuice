@@ -182,7 +182,7 @@ def leaf_backward(desc, layer, data, node_flows: torch.Tensor, kwargs: dict, log
                   batch_first: bool, compute_param_flows: bool) -> bool:
     """`top_k.leaf_backward` by the kernels, from the layer's forward state and the reading sums' counts; False where
     the forward left none (the torch passes then)."""
-    from .top_k import _staged, _grads_kw, _store, per_sample, external_rows
+    from .top_k import _staged, _grads_kw, _store, per_sample, external_rows, fold_signs
     st = _state(layer, node_flows.size(1))
     if st is None or node_flows.dtype != torch.float32 or not node_flows.is_contiguous():
         return False
@@ -212,12 +212,16 @@ def leaf_backward(desc, layer, data, node_flows: torch.Tensor, kwargs: dict, log
         glp_out += glp.to(glp_out.dtype)
     if gviews is not None:
         emap = external_rows(kwargs)
+        sign = fold_signs(gviews)                                                           # (folded: in the factors)
         for t, n in enumerate(nodes):
             grads = gviews.get(n["ns"])
             if grads is None:
                 continue
             A, Bt = (x.float() for x in per_sample(staged[n["ns"]], emap))
+            if sign is not None:
+                A, Bt = A * sign[:, None, None], Bt * sign[:, None, None]
             D = dtau[t].transpose(1, 2)                                                     # [B, M, S]
-            _store(gviews, fresh, grads, [torch.bmm(D, Bt.transpose(1, 2)), torch.bmm(A.transpose(1, 2), D)])
+            _store(gviews, fresh, grads, [torch.bmm(D, Bt.transpose(1, 2)), torch.bmm(A.transpose(1, 2), D)],
+                   signed = sign is not None)
     st["counts"] = None
     return True
