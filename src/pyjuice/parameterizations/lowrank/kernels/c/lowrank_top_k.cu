@@ -697,7 +697,7 @@ __global__ void __launch_bounds__(NW * 32, 1) tk_sk_kernel(const TkArgs a) {
 __global__ void tk_prep_kernel(
         const float* __restrict__ Bm, const float* __restrict__ Gt, const float* __restrict__ em, long em_stride,
         const long* __restrict__ eid, const bool* __restrict__ has, const float* __restrict__ theta,
-        const double* __restrict__ logw64, __half* __restrict__ BP, float* __restrict__ E, float* __restrict__ ev,
+        const float* __restrict__ logwin, __half* __restrict__ BP, float* __restrict__ E, float* __restrict__ ev,
         float* __restrict__ cmax, uint2* __restrict__ LTh, float* __restrict__ logw,
         int Bx, int B, int M, int N, int r, int KP, int S, int Rm) {
     const int task = blockIdx.y;
@@ -772,7 +772,7 @@ __global__ void tk_prep_kernel(
         const long total = (long)Rm * M * SP;
         for (long q = tid0; q < total; q += nth) {
             const int s = (int)(q % SP);
-            logw[q] = s < S ? (float)logw64[(q / SP) * S + s] : NEG;
+            logw[q] = s < S ? logwin[(q / SP) * S + s] : NEG;
         }
     }
 }
@@ -872,11 +872,11 @@ void smem_attr(K kern, int bytes, int dev, bool* done) {
 // The operands of one node vector: B [Bx, r, N] and G [Bx, S, N] (fp32) a row of tensors each; the circuit's element
 // values `em` [elements, B'] with every child's element id `eid` [N] (and `has` [N], or an empty tensor where every
 // child is reached); theta [M, N] (fp32); a sample each (B of them): the observed slots `slot` [B], the row each reads
-// `emap` [B] (an empty tensor: its own); the masked samples `rows` [Rm] and their weights `logw` [Rm, M, S] (float64;
+// `emap` [B] (an empty tensor: its own); the masked samples `rows` [Rm] and their weights `logw` [Rm, M, S] (float32;
 // empty where none): (BP, E, ev, cmax, LTh, mitems, oitems, noitems, slot32, logw, flags).
 std::vector<torch::Tensor> top_k_prep(torch::Tensor Bm, torch::Tensor G, torch::Tensor em, torch::Tensor eid,
                                       torch::Tensor has, torch::Tensor theta, torch::Tensor slot64, torch::Tensor emap,
-                                      torch::Tensor rows, torch::Tensor logw64) {
+                                      torch::Tensor rows, torch::Tensor logwin) {
     const c10::cuda::CUDAGuard guard(Bm.device());
     check(Bm, at::kFloat, "B"); check(G, at::kFloat, "G"); check(theta, at::kFloat, "theta");
     check(eid, at::kLong, "eid"); check(slot64, at::kLong, "slot"); check(rows, at::kLong, "rows");
@@ -894,8 +894,8 @@ std::vector<torch::Tensor> top_k_prep(torch::Tensor Bm, torch::Tensor G, torch::
     const bool full = has.numel() == 0;
     if (!full) TORCH_CHECK(has.is_cuda() && has.scalar_type() == at::kBool && has.numel() == N, "top_k: has [N] bool");
     if (Rm > 0) {
-        check(logw64, at::kDouble, "logw");
-        TORCH_CHECK(logw64.size(0) == Rm && logw64.size(1) == M && logw64.size(2) == S, "top_k: logw [Rm, M, S]");
+        check(logwin, at::kFloat, "logw");
+        TORCH_CHECK(logwin.size(0) == Rm && logwin.size(1) == M && logwin.size(2) == S, "top_k: logw [Rm, M, S]");
     }
     const int KP = padded_rank(r);
     auto f32 = Bm.options(), f16 = Bm.options().dtype(at::kHalf), i32 = Bm.options().dtype(at::kInt);
@@ -915,7 +915,7 @@ std::vector<torch::Tensor> top_k_prep(torch::Tensor Bm, torch::Tensor G, torch::
     auto stream = at::cuda::getCurrentCUDAStream();
     tk_prep_kernel<<<dim3(296, 5), 256, 0, stream>>>(
         Bm.data_ptr<float>(), G.data_ptr<float>(), em.data_ptr<float>(), em.stride(0), eid.data_ptr<long>(),
-        full ? nullptr : has.data_ptr<bool>(), theta.data_ptr<float>(), Rm > 0 ? logw64.data_ptr<double>() : nullptr,
+        full ? nullptr : has.data_ptr<bool>(), theta.data_ptr<float>(), Rm > 0 ? logwin.data_ptr<float>() : nullptr,
         reinterpret_cast<__half*>(BP.data_ptr<at::Half>()), E.data_ptr<float>(), ev.data_ptr<float>(),
         cmax.data_ptr<float>(), reinterpret_cast<uint2*>(LTh.data_ptr<int>()), logw.data_ptr<float>(),
         Bx, B, M, N, r, KP, S, Rm);

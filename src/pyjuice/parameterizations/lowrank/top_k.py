@@ -1,6 +1,6 @@
 """
-`LowRank(top_k = K)`: the per-candidate forms of the scale -- their passes in plain torch, in float64: the REFERENCE the
-kernels are checked against.
+`LowRank(top_k = K)`: the per-candidate forms of the scale -- their passes in plain torch, in `PASSES_DTYPE`: float32
+where the kernels do not serve yet (the default), float64 the REFERENCE the kernels are checked against.
 
 CANDIDATES are those of a `SoftEvidenceCategorical` variable, `soft_evidence_cat_ids[b, v]` in the caller's order, with
 their evidence `lp_b(c)` (`categorical_evidence_logp`) beside them; the k-th has the SLOT min(k, K): one of its own for
@@ -31,6 +31,13 @@ from __future__ import annotations
 
 import torch
 from typing import Optional
+
+#: the torch passes' dtype: float32 (fast: the default where no kernel serves) or float64 (the reference: tests, checks)
+PASSES_DTYPE = torch.float32
+
+
+def _d(t: torch.Tensor) -> torch.Tensor:
+    return t.to(PASSES_DTYPE)
 
 
 def _staged(kwargs):
@@ -75,14 +82,14 @@ def _candidate_place(ids_v: torch.Tensor, x: torch.Tensor):
 
 
 def leaf_log_probs(layer, ns, lp_v: torch.Tensor, ids_v: torch.Tensor, tilt = None, K: Optional[int] = None) -> torch.Tensor:
-    """`[B, M, C]` float64: log P_b(c | i) of the leaf node vector `ns` over its candidates `ids_v [B, C]`, the evidence
+    """`[B, M, C]` (`PASSES_DTYPE`): log P_b(c | i) of the leaf node vector `ns` over its candidates `ids_v [B, C]`, the evidence
     `lp_v [B, C]`; `tilt` its tensors `(A [B, M, r], B [B, r, K + 1])` (slots capped at `K`), or None (the plain leaf)."""
     _, _, _, _, spids = _leaf_rows(layer, ns)
     C = ids_v.size(1)
-    lt = layer.params[spids[None, :, None] + ids_v.long()[:, None, :]].double().log()          # [B, M, C]
-    lt = lt + lp_v.double()[:, None, :]
+    lt = _d(layer.params[spids[None, :, None] + ids_v.long()[:, None, :]]).log()             # [B, M, C]
+    lt = lt + _d(lp_v)[:, None, :]
     if tilt is not None:
-        tau = torch.bmm(tilt[0].double(), tilt[1].double())                                    # [B, M, K + 1]
+        tau = torch.bmm(_d(tilt[0]), _d(tilt[1]))                                              # [B, M, K + 1]
         slot = torch.arange(C, device = lt.device).clamp(max = K)
         lt = lt + tau[:, :, slot]
     return lt - torch.logsumexp(lt, dim = 2, keepdim = True)
@@ -117,7 +124,7 @@ def slot_parts(desc, sib: dict, batch_size: int, kwargs: dict, device):
     the candidates, capped at K; 0 where it is none of them: the leaf's value is -inf there); the samples `rows` whose
     token is missing, and there the slots' log-weights `[b, M, K + 1]` (the leaf's own log P_b(s | i), its first K
     candidates one by one and the rest summed), the leaf's log P_b(c | i) `[b, M, C]` and its tilt's rows (None
-    without one); float64 (None where no token is missing)."""
+    without one); `PASSES_DTYPE` (None where no token is missing)."""
     leaf_layer, xs, v = sib["layer"], sib["ns"], sib["var"]
     s, e, _, lvid, _ = _leaf_rows(leaf_layer, xs)
     lp, ids = kwargs.get("categorical_evidence_logp"), kwargs.get("soft_evidence_cat_ids")
@@ -136,7 +143,7 @@ def slot_parts(desc, sib: dict, batch_size: int, kwargs: dict, device):
         if tilt is not None:
             ext = external_rows(kwargs)
             er = rows if ext is None else ext[rows]                            # (the rows of the tensors they read)
-            tilt = (tilt[0][er].double(), tilt[1][er].double())
+            tilt = (_d(tilt[0][er]), _d(tilt[1][er]))
         logp = leaf_log_probs(leaf_layer, xs, lp_v[rows], ids_v[rows], tilt,
                               None if tilt is None else xs.parameterization.top_k)                # [b, M, C]
         own = logp[:, :, :min(K, C)]
@@ -149,13 +156,13 @@ def slot_parts(desc, sib: dict, batch_size: int, kwargs: dict, device):
 
 
 def slot_log_weights(desc, sib: dict, batch_size: int, kwargs: dict, device):
-    """`(logw [B, M, K + 1], rows, logp, tilt)` (float64): the log-weights of the token's slots for each node of a
+    """`(logw [B, M, K + 1], rows, logp, tilt)` (`PASSES_DTYPE`): the log-weights of the token's slots for each node of a
     `LowRank(top_k)` sum node vector (`slot_parts`) -- 0 at the observed token's slot and -inf elsewhere; where the
     token is missing the leaf's own log P_b(s | i) --; the samples `rows` whose token is missing, and there the leaf's
     log P_b(c | i) `[b, M, C]` and its tilt's rows (None without one)."""
     slot, rows, logw_rows, logp, tilt = slot_parts(desc, sib, batch_size, kwargs, device)
     s, e, _, _, _ = _leaf_rows(sib["layer"], sib["ns"])
-    logw = torch.full((batch_size, e - s, desc.top_k + 1), -float("inf"), dtype = torch.float64, device = device)
+    logw = torch.full((batch_size, e - s, desc.top_k + 1), -float("inf"), dtype = PASSES_DTYPE, device = device)
     logw.scatter_(2, slot[:, None, None].expand(-1, e - s, 1), 0.0)
     if rows.numel() > 0:
         logw[rows] = logw_rows
@@ -173,7 +180,7 @@ def _safe_div(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
 
 
 def _products(A, Bm, G, ltheta, lc):
-    """The shifted exponentials and their products, float64: `W [B, M, N]` = exp(log theta + A B) (a row's largest 1),
+    """The shifted exponentials and their products (`PASSES_DTYPE`): `W [B, M, N]` = exp(log theta + A B) (a row's largest 1),
     `E [B, S, N]` = exp(G) (a slot's largest 1), `ev [B, N]` = the children's values over their largest, `c [B, 1]` that
     largest's log; `Z [B, M, S]` = W E^T (the per-(node, slot) normalizers) and `U` = W (E ev)^T, each up to its row's
     and slot's shifts -- which every ratio below cancels."""
@@ -188,7 +195,7 @@ def _products(A, Bm, G, ltheta, lc):
 
 
 def _sum_values(A, Bm, G, ltheta, lc, logw) -> torch.Tensor:
-    """`[B, M]` (float64): log sum_s w_b[i, s] sum_j theta_b[i, j | s] c_b[j], from `A [B, M, r]`, `B [B, r, N]`, `G [B,
+    """`[B, M]` (`PASSES_DTYPE`): log sum_s w_b[i, s] sum_j theta_b[i, j | s] c_b[j], from `A [B, M, r]`, `B [B, r, N]`, `G [B,
     S, N]`, `log theta [M, N]`, the children's log-values `lc [B, N]` and the slots' log-weights `logw [B, M, S]`: -inf
     where no term is positive."""
     W, E, ev, c, Z, U = _products(A, Bm, G, ltheta, lc)
@@ -199,7 +206,7 @@ def _sum_values(A, Bm, G, ltheta, lc, logw) -> torch.Tensor:
 
 
 def _sum_backward_terms(A, Bm, G, ltheta, lc, logw, f):
-    """The backward of one `LowRank(top_k)` node vector, float64. With `pi_b[i, s]` the posterior of slot s given node
+    """The backward of one `LowRank(top_k)` node vector (`PASSES_DTYPE`). With `pi_b[i, s]` the posterior of slot s given node
     i (`w r / sum_s w r`, r = U / Z) and `a = f pi` the flow into each (node, slot), the counts along the edges and
     their normalizers' -- q[i, s, j] = a W E c / U, t[i, s, j] = a W E / Z -- make everything:
 
@@ -233,9 +240,9 @@ def sum_forward(desc, layer, ns_tensors, node_mars, element_mars, params, kwargs
         if top_k_fused.sum_forward(desc, layer, ns_info, tensors, geo, params, element_mars, node_mars,
                                    sibs[id(ns_info.ns)], kwargs):
             continue
-        A, Bm, G = (t.double() for t in per_sample(tensors, external_rows(kwargs)))
-        ltheta = desc._dense_params(geo, params, dtype = torch.float64).log()       # [M, N]
-        lc = desc._child_values(geo, element_mars).double()                         # [B, N]
+        A, Bm, G = (_d(t) for t in per_sample(tensors, external_rows(kwargs)))
+        ltheta = desc._dense_params(geo, params, dtype = PASSES_DTYPE).log()        # [M, N]
+        lc = _d(desc._child_values(geo, element_mars))                              # [B, N]
         logw = slot_log_weights(desc, sibs[id(ns_info.ns)], A.size(0), kwargs, node_mars.device)[0]
         ln = _sum_values(A, Bm, G, ltheta, lc, logw)
         node_mars[ns_info.nid_start:ns_info.nid_end, :] = ln.t().to(node_mars.dtype)
@@ -284,10 +291,10 @@ def sum_backward(desc, layer, ns_tensors, ns_grad_tensors, node_flows, element_f
 
     for (ns_info, tensors), grads, geo in zip(ns_tensors, ns_grad_tensors, geos):
         sib = sibs[id(ns_info.ns)]
-        f = node_flows[ns_info.nid_start:ns_info.nid_end, :].t().double().exp()       # [B, M] (log-space flows)
-        A, Bm, G = (t.double() for t in per_sample(tensors, external_rows(kwargs)))
-        theta = desc._dense_params(geo, params, dtype = torch.float64)
-        lc = desc._child_values(geo, element_mars).double()
+        f = _d(node_flows[ns_info.nid_start:ns_info.nid_end, :].t()).exp()            # [B, M] (log-space flows)
+        A, Bm, G = (_d(t) for t in per_sample(tensors, external_rows(kwargs)))
+        theta = desc._dense_params(geo, params, dtype = PASSES_DTYPE)
+        lc = _d(desc._child_values(geo, element_mars))
         logw, rows, logp, tilt = slot_log_weights(desc, sib, f.size(0), kwargs, dev)
         ef, Fp, Fm, Gl, dG, a = _sum_backward_terms(A, Bm, G, theta.log(), lc, logw, f)
 
@@ -323,7 +330,7 @@ def _leaf_terms(desc, sib, rows, logp, tilt, logw, a, f, kwargs, glp, gviews, fr
     leaf_grads = gviews.get(xs) if gviews is not None else None
     if tilt is not None and leaf_grads is not None:
         Kl = xs.parameterization.top_k
-        dtau = torch.zeros(b, M, Kl + 1, dtype = torch.float64, device = logp.device).index_add_(2, k.clamp(max = Kl), dlogit)
+        dtau = torch.zeros(b, M, Kl + 1, dtype = PASSES_DTYPE, device = logp.device).index_add_(2, k.clamp(max = Kl), dlogit)
         _store(gviews, fresh, leaf_grads, [torch.bmm(dtau, tilt[1].transpose(1, 2)), torch.bmm(tilt[0].transpose(1, 2), dtau)],
                rows = rows)
     if want_flows and leaf_layer.param_flows is not None:
@@ -366,7 +373,7 @@ def leaf_backward(desc, layer, data, node_flows, kwargs, logspace_flows: bool, m
     for ns in layer.nodes:
         tilt = per_sample(staged[ns], external_rows(kwargs))
         s, e, v, lvid, _ = _leaf_rows(layer, ns)
-        f = node_flows[s:e, :].t().double()
+        f = _d(node_flows[s:e, :].t())
         f = f.exp() if logspace_flows else f
         B, M = f.shape
         miss = _missing(missing_mask, v, B, dev, batch_first)
@@ -376,21 +383,21 @@ def leaf_backward(desc, layer, data, node_flows, kwargs, logspace_flows: bool, m
         if pf is not None and bool(miss.any()) and id(ns) not in layer.__dict__.get("_read_by_sums", ()):
             V = ns.dist.num_cats
             idx = layer.s_pfids[s - l0:e - l0][None, :, None] + ids_v.long()[:, None, :]  # [B, M, C]
-            fP = ((f * miss[:, None].double())[:, :, None] * P).reshape(-1).to(pf.dtype)   # the posterior counts f P
+            fP = ((f * _d(miss[:, None]))[:, :, None] * P).reshape(-1).to(pf.dtype)       # the posterior counts f P
             pf.index_add_(0, idx.reshape(-1), fP)                                       # F+
             pf.index_add_(0, (idx + V).reshape(-1), fP)                                 # F-
         place, found = _candidate_place(ids_v, data[v, :])
-        fo = f * ((~miss) & found)[:, None].double()                                   # [B, M]
-        onehot = torch.zeros(B, C, dtype = torch.float64, device = dev).scatter_(1, place[:, None], 1.0)
+        fo = f * _d(((~miss) & found)[:, None])                                       # [B, M]
+        onehot = torch.zeros(B, C, dtype = PASSES_DTYPE, device = dev).scatter_(1, place[:, None], 1.0)
         dlogit = fo[:, :, None] * (onehot[:, None, :] - P)                             # [B, M, C]
         if glp is not None:
             glp[:, lvid, :] += dlogit.sum(dim = 1).to(glp.dtype)
         grads = gviews.get(ns) if gviews is not None else None
         if grads is not None:
             slot = torch.arange(C, device = dev).clamp(max = K)
-            dtau = torch.zeros(B, M, K + 1, dtype = torch.float64, device = dev).index_add_(2, slot, dlogit)
-            _store(gviews, fresh, grads, [torch.bmm(dtau, tilt[1].double().transpose(1, 2)),
-                                          torch.bmm(tilt[0].double().transpose(1, 2), dtau)])
+            dtau = torch.zeros(B, M, K + 1, dtype = PASSES_DTYPE, device = dev).index_add_(2, slot, dlogit)
+            _store(gviews, fresh, grads, [torch.bmm(dtau, _d(tilt[1]).transpose(1, 2)),
+                                          torch.bmm(_d(tilt[0]).transpose(1, 2), dtau)])
         if pf is not None:
             V = ns.dist.num_cats
             spf = layer.s_pfids[s - l0:e - l0]                                          # [M]

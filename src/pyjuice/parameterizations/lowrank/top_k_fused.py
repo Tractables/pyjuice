@@ -53,13 +53,13 @@ def prep(Bm, G, element_mars, eid, has, theta, slot, rows_m, logw_m, emap = None
     `element_mars [eid, :]` (`has` [N] bool where an edge reaches them, None where every child is reached); `theta [M,
     N]` the shared parameters (0 where none); a sample each: `slot [B]` the observed token's slot, `emap [B]` the row of
     tensors it reads (None: its own, Bx = B); `rows_m` the samples whose token is missing and their slots' log-weights
-    `logw_m [b, M, K + 1]` (float64; None where none)."""
+    `logw_m [b, M, K + 1]` (None where none)."""
     dev = Bm.device
     f = lambda t: t.float().contiguous()
     return top_k_module().top_k_prep(
         f(Bm), f(G), element_mars, eid.long().contiguous(), _empty(dev, torch.bool) if has is None else has, f(theta),
         slot.long().contiguous(), _empty(dev, torch.long) if emap is None else emap.long().contiguous(),
-        rows_m.long().contiguous(), _empty(dev, torch.float64) if logw_m is None else logw_m.double().contiguous())
+        rows_m.long().contiguous(), _empty(dev, torch.float32) if logw_m is None else logw_m.float().contiguous())
 
 
 def forward(A, ops, node_mars: torch.Tensor, nid0: int) -> None:
