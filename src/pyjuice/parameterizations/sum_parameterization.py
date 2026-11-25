@@ -199,6 +199,16 @@ class SumParameterization():
         """
         return False
 
+    def takes_external_rows(self, ns) -> bool:
+        """
+        Whether this parameterization's passes take `external_params_rows`: the batch's samples reading rows of the
+        external tensors through a map (sample b reads row `rows[b]`; the tensors staged at their own batch, the map in
+        the passes' keywords as `EXTERNAL_PARAMS_ROWS_KWARG`) -- so samples sharing a row of tensors can share the work
+        their tensors alone determine (a conditional's two passes in one batch). The gradients stay per sample: the
+        backward writes them at the batch's rows. False by default: the circuit then refuses the map.
+        """
+        return False
+
     def reads_in_place(self, ns) -> bool:
         """
         Whether the FORWARD pass hands `ns`'s tensors to the layers as the caller gave them -- views of the

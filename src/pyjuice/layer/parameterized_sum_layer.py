@@ -29,6 +29,11 @@ EXTERNAL_PARAMS_KWARG = "sum_external_params"
 #   `pc.backward(x, sum_external_params_grad = {ns: grad_tensors})`
 EXTERNAL_PARAMS_GRAD_KWARG = "sum_external_params_grad"
 
+# Forward kwarg mapping each row of the batch to the row of the external tensors it reads (the tensors then have a batch
+# of their own; `SumParameterization.takes_external_rows`):
+#   `pc(x, external_params = {...}, external_params_rows = rows)`
+EXTERNAL_PARAMS_ROWS_KWARG = "external_params_rows"
+
 # The flat staging buffer the views point into, supplied by the PC so that kernels spanning several
 # nodes can address it directly instead of taking one pointer per node
 EXTERNAL_PARAMS_BUFFER_KWARG = "sum_external_params_buffer"

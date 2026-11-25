@@ -243,6 +243,89 @@ def test_hmm_differentiable_conditional():
         assert _rel(a.grad, b_.grad) < 2e-4, (name, _rel(a.grad, b_.grad))
 
 
+# ---------------------------------------------------------------------------------------------- a map of rows
+
+def test_hmm_conditional_in_one_batch():
+    """Both passes of the conditional in ONE call -- the batch twice, each half reading the same rows of the tensors
+    (`external_params_rows`) -- are the two calls: the values and every gradient, from one forward and one backward."""
+    T, N, C, K, r, re, b = 4, 4, 5, 2, 3, 2, 6
+    tab = _tables(N, 4)
+    pc, _, _ = _hmm_pc(T, N, K, r, re, tab)
+    ext, ids, lp, x, miss = _batch(b, T, N, C, K, r, re, 5)
+    w = torch.linspace(-1.0, 2.0, b, device = DEV)                               # (both signs)
+
+    def run(one):
+        leaves = [t.float().clone().requires_grad_(True) for t in ext] + [lp.float().clone().requires_grad_(True)]
+        pext = _pc_ext(leaves[:5], T, N)
+        if one:
+            ll = pc(x.repeat(2, 1), missing_mask = torch.cat([torch.zeros_like(miss), miss]), external_params = pext,
+                    external_params_rows = torch.arange(b, device = DEV).repeat(2), soft_evidence_cat_ids = ids.repeat(2, 1, 1),
+                    categorical_evidence_logp = leaves[5].repeat(2, 1, 1), differentiable = True).view(-1)
+            cond = ll[:b] - ll[b:]
+        else:
+            kw = dict(external_params = pext, categorical_evidence_logp = leaves[5], soft_evidence_cat_ids = ids,
+                      differentiable = True)
+            cond = pc(x, **kw).view(-1) - pc(x, missing_mask = miss, **kw).view(-1)
+        runs = pc._num_runs
+        (w * cond).sum().backward()
+        return cond.detach(), [t.grad for t in leaves], pc._num_runs - runs
+
+    c1, g1, passes = run(True)
+    c2, g2, _ = run(False)
+    assert passes == 1, passes                                                    # (the backward alone: no forward again)
+    assert torch.allclose(c1, c2, atol = 1e-5), (c1, c2)
+    for name, a, b_ in zip(("A", "B", "G", "U", "D", "lp"), g1, g2):
+        assert _rel(a, b_) < 1e-5, (name, _rel(a, b_))
+
+
+def test_rows_map_reads_the_rows_it_names():
+    """A map with repeats, in any order: the values, the per-sample gradients and the EM statistics of the gathered
+    tensors."""
+    T, N, C, K, r, re, b = 4, 4, 5, 2, 3, 2, 5
+    tab = _tables(N, 7)
+    pc, _, _ = _hmm_pc(T, N, K, r, re, tab)
+    ext, ids, lp, x, miss = _batch(b, T, N, C, K, r, re, 8)
+    rows = torch.tensor([3, 0, 0, 4, 2, 3, 1], device = DEV)
+    x2, ids2, miss2 = x[rows], ids[rows], miss[rows]
+    lp2 = lp[rows].float().contiguous()
+    evi = dict(categorical_evidence_logp = lp2, soft_evidence_cat_ids = ids2)
+
+    def run(pext, **kw):
+        g = {k_: tuple(torch.zeros(rows.numel(), *t.shape[1:], device = DEV) for t in v) for k_, v in pext.items()}
+        pc.init_param_flows(flows_memory = 0.0)
+        with torch.no_grad():
+            ll = pc(x2, missing_mask = miss2, external_params = pext, **kw, **evi).view(-1)
+        pc.backward(x2, missing_mask = miss2, compute_param_flows = True, flows_memory = 1.0, logspace_flows = True,
+                    allow_modify_flows = False, external_params_grad = g, **evi)
+        il = pc.input_layer_group[0]
+        return ll, g, pc.param_flows.clone(), pc.denom_param_flows.clone(), il.param_flows.clone()
+
+    got = run(_pc_ext(ext, T, N), external_params_rows = rows)
+    want = run(_pc_ext(tuple(t[rows] for t in ext), T, N))
+    assert torch.allclose(got[0], want[0], atol = 1e-6), (got[0], want[0])
+    for k_ in got[1]:
+        for a, b_ in zip(got[1][k_], want[1][k_]):
+            assert _rel(a, b_) < 1e-6, (k_, _rel(a, b_))
+    for a, b_ in zip(got[2:], want[2:]):
+        assert _rel(a, b_) < 1e-6, _rel(a, b_)
+
+
+def test_rows_map_needs_a_parameterization_that_reads_through_it():
+    with juice.set_block_size(4):
+        leaf = inputs(0, num_node_blocks = 1, dist = dists.Categorical(num_cats = V))
+        ns = summate(leaf, num_node_blocks = 1, parameterization = LowRank(rank = 2))
+        root = summate(multiply(ns, inputs(1, num_node_blocks = 1, dist = dists.Categorical(num_cats = V))),
+                       num_node_blocks = 1, block_size = 1)
+    pc = juice.compile(root)
+    pc.to(DEV)
+    x = torch.randint(0, V, (3, 2), device = DEV)
+    ext = {ns: (torch.randn(2, 4, 2, device = DEV), torch.randn(2, 2, 4, device = DEV))}
+    with pytest.raises(NotImplementedError, match = "external_params_rows"):
+        pc(x, external_params = ext, external_params_rows = torch.tensor([0, 1, 1], device = DEV))
+    with pytest.raises(AssertionError, match = "external_params_rows"):
+        pc(x, external_params_rows = torch.tensor([0, 1, 1], device = DEV))
+
+
 def test_zero_tensors_are_the_plain_circuit():
     """A, B, G, U, D all zero: the circuit of plain soft-evidence leaves and plain sums, as pyjuice evaluates it."""
     T, N, C, K, r, re, b = 4, 4, 5, 2, 3, 2, 6

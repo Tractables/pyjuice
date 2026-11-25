@@ -252,6 +252,10 @@ class LowRank(_ForwardMixin, _BackwardMixin, _DenominatorsMixin, SumParameteriza
     def storage_perm(self):
         return None
 
+    def takes_external_rows(self, ns) -> bool:
+        """With `top_k` (sum nodes and leaves): the passes read each sample's rows through the map (`lowrank/top_k.py`)."""
+        return self.top_k is not None
+
     def reads_in_place(self, ns) -> bool:
         """The forward's staging hands the layers the caller's tensors themselves (no copy): `"sum_exp"` where the
         virtual batch can serve it (the CUDA extension built: `lowrank/virtual.py`); `"exp_sum"` where its fused

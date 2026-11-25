@@ -695,6 +695,13 @@ class TensorCircuit(_BuildMixin, _CudaGraphsMixin, _ExternalParamsMixin, _Learni
             so the networks that made them train by autograd (`model/differentiable.py`); off by default: the returned
             log-likelihoods' backward runs the circuit's backward for its EM flows, as ever
         :type differentiable: bool
+
+        :param external_params_rows: (keyword) `[B]` integers: the row of the external tensors each sample reads --
+            the tensors then have a batch of their own, and samples sharing a row share the work their tensors alone
+            determine (both passes of a conditional in one batch). Only where every supplied node's parameterization
+            reads through the map (`SumParameterization.takes_external_rows`: `LowRank(top_k)`). A backward reads the
+            forward's map; the gradients it writes stay per sample (`model/differentiable.py` adds them into the rows)
+        :type external_params_rows: torch.Tensor
         """
 
         _pop_removed_precision_flags(kwargs)

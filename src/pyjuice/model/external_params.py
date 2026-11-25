@@ -14,7 +14,7 @@ from typing import Optional, Sequence
 
 from pyjuice.nodes import CircuitNodes
 from pyjuice.layer import StagedExternalParams, EXTERNAL_PARAMS_KWARG, EXTERNAL_PARAMS_GRAD_KWARG, \
-                          EXTERNAL_PARAMS_BUFFER_KWARG, EXTERNAL_PARAMS_GRAD_BUFFER_KWARG
+                          EXTERNAL_PARAMS_BUFFER_KWARG, EXTERNAL_PARAMS_GRAD_BUFFER_KWARG, EXTERNAL_PARAMS_ROWS_KWARG
 from pyjuice.layer.parameterized_sum_layer import validate_external_tensors
 from pyjuice.parameterizations.sum_parameterization import SumParameterization
 
@@ -675,8 +675,12 @@ class _ExternalParamsMixin:
         """
         owns_forward_state = (name == "external_params")
         ns2tensors = kwargs.get(EXTERNAL_PARAMS_KWARG, None)
+        if owns_forward_state and not isinstance(ns2tensors, StagedExternalParams):
+            self._staged_external_rows = None
 
         if ns2tensors is None:
+            assert kwargs.get(EXTERNAL_PARAMS_ROWS_KWARG) is None, \
+                f"`{EXTERNAL_PARAMS_ROWS_KWARG}` was given without external parameters."
             # This forward runs the gated layers as plain sum layers, so whatever was staged earlier
             # no longer describes the state `node_mars` was computed in. DROPPING it is what keeps the
             # staged tensors a description of the latest forward rather than of some earlier one.
@@ -701,6 +705,11 @@ class _ExternalParamsMixin:
             # `forward` mutates `kwargs` in place and then registers the backward hook with `**kwargs`,
             # so a staged dict really does come back round, and clearing here would break it.
             return None
+
+        if kwargs.get(EXTERNAL_PARAMS_ROWS_KWARG) is not None:
+            batch_size = self._external_rows_batch(ns2tensors, kwargs, batch_size, owns_forward_state)
+            if owns_forward_state:
+                self._staged_external_rows = kwargs[EXTERNAL_PARAMS_ROWS_KWARG]
 
         views = StagedExternalParams(self._external_params_views(
             name = name, batch_size = batch_size
@@ -948,6 +957,36 @@ class _ExternalParamsMixin:
             hit = memo[ns] = (rotates, ep.storage_owner(ns))
         return hit
 
+    def _external_rows_batch(self, ns2tensors: dict, kwargs: dict, batch_size: int, forward: bool) -> int:
+        """
+        The external tensors' own batch where `external_params_rows` maps the batch's samples onto their rows (sample b
+        reads row `rows[b]`): the tensors are staged at it and each layer's parameterization reads through the map
+        (`SumParameterization.takes_external_rows`, refused otherwise). The map is checked -- one integer per sample,
+        each a row of the tensors -- and left in `kwargs` as a long tensor on the tensors' device.
+        """
+        rows = kwargs[EXTERNAL_PARAMS_ROWS_KWARG]
+        assert forward, f"`{EXTERNAL_PARAMS_ROWS_KWARG}` is the forward pass's: a sampler reads one row a sample."
+        assert torch.is_tensor(rows) and rows.dim() == 1 and rows.numel() == batch_size and \
+            not rows.is_floating_point() and not rows.is_complex() and rows.dtype != torch.bool, \
+            f"`{EXTERNAL_PARAMS_ROWS_KWARG}` should be an integer tensor of one entry a sample ({batch_size}), the " \
+            f"row of the external tensors each sample reads."
+        for key in ns2tensors:
+            for ns in (self.external_params_groups[key][0] if isinstance(key, str) else [key]):
+                if not ns.parameterization.takes_external_rows(ns):
+                    raise NotImplementedError(
+                        f"`{EXTERNAL_PARAMS_ROWS_KWARG}`: `{type(ns.parameterization).__name__}` does not read its "
+                        f"external tensors through a map of rows ({ns}). Give each sample its own row instead.")
+        first = next(iter(ns2tensors.values()))
+        t0 = first if torch.is_tensor(first) else first[0]
+        ext_batch = t0.size(0)
+        rows = rows.to(device = t0.device, dtype = torch.long)
+        if rows.numel() > 0:
+            lo, hi = torch.stack([rows.min(), rows.max()]).tolist()
+            assert lo >= 0 and hi < ext_batch, \
+                f"`{EXTERNAL_PARAMS_ROWS_KWARG}` reads rows {lo} .. {hi} of external tensors with {ext_batch}."
+        kwargs[EXTERNAL_PARAMS_ROWS_KWARG] = rows
+        return ext_batch
+
     def _resolve_backward_external_params(self, kwargs: dict) -> None:
         """
         Point the backward pass at the external parameters the forward actually staged.
@@ -984,6 +1023,12 @@ class _ExternalParamsMixin:
                         "before the backward pass. Run the forward again, or hand the forward a copy.")
             kwargs[EXTERNAL_PARAMS_KWARG] = staged
             kwargs[EXTERNAL_PARAMS_BUFFER_KWARG] = self.external_params
+        # (the forward's map of rows, as it checked it: a backward reads the samples' rows as the forward did)
+        rows = self.__dict__.get("_staged_external_rows")
+        assert rows is not None or kwargs.get(EXTERNAL_PARAMS_ROWS_KWARG) is None, \
+            f"`{EXTERNAL_PARAMS_ROWS_KWARG}` was given to the backward pass, but the forward pass read no map of rows."
+        if staged is not None and rows is not None:
+            kwargs[EXTERNAL_PARAMS_ROWS_KWARG] = rows
 
     def _check_external_params_kwargs(self, kwargs: dict) -> None:
         """

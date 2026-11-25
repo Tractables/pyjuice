@@ -38,6 +38,17 @@ def _staged(kwargs):
     return kwargs.get(EXTERNAL_PARAMS_KWARG)
 
 
+def external_rows(kwargs):
+    """`[B]` long: the row of the external tensors each sample reads (`external_params_rows`), or None (its own)."""
+    from pyjuice.layer.parameterized_sum_layer import EXTERNAL_PARAMS_ROWS_KWARG
+    return kwargs.get(EXTERNAL_PARAMS_ROWS_KWARG)
+
+
+def per_sample(tensors, rows):
+    """The external tensors' rows the samples read: themselves, or gathered through the map `rows`."""
+    return tensors if rows is None else tuple(t.index_select(0, rows) for t in tensors)
+
+
 def _leaf_rows(layer, ns):
     """`(first node row, end, variable, its layer-local id, the nodes' first parameter ids [M])` of a soft-evidence
     leaf node vector of input layer `layer`."""
@@ -88,6 +99,7 @@ def leaf_forward(desc, layer, data: torch.Tensor, node_mars: torch.Tensor, kwarg
         tilt = staged.get(ns)
         if tilt is None:
             continue
+        tilt = per_sample(tilt, external_rows(kwargs))
         assert ids is not None and lp is not None, \
             "`LowRank(top_k)` on a soft-evidence leaf needs `soft_evidence_cat_ids` and `categorical_evidence_logp`."
         s, e, v, lvid, _ = _leaf_rows(layer, ns)
@@ -124,7 +136,9 @@ def slot_log_weights(desc, sib: dict, batch_size: int, kwargs: dict, device):
         staged = _staged(kwargs)
         tilt = None if staged is None else staged.get(xs)
         if tilt is not None:
-            tilt = (tilt[0][rows].double(), tilt[1][rows].double())
+            ext = external_rows(kwargs)
+            er = rows if ext is None else ext[rows]                            # (the rows of the tensors they read)
+            tilt = (tilt[0][er].double(), tilt[1][er].double())
         logp = leaf_log_probs(leaf_layer, xs, lp_v[rows], ids_v[rows], tilt,
                               None if tilt is None else xs.parameterization.top_k)                # [b, M, C]
         own = logp[:, :, :min(K, C)]
@@ -201,7 +215,7 @@ def sum_forward(desc, layer, ns_tensors, node_mars, element_mars, params, kwargs
     layer.__dict__["_lr_state"] = dict()
     layer.__dict__["_lr_topk_batch"] = node_mars.size(1)
     for ns_info, tensors in ns_tensors:
-        A, Bm, G = (t.double() for t in tensors)
+        A, Bm, G = (t.double() for t in per_sample(tensors, external_rows(kwargs)))
         geo = desc._geometry(layer, ns_info, node_mars.device)
         ltheta = desc._dense_params(geo, params, dtype = torch.float64).log()       # [M, N]
         lc = desc._child_values(geo, element_mars).double()                         # [B, N]
@@ -254,7 +268,7 @@ def sum_backward(desc, layer, ns_tensors, ns_grad_tensors, node_flows, element_f
     for (ns_info, tensors), grads, geo in zip(ns_tensors, ns_grad_tensors, geos):
         sib = sibs[id(ns_info.ns)]
         f = node_flows[ns_info.nid_start:ns_info.nid_end, :].t().double().exp()       # [B, M] (log-space flows)
-        A, Bm, G = (t.double() for t in tensors)
+        A, Bm, G = (t.double() for t in per_sample(tensors, external_rows(kwargs)))
         theta = desc._dense_params(geo, params, dtype = torch.float64)
         lc = desc._child_values(geo, element_mars).double()
         logw, rows, logp, tilt = slot_log_weights(desc, sib, f.size(0), kwargs, dev)
@@ -333,7 +347,7 @@ def leaf_backward(desc, layer, data, node_flows, kwargs, logspace_flows: bool, m
     l0 = layer._output_ind_range[0]
     K = desc.top_k
     for ns in layer.nodes:
-        tilt = staged[ns]
+        tilt = per_sample(staged[ns], external_rows(kwargs))
         s, e, v, lvid, _ = _leaf_rows(layer, ns)
         f = node_flows[s:e, :].t().double()
         f = f.exp() if logspace_flows else f
