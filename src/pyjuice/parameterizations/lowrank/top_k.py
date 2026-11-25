@@ -270,13 +270,20 @@ def _grads_kw(kwargs):
 
 
 def _store(gviews, fresh, grads, values, rows = None) -> None:
-    """Add `values` into the gradient destinations `grads` (at the samples `rows` only, if given); the destinations'
-    first writer of the pass initializes them where they were handed over unzeroed (`fresh`)."""
+    """Add `values` -- a sample each: every sample, or the samples `rows` -- into the gradient destinations `grads`;
+    the destinations' first writer of the pass initializes them where they were handed over unzeroed (`fresh`). Where
+    the destinations fold (`StagedExternalParams.fold`: the rows of the map, the samples' signs) each sample's value
+    goes into the row it read, times its sign."""
     if fresh and gviews.claim(grads):
         for g in grads:
             g.zero_()
+    fold = getattr(gviews, "fold", None)
+    if fold is not None:
+        into, sign = fold if rows is None else (fold[0][rows], fold[1][rows])
     for g, v in zip(grads, values):
-        if rows is None:
+        if fold is not None:
+            g.index_add_(0, into, (v * sign.view(-1, *([1] * (v.dim() - 1))).to(v.dtype)).to(g.dtype))
+        elif rows is None:
             g.add_(v.to(g.dtype))
         else:
             g.index_add_(0, rows, v.to(g.dtype))

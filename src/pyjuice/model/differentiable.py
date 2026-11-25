@@ -13,7 +13,8 @@ The gradient of `sum_b w_b log p_b` for the upstream weights `w`: ONE backward o
 each sample's gradients -- the per-sample ones a backward writes -- times the sign of its weight (a sample's flows all
 scale with its own weight). Where the circuit's latest pass is not this call's forward (another forward or backward
 ran since: the circuit keeps the node values of its latest forward only) the backward runs the forward again first. With
-`external_params_rows` the samples' gradients are added into the rows of the tensors they read. The circuit's own
+`external_params_rows` the backward itself adds each sample's gradient, times its sign, into the row of the tensors it
+read (`EXTERNAL_PARAMS_GRAD_SIGNS_KWARG`): no gradient a sample is kept. The circuit's own
 parameters get no gradient here (`compute_param_flows = False`): their EM statistics are a backward of their own, on
 the pass they train on.
 
@@ -32,7 +33,7 @@ from __future__ import annotations
 import torch
 
 from pyjuice.layer.parameterized_sum_layer import EXTERNAL_PARAMS_KWARG, EXTERNAL_PARAMS_GRAD_KWARG, \
-    EXTERNAL_PARAMS_ROWS_KWARG
+    EXTERNAL_PARAMS_ROWS_KWARG, EXTERNAL_PARAMS_GRAD_SIGNS_KWARG
 
 
 def _evidence_names(pc) -> set:
@@ -93,34 +94,34 @@ class _DifferentiableLLs(torch.autograd.Function):
         w = grad[:, 0].float()
         ext = given.get(EXTERNAL_PARAMS_KWARG) or {}
         rows = given.get(EXTERNAL_PARAMS_ROWS_KWARG)
-        out = [torch.zeros_like(t) for _, _, _, t in entries]
         if not bool((w != 0).any()):
-            return (None, None, None, None, None, *out)
+            return (None, None, None, None, None, *[torch.zeros_like(t) for _, _, _, t in entries])
         rest = {k: v for k, v in given.items() if k != EXTERNAL_PARAMS_KWARG}
-        B = w.size(0)
-        per_sample = lambda t: t.new_zeros((B,) + tuple(t.shape[1:])) if rows is not None else torch.zeros_like(t)
+        sign = torch.where(w < 0, -1.0, 1.0)
+        # (with a map of rows the backward folds the samples' gradients into the tensors' rows, each times its sign: the
+        # destinations have the tensors' own batch)
+        fold = {EXTERNAL_PARAMS_GRAD_SIGNS_KWARG: sign} if rows is not None else {}
         ext_grads = {}
         for kind, key, _, _ in entries:
             if kind == "ext" and key not in ext_grads:
                 ts = ext[key]
-                ext_grads[key] = per_sample(ts) if torch.is_tensor(ts) else tuple(per_sample(t) for t in ts)
+                ext_grads[key] = torch.zeros_like(ts) if torch.is_tensor(ts) else tuple(torch.zeros_like(t) for t in ts)
         evi_grads = {f"{key}_grad": torch.zeros_like(given[key]) for kind, key, _, _ in entries if kind == "evi"}
         with torch.no_grad():
             if pc.__dict__.get("_num_runs", 0) != ctx.run:
                 pc(inputs, **given)                                       # (another pass ran since: this call's values)
             pc.backward(inputs, ll_weights = w.abs(), compute_param_flows = False, logspace_flows = True,
-                        allow_modify_flows = False, **rest, **evi_grads,
+                        allow_modify_flows = False, **rest, **evi_grads, **fold,
                         **({EXTERNAL_PARAMS_GRAD_KWARG: ext_grads} if ext_grads else {}))
-        sign = torch.where(w < 0, -1.0, 1.0)
-        for i, (kind, key, slot, t) in enumerate(entries):
+        out = []
+        for kind, key, slot, t in entries:
             if kind == "ext":
                 g = ext_grads[key]
                 g = g if torch.is_tensor(g) else g[slot]
+                if fold:
+                    out.append(g.to(t.dtype))                             # (signed and folded by the backward)
+                    continue
             else:
                 g = evi_grads[f"{key}_grad"]
-            g = (g * sign.view(-1, *([1] * (g.dim() - 1))).to(g.dtype)).to(out[i].dtype)
-            if kind == "ext" and rows is not None:
-                out[i].index_add_(0, rows.to(device = g.device, dtype = torch.long), g)
-            else:
-                out[i].add_(g)
+            out.append((g * sign.view(-1, *([1] * (g.dim() - 1))).to(g.dtype)).to(t.dtype))
         return (None, None, None, None, None, *out)

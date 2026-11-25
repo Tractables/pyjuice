@@ -34,6 +34,11 @@ EXTERNAL_PARAMS_GRAD_KWARG = "sum_external_params_grad"
 #   `pc(x, external_params = {...}, external_params_rows = rows)`
 EXTERNAL_PARAMS_ROWS_KWARG = "external_params_rows"
 
+# Backward kwarg (private: `pc(..., differentiable = True)`'s, with `external_params_rows`) -- one sign a sample: the
+# gradient destinations then have the external tensors' batch, each sample's gradient added into the row it read times
+# its sign (the destinations' `fold`; `SumParameterization.takes_external_rows`)
+EXTERNAL_PARAMS_GRAD_SIGNS_KWARG = "_external_params_grad_signs"
+
 # The flat staging buffer the views point into, supplied by the PC so that kernels spanning several
 # nodes can address it directly instead of taking one pointer per node
 EXTERNAL_PARAMS_BUFFER_KWARG = "sum_external_params_buffer"
@@ -114,8 +119,14 @@ class StagedExternalParams(dict):
     in the backward claims it (:func:`claim`) and then writes every element of it rather than adding; one
     that adds zeroes it first (:func:`init_grads`). The circuit zeroes, at the backward's end, the
     destinations no writer claimed.
+
+    A mapping of gradient destinations with a `fold` -- `(rows [B], signs [B])`, the private fold of
+    `EXTERNAL_PARAMS_GRAD_SIGNS_KWARG` -- has the external tensors' own batch: a writer adds each sample's gradient into
+    the row it read (`rows[b]`) times its sign (the parameterizations that read through the map,
+    :func:`SumParameterization.takes_external_rows`, write it so).
     """
     fresh = False
+    fold = None
 
     def claim(self, tensors) -> bool:
         """Whether the caller is the first writer, in this backward, of the destination `tensors` (a node's

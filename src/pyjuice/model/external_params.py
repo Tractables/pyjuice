@@ -14,7 +14,8 @@ from typing import Optional, Sequence
 
 from pyjuice.nodes import CircuitNodes
 from pyjuice.layer import StagedExternalParams, EXTERNAL_PARAMS_KWARG, EXTERNAL_PARAMS_GRAD_KWARG, \
-                          EXTERNAL_PARAMS_BUFFER_KWARG, EXTERNAL_PARAMS_GRAD_BUFFER_KWARG, EXTERNAL_PARAMS_ROWS_KWARG
+                          EXTERNAL_PARAMS_BUFFER_KWARG, EXTERNAL_PARAMS_GRAD_BUFFER_KWARG, EXTERNAL_PARAMS_ROWS_KWARG, \
+                          EXTERNAL_PARAMS_GRAD_SIGNS_KWARG
 from pyjuice.layer.parameterized_sum_layer import validate_external_tensors
 from pyjuice.parameterizations.sum_parameterization import SumParameterization
 
@@ -676,7 +677,7 @@ class _ExternalParamsMixin:
         owns_forward_state = (name == "external_params")
         ns2tensors = kwargs.get(EXTERNAL_PARAMS_KWARG, None)
         if owns_forward_state and not isinstance(ns2tensors, StagedExternalParams):
-            self._staged_external_rows = None
+            self._staged_external_rows = self._staged_external_batch = None
 
         if ns2tensors is None:
             assert kwargs.get(EXTERNAL_PARAMS_ROWS_KWARG) is None, \
@@ -710,6 +711,7 @@ class _ExternalParamsMixin:
             batch_size = self._external_rows_batch(ns2tensors, kwargs, batch_size, owns_forward_state)
             if owns_forward_state:
                 self._staged_external_rows = kwargs[EXTERNAL_PARAMS_ROWS_KWARG]
+                self._staged_external_batch = batch_size
 
         views = StagedExternalParams(self._external_params_views(
             name = name, batch_size = batch_size
@@ -1160,6 +1162,17 @@ class _ExternalParamsMixin:
         # destinations and the copy-out happens once the backward is done; `get_external_params_grad`
         # keeps working either way.
         dsts = kwargs.pop(EXTERNAL_PARAMS_GRAD_KWARG, None)
+        # (one sign a sample, the private fold of `pc(..., differentiable = True)`: the destinations at the tensors' own
+        # batch, each sample's gradient added into the row it read times its sign -- `StagedExternalParams.fold`)
+        signs = kwargs.pop(EXTERNAL_PARAMS_GRAD_SIGNS_KWARG, None)
+        fold = None
+        if signs is not None:
+            rows = self.__dict__.get("_staged_external_rows")
+            assert rows is not None, \
+                f"`{EXTERNAL_PARAMS_GRAD_SIGNS_KWARG}` folds the gradients into the rows of a map the forward read; it read none."
+            assert signs.numel() == batch_size, f"`{EXTERNAL_PARAMS_GRAD_SIGNS_KWARG}`: one sign a sample ({batch_size})."
+            fold = (rows, signs.to(device = rows.device, dtype = torch.float32))
+            batch_size = self._staged_external_batch
         self._external_grad_dsts = None
         self._external_grad_groups = None
         in_place_grads, zero = {}, []
@@ -1201,6 +1214,7 @@ class _ExternalParamsMixin:
                 for t in zero:
                     seen.setdefault((t.data_ptr(), tuple(t.shape), tuple(t.stride())), t)
                 torch._foreach_zero_(list(seen.values()))
+            grad_views.fold = fold
             kwargs[EXTERNAL_PARAMS_GRAD_KWARG] = grad_views
             kwargs[EXTERNAL_PARAMS_GRAD_BUFFER_KWARG] = self.external_params_grad
             self._staged_external_params_grad = grad_views
@@ -1226,6 +1240,7 @@ class _ExternalParamsMixin:
                 seen.setdefault((t.data_ptr(), tuple(t.shape), tuple(t.stride())), t)
             torch._foreach_zero_(list(seen.values()))
 
+        grad_views.fold = fold
         kwargs[EXTERNAL_PARAMS_GRAD_KWARG] = grad_views
         # The flat buffer too: a kernel that writes gradients addresses it with the same compiled
         # offsets as the forward uses for the tensors themselves (the two buffers share a layout).

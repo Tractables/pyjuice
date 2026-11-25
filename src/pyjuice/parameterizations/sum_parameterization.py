@@ -205,7 +205,9 @@ class SumParameterization():
         external tensors through a map (sample b reads row `rows[b]`; the tensors staged at their own batch, the map in
         the passes' keywords as `EXTERNAL_PARAMS_ROWS_KWARG`) -- so samples sharing a row of tensors can share the work
         their tensors alone determine (a conditional's two passes in one batch). The gradients stay per sample: the
-        backward writes them at the batch's rows. False by default: the circuit then refuses the map.
+        backward writes them at the batch's rows -- unless the destinations fold (`StagedExternalParams.fold`, the
+        private signs of `pc(..., differentiable = True)`): then at the tensors' rows, each sample's times its sign.
+        False by default: the circuit then refuses the map.
         """
         return False
 
