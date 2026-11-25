@@ -46,6 +46,11 @@ def inputs(var: Union[int,Sequence[int]], num_node_blocks: int = 0, dist: Distri
     :param block_size: block size of the nodes; it does not change the semantics of the nodes, but will affect the speed of the compiled PC
     :type block_size: int
 
+    :param parameterization: (keyword) a per-sample external parameterization of the nodes' parameters, from
+                             `pyjuice.parameterizations` -- e.g. `LowRank(rank, top_k = K)` on a `SoftEvidenceCategorical`
+                             leaf --, its tensors supplied at call time (`external_params`) as a sum node's are
+    :type parameterization: Optional[SumParameterization]
+
     :returns: an `InputNodes` object (a subclass of `CircuitNodes`)
     """
 

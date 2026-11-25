@@ -689,9 +689,16 @@ class TensorCircuit(_BuildMixin, _CudaGraphsMixin, _ExternalParamsMixin, _Learni
 
         :param apply_cudagraph: replay a graph recorded under exactly this call's signature, if there is one
         :type apply_cudagraph: bool
+
+        :param differentiable: (keyword) return log-likelihoods differentiable in the call's tensors that require grad --
+            external parameters (`external_params`) and evidence with a gradient (`categorical_evidence_logp`, ...) --,
+            so the networks that made them train by autograd (`model/differentiable.py`); off by default: the returned
+            log-likelihoods' backward runs the circuit's backward for its EM flows, as ever
+        :type differentiable: bool
         """
 
         _pop_removed_precision_flags(kwargs)
+        differentiable = bool(kwargs.pop("differentiable", False))
         self._num_runs = getattr(self, "_num_runs", 0) + 1
 
         with device_grad_controller(device = self.device, no_grad = True):
@@ -716,6 +723,7 @@ class TensorCircuit(_BuildMixin, _CudaGraphsMixin, _ExternalParamsMixin, _Learni
             pflow_tempered_enabled = abs(pflow_temperature - 1.0) >= 1e-6
 
             self._check_external_params_kwargs(kwargs)
+            given = dict(kwargs)                                # (the call's keywords as given: `_DifferentiableLLs`)
             self._stage_external_params(kwargs, B)
 
             ## Initialize buffers for forward pass ##
@@ -761,6 +769,9 @@ class TensorCircuit(_BuildMixin, _CudaGraphsMixin, _ExternalParamsMixin, _Learni
             # graph is keyed on that dict (`_graph_key_options`), so no option can reach a captured pass
             # without being part of its key.
             sum_opts = dict(kwargs, precision = self.precision, pflow_temperature = pflow_temperature)
+            if self.__dict__.get("_sums_read_inputs", False):
+                # (a sum whose parameters read the leaf beside it reads the inputs: `SumParameterization.reads_sibling_leaf`)
+                sum_opts["_inputs"] = origin_inputs
 
             def _run_inner_layers():
                 # The buffers and parameters looked up once, and a group without hooks called at its `forward` -- what
@@ -828,6 +839,17 @@ class TensorCircuit(_BuildMixin, _CudaGraphsMixin, _ExternalParamsMixin, _Learni
                 cache["node_mars"] = self.node_mars.clone()
 
         ## Add gradient hook for backward pass ##
+
+        if torch.is_grad_enabled() and differentiable:
+            # Log-likelihoods differentiable in the call's tensors that require grad (`model/differentiable.py`), instead
+            # of the hook below, which runs the backward for EM flows
+            from .differentiable import differentiable_entries, _DifferentiableLLs
+            assert input_layer_fn is None and cache is None and not return_cache, \
+                "`differentiable = True` takes the plain forward only."
+            entries = differentiable_entries(self, given)
+            if not entries:
+                return lls.clone()
+            return _DifferentiableLLs.apply(lls.detach(), self, origin_inputs, given, entries, *[e[3] for e in entries])
 
         if torch.is_grad_enabled():
             lls.requires_grad = True
@@ -956,6 +978,7 @@ class TensorCircuit(_BuildMixin, _CudaGraphsMixin, _ExternalParamsMixin, _Learni
         self._run_params["temper_eflow"] = temper_eflow
 
         assert self.node_mars is not None and self.element_mars is not None, "Should run forward path first."
+        call_inputs = inputs                                    # ([B, num_vars]: what a sum reading its leaf reads)
         if input_layer_fn is None:
             assert inputs.dim() == 2 and inputs.size(1) == self.num_vars
             inputs = inputs.permute(1, 0)
@@ -1037,6 +1060,8 @@ class TensorCircuit(_BuildMixin, _CudaGraphsMixin, _ExternalParamsMixin, _Learni
                             pflow_temperature = pflow_temperature, temper_eflow = temper_eflow,
                             defer_param_flows = compute_param_flows and pf_defer,
                             pf_store_first = compute_param_flows and flows_memory == 0.0)
+            if self.__dict__.get("_sums_read_inputs", False):
+                sum_opts["_inputs"] = call_inputs
 
             def _inner_layers():
 
@@ -1127,7 +1152,10 @@ class TensorCircuit(_BuildMixin, _CudaGraphsMixin, _ExternalParamsMixin, _Learni
             if not _inner_layers_only:
                 for idx, layer in enumerate(self.input_layer_group):
                     if input_layer_fn is None:
-                        layer.backward(inputs, self.node_flows, self.node_mars, logspace_flows = logspace_flows, **kwargs)
+                        # (an input layer with an external parameterization is told whether parameter flows are wanted)
+                        extra = {} if layer.parameterization is None else {"_compute_param_flows": compute_param_flows}
+                        layer.backward(inputs, self.node_flows, self.node_mars, logspace_flows = logspace_flows, **kwargs,
+                                       **extra)
 
                     elif isinstance(input_layer_fn, str):
                         assert hasattr(layer, input_layer_fn), f"Custom input function `{input_layer_fn}` not found for layer type {type(layer)}."

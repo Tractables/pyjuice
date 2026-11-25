@@ -125,8 +125,13 @@ class _BuildMixin:
                             var_idmapping[vars] = torch.arange(0, vars.size(0))
                             input_layer.register_buffer("var_idmapping", var_idmapping)
 
+                        # Input nodes with an external parameterization take their tensors as sum nodes do
+                        if input_layer.parameterization is not None:
+                            for ns in input_layer.nodes:
+                                self.external_params_nodes[ns] = input_layer
+
                         input_layers.append(input_layer)
-                        
+
                         input_layer_id += 1
                         num_nodes += input_layer.num_nodes
 
@@ -221,6 +226,10 @@ class _BuildMixin:
         self.num_elements = num_elements
         self.num_sum_params = num_parameters
         self.num_param_flows = num_param_flows
+
+        # Sum nodes whose parameters depend on the value of the leaf they are multiplied with
+        # (`SumParameterization.reads_sibling_leaf`): each one's leaf, found and checked now
+        self._resolve_sibling_leaves(depth2nodes, num_layers)
 
         # Does any layer need the denominator flow `F-`? Resolved once here, so `init_param_flows`
         # allocates `denom_param_flows` only when it is actually used -- an ordinary PC never does and
@@ -402,10 +411,56 @@ class _BuildMixin:
 
         return depth2nodes, num_layers, max_node_block_size, max_ele_block_size
 
+    def _resolve_sibling_leaves(self, depth2nodes, num_layers: int) -> None:
+        """
+        For every sum node vector whose parameterization reads the value of the leaf beside it
+        (`SumParameterization.reads_sibling_leaf`): that leaf -- the one input node vector in its ONE parent product,
+        paired node i with node i --, checked by the parameterization (`validate_sibling_leaf`) and noted on the layer
+        (`_sibling_leaves[id(ns)]`: the leaf, its input layer, its variable) and on the leaf's input layer
+        (`_read_by_sums`: its node vectors such a sum reads); `_sums_read_inputs` on the circuit. Anything else --
+        several parents, no leaf or two, nodes not paired one to one, two such sums in one product -- is refused here,
+        with the reason: the circuit would not be the one the parameterization defines.
+        """
+        readers = [(ns, layer) for ns, layer in self.external_params_nodes.items()
+                   if not ns.is_input() and ns.parameterization.reads_sibling_leaf]
+        self._sums_read_inputs = len(readers) > 0
+        if not readers:
+            return None
+
+        parents = dict()
+        for depth in range(num_layers):
+            for pns in depth2nodes[depth].get("prod", []):
+                for ch in pns.chs:
+                    parents.setdefault(id(ch), []).append(pns)
+        input_layer_of = {id(ns): layer for layer in self.input_layer_group for ns in layer.nodes}
+
+        for ns, layer in readers:
+            ps = parents.get(id(ns), [])
+            assert len(ps) == 1, \
+                f"A sum node vector whose parameters read the leaf beside it must have exactly one parent product, got " \
+                f"{len(ps)}: {ns}."
+            pns = ps[0]
+            leaves = [k for k, ch in enumerate(pns.chs) if ch.is_input()]
+            assert len(leaves) == 1, \
+                f"The parent product of a sum node vector whose parameters read the leaf beside it must have exactly one " \
+                f"input node vector, got {len(leaves)}: {pns}."
+            others = [ch for ch in pns.chs if ch is not ns and isinstance(ch, ParameterizedSumNodes)
+                      and ch.parameterization.reads_sibling_leaf]
+            assert not others, "A product may hold one sum node vector that reads its leaf, not two."
+            kx, kn = leaves[0], [k for k, ch in enumerate(pns.chs) if ch is ns][0]
+            xs = pns.chs[kx]
+            ns.parameterization.validate_sibling_leaf(ns, xs)
+            paired = xs.num_nodes == ns.num_nodes and xs.block_size == ns.block_size and \
+                bool(torch.equal(pns.edge_ids[:, kx], pns.edge_ids[:, kn]))
+            assert paired, f"A sum node vector that reads its leaf must be paired with it node i with node i: {pns}."
+            layer.__dict__.setdefault("_sibling_leaves", dict())[id(ns)] = dict(
+                ns = xs, layer = input_layer_of[id(xs)], var = xs.scope.to_list()[0])
+            input_layer_of[id(xs)].__dict__.setdefault("_read_by_sums", set()).add(id(xs))
+
     def _categorize_input_nodes(self, nodes: Sequence[InputNodes]):
         signature2nodes = dict()
         for ns in nodes:
-            signature = ns.dist.get_signature()
+            signature = (ns.dist.get_signature(), ns.get_parameterization_signature())
             if signature not in signature2nodes:
                 signature2nodes[signature] = []
             signature2nodes[signature].append(ns)

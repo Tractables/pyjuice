@@ -126,6 +126,13 @@ class InputLayer(Layer, nn.Module):
         self.num_nodes = layer_num_nodes
         self.dist_signature = dist_signature
 
+        # The nodes' external parameterization (`InputNodes.parameterization`): one for the layer (compilation groups
+        # input nodes by it beside the distribution), None for plain leaves
+        par_signatures = set(ns.get_parameterization_signature() for ns in self.nodes)
+        assert len(par_signatures) == 1, \
+            f"Nodes of an InputLayer must share one external parameterization, got {par_signatures}."
+        self.parameterization = self.nodes[0].parameterization
+
         # Store the triton kernel functions implemented by the target `Distribution`
         self.fw_mar_fn = self.dist.get_fw_mar_fn()
         self.bk_flow_fn = self.dist.get_bk_flow_fn()
@@ -416,6 +423,11 @@ class InputLayer(Layer, nn.Module):
 
         assert params.dim() == 1
 
+        # (an external parameterization's pass reads the data and the evidence as the caller gave them: the
+        #  distribution's preprocessing below may hand its kernels re-ordered copies)
+        if self.parameterization is not None:
+            given = (data, dict(kwargs, missing_mask = missing_mask, _batch_first = _batch_first))
+
         if "cuda" in self.device.type:
             # Need to flatten data to ensure the memory is aligned following [num_vars, batch_size]
             data = data.reshape(-1).contiguous()
@@ -477,6 +489,11 @@ class InputLayer(Layer, nn.Module):
             kwargs["_fw_data"] = data
             self._run_post(self.post_fw_fns, kwargs, fw_launch_common)
             kwargs.pop("_fw_launch_common", None)
+
+            # An external parameterization: the values of the node vectors it was given tensors for, over the shared
+            # ones (the missing mask below applies to them too)
+            if self.parameterization is not None:
+                self.parameterization.input_forward(self, given[0], node_mars, given[1])
 
             # Apply missing mask if required
             if missing_mask is not None:
@@ -643,6 +660,14 @@ class InputLayer(Layer, nn.Module):
             params = params["params"]
 
         assert params.dim() == 1
+
+        # An external parameterization: the layer's backward is its descriptor's where its node vectors were given tensors
+        # (True: done -- the parameter flows, the evidence's and the tensors' gradients); else the plain leaf's below
+        compute_param_flows = kwargs.pop("_compute_param_flows", True)
+        if self.parameterization is not None and self.parameterization.input_backward(
+                self, data, node_flows, node_mars, kwargs, logspace_flows = logspace_flows, missing_mask = missing_mask,
+                batch_first = _batch_first, compute_param_flows = compute_param_flows):
+            return None
 
         if "cuda" in self.device.type:
             # Need to flatten data to ensure the memory is aligned following [num_vars, batch_size]

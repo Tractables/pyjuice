@@ -34,6 +34,10 @@ class _BackwardMixin:
         if not kwargs.get("logspace_flows", False):
             raise NotImplementedError("`LowRank` requires `logspace_flows = True` (the default).")
         self._require_full_supply(layer, ns_tensors)
+        if self.top_k is not None:                              # (the per-candidate form: its reference passes)
+            if layer.__dict__.get("_lr_topk_batch") != node_mars.size(1):
+                raise RuntimeError("`LowRank`: the backward needs the forward pass of the same batch first.")
+            return None
         state = layer.__dict__.get("_lr_state")
         if isinstance(state, tuple):                            # (the forward went through the virtual batch)
             fresh = state[1] == node_mars.size(1)
@@ -58,6 +62,10 @@ class _BackwardMixin:
         The element flows of a child several node vectors of the layer share add up.
         """
         dev = node_flows.device
+        if self.top_k is not None:                              # (the per-candidate form: its reference passes)
+            from . import top_k as lowrank_top_k
+            return lowrank_top_k.sum_backward(self, layer, ns_tensors, ns_grad_tensors, node_flows, element_flows,
+                                              node_mars, element_mars, params, param_flows, denom_param_flows, kwargs)
         state = layer._lr_state
         if isinstance(state, tuple):
             # (with the product group below, where the layer handed it over: `stream_fusion_bk` said so in this call)

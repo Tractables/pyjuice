@@ -992,7 +992,15 @@ class _ExternalParamsMixin:
 
         Without this, a stale or mistyped `ns` key is silently ignored -- the PC runs on its shared
         parameters and quietly returns a different answer than intended.
+
+        Also where the general names are resolved: `external_params` / `external_params_grad` -- every node with an
+        external parameterization, sum or input, in one dict -- are `sum_external_params` / `sum_external_params_grad`.
         """
+        for alias, name in (("external_params", EXTERNAL_PARAMS_KWARG), ("external_params_grad", EXTERNAL_PARAMS_GRAD_KWARG)):
+            if alias in kwargs:
+                assert name not in kwargs, f"Give `{alias}` or `{name}`, not both."
+                kwargs[name] = kwargs.pop(alias)
+
         for kwarg_name in (EXTERNAL_PARAMS_KWARG,):
             ns2tensors = kwargs.get(kwarg_name, None)
             if ns2tensors is None:

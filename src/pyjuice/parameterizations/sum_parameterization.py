@@ -232,6 +232,34 @@ class SumParameterization():
         """
         pass
 
+    #: Whether a sum node's effective parameters depend on the VALUE of the leaf beside it in its one parent product
+    #: (`LowRank(top_k)`: the token that leaf emits). The circuit then finds that leaf at compile time -- one parent
+    #: product, one input node vector in it, paired node i with node i, checked by :func:`validate_sibling_leaf` --
+    #: notes it on the layer (`_sibling_leaves[id(ns)]`: the leaf, its input layer, its variable) and on the leaf's
+    #: input layer (`_read_by_sums`), and hands the layer the call's inputs (`_inputs`, `[B, num_vars]`). A missing
+    #: value is the parameterization's to sum out: the circuit it defines must stay smooth and decomposable.
+    reads_sibling_leaf: bool = False
+
+    def validate_sibling_leaf(self, ns, leaf) -> None:
+        """Check, at compile time, the leaf whose value the effective parameters of `ns` read (:attr:`reads_sibling_leaf`)."""
+        pass
+
+    def input_forward(self, layer, data, node_mars, kwargs) -> None:
+        """
+        For a parameterization of INPUT nodes (`juice.inputs(..., parameterization = ...)`): the values of `layer`'s node
+        vectors that were given tensors, written over the distribution's (its missing mask applies after); `data`
+        `[num_vars, B]` and `kwargs` the call's evidence as the caller gave it.
+        """
+        raise NotImplementedError(f"{self.get_signature()} does not parameterize input nodes.")
+
+    def input_backward(self, layer, data, node_flows, node_mars, kwargs, logspace_flows: bool = False,
+                       missing_mask = None, batch_first: bool = True, compute_param_flows: bool = True) -> bool:
+        """
+        The backward of an input layer whose node vectors were given tensors -- its parameter flows, the evidence's and
+        the tensors' gradients --: True, done (the distribution's own backward does not run); False, none were given.
+        """
+        raise NotImplementedError(f"{self.get_signature()} does not parameterize input nodes.")
+
     def tensor_shapes(self, ns, batch_size: int) -> Tuple[Tuple[int,...],...]:
         """
         Shapes of the external tensors this parameterization consumes, for `ns` at `batch_size`, in

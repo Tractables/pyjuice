@@ -208,6 +208,8 @@ class _ForwardMixin:
         """What `ParameterizedSumLayer._stream_fusion` asks for the circuit's decision to leave the product group
         below (``children``) to this layer's forward: taken where the forward goes through the mixture's virtual batch,
         whose `expand` then reads each product's value from its two children."""
+        if self.top_k is not None:
+            return None
         return (children,) if lowrank_virtual.fuses(self, layer, children) else None
 
     def stream_fusion_bk(self, layer, batch_size: int, dtype, op: bool, param_flows: bool) -> bool:
@@ -216,6 +218,8 @@ class _ForwardMixin:
         layer's last forward went through the virtual batch (a backward at another batch size than that forward's is
         refused whatever this says), whose backward then reads each product's value from its two children and writes
         its flow as theirs; or through the fp16 exp_sum kernels (`_h_stream_bk`), whose backward does."""
+        if self.top_k is not None:                              # (the per-candidate form's passes take no fusion)
+            return False
         if isinstance(layer.__dict__.get("_lr_state"), tuple):
             return lowrank_virtual.fuses_bk()
         return self._h_stream_bk(layer, batch_size)
@@ -231,6 +235,12 @@ class _ForwardMixin:
         self._require_full_supply(layer, ns_tensors)
 
         children = kwargs.pop("stream_children", None)
+        if self.top_k is not None:                              # (the per-candidate form: its reference passes)
+            if children is not None:
+                from pyjuice.layer.fused_children import form_elements
+                form_elements(element_mars, node_mars, children)
+            from . import top_k as lowrank_top_k
+            return lowrank_top_k.sum_forward(self, layer, ns_tensors, node_mars, element_mars, params, kwargs)
         if lowrank_virtual.serves(self, layer, node_mars, element_mars):
             return lowrank_virtual.forward(self, layer, ns_tensors, node_mars, element_mars, params, kwargs,
                                            stream_children = children)

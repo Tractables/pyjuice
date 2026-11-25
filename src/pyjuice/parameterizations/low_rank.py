@@ -39,6 +39,20 @@ class LowRank(_ForwardMixin, _BackwardMixin, _DenominatorsMixin, SumParameteriza
     samples share no matmul; `"sum_exp"` is `k` matmuls with the shared parameters. Both are defined on the pairs the
     node vector's `edge_ids` connect; a pair without parameters has none here either.
 
+    **`top_k`** (the `"exp_sum"` form). The scale also has a CANDIDATE axis: an entry for each of the first `top_k`
+    candidates of a `SoftEvidenceCategorical` variable (`soft_evidence_cat_ids`, in the caller's order) and one shared by
+    all the others.
+
+    * On a soft-evidence LEAF (`juice.inputs(..., parameterization = LowRank(rank, top_k = K))`) the candidates are the
+      leaf's own values: `theta_b[i, c] = theta[i, c] q_b(c) exp(A_b[i] . B_b[:, s(c)]) / Z_b[i]`, normalized over the
+      candidates, `s(c)` the candidate's place capped at `K`; `B` is `[B, K, top_k + 1]`.
+    * On a SUM node, multiplied in its one parent product with such a leaf (node `i` with node `i`), the candidate is
+      the token that leaf emits: `log theta_b[i, j | x] = log theta[i, j] + A_b[i] . B_b[:, j] + G_b[s(x), j] - log
+      Z_b[i, s(x)]`, normalized over `j` for every (node, slot); a third tensor `G [B, top_k + 1, N]`. A missing token
+      is summed out under the leaf's own probabilities -- the circuit with a state for every (node, slot), exactly.
+
+    Which token is implied by the structure (the compiler checks that it is unambiguous); nothing names it.
+
     **Tensor layout.** Two `float32` tensors per node vector, in this order:
 
     * `A`: `[B, ns.num_nodes, k]`
@@ -131,7 +145,7 @@ class LowRank(_ForwardMixin, _BackwardMixin, _DenominatorsMixin, SumParameteriza
         return 0 if self.form == "sum_exp" else None
 
     def __init__(self, rank: int, form: str = "exp_sum", apply_z_correction: bool = True, tie_external: bool = False,
-                 flow_precision: str = "bf16"):
+                 flow_precision: str = "bf16", top_k: Optional[int] = None):
         super(LowRank, self).__init__()
 
         assert isinstance(rank, int) and rank >= 1, f"`rank` must be a positive integer, got {rank}."
@@ -140,25 +154,65 @@ class LowRank(_ForwardMixin, _BackwardMixin, _DenominatorsMixin, SumParameteriza
         assert flow_precision == "bf16" or form == "sum_exp", \
             "`flow_precision = \"fp8\"` is the \"sum_exp\" form's (its pass's end products); \"exp_sum\" makes its " \
             "flows in its fused kernels."
+        assert top_k is None or (isinstance(top_k, int) and top_k >= 1), f"`top_k` must be a positive integer or None, got {top_k}."
+        assert top_k is None or form == "exp_sum", "`top_k` is a form of the \"exp_sum\" scale."
 
         self.rank = rank
         self.form = form
         self.apply_z_correction = bool(apply_z_correction)
         self.tie_external = bool(tie_external)
         self.flow_precision = flow_precision
+        self.top_k = top_k
 
     # ------------------------------------------------------------------ identity
 
     def get_signature(self) -> str:
         return f"LowRank_{self.form}_r{self.rank}" + ("" if self.apply_z_correction else "_noz") + \
-            ("_tied" if self.tie_external else "") + ("_f8" if self.flow_precision == "fp8" else "")
+            ("_tied" if self.tie_external else "") + ("_f8" if self.flow_precision == "fp8" else "") + \
+            ("" if self.top_k is None else f"_k{self.top_k}")
 
     def _get_constructor(self):
         return LowRank, {"rank": self.rank, "form": self.form, "apply_z_correction": self.apply_z_correction,
-                         "tie_external": self.tie_external, "flow_precision": self.flow_precision}
+                         "tie_external": self.tie_external, "flow_precision": self.flow_precision, "top_k": self.top_k}
 
     def __reduce__(self):
-        return (self.__class__, (self.rank, self.form, self.apply_z_correction, self.tie_external, self.flow_precision))
+        return (self.__class__, (self.rank, self.form, self.apply_z_correction, self.tie_external, self.flow_precision,
+                                 self.top_k))
+
+    def validate_ns(self, ns) -> None:
+        """On input nodes: a `SoftEvidenceCategorical` leaf (its candidates are what `top_k` counts), with `top_k`."""
+        if ns.is_input():
+            from pyjuice.nodes.distributions import SoftEvidenceCategorical
+            assert isinstance(ns.dist, SoftEvidenceCategorical), \
+                f"`LowRank` on input nodes takes `SoftEvidenceCategorical` leaves, got {type(ns.dist).__name__}."
+            assert self.top_k is not None, \
+                "`LowRank` on a soft-evidence leaf needs `top_k`: its scale has a column for each of the first `top_k` " \
+                "candidates and one shared by the others."
+
+    @property
+    def reads_sibling_leaf(self) -> bool:
+        """With `top_k`, a sum node's parameters read the token of the leaf beside it."""
+        return self.top_k is not None
+
+    def validate_sibling_leaf(self, ns, leaf) -> None:
+        from pyjuice.nodes.distributions import SoftEvidenceCategorical
+        assert isinstance(leaf.dist, SoftEvidenceCategorical) and len(leaf.scope) == 1, \
+            f"`LowRank(top_k)` reads the candidates of a univariate `SoftEvidenceCategorical` leaf beside its node; got " \
+            f"{type(leaf.dist).__name__} over {len(leaf.scope)} variable(s)."
+
+    def input_forward(self, layer, data, node_mars, kwargs) -> None:
+        """An input layer's pass for its node vectors that were given tensors (`lowrank/top_k.py`); `data` [num_vars, B]
+        and `kwargs` as the caller gave them."""
+        from .lowrank import top_k as lowrank_top_k
+        lowrank_top_k.leaf_forward(self, layer, data, node_mars, kwargs)
+
+    def input_backward(self, layer, data, node_flows, node_mars, kwargs, logspace_flows: bool = False,
+                       missing_mask = None, batch_first: bool = True, compute_param_flows: bool = True) -> bool:
+        """An input layer's backward where its node vectors were given tensors (`lowrank/top_k.py`): True, done; False
+        (none given), the plain leaf's backward."""
+        from .lowrank import top_k as lowrank_top_k
+        return lowrank_top_k.leaf_backward(self, layer, data, node_flows, kwargs, logspace_flows, missing_mask, batch_first,
+                                           compute_param_flows)
 
     def storage_owner(self, ns):
         """With `tie_external`, every copy of a tied node reads one shared pair of tensors -- the source's."""
@@ -174,8 +228,15 @@ class LowRank(_ForwardMixin, _BackwardMixin, _DenominatorsMixin, SumParameteriza
     # ------------------------------------------------------------------ layout
 
     def tensor_shapes(self, ns, batch_size: int):
-        """What the caller hands over: `A [B, M, K]`, `B [B, K, N]`."""
-        return ((batch_size, ns.num_nodes, self.rank), (batch_size, self.rank, ns.num_ch_nodes))
+        """What the caller hands over: `A [B, M, K]`, `B [B, K, N]`; with `top_k`, on a sum node also `G [B, top_k + 1, N]`
+        (a row over the children for each of the first `top_k` candidates of the token emitted beside the node and one
+        for the others), and on a soft-evidence leaf `B [B, K, top_k + 1]` (the candidates' columns)."""
+        if ns.is_input():
+            return ((batch_size, ns.num_nodes, self.rank), (batch_size, self.rank, self.top_k + 1))
+        shapes = ((batch_size, ns.num_nodes, self.rank), (batch_size, self.rank, ns.num_ch_nodes))
+        if self.top_k is not None:
+            shapes = shapes + ((batch_size, self.top_k + 1, ns.num_ch_nodes),)
+        return shapes
 
     def storage_shapes(self, ns, batch_size: int):
         """Stored as the caller gives them, `A [B, M, K]`, `B [B, K, N]`, either form, and the gradients in the same
@@ -197,7 +258,9 @@ class LowRank(_ForwardMixin, _BackwardMixin, _DenominatorsMixin, SumParameteriza
         kernels can (`lowrank/forward.py`'s `exp_sum_fused`: a rank they hold, their extension built -- the
         fp16-rounded factors' kernels at the ranks they hold, `exp_sum_h`, the bf16 / TF32 ones at the others and at
         `precision = "fp32"`, all taking each sample's block where it lies and adding into the gradients where they
-        lie), other ranks copied."""
+        lie), other ranks copied. With `top_k`, or on a leaf: copied (the reference passes, `lowrank/top_k.py`)."""
+        if self.top_k is not None or ns.is_input():
+            return False
         if self.form == "exp_sum":
             if lowrank_forward.EXP_SUM_H and self.rank <= lowrank_forward.EXP_SUM_H_RANK_MOST and \
                     lowrank_forward.exp_sum_h_module() is not None:
