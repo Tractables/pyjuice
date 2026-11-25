@@ -163,18 +163,24 @@ def slot_parts(desc, sib: dict, batch_size: int, kwargs: dict, device):
     return place.clamp(max = K), rows, logw_rows, logp, tilt
 
 
+def slot_weights(slot, rows, logw_rows, batch_size: int, M: int, K: int) -> torch.Tensor:
+    """`logw [B, M, K + 1]` (`PASSES_DTYPE`) from `slot_parts`' pieces: 0 at the observed token's slot and -inf
+    elsewhere; at the samples `rows` whose token is missing, their slots' log-weights `logw_rows`."""
+    logw = torch.full((batch_size, M, K + 1), -float("inf"), dtype = PASSES_DTYPE, device = slot.device)
+    logw.scatter_(2, slot[:, None, None].expand(-1, M, 1), 0.0)
+    if rows.numel() > 0:
+        logw[rows] = logw_rows.to(PASSES_DTYPE)
+    return logw
+
+
 def slot_log_weights(desc, sib: dict, batch_size: int, kwargs: dict, device):
     """`(logw [B, M, K + 1], rows, logp, tilt)` (`PASSES_DTYPE`): the log-weights of the token's slots for each node of a
-    `LowRank(top_k)` sum node vector (`slot_parts`) -- 0 at the observed token's slot and -inf elsewhere; where the
-    token is missing the leaf's own log P_b(s | i) --; the samples `rows` whose token is missing, and there the leaf's
-    log P_b(c | i) `[b, M, C]` and its tilt's rows (None without one)."""
+    `LowRank(top_k)` sum node vector (`slot_parts`, `slot_weights`) -- 0 at the observed token's slot and -inf
+    elsewhere; where the token is missing the leaf's own log P_b(s | i) --; the samples `rows` whose token is missing,
+    and there the leaf's log P_b(c | i) `[b, M, C]` and its tilt's rows (None without one)."""
     slot, rows, logw_rows, logp, tilt = slot_parts(desc, sib, batch_size, kwargs, device)
     s, e, _, _, _ = _leaf_rows(sib["layer"], sib["ns"])
-    logw = torch.full((batch_size, e - s, desc.top_k + 1), -float("inf"), dtype = PASSES_DTYPE, device = device)
-    logw.scatter_(2, slot[:, None, None].expand(-1, e - s, 1), 0.0)
-    if rows.numel() > 0:
-        logw[rows] = logw_rows
-    return logw, rows, logp, tilt
+    return slot_weights(slot, rows, logw_rows, batch_size, e - s, desc.top_k), rows, logp, tilt
 
 
 def _finite_or_zero(t: torch.Tensor) -> torch.Tensor:
@@ -303,13 +309,16 @@ def sum_backward(desc, layer, ns_tensors, ns_grad_tensors, node_flows, element_f
         f = _d(node_flows[ns_info.nid_start:ns_info.nid_end, :].t()).exp()            # [B, M] (log-space flows)
         theta = desc._dense_params(geo, params, dtype = PASSES_DTYPE)
         lc = _d(desc._child_values(geo, element_mars))
-        logw, rows, logp, tilt = slot_log_weights(desc, sib, f.size(0), kwargs, dev)
-        if top_k_backward.serves(desc, geo["M"], geo["N"], tensors[0].size(2), logw, want_flows, kwargs):
-            ef, vals, a = top_k_backward.terms(*tensors, theta.log(), lc, logw, f, external_rows(kwargs), grads is not None)
+        slot, rows, logw_rows, logp, tilt = slot_parts(desc, sib, f.size(0), kwargs, dev)
+        if top_k_backward.serves(desc, geo["M"], geo["N"], tensors[0].size(2), dev, want_flows, kwargs):
+            ef, vals, a_rows = top_k_backward.terms(*tensors, theta.log(), lc, slot, rows, logw_rows, f,
+                                                    external_rows(kwargs), grads is not None)
         else:
             A, Bm, G = (_d(t) for t in per_sample(tensors, external_rows(kwargs)))
+            logw = slot_weights(slot, rows, logw_rows, f.size(0), geo["M"], desc.top_k)
             ef, Fp, Fm, Gl, dG, a = _sum_backward_terms(A, Bm, G, theta.log(), lc, logw, f)
             vals = None if grads is None else [torch.bmm(Gl, Bm.transpose(1, 2)), torch.bmm(A.transpose(1, 2), Gl), dG]
+            a_rows = a[rows]
 
         kids = geo["kids"]
         element_flows[kids, :] = torch.logaddexp(element_flows[kids, :], ef.log().t()[geo["cols"], :].to(element_flows.dtype))
@@ -320,8 +329,8 @@ def sum_backward(desc, layer, ns_tensors, ns_grad_tensors, node_flows, element_f
         if want_denom:
             desc._scatter_add(geo, denom_param_flows, desc._denom_offsets(layer)[id(ns_info.ns)][0],
                               _safe_div(Fm, theta).float())
-        if rows.numel() > 0 and not top_k_leaf_fused.add_counts(sib, desc.top_k, f.size(0), a[rows]):
-            _leaf_terms(desc, sib, rows, logp, tilt, logw[rows], a[rows], f[rows], kwargs, glp, gviews, fresh, want_flows)
+        if rows.numel() > 0 and not top_k_leaf_fused.add_counts(sib, desc.top_k, f.size(0), a_rows):
+            _leaf_terms(desc, sib, rows, logp, tilt, logw_rows, a_rows, f[rows], kwargs, glp, gviews, fresh, want_flows)
     return None
 
 
