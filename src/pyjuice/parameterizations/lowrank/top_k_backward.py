@@ -290,36 +290,52 @@ if triton is not None:
 
     @triton.jit
     def _bw_em_kernel(AH, BH, L2T, E, EV, ALPHA, BETA, MROW, SLOT, EMAP, FP, FM, M, N, B,
-                      KP: tl.constexpr, K0: tl.constexpr, K1: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr):
-        """a CTA a 64 x 64 tile of the parameters: over the samples, F+ = sum_b Q, F- = sum_b T ([M, N]: q, t summed
-        over the slots)"""
+                      KP: tl.constexpr, K0: tl.constexpr, K1: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr,
+                      OBS: tl.constexpr, FIRST: tl.constexpr):
+        """a CTA a 64 x 64 tile of the parameters: over the samples of a kind (OBS the observed ones), F+ = sum_b Q, F-
+        = sum_b T ([M, N]: q, t summed over the slots), stored (FIRST) or added (one kind a launch: a branch between
+        the kinds inside the loop ran at less than half the speed)"""
         rows = tl.program_id(0) * BM + tl.arange(0, BM)
         cols = tl.program_id(1) * BN + tl.arange(0, BN)
         s = tl.arange(0, 64)
+        k = tl.arange(0, K0)
+        l2t = tl.load(L2T + rows[:, None] * N + cols[None, :]).to(tl.float32)
         Fp = tl.zeros([BM, BN], tl.float32)
         Fm = tl.zeros([BM, BN], tl.float32)
         for b in range(0, B):
             b64 = b.to(tl.int64)
-            eb = tl.load(EMAP + b64).to(tl.int64)
             so = tl.load(SLOT + b64).to(tl.int64)
-            W = tl.exp2(_logits(AH, BH, L2T, eb, rows, cols, M, N, KP, K0, K1) - tl.load(MROW + b64 * M + rows)[:, None])
-            ev = tl.load(EV + b64 * N + cols)
-            base = (b64 * M + rows) * 65
-            if so >= 0:
-                es = tl.load(E + (eb * 65 + so) * N + cols)
-                X = tl.load(ALPHA + base)[:, None] * es[None, :]
-                Y = tl.load(BETA + base)[:, None] * es[None, :]
-            else:
-                Es = tl.load(E + (eb * 65 + s[:, None]) * N + cols[None, :])
-                er = tl.load(E + (eb * 65 + 64) * N + cols)
-                X = tl.dot(_tf32(tl.load(ALPHA + base[:, None] + s[None, :])), Es, input_precision = "tf32") + \
-                    tl.load(ALPHA + base + 64)[:, None] * er[None, :]
-                Y = tl.dot(_tf32(tl.load(BETA + base[:, None] + s[None, :])), Es, input_precision = "tf32") + \
-                    tl.load(BETA + base + 64)[:, None] * er[None, :]
-            Fp += W * X * ev[None, :]
-            Fm += W * Y
-        tl.store(FP + rows[:, None] * N + cols[None, :], Fp)
-        tl.store(FM + rows[:, None] * N + cols[None, :], Fm)
+            if (so >= 0) == OBS:
+                eb = tl.load(EMAP + b64).to(tl.int64)
+                lg = tl.dot(tl.load(AH + (eb * M + rows[:, None]) * KP + k[None, :]),
+                            tl.load(BH + (eb * KP + k[:, None]) * N + cols[None, :]))
+                if K1 > 0:
+                    k1 = K0 + tl.arange(0, K1)
+                    lg += tl.dot(tl.load(AH + (eb * M + rows[:, None]) * KP + k1[None, :]),
+                                 tl.load(BH + (eb * KP + k1[:, None]) * N + cols[None, :]))
+                W = tl.exp2(lg + l2t - tl.load(MROW + b64 * M + rows)[:, None])
+                ev = tl.load(EV + b64 * N + cols)
+                base = (b64 * M + rows) * 65
+                if OBS:
+                    We = W * tl.load(E + (eb * 65 + so) * N + cols)[None, :]
+                    Fp += We * (tl.load(ALPHA + base)[:, None] * ev[None, :])
+                    Fm += We * tl.load(BETA + base)[:, None]
+                else:
+                    Es = tl.load(E + (eb * 65 + s[:, None]) * N + cols[None, :])
+                    er = tl.load(E + (eb * 65 + 64) * N + cols)
+                    X = tl.dot(_tf32(tl.load(ALPHA + base[:, None] + s[None, :])), Es, input_precision = "tf32") + \
+                        tl.load(ALPHA + base + 64)[:, None] * er[None, :]
+                    Y = tl.dot(_tf32(tl.load(BETA + base[:, None] + s[None, :])), Es, input_precision = "tf32") + \
+                        tl.load(BETA + base + 64)[:, None] * er[None, :]
+                    Fp += W * X * ev[None, :]
+                    Fm += W * Y
+        out = rows[:, None] * N + cols[None, :]
+        if FIRST:
+            tl.store(FP + out, Fp)
+            tl.store(FM + out, Fm)
+        else:
+            tl.store(FP + out, Fp + tl.load(FP + out))
+            tl.store(FM + out, Fm + tl.load(FM + out))
 
 
 def serves(desc, M: int, N: int, r: int, device, kwargs: dict) -> bool:
@@ -396,6 +412,8 @@ def terms(A, Bm, G, ltheta, lc, slot, rows, logw_rows, f, emap, want_grads: bool
     if want_flows:
         FP = torch.empty(M, N, dtype = torch.float32, device = dev)
         FM = torch.empty_like(FP)
-        _bw_em_kernel[(M // BM, N // BN)](AH, BH, L2T, E, EV, ALPHA, BETA, MROW, SLOT, EMAP, FP, FM, M, N, B, **opts)
+        for obs in (False, True):
+            _bw_em_kernel[(M // BM, N // BN)](AH, BH, L2T, E, EV, ALPHA, BETA, MROW, SLOT, EMAP, FP, FM, M, N, B,
+                                              OBS = obs, FIRST = not obs, **opts)
         flows = (FP, FM)
     return EF, vals, ACNT[:Rm], flows
