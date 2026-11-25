@@ -1601,14 +1601,14 @@ def test_anemone_top_down_leaves_non_requesting_layers_alone():
     # Spy on the hook: record which layers it is called for.
     desc = type(gated.parameterization)
     called = []
-    original = desc.accumulate_denom_top_down
-    desc.accumulate_denom_top_down = lambda self, layer, *a, **k: (
+    original = desc.collapsed_top_down                # (the requesting layers' top-down step, both flows)
+    desc.collapsed_top_down = lambda self, layer, *a, **k: (
         called.append(layer), original(self, layer, *a, **k))[1]
     try:
         pc.denom_param_flows[:] = 0.0
         eval_top_down_probs(pc, update_pflow = True, scale = 0.25, use_cudagraph = False)
     finally:
-        desc.accumulate_denom_top_down = original
+        desc.collapsed_top_down = original
 
     assert called == requesting, \
         f"the top-down denominator hook ran for {len(called)} layers, expected exactly the requesting one"
@@ -2483,3 +2483,49 @@ def test_ungated_backward_beside_a_parameterization_without_the_denominator(kind
         got, want = pc_ext.get_node_params(n1), pc_plain.get_node_params(n0)
         assert bool(torch.isfinite(got).all())
         assert torch.allclose(got, want, rtol = 1e-4, atol = 1e-6), (got - want).abs().max().item()
+
+
+def test_collapsed_top_down_reduces_to_the_shared_step_and_scales_a_row():
+    """`BlockScale.collapsed_top_down` (Anemone's top-down step where rows ran under external parameters). With `W`
+    constant over a node's gates the collapsed row IS the shared row: the hook's `F+`, `F-` and children's flows equal
+    the circuit's own step (its layout check). With any `W`: `F+` and `F-` gain the same term, a node's `scale * P_td`
+    in all, half of it shaped as its `F-` row."""
+    from pyjuice.model.backend.top_down_prob import eval_top_down_probs
+    root, ni = _build(gated = True)
+    pc = juice.compile(root, verbose = False).to(torch.device("cuda"))
+    x = torch.randint(0, NUM_CATS, [32, 2], device = pc.device)
+    phi = _phi(ni, 32, pc.device)
+    pc(x, sum_external_params = {ni: phi})
+    pc.backward(x, sum_external_params = {ni: phi}, logspace_flows = True, flows_memory = 0.0, allow_modify_flows = False)
+    layer = _ext_layer(pc)
+    desc = layer.parameterization
+    g = torch.Generator().manual_seed(3)
+    pfs, pfe = ni._param_flow_range
+
+    def run(fill, collapsed):
+        pc.init_param_flows(flows_memory = 0.0)
+        for pid in range(layer.num_fw_partitions):
+            W = desc._denom_slice(layer, pc.denom_param_flows, pid)
+            W.copy_(fill(W).to(W.device))
+        before = _fminus(pc, ni).clone()
+        hook = type(desc).collapsed_top_down
+        if not collapsed:
+            type(desc).collapsed_top_down = lambda *a, **k: False
+        try:
+            eval_top_down_probs(pc, update_pflow = True, scale = 0.7, use_cudagraph = False)
+        finally:
+            type(desc).collapsed_top_down = hook
+        return pc.param_flows[pfs:pfe].clone(), (_fminus(pc, ni) - before)[pfs:pfe], pc._single_element_flows.clone(), before
+
+    flat = lambda W: 0.3 + torch.rand(W.size(0), 1, generator = g).expand_as(W)
+    g.manual_seed(3); a = run(flat, True)
+    g.manual_seed(3); b = run(flat, False)
+    for x, y in zip(a[:3], b[:3]):
+        assert torch.allclose(x, y, rtol = 1e-4, atol = 1e-7), (x - y).abs().max()
+
+    Fp, dFm, _, Fm0 = run(lambda W: 0.1 + torch.rand(W.shape, generator = g), True)
+    assert torch.allclose(Fp, dFm, rtol = 1e-4, atol = 1e-7)                 # (the same term in both)
+    _, shared, _, _ = b
+    assert Fp.sum().item() == pytest.approx(shared.sum().item(), rel = 1e-4)   # (scale * P_td a node, in all)
+    assert not torch.allclose(Fp, shared, rtol = 1e-2)                       # (and not the shared row's shape)
+

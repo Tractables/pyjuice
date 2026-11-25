@@ -376,6 +376,14 @@ def eval_top_down_probs(pc, update_pflow: bool = True, scale: float = 1.0, pc_is
                     prod_layer_td_backward(layer, node_flows, element_flows)
 
                 elif layer.is_sum():
+                    # Rows that ran under external parameters: the step through the model they collapse to, in the
+                    # parameterization's own layouts (`SumParameterization.collapsed_top_down`); else the circuit's
+                    desc = getattr(layer, "parameterization", None)
+                    if desc is not None and denom_param_flows is not None and \
+                            getattr(layer, "requests_denom_param_flows", False) and \
+                            desc.collapsed_top_down(layer, node_flows, element_flows, params, pc.param_flows,
+                                                    denom_param_flows, hyperparameters[0]):
+                        continue
                     sum_layer_td_backward(layer, node_flows, element_flows, node_mars, element_mars, params, 
                                           pc_is_normalized = pc_is_normalized)
 
@@ -450,6 +458,8 @@ def eval_top_down_probs(pc, update_pflow: bool = True, scale: float = 1.0, pc_is
     # Backward pass over the input layers
     if update_pflow:
         for layer in pc.input_layer_group:
-            layer.add_missing_flows(node_flows, scale = scale)
+            desc = getattr(layer, "parameterization", None)
+            if desc is None or not desc.input_top_down(layer, node_flows, scale):
+                layer.add_missing_flows(node_flows, scale = scale)
 
     return None

@@ -211,6 +211,47 @@ class _DenominatorsMixin:
             W = self._denom_slice(layer, denom_param_flows, pid)
             W += (node_flows[gid] * scale).unsqueeze(1)
 
+    def collapsed_top_down(self, layer, node_flows, element_flows, params, param_flows, denom_param_flows, scale) -> bool:
+        """
+        See the base class. `F-[n, c] = theta[n, c] * W[n, g(c)]`, so a node's collapsed row is `theta * W / f` with
+        `f = sum_c theta W`, and the term -- half that row, half the shared one, times `scale * P_td` -- is
+
+            F+[n, c] += theta[n, c] * (kappa[n] * W[n, g(c)] + rest[n]),     W[n, g] += kappa[n] * W[n, g] + rest[n]
+
+        with `kappa = scale * P_td / (2 f)`, `rest = scale * P_td / 2` (a node no flow reached: `kappa = 0`, `rest =
+        scale * P_td`, which is :func:`accumulate_denom_top_down` and the circuit's own step). In gate space, as `W` is.
+        """
+        if not self.apply_z_correction:
+            return False
+        block_size = layer.block_size
+        gate_cbs = self.gate_sizes(layer.nodes[0])[1]
+        ar_m = torch.arange(block_size, device = params.device, dtype = torch.long)
+        for pid in range(layer.num_fw_partitions):
+            nids = layer.partitioned_nids[pid].to(torch.long)
+            cids = layer.partitioned_cids[pid].to(torch.long)                       # [rows, E]; 0 = padding
+            pids = layer.partitioned_pids[pid].to(torch.long)
+            pfids = layer.partitioned_pfids[pid].to(torch.long)
+            rows, E = cids.shape
+            real = (cids > 0)[:, None, :]
+            P = node_flows[(nids[:, None] + ar_m[None, :]).reshape(-1)].view(rows, block_size).double()
+            theta = params[pids[:, None, :] + ar_m[None, :, None]].double() * real   # [rows, block_size, E]
+            W = self._denom_slice(layer, denom_param_flows, pid).view(rows, block_size, -1)
+            We = W.double().repeat_interleave(gate_cbs, dim = 2)[:, :, :E]
+            Fm = theta * We
+            f = Fm.sum(dim = 2)
+            live = f > 0
+            safe = torch.where(live, f, torch.ones_like(f))
+            down = (P[:, :, None] * torch.where(live[:, :, None], Fm / safe[:, :, None], theta)).sum(dim = 1)   # [rows, E]
+            element_flows.index_add_(0, cids.reshape(-1), down.reshape(-1).to(element_flows.dtype))
+            kappa = torch.where(live, 0.5 * scale * P / safe, torch.zeros_like(f))
+            rest = torch.where(live, 0.5 * scale * P, scale * P)
+            add = theta * (kappa[:, :, None] * We + rest[:, :, None])
+            # (a padded edge adds 0 -- `theta` is masked -- wherever its ids point: no mask to gather by, which a
+            # CUDA graph's capture could not record)
+            param_flows.index_add_(0, (pfids[:, None, :] + ar_m[None, :, None]).reshape(-1), add.reshape(-1).to(param_flows.dtype))
+            W.add_((kappa[:, :, None] * W.double() + rest[:, :, None]).to(W.dtype))
+        return True
+
     def materialize_denom_flows(self, ns, params, denom_param_flows, denom_sources, out = None):
         """
         Rebuild `F-` for `ns`'s parameter-flow range from the gate-space accumulator:

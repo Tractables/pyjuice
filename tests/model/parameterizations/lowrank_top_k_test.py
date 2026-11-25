@@ -398,3 +398,157 @@ def test_hmm_em_numerator_and_denominator_each_are_the_definitions(masked):
             Ep += rows[:, :V]; Em += rows[:, V:]
     assert _rel(Ep, ref["Ep"]) < 2e-4, _rel(Ep, ref["Ep"])
     assert _rel(Em, ref["Em"]) < 2e-4, _rel(Em, ref["Em"])
+
+
+# ---------------------------------------------------------------------------------------------- Anemone's top-down term
+
+def _tables_of(pc, trans):
+    """The circuit's transitions [N, N], emissions [N, V] and start [N], float64."""
+    layer = [l for g in pc.inner_layer_groups if g.is_sum() for l in g.layers if trans[0] in l.nodes][0]
+    desc = layer.parameterization
+    info = [i for i in layer.external_node_infos if i.ns is trans[0]][0]
+    lt = desc._dense_params(desc._geometry(layer, info, DEV), pc.params, dtype = torch.float64)
+    N = lt.size(0)
+    ps, pe = pc.root_ns._param_range
+    return lt, pc.input_layer_group[0].params[:N * V].view(N, V).double(), pc.params[ps:pe].double()
+
+
+def _em_pass(pc, chunk, T, N):
+    """The EM pass of one chunk (its own missing mask); returns the per-sample inputs it ran with."""
+    ext, ids, lp, x, miss = chunk
+    inputs = dict(external_params = _pc_ext(ext, T, N), categorical_evidence_logp = lp.float(),
+                  soft_evidence_cat_ids = ids)
+    evi = {k: v for k, v in inputs.items() if k != "external_params"}
+    with torch.no_grad():
+        pc(x, missing_mask = miss, **inputs)
+    pc.backward(x, missing_mask = miss, compute_param_flows = True, flows_memory = 1.0, logspace_flows = True,
+                allow_modify_flows = False, **evi)
+    return inputs
+
+
+def _conditional(p, num, den):
+    """The conditional M-step: theta F+ / F-, renormalized; a ratio of 1 where both are 0."""
+    q = p * torch.where(den > 0, num / den.clamp_min(1e-300), torch.ones_like(den))
+    return q / q.sum(-1, keepdim = True)
+
+
+def _anemone_update(cur, st, s, rows):
+    """One Anemone update by the definition, from the statistics `st` of `rows` rows (`_definition_stats`' layout) at
+    the tables `cur`: EM on s x the rows plus 1 - s x the model they collapse to -- at each state the posterior-weighted
+    mean of the rows' own transition rows (its F- row at that position, normalized; the shared row where no flow came),
+    the top-down probabilities one pass through those from the start; a leaf's the mean of the rows' own emission
+    probabilities (its F- row over all positions, normalized). The term's row: half that, half the shared one."""
+    theta, em, pi = cur["lT"].exp(), cur["lE"].exp(), cur["lpi"].exp()
+    hat = s / rows
+    P, Ptot = pi.clone(), torch.zeros_like(pi)
+    Tp, Tm = hat * st["Tp"], torch.zeros_like(theta)
+    for t in range(st["Tm"].size(0)):
+        Fm = hat * st["Tm"][t]
+        f = Fm.sum(1)
+        live = (f > 0)[:, None]
+        safe = f.clamp_min(1e-300)[:, None]
+        term = (1 - s) * P[:, None] * torch.where(live, 0.5 * (Fm / safe + theta), theta)
+        Tp, Tm = Tp + term, Tm + Fm + term
+        Ptot = Ptot + P
+        P = P @ torch.where(live, Fm / safe, theta)
+    Ptot = Ptot + P
+    Fe = hat * st["Em"]
+    f = Fe.sum(1)
+    term = (1 - s) * Ptot[:, None] * torch.where((f > 0)[:, None], 0.5 * (Fe / f.clamp_min(1e-300)[:, None] + em), em)
+    start = hat * st["pi"] + (1 - s) * pi                 # (the start: a plain sum)
+    return dict(lT = _conditional(theta, Tp, Tm).log(), lE = _conditional(em, hat * st["Ep"] + term, Fe + term).log(),
+                lpi = (start / start.sum()).log())
+
+
+def _two_chunks(T, N, C, K, r, re):
+    return [_batch(3, T, N, C, K, r, re, 21, masked = 0.0), _batch(3, T, N, C, K, r, re, 22, masked = 0.5)]
+
+
+def _same(pc, trans, cur, tol = 1e-4):
+    for a, b in zip(_tables_of(pc, trans), (cur["lT"].exp(), cur["lE"].exp(), cur["lpi"].exp())):
+        assert _rel(a, b) < tol, _rel(a, b)
+
+
+def test_anemone_top_down_term_is_the_collapsed_models():
+    """One Anemone update over two chunks (every token observed; half masked) of rows that ran under external
+    parameters equals the definition's: the top-down term that of the model the rows collapse to."""
+    T, N, C, K, r, re, s = 4, 4, 5, 2, 3, 2, 0.3
+    tab = _tables(N, 10)
+    pc, trans, leaves = _hmm_pc(T, N, K, r, re, tab)
+    chunks = _two_chunks(T, N, C, K, r, re)
+    opt = juice.optim.Anemone(pc, step_size = s, momentum = 0.0, niters_per_update = 2, pseudocount = 0.0)
+    for chunk in chunks:
+        _em_pass(pc, chunk, T, N)
+        opt.step()
+    st = [_definition_stats(tab, *c[:4], c[4], K) for c in chunks]
+    _same(pc, trans, _anemone_update(tab, {k: st[0][k] + st[1][k] for k in st[0]}, s, 6))
+
+
+def test_anemone_top_down_term_under_momentum():
+    """Under momentum the flows are averaged over updates and the top-down term is made from the averaged flows, at the
+    update: two updates (momentum 0.5) equal the definition's -- the transitions' F- averaged as the circuit keeps it,
+    W = F- / theta, and multiplied by the tables of the update."""
+    T, N, C, K, r, re, s, m = 4, 4, 5, 2, 3, 2, 0.3, 0.5
+    tab = _tables(N, 10)
+    pc, trans, leaves = _hmm_pc(T, N, K, r, re, tab)
+    opt = juice.optim.Anemone(pc, step_size = s, momentum = m, niters_per_update = 1, pseudocount = 0.0)
+    cur, buf = dict(tab), None
+    for k, chunk in enumerate(_two_chunks(T, N, C, K, r, re)):
+        _em_pass(pc, chunk, T, N)
+        opt.step()
+        S = dict(_definition_stats(cur, *chunk[:4], chunk[4], K))
+        S["Tm"] = S["Tm"] / cur["lT"].exp()
+        buf = {key: (1 - m) * S[key] + (0.0 if buf is None else m * buf[key]) for key in S}
+        avg = {key: v / (1 - m ** (k + 1)) for key, v in buf.items()}
+        avg["Tm"] = avg["Tm"] * cur["lT"].exp()
+        cur = _anemone_update(cur, avg, s, 3)
+    _same(pc, trans, cur)
+
+
+def test_anemone_without_external_params_is_the_shared_top_down_term():
+    """Rows that ran without external parameters collapse to the circuit's own parameters at the sums: the term there
+    is the shared `P_td theta` (the update equals the definition's with zero external tensors)."""
+    T, N, C, K, r, re, s = 4, 4, 5, 2, 3, 2, 0.3
+    tab = _tables(N, 10)
+    pc, trans, leaves = _hmm_pc(T, N, K, r, re, tab)
+    ext, ids, lp, x, miss = _batch(3, T, N, C, K, r, re, 21, masked = 0.0)
+    zero = tuple(torch.zeros_like(t) for t in ext)
+    opt = juice.optim.Anemone(pc, step_size = s, momentum = 0.0, pseudocount = 0.0)
+    _em_pass(pc, (zero, ids, lp, x, miss), T, N)
+    opt.step()
+    _same(pc, trans, _anemone_update(tab, _definition_stats(tab, zero, ids, lp, x, miss, K), s, 3))
+
+
+def test_anemone_keeps_the_categories_no_row_can_emit():
+    """The categories that are no row's candidate -- no data in either phase -- keep their parameters (up to the row's
+    normalizer) under Anemone's default pseudocount: the top-down term's shared half covers them, and the prior enters
+    with the step's weight (alone, at full strength, it took every one of them to its 1 / V on each update)."""
+    T, N, C, K, r, re = 4, 4, 5, 2, 3, 2
+    tab = _tables(N, 10)
+    pc, trans, leaves = _hmm_pc(T, N, K, r, re, tab)
+    ext, _, lp, _, miss = _batch(3, T, N, C, K, r, re, 21, masked = 0.0)
+    g = torch.Generator().manual_seed(31)
+    ids = torch.stack([torch.stack([torch.randperm(V - 2, generator = g)[:C] for _ in range(T)]) for _ in range(3)]).to(DEV)
+    x = ids.gather(2, torch.randint(0, C, (3, T), generator = g).to(DEV)[..., None])[..., 0]
+    opt = juice.optim.Anemone(pc, step_size = 0.3, momentum = 0.0, pseudocount = 1e-6)
+    _em_pass(pc, (ext, ids, lp, x, miss), T, N)
+    opt.step()
+    _, le, _ = _tables_of(pc, trans)
+    e0 = tab["lE"].exp()
+    kept = le[:, V - 2:] / e0[:, V - 2:]                  # (categories V - 2, V - 1: no row's candidate)
+    assert _rel(kept[:, 0], kept[:, 1]) < 1e-4, (kept, "the two unseen categories were moved apart")
+
+
+def test_anemone_tiny_step_moves_nothing():
+    """The prior enters an Anemone update with the step's weight: at a tiny step every parameter stays put, the
+    categories with little statistics included (a full-strength pseudocount moved those to the prior's value)."""
+    T, N, C, K, r, re = 4, 4, 5, 2, 3, 2
+    tab = _tables(N, 10)
+    pc, trans, leaves = _hmm_pc(T, N, K, r, re, tab)
+    chunk = _two_chunks(T, N, C, K, r, re)[0]
+    before = _tables_of(pc, trans)
+    opt = juice.optim.Anemone(pc, step_size = 1e-6, momentum = 0.0, pseudocount = 1e-2)
+    _em_pass(pc, chunk, T, N)
+    opt.step()
+    for a, b in zip(_tables_of(pc, trans), before):
+        assert float(((a - b).abs() / b).max()) < 1e-4, float(((a - b).abs() / b).max())

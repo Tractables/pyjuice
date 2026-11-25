@@ -505,6 +505,32 @@ class SumParameterization():
             "a denominator that matches the numerator."
         )
 
+    def collapsed_top_down(self, layer, node_flows, element_flows, params, param_flows, denom_param_flows, scale) -> bool:
+        """
+        The mini-batch-EM top-down step of a sum layer whose rows ran under PER-SAMPLE parameters, through the model
+        they collapse to; False (the default) leaves the layer to the circuit's own step -- `P_td[n] * theta[n, c]`
+        from the shared parameters, which is the model's expected counts only when every row ran under them.
+
+        Each row has a model of its own, and the flows hold what they collapse to at a node: `F-[n, .]` is the
+        posterior-weighted sum of the rows' own parameters there, so its normalized row `theta~[n, .]` is the node's
+        mean conditional. With `node_flows[n]` = `P_td[n]` (one "sample") the hook
+
+        * adds `P_td[n] * theta~[n, c]` to the children's `element_flows` (the top-down pass goes on through it), and
+        * adds the term `scale * P_td[n] * (theta~[n, c] + theta[n, c]) / 2` to `F+` and to `F-`, in its own layouts:
+          the collapsed half steps the entries the rows use by about the node's step `s f / (s f + (1 - s) P_td)`
+          (`f` its flow), the shared half damps the entries they give almost no probability (their `F-` is tiny, and
+          against it alone one observation is a step of `1 / probability`).
+
+        A node no flow reached has no collapsed row: its shared one, as the circuit's own step does.
+        """
+        return False
+
+    def input_top_down(self, layer, node_flows, scale) -> bool:
+        """:func:`collapsed_top_down` for an input layer given a parameterization: the term `scale * P_td[n] x` the
+        node's collapsed distribution into both phases of its flows; False (the default): the layer's own
+        (`add_missing_flows`)."""
+        return False
+
     def materialize_denom_flows(self, ns, params, denom_param_flows, denom_sources, out = None):
         """
         Rebuild `F-` for `ns`'s parameter-flow range, laid out exactly like `param_flows[pfs:pfe]`.

@@ -73,8 +73,9 @@ class _LearningMixin:
         :type step_size: float
 
         :param pseudocount: a pseudo count added to the parameter flows. At 0, a node no flow reached (its flows sum to
-            0, the update 0 / 0) keeps its parameters; the conditional dual-flow update takes such a parameter's ratio
-            `F+ / F-` as 1
+            0, the update 0 / 0) keeps its parameters; the conditional dual-flow update takes a parameter no flow
+            reached (both statistics 0) as a ratio `F+ / F-` of 1 whatever the pseudocount -- the update has no
+            information about it
         :type pseudocount: float
 
         :param keep_zero_params: if `True`, freeze exactly zero parameters; positive parameters are updated
@@ -115,9 +116,18 @@ class _LearningMixin:
                 # the stored rounding and taken as it was, the term reset the copy to that rounding every step, and an
                 # update smaller than half a bf16 ulp never landed (MEASURED: near convergence every parameter fp32 moved
                 # by > 2 ulps in 40 steps stayed where it was)
+                # (where the rows ran under external parameters, through the model they collapse to -- each node's
+                # posterior-weighted mean of the rows' own parameters, its `F-` row normalized: `collapsed_top_down`)
                 eval_top_down_probs(self, update_pflow = True, scale = (1.0 - step_size), use_cudagraph = use_cudagraph)
 
                 self._cum_flow = 0.0 # Zero out the cumulative flow value
+                # The prior enters with the step's weight, as the data does: the update's fixed point is then the MAP one
+                # at `pseudocount` (pseudo counts a sample) whatever the step size, and no parameter moves faster than
+                # the step. Added at full strength to flows scaled by `step_size / cum_flow`, its strength at the fixed
+                # point was `pseudocount / step_size`, and where the statistics are small -- a top-down term from each
+                # row's own model gives the categories it rarely emits little -- it moved them to the prior's value on
+                # every update, at any step size
+                pseudocount = pseudocount * step_size
                 step_size = 1.0 # We have applied the step size within the parameter flows
 
             # Update input layers
@@ -325,7 +335,6 @@ class _LearningMixin:
             pf = getattr(layer, "param_flows", None)
             if pf is not None:
                 tensors.append(pf)
-
         for pf in tensors:
             if dtype is not None and pf.dtype != dtype:
                 buf = pf.to(dtype)
