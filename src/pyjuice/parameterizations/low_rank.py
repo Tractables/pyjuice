@@ -206,6 +206,12 @@ class LowRank(_ForwardMixin, _BackwardMixin, _DenominatorsMixin, SumParameteriza
         from .lowrank import top_k as lowrank_top_k
         lowrank_top_k.leaf_forward(self, layer, data, node_mars, kwargs)
 
+    def input_forward_replaces(self, layer, kwargs) -> bool:
+        """Every node vector of the leaf layer given tensors: the values are all its (`lowrank/top_k.py`)."""
+        from .lowrank import top_k as lowrank_top_k
+        staged = lowrank_top_k._staged(kwargs)
+        return bool(staged) and all(ns in staged for ns in layer.nodes)
+
     def input_backward(self, layer, data, node_flows, node_mars, kwargs, logspace_flows: bool = False,
                        missing_mask = None, batch_first: bool = True, compute_param_flows: bool = True) -> bool:
         """An input layer's backward where its node vectors were given tensors (`lowrank/top_k.py`): True, done; False

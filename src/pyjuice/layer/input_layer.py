@@ -454,8 +454,12 @@ class InputLayer(Layer, nn.Module):
 
             grid = (triton.cdiv(layer_num_nodes * batch_size, BLOCK_SIZE),)
 
+            # (an external parameterization writing every node value of the layer this call: the distribution's kernels,
+            #  whose values it would overwrite, skipped -- its backward is the layer's whole backward too)
+            replaced = self.parameterization is not None and self.parameterization.input_forward_replaces(self, given[1])
+
             if not _apply_missing_mask_only:
-                if self._mars_kernel is not None:
+                if self._mars_kernel is not None and not replaced:
                     self._mars_kernel[grid](
                         params_ptr = self.params, 
                         node_mars_ptr = node_mars, 
@@ -479,16 +483,17 @@ class InputLayer(Layer, nn.Module):
             #
             # Built here rather than at scope entry so that a circuit never run inside the scope
             # never pays for a copy, and so the scope needs no list of the circuits it covers.
-            self._ensure_fast_inference_params(kwargs)
-            # Handed to the distribution like the backward's `_bk_launch_common`, and from the start:
-            # `preprocess_fw_kwargs` is where a distribution may first decide between kernel sets.
-            fw_launch_common = self._fw_launch_common(data, node_mars)
-            kwargs["_fw_launch_common"] = fw_launch_common
-            self.dist.preprocess_fw_kwargs(self, kwargs)
-            self.dist.set_custom_kernel_kwargs(kwargs)
-            kwargs["_fw_data"] = data
-            self._run_post(self.post_fw_fns, kwargs, fw_launch_common)
-            kwargs.pop("_fw_launch_common", None)
+            if not replaced:
+                self._ensure_fast_inference_params(kwargs)
+                # Handed to the distribution like the backward's `_bk_launch_common`, and from the start:
+                # `preprocess_fw_kwargs` is where a distribution may first decide between kernel sets.
+                fw_launch_common = self._fw_launch_common(data, node_mars)
+                kwargs["_fw_launch_common"] = fw_launch_common
+                self.dist.preprocess_fw_kwargs(self, kwargs)
+                self.dist.set_custom_kernel_kwargs(kwargs)
+                kwargs["_fw_data"] = data
+                self._run_post(self.post_fw_fns, kwargs, fw_launch_common)
+                kwargs.pop("_fw_launch_common", None)
 
             # An external parameterization: the values of the node vectors it was given tensors for, over the shared
             # ones (the missing mask below applies to them too)

@@ -264,6 +264,14 @@ class SumParameterization():
         """
         raise NotImplementedError(f"{self.get_signature()} does not parameterize input nodes.")
 
+    def input_forward_replaces(self, layer, kwargs) -> bool:
+        """
+        Whether this call's :func:`input_forward` writes every node value of `layer` (each of its node vectors was given
+        tensors) -- the distribution's own forward kernels are then skipped, their values overwritten anyway --, and
+        :func:`input_backward` then does the layer's whole backward. False by default.
+        """
+        return False
+
     def input_backward(self, layer, data, node_flows, node_mars, kwargs, logspace_flows: bool = False,
                        missing_mask = None, batch_first: bool = True, compute_param_flows: bool = True) -> bool:
         """
