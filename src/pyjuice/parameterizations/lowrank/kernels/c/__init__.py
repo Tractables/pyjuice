@@ -124,6 +124,47 @@ def get_exp_sum_h_module():
     return _exp_sum_h_module
 
 
+_top_k_module = None
+_top_k_attempted = False
+
+
+def get_top_k_module():
+    """`LowRank(top_k)` sum layers' fused forward (`lowrank_top_k.cu`: the tile made in registers from fp16-rounded
+    factors, contracted with the token's slots in TF32), or None if unavailable (warns once; silently below compute
+    capability 8.0, whose TF32 MMAs it takes): the layers then keep their float64 reference (`lowrank/top_k.py`).
+    Plain CUDA."""
+    global _top_k_module, _top_k_attempted
+
+    if _top_k_attempted:
+        return _top_k_module
+
+    _top_k_attempted = True
+
+    if not ENABLE_CUDA_KERNELS:
+        return None
+
+    import torch
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() < (8, 0):
+        return None
+
+    flags = _compile_flags()
+    if flags is None:
+        return None
+
+    from pyjuice.utils.cuda_ext import jit_load
+    try:
+        _top_k_module = jit_load(
+            "pyjuice_lowrank_top_k_cuda",
+            sources = [os.path.join(_THIS_DIR, "lowrank_top_k.cu")],
+            extra_cuda_cflags = flags, verbose = False)
+    except Exception as e:
+        warnings.warn(
+            f"pyjuice CUDA kernel 'pyjuice_lowrank_top_k_cuda' failed to compile ({type(e).__name__}: {e}). "
+            "`LowRank(top_k)` sum layers keep their float64 reference.", RuntimeWarning)
+        _top_k_module = None
+    return _top_k_module
+
+
 _fp8_module = None
 _fp8_attempted = False
 

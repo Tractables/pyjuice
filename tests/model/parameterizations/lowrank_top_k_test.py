@@ -94,7 +94,7 @@ def _definition_stats(tab, ext, ids, lp, x, miss, K):
 
 # ---------------------------------------------------------------------------------------------- the circuits
 
-def _hmm_pc(T, N, K, r, re, tab):
+def _hmm_pc(T, N, K, r, re, tab, V = V):
     with juice.set_block_size(N):
         leaf = inputs(T - 1, num_node_blocks = 1, dist = dists.SoftEvidenceCategorical(num_cats = V),
                       parameterization = LowRank(rank = re, top_k = K))
@@ -119,13 +119,13 @@ def _hmm_pc(T, N, K, r, re, tab):
     return pc, trans, leaves
 
 
-def _tables(N, seed):
+def _tables(N, seed, V = V):
     g = torch.Generator().manual_seed(seed)
     mk = lambda *s: torch.log_softmax(torch.randn(*s, generator = g, dtype = torch.float64), dim = -1).to(DEV)
     return dict(lT = mk(N, N), lpi = mk(N), lE = mk(N, V))
 
 
-def _batch(b, T, N, C, K, r, re, seed, masked = 0.5, scale = 0.7):
+def _batch(b, T, N, C, K, r, re, seed, masked = 0.5, scale = 0.7, V = V):
     """the external tensors (A, B, G, U, D) in the reference's layout, the candidates and their evidence, the tokens
     (each among its position's candidates) and a mask"""
     g = torch.Generator().manual_seed(seed)
@@ -324,6 +324,45 @@ def test_rows_map_needs_a_parameterization_that_reads_through_it():
         pc(x, external_params = ext, external_params_rows = torch.tensor([0, 1, 1], device = DEV))
     with pytest.raises(AssertionError, match = "external_params_rows"):
         pc(x, external_params_rows = torch.tensor([0, 1, 1], device = DEV))
+
+
+def test_the_fused_forward_is_the_reference():
+    """The fused forward (`lowrank/top_k_fused.py`: the kernels' shapes, 128 nodes, top_k 64) against the float64
+    reference -- the circuit's values (fp16 logits, TF32 slots: ~1e-2 nats) -- and, both passes of the conditional one
+    batch through the map, the two calls' values (up to the kernels' rounding)."""
+    import pyjuice.parameterizations.lowrank.top_k_fused as tkf
+    if tkf.top_k_module() is None:
+        pytest.skip("the CUDA module did not build")
+    T, N, C, K, r, re, b, V2 = 3, 128, 70, 64, 20, 8, 4, 80
+    tab = _tables(N, 11, V2)
+    pc, _, _ = _hmm_pc(T, N, K, r, re, tab, V2)
+    ext, ids, lp, x, miss = _batch(b, T, N, C, K, r, re, 12, V = V2)
+    pext, lp = _pc_ext(ext, T, N), lp.float()
+    calls = []
+    real = tkf.forward
+    tkf.forward = lambda *a, **k: (calls.append(1), real(*a, **k))[1]
+    try:
+        vals = {}
+        for fused in (False, True):
+            tkf.TOP_K_FUSED = fused
+            with torch.no_grad():
+                full = pc(x, external_params = pext, categorical_evidence_logp = lp, soft_evidence_cat_ids = ids).view(-1)
+                vis = pc(x, missing_mask = miss, external_params = pext, categorical_evidence_logp = lp,
+                         soft_evidence_cat_ids = ids).view(-1)
+                one = pc(x.repeat(2, 1), missing_mask = torch.cat([torch.zeros_like(miss), miss]), external_params = pext,
+                         external_params_rows = torch.arange(b, device = DEV).repeat(2),
+                         categorical_evidence_logp = lp.repeat(2, 1, 1), soft_evidence_cat_ids = ids.repeat(2, 1, 1)).view(-1)
+            vals[fused] = (full, vis, one)
+    finally:
+        tkf.TOP_K_FUSED = True
+        tkf.forward = real
+    assert len(calls) == 3 * (T - 1), len(calls)                                  # (every transition, every call, fused)
+    for a, ref in zip(vals[True][:2], vals[False][:2]):
+        assert float((a - ref).abs().max()) < 2e-2, float((a - ref).abs().max())
+    full, vis, one = vals[True]
+    # (the same values up to the kernels' rounding: a batch's split into the CTAs' shares sets where each part's
+    # running maximum -- and so W's TF32 rounding -- falls)
+    assert torch.allclose(one, torch.cat([full, vis]), atol = 2e-3), (one, torch.cat([full, vis]))
 
 
 def test_zero_tensors_are_the_plain_circuit():

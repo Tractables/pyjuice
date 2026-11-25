@@ -111,27 +111,25 @@ def leaf_forward(desc, layer, data: torch.Tensor, node_mars: torch.Tensor, kwarg
     return None
 
 
-def slot_log_weights(desc, sib: dict, batch_size: int, kwargs: dict, device):
-    """`(logw [B, M, K + 1], rows, logp, tilt)` (float64): the log-weights of the token's slots for each node of a
-    `LowRank(top_k)` sum node vector, `sib` its leaf (`_sibling_leaves`) -- 0 at the observed token's slot and -inf
-    elsewhere; where the token is missing the leaf's own log P_b(s | i), its first K candidates one by one and the rest
-    summed --; the samples `rows` whose token is missing, and there the leaf's log P_b(c | i) `[b, M, C]` and its tilt's
-    rows (None without one)."""
+def slot_parts(desc, sib: dict, batch_size: int, kwargs: dict, device):
+    """`(slot [B], rows, logw_rows, logp, tilt)`: what the token's slots weigh for each node of a `LowRank(top_k)` sum
+    node vector, `sib` its leaf (`_sibling_leaves`) -- the observed token's slot in each sample (its first place among
+    the candidates, capped at K; 0 where it is none of them: the leaf's value is -inf there); the samples `rows` whose
+    token is missing, and there the slots' log-weights `[b, M, K + 1]` (the leaf's own log P_b(s | i), its first K
+    candidates one by one and the rest summed), the leaf's log P_b(c | i) `[b, M, C]` and its tilt's rows (None
+    without one); float64 (None where no token is missing)."""
     leaf_layer, xs, v = sib["layer"], sib["ns"], sib["var"]
     s, e, _, lvid, _ = _leaf_rows(leaf_layer, xs)
     lp, ids = kwargs.get("categorical_evidence_logp"), kwargs.get("soft_evidence_cat_ids")
     assert ids is not None and lp is not None, \
         "A `LowRank(top_k)` sum reads its leaf's candidates: `soft_evidence_cat_ids` and `categorical_evidence_logp`."
-    K, M, S = desc.top_k, e - s, desc.top_k + 1
+    K, M = desc.top_k, e - s
     lp_v, ids_v = lp[:, lvid, :], ids[:, lvid, :]
     C = ids_v.size(1)
 
     place, _ = _candidate_place(ids_v, kwargs["_inputs"][:, v])
-    logw = torch.full((batch_size, M, S), -float("inf"), dtype = torch.float64, device = device)
-    logw.scatter_(2, place.clamp(max = K)[:, None, None].expand(-1, M, 1), 0.0)
-
     miss = _missing(kwargs.get("missing_mask"), v, batch_size, device, kwargs.get("_batch_first", True))
-    rows, logp, tilt = torch.nonzero(miss).reshape(-1), None, None
+    rows, logw_rows, logp, tilt = torch.nonzero(miss).reshape(-1), None, None, None
     if rows.numel() > 0:
         staged = _staged(kwargs)
         tilt = None if staged is None else staged.get(xs)
@@ -146,7 +144,21 @@ def slot_log_weights(desc, sib: dict, batch_size: int, kwargs: dict, device):
             own = torch.cat([own, own.new_full((own.size(0), M, K - C), -float("inf"))], dim = 2)
         rest = torch.logsumexp(logp[:, :, K:], dim = 2, keepdim = True) if C > K else \
             logp.new_full((logp.size(0), M, 1), -float("inf"))
-        logw[rows] = torch.cat([own, rest], dim = 2)
+        logw_rows = torch.cat([own, rest], dim = 2)
+    return place.clamp(max = K), rows, logw_rows, logp, tilt
+
+
+def slot_log_weights(desc, sib: dict, batch_size: int, kwargs: dict, device):
+    """`(logw [B, M, K + 1], rows, logp, tilt)` (float64): the log-weights of the token's slots for each node of a
+    `LowRank(top_k)` sum node vector (`slot_parts`) -- 0 at the observed token's slot and -inf elsewhere; where the
+    token is missing the leaf's own log P_b(s | i) --; the samples `rows` whose token is missing, and there the leaf's
+    log P_b(c | i) `[b, M, C]` and its tilt's rows (None without one)."""
+    slot, rows, logw_rows, logp, tilt = slot_parts(desc, sib, batch_size, kwargs, device)
+    s, e, _, _, _ = _leaf_rows(sib["layer"], sib["ns"])
+    logw = torch.full((batch_size, e - s, desc.top_k + 1), -float("inf"), dtype = torch.float64, device = device)
+    logw.scatter_(2, slot[:, None, None].expand(-1, e - s, 1), 0.0)
+    if rows.numel() > 0:
+        logw[rows] = logw_rows
     return logw, rows, logp, tilt
 
 
@@ -208,15 +220,20 @@ def _sum_backward_terms(A, Bm, G, ltheta, lc, logw, f):
 
 
 def sum_forward(desc, layer, ns_tensors, node_mars, element_mars, params, kwargs) -> None:
-    """The node values of a `LowRank(top_k)` sum layer, written over its rows of `node_mars`."""
+    """The node values of a `LowRank(top_k)` sum layer, written over its rows of `node_mars`: by the fused kernel
+    where it serves (`top_k_fused.py`), else here."""
+    from . import top_k_fused
     sibs = layer.__dict__.get("_sibling_leaves")
     assert sibs is not None, "A `LowRank(top_k)` sum layer compiled without its leaves (`_resolve_top_k_siblings`)."
     assert "_inputs" in kwargs, "A `LowRank(top_k)` sum layer reads the tokens; the circuit's forward passes them."
     layer.__dict__["_lr_state"] = dict()
     layer.__dict__["_lr_topk_batch"] = node_mars.size(1)
     for ns_info, tensors in ns_tensors:
-        A, Bm, G = (t.double() for t in per_sample(tensors, external_rows(kwargs)))
         geo = desc._geometry(layer, ns_info, node_mars.device)
+        if top_k_fused.sum_forward(desc, layer, ns_info, tensors, geo, params, element_mars, node_mars,
+                                   sibs[id(ns_info.ns)], kwargs):
+            continue
+        A, Bm, G = (t.double() for t in per_sample(tensors, external_rows(kwargs)))
         ltheta = desc._dense_params(geo, params, dtype = torch.float64).log()       # [M, N]
         lc = desc._child_values(geo, element_mars).double()                         # [B, N]
         logw = slot_log_weights(desc, sibs[id(ns_info.ns)], A.size(0), kwargs, node_mars.device)[0]
