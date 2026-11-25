@@ -98,6 +98,9 @@ def leaf_log_probs(layer, ns, lp_v: torch.Tensor, ids_v: torch.Tensor, tilt = No
 def leaf_forward(desc, layer, data: torch.Tensor, node_mars: torch.Tensor, kwargs: dict) -> None:
     """The values of the input layer's node vectors that were given tensors, written over the shared forward's (the
     layer's missing mask applies after). `data` `[num_vars, B]`, `kwargs` the evidence as the caller gave it."""
+    from . import top_k_leaf_fused
+    if top_k_leaf_fused.leaf_forward(desc, layer, data, node_mars, kwargs):
+        return None
     staged = _staged(kwargs)
     if not staged:
         return None
@@ -124,7 +127,12 @@ def slot_parts(desc, sib: dict, batch_size: int, kwargs: dict, device):
     the candidates, capped at K; 0 where it is none of them: the leaf's value is -inf there); the samples `rows` whose
     token is missing, and there the slots' log-weights `[b, M, K + 1]` (the leaf's own log P_b(s | i), its first K
     candidates one by one and the rest summed), the leaf's log P_b(c | i) `[b, M, C]` and its tilt's rows (None
-    without one); `PASSES_DTYPE` (None where no token is missing)."""
+    without one); `PASSES_DTYPE` (None where no token is missing). Where the leaf's layer ran by the kernels, the slots
+    and the weights its forward made (`top_k_leaf_fused.slot_rows`), and no log P_b(c | i) or tilt."""
+    from . import top_k_leaf_fused
+    made = top_k_leaf_fused.slot_rows(sib, desc.top_k, batch_size)
+    if made is not None:
+        return (*made, None, None)
     leaf_layer, xs, v = sib["layer"], sib["ns"], sib["var"]
     s, e, _, lvid, _ = _leaf_rows(leaf_layer, xs)
     lp, ids = kwargs.get("categorical_evidence_logp"), kwargs.get("soft_evidence_cat_ids")
@@ -278,6 +286,7 @@ def sum_backward(desc, layer, ns_tensors, ns_grad_tensors, node_flows, element_f
     the shared slot's spread over its candidates as P_b(c | i)), d / d logit(c) = rho - f P_b(c | i): the evidence's
     gradient (summed over i), the tilt's, and the leaf's EM statistics there, F+ += rho, F- += f P_b(c | i).
     """
+    from . import top_k_leaf_fused
     dev = node_flows.device
     sibs = layer.__dict__["_sibling_leaves"]
     gviews, fresh = _grads_kw(kwargs)
@@ -307,7 +316,7 @@ def sum_backward(desc, layer, ns_tensors, ns_grad_tensors, node_flows, element_f
         if want_denom:
             desc._scatter_add(geo, denom_param_flows, desc._denom_offsets(layer)[id(ns_info.ns)][0],
                               _safe_div(Fm, theta).float())
-        if rows.numel() > 0:
+        if rows.numel() > 0 and not top_k_leaf_fused.add_counts(sib, desc.top_k, f.size(0), a[rows]):
             _leaf_terms(desc, sib, rows, logp, tilt, logw[rows], a[rows], f[rows], kwargs, glp, gviews, fresh, want_flows)
     return None
 
@@ -363,6 +372,10 @@ def leaf_backward(desc, layer, data, node_flows, kwargs, logspace_flows: bool, m
     assert len(supplied) == len(layer.nodes), \
         "`LowRank` on input nodes: supply every node vector of the layer (a registered group), or none."
     assert layer.dist._dual_flow_backward, "`LowRank` on a soft-evidence leaf: its dual-flow statistics (the default)."
+    from . import top_k_leaf_fused
+    if top_k_leaf_fused.leaf_backward(desc, layer, data, node_flows, kwargs, logspace_flows, missing_mask, batch_first,
+                                      compute_param_flows):
+        return True
     gviews, fresh = _grads_kw(kwargs)
     lp, ids = kwargs.get("categorical_evidence_logp"), kwargs.get("soft_evidence_cat_ids")
     glp = kwargs.get("categorical_evidence_logp_grad")

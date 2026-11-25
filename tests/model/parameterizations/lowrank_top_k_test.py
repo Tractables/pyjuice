@@ -365,6 +365,61 @@ def test_the_fused_forward_is_the_reference():
     assert torch.allclose(one, torch.cat([full, vis]), atol = 2e-3), (one, torch.cat([full, vis]))
 
 
+@pytest.mark.parametrize("C", [40, 200])                         # (fewer candidates than slots; a shared slot)
+def test_the_fused_leaf_is_the_torch_passes(C):
+    """The leaves by the kernels (`lowrank/top_k_leaf_fused.py`: 128 nodes) against their torch passes -- the sums'
+    forward the torch reference in both, to see the leaves alone --: the differentiable conditional (one call, the map)
+    and its gradients, and an EM backward's statistics on the all-observed pass and on the visible-only one (the
+    missing tokens' posterior counts)."""
+    import pyjuice.parameterizations.lowrank.top_k_fused as tkf
+    import pyjuice.parameterizations.lowrank.top_k_leaf_fused as tlf
+    if tlf.module() is None:
+        pytest.skip("the CUDA module did not build")
+    T, N, K, r, re, b, V2 = 3, 128, 64, 20, 8, 4, 300
+    tab = _tables(N, 21, V2)
+    pc, _, _ = _hmm_pc(T, N, K, r, re, tab, V2)
+    ext, ids, lp, x, miss = _batch(b, T, N, C, K, r, re, 22, V = V2)
+    pext, lp = _pc_ext(ext, T, N), lp.float()
+    rows = torch.arange(b, device = DEV).repeat(2)
+    ran = []
+    real_sum, real_leaf = tkf.sum_forward, tlf.leaf_forward
+    tkf.sum_forward = lambda *a, **k: False
+    tlf.leaf_forward = lambda *a, **k: (lambda got: (ran.append(got), got)[1])(real_leaf(*a, **k))
+
+    def passes():
+        ts = {g_: tuple(t.clone().requires_grad_(True) for t in v) for g_, v in pext.items()}
+        lpg = lp.clone().requires_grad_(True)
+        ll = pc(x.repeat(2, 1), missing_mask = torch.cat([torch.zeros_like(miss), miss]), external_params = ts,
+                external_params_rows = rows, categorical_evidence_logp = lpg.repeat(2, 1, 1),
+                soft_evidence_cat_ids = ids.repeat(2, 1, 1), differentiable = True).view(-1)
+        (-(ll[:b] - ll[b:]).sum()).backward()
+        out = [ll.detach()] + [t.grad for v in ts.values() for t in v] + [lpg.grad]
+        for m_ in (None, miss):
+            pc.init_param_flows(flows_memory = 0.0)
+            with torch.no_grad():
+                pc(x, missing_mask = m_, external_params = pext, categorical_evidence_logp = lp, soft_evidence_cat_ids = ids)
+            pc.backward(x, missing_mask = m_, compute_param_flows = True, flows_memory = 1.0, logspace_flows = True,
+                        allow_modify_flows = False, external_params = pext, categorical_evidence_logp = lp,
+                        soft_evidence_cat_ids = ids)
+            out += [pc.input_layer_group[0].param_flows.clone(), pc.param_flows.clone()]
+        return out
+
+    try:
+        tkf.TOP_K_FUSED = False
+        ref = passes()
+        tkf.TOP_K_FUSED = True
+        got = passes()
+    finally:
+        tkf.TOP_K_FUSED = True
+        tkf.sum_forward, tlf.leaf_forward = real_sum, real_leaf
+    assert ran == [False] * 3 + [True] * 3, ran                                     # (the torch passes, then the kernels)
+    assert torch.allclose(got[0], ref[0], atol = 1e-4), float((got[0] - ref[0]).abs().max())
+    names = ("A", "B", "G", "U", "D", "lp", "leaf F (all observed)", "sums' F (all observed)", "leaf F (visible)",
+             "sums' F (visible)")
+    for name, a, r_ in zip(names, got[1:], ref[1:]):
+        assert _rel(a, r_) < 1e-4, (name, _rel(a, r_))
+
+
 def test_zero_tensors_are_the_plain_circuit():
     """A, B, G, U, D all zero: the circuit of plain soft-evidence leaves and plain sums, as pyjuice evaluates it."""
     T, N, C, K, r, re, b = 4, 4, 5, 2, 3, 2, 6

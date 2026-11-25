@@ -165,6 +165,46 @@ def get_top_k_module():
     return _top_k_module
 
 
+_top_k_leaf_module = None
+_top_k_leaf_attempted = False
+
+
+def get_top_k_leaf_module():
+    """`LowRank(top_k)` soft-evidence leaves' passes (`lowrank_top_k_leaf.cu`: the candidates' rows of a transposed
+    log2 table, the normalizers, values, slot weights and gradients a tile a sample), or None if unavailable (warns
+    once): the leaves then keep their torch passes (`lowrank/top_k.py`). Plain CUDA."""
+    global _top_k_leaf_module, _top_k_leaf_attempted
+
+    if _top_k_leaf_attempted:
+        return _top_k_leaf_module
+
+    _top_k_leaf_attempted = True
+
+    if not ENABLE_CUDA_KERNELS:
+        return None
+
+    import torch
+    if not torch.cuda.is_available():
+        return None
+
+    flags = _compile_flags()
+    if flags is None:
+        return None
+
+    from pyjuice.utils.cuda_ext import jit_load
+    try:
+        _top_k_leaf_module = jit_load(
+            "pyjuice_lowrank_top_k_leaf_cuda",
+            sources = [os.path.join(_THIS_DIR, "lowrank_top_k_leaf.cu")],
+            extra_cuda_cflags = flags, verbose = False)
+    except Exception as e:
+        warnings.warn(
+            f"pyjuice CUDA kernel 'pyjuice_lowrank_top_k_leaf_cuda' failed to compile ({type(e).__name__}: {e}). "
+            "`LowRank(top_k)` leaves keep their torch passes.", RuntimeWarning)
+        _top_k_leaf_module = None
+    return _top_k_leaf_module
+
+
 _fp8_module = None
 _fp8_attempted = False
 
