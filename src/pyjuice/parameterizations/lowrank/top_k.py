@@ -318,7 +318,7 @@ def sum_backward(desc, layer, ns_tensors, ns_grad_tensors, node_flows, element_f
         lc = _d(desc._child_values(geo, element_mars))
         slot, rows, logw_rows, logp, tilt = slot_parts(desc, sib, f.size(0), kwargs, dev)
         if top_k_backward.serves(desc, geo["M"], geo["N"], tensors[0].size(2), dev, kwargs):
-            ef, vals, a_rows, flows = top_k_backward.terms(*tensors, theta.log(), lc, slot, rows, logw_rows, f,
+            ef, vals, a_rows, flows = top_k_backward.terms(*tensors, theta, lc, slot, rows, logw_rows, f,
                                                            external_rows(kwargs), grads is not None, want_flows)
             Fp, Fm = flows if want_flows else (None, None)
         else:

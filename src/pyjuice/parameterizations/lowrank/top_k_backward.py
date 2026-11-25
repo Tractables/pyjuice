@@ -338,6 +338,39 @@ if triton is not None:
             tl.store(FM + out, Fm + tl.load(FM + out))
 
 
+    @triton.jit
+    def _prep_factor_kernel(X, OH, OT, sx0, sx1, rows_in, rows_out, n_in, n_out, scale,
+                            TF32: tl.constexpr, BLOCK: tl.constexpr):
+        """row (b, i) of a factor x [Bx, rows_in, n_in] (inner-contiguous): OH = fp16(x * scale) and (TF32) OT = x
+        rounded to TF32, both [Bx, rows_out, n_out] -- zero past the input's rows and entries (the ranks' padding)"""
+        q = tl.program_id(0).to(tl.int64)
+        b = q // rows_out
+        i = q % rows_out
+        k = tl.arange(0, BLOCK)
+        x = tl.load(X + b * sx0 + i * sx1 + k, mask = (k < n_in) & (i < rows_in), other = 0.0).to(tl.float32)
+        o = q * n_out + k
+        tl.store(OH + o, (x * scale).to(tl.float16), mask = k < n_out)
+        if TF32:
+            tl.store(OT + o, _tf32(x), mask = k < n_out)
+
+    @triton.jit
+    def _prep_shift_kernel(X, O, sx0, sx1, rows, n, scale, LOG: tl.constexpr, EXP: tl.constexpr, TF32: tl.constexpr,
+                           HALF: tl.constexpr, BLOCK: tl.constexpr):
+        """row (b, i) of x [., rows, n] (inner-contiguous): y = log2 x (LOG) or x * scale, less its largest finite
+        entry (0 where none is), 2^y (EXP), rounded to TF32 (TF32), into O [., rows, n] as fp16 (HALF) or fp32"""
+        q = tl.program_id(0).to(tl.int64)
+        k = tl.arange(0, BLOCK)
+        x = tl.load(X + (q // rows) * sx0 + (q % rows) * sx1 + k, mask = k < n, other = -float("inf")).to(tl.float32)
+        y = tl.log2(x) if LOG else x * scale
+        big = tl.maximum(tl.max(tl.where((y == y) & (tl.abs(y) < float("inf")), y, -1e30), axis = 0), -1e30)
+        y = y - big
+        if EXP:
+            y = tl.exp2(y)
+        if TF32:
+            y = _tf32(y)
+        tl.store(O + q * n + k, y.to(tl.float16) if HALF else y, mask = k < n)
+
+
 def serves(desc, M: int, N: int, r: int, device, kwargs: dict) -> bool:
     """Whether the kernels take a node vector's backward: its element flows, gradients and EM statistics."""
     from . import top_k_fused
@@ -345,37 +378,51 @@ def serves(desc, M: int, N: int, r: int, device, kwargs: dict) -> bool:
             M % BM == 0 and N % BN == 0 and _parts(r) is not None and kwargs.get("precision", "auto") != "fp32")
 
 
-def _tf32_round(x: torch.Tensor) -> torch.Tensor:
-    i = x.float().contiguous().view(torch.int32)
-    return ((i + 0x1000) & ~0x1FFF).view(torch.float32)
+def _inner(t: torch.Tensor) -> torch.Tensor:
+    """`t` with a contiguous last dimension (a view where it has one)"""
+    return t if t.stride(-1) == 1 else t.contiguous()
 
 
-def _shifted_exp(x: torch.Tensor, dim: int) -> torch.Tensor:
-    """exp(x - its largest along `dim`), the largest over the finite entries (0 where none is)"""
-    big = torch.where(torch.isfinite(x), x, torch.full_like(x, -1e30)).amax(dim = dim, keepdim = True).clamp_min(-1e30)
-    return (x - big).exp()
+def _factors(X: torch.Tensor, rows_out: int, n_out: int, scale: float, tf32: bool):
+    """`(fp16(X * scale), X in TF32 or None)`, `[Bx, rows_out, n_out]` from `X [Bx, rows, n]` zero-padded"""
+    X = _inner(X)
+    Bx, rows_in, n_in = X.shape
+    OH = torch.empty(Bx, rows_out, n_out, dtype = torch.float16, device = X.device)
+    OT = torch.empty(Bx, rows_out, n_out, dtype = torch.float32, device = X.device) if tf32 else OH
+    _prep_factor_kernel[(Bx * rows_out,)](X, OH, OT, X.stride(0), X.stride(1), rows_in, rows_out, n_in, n_out, scale,
+                                          TF32 = tf32, BLOCK = triton.next_power_of_2(max(n_out, 16)), num_warps = 4)
+    return OH, (OT if tf32 else None)
 
 
-def terms(A, Bm, G, ltheta, lc, slot, rows, logw_rows, f, emap, want_grads: bool, want_flows: bool = False):
+def _shifted(X: torch.Tensor, log: bool = False, scale: float = 1.0, exp: bool = False, tf32: bool = False,
+             half: bool = False) -> torch.Tensor:
+    """Each row of `X [..., rows, n]` (2-D or 3-D): log2 X or X * scale less its largest finite entry, 2^. (`exp`), in
+    TF32 (`tf32`), as fp16 (`half`) or fp32"""
+    X3 = _inner(X if X.dim() == 3 else X[None])
+    n0, rows, n = X3.shape
+    O = torch.empty(n0, rows, n, dtype = torch.float16 if half else torch.float32, device = X.device)
+    _prep_shift_kernel[(n0 * rows,)](X3, O, X3.stride(0), X3.stride(1), rows, n, scale, LOG = log, EXP = exp,
+                                     TF32 = tf32, HALF = half, BLOCK = triton.next_power_of_2(max(n, 16)), num_warps = 4)
+    return O if X.dim() == 3 else O[0]
+
+
+def terms(A, Bm, G, theta, lc, slot, rows, logw_rows, f, emap, want_grads: bool, want_flows: bool = False):
     """`top_k._sum_backward_terms`' element flows `[B, N]`, the gradients' values `[dA, dB, dG]` (None unless
     `want_grads`), the posterior counts `a` of the masked samples `rows` `[b, M, 65]` and the EM statistics `(F+, F-)`
     `[M, N]` (None unless `want_flows`), by the kernels: `A [Bx, M, r]`, `Bm [Bx, r, N]`, `G [Bx, 65, N]` a row of
-    tensors each, `emap [B]` the row a sample reads (None: its own); `ltheta [M, N]`, `lc [B, N]`, `f [B, M]`; the
-    observed samples' slots `slot [B]`, the masked ones' weights `logw_rows`."""
+    tensors each, `emap [B]` the row a sample reads (None: its own); the parameters `theta [M, N]` (0 where none),
+    `lc [B, N]`, `f [B, M]`; the observed samples' slots `slot [B]`, the masked ones' weights `logw_rows`."""
     Bx, M, r = A.shape
     N = Bm.size(2)
     B = lc.size(0)
     dev = A.device
     K0, K1 = _parts(r)
     KP = K0 + K1
-    pad = lambda t, dim: torch.nn.functional.pad(t, (0, KP - r) if dim == 2 else (0, 0, 0, KP - r))
-    AH = pad((A.float() * _L2E).half(), 2).contiguous()                                # [Bx, M, KP] (the forward's A')
-    BH = pad(Bm.half(), 1).contiguous()                                               # [Bx, KP, N]
-    l2t = ltheta.float() * _L2E
-    L2T = (l2t - torch.where(torch.isfinite(l2t), l2t, torch.full_like(l2t, -1e30)).amax(dim = 1, keepdim = True)
-           .clamp_min(-1e30)).half().contiguous()                                     # [M, N]
-    E = _tf32_round(_shifted_exp(G.float(), 2)).contiguous()                          # [Bx, 65, N]
-    EV = _shifted_exp(lc.float(), 1).contiguous()                                     # [B, N]
+    AH, ATF = _factors(A, M, KP, _L2E, want_grads)                                     # [Bx, M, KP] (the forward's A')
+    BH, BTF = _factors(Bm, KP, N, 1.0, want_grads)                                     # [Bx, KP, N]
+    L2T = _shifted(theta, log = True, half = True)                                    # [M, N] log2 theta less its row's largest
+    E = _shifted(G, scale = _L2E, exp = True, tf32 = True)                            # [Bx, 65, N]
+    EV = _shifted(lc, scale = _L2E, exp = True)                                       # [B, N]
     EMAP = (torch.arange(B, device = dev) if emap is None else emap).to(torch.int32).contiguous()
     Rm = rows.numel()
     LWIDX = torch.full((B,), -1, dtype = torch.int32, device = dev)
@@ -393,10 +440,8 @@ def terms(A, Bm, G, ltheta, lc, slot, rows, logw_rows, f, emap, want_grads: bool
         _bw_rows_kernel[(M // BM, B)](AH, BH, L2T, E, EV, LOGW, LWIDX, SLOT, F, EMAP, ALPHA, BETA, ACNT, MROW, M, N,
                                       OBS = obs, **opts)
     vals = None
-    ATF, DB = AH, EF                                                                   # (not read without gradients)
+    DB = EF                                                                            # (not read without gradients)
     if want_grads:
-        ATF = pad(_tf32_round(A), 2).contiguous()
-        BTF = pad(_tf32_round(Bm), 1).contiguous()
         DA = torch.empty(B, M, r, dtype = torch.float32, device = dev)
         DB = torch.empty(B, r, N, dtype = torch.float32, device = dev)
         DG = torch.empty(B, 65, N, dtype = torch.float32, device = dev)
@@ -406,7 +451,8 @@ def terms(A, Bm, G, ltheta, lc, slot, rows, logw_rows, f, emap, want_grads: bool
                                         OBS = obs, **opts)
         vals = [DA, DB, DG]
     for obs in (False, True):
-        _bw_db_kernel[(N // BN, B)](AH, BH, L2T, E, EV, ALPHA, BETA, MROW, LWIDX, SLOT, EMAP, ATF, EF, DB, M, N, r,
+        _bw_db_kernel[(N // BN, B)](AH, BH, L2T, E, EV, ALPHA, BETA, MROW, LWIDX, SLOT, EMAP, ATF if want_grads else AH,
+                                    EF, DB, M, N, r,
                                     OBS = obs, GRADS = want_grads, **opts)
     flows = None
     if want_flows:
