@@ -316,32 +316,45 @@ def sum_backward(desc, layer, ns_tensors, ns_grad_tensors, node_flows, element_f
 
     for (ns_info, tensors), grads, geo in zip(ns_tensors, ns_grad_tensors, geos):
         sib = sibs[id(ns_info.ns)]
-        f = _d(node_flows[ns_info.nid_start:ns_info.nid_end, :].t()).exp()            # [B, M] (log-space flows)
+        nf = node_flows[ns_info.nid_start:ns_info.nid_end, :]                        # [M, B] (log-space flows)
+        B = nf.size(1)
+        f = None                                                                      # (f [B, M]: where torch needs it)
         theta = desc._dense_params(geo, params, dtype = PASSES_DTYPE)
-        slot, rows, logw_rows, logp, tilt = slot_parts(desc, sib, f.size(0), kwargs, dev)
-        if top_k_backward.serves(desc, geo["M"], geo["N"], tensors[0].size(2), f.size(0), dev, kwargs, want_flows) \
-                and element_mars.stride(1) == 1:
-            # (the gradients added into their destinations by the kernels)
-            ef, a_rows, flows = top_k_backward.terms(*tensors, theta, element_mars, geo, slot, rows, logw_rows, f,
-                                                     external_rows(kwargs), grads, gviews, fresh, want_flows, pm)
+        slot, rows, logw_rows, logp, tilt = slot_parts(desc, sib, B, kwargs, dev)
+        kernels = top_k_backward.serves(desc, geo["M"], geo["N"], tensors[0].size(2), B, dev, kwargs, want_flows) \
+            and element_mars.stride(1) == 1 and nf.dtype == torch.float32 and nf.stride(1) == 1
+        if kernels:
+            # (the gradients added into their destinations by the kernels; the counts into the leaf's buffer)
+            counts = top_k_leaf_fused.counts_buffer(sib, desc.top_k, B) if rows.numel() > 0 else None
+            ef, a_rows, flows = top_k_backward.terms(*tensors, theta, element_mars, geo, slot, rows, logw_rows, nf,
+                                                     external_rows(kwargs), grads, gviews, fresh, want_flows, pm, counts)
             Fp, Fm = flows if want_flows else (None, None)
         else:
+            f = _d(nf.t()).exp()
             A, Bm, G = (_d(t) for t in per_sample(tensors, external_rows(kwargs)))
             lc = _d(desc._child_values(geo, element_mars))
-            logw = slot_weights(slot, rows, logw_rows, f.size(0), geo["M"], desc.top_k)
+            logw = slot_weights(slot, rows, logw_rows, B, geo["M"], desc.top_k)
             ef, Fp, Fm, Gl, dG, a = _sum_backward_terms(A, Bm, G, theta.log(), lc, logw, f, pm)
             if grads is not None:
                 _store(gviews, fresh, grads, [torch.bmm(Gl, Bm.transpose(1, 2)), torch.bmm(A.transpose(1, 2), Gl), dG])
             a_rows = a[rows]
 
         kids = geo["kids"]
-        element_flows[kids, :] = torch.logaddexp(element_flows[kids, :], ef.log().t()[geo["cols"], :].to(element_flows.dtype))
+        if kernels and element_flows.dtype == torch.float32 and element_flows.stride(1) == 1:
+            top_k_backward.scatter_element_flows(ef, geo["cols"], kids, element_flows)
+        else:
+            element_flows[kids, :] = torch.logaddexp(element_flows[kids, :],
+                                                     ef.log().t()[geo["cols"], :].to(element_flows.dtype))
         if want_flows:
-            desc._scatter_add(geo, param_flows, ns_info.ns._param_flow_range[0], Fp.float())
-        if want_denom:
-            desc._scatter_add(geo, denom_param_flows, desc._denom_offsets(layer)[id(ns_info.ns)][0],
-                              _safe_div(Fm, theta).float())
-        if rows.numel() > 0 and not top_k_leaf_fused.add_counts(sib, desc.top_k, f.size(0), a_rows):
+            pf0 = ns_info.ns._param_flow_range[0]
+            d0 = desc._denom_offsets(layer)[id(ns_info.ns)][0] if want_denom else None
+            if not (kernels and top_k_backward.scatter_statistics(geo, Fp, Fm, params, param_flows, pf0,
+                                                                    denom_param_flows if want_denom else None, d0)):
+                desc._scatter_add(geo, param_flows, pf0, Fp.float())
+                if want_denom:
+                    desc._scatter_add(geo, denom_param_flows, d0, _safe_div(Fm, theta).float())
+        if rows.numel() > 0 and not top_k_leaf_fused.add_counts(sib, desc.top_k, B, a_rows):
+            f = _d(nf.t()).exp() if f is None else f
             _leaf_terms(desc, sib, rows, logp, tilt, logw_rows, a_rows, f[rows], kwargs, glp, gviews, fresh, want_flows,
                         pm)
     return None

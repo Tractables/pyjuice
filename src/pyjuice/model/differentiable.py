@@ -103,11 +103,13 @@ class _DifferentiableLLs(torch.autograd.Function):
         # (with a map of rows the backward folds the samples' gradients into the tensors' rows, each times its sign: the
         # destinations have the tensors' own batch)
         fold = {EXTERNAL_PARAMS_GRAD_SIGNS_KWARG: sign} if rows is not None else {}
+        # (the external gradients' destinations unzeroed: the backward initializes every one it is handed -- zeroed, or
+        # stored by its first writer, or copied out of its own buffer; the evidence's are added into, from zero)
         ext_grads = {}
         for kind, key, _, _ in entries:
             if kind == "ext" and key not in ext_grads:
                 ts = ext[key]
-                ext_grads[key] = torch.zeros_like(ts) if torch.is_tensor(ts) else tuple(torch.zeros_like(t) for t in ts)
+                ext_grads[key] = torch.empty_like(ts) if torch.is_tensor(ts) else tuple(torch.empty_like(t) for t in ts)
         evi_grads = {f"{key}_grad": torch.zeros_like(given[key]) for kind, key, _, _ in entries if kind == "evi"}
         with torch.no_grad():
             if pc.__dict__.get("_num_runs", 0) != ctx.run:

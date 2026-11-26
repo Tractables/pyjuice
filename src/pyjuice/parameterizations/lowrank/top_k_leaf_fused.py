@@ -160,20 +160,44 @@ def slot_rows(sib: dict, K: int, batch_size: int):
         return None
     t = _plan(sib["layer"])["index"][id(sib["ns"])]
     o0, o1 = st["offs"][t], st["offs"][t + 1]
-    return st["place"][t].long().clamp(0, K), st["rows"][o0:o1], st["logw"][o0:o1]
+    if st.get("slot") is None:                                     # (every position's, once a forward)
+        st["slot"] = st["place"].long().clamp_(0, K)
+    return st["slot"][t], st["rows"][o0:o1], st["logw"][o0:o1]
+
+
+#: The counts' rows as the sums' backward kernels write them (`SA` of `kernels/c/lowrank_top_k.cu`: K + 1 padded)
+COUNTS_STRIDE = 72
+
+
+def counts_buffer(sib: dict, K: int, batch_size: int):
+    """The leaf's buffer `[b, M, COUNTS_STRIDE]` of a reading sum's posterior counts at its missing tokens (the rows
+    `slot_rows` named) -- the sum's backward kernels write them there --, or None where its layer has no forward state
+    or K is past the stride."""
+    st = _state(sib["layer"], batch_size)
+    if st is None or st["K"] != K or K + 1 > COUNTS_STRIDE:
+        return None
+    t = _plan(sib["layer"])["index"][id(sib["ns"])]
+    return _counts(st)[st["offs"][t]:st["offs"][t + 1]]
+
+
+def _counts(st: dict) -> torch.Tensor:
+    if st["counts"] is None:                                       # (zeros: a row no sum writes reads none)
+        R, M, S1 = st["logw"].shape
+        st["counts"] = torch.zeros(R, M, max(S1, COUNTS_STRIDE), dtype = st["logw"].dtype, device = st["logw"].device)
+    return st["counts"]
 
 
 def add_counts(sib: dict, K: int, batch_size: int, a_rows: torch.Tensor) -> bool:
     """A reading sum's posterior counts of its slots `a_rows [b, M, K + 1]` at the leaf's missing tokens (the rows
-    `slot_rows` named), for the leaf's backward; False where its layer has no forward state (`top_k._leaf_terms`
-    then)."""
+    `slot_rows` named), for the leaf's backward -- nothing to do where they are already its buffer's
+    (`counts_buffer`); False where its layer has no forward state (`top_k._leaf_terms` then)."""
     st = _state(sib["layer"], batch_size)
     if st is None or st["K"] != K:
         return False
-    if st["counts"] is None:
-        st["counts"] = torch.zeros_like(st["logw"])
     t = _plan(sib["layer"])["index"][id(sib["ns"])]
-    st["counts"][st["offs"][t]:st["offs"][t + 1]] = a_rows
+    dst = _counts(st)[st["offs"][t]:st["offs"][t + 1]]
+    if dst.numel() > 0 and a_rows.data_ptr() != dst.data_ptr():
+        dst[:, :, :a_rows.size(2)] = a_rows
     return True
 
 

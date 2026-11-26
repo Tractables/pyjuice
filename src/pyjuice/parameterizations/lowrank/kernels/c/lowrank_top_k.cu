@@ -295,10 +295,16 @@ struct TkArgs {
     const int4* mitems; const int4* oitems; const int* noitems; const int* slot32; const float* logw;
     float* out; float* ws; int* flags;
     long nid0, ostride, sA; int r, M, N, S, Rm;                    // sA: A's batch stride (its rows contiguous)
-    // the backward's rows pass (COUNTS): the node flows f [B, M]; out alpha, beta, the counts [Rm, M, SA] (a masked
-    // sample's), ao, bo [B, M] (an observed one's), W's shift h [B, M] (every sample's)
-    const float* f; float* alpha; float* beta; float* acnt; float* ao; float* bo; float* hrow;
+    // the backward's rows pass (COUNTS): the node flows' log-space rows f [M][fld] (the circuit's buffer, a sample a
+    // column); out alpha, beta, the counts [Rm, M, SA] (a masked sample's), ao, bo [B, M] (an observed one's), W's
+    // shift h [B, M] (every sample's)
+    const float* f; long fld; float* alpha; float* beta; float* acnt; float* ao; float* bo; float* hrow;
 };
+
+// a node's flow in sample b: its log-space row's entry, exponentiated
+__device__ __forceinline__ float node_flow(const TkArgs& a, int b, int node) {
+    return __expf(__ldg(a.f + (long)node * a.fld + b));
+}
 
 // the masked item y's sums over its tile x's chunks c0 .. c1 - 1
 template <int NK>
@@ -619,7 +625,7 @@ __device__ __forceinline__ void masked_counts(const MState& St, const TkArgs& a,
     const float wr0 = __expf(__ldg(lw0 - 2 * t + 8 * NS8)) * ratio(ur0, zr0);
     const float wr1 = __expf(__ldg(lw1 - 2 * t + 8 * NS8)) * ratio(ur1, zr1);
     R0 += wr0; R1 += wr1;
-    const float c0 = sdiv(a.f[(long)b * M + node0], R0), c1 = sdiv(a.f[(long)b * M + node1], R1);
+    const float c0 = sdiv(node_flow(a, b, node0), R0), c1 = sdiv(node_flow(a, b, node1), R1);
     const long q0 = ((long)y * M + node0) * SA + 2 * t, q1 = q0 + 8L * SA;
     #pragma unroll
     for (int sn = 0; sn < NS8; ++sn) {
@@ -654,8 +660,8 @@ __device__ __forceinline__ void masked_counts(const MState& St, const TkArgs& a,
         for (int k = 0; k < 2; ++k) {
             const int o = k == 0 ? o1 : o2;
             if (o < 0) continue;
-            const float f0 = ratio(pu[k][0], pz[k][0]) > 0.f ? a.f[(long)o * M + node0] : 0.f;
-            const float f1 = ratio(pu[k][1], pz[k][1]) > 0.f ? a.f[(long)o * M + node1] : 0.f;
+            const float f0 = ratio(pu[k][0], pz[k][0]) > 0.f ? node_flow(a, o, node0) : 0.f;
+            const float f1 = ratio(pu[k][1], pz[k][1]) > 0.f ? node_flow(a, o, node1) : 0.f;
             a.ao[(long)o * M + node0] = sdiv(f0, pu[k][0]); a.ao[(long)o * M + node1] = sdiv(f1, pu[k][1]);
             a.bo[(long)o * M + node0] = sdiv(f0, pz[k][0]); a.bo[(long)o * M + node1] = sdiv(f1, pz[k][1]);
             a.hrow[(long)o * M + node0] = h0; a.hrow[(long)o * M + node1] = h1;
@@ -687,8 +693,8 @@ __device__ __forceinline__ void observed_counts(const OState& St, const TkArgs& 
             const float z1 = quad_sum(z_of_0 ? St.zs[k][0][1] : St.zs[k][j][1]);
             const float u0 = quad_sum(St.us[k][j][0]), u1 = quad_sum(St.us[k][j][1]);
             if (t == 0 && row >= 0 && (k == 0 || two)) {
-                const float f0 = sdiv(u0, z0) > 0.f ? a.f[(long)row * M + node0] : 0.f;
-                const float f1 = sdiv(u1, z1) > 0.f ? a.f[(long)row * M + node1] : 0.f;
+                const float f0 = sdiv(u0, z0) > 0.f ? node_flow(a, row, node0) : 0.f;
+                const float f1 = sdiv(u1, z1) > 0.f ? node_flow(a, row, node1) : 0.f;
                 a.ao[(long)row * M + node0] = sdiv(f0, u0); a.ao[(long)row * M + node1] = sdiv(f1, u1);
                 a.bo[(long)row * M + node0] = sdiv(f0, z0); a.bo[(long)row * M + node1] = sdiv(f1, z1);
                 a.hrow[(long)row * M + node0] = St.m[k][0] == NEG ? 0.f : St.m[k][0];
@@ -1623,8 +1629,9 @@ __global__ void __launch_bounds__(NW * 32, 1) tk_bw_cols_kernel(const BwArgs a) 
 struct EmArgs {
     const __half* AH; const __half* BP; const float* E; const float* ev; const uint2* LTh;
     const float* ao; const float* bo; const float* hrow; const int* slot; const int* emap;   // slot -1: masked
+    const int* olist;                    // [nl] the samples to walk (-1: none; null: every sample, nl = B)
     float* FP; float* FM;
-    int M, N, S, B;
+    int M, N, S, B, nl;
 };
 
 template <int NK>
@@ -1636,14 +1643,16 @@ struct EmGeo {                         // a stage: B chunk [KP][BROW] fp16, es a
 };
 
 template <int NK>
-__device__ __forceinline__ void em_segment(const EmArgs& a, int tile, int b0, int b1, unsigned char* smem) {
+__device__ __forceinline__ void em_segment(const EmArgs& a, int tile, int l0, int l1, unsigned char* smem) {
     using G = EmGeo<NK>;
     constexpr int KP = G::KP;
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, g = lane >> 2, t = lane & 3;
     const int N = a.N, M = a.M, S = a.S, nchunks = N / TN;
     const int x = tile / nchunks, c = tile % nchunks, j0 = c * TN;
     const int node0 = x * TM + warp * 16 + g, node1 = node0 + 8;
-    auto next_obs = [&](int b) { while (b < b1 && a.slot[b] < 0) ++b; return b; };
+    // (the walk's places l0 .. l1 - 1: a place's sample, -1 where none -- the list's padding, or a masked sample)
+    auto smp = [&](int l) { const int b = a.olist != nullptr ? a.olist[l] : l; return b >= 0 && a.slot[b] >= 0 ? b : -1; };
+    auto next_obs = [&](int l) { while (l < l1 && smp(l) < 0) ++l; return l; };
     constexpr int NB = KP * (TN / 8), NSEG = NB + 2 * (TN / 4);
     auto load_seg = [&](int q, int st, int b) {
         const int e = a.emap != nullptr ? a.emap[b] : b;
@@ -1657,8 +1666,9 @@ __device__ __forceinline__ void em_segment(const EmArgs& a, int tile, int b0, in
             cp16(bs + G::B_BYTES + (v * TN + s * 4) * 4, src + j0 + s * 4);
         }
     };
-    int b = next_obs(b0);
-    if (b >= b1) return;                                                     // (no observed sample: the CTA's)
+    int l = next_obs(l0);
+    if (l >= l1) return;                                                     // (no observed sample: the CTA's)
+    int b = smp(l);
     __syncthreads();                                                         // (the last segment's stages read by all)
     for (int q = tid; q < NSEG; q += NW * 32) load_seg(q, 0, b);
     cp_commit();
@@ -1671,11 +1681,11 @@ __device__ __forceinline__ void em_segment(const EmArgs& a, int tile, int b0, in
     for (int nt = 0; nt < 8; ++nt)
         #pragma unroll
         for (int q = 0; q < 4; ++q) Fp[nt][q] = Fm[nt][q] = 0.f;
-    for (int st = 0; b < b1; st ^= 1) {
-        const int bn = next_obs(b + 1);
+    for (int st = 0; l < l1; st ^= 1) {
+        const int ln = next_obs(l + 1), bn = ln < l1 ? smp(ln) : -1;
         cp_wait<0>();
         __syncthreads();                     // (this sample's stage complete; the other free)
-        if (bn < b1) {
+        if (ln < l1) {
             for (int q = tid; q < NSEG; q += NW * 32) load_seg(q, st ^ 1, bn);
             cp_commit();
         }
@@ -1705,6 +1715,7 @@ __device__ __forceinline__ void em_segment(const EmArgs& a, int tile, int b0, in
             Fp[nt][2] += w2 * ev.x * a1; Fp[nt][3] += w3 * ev.y * a1;
             Fm[nt][0] += w0 * c0; Fm[nt][1] += w1 * c0; Fm[nt][2] += w2 * c1; Fm[nt][3] += w3 * c1;
         }
+        l = ln;
         b = bn;
     }
     float* P0 = a.FP + (long)node0 * N + j0 + 2 * t;
@@ -1720,13 +1731,13 @@ template <int NK>
 __global__ void __launch_bounds__(NW * 32, 1) tk_bw_em_obs_kernel(const EmArgs a) {
     extern __shared__ __align__(128) unsigned char smem[];
     const int ntile = (a.M / TM) * (a.N / TN);
-    const long U = (long)ntile * a.B, P = gridDim.x, k = blockIdx.x;
+    const long U = (long)ntile * a.nl, P = gridDim.x, k = blockIdx.x;
     const long u0 = U * k / P, u1 = U * (k + 1) / P;
     for (long u = u0; u < u1;) {
-        const int tile = (int)(u / a.B), b0 = (int)(u % a.B);
-        const int b1 = (int)min((long)a.B, b0 + (u1 - u));
-        em_segment<NK>(a, tile, b0, b1, smem);
-        u += b1 - b0;
+        const int tile = (int)(u / a.nl), l0 = (int)(u % a.nl);
+        const int l1 = (int)min((long)a.nl, l0 + (u1 - u));
+        em_segment<NK>(a, tile, l0, l1, smem);
+        u += l1 - l0;
     }
 }
 
@@ -1992,19 +2003,25 @@ void top_k_forward(torch::Tensor A, torch::Tensor BP, torch::Tensor E, torch::Te
 std::vector<torch::Tensor> top_k_bw_rows(torch::Tensor A, torch::Tensor BP, torch::Tensor E, torch::Tensor ev,
                                          torch::Tensor cmax, torch::Tensor LTh, torch::Tensor mitems,
                                          torch::Tensor oitems, torch::Tensor noitems, torch::Tensor slot32,
-                                         torch::Tensor logw, torch::Tensor flags, torch::Tensor f) {
+                                         torch::Tensor logw, torch::Tensor flags, torch::Tensor f, torch::Tensor acnt_out) {
     const c10::cuda::CUDAGuard guard(A.device());
     const int M = A.size(1), B = ev.size(0), Rm = mitems.size(0);
-    check(f, at::kFloat, "f");
-    TORCH_CHECK(f.size(0) == B && f.size(1) == M, "top_k: the node flows f [B, M]");
+    TORCH_CHECK(f.is_cuda() && f.scalar_type() == at::kFloat && f.dim() == 2 && f.size(0) == M && f.size(1) == B &&
+                f.stride(1) == 1, "top_k: the node flows' log-space rows f [M, B] (a sample a column)");
     const int P = flags.size(0) / 2;
     auto o = A.options();
     auto ws = torch::empty({(long)P * (WS_M + WS_O) * NW * 32}, o);
     auto alpha = torch::empty({std::max(Rm, 1), M, SA}, o), beta = torch::empty_like(alpha);
-    auto acnt = torch::empty_like(alpha);
+    // (the counts into the caller's buffer where it gives one: [Rm, M, SA], its leaf's)
+    auto acnt = acnt_out.numel() > 0 ? acnt_out : torch::empty_like(alpha);
+    if (acnt_out.numel() > 0) {
+        check(acnt_out, at::kFloat, "acnt_out");
+        TORCH_CHECK(acnt_out.size(0) == Rm && acnt_out.size(1) == M && acnt_out.size(2) == SA, "top_k: acnt_out [Rm, M, 72]");
+    }
     auto ao = torch::empty({B, M}, o), bo = torch::empty_like(ao), hrow = torch::empty_like(ao);
     TkArgs args = sk_args(A, BP, E, ev, cmax, LTh, mitems, oitems, noitems, slot32, logw, flags, ws);
-    args.f = f.data_ptr<float>(); args.alpha = alpha.data_ptr<float>(); args.beta = beta.data_ptr<float>();
+    args.f = f.data_ptr<float>(); args.fld = f.stride(0);
+    args.alpha = alpha.data_ptr<float>(); args.beta = beta.data_ptr<float>();
     args.acnt = acnt.data_ptr<float>(); args.ao = ao.data_ptr<float>(); args.bo = bo.data_ptr<float>();
     args.hrow = hrow.data_ptr<float>();
     sk_launch<true>(args, BP.size(1), P, Rm, B, A.get_device());
@@ -2083,9 +2100,10 @@ void top_k_bw_grads(torch::Tensor A, torch::Tensor AH, torch::Tensor BP, torch::
 
 // The EM statistics of the observed samples (slot >= 0; -1 a masked one, skipped) added into FP, FM [M, N] (fp32):
 // from the operands (AH, BP, E, ev, LTh) and the rows pass's ao, bo, hrow; emap the row a sample reads (empty: its own).
+// `olist` the samples to walk, -1 padded (`top_k_em_index`; empty: every sample) -- the work split over them.
 void top_k_bw_em_observed(torch::Tensor AH, torch::Tensor BP, torch::Tensor E, torch::Tensor ev, torch::Tensor LTh,
                           torch::Tensor ao, torch::Tensor bo, torch::Tensor hrow, torch::Tensor slot, torch::Tensor emap,
-                          torch::Tensor FP, torch::Tensor FM) {
+                          torch::Tensor olist, torch::Tensor FP, torch::Tensor FM) {
     const c10::cuda::CUDAGuard guard(AH.device());
     check(slot, at::kInt, "slot"); check(FP, at::kFloat, "FP"); check(FM, at::kFloat, "FM");
     const int M = AH.size(1), KP = AH.size(2), N = BP.size(2), S = E.size(1), B = ev.size(0);
@@ -2100,8 +2118,13 @@ void top_k_bw_em_observed(torch::Tensor AH, torch::Tensor BP, torch::Tensor E, t
     args.FP = FP.data_ptr<float>(); args.FM = FM.data_ptr<float>();
     args.M = M; args.N = N; args.S = S; args.B = B;
     if (emap.numel() > 0) check(emap, at::kInt, "emap");
+    args.olist = nullptr; args.nl = B;
+    if (olist.numel() > 0) {
+        check(olist, at::kInt, "olist");
+        args.olist = olist.data_ptr<int>(); args.nl = (int)olist.numel();
+    }
     const int sms = at::cuda::getCurrentDeviceProperties()->multiProcessorCount, dev = AH.get_device();
-    const long units = (long)(M / TM) * (N / TN) * B;
+    const long units = (long)(M / TM) * (N / TN) * args.nl;
     const int grid = (int)std::max(1L, std::min((long)sms, units));
     auto stream = at::cuda::getCurrentCUDAStream();
 #define EM_CASE(NKV)                                                                                               \
@@ -2122,6 +2145,173 @@ void top_k_bw_em_observed(torch::Tensor AH, torch::Tensor BP, torch::Tensor E, t
 #undef EM_CASE
 }
 
+// ---------------------------------------------------------------------------------------------------------------------
+// The backward's small passes: the EM statistics' sample lists, and the element flows' and the statistics' scatters.
+
+// an exclusive scan of a pair over the block (every thread calls it; blockDim.x a multiple of 32); `tot` the sums
+__device__ __forceinline__ int2 block_scan2(int2 v, int2& tot) {
+    __shared__ int2 ws[32];
+    const int lane = threadIdx.x & 31, w = threadIdx.x >> 5, nw = blockDim.x >> 5;
+    int2 x = v;
+    #pragma unroll
+    for (int d = 1; d < 32; d <<= 1) {
+        const int p = __shfl_up_sync(~0u, x.x, d), q = __shfl_up_sync(~0u, x.y, d);
+        if (lane >= d) { x.x += p; x.y += q; }
+    }
+    if (lane == 31) ws[w] = x;
+    __syncthreads();
+    if (w == 0) {
+        int2 y = lane < nw ? ws[lane] : make_int2(0, 0);
+        #pragma unroll
+        for (int d = 1; d < 32; d <<= 1) {
+            const int p = __shfl_up_sync(~0u, y.x, d), q = __shfl_up_sync(~0u, y.y, d);
+            if (lane >= d) { y.x += p; y.y += q; }
+        }
+        ws[lane] = y;
+    }
+    __syncthreads();
+    tot = ws[nw - 1];
+    const int2 before = w > 0 ? ws[w - 1] : make_int2(0, 0);
+    return make_int2(before.x + x.x - v.x, before.y + x.y - v.y);
+}
+
+// (one CTA) the samples the EM statistics take -- `pmask` [B] (null: all) -- in the kernels' terms: SLOT [B] an observed
+// one's slot (-1 else), LWIDX [B] a masked one's place in `rows` (-1 else), EMAP [B] the row a sample reads, MROWS
+// [max(Rm, 1)] the masked ones in order then -1, NM [1] their count, OLIST [max(B - Rm, 1)] the observed ones in order
+// then -1. kind [B] and nothing else in shared memory.
+__global__ void __launch_bounds__(1024) tk_em_index_kernel(
+        const int* __restrict__ slot32, const long* __restrict__ rows, const long* __restrict__ emap,
+        const bool* __restrict__ pmask, int* __restrict__ SLOT, int* __restrict__ LWIDX, int* __restrict__ EMAP,
+        int* __restrict__ MROWS, int* __restrict__ NM, int* __restrict__ OLIST, int B, int Rm) {
+    extern __shared__ int kind[];
+    const int tid = threadIdx.x, nth = blockDim.x;
+    for (int b = tid; b < B; b += nth) {
+        kind[b] = 0;
+        LWIDX[b] = -1;
+        EMAP[b] = emap != nullptr ? (int)emap[b] : b;
+    }
+    __syncthreads();
+    for (int q = tid; q < Rm; q += nth) {
+        kind[rows[q]] = 1;
+        LWIDX[rows[q]] = q;
+    }
+    __syncthreads();
+    const int per = (B + nth - 1) / nth, b0 = min(B, tid * per), b1 = min(B, b0 + per);
+    int2 cnt = make_int2(0, 0);                                              // (the thread's: masked, observed taken)
+    for (int b = b0; b < b1; ++b)
+        if (pmask == nullptr || pmask[b]) { if (kind[b]) ++cnt.x; else ++cnt.y; }
+    int2 tot;
+    int2 at = block_scan2(cnt, tot);
+    for (int b = b0; b < b1; ++b) {
+        const bool take = pmask == nullptr || pmask[b];
+        SLOT[b] = take && !kind[b] ? slot32[b] : -1;
+        if (take) { if (kind[b]) MROWS[at.x++] = b; else OLIST[at.y++] = b; }
+    }
+    for (int j = tot.x + tid; j < max(Rm, 1); j += nth) MROWS[j] = -1;
+    for (int j = tot.y + tid; j < max(B - Rm, 1); j += nth) OLIST[j] = -1;
+    if (tid == 0) NM[0] = tot.x;
+}
+
+std::vector<torch::Tensor> top_k_em_index(torch::Tensor slot32, torch::Tensor rows, torch::Tensor emap,
+                                          torch::Tensor pmask) {
+    const c10::cuda::CUDAGuard guard(slot32.device());
+    check(slot32, at::kInt, "slot32"); check(rows, at::kLong, "rows");
+    const int B = slot32.size(0), Rm = rows.numel();
+    TORCH_CHECK(B <= 4096 && Rm <= B, "top_k: the EM statistics' lists of at most 4096 samples");
+    if (emap.numel() > 0) { check(emap, at::kLong, "emap"); TORCH_CHECK(emap.numel() == B, "top_k: emap [B]"); }
+    if (pmask.numel() > 0) { check(pmask, at::kBool, "pmask"); TORCH_CHECK(pmask.numel() == B, "top_k: pmask [B]"); }
+    auto o = slot32.options();
+    auto SLOT = torch::empty({B}, o), LWIDX = torch::empty({B}, o), EMAP = torch::empty({B}, o);
+    auto MROWS = torch::empty({std::max(Rm, 1)}, o), NM = torch::empty({1}, o), OLIST = torch::empty({std::max(B - Rm, 1)}, o);
+    tk_em_index_kernel<<<1, 1024, B * sizeof(int), at::cuda::getCurrentCUDAStream()>>>(
+        slot32.data_ptr<int>(), rows.data_ptr<long>(), emap.numel() > 0 ? emap.data_ptr<long>() : nullptr,
+        pmask.numel() > 0 ? pmask.data_ptr<bool>() : nullptr, SLOT.data_ptr<int>(), LWIDX.data_ptr<int>(),
+        EMAP.data_ptr<int>(), MROWS.data_ptr<int>(), NM.data_ptr<int>(), OLIST.data_ptr<int>(), B, Rm);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return {SLOT, LWIDX, EMAP, MROWS, NM, OLIST};
+}
+
+// element_flows[kids[k], b] = logaddexp(element_flows[kids[k], b], log EF[b, cols[k]]): the children's element flows
+// (log space, a sample a column) from the backward's EF [B, N] (linear), a 32 x 32 tile a CTA through shared memory
+__global__ void tk_scatter_ef_kernel(const float* __restrict__ EF, const long* __restrict__ cols,
+                                     const long* __restrict__ kids, float* __restrict__ ef, long ld, int B, int N, int nk) {
+    __shared__ float tile[32][33];
+    const int k0 = blockIdx.x * 32, b0 = blockIdx.y * 32, tx = threadIdx.x, ty = threadIdx.y;
+    const int kx = k0 + tx;
+    const long cx = kx < nk ? cols[kx] : 0;
+    for (int u = ty; u < 32; u += 8) {
+        const int b = b0 + u;
+        tile[u][tx] = (kx < nk && b < B) ? EF[(long)b * N + cx] : 0.f;
+    }
+    __syncthreads();
+    for (int u = ty; u < 32; u += 8) {
+        const int k = k0 + u, b = b0 + tx;
+        if (k >= nk || b >= B) continue;
+        float* p = ef + kids[k] * ld + b;
+        const float x = *p, y = __logf(tile[tx][u]);
+        const float m = fmaxf(x, y);
+        *p = m == -INFINITY ? m : m + log1pf(__expf(-fabsf(x - y)));
+    }
+}
+
+void top_k_scatter_ef(torch::Tensor EF, torch::Tensor cols, torch::Tensor kids, torch::Tensor element_flows) {
+    const c10::cuda::CUDAGuard guard(EF.device());
+    check(EF, at::kFloat, "EF"); check(cols, at::kLong, "cols"); check(kids, at::kLong, "kids");
+    TORCH_CHECK(element_flows.is_cuda() && element_flows.scalar_type() == at::kFloat && element_flows.dim() == 2 &&
+                element_flows.stride(1) == 1 && element_flows.size(1) == EF.size(0) && cols.numel() == kids.numel(),
+                "top_k: the element flows [rows, B] fp32 and EF [B, N]");
+    const int B = EF.size(0), N = EF.size(1), nk = cols.numel();
+    if (nk == 0 || B == 0) return;
+    dim3 grid((unsigned)((nk + 31) / 32), (unsigned)((B + 31) / 32)), block(32, 8);
+    tk_scatter_ef_kernel<<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
+        EF.data_ptr<float>(), cols.data_ptr<long>(), kids.data_ptr<long>(), element_flows.data_ptr<float>(),
+        element_flows.stride(0), B, N, nk);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+// The EM statistics onto a node vector's slots where its parameters lie block-major (`LowRank._scatter_add`'s grid:
+// (i, j) at ((i / bs * Nb + j / cbs) * cbs + j % cbs) * bs + i % bs): pf[pf0 + .] += FP[i, j], and where `den` is
+// given den[den0 + .] += FM[i, j] / theta (0 where theta = 0), theta = params[p0 + .] -- a 32 x 32 tile a CTA
+__global__ void tk_scatter_em_kernel(const float* __restrict__ FP, const float* __restrict__ FM,
+                                     const float* __restrict__ params, float* __restrict__ pf, float* __restrict__ den,
+                                     long p0, long pf0, long den0, int M, int N, int Nb, int cbs, int bs) {
+    __shared__ float tp[32][33], tm[32][33];
+    const int i0 = blockIdx.y * 32, j0 = blockIdx.x * 32, tx = threadIdx.x, ty = threadIdx.y;
+    for (int u = ty; u < 32; u += 8) {
+        const int i = i0 + u, j = j0 + tx;
+        const bool in = i < M && j < N;
+        tp[u][tx] = in ? FP[(long)i * N + j] : 0.f;
+        if (den != nullptr) tm[u][tx] = in ? FM[(long)i * N + j] : 0.f;
+    }
+    __syncthreads();
+    for (int u = ty; u < 32; u += 8) {
+        const int i = i0 + tx, j = j0 + u;                                    // (i fastest: the slots' order)
+        if (i >= M || j >= N) continue;
+        const long o = ((long)(i / bs) * Nb + j / cbs) * cbs * bs + (long)(j % cbs) * bs + i % bs;
+        pf[pf0 + o] += tp[tx][u];
+        if (den != nullptr) {
+            const float th = params[p0 + o];
+            den[den0 + o] += th > 0.f ? tm[tx][u] / th : 0.f;
+        }
+    }
+}
+
+void top_k_scatter_em(torch::Tensor FP, torch::Tensor FM, torch::Tensor params, torch::Tensor pf, torch::Tensor den,
+                      int64_t p0, int64_t pf0, int64_t den0, int64_t Nb, int64_t cbs, int64_t bs) {
+    const c10::cuda::CUDAGuard guard(FP.device());
+    check(FP, at::kFloat, "FP"); check(pf, at::kFloat, "param flows");
+    const int M = FP.size(0), N = FP.size(1);
+    const bool wd = den.numel() > 0;
+    if (wd) { check(FM, at::kFloat, "FM"); check(den, at::kFloat, "denominators"); check(params, at::kFloat, "params"); }
+    TORCH_CHECK(M % bs == 0 && N % cbs == 0 && N == Nb * cbs && (!wd || FM.sizes() == FP.sizes()),
+                "top_k: the statistics' grid");
+    dim3 grid((unsigned)((N + 31) / 32), (unsigned)((M + 31) / 32)), block(32, 8);
+    tk_scatter_em_kernel<<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
+        FP.data_ptr<float>(), wd ? FM.data_ptr<float>() : nullptr, wd ? params.data_ptr<float>() : nullptr,
+        pf.data_ptr<float>(), wd ? den.data_ptr<float>() : nullptr, p0, pf0, den0, M, N, (int)Nb, (int)cbs, (int)bs);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("top_k_prep", &top_k_prep, "a LowRank(top_k) sum node vector's operands and work items for `top_k_forward`");
     m.def("top_k_forward", &top_k_forward,
@@ -2132,4 +2322,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "the backward's EM statistics of the observed samples (a tile of the parameters a CTA, over the samples)");
     m.def("top_k_bw_grads", &top_k_bw_grads,
           "the backward's dA and cols passes: the element flows and the gradients, added into their destinations");
+    m.def("top_k_em_index", &top_k_em_index, "the samples the backward's EM statistics take, in the kernels' terms");
+    m.def("top_k_scatter_ef", &top_k_scatter_ef, "the children's element flows from the backward's EF (log space)");
+    m.def("top_k_scatter_em", &top_k_scatter_em,
+          "the EM statistics onto a node vector's slots of the parameter flows and the denominators (block-major)");
 }

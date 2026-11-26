@@ -81,6 +81,40 @@ def serves(desc, M: int, N: int, r: int, B: int, device, kwargs: dict, want_flow
             and (triton is not None or not want_flows) and top_k_fused.top_k_module() is not None)
 
 
+def scatter_element_flows(EF, cols, kids, element_flows) -> None:
+    """`element_flows[kids, :] = logaddexp(element_flows[kids, :], log EF[:, cols]^T)` (`top_k.sum_backward`'s) by one
+    kernel: the children's element flows from `terms`' EF [B, N] (fp32 flows, a sample a column)."""
+    from . import top_k_fused as tkf
+    tkf.top_k_module().top_k_scatter_ef(EF, cols, kids, element_flows)
+
+
+def scatter_statistics(geo, Fp, Fm, params, param_flows, pf0: int, denom, d0) -> bool:
+    """The EM statistics onto the node vector's slots by one kernel (`LowRank._scatter_add`'s): F+ into the parameter
+    flows from `pf0` on, F- / theta into the denominators from `d0` on (`denom` None: none) -- where its parameters lie
+    block-major (`geo["grid"]`) and all is fp32; False else (the torch passes then)."""
+    from . import top_k_fused as tkf
+    grid = geo["grid"]
+    if grid is None or params.dtype != torch.float32 or param_flows.dtype != torch.float32 or \
+            (denom is not None and denom.dtype != torch.float32):
+        return False
+    off, _, Nb, cbs, bs = grid
+    tkf.top_k_module().top_k_scatter_em(Fp, Fm, params, param_flows,
+                                        tkf._empty(Fp.device, torch.float32) if denom is None else denom, geo["p0"],
+                                        pf0 + off, 0 if denom is None else d0 + off, Nb, cbs, bs)
+    return True
+
+
+def _fold_operands(gviews, fold, B: int, dev):
+    """`(drow, sgn)` int32, float32 [B]: the row each sample's gradient goes into and its sign -- the fold's
+    (`StagedExternalParams.fold`), made once a backward, else a sample's own row, sign 1"""
+    if fold is None:
+        return torch.arange(B, dtype = torch.int32, device = dev), torch.ones(B, device = dev)
+    made = gviews.__dict__.get("_top_k_fold")
+    if made is None or made[0] is not fold:
+        made = gviews.__dict__["_top_k_fold"] = (fold, fold[0].to(torch.int32).contiguous(), fold[1].float().contiguous())
+    return made[1], made[2]
+
+
 def _dest_ok(g: torch.Tensor) -> bool:
     """`g` [batch, rows, n] as the kernels add into it: float32, its rows contiguous and adjacent, 16-byte aligned with a
     batch stride of a multiple of 4 floats"""
@@ -88,21 +122,22 @@ def _dest_ok(g: torch.Tensor) -> bool:
             and g.stride(0) % 4 == 0 and g.data_ptr() % 16 == 0)
 
 
-def terms(A, Bm, G, theta, element_mars, geo, slot, rows, logw_rows, f, emap, grads, gviews, fresh: bool,
-          want_flows: bool = False, pmask = None):
+def terms(A, Bm, G, theta, element_mars, geo, slot, rows, logw_rows, nf, emap, grads, gviews, fresh: bool,
+          want_flows: bool = False, pmask = None, counts = None):
     """`top_k._sum_backward_terms`' element flows `[B, N]`, the posterior counts `a` of the masked samples `rows`
     `[b, M, 65]` and the EM statistics `(F+, F-)` `[M, N]` (None unless `want_flows`; of the samples `pmask` [B] holds,
     if given) by the kernels; the gradients of
     `A [Bx, M, r]`, `Bm [Bx, r, N]`, `G [Bx, 65, N]` (a row of tensors each) ADDED into the destinations `grads` (None:
     none) -- where they fold (`StagedExternalParams.fold`) each sample's times its sign into the row it read, else
     into its own. `emap [B]` the row a sample reads (None: its own); the parameters `theta [M, N]` (0 where none); the
-    children's values `element_mars [geo["eid"], :]`; `f [B, M]` the node flows; the observed samples' slots `slot
-    [B]`, the masked ones' weights `logw_rows`."""
+    children's values `element_mars [geo["eid"], :]`; `nf [M, B]` the node flows' log-space rows (the circuit's
+    buffer); the observed samples' slots `slot [B]`, the masked ones' weights `logw_rows`; `counts` None, or the buffer
+    `[b, M, 72]` the posterior counts go into (their leaf's: `top_k_leaf_fused.counts_buffer`)."""
     from . import top_k_fused as tkf
     mod = tkf.top_k_module()
     Bx, M, r = A.shape
     N = Bm.size(2)
-    B = f.size(0)
+    B = nf.size(1)
     dev = A.device
     fold = getattr(gviews, "fold", None) if grads is not None else None
     # (the samples reading a row share one item -- its tile -- where their gradients merge: a fold, or none asked)
@@ -112,15 +147,15 @@ def terms(A, Bm, G, theta, element_mars, geo, slot, rows, logw_rows, f, emap, gr
                    emap, pair = pair)
     BP, E, ev, cmax, LTh, mitems, oitems, noitems, slot32, logw, flags = ops
     AH, L2T, LTc = mod.top_k_bw_prep(A_, theta.float().contiguous(), BP.size(1))
-    alpha, beta, acnt, ao, bo, hrow = mod.top_k_bw_rows(A_, *ops, f.float().contiguous())
+    alpha, beta, acnt, ao, bo, hrow = mod.top_k_bw_rows(A_, *ops, nf, tkf._empty(dev, torch.float32) if counts is None
+                                                        else counts)
     EF = torch.zeros(B, N, dtype = torch.float32, device = dev)
     if grads is not None:
         gviews.init_grads(grads) if fresh else None
-        drow, sgn = fold if fold is not None else (torch.arange(B, device = dev), None)
-        sgn = torch.ones(B, device = dev) if sgn is None else sgn
+        drow, sgn = _fold_operands(gviews, fold, B, dev)
         dests = [g if _dest_ok(g) else torch.zeros(g.shape, dtype = torch.float32, device = dev) for g in grads]
         mod.top_k_bw_grads(A_, AH, BP, E, ev, LTh, LTc, mitems, oitems, noitems, slot32, alpha, beta, ao, bo, hrow,
-                           drow.to(torch.int32).contiguous(), sgn.float().contiguous(), EF, *dests)
+                           drow, sgn, EF, *dests)
         for g, d in zip(grads, dests):
             if d is not g:
                 g.add_(d.to(g.dtype))
@@ -133,30 +168,25 @@ def terms(A, Bm, G, theta, element_mars, geo, slot, rows, logw_rows, f, emap, gr
     if want_flows:
         KP = BP.size(1)
         K0 = min(KP, 64)
-        EMAP = (torch.arange(B, device = dev) if emap is None else emap).to(torch.int32).contiguous()
-        LWIDX = torch.full((B,), -1, dtype = torch.int32, device = dev)
-        LWIDX[rows] = torch.arange(Rm, dtype = torch.int32, device = dev)
-        # (the observed samples the statistics take: a slot; -1 the others)
-        SLOT = torch.where((LWIDX >= 0) if pmask is None else (LWIDX >= 0) | ~pmask, -1, slot.to(torch.int32))
-        SLOT = SLOT.to(torch.int32).contiguous()
+        # (the samples the statistics take, in the kernels' terms: the observed ones' slots, -1 the others; the masked
+        # ones' places; the rows read; the masked and the observed ones taken, in order, -1 padded)
+        none = tkf._empty(dev, torch.long)
+        SLOT, LWIDX, EMAP, MROWS, NM, OLIST = mod.top_k_em_index(
+            slot32, rows.long().contiguous(), none if emap is None else emap.long().contiguous(),
+            tkf._empty(dev, torch.bool) if pmask is None else pmask.contiguous())
         # the masked samples' (Triton: stored, or zeros where none), then the observed ones' added (CUDA: a tile of
         # the parameters a CTA walking the samples)
         if Rm > 0:
             FP = torch.empty(M, N, dtype = torch.float32, device = dev)
             FM = torch.empty_like(FP)
-            if pmask is None:                                     # (the masked samples the statistics take, first)
-                mrows, nm = rows, torch.full((1,), Rm, dtype = torch.int32, device = dev)
-            else:
-                keep = pmask[rows]
-                mrows, nm = rows[torch.argsort((~keep).to(torch.int8), stable = True)], keep.sum(dtype = torch.int32)
-            _bw_em_kernel[(M // BM, N // BN)](AH, BP, L2T, E, ev, alpha, beta, hrow, mrows.to(torch.int32).contiguous(),
-                                              nm.reshape(1), LWIDX, EMAP, FP, FM, M, N, KP = KP, K0 = K0, K1 = KP - K0,
-                                              BM = BM, BN = BN, SA = SA, num_warps = 4, num_stages = 1)
+            _bw_em_kernel[(M // BM, N // BN)](AH, BP, L2T, E, ev, alpha, beta, hrow, MROWS, NM, LWIDX, EMAP, FP, FM, M,
+                                              N, KP = KP, K0 = K0, K1 = KP - K0, BM = BM, BN = BN, SA = SA, num_warps = 4,
+                                              num_stages = 1)
         else:
             FP = torch.zeros(M, N, dtype = torch.float32, device = dev)
             FM = torch.zeros_like(FP)
         if B > Rm:
             mod.top_k_bw_em_observed(AH, BP, E, ev, LTh, ao, bo, hrow, SLOT,
-                                     torch.empty(0, dtype = torch.int32, device = dev) if emap is None else EMAP, FP, FM)
+                                     tkf._empty(dev, torch.int32) if emap is None else EMAP, OLIST, FP, FM)
         flows = (FP, FM)
     return EF, acnt[:Rm, :, :65], flows

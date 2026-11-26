@@ -248,7 +248,7 @@ struct BwArgs {
     Tile g;
     const float* lz; const float* lb; const int* place;          // the forward's
     const float* flows; int logspace;                            // node flows [rows][B]
-    const int* wrow; const float* logw; const float* acnt;       // a missing token a sum reads: its row of the slots'
+    const int* wrow; const float* logw; const float* acnt; int acs;   // a missing token a sum reads: its row of the slots'
                                                                  // log-weights and posterior counts [R][M][K + 1]
     float* glp;                                                  // [B][nvars][C] (added into; null: not wanted)
     float* dtau;                                                 // [T][B][S][M] written, or (drow) [T][Bd][S][M] added
@@ -319,13 +319,13 @@ __global__ void __launch_bounds__(NW * 32) tk_leaf_backward_kernel(const BwArgs 
                 gH[j] = gB[j] = alone ? 0.f : -fo[j];
             }
         } else {
-            ac = a.acnt + ((long)r * g.M + i0) * (g.K + 1);
+            ac = a.acnt + ((long)r * g.M + i0) * a.acs;
             const float* lw = a.logw + ((long)r * g.M + i0) * (g.K + 1);
 #pragma unroll
             for (int j = 0; j < 4; ++j) {
                 float f = 0.f;
-                for (int s = 0; s <= g.K; ++s) f += ac[j * (g.K + 1) + s];
-                const float pr = ex2(lw[j * (g.K + 1) + g.K] * LOG2E), aK = ac[j * (g.K + 1) + g.K];
+                for (int s = 0; s <= g.K; ++s) f += ac[j * a.acs + s];
+                const float pr = ex2(lw[j * (g.K + 1) + g.K] * LOG2E), aK = ac[j * a.acs + g.K];
                 fo[j] = 0.f;
                 fm[j] = f;
                 cp[j] = pr > 0.f ? aK / pr : 0.f;
@@ -380,7 +380,7 @@ __global__ void __launch_bounds__(NW * 32) tk_leaf_backward_kernel(const BwArgs 
 #pragma unroll
                     for (int j = 0; j < 4; ++j) {
                         P[j] = ex2(at(th, j) + l + at(tc, j) - lzs[j]);
-                        const float d = miss ? (c < g.K && !alone ? ac[j * (g.K + 1) + c] : 0.f) : (c == p ? fo[j] : 0.f);
+                        const float d = miss ? (c < g.K && !alone ? ac[j * a.acs + c] : 0.f) : (c == p ? fo[j] : 0.f);
                         dl[j] = P[j] * (c < g.K ? gH[j] : gB[j]) + d;
                         fp[j] = alone ? cp[j] * P[j] : (c < g.K ? d : cp[j] * P[j]);
                     }
@@ -641,11 +641,13 @@ torch::Tensor top_k_leaf_backward(torch::Tensor tab, torch::Tensor nv_tab, torch
     a.Bd = fold ? (int)Bd : 0;
     a.lz = lz.data_ptr<float>(); a.lb = lb.data_ptr<float>(); a.place = place.data_ptr<int>();
     a.flows = flows.data_ptr<float>(); a.logspace = logspace ? 1 : 0;
-    a.wrow = nullptr; a.logw = nullptr; a.acnt = nullptr;
+    a.wrow = nullptr; a.logw = nullptr; a.acnt = nullptr; a.acs = 0;
     if (acnt.numel() > 0) {
         check(wrow, at::kInt, "wrow"); check(logw, at::kFloat, "logw"); check(acnt, at::kFloat, "acnt");
-        TORCH_CHECK(acnt.sizes() == logw.sizes(), "top_k leaf: acnt as logw");
+        TORCH_CHECK(acnt.size(0) == logw.size(0) && acnt.size(1) == logw.size(1) && acnt.size(2) >= logw.size(2),
+                    "top_k leaf: acnt [R, M, >= K + 1] as logw");
         a.wrow = wrow.data_ptr<int>(); a.logw = logw.data_ptr<float>(); a.acnt = acnt.data_ptr<float>();
+        a.acs = (int)acnt.size(2);
     }
     a.glp = glp.numel() > 0 ? glp.data_ptr<float>() : nullptr; a.dtau = dtau_out ? dtau.data_ptr<float>() : nullptr;
     a.fpT = nullptr; a.fmT = nullptr;
