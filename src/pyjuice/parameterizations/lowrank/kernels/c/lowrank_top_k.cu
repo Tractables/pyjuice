@@ -20,7 +20,9 @@
 // SAMPLES SHARING A ROW OF TENSORS (`external_params_rows`: both passes of a conditional one batch) share the tile W,
 // which their tensors alone determine: the WORK ITEMS (`tk_items_kernel`) gather them -- a MASKED item a sample whose
 // token is missing with up to two observed samples reading the same row (its partners), an OBSERVED item two slots of a
-// row and up to two of its observed samples. Without the map every sample reads its own row: the same items.
+// row and up to two of its observed samples. Without the map every sample reads its own row: the same items. The node
+// vectors reading one leaf layer take theirs from one launch a pass (`top_k_items`, a CTA a leaf: they depend on the
+// leaf's slots and masked rows alone) -- a launch a node vector was ~13.5 us of one CTA's scans on the chain each.
 //
 // TWO PERSISTENT LAUNCHES a node vector (`tk_sk_kernel`, stream-K: its notes below), one a kind of item:
 //
@@ -922,10 +924,12 @@ __global__ void tk_prep_kernel(
         const long* eid, const bool* has, const float* theta,
         const float* logwin, __half* BP, float* E, float* ev,
         float* cmax, uint2* LTh, float* logw,
-        int Bx, int B, int M, int N, int r, int KP, int S, int Rm) {
+        int Bx, int B, int M, int N, int r, int KP, int S, int Rm, int* flags, int nflags) {
     pdl_entry();
     const int task = blockIdx.y;
     const long tid0 = (long)blockIdx.x * blockDim.x + threadIdx.x, nth = (long)gridDim.x * blockDim.x;
+    if (task == 0 && blockIdx.x == 0)                                        // (the forward's stream-K flags)
+        for (int i = threadIdx.x; i < nflags; i += blockDim.x) flags[i] = 0;
     const long wid = tid0 >> 5, nwarp = nth >> 5;
     const int lane = threadIdx.x & 31;
     if (task == 0) {                                                         // B, fp16, its ranks padded
@@ -1002,16 +1006,35 @@ __global__ void tk_prep_kernel(
     }
 }
 
-// The work items (one CTA): a masked item a masked sample, its row of tensors and up to two observed samples reading
-// that row (its partners: the row's observed samples 2i, 2i + 1 for its i-th masked one); the row's other observed
-// samples in slots of two, an observed item two slots. Every sample's place among its row's samples of its kind by
-// scans in shared memory (deterministic: in the samples' order). `emap` the row each sample reads (null: its own);
-// `pair` 0: no partners, a sample an item (the backward where a row's samples keep their gradients apart).
+// The work items (a CTA a node vector's): a masked item a masked sample, its row of tensors and up to two observed
+// samples reading that row (its partners: the row's observed samples 2i, 2i + 1 for its i-th masked one); the row's
+// other observed samples in slots of two, an observed item two slots. Every sample's place among its row's samples of
+// its kind by scans in shared memory (deterministic: in the samples' order). `emap` the row each sample reads (null:
+// its own); `pair` 0: no partners, a sample an item (the backward where a row's samples keep their gradients apart).
+// `roff` (null: one node vector, Rm masked samples): CTA t the node vector reading leaf t, its masked samples rows
+// [roff[t], roff[t + 1]), its slots slot64 [t][B], its items past the earlier leaves' (`items_offsets`).
+__device__ __forceinline__ void items_offsets(const int* roff, int t, int B, long& mo, long& oo) {
+    mo = 0; oo = 0;
+    for (int u = 0; u < t; ++u) {
+        const int rm = roff[u + 1] - roff[u];
+        mo += max(rm, 1);
+        oo += 2 * max((B - rm + 1) / 2, 1) + 1;
+    }
+}
+
 __global__ void __launch_bounds__(1024) tk_items_kernel(
-        const long* emap, const long* rows, const long* slot64,
+        const long* emap, const long* rows, const int* roff, const long* slot64,
         int4* mitems, int4* oitems, int* noitems, int* slot32,
-        int* flags, int B, int Rm, int P, int pair) {
+        int B, int Rm, int pair) {
     pdl_entry();
+    if (roff != nullptr) {
+        const int t = blockIdx.x;
+        long mo, oo;
+        items_offsets(roff, t, B, mo, oo);
+        rows += roff[t]; Rm = roff[t + 1] - roff[t];
+        slot64 += (long)t * B; slot32 += (long)t * B;
+        mitems += mo; oitems += oo; noitems += t;
+    }
     extern __shared__ int sm[];
     int* se = sm;                                                            // [B] its group (pair: the row it reads)
     int* sk = se + B;                                                        // [B] its kind (1: masked)
@@ -1027,7 +1050,6 @@ __global__ void __launch_bounds__(1024) tk_items_kernel(
         slot32[b] = (int)slot64[b];
     }
     if (tid == 0) nslots = 0;
-    for (int i = tid; i < P; i += nth) flags[i] = 0;                         // (the forward's stream-K flags)
     __syncthreads();
     for (int q = tid; q < Rm; q += nth) {
         sk[rows[q]] = 1;
@@ -2103,11 +2125,13 @@ void bw_launches(BwArgs args, bool grads, int B, long gsz, int sms, int dev, cud
 // child is reached); theta [M, N] (fp32); a sample each (B of them): the observed slots `slot` [B], the row each reads
 // `emap` [B] (an empty tensor: its own); the masked samples `rows` [Rm] and their weights `logw` [Rm, M, S] (float32;
 // empty where none); `pair`: a row's samples in one item (else a sample an item); `lth` theta's l2t as an earlier
-// call made it (int32 [M N / 2], its LTh: not made again), or an empty tensor: (BP, E, ev, cmax, LTh, mitems, oitems,
-// noitems, slot32, logw, flags).
+// call made it (int32 [M N / 2], its LTh: not made again), or an empty tensor; `items` the work items (mitems, oitems,
+// noitems, slot32) `top_k_items` made for it with the others reading the leaf layer (pair), or empty (made here):
+// (BP, E, ev, cmax, LTh, mitems, oitems, noitems, slot32, logw, flags).
 std::vector<torch::Tensor> top_k_prep(torch::Tensor Bm, torch::Tensor G, torch::Tensor em, torch::Tensor eid,
                                       torch::Tensor has, torch::Tensor theta, torch::Tensor slot64, torch::Tensor emap,
-                                      torch::Tensor rows, torch::Tensor logwin, bool pair, torch::Tensor lth) {
+                                      torch::Tensor rows, torch::Tensor logwin, bool pair, torch::Tensor lth,
+                                      std::vector<torch::Tensor> items) {
     const c10::cuda::CUDAGuard guard(Bm.device());
     check_rows(Bm, at::kFloat, "B"); check_rows(G, at::kFloat, "G"); check(theta, at::kFloat, "theta");
     check(eid, at::kLong, "eid"); check(slot64, at::kLong, "slot"); check(rows, at::kLong, "rows");
@@ -2140,8 +2164,16 @@ std::vector<torch::Tensor> top_k_prep(torch::Tensor Bm, torch::Tensor G, torch::
                            "top_k: lth, an earlier call's LTh (int32 [M N / 2])");
     auto LTh = reuse ? lth : torch::empty({(long)M * N / 2}, i32);
     const long ocap = std::max((B - Rm + 1) / 2, 1);
-    auto mitems = torch::empty({std::max(Rm, 1), 4}, i32), oitems = torch::empty({2 * ocap + 1, 4}, i32);
-    auto noitems = torch::empty({1}, i32), slot32 = torch::empty({B}, i32);
+    const bool given = !items.empty();
+    if (given) {
+        TORCH_CHECK(items.size() == 4 && pair, "top_k: given work items (mitems, oitems, noitems, slot32), paired");
+        TORCH_CHECK(items[0].size(0) == std::max(Rm, 1) && items[1].size(0) == 2 * ocap + 1 && items[2].numel() == 1 &&
+                    items[3].numel() == B, "top_k: the given work items' shapes");
+        for (const auto& t : items) check(t, at::kInt, "items");
+    }
+    auto mitems = given ? items[0] : torch::empty({std::max(Rm, 1), 4}, i32);
+    auto oitems = given ? items[1] : torch::empty({2 * ocap + 1, 4}, i32);
+    auto noitems = given ? items[2] : torch::empty({1}, i32), slot32 = given ? items[3] : torch::empty({B}, i32);
     auto logw = padded ? logwin : torch::empty({std::max(Rm, 1), M, SP}, f32);
     // the forward's grid (each kind's launch): a CTA an SM, at least ~4 chunks a CTA (the observed items' count an
     // upper bound here); its flags, the masked launch's and the observed one's
@@ -2157,18 +2189,54 @@ std::vector<torch::Tensor> top_k_prep(torch::Tensor Bm, torch::Tensor G, torch::
         Rm > 0 && !padded ? logwin.data_ptr<float>() : nullptr,
         reinterpret_cast<__half*>(BP.data_ptr<at::Half>()), E.data_ptr<float>(), ev.data_ptr<float>(),
         cmax.data_ptr<float>(), reinterpret_cast<uint2*>(LTh.data_ptr<int>()), logw.data_ptr<float>(),
-        Bx, B, M, N, r, KP, S, Rm);
+        Bx, B, M, N, r, KP, S, Rm, flags.data_ptr<int>(), 2 * P);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
-    static bool done[64] = {};
-    const int ibytes = 5 * B * 4;
-    if (ibytes > 48 * 1024) smem_attr(tk_items_kernel, ibytes, Bm.get_device(), done);
-    launch_pdl(tk_items_kernel, dim3(1), dim3(1024), (int)ibytes, stream,
-        mapped ? emap.data_ptr<long>() : nullptr, rows.data_ptr<long>(), slot64.data_ptr<long>(),
-        reinterpret_cast<int4*>(mitems.data_ptr<int>()), reinterpret_cast<int4*>(oitems.data_ptr<int>()),
-        noitems.data_ptr<int>(), slot32.data_ptr<int>(), flags.data_ptr<int>(), B, Rm, 2 * P, pair ? 1 : 0);
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    if (!given) {
+        static bool done[64] = {};
+        const int ibytes = 5 * B * 4;
+        if (ibytes > 48 * 1024) smem_attr(tk_items_kernel, ibytes, Bm.get_device(), done);
+        launch_pdl(tk_items_kernel, dim3(1), dim3(1024), (int)ibytes, stream,
+            mapped ? emap.data_ptr<long>() : nullptr, rows.data_ptr<long>(), (const int*)nullptr, slot64.data_ptr<long>(),
+            reinterpret_cast<int4*>(mitems.data_ptr<int>()), reinterpret_cast<int4*>(oitems.data_ptr<int>()),
+            noitems.data_ptr<int>(), slot32.data_ptr<int>(), B, Rm, pair ? 1 : 0);
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+    }
     if (Rm == 0) mitems = mitems.narrow(0, 0, 0);
     return {BP, E, ev, cmax, LTh, mitems, oitems, noitems, slot32, logw, flags};
+}
+
+// The paired work items of the T node vectors reading a leaf layer's T leaves, in one launch (`tk_items_kernel`, a CTA
+// a leaf): leaf t's masked samples rows [offs[t], offs[t + 1]) of `rows` (int64; `roff` the offsets on the device,
+// int32 [T + 1]), its observed slots `slots` [T, B] (int64), `emap` [B] the row each sample reads (empty: its own) --
+// (mitems [sum max(Rm_t, 1), 4], oitems [sum (2 max((B - Rm_t + 1) / 2, 1) + 1), 4], noitems [T], slot32 [T, B]), a
+// leaf's after the earlier leaves' (`top_k_prep`'s `items` the slices).
+std::vector<torch::Tensor> top_k_items(torch::Tensor emap, torch::Tensor rows, torch::Tensor roff,
+                                       std::vector<int64_t> offs, torch::Tensor slots) {
+    const c10::cuda::CUDAGuard guard(slots.device());
+    check(rows, at::kLong, "rows"); check(roff, at::kInt, "roff"); check(slots, at::kLong, "slots");
+    const int T = (int)offs.size() - 1, B = (int)slots.size(1);
+    TORCH_CHECK(T >= 1 && slots.dim() == 2 && slots.size(0) == T && roff.numel() == T + 1 && B <= 4096,
+                "top_k: items of T leaves: slots [T, B], offsets T + 1, at most 4096 samples");
+    const bool mapped = emap.numel() > 0;
+    if (mapped) { check(emap, at::kLong, "emap"); TORCH_CHECK(emap.size(0) == B, "top_k: emap [B]"); }
+    long nm = 0, no = 0;
+    for (int t = 0; t < T; ++t) {
+        const long rm = offs[t + 1] - offs[t];
+        nm += std::max(rm, 1L);
+        no += 2 * std::max((B - rm + 1) / 2, 1L) + 1;
+    }
+    auto i32 = slots.options().dtype(at::kInt);
+    auto mitems = torch::empty({nm, 4}, i32), oitems = torch::empty({no, 4}, i32);
+    auto noitems = torch::empty({T}, i32), slot32 = torch::empty({T, B}, i32);
+    static bool done[64] = {};
+    const int ibytes = 5 * B * 4;
+    if (ibytes > 48 * 1024) smem_attr(tk_items_kernel, ibytes, slots.get_device(), done);
+    launch_pdl(tk_items_kernel, dim3(T), dim3(1024), (int)ibytes, at::cuda::getCurrentCUDAStream(),
+        mapped ? emap.data_ptr<long>() : nullptr, rows.numel() > 0 ? rows.data_ptr<long>() : nullptr,
+        roff.data_ptr<int>(), slots.data_ptr<long>(), reinterpret_cast<int4*>(mitems.data_ptr<int>()),
+        reinterpret_cast<int4*>(oitems.data_ptr<int>()), noitems.data_ptr<int>(), slot32.data_ptr<int>(), B, 0, 1);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return {mitems, oitems, noitems, slot32};
 }
 
 // The sums' persistent launches (`tk_sk_kernel`): the masked items' and the observed items' beside it on a side stream
@@ -2615,6 +2683,7 @@ void top_k_scatter_em(torch::Tensor FP, torch::Tensor FM, torch::Tensor params, 
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("top_k_prep", &top_k_prep, "a LowRank(top_k) sum node vector's operands and work items for `top_k_forward`");
+    m.def("top_k_items", &top_k_items, "the paired work items of the node vectors reading a leaf layer, one launch");
     m.def("top_k_forward", &top_k_forward,
           "a LowRank(top_k) sum node vector's values and its backward's stash: a persistent stream-K launch for each "
           "kind of work item");

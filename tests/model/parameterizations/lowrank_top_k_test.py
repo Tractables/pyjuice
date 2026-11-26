@@ -885,8 +885,9 @@ def test_zero_weights_give_zero_gradients_and_no_em_statistics(kernels, impossib
 
 def test_tied_sums_make_their_parameters_tables_once_a_pass(monkeypatch):
     """Tied `LowRank(top_k)` sums make their parameters' tables (theta's grid, the forward's and the backward's l2t)
-    once a pass and share them (`top_k_fused.theta_tables`): the values bit for bit those of tables made at every sum,
-    the gradients and the EM statistics up to the order of the kernels' adds; the next forward makes them again -- an
+    once a pass and share them (`top_k_fused.theta_tables`), and the sums reading the leaf layer their work items in
+    one launch (`top_k_fused.work_items`): the values bit for bit those of tables and items made at every sum, the
+    gradients and the EM statistics up to the order of the kernels' adds; the next forward makes them again -- an
     update of the parameters in place, through `.data` (no version bump), is seen."""
     import pyjuice.parameterizations.lowrank.top_k_fused as tkf
     import pyjuice.parameterizations.lowrank.top_k_leaf_fused as tlf
@@ -908,7 +909,8 @@ def test_tied_sums_make_their_parameters_tables_once_a_pass(monkeypatch):
                 param_flows_mask = torch.arange(2 * b, device = DEV) < b).view(-1)
         (-(wt * (ll[:b] - ll[b:])).sum()).backward()
         cache = tlf.pass_cache(dict(layer = pc.input_layer_group[0]), 2 * b)
-        seen.append(None if cache is None else sorted(k_ for v in cache.values() for k_ in v))
+        seen.append(None if cache is None else
+                    (sorted(k_ for v in cache.values() if isinstance(v, dict) for k_ in v), "items" in cache))
         return [ll.detach()] + [t.grad for v in ts.values() for t in v] + [lpg.grad] + _stats(pc)
 
     def same(a, b_):
@@ -918,7 +920,7 @@ def test_tied_sums_make_their_parameters_tables_once_a_pass(monkeypatch):
             assert _rel(u, v) < 1e-5, (k, _rel(u, v))
 
     got = conditional()
-    assert seen[-1] == ["L2T", "LTc", "LTh", "theta"], seen      # (one entry: the tied sums' source)
+    assert seen[-1] == (["L2T", "LTc", "LTh", "theta"], True), seen     # (one entry: the tied sums' source)
     with monkeypatch.context() as mp:
         mp.setattr(tlf, "pass_cache", lambda sib, batch_size: None)    # (tables made at every sum)
         same(got, conditional())

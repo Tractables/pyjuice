@@ -76,20 +76,47 @@ def theta_tables(desc, sib, ns, geo, params, batch_size: int) -> dict:
     return tab
 
 
-def prep(Bm, G, element_mars, eid, has, theta, slot, rows_m, logw_m, emap = None, pair: bool = True, lth = None):
+def prep(Bm, G, element_mars, eid, has, theta, slot, rows_m, logw_m, emap = None, pair: bool = True, lth = None,
+         items = None):
     """`top_k_prep`'s operands: `B [Bx, r, N]`, `G [Bx, K + 1, N]` a row of tensors each; the children's values
     `element_mars [eid, :]` (`has` [N] bool where an edge reaches them, None where every child is reached); `theta [M,
     N]` the shared parameters (0 where none); a sample each: `slot [B]` the observed token's slot, `emap [B]` the row of
     tensors it reads (None: its own, Bx = B); `rows_m` the samples whose token is missing and their slots' log-weights
     `logw_m [b, M, K + 1]` (None where none); `pair`: the samples reading a row share its work items (else a sample an
-    item); `lth` theta's l2t as an earlier call made it (`theta_tables`' "LTh": not made again), or None."""
+    item); `lth` theta's l2t as an earlier call made it (`theta_tables`' "LTh": not made again), or None; `items` its
+    work items as `work_items` made them, or None (made by the prep)."""
     dev = Bm.device
     f = lambda t: t.float().contiguous()
     return top_k_module().top_k_prep(
         _rows(Bm), _rows(G), element_mars, eid.long().contiguous(), _empty(dev, torch.bool) if has is None else has, f(theta),
         slot.long().contiguous(), _empty(dev, torch.long) if emap is None else emap.long().contiguous(),
         rows_m.long().contiguous(), _empty(dev, torch.float32) if logw_m is None else _weights_operand(logw_m), pair,
-        _empty(dev, torch.int32) if lth is None else lth)
+        _empty(dev, torch.int32) if lth is None else lth, [] if items is None else items)
+
+
+def work_items(sib: dict, batch_size: int, emap):
+    """The paired work items of a sum reading the leaf `sib` -- `top_k_items`' for every node vector reading the leaf's
+    layer, one launch a pass (kept in the leaf's forward state, whose slots and masked rows they are made from) --, or
+    None where the leaf's layer has no forward state (the prep makes its own)."""
+    from . import top_k_leaf_fused
+    cache = top_k_leaf_fused.pass_cache(sib, batch_size)
+    st = top_k_leaf_fused._state(sib["layer"], batch_size)
+    if cache is None or st is None or st.get("slot") is None:
+        return None
+    got = cache.get("items")
+    if got is None:
+        offs, B, dev = st["offs"], batch_size, st["slot"].device
+        roff = top_k_leaf_fused._to_device(torch.tensor(offs, dtype = torch.int32), dev)
+        mi, oi, ni, s32 = top_k_module().top_k_items(_empty(dev, torch.long) if emap is None else emap.long().contiguous(),
+                                                     st["rows"].long().contiguous(), roff, offs, st["slot"].contiguous())
+        got, mo, oo = [], 0, 0
+        for t in range(len(offs) - 1):                                     # (a leaf's after the earlier leaves')
+            rm = offs[t + 1] - offs[t]
+            m1, o1 = mo + max(rm, 1), oo + 2 * max((B - rm + 1) // 2, 1) + 1
+            got.append([mi[mo:m1], oi[oo:o1], ni[t:t + 1], s32[t]])
+            mo, oo = m1, o1
+        cache["items"] = got
+    return got[top_k_leaf_fused._plan(sib["layer"])["index"][id(sib["ns"])]]
 
 
 #: The masked samples' weights' row stride in the kernels' operand (`SP` of `kernels/c/lowrank_top_k.cu`)
@@ -131,7 +158,7 @@ def sum_forward(desc, layer, ns_info, tensors, geo, params, element_mars, node_m
     slot, rows_m, logw_m, _, _ = slot_parts(desc, sib, B, kwargs, node_mars.device)
     tab = theta_tables(desc, sib, ns_info.ns, geo, params, B)              # (the parameters' tables: once a pass)
     ops = prep(Bm, G, element_mars, geo["eid"], None if geo["full"] else geo["has"], tab["theta"], slot, rows_m, logw_m,
-               emap, lth = tab.get("LTh"))
+               emap, lth = tab.get("LTh"), items = work_items(sib, B, emap))
     tab.setdefault("LTh", ops[4])
     # (a backward may follow -- the call had grad on -- and its kernels serve: the operands and the sums' stash kept
     # for it, which `top_k_backward.terms` takes: `kept_of`)
