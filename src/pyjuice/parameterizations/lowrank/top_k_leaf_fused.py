@@ -132,9 +132,8 @@ def leaf_forward(desc, layer, data: torch.Tensor, node_mars: torch.Tensor, kwarg
     tilts = [staged[n["ns"]] for n in nodes]
     Bx, S = tilts[0][0].size(0), tilts[0][1].size(2)
     tau = torch.empty(T, Bx, S, M, dtype = torch.float32, device = dev)
-    for t, (A, Bt) in enumerate(tilts):
-        torch.bmm(Bt.float().transpose(1, 2), A.float().transpose(1, 2), out = tau[t])   # (A B)^T [Bx, S, M]
-    tau.mul_(_L2E)
+    for t, (A, Bt) in enumerate(tilts):                                                  # log2 e (A B)^T [Bx, S, M]
+        torch.bmm((Bt.float() * _L2E).transpose(1, 2), A.float().transpose(1, 2), out = tau[t])   # (the scale on Bt)
     ids = kwargs["soft_evidence_cat_ids"].to(torch.int32).contiguous()
     lp = kwargs["categorical_evidence_logp"].float().contiguous()
     emap32 = torch.empty(0, dtype = torch.int32, device = dev) if emap is None else emap.to(torch.int32).contiguous()
@@ -178,11 +177,48 @@ def add_counts(sib: dict, K: int, batch_size: int, a_rows: torch.Tensor) -> bool
     return True
 
 
+
+def _tilt_grads(mod, nodes, graded, dtau, staged, gviews, fresh, emap) -> None:
+    """The tilt's gradients from dtau [T, B or Bx (folded), S, M] (a row of destinations each, reading the row of
+    tensors `emap` names -- None: its own), added into the destinations: one pass over dtau and the factors a run of
+    positions whose operands share their strides (`top_k_leaf_tilt_grads`), else cuBLAS's products into them."""
+    dests = [gviews.get(n["ns"]) for n in graded]
+    if fresh:
+        for g in dests:
+            gviews.init_grads(g)
+    idx = [nodes.index(n) for n in graded]
+    ops = [tuple(x.float() for x in staged[n["ns"]]) + tuple(g) for n, g in zip(graded, dests)]
+    A0, B0 = ops[0][0], ops[0][1]
+    fits = (A0.size(2) <= 64 and B0.size(2) <= 65 and A0.size(1) % 64 == 0 and dtau.dtype == torch.float32 and
+            all(x.dtype == torch.float32 for o in ops for x in o))
+    em = torch.empty(0, dtype = torch.int32, device = dtau.device) if emap is None else emap.to(torch.int32).contiguous()
+    k = 0
+    while k < len(ops):
+        if not fits:
+            t = idx[k]
+            A, Bt, gA, gB = ops[k]
+            if emap is not None:
+                A, Bt = A.index_select(0, emap), Bt.index_select(0, emap)
+            D = dtau[t].transpose(1, 2)                                                     # [B or Bx, M, S]
+            gA.baddbmm_(D, Bt.transpose(1, 2))
+            gB.baddbmm_(A.transpose(1, 2), D)
+            k += 1
+            continue
+        # a run of consecutive positions with the same strides (one launch)
+        j = k + 1
+        while j < len(ops) and idx[j] == idx[j - 1] + 1 and all(x.stride() == y.stride() for x, y in zip(ops[j], ops[k])):
+            j += 1
+        run = ops[k:j]
+        ptrs = torch.tensor([[o[q].data_ptr() for o in run] for q in range(4)], dtype = torch.int64, device = dtau.device)
+        strides = torch.tensor([s for x in run[0] for s in x.stride()], dtype = torch.int64)
+        mod.top_k_leaf_tilt_grads(dtau[idx[k]:idx[j - 1] + 1], ptrs, strides, em, A0.size(2))
+        k = j
+
 def leaf_backward(desc, layer, data, node_flows: torch.Tensor, kwargs: dict, logspace_flows: bool, missing_mask,
                   batch_first: bool, compute_param_flows: bool) -> bool:
     """`top_k.leaf_backward` by the kernels, from the layer's forward state and the reading sums' counts; False where
     the forward left none (the torch passes then)."""
-    from .top_k import _staged, _grads_kw, _store, per_sample, external_rows, fold_signs
+    from .top_k import _staged, _grads_kw, external_rows
     st = _state(layer, node_flows.size(1))
     if st is None or node_flows.dtype != torch.float32 or not node_flows.is_contiguous():
         return False
@@ -199,10 +235,17 @@ def leaf_backward(desc, layer, data, node_flows: torch.Tensor, kwargs: dict, log
     counts = st["counts"] if st["counts"] is not None else none
     em = compute_param_flows and layer.param_flows is not None
     fpT, fmT = (torch.zeros_like(st["tab"]), torch.zeros_like(st["tab"])) if em else (none, none)
+    # the tilt's gradients' dtau: where any is wanted; where the destinations fold, each sample's times its sign summed
+    # into the row it read by the kernel -- a row's gradients then one product
+    graded = [n for n in nodes if gviews is not None and gviews.get(n["ns"]) is not None]
+    fold = getattr(gviews, "fold", None) if graded else None
+    drow, dsgn, Bd = none.int(), none, 0
+    if fold is not None:
+        drow, dsgn, Bd = fold[0].to(torch.int32).contiguous(), fold[1].float().contiguous(), staged[graded[0]["ns"]][0].size(0)
     dtau = mod.top_k_leaf_backward(st["tab"], plan["nv_tab"], st["tau"], st["emap"], st["ids"], st["lp"], plan["nv_lvid"],
                                    plan["nv_row0"], st["lz"], st["lb"], st["place"], node_flows, logspace_flows,
                                    st["wrow"], st["logw"], counts, st["S"], st["K"], glp if glp is not None else none,
-                                   fpT, fmT)
+                                   fpT, fmT, bool(graded), drow, dsgn, Bd)
     if em:                                                                              # (F+ then F- of each block's rows)
         V = nodes[0]["ns"].dist.num_cats
         for k, spf in enumerate(plan["flows"]):
@@ -210,18 +253,7 @@ def leaf_backward(desc, layer, data, node_flows: torch.Tensor, kwargs: dict, log
             mod.top_k_leaf_fold(fmT[k], spf, layer.param_flows, V)
     if glp is not None and glp is not glp_out:
         glp_out += glp.to(glp_out.dtype)
-    if gviews is not None:
-        emap = external_rows(kwargs)
-        sign = fold_signs(gviews)                                                           # (folded: in the factors)
-        for t, n in enumerate(nodes):
-            grads = gviews.get(n["ns"])
-            if grads is None:
-                continue
-            A, Bt = (x.float() for x in per_sample(staged[n["ns"]], emap))
-            if sign is not None:
-                A, Bt = A * sign[:, None, None], Bt * sign[:, None, None]
-            D = dtau[t].transpose(1, 2)                                                     # [B, M, S]
-            _store(gviews, fresh, grads, [torch.bmm(D, Bt.transpose(1, 2)), torch.bmm(A.transpose(1, 2), D)],
-                   signed = sign is not None)
+    if graded:
+        _tilt_grads(mod, nodes, graded, dtau, staged, gviews, fresh, None if fold is not None else external_rows(kwargs))
     st["counts"] = None
     return True

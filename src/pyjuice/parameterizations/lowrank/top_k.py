@@ -263,24 +263,17 @@ def sum_forward(desc, layer, ns_tensors, node_mars, element_mars, params, kwargs
     return None
 
 
-def fold_signs(gviews):
-    """The samples' signs where the gradient destinations fold (`StagedExternalParams.fold`) -- a writer may scale
-    its values by them and hand `_store` the values `signed` --, else None."""
-    fold = getattr(gviews, "fold", None)
-    return None if fold is None else fold[1]
-
-
 def _grads_kw(kwargs):
     from pyjuice.layer.parameterized_sum_layer import EXTERNAL_PARAMS_GRAD_KWARG
     gviews = kwargs.get(EXTERNAL_PARAMS_GRAD_KWARG)
     return gviews, getattr(gviews, "fresh", False)
 
 
-def _store(gviews, fresh, grads, values, rows = None, signed: bool = False) -> None:
+def _store(gviews, fresh, grads, values, rows = None) -> None:
     """Add `values` -- a sample each: every sample, or the samples `rows` -- into the gradient destinations `grads`;
     the destinations' first writer of the pass initializes them where they were handed over unzeroed (`fresh`). Where
     the destinations fold (`StagedExternalParams.fold`: the rows of the map, the samples' signs) each sample's value
-    goes into the row it read, times its sign (`signed`: the values carry it already, `fold_signs`)."""
+    goes into the row it read, times its sign."""
     if fresh and gviews.claim(grads):
         for g in grads:
             g.zero_()
@@ -288,9 +281,7 @@ def _store(gviews, fresh, grads, values, rows = None, signed: bool = False) -> N
     if fold is not None:
         into, sign = fold if rows is None else (fold[0][rows], fold[1][rows])
     for g, v in zip(grads, values):
-        if fold is not None and signed:
-            g.index_add_(0, into, v.to(g.dtype))
-        elif fold is not None:
+        if fold is not None:
             g.index_add_(0, into, (v * sign.view(-1, *([1] * (v.dim() - 1))).to(v.dtype)).to(g.dtype))
         elif rows is None:
             g.add_(v.to(g.dtype))
