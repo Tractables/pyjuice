@@ -212,7 +212,10 @@ __global__ void __launch_bounds__(NW * 32) tk_leaf_forward_kernel(const FwArgs a
 #pragma unroll
     for (int j = 0; j < 4; ++j) {
         bulk[j].m += at(tK, j);
-        lzs[j] = lse_log2(lse_merge(lse_merge(own[j], mid[j]), bulk[j]));
+        // (no candidate with mass -- all of its evidence impossible: the normalizer 0, so that every log-probability
+        // stays -inf and the backward's terms 2^(x - lz) are 0, not -inf - -inf)
+        const float lz = lse_log2(lse_merge(lse_merge(own[j], mid[j]), bulk[j]));
+        lzs[j] = lz == -INFINITY ? 0.f : lz;
         lbs[j] = lse_log2(bulk[j]);
     }
     st4(a.lz + tb * g.M + i0, lzs[0], lzs[1], lzs[2], lzs[3]);

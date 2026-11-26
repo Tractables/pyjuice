@@ -129,7 +129,8 @@ def leaf_log_probs(layer, ns, lp_v: torch.Tensor, ids_v: torch.Tensor, tilt = No
         tau = torch.bmm(_d(tilt[0]), _d(tilt[1]))                                              # [B, M, K + 1]
         slot = torch.arange(C, device = lt.device).clamp(max = K)
         lt = lt + tau[:, :, slot]
-    return lt - torch.logsumexp(lt, dim = 2, keepdim = True)
+    z = torch.logsumexp(lt, dim = 2, keepdim = True)
+    return lt - z.masked_fill(z == -float("inf"), 0.0)           # (no candidate with mass: every log-probability -inf)
 
 
 def leaf_forward(desc, layer, data: torch.Tensor, node_mars: torch.Tensor, kwargs: dict) -> None:

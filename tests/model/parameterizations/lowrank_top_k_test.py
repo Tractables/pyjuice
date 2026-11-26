@@ -764,6 +764,37 @@ def test_one_backward_for_the_gradients_and_the_em_statistics(kernels):
     assert abs(cum - cum_want) < 1e-5 * cum_want, (cum, cum_want)
 
 
+@pytest.mark.parametrize("kernels", [False, True])
+def test_impossible_evidence_has_no_mass(kernels):
+    """A sample whose soft evidence is impossible (every candidate's -inf): its leaves' log-probabilities -inf, not
+    the NaN of a normalizer -inf - -inf -- its log-likelihood -inf in both passes of the conditional --, every other
+    sample's value as without it."""
+    pc, (ext, ids, lp, x, miss), (T, N, b) = _mask_case(kernels)
+    pext, lp = _pc_ext(ext, T, N), lp.float()
+    bad = lp.clone()
+    bad[0] = -float("inf")
+    rows = torch.arange(b, device = DEV).repeat(2)
+
+    def lls(lp_):
+        with torch.no_grad():
+            return pc(x.repeat(2, 1), missing_mask = torch.cat([torch.zeros_like(miss), miss]), external_params = pext,
+                      external_params_rows = rows, categorical_evidence_logp = lp_.repeat(2, 1, 1),
+                      soft_evidence_cat_ids = ids.repeat(2, 1, 1)).view(-1)
+
+    import pyjuice.parameterizations.lowrank.top_k_fused as tkf
+    if kernels and tkf.top_k_module() is None:
+        pytest.skip("the CUDA modules did not build")
+    tkf.TOP_K_FUSED = kernels
+    try:
+        good, got = lls(lp), lls(bad)
+    finally:
+        tkf.TOP_K_FUSED = True
+    others = torch.ones(2 * b, dtype = torch.bool, device = DEV)
+    others[0] = others[b] = False
+    assert bool((got[[0, b]] == -float("inf")).all()), got[[0, b]]
+    assert torch.equal(got[others], good[others])
+
+
 def test_the_kernels_together_are_the_torch_passes():
     """Every pass by the kernels -- the sums' (their counts written straight into the leaves' buffer) and the leaves' --
     against every pass by torch: the differentiable conditional in one call (the map) with the EM statistics of its
