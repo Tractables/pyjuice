@@ -455,6 +455,89 @@ def test_the_fused_leaf_is_the_torch_passes(C):
         assert _rel(a, r_) < 1e-4, (name, _rel(a, r_))
 
 
+@pytest.mark.parametrize("re, S, layout, T", [(64, 65, "groups", 4), (20, 9, "groups", 4), (6, 65, "ranks strided", 4),
+                                              (8, 33, "slots strided", 70)])
+def test_the_tilt_kernels_are_the_products(re, S, layout, T):
+    """The leaves' tilt products by their kernels (`kernels/c/lowrank_top_k_tilt.cu`) against float64: the forward's
+    log2 e (A B)^T, and the gradients of destination rows reading the tensors' rows through a map -- into destinations
+    of NaN handed over unzeroed (each one's first writer stores it whole), and added into others; two positions sharing
+    one destination (the second adds) -- at the groups' layout (A [n, T M, re], B [n, T re, S] split along their axis)
+    and with the ranks or the slots strided (the scalar paths); rank counts and slots below the kernels' 64 and 65, and
+    more positions than a launch takes."""
+    import math
+    import pyjuice.parameterizations.lowrank.top_k_leaf_fused as tlf
+    from pyjuice.layer.parameterized_sum_layer import StagedExternalParams
+    if tlf.tilt_module() is None:
+        pytest.skip("the CUDA module did not build")
+    Bx, M = 3, 256
+    g = torch.Generator(device = DEV).manual_seed(100 * re + S)
+    rn = lambda *s: torch.randn(*s, device = DEV, generator = g)
+    U = rn(Bx, re, T * M).transpose(1, 2) if layout == "ranks strided" else rn(Bx, T * M, re)
+    Dd = rn(Bx, S, T * re).transpose(1, 2) if layout == "slots strided" else rn(Bx, T * re, S)
+    tilts = [(U[:, t * M:(t + 1) * M], Dd[:, t * re:(t + 1) * re]) for t in range(T)]
+    tau = torch.empty(T, Bx, S, M, device = DEV)
+    tlf._tilts(tilts, tau)
+    ref = torch.stack([torch.bmm(Bt.double().transpose(1, 2), A.double().transpose(1, 2)) for A, Bt in tilts])
+    assert _rel(tau, ref / math.log(2.0)) < 1e-6, _rel(tau, ref / math.log(2.0))
+
+    emap = torch.tensor([2, 0, 1, 1, 0, 2], device = DEV)
+    D = rn(T, emap.numel(), S, M)
+    want = [[torch.bmm(D[t].double().transpose(1, 2), Bt.double()[emap].transpose(1, 2)),
+             torch.bmm(A.double()[emap].transpose(1, 2), D[t].double().transpose(1, 2))]
+            for t, (A, Bt) in enumerate(tilts)]
+    want[T - 2] = [a + b for a, b in zip(want[T - 2], want[T - 1])]       # (the last position writes the one before's)
+    nodes = [dict(ns = t) for t in range(T)]
+    for fresh, fill in ((True, float("nan")), (False, 1.0)):
+        gU = torch.full((emap.numel(), T * M, re), fill, device = DEV)
+        gD = torch.full((emap.numel(), T * re, S), fill, device = DEV)
+        dst = [(gU[:, t * M:(t + 1) * M], gD[:, t * re:(t + 1) * re]) for t in range(T - 1)]
+        gv = StagedExternalParams({t: dst[min(t, T - 2)] for t in range(T)})
+        gv.fresh = fresh
+        tlf._tilt_grads(nodes, nodes, D, dict(enumerate(tilts)), gv, fresh, emap)
+        base = 0.0 if fresh else 1.0
+        for t in range(T - 1):
+            for name, got, w in zip(("A", "B"), dst[t], want[t]):
+                assert _rel(got - base, w) < 2e-6, (fresh, t, name, _rel(got - base, w))
+
+
+def test_the_kernels_initialize_the_gradient_destinations():
+    """Destinations handed over unzeroed (`StagedExternalParams.fresh`: every node's backward initializes what it
+    writes) keep whatever they held -- NaN here -- until written: the kernels' backward (the leaves' tilt products
+    storing theirs whole, the sums' zeroing theirs before they add) gives the gradients of zeroed destinations and of
+    the circuit's own buffer (zeroed, added into)."""
+    import pyjuice.parameterizations.lowrank.top_k_leaf_fused as tlf
+    pc, (ext, ids, lp, x, miss), (T, N, b) = _mask_case(True)
+    if tlf.tilt_module() is None:
+        pytest.skip("the CUDA module did not build")
+    pext, lp = _pc_ext(ext, T, N), lp.float()
+    evi = dict(categorical_evidence_logp = lp, soft_evidence_cat_ids = ids)
+    tm, stores = tlf.tilt_module(), []
+    real = tm.top_k_leaf_tilt_grads
+    tm.top_k_leaf_tilt_grads = lambda *a: (stores.append(a[5]), real(*a))[1]
+
+    def grads(fill):
+        with torch.no_grad():
+            pc(x, missing_mask = miss, external_params = pext, **evi)
+        kw = dict(missing_mask = miss, compute_param_flows = False, logspace_flows = True, allow_modify_flows = False,
+                  **evi)
+        if fill is None:
+            pc.backward(x, **kw)
+            return [t.clone() for grp in ("tr", "em") for t in pc.get_external_params_grad(grp)]
+        g = {k_: tuple(torch.full_like(t, fill) for t in v) for k_, v in pext.items()}
+        pc.backward(x, external_params_grad = g, **kw)
+        return [t for v in g.values() for t in v]
+
+    try:
+        with _paths(True):
+            got = [grads(float("nan")), grads(0.0), grads(None)]
+    finally:
+        tm.top_k_leaf_tilt_grads = real
+    assert stores == [True, True, False], stores                    # (stored over the unzeroed; added into the buffer)
+    for name, a, z, o in zip(("A", "B", "G", "U", "D"), *got):
+        assert bool(torch.isfinite(a).all()), name
+        assert _rel(a, z) < 1e-5 and _rel(o, z) < 1e-5, (name, _rel(a, z), _rel(o, z))
+
+
 def test_the_backward_kernels_are_the_reference():
     """The sums' backward by the kernels (`lowrank/top_k_backward.py`, `kernels/c/lowrank_top_k.cu`: 128 nodes, 128
     children) against the reference

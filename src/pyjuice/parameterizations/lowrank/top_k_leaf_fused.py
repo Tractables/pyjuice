@@ -13,6 +13,9 @@
   parameters' EM statistics (`compute_param_flows`): F+ and F- into transposed buffers a block of parameters, then
   added into the layer's flows.
 
+The tilt's products -- the forward's log2 e (A B)^T, the backward's gradients of A and B from d / d tau -- by their own
+kernels (`kernels/c/lowrank_top_k_tilt.cu`: exact fp32, a launch a run of positions), else cuBLAS's.
+
 Measured precision (fp32 sums in log2 units, `ex2.approx`) against float64: ~1e-5 nats on the values and the slot
 weights, ~1e-6 relative on the gradients.
 """
@@ -35,6 +38,14 @@ def module():
         from .kernels.c import get_top_k_leaf_module
         _ONCE["leaf"] = get_top_k_leaf_module()
     return _ONCE["leaf"]
+
+
+def tilt_module():
+    """The tilt products' module (`kernels/c/lowrank_top_k_tilt.cu`), or None (cuBLAS's products then)."""
+    if "tilt" not in _ONCE:
+        from .kernels.c import get_top_k_tilt_module
+        _ONCE["tilt"] = get_top_k_tilt_module()
+    return _ONCE["tilt"]
 
 
 def _plan(layer) -> dict:
@@ -133,8 +144,7 @@ def leaf_forward(desc, layer, data: torch.Tensor, node_mars: torch.Tensor, kwarg
     tilts = [staged[n["ns"]] for n in nodes]
     Bx, S = tilts[0][0].size(0), tilts[0][1].size(2)
     tau = torch.empty(T, Bx, S, M, dtype = torch.float32, device = dev)
-    for t, (A, Bt) in enumerate(tilts):                                                  # log2 e (A B)^T [Bx, S, M]
-        torch.bmm((Bt.float() * _L2E).transpose(1, 2), A.float().transpose(1, 2), out = tau[t])   # (the scale on Bt)
+    _tilts(tilts, tau)
     ids = kwargs["soft_evidence_cat_ids"].to(torch.int32).contiguous()
     lp = kwargs["categorical_evidence_logp"].float().contiguous()
     emap32 = torch.empty(0, dtype = torch.int32, device = dev) if emap is None else emap.to(torch.int32).contiguous()
@@ -219,25 +229,56 @@ def add_counts(sib: dict, K: int, batch_size: int, a_rows: torch.Tensor) -> bool
 
 
 
-def _tilt_grads(mod, nodes, graded, dtau, staged, gviews, fresh, emap) -> None:
+def _vec(*ts) -> bool:
+    """Whether the kernels take these `[b, M, re]` tensors' rows 16 B at a time: their ranks contiguous and a multiple
+    of 4, every row 16-B aligned."""
+    return all(t.stride(2) == 1 and t.size(2) % 4 == 0 and t.stride(0) % 4 == 0 and t.stride(1) % 4 == 0 and
+               t.data_ptr() % 16 == 0 for t in ts)
+
+
+def _tilts(tilts, tau: torch.Tensor) -> None:
+    """tau [T, Bx, S, M] = log2 e (A B)^T of each position's tensors `(A [Bx, M, re], B [Bx, re, S])`: one launch a run
+    of positions whose tensors share their strides (`top_k_leaf_tau`), else cuBLAS's product (the scale on B)."""
+    tm = tilt_module()
+    ops = [tuple(x.float() for x in tl) for tl in tilts]
+    fits = tm is not None and ops[0][0].size(2) <= 64 and tau.size(2) <= 65 and tau.size(3) % 128 == 0
+    k = 0
+    while k < len(ops):
+        if not fits:
+            A, Bt = ops[k]
+            torch.bmm((Bt * _L2E).transpose(1, 2), A.transpose(1, 2), out = tau[k])
+            k += 1
+            continue
+        j = k + 1
+        while j < len(ops) and all(x.stride() == y.stride() for x, y in zip(ops[j], ops[k])):
+            j += 1
+        run = ops[k:j]
+        tm.top_k_leaf_tau(tau[k:j], [o[q].data_ptr() for q in range(2) for o in run],
+                          [s for x in run[0] for s in x.stride()], run[0][0].size(2), all(_vec(o[0]) for o in run))
+        k = j
+
+
+def _tilt_grads(nodes, graded, dtau, staged, gviews, fresh, emap) -> None:
     """The tilt's gradients from dtau [T, B or Bx (folded), S, M] (a row of destinations each, reading the row of
-    tensors `emap` names -- None: its own), added into the destinations: one pass over dtau and the factors a run of
-    positions whose operands share their strides (`top_k_leaf_tilt_grads`), else cuBLAS's products into them."""
+    tensors `emap` names -- None: its own): one pass over dtau and the factors a run of positions whose operands share
+    their strides (`top_k_leaf_tilt_grads`), a destination STORED whole by its first writer of the pass (`claim`: not
+    zeroed first) and added into by the others; else cuBLAS's products into them."""
+    tm = tilt_module()
     dests = [gviews.get(n["ns"]) for n in graded]
-    if fresh:
-        for g in dests:
-            gviews.init_grads(g)
+    store = [bool(fresh) and gviews.claim(g) for g in dests]
     idx = [nodes.index(n) for n in graded]
     ops = [tuple(x.float() for x in staged[n["ns"]]) + tuple(g) for n, g in zip(graded, dests)]
     A0, B0 = ops[0][0], ops[0][1]
-    fits = (A0.size(2) <= 64 and B0.size(2) <= 65 and A0.size(1) % 64 == 0 and dtau.dtype == torch.float32 and
-            all(x.dtype == torch.float32 for o in ops for x in o))
+    fits = (tm is not None and A0.size(2) <= 64 and B0.size(2) <= 65 and A0.size(1) % 64 == 0 and
+            dtau.dtype == torch.float32 and all(x.dtype == torch.float32 for o in ops for x in o))
     em = torch.empty(0, dtype = torch.int32, device = dtau.device) if emap is None else emap.to(torch.int32).contiguous()
     k = 0
     while k < len(ops):
         if not fits:
             t = idx[k]
             A, Bt, gA, gB = ops[k]
+            if store[k]:
+                torch._foreach_zero_([gA, gB])
             if emap is not None:
                 A, Bt = A.index_select(0, emap), Bt.index_select(0, emap)
             D = dtau[t].transpose(1, 2)                                                     # [B or Bx, M, S]
@@ -245,15 +286,19 @@ def _tilt_grads(mod, nodes, graded, dtau, staged, gviews, fresh, emap) -> None:
             gB.baddbmm_(A.transpose(1, 2), D)
             k += 1
             continue
-        # a run of consecutive positions with the same strides (one launch)
+        # a run of consecutive positions with the same strides and the same first writing, no destination twice (one
+        # launch: its CTAs write their rows unsynchronized)
         j = k + 1
-        while j < len(ops) and idx[j] == idx[j - 1] + 1 and all(x.stride() == y.stride() for x, y in zip(ops[j], ops[k])):
+        while (j < len(ops) and idx[j] == idx[j - 1] + 1 and store[j] == store[k] and
+               all(x.stride() == y.stride() for x, y in zip(ops[j], ops[k])) and
+               all(ops[j][2].data_ptr() != o[2].data_ptr() for o in ops[k:j])):
             j += 1
         run = ops[k:j]
-        ptrs = torch.tensor([[o[q].data_ptr() for o in run] for q in range(4)], dtype = torch.int64, device = dtau.device)
-        strides = torch.tensor([s for x in run[0] for s in x.stride()], dtype = torch.int64)
-        mod.top_k_leaf_tilt_grads(dtau[idx[k]:idx[j - 1] + 1], ptrs, strides, em, A0.size(2))
+        tm.top_k_leaf_tilt_grads(dtau[idx[k]:idx[j - 1] + 1], [o[q].data_ptr() for q in range(4) for o in run],
+                                 [s for x in run[0] for s in x.stride()], em, A0.size(2), store[k],
+                                 all(_vec(o[0], o[2]) for o in run))
         k = j
+
 
 def leaf_backward(desc, layer, data, node_flows: torch.Tensor, kwargs: dict, logspace_flows: bool, missing_mask,
                   batch_first: bool, compute_param_flows: bool) -> bool:
@@ -303,6 +348,6 @@ def leaf_backward(desc, layer, data, node_flows: torch.Tensor, kwargs: dict, log
     if glp is not None and glp is not glp_out:
         glp_out += glp.to(glp_out.dtype)
     if graded:
-        _tilt_grads(mod, nodes, graded, dtau, staged, gviews, fresh, None if fold is not None else external_rows(kwargs))
+        _tilt_grads(nodes, graded, dtau, staged, gviews, fresh, None if fold is not None else external_rows(kwargs))
     st["counts"] = None
     return True

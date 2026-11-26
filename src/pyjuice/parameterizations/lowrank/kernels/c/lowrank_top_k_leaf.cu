@@ -534,102 +534,6 @@ __global__ void __launch_bounds__(NW * 32) tk_leaf_backward_kernel(const BwArgs 
     if (merge) dtm.put((long)Kl * g.M, dRS[0], dRS[1], dRS[2], dRS[3]);
 }
 
-
-// The tilt's gradients from dtau (`top_k_leaf_backward`'s, a row of destinations each: d / d tau [T, Bd, S, M]):
-//     dA_t[b, i, r] += sum_s D[t, b, s, i] Bt_t[e, r, s],      dBt_t[b, r, s] += sum_i A_t[e, i, r] D[t, b, s, i]
-// (e the row of tensors b reads), a CTA a (position, row): its nodes in chunks of 64 staged with their D columns, dA's
-// chunk added at once, dBt's sums kept over the chunks -- one pass over D and A (cuBLAS's two batched products read D
-// twice, at ~9-22 TF/s on these shapes). Exact fp32 (FMAs). re <= 64 ranks, S <= 65 slots.
-constexpr int TR = 64, TS = 65, TC = 64, DST = TC + 1;   // ranks, slots, nodes a chunk, D's staged row stride
-struct TiltArgs {
-    const float* D; const long long* Ap; const long long* Bp; const long long* dAp; const long long* dBp;
-    const int* emap;
-    long sab, sam, sar, sbb, sbr, sbs, sdab, sdam, sdar, sdbb, sdbr, sdbs;
-    int Bd, M, re, S;
-};
-
-constexpr int TILT_SMEM = (TS * TR + TC * TR + TS * DST) * 4;   // BtT, As, Ds (dynamic: past the 48 KB static cap)
-
-__global__ void __launch_bounds__(256) tk_leaf_tilt_grad_kernel(const TiltArgs a) {
-    extern __shared__ __align__(16) float tsm[];
-    float (*BtT)[TR] = reinterpret_cast<float (*)[TR]>(tsm);                  // Bt_t[e] transposed: [s][r]
-    float (*As)[TR] = reinterpret_cast<float (*)[TR]>(tsm + TS * TR);         // the chunk's A: [node][r]
-    float (*Ds)[DST] = reinterpret_cast<float (*)[DST]>(tsm + TS * TR + TC * TR);   // the chunk's D: [s][node]
-    const int tb = blockIdx.x, t = tb / a.Bd, b = tb % a.Bd;
-    const int e = a.emap != nullptr ? a.emap[b] : b;
-    const float* A = reinterpret_cast<const float*>(a.Ap[t]) + (long)e * a.sab;
-    const float* Bt = reinterpret_cast<const float*>(a.Bp[t]) + (long)e * a.sbb;
-    float* dA = reinterpret_cast<float*>(a.dAp[t]) + (long)b * a.sdab;
-    float* dB = reinterpret_cast<float*>(a.dBp[t]) + (long)b * a.sdbb;
-    const float* D = a.D + ((long)t * a.Bd + b) * a.S * a.M;
-    const int tid = threadIdx.x, ty = tid >> 4, tx = tid & 15;
-    const int re = a.re, S = a.S, M = a.M;
-    for (int q = tid; q < TS * TR; q += 256) {
-        const int s = q / TR, r = q % TR;
-        BtT[s][r] = (s < S && r < re) ? Bt[(long)r * a.sbr + (long)s * a.sbs] : 0.f;
-    }
-    float gB[4][4], gR[4];                                 // dBt: ranks tx*4.., slots ty*4..; the rest slot's (ty 0)
-    #pragma unroll
-    for (int u = 0; u < 4; ++u) { gR[u] = 0.f; gB[u][0] = gB[u][1] = gB[u][2] = gB[u][3] = 0.f; }
-    for (int i0 = 0; i0 < M; i0 += TC) {
-        __syncthreads();                                   // (the last chunk read by all; BtT written)
-        for (int q = tid; q < TS * TC; q += 256) {
-            const int s = q / TC, i = q % TC;
-            Ds[s][i] = s < S ? D[(long)s * M + i0 + i] : 0.f;
-        }
-        for (int q = tid; q < TC * TR; q += 256) {
-            const int i = q / TR, r = q % TR;
-            As[i][r] = r < re ? A[(long)(i0 + i) * a.sam + (long)r * a.sar] : 0.f;
-        }
-        __syncthreads();
-        // dA's chunk: nodes ty*4 .. +3, ranks tx*4 .. +3
-        float g[4][4];
-        #pragma unroll
-        for (int u = 0; u < 4; ++u) g[u][0] = g[u][1] = g[u][2] = g[u][3] = 0.f;
-        for (int s = 0; s < TS; ++s) {
-            const float4 bt = *reinterpret_cast<const float4*>(&BtT[s][tx * 4]);
-            #pragma unroll
-            for (int u = 0; u < 4; ++u) {
-                const float d = Ds[s][ty * 4 + u];
-                g[u][0] += d * bt.x; g[u][1] += d * bt.y; g[u][2] += d * bt.z; g[u][3] += d * bt.w;
-            }
-        }
-        #pragma unroll
-        for (int u = 0; u < 4; ++u) {
-            float* o = dA + (long)(i0 + ty * 4 + u) * a.sdam;
-            #pragma unroll
-            for (int v = 0; v < 4; ++v) {
-                const int r = tx * 4 + v;
-                if (r < re) o[(long)r * a.sdar] += g[u][v];
-            }
-        }
-        // dBt: over the chunk's nodes, ranks tx*4 .. +3, slots ty*4 .. +3 (and the rest slot: ty 0)
-        for (int i = 0; i < TC; ++i) {
-            const float4 av = *reinterpret_cast<const float4*>(&As[i][tx * 4]);
-            #pragma unroll
-            for (int u = 0; u < 4; ++u) {
-                const float d = Ds[ty * 4 + u][i];
-                gB[0][u] += av.x * d; gB[1][u] += av.y * d; gB[2][u] += av.z * d; gB[3][u] += av.w * d;
-            }
-            if (ty == 0) {
-                const float d = Ds[TS - 1][i];
-                gR[0] += av.x * d; gR[1] += av.y * d; gR[2] += av.z * d; gR[3] += av.w * d;
-            }
-        }
-    }
-    #pragma unroll
-    for (int v = 0; v < 4; ++v) {
-        const int r = tx * 4 + v;
-        if (r >= re) continue;
-        #pragma unroll
-        for (int u = 0; u < 4; ++u) {
-            const int s = ty * 4 + u;
-            if (s < S - 1) dB[(long)r * a.sdbr + (long)s * a.sdbs] += gB[v][u];
-        }
-        if (ty == 0) dB[(long)r * a.sdbr + (long)(S - 1) * a.sdbs] += gR[v];
-    }
-}
-
 void check(const torch::Tensor& t, at::ScalarType dt, const char* name) {
     TORCH_CHECK(t.is_cuda() && t.scalar_type() == dt && t.is_contiguous(), "top_k leaf: ", name,
                 " must be a contiguous CUDA tensor of ", c10::toString(dt));
@@ -804,40 +708,9 @@ void top_k_leaf_fold(torch::Tensor fT, torch::Tensor spfids, torch::Tensor pf, i
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
-// The tilt's gradients of the positions (`D` [T, Bd, S, M] contiguous; their factors and destinations by address,
-// `ptrs` [4, T] int64: A_t, Bt_t, dA_t, dBt_t; every position's strides `strides` [12]: A's, Bt's, dA's, dBt's), ADDED
-// into the destinations; `emap` [Bd] int32 the row of tensors a destination row reads (empty: its own)
-void top_k_leaf_tilt_grads(torch::Tensor D, torch::Tensor ptrs, torch::Tensor strides, torch::Tensor emap, int64_t re) {
-    const at::cuda::CUDAGuard guard(D.device());
-    check(D, at::kFloat, "D"); check(ptrs, at::kLong, "ptrs");
-    TORCH_CHECK(D.dim() == 4 && ptrs.size(0) == 4 && ptrs.size(1) == D.size(0) && strides.numel() == 12,
-                "top_k leaf: the tilt's gradients' operands");
-    const int T = D.size(0), Bd = D.size(1), S = D.size(2), M = D.size(3);
-    TORCH_CHECK(re <= TR && S <= TS && M % TC == 0, "top_k leaf: the tilt's ranks <= 64, slots <= 65");
-    auto st = strides.to(at::kCPU).contiguous();
-    const long* sv = st.data_ptr<long>();
-    TiltArgs a;
-    a.D = D.data_ptr<float>();
-    const long long* pp = reinterpret_cast<const long long*>(ptrs.data_ptr<long>());
-    a.Ap = pp; a.Bp = pp + T; a.dAp = pp + 2 * T; a.dBp = pp + 3 * T;
-    a.emap = emap.numel() > 0 ? emap.data_ptr<int>() : nullptr;
-    a.sab = sv[0]; a.sam = sv[1]; a.sar = sv[2]; a.sbb = sv[3]; a.sbr = sv[4]; a.sbs = sv[5];
-    a.sdab = sv[6]; a.sdam = sv[7]; a.sdar = sv[8]; a.sdbb = sv[9]; a.sdbr = sv[10]; a.sdbs = sv[11];
-    a.Bd = Bd; a.M = M; a.re = (int)re; a.S = S;
-    static bool done[64] = {};
-    const int dev = D.get_device();
-    if (!done[dev]) {
-        C10_CUDA_CHECK(cudaFuncSetAttribute(tk_leaf_tilt_grad_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, TILT_SMEM));
-        done[dev] = true;
-    }
-    tk_leaf_tilt_grad_kernel<<<T * Bd, 256, TILT_SMEM, at::cuda::getCurrentCUDAStream()>>>(a);
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
-}
-
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("top_k_leaf_table", &top_k_leaf_table, "log2 theta^T of a soft-evidence leaf node vector");
     m.def("top_k_leaf_forward", &top_k_leaf_forward, "LowRank(top_k) leaves' forward");
     m.def("top_k_leaf_backward", &top_k_leaf_backward, "LowRank(top_k) leaves' backward");
     m.def("top_k_leaf_fold", &top_k_leaf_fold, "a transposed block of flows into the parameter flows");
-    m.def("top_k_leaf_tilt_grads", &top_k_leaf_tilt_grads, "the leaves' tilt gradients from dtau, one pass");
 }
