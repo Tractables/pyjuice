@@ -63,12 +63,22 @@
 //
 //  * dA (`tk_bw_da_kernel`, the forward's tiling: 128 nodes x an item, the children in chunks of 64): W, X, Y by MMAs
 //    (alpha's and beta's fragments the A operand, kept by the warp), Gl summed over the item's samples, each times its
-//    sign (the samples of a row of tensors share its gradients: `external_params_rows`' fold), dA += Gl B^T (Gl's
-//    accumulator fragment the A operand, the children permuted; B the staged fp16 chunk: the forward's operand).
+//    sign (the samples of a row of tensors share its gradients: `external_params_rows`' fold), dA += Gl B^T (B the
+//    staged fp16 chunk: the forward's operand).
 //  * COLS (`tk_bw_cols_kernel`: 128 children x an item, eight warps of 16, the nodes in chunks of 32): the transposed
 //    tile -- W^T = B^T A'^T (+ l2t^T), X^T = E^T alpha^T, Y^T = E^T beta^T, the children the MMAs' M -- so the sums over
-//    the nodes stay in the warp: the element flows, dB^T += Gl^T A' (A' the forward's fp16 operand: ldmatrix.trans
-//    makes its TF32 fragments), dG^T += (W ev)^T alpha - W^T beta.
+//    the nodes stay in the warp: the element flows, dB^T += Gl^T A' (A' the forward's fp16 operand), dG^T += (W ev)^T
+//    alpha - W^T beta.
+//
+// Gl is dA's and dB's fp16 MMA operand (m16n8k16 against the fp16 factors as they lie, the sums in fp32): |Gl[i, j]|
+// <= f[i] a sample, so a power of 2 takes it into fp16's range -- a node's row by its samples' flows there (dA), the
+// item by its samples' largest flows (dB: its sum runs over the nodes) -- and comes back out of the sums. An entry
+// below 2^-14 of that bound loses bits (below 2^-24: all of them), what TF32 kept: MEASURED on the head's inputs
+// against float64, dA and dB are what their TF32 operand gave to every printed digit (dA 1.5e-3 .. 4.4e-3, dB 1.1e-3
+// .. 1.8e-3 of the gradient's norm: the forward's fp16 logits); the same inputs through both kernels: dA 4.4e-7, dB
+// 7.9e-7 of the largest apart. The bound is the terms' -- W's shift cancels in them --, not their factors': W alone
+// reaches 2^8 (the forward's lazy shift), so the scale (up to 2^126, for flows ~1e-35) multiplies the bounded product,
+// last; the conversion saturates (`sat_h2`) where rounding takes a value past it.
 //
 // dA's and the cols' sums are linear in the chunks: a CTA takes an equal share of the items' chunks (stream-K) and
 // adds (red) each segment's sums into the destinations at its end -- the gradients into the rows of tensors the samples
@@ -149,7 +159,20 @@ __device__ __forceinline__ unsigned to_tf32(float x) { return __float_as_uint(x)
 __device__ __forceinline__ float rtf32(float x) { return __uint_as_float((__float_as_uint(x) + 0x1000u) & ~0x1FFFu); }
 
 __device__ __forceinline__ unsigned h2u(__half2 h) { return *reinterpret_cast<unsigned*>(&h); }
-__device__ __forceinline__ float2 u2f2(unsigned u) { return __half22float2(*reinterpret_cast<const __half2*>(&u)); }
+// 2^e with b 2^e in [2^14, 2^15) (e at most 126: its inverse a normal float; 1 where b is 0 or subnormal): what takes
+// values bounded by b (>= 0, finite) into fp16's range -- an fp16 MMA operand of fp32 values, the scale taken back out
+// of the fp32 sums
+__device__ __forceinline__ float fp16_scale(float b) {
+    const int ex = (__float_as_int(b) >> 23) & 0xFF;
+    return ex == 0 ? 1.f : __int_as_float(min(253, 268 - ex) << 23);
+}
+// (lo, hi) as an fp16 pair, rounded to nearest, SATURATED at +-65504: a value past the bound its scale was made for
+// (an inf would make the MMA's sums NaN) -- one F2FP, as the plain conversion
+__device__ __forceinline__ unsigned sat_h2(float lo, float hi) {
+    unsigned d;
+    asm("cvt.rn.satfinite.f16x2.f32 %0, %1, %2;" : "=r"(d) : "f"(hi), "f"(lo));
+    return d;
+}
 
 __device__ __forceinline__ void red1(float* p, float v) {
     asm volatile("red.global.add.f32 [%0], %1;" :: "l"(p), "f"(v) : "memory");
@@ -601,7 +624,7 @@ __device__ __forceinline__ void observed_values(const OState& St, const TkArgs& 
 // The STASH ending of a masked item y's tile x -- what the backward takes from the forward's sums, the node flows not
 // in it (they scale a node's row: `tk_flows_kernel`, the backward's kernels): the slots' posterior pi = w (U / Z) /
 // sum_s w (U / Z), alpha = pi / U, beta = pi / Z (the masked sample's rows; the slot after the rest's: 1 where the node
-// has mass, the place of its flow), its ao 1 where the node has mass (its flow's place too); a partner's ao = 1 / u,
+// has mass, the place of its flow), its ao 1 where the node has mass (what the flows kernel reads); a partner's ao = 1 / u,
 // bo = 1 / z where u / z > 0; W's shift h.
 __device__ __forceinline__ void masked_stash(const MState& St, const TkArgs& a, int y, int x) {
     const int4 item = a.mitems[y];
@@ -1050,7 +1073,8 @@ struct BwArgs {                         // the dA and cols passes' (see `top_k_b
     const int4* mitems; const int4* oitems; const int* noitems; const int* slot32;   // the prep's work items
     const float* alpha; const float* beta;   // [Rm, M, SA] a masked sample's, its node flows not in them (the stash's;
                                              // slots 0 .. 63 TF32)
-    const float* ao; const float* bo;        // [B, M] an observed sample's; ao of a masked one: its node flows
+    const float* ao; const float* bo;        // [B, M] an observed sample's
+    const float* fl; const float* fmx;       // [B, M] a sample's node flows, [B] their largest (`tk_flows_kernel`)
     const float* hrow;                       // [B, M] W's shift (log2 units) a sample
     const int* drow; const float* sgn;       // [B] the row of the destinations a sample's gradients go to, its sign
     float* EF;                               // [B, N] the element flows (added into)
@@ -1165,16 +1189,24 @@ __device__ __forceinline__ void da_segment(const BwArgs& a, int y, int x, int c0
         br0 = __ldg(be0 + 8 * NS8); br1 = __ldg(be0 + 8 * SA + 8 * NS8);
     }
     const float h0 = a.hrow[(long)hb * M + node0], h1 = a.hrow[(long)hb * M + node1];
-    // (the masked sample's terms: its nodes' flows -- not in alpha, beta -- times its sign)
-    const float smf0 = MASKED ? sm * a.ao[(long)bm * M + node0] : 0.f;
-    const float smf1 = MASKED ? sm * a.ao[(long)bm * M + node1] : 0.f;
     float aop[2][2], bop[2][2];
+    // Gl is dA's fp16 MMA operand: a node's row times a power of 2 (sc0, sc1) that takes its bound -- the flows of the
+    // item's samples there: |Gl[i, j]| <= f[i] a sample -- into fp16's range, in the samples' factors (applied LAST: W
+    // alone reaches 2^8, the forward's lazy shift, and the scale 2^126 -- a flow ~1e-35 -- times it overflowed); the
+    // row's sums (fp32) take it back out
+    float bd0 = MASKED ? a.fl[(long)bm * M + node0] : 0.f, bd1 = MASKED ? a.fl[(long)bm * M + node1] : 0.f;
     #pragma unroll
     for (int p = 0; p < 2; ++p) {
         const long r0 = o[p] >= 0 ? (long)o[p] * M + node0 : 0;
         aop[p][0] = o[p] >= 0 ? a.ao[r0] : 0.f; aop[p][1] = o[p] >= 0 ? a.ao[r0 + 8] : 0.f;
         bop[p][0] = o[p] >= 0 ? a.bo[r0] : 0.f; bop[p][1] = o[p] >= 0 ? a.bo[r0 + 8] : 0.f;
+        bd0 += o[p] >= 0 ? a.fl[r0] : 0.f; bd1 += o[p] >= 0 ? a.fl[r0 + 8] : 0.f;
     }
+    const float sc0 = fp16_scale(bd0), sc1 = fp16_scale(bd1);
+    // (the masked sample's terms: its nodes' flows -- not in alpha, beta -- times its sign)
+    const float smf0 = MASKED ? sm * sc0 * a.fl[(long)bm * M + node0] : 0.f;
+    const float smf1 = MASKED ? sm * sc1 * a.fl[(long)bm * M + node1] : 0.f;
+    const float sgs[2][2] = {{sg[0] * sc0, sg[0] * sc1}, {sg[1] * sc0, sg[1] * sc1}};
     float dA[2 * NK][4];
     #pragma unroll
     for (int q = 0; q < 2 * NK; ++q) dA[q][0] = dA[q][1] = dA[q][2] = dA[q][3] = 0.f;
@@ -1230,42 +1262,47 @@ __device__ __forceinline__ void da_segment(const BwArgs& a, int y, int x, int c0
                     const float ys[4] = {Y[0] + er.x * br0, Y[1] + er.y * br0, Y[2] + er.x * br1, Y[3] + er.y * br1};
                     const float ev4[4] = {evm.x, evm.y, evm.x, evm.y};
                     #pragma unroll
-                    for (int c = 0; c < 4; ++c) gs[q][c] = (c < 2 ? smf0 : smf1) * W[q][c] * (ev4[c] * xs[c] - ys[c]);
+                    for (int c = 0; c < 4; ++c) gs[q][c] = W[q][c] * (ev4[c] * xs[c] - ys[c]) * (c < 2 ? smf0 : smf1);
                 }
                 #pragma unroll
                 for (int pp = 0; pp < 2; ++pp) {
                     if (o[pp] < 0) continue;
                     const float2 es = *reinterpret_cast<const float2*>(Es + (MASKED ? so[pp] : pp) * FE + jc0);
                     const float2 eo = *reinterpret_cast<const float2*>(Vs + (MASKED ? 1 + pp : pp) * TN + jc0);
-                    gs[q][0] += sg[pp] * W[q][0] * es.x * (aop[pp][0] * eo.x - bop[pp][0]);
-                    gs[q][1] += sg[pp] * W[q][1] * es.y * (aop[pp][0] * eo.y - bop[pp][0]);
-                    gs[q][2] += sg[pp] * W[q][2] * es.x * (aop[pp][1] * eo.x - bop[pp][1]);
-                    gs[q][3] += sg[pp] * W[q][3] * es.y * (aop[pp][1] * eo.y - bop[pp][1]);
+                    gs[q][0] += W[q][0] * es.x * (aop[pp][0] * eo.x - bop[pp][0]) * sgs[pp][0];
+                    gs[q][1] += W[q][1] * es.y * (aop[pp][0] * eo.y - bop[pp][0]) * sgs[pp][0];
+                    gs[q][2] += W[q][2] * es.x * (aop[pp][1] * eo.x - bop[pp][1]) * sgs[pp][1];
+                    gs[q][3] += W[q][3] * es.y * (aop[pp][1] * eo.y - bop[pp][1]) * sgs[pp][1];
                 }
             }
-            // dA [16 nodes x KP] += Gl B^T (k: child 2t <-> fragment column t, 2t + 1 <-> t + 4)
+            // dA [16 nodes x KP] += Gl B^T: Gl's fp16 fragment the A operand (k: the 16 children of two child tiles), B^T
+            // from the staged chunk as it lies (rank-major: `ldmatrix`, two rank tiles a load)
             #pragma unroll
-            for (int q = 0; q < 4; ++q) {
-                const unsigned g0 = to_tf32(gs[q][0]), g1 = to_tf32(gs[q][2]);
-                const unsigned g2 = to_tf32(gs[q][1]), g3 = to_tf32(gs[q][3]);
+            for (int q = 0; q < 4; q += 2) {
+                const unsigned ga[4] = {sat_h2(gs[q][0], gs[q][1]), sat_h2(gs[q][2], gs[q][3]),
+                                        sat_h2(gs[q + 1][0], gs[q + 1][1]), sat_h2(gs[q + 1][2], gs[q + 1][3])};
                 #pragma unroll
-                for (int rt = 0; rt < 2 * NK; ++rt) {
-                    const unsigned bh = *reinterpret_cast<const unsigned*>(Bs + (rt * 8 + g) * BROW + (4 * hh + q) * 8 + 2 * t);
-                    const float2 b = u2f2(bh);
-                    mma_tf32(dA[rt], g0, g1, g2, g3, __float_as_uint(b.x), __float_as_uint(b.y));
+                for (int rt = 0; rt < 2 * NK; rt += 2) {
+                    unsigned bf[4];
+                    ldsm4(bf, smem_u32(Bs + ((rt + (lane >> 4)) * 8 + (lane & 7)) * BROW + (4 * hh + q) * 8 +
+                                       ((lane >> 3) & 1) * 8));
+                    mma_f16(dA[rt], ga, bf[0], bf[1]);
+                    mma_f16(dA[rt + 1], ga, bf[2], bf[3]);
                 }
             }
         }
     }
-    // into the destination row: ranks 2t, 2t + 1 of each 8 (pairs where r is even)
+    // into the destination row, the rows' scales taken out: ranks 2t, 2t + 1 of each 8 (pairs where r is even)
     float* D0 = a.DA + (long)a.drow[hb] * a.sDA + (long)node0 * r;
     float* D1 = D0 + 8L * r;
     const bool pair = (r & 1) == 0;
+    const float iv0 = 1.f / sc0, iv1 = 1.f / sc1;
     #pragma unroll
     for (int rt = 0; rt < 2 * NK; ++rt) {
         const int k = rt * 8 + 2 * t;
-        if (k + 1 < r) { red2(D0 + k, dA[rt][0], dA[rt][1], pair); red2(D1 + k, dA[rt][2], dA[rt][3], pair); }
-        else if (k < r) { red1(D0 + k, dA[rt][0]); red1(D1 + k, dA[rt][2]); }
+        if (k + 1 < r) {
+            red2(D0 + k, dA[rt][0] * iv0, dA[rt][1] * iv0, pair); red2(D1 + k, dA[rt][2] * iv1, dA[rt][3] * iv1, pair);
+        } else if (k < r) { red1(D0 + k, dA[rt][0] * iv0); red1(D1 + k, dA[rt][2] * iv1); }
     }
 }
 
@@ -1319,7 +1356,15 @@ __device__ __forceinline__ void cols_segment(const BwArgs& a, int y, int x, int 
     int so[2]; float sg[2];
     #pragma unroll
     for (int p = 0; p < 2; ++p) { so[p] = o[p] >= 0 ? a.slot32[o[p]] : 0; sg[p] = o[p] >= 0 ? a.sgn[o[p]] : 0.f; }
-    const float sm = MASKED ? a.sgn[bm] : 0.f;
+    // Gl is dB's fp16 MMA operand (k the nodes): the item's times a power of 2 that takes its bound -- its samples'
+    // largest flows: |Gl[i, j]| <= f[i] a sample -- into fp16's range, in the samples' signs (applied last, as dA's);
+    // dB's sums take it back out
+    float bd = MASKED ? a.fmx[bm] : 0.f;
+    #pragma unroll
+    for (int p = 0; p < 2; ++p) bd += o[p] >= 0 ? a.fmx[o[p]] : 0.f;
+    const float sci = GRADS ? fp16_scale(bd) : 1.f;
+    const float sm = MASKED ? a.sgn[bm] : 0.f, sms = sm * sci;
+    const float sgs[2] = {sg[0] * sci, sg[1] * sci};
     const int jw = x * CN + warp * 16;                                       // the warp's first child
     const int j0 = jw + g, j1 = j0 + 8;                                      // the thread's (rows of W^T)
 
@@ -1339,7 +1384,7 @@ __device__ __forceinline__ void cols_segment(const BwArgs& a, int y, int x, int 
             const int v = (qq - NA - 2 * NAB) / NV, s = (qq - NA - 2 * NAB) % NV;
             const float* src;
             if (v == 0) src = a.hrow + (long)hb * M;
-            else if (v == 5) src = a.ao + (long)bm * M;
+            else if (v == 5) src = a.fl + (long)bm * M;
             else {
                 const int op = v < 3 ? o[0] : o[1];                          // (selects: a run-time index would
                 if (op < 0) return;                                          // keep o on the stack)
@@ -1449,6 +1494,7 @@ __device__ __forceinline__ void cols_segment(const BwArgs& a, int y, int x, int 
             W[nt][2] = exp2f(W[nt][2] - h.x); W[nt][3] = exp2f(W[nt][3] - h.y);
         }
 
+        unsigned ga[4];                                                      // (Gl^T's fp16 fragment: two node tiles)
         // a node tile at a time (its operands consumed at once: the four tiles' kept the code over the register cap):
         // X^T, Y^T [16 children x 8 nodes] (masked) = E^T alpha^T, E^T beta^T, slots 0 .. 63 by MMAs, the rest by FMAs;
         // the elementwise terms (c: 0 (j0, i0), 1 (j0, i1), 2 (j1, i0), 3 (j1, i1); i0 = 8 nt + 2t, i1 = i0 + 1); dB^T,
@@ -1483,7 +1529,7 @@ __device__ __forceinline__ void cols_segment(const BwArgs& a, int y, int x, int 
                     if (c < 2) ef0 += qv; else ef1 += qv;
                     if constexpr (GRADS) {
                         const float yy = Y[c] + erj * brx[c & 1];
-                        gs[c] = sm * (qv - w * yy);
+                        gs[c] = (qv - w * yy) * sms;
                         if (c < 2) dgr0 += wev * arx[c & 1] - w * brx[c & 1];
                         else dgr1 += wev * arx[c & 1] - w * brx[c & 1];
                     }
@@ -1502,31 +1548,22 @@ __device__ __forceinline__ void cols_segment(const BwArgs& a, int y, int x, int 
                     po[pp][jj] += al * w;
                     if constexpr (GRADS) {
                         ro[pp][jj] += be * w;
-                        gs[c] += sg[pp] * w * eso[pp][jj] * (al * evo[pp][jj] - be);
+                        gs[c] += w * eso[pp][jj] * (al * evo[pp][jj] - be) * sgs[pp];
                     }
                 }
             }
             if constexpr (GRADS) {
-                // dB^T [16 children x KP] += Gl^T A': Gl's fragment the A operand (k: node 2t <-> fragment column t,
-                // 2t + 1 <-> t + 4: c0, c2, c1, c3), A' from the staged chunk by ldmatrix.trans (nodes 2t, 2t + 1, rank g)
-                const unsigned g0 = to_tf32(gs[0]), g1 = to_tf32(gs[2]), g2 = to_tf32(gs[1]), g3 = to_tf32(gs[3]);
-                #pragma unroll
-                for (int rq = 0; rq < NK / 2; ++rq) {                        // 4 rank tiles a load
-                    unsigned bf[4];
-                    ldsm4t(bf, smem_u32(As + (nt * 8 + (lane & 7)) * AR + (rq * 4 + (lane >> 3)) * 8));
+                // dB^T [16 children x KP] += Gl^T A': Gl's fp16 fragment the A operand (k: the 16 nodes of two node tiles),
+                // A' from the staged chunk by `ldmatrix.trans` (two rank tiles a load)
+                ga[2 * (nt & 1)] = sat_h2(gs[0], gs[1]);
+                ga[2 * (nt & 1) + 1] = sat_h2(gs[2], gs[3]);
+                if (nt & 1) {
                     #pragma unroll
-                    for (int k4 = 0; k4 < 4; ++k4) {
-                        const float2 b = u2f2(bf[k4]);
-                        mma_tf32(dB[rq * 4 + k4], g0, g1, g2, g3, __float_as_uint(b.x), __float_as_uint(b.y));
-                    }
-                }
-                if constexpr (NK & 1) {                                      // (an odd count of 16-rank steps: 2 tiles)
-                    unsigned bf[4];
-                    ldsm4t(bf, smem_u32(As + (nt * 8 + (lane & 7)) * AR + ((NK / 2) * 4 + ((lane >> 3) & 1)) * 8));
-                    #pragma unroll
-                    for (int k4 = 0; k4 < 2; ++k4) {
-                        const float2 b = u2f2(bf[k4]);
-                        mma_tf32(dB[(NK / 2) * 4 + k4], g0, g1, g2, g3, __float_as_uint(b.x), __float_as_uint(b.y));
+                    for (int rt = 0; rt < 2 * NK; rt += 2) {
+                        unsigned bf[4];
+                        ldsm4t(bf, smem_u32(As + ((nt - 1 + ((lane >> 3) & 1)) * 8 + (lane & 7)) * AR + (rt + (lane >> 4)) * 8));
+                        mma_f16(dB[rt], ga, bf[0], bf[1]);
+                        mma_f16(dB[rt + 1], ga, bf[2], bf[3]);
                     }
                 }
                 if constexpr (MASKED) {
@@ -1586,7 +1623,7 @@ __device__ __forceinline__ void cols_segment(const BwArgs& a, int y, int x, int 
         cp_wait<0>();
         __syncthreads();                                                     // (every warp past the stages)
         float* buf = reinterpret_cast<float*>(smem) + warp * (G::EROWS * TBUF);
-        constexpr float SC = 1.f / LOG2E;                                    // (A' = log2 e A)
+        const float SC = 1.f / (LOG2E * sci);                                // (A' = log2 e A; Gl's scale)
         #pragma unroll
         for (int rt = 0; rt < 2 * NK; ++rt) {
             const int k = rt * 8 + 2 * t;
@@ -1814,24 +1851,39 @@ __global__ void tk_bw_ltc_kernel(const __half* __restrict__ L2T, uint2* __restri
     }
 }
 
-// The node flows into the stash, in place (the backward's first step; blockIdx.y the task, blockIdx.x grid-stride): f
-// = exp of the log-space rows nf [M][fld] (the circuit's buffer, a sample a column) -- task 0: each sample's ao, bo [B,
-// M] times f where they are > 0 (an observed sample's alpha, beta; a masked one's ao: its flow where the node has
-// mass); task 1 (acnt given: the leaf's buffer): a masked row's flow into the slot after its posterior's, where the
-// stash left 1.
+// The node flows into the stash, in place (the backward's first step). blockIdx.y the task, a CTA a sample (task 0)
+// or a masked row (task 1): f = exp of the log-space rows nf [M][fld] (the circuit's buffer, a sample a column) --
+// task 0: fl [B, M] the sample's flows where its ao is > 0 (a node with mass), fmx [B] their largest, and its ao, bo
+// [B, M] times them (an observed sample's alpha, beta); task 1 (acnt given: the leaf's buffer): the masked row's flows
+// into the slot after its posterior's, where the stash left 1.
 __global__ void tk_flows_kernel(const float* __restrict__ nf, long fld, float* __restrict__ ao, float* __restrict__ bo,
-                                const long* __restrict__ rows, float* __restrict__ acnt, int B, int M, int Rm) {
-    const long n = blockIdx.y == 0 ? (long)B * M : (long)Rm * M;
-    for (long q = (long)blockIdx.x * blockDim.x + threadIdx.x; q < n; q += (long)gridDim.x * blockDim.x) {
-        const int i = (int)(q % M), y = (int)(q / M);
-        if (blockIdx.y == 0) {
-            const float f = __expf(nf[(long)i * fld + y]), x = ao[q], z = bo[q];
-            ao[q] = x > 0.f ? x * f : 0.f;
-            bo[q] = z > 0.f ? z * f : 0.f;
-        } else {
-            float* c = acnt + q * SA + 8 * NS8 + 1;
-            *c = *c > 0.f ? __expf(nf[(long)i * fld + rows[y]]) : 0.f;
+                                float* __restrict__ fl, float* __restrict__ fmx, const long* __restrict__ rows,
+                                float* __restrict__ acnt, int B, int M, int Rm) {
+    __shared__ float wm[32];
+    const int y = blockIdx.x, tid = threadIdx.x;
+    if (blockIdx.y == 1) {
+        if (y >= Rm) return;
+        const long b = rows[y];
+        for (int i = tid; i < M; i += blockDim.x) {
+            float* c = acnt + ((long)y * M + i) * SA + 8 * NS8 + 1;
+            *c = *c > 0.f ? __expf(nf[(long)i * fld + b]) : 0.f;
         }
+        return;
+    }
+    if (y >= B) return;
+    float mx = 0.f;
+    for (int i = tid; i < M; i += blockDim.x) {
+        const long q = (long)y * M + i;
+        const float x = ao[q], f = x > 0.f ? __expf(nf[(long)i * fld + y]) : 0.f;
+        fl[q] = f; ao[q] = x * f; bo[q] *= f;
+        mx = fmaxf(mx, f);
+    }
+    mx = warp_max(mx);                                                       // (the CTA's largest: its warps', then theirs)
+    if ((tid & 31) == 0) wm[tid >> 5] = mx;
+    __syncthreads();
+    if (tid < 32) {
+        mx = warp_max(tid < (int)(blockDim.x >> 5) ? wm[tid] : 0.f);
+        if (tid == 0) fmx[y] = mx;
     }
 }
 
@@ -2070,8 +2122,10 @@ std::vector<torch::Tensor> top_k_forward(torch::Tensor A, torch::Tensor BP, torc
 
 // The node flows into a stash, in place (`tk_flows_kernel`): `nf` [M, B] the node vector's log-space rows of the node
 // flows (fp32, a sample a column), ao, bo [B, M]; `rows` [Rm] the masked samples and `acnt` their rows of the leaf's
-// buffer [Rm, M, SA] (empty: none) -- the flow into the slot after the posterior's.
-void top_k_flows(torch::Tensor nf, torch::Tensor ao, torch::Tensor bo, torch::Tensor rows, torch::Tensor acnt) {
+// buffer [Rm, M, SA] (empty: none) -- the flow into the slot after the posterior's. Returns (fl [B, M] the samples'
+// node flows, fmx [B] their largest).
+std::vector<torch::Tensor> top_k_flows(torch::Tensor nf, torch::Tensor ao, torch::Tensor bo, torch::Tensor rows,
+                                       torch::Tensor acnt) {
     const c10::cuda::CUDAGuard guard(ao.device());
     check(ao, at::kFloat, "ao"); check(bo, at::kFloat, "bo");
     const int B = ao.size(0), M = ao.size(1), Rm = acnt.numel() > 0 ? (int)rows.size(0) : 0;
@@ -2081,10 +2135,13 @@ void top_k_flows(torch::Tensor nf, torch::Tensor ao, torch::Tensor bo, torch::Te
         check(rows, at::kLong, "rows"); check(acnt, at::kFloat, "acnt");
         TORCH_CHECK(acnt.size(0) == Rm && acnt.size(1) == M && acnt.size(2) == SA, "top_k: acnt [Rm, M, 72]");
     }
-    tk_flows_kernel<<<dim3(64, Rm > 0 ? 2 : 1), 256, 0, at::cuda::getCurrentCUDAStream()>>>(
-        nf.data_ptr<float>(), nf.stride(0), ao.data_ptr<float>(), bo.data_ptr<float>(),
-        Rm > 0 ? rows.data_ptr<long>() : nullptr, Rm > 0 ? acnt.data_ptr<float>() : nullptr, B, M, Rm);
+    auto fl = torch::empty_like(ao), fmx = torch::empty({B}, ao.options());
+    tk_flows_kernel<<<dim3(std::max(B, Rm), Rm > 0 ? 2 : 1), 256, 0, at::cuda::getCurrentCUDAStream()>>>(
+        nf.data_ptr<float>(), nf.stride(0), ao.data_ptr<float>(), bo.data_ptr<float>(), fl.data_ptr<float>(),
+        fmx.data_ptr<float>(), Rm > 0 ? rows.data_ptr<long>() : nullptr, Rm > 0 ? acnt.data_ptr<float>() : nullptr,
+        B, M, Rm);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return {fl, fmx};
 }
 
 // The backward's operands beside the prep's: (AH [Bx, M, KP] = fp16(log2 e A), ranks zero-padded; l2t [M, N] fp16 (the
@@ -2115,8 +2172,9 @@ std::vector<torch::Tensor> top_k_bw_prep(torch::Tensor A, torch::Tensor theta, i
 void top_k_bw_grads(torch::Tensor A, torch::Tensor AH, torch::Tensor BP, torch::Tensor E, torch::Tensor ev,
                     torch::Tensor LTh, torch::Tensor LTc, torch::Tensor mitems, torch::Tensor oitems,
                     torch::Tensor noitems, torch::Tensor slot32, torch::Tensor alpha, torch::Tensor beta,
-                    torch::Tensor ao, torch::Tensor bo, torch::Tensor hrow, torch::Tensor drow, torch::Tensor sgn,
-                    torch::Tensor EF, torch::Tensor DA, torch::Tensor DB, torch::Tensor DG) {
+                    torch::Tensor ao, torch::Tensor bo, torch::Tensor hrow, torch::Tensor fl, torch::Tensor fmx,
+                    torch::Tensor drow, torch::Tensor sgn, torch::Tensor EF, torch::Tensor DA, torch::Tensor DB,
+                    torch::Tensor DG) {
     const c10::cuda::CUDAGuard guard(A.device());
     check_rows(A, at::kFloat, "A"); check(EF, at::kFloat, "EF");
     const int M = A.size(1), r = A.size(2), KP = BP.size(1), N = BP.size(2), S = E.size(1), Rm = mitems.size(0);
@@ -2132,6 +2190,7 @@ void top_k_bw_grads(torch::Tensor A, torch::Tensor AH, torch::Tensor BP, torch::
     args.oitems = reinterpret_cast<const int4*>(oitems.data_ptr<int>()); args.noitems = noitems.data_ptr<int>();
     args.slot32 = slot32.data_ptr<int>(); args.alpha = alpha.data_ptr<float>(); args.beta = beta.data_ptr<float>();
     args.ao = ao.data_ptr<float>(); args.bo = bo.data_ptr<float>(); args.hrow = hrow.data_ptr<float>();
+    args.fl = fl.data_ptr<float>(); args.fmx = fmx.data_ptr<float>();
     args.EF = EF.data_ptr<float>(); args.A = A.data_ptr<float>(); args.sA = A.stride(0);
     args.LTh = reinterpret_cast<const uint2*>(LTh.data_ptr<int>());
     if (grads) {
@@ -2377,7 +2436,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("top_k_forward", &top_k_forward,
           "a LowRank(top_k) sum node vector's values and its backward's stash: a persistent stream-K launch for each "
           "kind of work item");
-    m.def("top_k_flows", &top_k_flows, "the node flows into the forward's stash, in place");
+    m.def("top_k_flows", &top_k_flows, "the node flows into the forward's stash, in place; the flows, their largest");
     m.def("top_k_bw_prep", &top_k_bw_prep, "the backward's operands beside the prep's: fp16 A', l2t, l2t for the cols");
     m.def("top_k_bw_em_observed", &top_k_bw_em_observed,
           "the backward's EM statistics of the observed samples (a tile of the parameters a CTA, over the samples)");

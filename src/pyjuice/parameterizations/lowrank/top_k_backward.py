@@ -40,7 +40,7 @@ if triton is not None:
         Q, F- = sum_b T ([M, N]: q, t summed over the slots), stored -- the observed samples' then added by
         `top_k_bw_em_observed` (CUDA). W from the CUDA passes' operands -- AH = fp16(log2 e A) [Bx, M, KP], BH [Bx, KP,
         N] fp16, l2t [M, N] fp16 -- and the stash's shift HROW [B, M]; a masked sample's alpha, beta [Rm, M, SA] at
-        its place LWIDX (its node flows not in them: FLOW [B, M], times W)."""
+        its place LWIDX (its node flows not in them: FLOW [B, M], `top_k_flows`', times W)."""
         rows = tl.program_id(0) * BM + tl.arange(0, BM)
         cols = tl.program_id(1) * BN + tl.arange(0, BN)
         s = tl.arange(0, 64)
@@ -156,26 +156,26 @@ def terms(A, Bm, G, theta, element_mars, geo, slot, rows, logw_rows, nf, emap, g
     if stash is None:
         stash = tkf.forward(A_, ops, None, 0, True, counts)
     alpha, beta, acnt, ao, bo, hrow = stash
-    # the node flows into the stash: ao, bo (ao of a masked sample its flows: its terms' factor in the passes below),
-    # and beside the masked samples' posterior where that lies in their leaf's buffer
+    # the node flows: into the stash's ao, bo, and beside the masked samples' posterior where that lies in their leaf's
+    # buffer; fl [B, M] the flows themselves (a masked sample's terms' factor in the passes below), fmx [B] their largest
     Rm = rows.numel()
     own = counts is not None and Rm > 0 and acnt.data_ptr() == counts.data_ptr()
     none32 = tkf._empty(dev, torch.float32)
-    mod.top_k_flows(nf, ao, bo, rows.long().contiguous(), acnt if own else none32)
+    fl, fmx = mod.top_k_flows(nf, ao, bo, rows.long().contiguous(), acnt if own else none32)
     EF = torch.zeros(B, N, dtype = torch.float32, device = dev)
     if grads is not None:
         gviews.init_grads(grads) if fresh else None
         drow, sgn = _fold_operands(gviews, fold, B, dev)
         dests = [g if _dest_ok(g) else torch.zeros(g.shape, dtype = torch.float32, device = dev) for g in grads]
         mod.top_k_bw_grads(A_, AH, BP, E, ev, LTh, LTc, mitems, oitems, noitems, slot32, alpha, beta, ao, bo, hrow,
-                           drow, sgn, EF, *dests)
+                           fl, fmx, drow, sgn, EF, *dests)
         for g, d in zip(grads, dests):
             if d is not g:
                 g.add_(d.to(g.dtype))
     else:
         none = torch.empty(0, dtype = torch.float32, device = dev)
         mod.top_k_bw_grads(A_, AH, BP, E, ev, LTh, LTc, mitems, oitems, noitems, slot32, alpha, beta, ao, bo, hrow,
-                           none, none, EF, none, none, none)
+                           fl, fmx, none, none, EF, none, none, none)
     flows = None
     if want_flows:
         KP = BP.size(1)
@@ -191,7 +191,7 @@ def terms(A, Bm, G, theta, element_mars, geo, slot, rows, logw_rows, nf, emap, g
         if Rm > 0:
             FP = torch.empty(M, N, dtype = torch.float32, device = dev)
             FM = torch.empty_like(FP)
-            _bw_em_kernel[(M // BM, N // BN)](AH, BP, L2T, E, ev, alpha, beta, hrow, ao, MROWS, NM, LWIDX, EMAP, FP,
+            _bw_em_kernel[(M // BM, N // BN)](AH, BP, L2T, E, ev, alpha, beta, hrow, fl, MROWS, NM, LWIDX, EMAP, FP,
                                               FM, M, N, KP = KP, K0 = K0, K1 = KP - K0, BM = BM, BN = BN, SA = SA,
                                               num_warps = 4, num_stages = 1)
         else:
@@ -202,5 +202,5 @@ def terms(A, Bm, G, theta, element_mars, geo, slot, rows, logw_rows, nf, emap, g
                                      tkf._empty(dev, torch.int32) if emap is None else EMAP, OLIST, FP, FM)
         flows = (FP, FM)
     # (the counts: in the leaf's rows as it holds them -- the slots' posterior, the flow beside it --, else their product)
-    a_rows = None if own else acnt[:Rm, :, :65] * ao.index_select(0, rows)[:, :, None]
+    a_rows = None if own else acnt[:Rm, :, :65] * fl.index_select(0, rows)[:, :, None]
     return EF, a_rows, flows
