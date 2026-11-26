@@ -96,3 +96,23 @@ def test_a_plain_leaf_refuses_a_mask_with_the_evidence_gradients():
     with pytest.raises(NotImplementedError, match = "param_flows_mask"):
         pc.backward(x, compute_param_flows = True, param_flows_mask = torch.tensor([True, False, True], device = DEV),
                     categorical_evidence_logp = lp, categorical_evidence_logp_grad = torch.zeros_like(lp))
+
+
+def test_the_normalizer_is_added_on_the_device_and_read_as_a_float():
+    """`_cum_flow`: a backward's share added on the device (`_add_cum_flow`, no host synchronization), folded into the
+    float where it is read -- its value and type for every reader, through sets, `+=`, numbers and another device's
+    pending sum."""
+    pc = juice.compile(juice.structures.HMM(seq_length = 4, num_latents = 4, num_emits = 3))
+    pc._cum_flow = 2.0
+    pc._add_cum_flow(torch.tensor(1.5, device = DEV))
+    pc._add_cum_flow(torch.tensor([0.25], device = DEV, dtype = torch.float32))
+    pc._add_cum_flow(3)
+    assert isinstance(pc._cum_flow, float) and pc._cum_flow == 6.75
+    pc._cum_flow += 1.0
+    assert pc._cum_flow == 7.75
+    pc._add_cum_flow(torch.tensor(1.0))                                         # (a pending sum on the CPU, then ...)
+    pc._add_cum_flow(torch.tensor(1.0, device = DEV))                           # (... one on the GPU: folded first)
+    assert pc._cum_flow == 9.75
+    pc._add_cum_flow(torch.tensor(5.0, device = DEV))
+    pc._cum_flow = 0.0                                                          # (a set drops what is pending)
+    assert pc._cum_flow == 0.0

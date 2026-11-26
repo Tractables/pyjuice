@@ -96,8 +96,8 @@ class _DifferentiableLLs(torch.autograd.Function):
         w = grad[:, 0].float()
         ext = given.get(EXTERNAL_PARAMS_KWARG) or {}
         rows = given.get(EXTERNAL_PARAMS_ROWS_KWARG)
-        if not bool((w != 0).any()):
-            return (None, None, None, None, None, None, *[torch.zeros_like(t) for _, _, _, t in entries])
+        # (no early exit where every weight is zero: deciding it would synchronize with the device; the backward at zero
+        # weights gives zero gradients and adds nothing to the EM statistics)
         rest = {k: v for k, v in given.items() if k != EXTERNAL_PARAMS_KWARG}
         sign = torch.where(w < 0, -1.0, 1.0)
         # (with a map of rows the backward folds the samples' gradients into the tensors' rows, each times its sign: the

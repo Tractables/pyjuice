@@ -795,6 +795,36 @@ def test_impossible_evidence_has_no_mass(kernels):
     assert torch.equal(got[others], good[others])
 
 
+@pytest.mark.parametrize("kernels", [False, True])
+@pytest.mark.parametrize("impossible", [False, True])
+def test_zero_weights_give_zero_gradients_and_no_em_statistics(kernels, impossible):
+    """The differentiable conditional at zero upstream weights (its backward runs -- no early exit, whose test would
+    synchronize with the device): every gradient exactly zero, nothing added into the EM statistics or `_cum_flow` --
+    also where a sample's evidence is impossible (its log-likelihood -inf)."""
+    pc, (ext, ids, lp, x, miss), (T, N, b) = _mask_case(kernels)
+    pext, lp = _pc_ext(ext, T, N), lp.float()
+    if impossible:
+        lp = lp.clone()
+        lp[0] = -float("inf")                                                   # (sample 0: no candidate possible)
+    rows = torch.arange(b, device = DEV).repeat(2)
+    ts = {g_: tuple(t.clone().requires_grad_(True) for t in v) for g_, v in pext.items()}
+    lpg = lp.clone().requires_grad_(True)
+    with _paths(kernels):
+        pc.init_param_flows(flows_memory = 0.0)
+        pc._cum_flow = 0.0
+        ll = pc(x.repeat(2, 1), missing_mask = torch.cat([torch.zeros_like(miss), miss]), external_params = ts,
+                external_params_rows = rows, categorical_evidence_logp = lpg.repeat(2, 1, 1),
+                soft_evidence_cat_ids = ids.repeat(2, 1, 1), differentiable = True,
+                param_flows_mask = torch.arange(2 * b, device = DEV) < b).view(-1)
+        assert bool(torch.isinf(ll[0])) == impossible
+        (0.0 * (ll[:b] - ll[b:])).sum().backward()
+    for t in [t for v in ts.values() for t in v] + [lpg]:
+        assert t.grad is not None and bool((t.grad == 0).all()), t.grad
+    for k, st in enumerate(_stats(pc)):
+        assert bool((st == 0).all()), k
+    assert pc._cum_flow == 0.0
+
+
 def test_the_kernels_together_are_the_torch_passes():
     """Every pass by the kernels -- the sums' (their counts written straight into the leaves' buffer) and the leaves' --
     against every pass by torch: the differentiable conditional in one call (the map) with the EM statistics of its

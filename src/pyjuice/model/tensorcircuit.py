@@ -308,6 +308,39 @@ class TensorCircuit(_BuildMixin, _CudaGraphsMixin, _ExternalParamsMixin, _Learni
             raise NotImplementedError(f"Unknown propagation algorithm {propagation_alg}.")
         
     @property
+    def _cum_flow(self) -> float:
+        """
+        The EM step's normalizer: the total root flow the parameter flows took since it was last reset (a float). A
+        backward adds its share on the device (`_add_cum_flow`: no host synchronization in the pass); reading the value
+        folds what is pending into the float -- the one synchronization, where the update reads it.
+        """
+        self._fold_cum_flow()
+        return self.__dict__.get("_cum_flow_value", 0.0)
+
+    @_cum_flow.setter
+    def _cum_flow(self, value: float):
+        self.__dict__["_cum_flow_value"] = float(value)
+        self.__dict__["_cum_flow_pending"] = None
+
+    def _fold_cum_flow(self) -> None:
+        pending = self.__dict__.get("_cum_flow_pending")
+        if pending is not None:
+            self.__dict__["_cum_flow_value"] = self.__dict__.get("_cum_flow_value", 0.0) + float(pending)
+            self.__dict__["_cum_flow_pending"] = None
+
+    def _add_cum_flow(self, flow) -> None:
+        """`flow` (a number, or a one-element tensor: added on its device, read later) into `_cum_flow`."""
+        if not torch.is_tensor(flow):
+            self.__dict__["_cum_flow_value"] = self.__dict__.get("_cum_flow_value", 0.0) + float(flow)
+            return
+        flow = flow.detach().double().reshape(())
+        pending = self.__dict__.get("_cum_flow_pending")
+        if pending is not None and pending.device != flow.device:
+            self._fold_cum_flow()                                           # (another device's pending sum)
+            pending = None
+        self.__dict__["_cum_flow_pending"] = flow if pending is None else pending + flow
+
+    @property
     def precision(self) -> str:
         """
         Precision of the sum layers' products, in the forward and the backward pass:
@@ -1054,11 +1087,12 @@ class TensorCircuit(_BuildMixin, _CudaGraphsMixin, _ExternalParamsMixin, _Learni
 
             # Accumulate the total amount of flows added to the PC
             if compute_param_flows:
+                # (added on the device: no host synchronization in the pass)
                 if ll_weights is None:
-                    self._cum_flow += (self._root_node_range[1] - self._root_node_range[0]) * \
-                        (B if pmask is None else int(pmask.sum().item()))
+                    self._add_cum_flow((self._root_node_range[1] - self._root_node_range[0]) *
+                                       (B if pmask is None else pmask.sum()))
                 else:
-                    self._cum_flow += (ll_weights if pmask is None else ll_weights * pmask).sum().item()
+                    self._add_cum_flow((ll_weights if pmask is None else ll_weights * pmask).sum())
 
             # Load cached node flows
             if self._buffer_matches(name = "node_flows", cache = cache):
