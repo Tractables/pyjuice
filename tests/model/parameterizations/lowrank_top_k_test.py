@@ -607,6 +607,41 @@ def test_one_backward_for_the_gradients_and_the_em_statistics(kernels):
     assert abs(cum - cum_want) < 1e-5 * cum_want, (cum, cum_want)
 
 
+def test_the_kernels_together_are_the_torch_passes():
+    """Every pass by the kernels -- the sums' (their counts written straight into the leaves' buffer) and the leaves' --
+    against every pass by torch: the differentiable conditional in one call (the map) with the EM statistics of its
+    all-observed pass (`param_flows_mask`), its gradients and statistics."""
+    import pyjuice.parameterizations.lowrank.top_k_fused as tkf
+    import pyjuice.parameterizations.lowrank.top_k_leaf_fused as tlf
+    import pyjuice.parameterizations.lowrank.top_k_backward as tkb
+    if tkf.top_k_module() is None or tlf.module() is None or tkb.triton is None:
+        pytest.skip("the CUDA modules did not build, or no Triton")
+    pc, (ext, ids, lp, x, miss), (T, N, b) = _mask_case(True)
+    pext, lp = _pc_ext(ext, T, N), lp.float()
+    rows = torch.arange(b, device = DEV).repeat(2)
+    wt = torch.linspace(0.5, 2.0, b, device = DEV)
+
+    def conditional():
+        ts = {g_: tuple(t.clone().requires_grad_(True) for t in v) for g_, v in pext.items()}
+        lpg = lp.clone().requires_grad_(True)
+        pc.init_param_flows(flows_memory = 0.0)
+        ll = pc(x.repeat(2, 1), missing_mask = torch.cat([torch.zeros_like(miss), miss]), external_params = ts,
+                external_params_rows = rows, categorical_evidence_logp = lpg.repeat(2, 1, 1),
+                soft_evidence_cat_ids = ids.repeat(2, 1, 1), differentiable = True,
+                param_flows_mask = torch.arange(2 * b, device = DEV) < b).view(-1)
+        (-(wt * (ll[:b] - ll[b:])).sum()).backward()
+        return [ll.detach()] + [t.grad for v in ts.values() for t in v] + [lpg.grad] + _stats(pc)
+
+    with _paths(False):
+        ref = conditional()
+    with _paths(True):
+        got = conditional()
+    assert torch.allclose(got[0], ref[0], atol = 1e-3), float((got[0] - ref[0]).abs().max())
+    names = ("A", "B", "G", "U", "D", "lp", "sums' F+", "sums' F- / theta", "leaves' F")
+    for name, a, r_ in zip(names, got[1:], ref[1:]):
+        assert _rel(a, r_) < 5e-3, (name, _rel(a, r_))
+
+
 def test_zero_tensors_are_the_plain_circuit():
     """A, B, G, U, D all zero: the circuit of plain soft-evidence leaves and plain sums, as pyjuice evaluates it."""
     T, N, C, K, r, re, b = 4, 4, 5, 2, 3, 2, 6

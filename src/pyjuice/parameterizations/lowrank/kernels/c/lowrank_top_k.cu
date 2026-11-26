@@ -1276,7 +1276,9 @@ struct ColsGeo {   // a stage: A' chunk [CM][AR] fp16, alpha, beta chunks [CM][S
     static constexpr int AB_BYTES = MASKED ? CM * SA * 4 : 0;
     static constexpr int V_BYTES = 5 * CM * 4;
     static constexpr int STAGE = A_BYTES + 2 * AB_BYTES + V_BYTES;
-    static constexpr int EPI = NW * KP * TBUF * 4;                 // the dB^T transpose, a buffer a warp
+    // the dB^T and dG^T transposes, a buffer a warp: a row a rank, and (masked) a slot -- 64 of them whatever the ranks
+    static constexpr int EROWS = MASKED && KP < 64 ? 64 : KP;
+    static constexpr int EPI = NW * EROWS * TBUF * 4;
     static constexpr int BYTES = 2 * STAGE > EPI ? 2 * STAGE : EPI;
 };
 
@@ -1557,7 +1559,7 @@ __device__ __forceinline__ void cols_segment(const BwArgs& a, int y, int x, int 
         // dB^T and dG^T through a buffer a warp (transposed: a rank's / a slot's 16 children adjacent), red.v4 rows
         cp_wait<0>();
         __syncthreads();                                                     // (every warp past the stages)
-        float* buf = reinterpret_cast<float*>(smem) + warp * (KP * TBUF);
+        float* buf = reinterpret_cast<float*>(smem) + warp * (G::EROWS * TBUF);
         constexpr float SC = 1.f / LOG2E;                                    // (A' = log2 e A)
         #pragma unroll
         for (int rt = 0; rt < 2 * NK; ++rt) {
