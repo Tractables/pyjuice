@@ -825,16 +825,20 @@ __global__ void __launch_bounds__(NW * 32, 1) tk_sk_kernel(const TkArgs a) {
     const int ca0 = (int)(g0 % nch), cb1 = (int)((g1 - 1) % nch) + 1;
     const bool part = cb1 < nch;                                             // (the share ends inside a tile)
     const long last = part ? tb - 1 : tb;                                    // (its last whole tile after the first)
-    const int nseg = (part && tb == ta) ? 1 : (part ? 1 : 0) + 1 + (int)(last > ta ? last - ta : 0);
+    const int nmid = (int)(last > ta ? last - ta : 0);                       // (the whole tiles after the first)
+    const int nseg = (part && tb == ta) ? 1 : (part ? 1 : 0) + 1 + nmid;
     int* flags = a.flags + (MASKED ? 0 : gridDim.x);                         // (each kind its own: by the grid, not the share)
+    // the order: the partial (published at once: the next CTA waits on it), the whole tiles, the first tile ta last --
+    // its last part waits on the lower CTAs' partials, done by then (first, it waited up to a tile's time: a share
+    // starting at a tile's last chunk waited on its 15-chunk partial before its own work, 40 us a call)
     for (int si = 0; si < nseg; ++si) {
         long tt; int c0, c1, mode;                                           // mode 0 whole, 1 partial, 2 the tile's last part
         if (part && si == 0) {
             tt = tb; c0 = tb == ta ? ca0 : 0; c1 = cb1; mode = 1;
         } else {
             const int j = si - (part ? 1 : 0);
-            if (j == 0) { tt = ta; c0 = ca0; c1 = ta == tb ? cb1 : nch; mode = ca0 > 0 ? 2 : 0; }
-            else { tt = ta + j; c0 = 0; c1 = nch; mode = 0; }
+            if (j < nmid) { tt = ta + 1 + j; c0 = 0; c1 = nch; mode = 0; }
+            else { tt = ta; c0 = ca0; c1 = ta == tb ? cb1 : nch; mode = ca0 > 0 ? 2 : 0; }
         }
         const int item = (int)(tt / nx), x = (int)(tt % nx);
         St S;
