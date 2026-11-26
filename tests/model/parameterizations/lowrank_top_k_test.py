@@ -245,6 +245,38 @@ def test_hmm_differentiable_conditional():
         assert _rel(a.grad, b_.grad) < 2e-4, (name, _rel(a.grad, b_.grad))
 
 
+def test_the_autograd_backward_leaves_no_gradients_on_the_circuit():
+    """Once the autograd backward of a differentiable call returns, the gradients are autograd's alone: the circuit
+    keeps none of the destinations its backward wrote (they would stay allocated until its next backward staged
+    others) -- they are freed with their last reader."""
+    import gc, weakref
+    from pyjuice.layer.parameterized_sum_layer import EXTERNAL_PARAMS_GRAD_KWARG
+    T, N, C, K, r, re, b = 4, 4, 5, 2, 3, 2, 6
+    pc, _, _ = _hmm_pc(T, N, K, r, re, _tables(N, 4))
+    ext, ids, lp, x, miss = _batch(b, T, N, C, K, r, re, 5)
+    leaves = [t.float().clone().requires_grad_(True) for t in ext] + [lp.float().clone().requires_grad_(True)]
+    seen, real = [], pc.backward
+
+    def spy(*args, **kwargs):
+        for ts in kwargs[EXTERNAL_PARAMS_GRAD_KWARG].values():
+            seen.extend(weakref.ref(t) for t in ((ts,) if torch.is_tensor(ts) else ts))
+        return real(*args, **kwargs)
+
+    pc.backward = spy
+    try:
+        ll = pc(x, missing_mask = miss, external_params = _pc_ext(leaves[:5], T, N), categorical_evidence_logp = leaves[5],
+                soft_evidence_cat_ids = ids, differentiable = True)
+        ll.sum().backward()
+    finally:
+        del pc.backward
+    assert len(seen) > 0 and all(float(t.grad.abs().sum()) > 0 for t in leaves[:5])
+    del ll
+    for t in leaves:
+        t.grad = None
+    gc.collect()
+    assert all(w() is None for w in seen), sum(w() is not None for w in seen)
+
+
 # ---------------------------------------------------------------------------------------------- a map of rows
 
 def test_hmm_conditional_in_one_batch():

@@ -1248,6 +1248,21 @@ class _ExternalParamsMixin:
         kwargs[EXTERNAL_PARAMS_GRAD_BUFFER_KWARG] = self.external_params_grad
         self._staged_external_params_grad = grad_views
 
+    def _release_external_params_grads(self) -> None:
+        """
+        Drop the circuit's hold on the gradient destinations of the last backward.
+
+        The staged destinations stay on the circuit after a backward (`get_external_params_grad` reads them), which
+        keeps a caller's own tensors allocated until the next backward stages others. Where the caller hands them
+        on and nothing reads them back from the circuit -- `pc(..., differentiable = True)`: the gradients are
+        autograd's once its backward returns -- it calls this, and they are freed with their last reader (measured, the
+        best Codpula head at 48 blocks: 1.85 GB that otherwise stayed through the next step's forward, and beside the
+        next backward's destinations when those were allocated). `get_external_params_grad` has nothing to return
+        until the next backward.
+        """
+        self._staged_external_params_grad = None
+        self._external_grad_dsts = None
+
     def get_external_params_grad(self, ns: CircuitNodes):
         """
         Per-sample gradients of the external parameters of `ns`, as computed by the last backward pass.

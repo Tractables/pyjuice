@@ -118,6 +118,7 @@ class _DifferentiableLLs(torch.autograd.Function):
                         param_flows_mask = ctx.pmask, logspace_flows = True,
                         allow_modify_flows = False, **rest, **evi_grads, **fold,
                         **({EXTERNAL_PARAMS_GRAD_KWARG: ext_grads} if ext_grads else {}))
+            pc._release_external_params_grads()                           # (the destinations: autograd's from here)
         out = []
         for kind, key, slot, t in entries:
             if kind == "ext":
