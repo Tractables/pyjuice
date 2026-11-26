@@ -342,6 +342,12 @@ def test_rows_map_reads_the_rows_it_names():
             assert _rel(a, b_) < 1e-6, (k_, _rel(a, b_))
     for a, b_ in zip(got[2:], want[2:]):
         assert _rel(a, b_) < 1e-6, _rel(a, b_)
+    # (the map on the host: the same values; checked there, so a row past the tensors' is an error of the call)
+    host = run(_pc_ext(ext, T, N), external_params_rows = rows.cpu())
+    assert torch.allclose(host[0], got[0], atol = 1e-6), (host[0], got[0])
+    with pytest.raises(AssertionError, match = "reads rows"), torch.no_grad():
+        pc(x2, missing_mask = miss2, external_params = _pc_ext(ext, T, N), external_params_rows = (rows + 1).cpu(),
+           **evi)
 
 
 def test_rows_map_needs_a_parameterization_that_reads_through_it():

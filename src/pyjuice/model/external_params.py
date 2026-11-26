@@ -981,11 +981,17 @@ class _ExternalParamsMixin:
         first = next(iter(ns2tensors.values()))
         t0 = first if torch.is_tensor(first) else first[0]
         ext_batch = t0.size(0)
-        rows = rows.to(device = t0.device, dtype = torch.long)
-        if rows.numel() > 0:
-            lo, hi = torch.stack([rows.min(), rows.max()]).tolist()
+        on_host = not rows.is_cuda
+        if rows.numel() > 0 and on_host:                       # (the caller's rows on the host: checked here)
+            lo, hi = int(rows.min()), int(rows.max())
             assert lo >= 0 and hi < ext_batch, \
                 f"`{EXTERNAL_PARAMS_ROWS_KWARG}` reads rows {lo} .. {hi} of external tensors with {ext_batch}."
+        rows = rows.to(device = t0.device, dtype = torch.long)
+        if rows.numel() > 0 and not on_host:
+            # (rows on the device checked there, without a synchronization: a failure is reported at a later CUDA call)
+            torch._assert_async((rows.min() >= 0) & (rows.max() < ext_batch),
+                                f"`{EXTERNAL_PARAMS_ROWS_KWARG}` reads a row outside the external tensors' 0 .. "
+                                f"{ext_batch - 1}.")
         kwargs[EXTERNAL_PARAMS_ROWS_KWARG] = rows
         return ext_batch
 

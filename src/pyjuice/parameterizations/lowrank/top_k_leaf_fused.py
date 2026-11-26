@@ -126,18 +126,16 @@ def leaf_forward(desc, layer, data: torch.Tensor, node_mars: torch.Tensor, kwarg
     T, B, dev = len(nodes), node_mars.size(1), node_mars.device
     M, K = plan["M"][0], (plan["Ks"][0] if plan["Ks"] else desc.top_k)
 
-    # the missing tokens a sum reads: their rows of the slot weights (the pass's one synchronization)
+    # the missing tokens a sum reads: their rows of the slot weights -- the pass's one synchronization, its copy started
+    # here and waited on after the launches that need none of it (the tables, the tilts), so the host plans while the
+    # device works
     miss = _missing_all(kwargs.get("missing_mask"), plan["vars"], B, dev, kwargs.get("_batch_first", True))
-    rmask = (miss & plan["read"][:, None]).cpu()
-    counts = rmask.sum(dim = 1).tolist()
-    offs = [0]
-    for c in counts:
-        offs.append(offs[-1] + c)
-    R = offs[-1]
-    nz = rmask.nonzero()
-    wrow = torch.full((T, B), -1, dtype = torch.int32)
-    wrow[nz[:, 0], nz[:, 1]] = torch.arange(R, dtype = torch.int32)
-    wrow, rows = wrow.to(dev), nz[:, 1].to(dev)
+    rmask_d = miss & plan["read"][:, None]
+    rmask = torch.empty(rmask_d.shape, dtype = rmask_d.dtype, pin_memory = rmask_d.is_cuda)
+    rmask.copy_(rmask_d, non_blocking = True)
+    copied = torch.cuda.Event() if rmask_d.is_cuda else None
+    if copied is not None:
+        copied.record(torch.cuda.current_stream(dev))
 
     V = nodes[0]["ns"].dist.num_cats
     tables = [mod.top_k_leaf_table(layer.params, spids, V) for spids in plan["tables"]]
@@ -152,6 +150,18 @@ def leaf_forward(desc, layer, data: torch.Tensor, node_mars: torch.Tensor, kwarg
     emap32 = torch.empty(0, dtype = torch.int32, device = dev) if emap is None else emap.to(torch.int32).contiguous()
     tok = data.index_select(0, plan["vars"]).to(torch.int32).contiguous()
     ord_, rank = _by_row(emap32, B) if ids.size(0) != B else (_none_i32(dev), _none_i32(dev))   # (evidence by row)
+
+    if copied is not None:
+        copied.synchronize()
+    counts = rmask.sum(dim = 1).tolist()
+    offs = [0]
+    for c in counts:
+        offs.append(offs[-1] + c)
+    R = offs[-1]
+    nz = rmask.nonzero()
+    wrow = torch.full((T, B), -1, dtype = torch.int32)
+    wrow[nz[:, 0], nz[:, 1]] = torch.arange(R, dtype = torch.int32)
+    wrow, rows = _to_device(wrow, dev), _to_device(nz[:, 1], dev)
     lz, lb, place, logw = mod.top_k_leaf_forward(tab, plan["nv_tab"], tau, emap32, ids, lp, plan["nv_lvid"],
                                                  plan["nv_row0"], tok, miss.to(torch.uint8).contiguous(), wrow, R, S, K,
                                                  node_mars, ord_)
@@ -163,6 +173,16 @@ def leaf_forward(desc, layer, data: torch.Tensor, node_mars: torch.Tensor, kwarg
 
 def _none_i32(dev):
     return torch.empty(0, dtype = torch.int32, device = dev)
+
+
+def _to_device(t: torch.Tensor, dev) -> torch.Tensor:
+    """A host tensor `t` on `dev` without a synchronization: staged in pinned memory and copied asynchronously (the
+    caching host allocator keeps the pinned block until the copy is done)."""
+    if dev.type != "cuda":
+        return t.to(dev)
+    h = torch.empty(t.shape, dtype = t.dtype, pin_memory = True)
+    h.copy_(t)
+    return h.to(dev, non_blocking = True)
 
 
 def _by_row(emap32: torch.Tensor, B: int):
