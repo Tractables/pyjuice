@@ -124,14 +124,15 @@ def _dest_ok(g: torch.Tensor) -> bool:
             and g.stride(0) % 4 == 0 and g.data_ptr() % 16 == 0)
 
 
-def terms(A, Bm, G, theta, element_mars, geo, slot, rows, logw_rows, nf, emap, grads, gviews, fresh: bool,
+def terms(A, Bm, G, tab, element_mars, geo, slot, rows, logw_rows, nf, emap, grads, gviews, fresh: bool,
           want_flows: bool = False, pmask = None, counts = None, kept = None):
     """`top_k._sum_backward_terms`' element flows `[B, N]`, the posterior counts `a` of the masked samples `rows`
     `[b, M, 65]` (None where they went into `counts`) and the EM statistics `(F+, F-)` `[M, N]` (None unless
     `want_flows`; of the samples `pmask` [B] holds, if given) by the kernels; the gradients of
     `A [Bx, M, r]`, `Bm [Bx, r, N]`, `G [Bx, 65, N]` (a row of tensors each) ADDED into the destinations `grads` (None:
     none) -- where they fold (`StagedExternalParams.fold`) each sample's times its sign into the row it read, else
-    into its own. `emap [B]` the row a sample reads (None: its own); the parameters `theta [M, N]` (0 where none); the
+    into its own. `emap [B]` the row a sample reads (None: its own); `tab` the parameters, `theta [M, N]` (0 where none),
+    and their tables made so far in the pass (`top_k_fused.theta_tables`: the ones made here added); the
     children's values `element_mars [geo["eid"], :]`; `nf [M, B]` the node flows' log-space rows (the circuit's
     buffer); the observed samples' slots `slot [B]`, the masked ones' weights `logw_rows`; `counts` None, or the buffer
     `[b, M, 72]` the posterior counts go into, as it holds them (their leaf's: `top_k_leaf_fused.counts_buffer`);
@@ -150,10 +151,15 @@ def terms(A, Bm, G, theta, element_mars, geo, slot, rows, logw_rows, nf, emap, g
     ops, stash = kept if kept is not None else (None, None)
     if ops is None or not pair:
         # (its own items; the forward's stash still serves: a sample's terms, whatever the items that made them)
-        ops = tkf.prep(Bm, G, element_mars, geo["eid"], None if geo["full"] else geo["has"], theta, slot, rows,
-                       logw_rows, emap, pair = pair)
+        ops = tkf.prep(Bm, G, element_mars, geo["eid"], None if geo["full"] else geo["has"], tab["theta"], slot, rows,
+                       logw_rows, emap, pair = pair, lth = tab.get("LTh"))
+        tab.setdefault("LTh", ops[4])
     BP, E, ev, cmax, LTh, mitems, oitems, noitems, slot32, logw, flags = ops
-    AH, L2T, LTc = mod.top_k_bw_prep(A_, theta.float().contiguous(), BP.size(1))
+    none_h = tkf._empty(dev, torch.float16)
+    AH, L2T, LTc = mod.top_k_bw_prep(A_, tab["theta"], BP.size(1), tab.get("L2T", none_h),
+                                     tab.get("LTc", tkf._empty(dev, torch.int32)))
+    tab.setdefault("L2T", L2T)
+    tab.setdefault("LTc", LTc)
     if stash is None:
         stash = tkf.forward(A_, ops, None, 0, True, counts)
     alpha, beta, acnt, ao, bo, hrow = stash

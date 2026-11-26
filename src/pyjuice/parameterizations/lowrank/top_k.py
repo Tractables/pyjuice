@@ -357,14 +357,16 @@ def sum_backward(desc, layer, ns_tensors, ns_grad_tensors, node_flows, element_f
         nf = node_flows[ns_info.nid_start:ns_info.nid_end, :]                        # [M, B] (log-space flows)
         B = nf.size(1)
         f = None                                                                      # (f [B, M]: where torch needs it)
-        theta = desc._dense_params(geo, params, dtype = PASSES_DTYPE)
         slot, rows, logw_rows, logp, tilt = slot_parts(desc, sib, B, kwargs, dev)
         kernels = top_k_backward.serves(desc, geo["M"], geo["N"], tensors[0].size(2), B, dev, kwargs, want_flows) \
             and element_mars.stride(1) == 1 and nf.dtype == torch.float32 and nf.stride(1) == 1
+        # (the parameters: the kernels' fp32 grid and its tables, once a pass -- the forward's --; torch's in PASSES_DTYPE)
+        tab = top_k_fused.theta_tables(desc, sib, ns_info.ns, geo, params, B) if kernels else None
+        theta = tab["theta"] if kernels else desc._dense_params(geo, params, dtype = PASSES_DTYPE)
         if kernels:
             # (the gradients added into their destinations by the kernels; the counts into the leaf's buffer)
             counts = top_k_leaf_fused.counts_buffer(sib, desc.top_k, B) if rows.numel() > 0 else None
-            ef, a_rows, flows = top_k_backward.terms(*tensors, theta, element_mars, geo, slot, rows, logw_rows, nf,
+            ef, a_rows, flows = top_k_backward.terms(*tensors, tab, element_mars, geo, slot, rows, logw_rows, nf,
                                                      external_rows(kwargs), grads, gviews, fresh, want_flows, pm, counts,
                                                      top_k_fused.kept_of(layer, ns_info.ns, B))
             Fp, Fm = flows if want_flows else (None, None)

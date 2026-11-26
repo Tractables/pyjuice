@@ -59,19 +59,37 @@ def _rows(t: torch.Tensor) -> torch.Tensor:
     return t if ok else t.contiguous()
 
 
-def prep(Bm, G, element_mars, eid, has, theta, slot, rows_m, logw_m, emap = None, pair: bool = True):
+def theta_tables(desc, sib, ns, geo, params, batch_size: int) -> dict:
+    """The node vector's shared parameters as the kernels read them -- `{"theta": [M, N] fp32}`, and each table of them
+    once a kernel made it ("LTh": the forward's l2t; "L2T", "LTc": the backward's) -- kept for the pass in its leaf's
+    state (`top_k_leaf_fused.pass_cache`: made again every forward) and shared by the node vectors of one source of
+    parameters (tied copies); a dict of this call alone where the leaf has no state."""
+    from . import top_k_leaf_fused
+    cache = top_k_leaf_fused.pass_cache(sib, batch_size)
+    src = ns.get_source_ns() if ns.is_tied() else ns
+    key = ("theta", id(src), params.data_ptr(), params.dtype, geo["M"], geo["N"])
+    tab = None if cache is None else cache.get(key)
+    if tab is None:
+        tab = dict(theta = desc._dense_params(geo, params, dtype = torch.float32))
+        if cache is not None:
+            cache[key] = tab
+    return tab
+
+
+def prep(Bm, G, element_mars, eid, has, theta, slot, rows_m, logw_m, emap = None, pair: bool = True, lth = None):
     """`top_k_prep`'s operands: `B [Bx, r, N]`, `G [Bx, K + 1, N]` a row of tensors each; the children's values
     `element_mars [eid, :]` (`has` [N] bool where an edge reaches them, None where every child is reached); `theta [M,
     N]` the shared parameters (0 where none); a sample each: `slot [B]` the observed token's slot, `emap [B]` the row of
     tensors it reads (None: its own, Bx = B); `rows_m` the samples whose token is missing and their slots' log-weights
     `logw_m [b, M, K + 1]` (None where none); `pair`: the samples reading a row share its work items (else a sample an
-    item)."""
+    item); `lth` theta's l2t as an earlier call made it (`theta_tables`' "LTh": not made again), or None."""
     dev = Bm.device
     f = lambda t: t.float().contiguous()
     return top_k_module().top_k_prep(
         _rows(Bm), _rows(G), element_mars, eid.long().contiguous(), _empty(dev, torch.bool) if has is None else has, f(theta),
         slot.long().contiguous(), _empty(dev, torch.long) if emap is None else emap.long().contiguous(),
-        rows_m.long().contiguous(), _empty(dev, torch.float32) if logw_m is None else _weights_operand(logw_m), pair)
+        rows_m.long().contiguous(), _empty(dev, torch.float32) if logw_m is None else _weights_operand(logw_m), pair,
+        _empty(dev, torch.int32) if lth is None else lth)
 
 
 #: The masked samples' weights' row stride in the kernels' operand (`SP` of `kernels/c/lowrank_top_k.cu`)
@@ -111,8 +129,10 @@ def sum_forward(desc, layer, ns_info, tensors, geo, params, element_mars, node_m
             (emap is None and A.size(0) != B):
         return False
     slot, rows_m, logw_m, _, _ = slot_parts(desc, sib, B, kwargs, node_mars.device)
-    theta = desc._dense_params(geo, params, dtype = torch.float32)
-    ops = prep(Bm, G, element_mars, geo["eid"], None if geo["full"] else geo["has"], theta, slot, rows_m, logw_m, emap)
+    tab = theta_tables(desc, sib, ns_info.ns, geo, params, B)              # (the parameters' tables: once a pass)
+    ops = prep(Bm, G, element_mars, geo["eid"], None if geo["full"] else geo["has"], tab["theta"], slot, rows_m, logw_m,
+               emap, lth = tab.get("LTh"))
+    tab.setdefault("LTh", ops[4])
     # (a backward may follow -- the call had grad on -- and its kernels serve: the operands and the sums' stash kept
     # for it, which `top_k_backward.terms` takes: `kept_of`)
     keep = kwargs.get("_grad_enabled", False) and \

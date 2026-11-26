@@ -965,6 +965,7 @@ __global__ void tk_prep_kernel(
             if (lane == 0) cmax[bb] = mx;
         }
     } else if (task == 3) {                                                  // l2t in fragment order, a CTA a 16-row tile
+        if (theta == nullptr) return;                                        // (an earlier call's table reused)
         __shared__ float rmax[16];
         const int nch = N / TN;
         const int warp = threadIdx.x >> 5;
@@ -2101,11 +2102,12 @@ void bw_launches(BwArgs args, bool grads, int B, long gsz, int sms, int dev, cud
 // values `em` [elements, B'] with every child's element id `eid` [N] (and `has` [N], or an empty tensor where every
 // child is reached); theta [M, N] (fp32); a sample each (B of them): the observed slots `slot` [B], the row each reads
 // `emap` [B] (an empty tensor: its own); the masked samples `rows` [Rm] and their weights `logw` [Rm, M, S] (float32;
-// empty where none); `pair`: a row's samples in one item (else a sample an item): (BP, E, ev, cmax, LTh, mitems,
-// oitems, noitems, slot32, logw, flags).
+// empty where none); `pair`: a row's samples in one item (else a sample an item); `lth` theta's l2t as an earlier
+// call made it (int32 [M N / 2], its LTh: not made again), or an empty tensor: (BP, E, ev, cmax, LTh, mitems, oitems,
+// noitems, slot32, logw, flags).
 std::vector<torch::Tensor> top_k_prep(torch::Tensor Bm, torch::Tensor G, torch::Tensor em, torch::Tensor eid,
                                       torch::Tensor has, torch::Tensor theta, torch::Tensor slot64, torch::Tensor emap,
-                                      torch::Tensor rows, torch::Tensor logwin, bool pair) {
+                                      torch::Tensor rows, torch::Tensor logwin, bool pair, torch::Tensor lth) {
     const c10::cuda::CUDAGuard guard(Bm.device());
     check_rows(Bm, at::kFloat, "B"); check_rows(G, at::kFloat, "G"); check(theta, at::kFloat, "theta");
     check(eid, at::kLong, "eid"); check(slot64, at::kLong, "slot"); check(rows, at::kLong, "rows");
@@ -2133,7 +2135,10 @@ std::vector<torch::Tensor> top_k_prep(torch::Tensor Bm, torch::Tensor G, torch::
     auto f32 = Bm.options(), f16 = Bm.options().dtype(at::kHalf), i32 = Bm.options().dtype(at::kInt);
     auto BP = torch::empty({Bx, KP, N}, f16), E = torch::empty({Bx, S, N}, f32);
     auto ev = torch::empty({B, N}, f32), cmax = torch::empty({B}, f32);
-    auto LTh = torch::empty({(long)M * N / 2}, i32);
+    const bool reuse = lth.numel() > 0;
+    if (reuse) TORCH_CHECK(lth.is_cuda() && lth.scalar_type() == at::kInt && lth.is_contiguous() && lth.numel() == (long)M * N / 2,
+                           "top_k: lth, an earlier call's LTh (int32 [M N / 2])");
+    auto LTh = reuse ? lth : torch::empty({(long)M * N / 2}, i32);
     const long ocap = std::max((B - Rm + 1) / 2, 1);
     auto mitems = torch::empty({std::max(Rm, 1), 4}, i32), oitems = torch::empty({2 * ocap + 1, 4}, i32);
     auto noitems = torch::empty({1}, i32), slot32 = torch::empty({B}, i32);
@@ -2148,7 +2153,7 @@ std::vector<torch::Tensor> top_k_prep(torch::Tensor Bm, torch::Tensor G, torch::
     launch_pdl(tk_prep_kernel, dim3(296, 5), dim3(256), 0, stream,
         Bm.data_ptr<float>(), Bm.stride(0), G.data_ptr<float>(), G.stride(0), em.data_ptr<float>(), em.stride(0),
         eid.data_ptr<long>(),
-        full ? nullptr : has.data_ptr<bool>(), theta.data_ptr<float>(),
+        full ? nullptr : has.data_ptr<bool>(), reuse ? nullptr : theta.data_ptr<float>(),
         Rm > 0 && !padded ? logwin.data_ptr<float>() : nullptr,
         reinterpret_cast<__half*>(BP.data_ptr<at::Half>()), E.data_ptr<float>(), ev.data_ptr<float>(),
         cmax.data_ptr<float>(), reinterpret_cast<uint2*>(LTh.data_ptr<int>()), logw.data_ptr<float>(),
@@ -2297,23 +2302,33 @@ std::vector<torch::Tensor> top_k_flows(torch::Tensor nf, torch::Tensor ao, torch
 }
 
 // The backward's operands beside the prep's: (AH [Bx, M, KP] = fp16(log2 e A), ranks zero-padded; l2t [M, N] fp16 (the
-// forward's values, row-major); LTc: l2t in the cols kernel's fragment order) from A [Bx, M, r] and theta [M, N].
-std::vector<torch::Tensor> top_k_bw_prep(torch::Tensor A, torch::Tensor theta, int64_t KP) {
+// forward's values, row-major); LTc: l2t in the cols kernel's fragment order) from A [Bx, M, r] and theta [M, N] --
+// theta's two tables those of an earlier call where given (`l2t`, `ltc`; empty tensors: made here).
+std::vector<torch::Tensor> top_k_bw_prep(torch::Tensor A, torch::Tensor theta, int64_t KP, torch::Tensor l2t,
+                                         torch::Tensor ltc) {
     const c10::cuda::CUDAGuard guard(A.device());
     check_rows(A, at::kFloat, "A"); check(theta, at::kFloat, "theta");
     const int Bx = A.size(0), M = A.size(1), r = A.size(2), N = theta.size(1);
     TORCH_CHECK(theta.size(0) == M && KP == padded_rank(r) && M % CN == 0 && N % CN == 0, "top_k: shapes");
+    // (theta's tables as an earlier call made them -- L2T, LTc --: not made again)
+    const bool reuse = l2t.numel() > 0 && ltc.numel() > 0;
+    if (reuse) {
+        check(l2t, at::kHalf, "l2t"); check(ltc, at::kInt, "ltc");
+        TORCH_CHECK(l2t.numel() == (long)M * N && ltc.numel() == (long)M * N / 2, "top_k: an earlier call's L2T, LTc");
+    }
     auto AH = torch::empty({Bx, M, KP}, A.options().dtype(at::kHalf));
-    auto L2T = torch::empty({M, N}, A.options().dtype(at::kHalf));
-    auto LTc = torch::empty({(long)M * N / 2}, A.options().dtype(at::kInt));
+    auto L2T = reuse ? l2t : torch::empty({M, N}, A.options().dtype(at::kHalf));
+    auto LTc = reuse ? ltc : torch::empty({(long)M * N / 2}, A.options().dtype(at::kInt));
     auto stream = at::cuda::getCurrentCUDAStream();
-    launch_pdl(tk_bw_prep_kernel, dim3(296, 2), dim3(256), 0, stream, A.data_ptr<float>(), A.stride(0), theta.data_ptr<float>(),
-        reinterpret_cast<__half*>(AH.data_ptr<at::Half>()), reinterpret_cast<__half*>(L2T.data_ptr<at::Half>()),
-        Bx, M, N, r, (int)KP);
+    launch_pdl(tk_bw_prep_kernel, dim3(296, reuse ? 1 : 2), dim3(256), 0, stream, A.data_ptr<float>(), A.stride(0),
+        theta.data_ptr<float>(), reinterpret_cast<__half*>(AH.data_ptr<at::Half>()),
+        reinterpret_cast<__half*>(L2T.data_ptr<at::Half>()), Bx, M, N, r, (int)KP);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
-    launch_pdl(tk_bw_ltc_kernel, dim3(296), dim3(256), 0, stream, reinterpret_cast<const __half*>(L2T.data_ptr<at::Half>()),
-        reinterpret_cast<uint2*>(LTc.data_ptr<int>()), M, N);
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    if (!reuse) {
+        launch_pdl(tk_bw_ltc_kernel, dim3(296), dim3(256), 0, stream, reinterpret_cast<const __half*>(L2T.data_ptr<at::Half>()),
+            reinterpret_cast<uint2*>(LTc.data_ptr<int>()), M, N);
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+    }
     return {AH, L2T, LTc};
 }
 

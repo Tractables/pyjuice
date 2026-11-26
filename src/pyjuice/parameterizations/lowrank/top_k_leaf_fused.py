@@ -178,6 +178,14 @@ def _state(layer, B: int):
     return st if st is not None and st["B"] == B else None
 
 
+def pass_cache(sib: dict, batch_size: int):
+    """A dict for what the sums reading the leaf share in a pass (their parameters' tables: `top_k_fused.theta_tables`),
+    kept in the leaf's forward state -- made again by every forward, so nothing outlives the parameters it was made from
+    --, or None where the leaf's layer has no state for this batch."""
+    st = _state(sib["layer"], batch_size)
+    return None if st is None else st.setdefault("shared", {})
+
+
 def slot_rows(sib: dict, K: int, batch_size: int):
     """`(slot [B], rows, logw_rows)` of a sum's leaf `sib` (`_sibling_leaves`) from its layer's forward state (as
     `top_k.slot_parts` makes them), or None (no state: the torch passes)."""

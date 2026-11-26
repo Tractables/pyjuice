@@ -877,6 +877,57 @@ def test_zero_weights_give_zero_gradients_and_no_em_statistics(kernels, impossib
     assert pc._cum_flow == 0.0
 
 
+def test_tied_sums_make_their_parameters_tables_once_a_pass(monkeypatch):
+    """Tied `LowRank(top_k)` sums make their parameters' tables (theta's grid, the forward's and the backward's l2t)
+    once a pass and share them (`top_k_fused.theta_tables`): the values bit for bit those of tables made at every sum,
+    the gradients and the EM statistics up to the order of the kernels' adds; the next forward makes them again -- an
+    update of the parameters in place, through `.data` (no version bump), is seen."""
+    import pyjuice.parameterizations.lowrank.top_k_fused as tkf
+    import pyjuice.parameterizations.lowrank.top_k_leaf_fused as tlf
+    if tkf.top_k_module() is None or tlf.module() is None:
+        pytest.skip("the CUDA modules did not build")
+    pc, (ext, ids, lp, x, miss), (T, N, b) = _mask_case(True)
+    pext, lp = _pc_ext(ext, T, N), lp.float()
+    rows = torch.arange(b, device = DEV).repeat(2)
+    wt = torch.linspace(0.5, 2.0, b, device = DEV)
+    seen = []
+
+    def conditional():
+        ts = {g_: tuple(t.clone().requires_grad_(True) for t in v) for g_, v in pext.items()}
+        lpg = lp.clone().requires_grad_(True)
+        pc.init_param_flows(flows_memory = 0.0)
+        ll = pc(x.repeat(2, 1), missing_mask = torch.cat([torch.zeros_like(miss), miss]), external_params = ts,
+                external_params_rows = rows, categorical_evidence_logp = lpg.repeat(2, 1, 1),
+                soft_evidence_cat_ids = ids.repeat(2, 1, 1), differentiable = True,
+                param_flows_mask = torch.arange(2 * b, device = DEV) < b).view(-1)
+        (-(wt * (ll[:b] - ll[b:])).sum()).backward()
+        cache = tlf.pass_cache(dict(layer = pc.input_layer_group[0]), 2 * b)
+        seen.append(None if cache is None else sorted(k_ for v in cache.values() for k_ in v))
+        return [ll.detach()] + [t.grad for v in ts.values() for t in v] + [lpg.grad] + _stats(pc)
+
+    def same(a, b_):
+        assert len(a) == len(b_)
+        assert torch.equal(a[0], b_[0])                                 # (the values: no adds across CTAs)
+        for k, (u, v) in enumerate(zip(a[1:], b_[1:])):                 # (the kernels' adds in any order)
+            assert _rel(u, v) < 1e-5, (k, _rel(u, v))
+
+    got = conditional()
+    assert seen[-1] == ["L2T", "LTc", "LTh", "theta"], seen      # (one entry: the tied sums' source)
+    with monkeypatch.context() as mp:
+        mp.setattr(tlf, "pass_cache", lambda sib, batch_size: None)    # (tables made at every sum)
+        same(got, conditional())
+    with torch.no_grad():                                               # (the transitions' parameters, in place)
+        lay = next(l for grp in pc.inner_layer_groups for l in grp if getattr(l, "parameterization", None) is not None)
+        ns = lay.nodes[0]
+        ps, pe = (ns.get_source_ns() if ns.is_tied() else ns)._param_range
+        pc.params.data[ps:pe] *= torch.linspace(0.5, 1.5, pe - ps, device = DEV)
+    got2 = conditional()
+    assert not torch.equal(got2[0], got[0])
+    with monkeypatch.context() as mp:
+        mp.setattr(tlf, "pass_cache", lambda sib, batch_size: None)
+        same(got2, conditional())
+
+
 def test_the_kernels_together_are_the_torch_passes():
     """Every pass by the kernels -- the sums' (their counts written straight into the leaves' buffer) and the leaves' --
     against every pass by torch: the differentiable conditional in one call (the map) with the EM statistics of its
