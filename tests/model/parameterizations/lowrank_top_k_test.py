@@ -969,6 +969,37 @@ def test_the_kernels_together_are_the_torch_passes():
         assert _rel(a, r_) < 5e-3, (name, _rel(a, r_))
 
 
+@pytest.mark.parametrize("by_row", [False, True])
+def test_gradients_fold_into_rows_read_by_any_number_of_samples(by_row):
+    """A map whose rows are read by three samples, two, one and none, in the autograd backward (each sample's gradients
+    folded into the row it read, times its sign): the kernels -- the evidence a sample each, or a row each (a row's
+    samples then a CTA of the leaves' backward, which stores the rows it holds whole) -- against the torch passes."""
+    pc, (ext, ids, lp, x, miss), (T, N, b) = _mask_case(True)
+    pext, lp = _pc_ext(ext, T, N), lp.float()
+    rows = torch.tensor([3, 0, 0, 2, 0, 3], device = DEV)
+    wt = torch.tensor([1.0, -0.5, 2.0, -1.5, 0.75, 1.25], device = DEV)
+    xs, ms = x[rows], miss[rows] & (torch.arange(rows.numel(), device = DEV) % 2 == 1)[:, None]
+
+    def run():
+        ts = {g_: tuple(t.clone().requires_grad_(True) for t in v) for g_, v in pext.items()}
+        lpg = lp.clone().requires_grad_(True)
+        evi = dict(categorical_evidence_logp = lpg, soft_evidence_cat_ids = ids) if by_row else \
+            dict(categorical_evidence_logp = lpg[rows], soft_evidence_cat_ids = ids[rows])
+        ll = pc(xs, missing_mask = ms, external_params = ts, external_params_rows = rows, differentiable = True,
+                **evi).view(-1)
+        (wt * ll).sum().backward()
+        return [ll.detach()] + [t.grad for v in ts.values() for t in v] + [lpg.grad]
+
+    with _paths(False):
+        ref = run()
+    with _paths(True):
+        got = run()
+    assert torch.allclose(got[0], ref[0], atol = 1e-3), float((got[0] - ref[0]).abs().max())
+    for name, a, r_ in zip(("A", "B", "G", "U", "D", "lp"), got[1:], ref[1:]):
+        assert torch.isfinite(a).all() and _rel(a, r_) < 5e-3, (name, _rel(a, r_))
+        assert float(a[1].abs().max()) == 0.0 if name != "lp" else True, name      # (row 1: read by none)
+
+
 @pytest.mark.parametrize("kernels", [False, True])
 def test_evidence_of_the_rows_batch_is_read_through_the_map(kernels):
     """The conditional in one call with its evidence given a row each -- the rows' batch, read through

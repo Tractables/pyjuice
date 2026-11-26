@@ -251,9 +251,11 @@ struct BwArgs {
                                                                  // log-weights [R][M][K + 1] and of the sum's posterior
                                                                  // [R][M][K + 2]: the slots', then the node's flow
     float* glp;                                                  // [B][nvars][C] (added into; null: not wanted)
-    float* dtau;                                                 // [T][B][S][M] written, or (drow) [T][Bd][S][M] added
-                                                                 // into: a sample's times dsgn into row drow; null: none
+    float* dtau;                                                 // [T][B][S][M] written, or (drow) [T][Bd][S][M]: a
+                                                                 // sample's times dsgn into row drow; null: none
     const int* drow; const float* dsgn; int Bd;
+    const bool* owned;                                           // [Bd] (drow) the rows a CTA holds every sample of:
+                                                                 // stored whole, the others added into (null: all)
     int* ekey; float* emr; int4* emeta; int* eplus; int Vb;      // EM (null: none): a tile's entries [T][B][C] (key
                                                                  // k Vb + v; preset: no entry), rows [T][B][4][M],
                                                                  // (sample, cp's first candidate, count rows) [T][B]
@@ -264,16 +266,21 @@ struct BwArgs {
                                                                  // place's rank within its row (null: a sample a CTA)
 };
 
-// dtau's writes of a thread's 4 nodes: stores into the sample's row, or (fold) its values times its sign added into
-// the row of tensors it read (the buffer zeroed; zeros then not written); none where no tilt gradient is wanted
+// dtau's writes of a thread's 4 nodes, times the sample's sign (1 where nothing folds): stored into a row the CTA holds
+// whole (OWN: the sample's own, or the row of tensors it read where no other CTA's sample folds into it), added into
+// one CTA's share (ADD: the row zeroed before; zeros then not written), or left to the CTA's one writer of its samples'
+// row (MERGED); none where no tilt gradient is wanted
+enum : int { DT_OWN = 0, DT_ADD = 1, DT_MERGED = 2 };
 struct DtauOut {
-    float* p; float sg; bool fold;
+    float* p; float sg; int mode;
     __device__ __forceinline__ void put(long off, float x0, float x1, float x2, float x3) const {
-        if (p == nullptr) return;
-        if (fold) red4(p + off, sg * x0, sg * x1, sg * x2, sg * x3);
-        else st4(p + off, x0, x1, x2, x3);
+        if (p == nullptr || mode == DT_MERGED) return;
+        if (mode == DT_ADD) red4(p + off, sg * x0, sg * x1, sg * x2, sg * x3);
+        else st4(p + off, sg * x0, sg * x1, sg * x2, sg * x3);
     }
-    __device__ __forceinline__ void zero(long off) const { if (p != nullptr && !fold) st4(p + off, 0.f, 0.f, 0.f, 0.f); }
+    __device__ __forceinline__ void zero(long off) const {
+        if (p != nullptr && mode == DT_OWN) st4(p + off, 0.f, 0.f, 0.f, 0.f);
+    }
 };
 
 // The backward of a CTA's samples: one (NS = 1), or (the evidence a row each) up to NS of a row, walking its candidates
@@ -305,6 +312,10 @@ __global__ void __launch_bounds__(NW * 32) tk_leaf_backward_kernel(const BwArgs 
     const int i0 = act ? blk * 128 + 4 * lane : 0;
     const int Kl = g.S - 1;
     const bool fold = a.drow != nullptr;
+    // (one write of the tilt's gradient for the samples where they fold into one row -- stored where no other CTA's
+    // sample folds into it --; else a sample each)
+    const bool merge = NS > 1 && fold && ns > 1 && a.drow[bs[0]] == a.drow[bs[NS - 1]];
+    const auto owns = [&](int b) { return !fold || (a.owned != nullptr && a.owned[a.drow[b]]); };
     int p[NS], r[NS];
     bool miss[NS], em[NS], alone[NS], live[NS], grad[NS];
     float gs[NS];
@@ -319,7 +330,7 @@ __global__ void __launch_bounds__(NW * 32) tk_leaf_backward_kernel(const BwArgs 
         r[m] = miss[m] && a.wrow != nullptr ? a.wrow[tb] : -1;
         dt[m] = DtauOut{a.dtau == nullptr ? nullptr
                         : a.dtau + ((long)t * (fold ? a.Bd : g.B) + (fold ? a.drow[b] : b)) * g.S * g.M + i0,
-                        fold ? a.dsgn[b] : 1.f, fold};
+                        fold ? a.dsgn[b] : 1.f, merge ? DT_MERGED : owns(b) ? DT_OWN : DT_ADD};
         em[m] = m < ns && a.ekey != nullptr && p[m] != -1             // EM statistics: every token among the candidates
                 && (a.pmask == nullptr || a.pmask[b]);
         alone[m] = miss[m] && r[m] < 0;                                // a missing token no one reads: its leaf is 1
@@ -330,15 +341,17 @@ __global__ void __launch_bounds__(NW * 32) tk_leaf_backward_kernel(const BwArgs 
             for (int s = 0; s < g.S; ++s) dt[m].zero((long)s * g.M);
         any = any || live[m];
     }
-    if (!any) return;
+    const DtauOut dtm{dt[0].p, 1.f, merge && owns(bs[0]) ? DT_OWN : DT_ADD};
+    if (!any) {
+        if (merge && act)                                              // (the merged row's zeros: its one writer's)
+            for (int s = 0; s < g.S; ++s) dtm.zero((long)s * g.M);
+        return;
+    }
     const int b0 = bs[0];
     const long e0 = ((long)(g.erow != nullptr ? g.erow[b0] : b0) * g.nvars + g.nv_lvid[t]) * g.C;
     const float* tab = g.tab + (long)g.nv_tab[t] * g.tab_stride + i0;
     const float* tau = g.tau == nullptr ? nullptr
                      : g.tau + ((long)t * g.Bx + (g.emap != nullptr ? g.emap[b0] : b0)) * g.S * g.M + i0;
-    // (one write of the tilt's gradient for the samples where they fold into one row; else a sample each)
-    const bool merge = NS > 1 && fold && ns > 1 && a.drow[bs[0]] == a.drow[bs[NS - 1]];
-    const DtauOut dtm{dt[0].p, 1.f, true};
     // EM: the tile's entries and its rows (`tk_leaf_em` reads them), where a sample's statistics are taken -- its
     // samples' cp from candidate 0 (a missing token no one reads) or K (a sum reads it: the slots' counts below K, by
     // their rows of the counts), none (C) where every token is observed
@@ -543,7 +556,40 @@ __global__ void __launch_bounds__(NW * 32) tk_leaf_backward_kernel(const BwArgs 
             dt[m].put((long)Kl * g.M, dR[m][0], dR[m][1], dR[m][2], dR[m][3]);
         }
     }
-    if (merge) dtm.put((long)Kl * g.M, dRS[0], dRS[1], dRS[2], dRS[3]);
+    if (merge) {
+        dtm.put((long)Kl * g.M, dRS[0], dRS[1], dRS[2], dRS[3]);
+        for (int s = min(g.C, Kl); s < Kl; ++s) dtm.zero((long)s * g.M);         // (slots past the candidates)
+    }
+}
+
+// The folded dtau [T][Bd][S][M]'s rows (a CTA a (row d, t)): `owned[d]` whether one CTA of the backward holds every
+// sample folding into d -- the places of `ord` in groups of NS of an evidence row by their `rank`, else (null) a
+// sample a CTA -- and stores it whole; the others' (no sample, or samples in more than one CTA: added into) zeroed
+template <int NS>
+__global__ void __launch_bounds__(256) tk_dtau_rows_kernel(const int* drow, const int* ord, const int* rank, int B,
+                                                           int Bd, long rowsz, bool* owned, float* dtau) {
+    __shared__ int s_lo[8], s_hi[8];
+    const int d = blockIdx.x, t = blockIdx.y, lane = threadIdx.x & 31, w = threadIdx.x >> 5;
+    int lo = INT_MAX, hi = -1;
+    for (int q = threadIdx.x; q < B; q += blockDim.x) {
+        const int b = ord != nullptr ? ord[q] : q;
+        if (drow[b] != d) continue;
+        const int grp = ord != nullptr ? q - rank[q] % NS : q;
+        lo = min(lo, grp); hi = max(hi, grp);
+    }
+#pragma unroll
+    for (int o = 16; o >= 1; o >>= 1) {
+        lo = min(lo, __shfl_xor_sync(0xffffffffu, lo, o)); hi = max(hi, __shfl_xor_sync(0xffffffffu, hi, o));
+    }
+    if (lane == 0) { s_lo[w] = lo; s_hi[w] = hi; }
+    __syncthreads();
+    lo = s_lo[0]; hi = s_hi[0];
+    for (int i = 1; i < (int)(blockDim.x >> 5); ++i) { lo = min(lo, s_lo[i]); hi = max(hi, s_hi[i]); }
+    const bool own = lo == hi;                                         // (no sample: INT_MAX against -1)
+    if (t == 0 && threadIdx.x == 0) owned[d] = own;
+    if (own) return;
+    float4* row = reinterpret_cast<float4*>(dtau + ((long)t * Bd + d) * rowsz);
+    for (long i = threadIdx.x; i < rowsz / 4; i += blockDim.x) row[i] = make_float4(0.f, 0.f, 0.f, 0.f);
 }
 
 // The EM statistics of the backward's entries sorted by key (k Vb + v, Vb = V up to EB: a block of EB categories in one
@@ -808,9 +854,10 @@ torch::Tensor top_k_leaf_backward(torch::Tensor tab, torch::Tensor nv_tab, torch
         TORCH_CHECK(drow.numel() == B && dsgn.numel() == B && Bd > 0, "top_k leaf: drow, dsgn [B]");
     }
     auto dtau = !dtau_out ? torch::empty({0}, tab.options())
-              : fold ? torch::zeros({T, Bd, S, M}, tab.options()) : torch::empty({T, B, S, M}, tab.options());
+              : fold ? torch::empty({T, Bd, S, M}, tab.options()) : torch::empty({T, B, S, M}, tab.options());
     a.drow = fold ? drow.data_ptr<int>() : nullptr; a.dsgn = fold ? dsgn.data_ptr<float>() : nullptr;
     a.Bd = fold ? (int)Bd : 0;
+    a.owned = nullptr;
     a.lz = lz.data_ptr<float>(); a.lb = lb.data_ptr<float>(); a.place = place.data_ptr<int>();
     a.flows = flows.data_ptr<float>(); a.logspace = logspace ? 1 : 0;
     a.wrow = nullptr; a.logw = nullptr; a.lws = 0; a.acnt = nullptr; a.acs = 0;
@@ -860,6 +907,20 @@ torch::Tensor top_k_leaf_backward(torch::Tensor tab, torch::Tensor nv_tab, torch
         a.pmask = pmask.data_ptr<bool>();
     }
     const auto stream = at::cuda::getCurrentCUDAStream();
+    torch::Tensor owned;
+    if (fold) {                                             // (the rows a CTA stores whole; the others zeroed)
+        TORCH_CHECK(M % 4 == 0, "top_k leaf: nodes a multiple of 4");
+        owned = torch::empty({Bd}, tab.options().dtype(at::kBool));
+        a.owned = owned.data_ptr<bool>();
+        const dim3 rgrid((unsigned)Bd, (unsigned)T);
+        if (a.ord != nullptr)
+            tk_dtau_rows_kernel<2><<<rgrid, 256, 0, stream>>>(a.drow, a.ord, a.rank, (int)B, (int)Bd, (long)S * M,
+                                                               owned.data_ptr<bool>(), a.dtau);
+        else
+            tk_dtau_rows_kernel<1><<<rgrid, 256, 0, stream>>>(a.drow, nullptr, nullptr, (int)B, (int)Bd, (long)S * M,
+                                                               owned.data_ptr<bool>(), a.dtau);
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+    }
     dim3 grid((unsigned)B, (unsigned)T, (unsigned)((M + NW * 128 - 1) / (NW * 128)));
     if (a.ord != nullptr) tk_leaf_backward_kernel<2><<<grid, NW * 32, 0, stream>>>(a);
     else tk_leaf_backward_kernel<1><<<grid, NW * 32, 0, stream>>>(a);
