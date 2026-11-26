@@ -422,7 +422,8 @@ def test_the_fused_leaf_is_the_torch_passes(C):
 
 
 def test_the_backward_kernels_are_the_reference():
-    """The sums' backward by the kernels (`lowrank/top_k_backward.py`: 128 nodes, 128 children) against the reference
+    """The sums' backward by the kernels (`lowrank/top_k_backward.py`, `kernels/c/lowrank_top_k.cu`: 128 nodes, 128
+    children) against the reference
     (`_sum_backward_terms`) -- the forward passes the torch references in both, the leaves too --: the differentiable
     conditional's gradients (one call, the map; the kernels' W from the forward's fp16 logits: ~1e-3), a backward's
     node flows without gradients or EM statistics (the element flows alone), and the EM statistics of a backward on
@@ -430,8 +431,8 @@ def test_the_backward_kernels_are_the_reference():
     import pyjuice.parameterizations.lowrank.top_k_fused as tkf
     import pyjuice.parameterizations.lowrank.top_k_leaf_fused as tlf
     import pyjuice.parameterizations.lowrank.top_k_backward as tkb
-    if tkb.triton is None:
-        pytest.skip("no Triton")
+    if tkf.top_k_module() is None or tkb.triton is None:
+        pytest.skip("the CUDA module did not build, or no Triton")
     T, N, C, K, r, re, b, V2 = 3, 128, 70, 64, 20, 8, 4, 80
     tab = _tables(N, 31, V2)
     pc, _, _ = _hmm_pc(T, N, K, r, re, tab, V2)

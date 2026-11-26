@@ -324,26 +324,24 @@ def sum_backward(desc, layer, ns_tensors, ns_grad_tensors, node_flows, element_f
         sib = sibs[id(ns_info.ns)]
         f = _d(node_flows[ns_info.nid_start:ns_info.nid_end, :].t()).exp()            # [B, M] (log-space flows)
         theta = desc._dense_params(geo, params, dtype = PASSES_DTYPE)
-        lc = _d(desc._child_values(geo, element_mars))
         slot, rows, logw_rows, logp, tilt = slot_parts(desc, sib, f.size(0), kwargs, dev)
-        signed = False
-        if top_k_backward.serves(desc, geo["M"], geo["N"], tensors[0].size(2), dev, kwargs):
-            ef, vals, a_rows, flows = top_k_backward.terms(*tensors, theta, lc, slot, rows, logw_rows, f,
-                                                           external_rows(kwargs), grads is not None, want_flows,
-                                                           signs = fold_signs(gviews))
+        if top_k_backward.serves(desc, geo["M"], geo["N"], tensors[0].size(2), f.size(0), dev, kwargs, want_flows) \
+                and element_mars.stride(1) == 1:
+            # (the gradients added into their destinations by the kernels)
+            ef, a_rows, flows = top_k_backward.terms(*tensors, theta, element_mars, geo, slot, rows, logw_rows, f,
+                                                     external_rows(kwargs), grads, gviews, fresh, want_flows)
             Fp, Fm = flows if want_flows else (None, None)
-            signed = True
         else:
             A, Bm, G = (_d(t) for t in per_sample(tensors, external_rows(kwargs)))
+            lc = _d(desc._child_values(geo, element_mars))
             logw = slot_weights(slot, rows, logw_rows, f.size(0), geo["M"], desc.top_k)
             ef, Fp, Fm, Gl, dG, a = _sum_backward_terms(A, Bm, G, theta.log(), lc, logw, f)
-            vals = None if grads is None else [torch.bmm(Gl, Bm.transpose(1, 2)), torch.bmm(A.transpose(1, 2), Gl), dG]
+            if grads is not None:
+                _store(gviews, fresh, grads, [torch.bmm(Gl, Bm.transpose(1, 2)), torch.bmm(A.transpose(1, 2), Gl), dG])
             a_rows = a[rows]
 
         kids = geo["kids"]
         element_flows[kids, :] = torch.logaddexp(element_flows[kids, :], ef.log().t()[geo["cols"], :].to(element_flows.dtype))
-        if grads is not None:
-            _store(gviews, fresh, grads, vals, signed = signed)
         if want_flows:
             desc._scatter_add(geo, param_flows, ns_info.ns._param_flow_range[0], Fp.float())
         if want_denom:

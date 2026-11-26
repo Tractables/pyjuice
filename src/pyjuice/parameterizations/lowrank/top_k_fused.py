@@ -18,6 +18,9 @@ TOP_K_FUSED = True
 
 _ONCE = {}
 
+#: the most samples a call the kernels take (their work items' scans)
+MAX_SAMPLES = 4096
+
 
 def top_k_module():
     """The fused forward's module, or None (no CUDA toolchain, a failed build, compute capability below 8.0)."""
@@ -30,7 +33,7 @@ def top_k_module():
 def serves(desc, M: int, N: int, rank: int, node_mars: torch.Tensor, kwargs: dict) -> bool:
     """Whether the fused forward takes a node vector of `M` nodes over `N` children, its factors of rank `rank`."""
     return (TOP_K_FUSED and node_mars.is_cuda and node_mars.dtype == torch.float32 and node_mars.is_contiguous()
-            and desc.top_k == 64 and M % 128 == 0 and N % 64 == 0 and rank <= 128
+            and desc.top_k == 64 and M % 128 == 0 and N % 64 == 0 and rank <= 128 and node_mars.size(1) <= MAX_SAMPLES
             and kwargs.get("precision", "auto") != "fp32" and top_k_module() is not None)
 
 
@@ -56,18 +59,19 @@ def _rows(t: torch.Tensor) -> torch.Tensor:
     return t if ok else t.contiguous()
 
 
-def prep(Bm, G, element_mars, eid, has, theta, slot, rows_m, logw_m, emap = None):
+def prep(Bm, G, element_mars, eid, has, theta, slot, rows_m, logw_m, emap = None, pair: bool = True):
     """`top_k_prep`'s operands: `B [Bx, r, N]`, `G [Bx, K + 1, N]` a row of tensors each; the children's values
     `element_mars [eid, :]` (`has` [N] bool where an edge reaches them, None where every child is reached); `theta [M,
     N]` the shared parameters (0 where none); a sample each: `slot [B]` the observed token's slot, `emap [B]` the row of
     tensors it reads (None: its own, Bx = B); `rows_m` the samples whose token is missing and their slots' log-weights
-    `logw_m [b, M, K + 1]` (None where none)."""
+    `logw_m [b, M, K + 1]` (None where none); `pair`: the samples reading a row share its work items (else a sample an
+    item)."""
     dev = Bm.device
     f = lambda t: t.float().contiguous()
     return top_k_module().top_k_prep(
         _rows(Bm), _rows(G), element_mars, eid.long().contiguous(), _empty(dev, torch.bool) if has is None else has, f(theta),
         slot.long().contiguous(), _empty(dev, torch.long) if emap is None else emap.long().contiguous(),
-        rows_m.long().contiguous(), _empty(dev, torch.float32) if logw_m is None else logw_m.float().contiguous())
+        rows_m.long().contiguous(), _empty(dev, torch.float32) if logw_m is None else logw_m.float().contiguous(), pair)
 
 
 def forward(A, ops, node_mars: torch.Tensor, nid0: int) -> None:
@@ -75,19 +79,13 @@ def forward(A, ops, node_mars: torch.Tensor, nid0: int) -> None:
     top_k_module().top_k_forward(_rows(A), *ops, node_mars, nid0)
 
 
-#: the most samples whose rows of tensors the kernels share by a map (`top_k_prep`'s work items); more are gathered
-MAX_MAPPED = 4096
-
-
 def sum_forward(desc, layer, ns_info, tensors, geo, params, element_mars, node_mars, sib, kwargs) -> bool:
     """A `LowRank(top_k)` sum node vector's values by the fused kernels, written over its rows of `node_mars`; False
     where they do not serve (the reference then). Samples reading the same row of tensors (`external_params_rows`)
     share its tile."""
-    from .top_k import slot_parts, per_sample, external_rows
+    from .top_k import slot_parts, external_rows
     B = node_mars.size(1)
     emap = external_rows(kwargs)
-    if emap is not None and B > MAX_MAPPED:
-        tensors, emap = per_sample(tensors, emap), None
     A, Bm, G = tensors
     if not serves(desc, geo["M"], geo["N"], A.size(2), node_mars, kwargs) or element_mars.stride(1) != 1 or \
             (emap is None and A.size(0) != B):
