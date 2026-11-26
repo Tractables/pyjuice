@@ -123,7 +123,7 @@ def _dest_ok(g: torch.Tensor) -> bool:
 
 
 def terms(A, Bm, G, theta, element_mars, geo, slot, rows, logw_rows, nf, emap, grads, gviews, fresh: bool,
-          want_flows: bool = False, pmask = None, counts = None):
+          want_flows: bool = False, pmask = None, counts = None, ops = None):
     """`top_k._sum_backward_terms`' element flows `[B, N]`, the posterior counts `a` of the masked samples `rows`
     `[b, M, 65]` and the EM statistics `(F+, F-)` `[M, N]` (None unless `want_flows`; of the samples `pmask` [B] holds,
     if given) by the kernels; the gradients of
@@ -132,7 +132,8 @@ def terms(A, Bm, G, theta, element_mars, geo, slot, rows, logw_rows, nf, emap, g
     into its own. `emap [B]` the row a sample reads (None: its own); the parameters `theta [M, N]` (0 where none); the
     children's values `element_mars [geo["eid"], :]`; `nf [M, B]` the node flows' log-space rows (the circuit's
     buffer); the observed samples' slots `slot [B]`, the masked ones' weights `logw_rows`; `counts` None, or the buffer
-    `[b, M, 72]` the posterior counts go into (their leaf's: `top_k_leaf_fused.counts_buffer`)."""
+    `[b, M, 72]` the posterior counts go into (their leaf's: `top_k_leaf_fused.counts_buffer`); `ops` None, or the
+    forward's operands (`top_k_fused.prep_of`: made with the samples of a row sharing its items)."""
     from . import top_k_fused as tkf
     mod = tkf.top_k_module()
     Bx, M, r = A.shape
@@ -143,8 +144,11 @@ def terms(A, Bm, G, theta, element_mars, geo, slot, rows, logw_rows, nf, emap, g
     # (the samples reading a row share one item -- its tile -- where their gradients merge: a fold, or none asked)
     pair = emap is None or fold is not None or grads is None
     A_ = tkf._rows(A)
-    ops = tkf.prep(Bm, G, element_mars, geo["eid"], None if geo["full"] else geo["has"], theta, slot, rows, logw_rows,
-                   emap, pair = pair)
+    if ops is not None and pair:
+        ops[10].zero_()                       # (the forward's operands: its stream-K flags reset for the rows pass)
+    else:
+        ops = tkf.prep(Bm, G, element_mars, geo["eid"], None if geo["full"] else geo["has"], theta, slot, rows,
+                       logw_rows, emap, pair = pair)
     BP, E, ev, cmax, LTh, mitems, oitems, noitems, slot32, logw, flags = ops
     AH, L2T, LTc = mod.top_k_bw_prep(A_, theta.float().contiguous(), BP.size(1))
     alpha, beta, acnt, ao, bo, hrow = mod.top_k_bw_rows(A_, *ops, nf, tkf._empty(dev, torch.float32) if counts is None

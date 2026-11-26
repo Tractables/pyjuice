@@ -132,7 +132,8 @@ struct FwArgs {
     const int* tok; const unsigned char* miss;                   // [T][B] the token, missing
     float* node_mars;                                            // [rows][B]
     float* lz; float* lb; int* place;                            // [T][B][M] log2 Z, log2 of the bulk's sum; [T][B]
-    const int* wrow; float* logw;                                // [T][B] -> row of logw [R][M][K + 1] (-1: none)
+    const int* wrow; float* logw; int lws;                       // [T][B] -> row of logw [R][M][lws] (slots 0 .. K;
+                                                                 // -1: none): lws = 72, the sums' operand stride
 };
 
 __global__ void __launch_bounds__(NW * 32) tk_leaf_forward_kernel(const FwArgs a) {
@@ -226,7 +227,7 @@ __global__ void __launch_bounds__(NW * 32) tk_leaf_forward_kernel(const FwArgs a
 #pragma unroll
         for (int j = 0; j < 4; ++j) a.node_mars[(r0 + j) * g.B + b] = v[j];
     } else if (a.wrow != nullptr && a.wrow[tb] >= 0) {                // the slots' log-weights, as the sum reads them
-        float* out = a.logw + ((long)a.wrow[tb] * g.M + i0) * (g.K + 1);
+        float* out = a.logw + ((long)a.wrow[tb] * g.M + i0) * a.lws;
         for (int s = 0; s < g.K; ++s) {
             float x[4] = {-INFINITY, -INFINITY, -INFINITY, -INFINITY};
             if (s < g.C) {
@@ -237,18 +238,20 @@ __global__ void __launch_bounds__(NW * 32) tk_leaf_forward_kernel(const FwArgs a
                 for (int j = 0; j < 4; ++j) x[j] = (at(th, j) + l + at(tc, j) - lzs[j]) * LN2;
             }
 #pragma unroll
-            for (int j = 0; j < 4; ++j) out[j * (g.K + 1) + s] = x[j];
+            for (int j = 0; j < 4; ++j) out[j * a.lws + s] = x[j];
         }
 #pragma unroll
-        for (int j = 0; j < 4; ++j) out[j * (g.K + 1) + g.K] = (lse_log2(lse_merge(mid[j], bulk[j])) - lzs[j]) * LN2;
+        for (int j = 0; j < 4; ++j) out[j * a.lws + g.K] = (lse_log2(lse_merge(mid[j], bulk[j])) - lzs[j]) * LN2;
     }
 }
+
+constexpr int LW_STRIDE = 72;          // the slots' log-weights' row stride (the sums' kernels' SP)
 
 struct BwArgs {
     Tile g;
     const float* lz; const float* lb; const int* place;          // the forward's
     const float* flows; int logspace;                            // node flows [rows][B]
-    const int* wrow; const float* logw; const float* acnt; int acs;   // a missing token a sum reads: its row of the slots'
+    const int* wrow; const float* logw; int lws; const float* acnt; int acs;   // a missing token a sum reads: its row of the slots'
                                                                  // log-weights and posterior counts [R][M][K + 1]
     float* glp;                                                  // [B][nvars][C] (added into; null: not wanted)
     float* dtau;                                                 // [T][B][S][M] written, or (drow) [T][Bd][S][M] added
@@ -320,12 +323,12 @@ __global__ void __launch_bounds__(NW * 32) tk_leaf_backward_kernel(const BwArgs 
             }
         } else {
             ac = a.acnt + ((long)r * g.M + i0) * a.acs;
-            const float* lw = a.logw + ((long)r * g.M + i0) * (g.K + 1);
+            const float* lw = a.logw + ((long)r * g.M + i0) * a.lws;
 #pragma unroll
             for (int j = 0; j < 4; ++j) {
                 float f = 0.f;
                 for (int s = 0; s <= g.K; ++s) f += ac[j * a.acs + s];
-                const float pr = ex2(lw[j * (g.K + 1) + g.K] * LOG2E), aK = ac[j * a.acs + g.K];
+                const float pr = ex2(lw[j * a.lws + g.K] * LOG2E), aK = ac[j * a.acs + g.K];
                 fo[j] = 0.f;
                 fm[j] = f;
                 cp[j] = pr > 0.f ? aK / pr : 0.f;
@@ -581,7 +584,8 @@ torch::Tensor top_k_leaf_table(torch::Tensor params, torch::Tensor spids, int64_
 }
 
 // the forward of T node vectors over B samples: writes their node values (observed tokens) into node_mars; returns
-// (lz [T, B, M], lb [T, B, M], place [T, B], logw [R, M, K + 1]) -- R the rows wrow names (logw empty where none)
+// (lz [T, B, M], lb [T, B, M], place [T, B], logw [R, M, max(K + 1, 72)] -- slots 0 .. K, the rows 72 wide as the sums'
+// kernels read them (the rest not written) --) -- R the rows wrow names (logw empty where none)
 std::vector<torch::Tensor> top_k_leaf_forward(torch::Tensor tab, torch::Tensor nv_tab, torch::Tensor tau, torch::Tensor emap,
                                               torch::Tensor ids, torch::Tensor lp, torch::Tensor nv_lvid,
                                               torch::Tensor nv_row0, torch::Tensor tok, torch::Tensor miss,
@@ -597,10 +601,10 @@ std::vector<torch::Tensor> top_k_leaf_forward(torch::Tensor tab, torch::Tensor n
     auto f32 = tab.options();
     auto lz = torch::empty({T, B, M}, f32), lb = torch::empty({T, B, M}, f32);
     auto place = torch::empty({T, B}, tok.options());
-    auto logw = torch::empty({std::max<int64_t>(R, 0), M, K + 1}, f32);
+    auto logw = torch::empty({std::max<int64_t>(R, 0), M, std::max<int64_t>(K + 1, LW_STRIDE)}, f32);
     a.tok = tok.data_ptr<int>(); a.miss = miss.data_ptr<uint8_t>(); a.node_mars = node_mars.data_ptr<float>();
     a.lz = lz.data_ptr<float>(); a.lb = lb.data_ptr<float>(); a.place = place.data_ptr<int>();
-    a.wrow = nullptr; a.logw = nullptr;
+    a.wrow = nullptr; a.logw = nullptr; a.lws = (int)logw.size(2);
     if (R > 0) { check(wrow, at::kInt, "wrow"); a.wrow = wrow.data_ptr<int>(); a.logw = logw.data_ptr<float>(); }
     dim3 grid((unsigned)B, (unsigned)T, (unsigned)((M + NW * 128 - 1) / (NW * 128)));
     tk_leaf_forward_kernel<<<grid, NW * 32, 0, at::cuda::getCurrentCUDAStream()>>>(a);
@@ -641,12 +645,13 @@ torch::Tensor top_k_leaf_backward(torch::Tensor tab, torch::Tensor nv_tab, torch
     a.Bd = fold ? (int)Bd : 0;
     a.lz = lz.data_ptr<float>(); a.lb = lb.data_ptr<float>(); a.place = place.data_ptr<int>();
     a.flows = flows.data_ptr<float>(); a.logspace = logspace ? 1 : 0;
-    a.wrow = nullptr; a.logw = nullptr; a.acnt = nullptr; a.acs = 0;
+    a.wrow = nullptr; a.logw = nullptr; a.lws = 0; a.acnt = nullptr; a.acs = 0;
     if (acnt.numel() > 0) {
         check(wrow, at::kInt, "wrow"); check(logw, at::kFloat, "logw"); check(acnt, at::kFloat, "acnt");
-        TORCH_CHECK(acnt.size(0) == logw.size(0) && acnt.size(1) == logw.size(1) && acnt.size(2) >= logw.size(2),
-                    "top_k leaf: acnt [R, M, >= K + 1] as logw");
+        TORCH_CHECK(acnt.size(0) == logw.size(0) && acnt.size(1) == logw.size(1) && acnt.size(2) >= K + 1 &&
+                    logw.size(2) >= K + 1, "top_k leaf: acnt, logw [R, M, >= K + 1]");
         a.wrow = wrow.data_ptr<int>(); a.logw = logw.data_ptr<float>(); a.acnt = acnt.data_ptr<float>();
+        a.lws = (int)logw.size(2);
         a.acs = (int)acnt.size(2);
     }
     a.glp = glp.numel() > 0 ? glp.data_ptr<float>() : nullptr; a.dtau = dtau_out ? dtau.data_ptr<float>() : nullptr;

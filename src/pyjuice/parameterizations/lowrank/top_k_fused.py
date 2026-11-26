@@ -71,7 +71,20 @@ def prep(Bm, G, element_mars, eid, has, theta, slot, rows_m, logw_m, emap = None
     return top_k_module().top_k_prep(
         _rows(Bm), _rows(G), element_mars, eid.long().contiguous(), _empty(dev, torch.bool) if has is None else has, f(theta),
         slot.long().contiguous(), _empty(dev, torch.long) if emap is None else emap.long().contiguous(),
-        rows_m.long().contiguous(), _empty(dev, torch.float32) if logw_m is None else logw_m.float().contiguous(), pair)
+        rows_m.long().contiguous(), _empty(dev, torch.float32) if logw_m is None else _weights_operand(logw_m), pair)
+
+
+#: The masked samples' weights' row stride in the kernels' operand (`SP` of `kernels/c/lowrank_top_k.cu`)
+WEIGHTS_STRIDE = 72
+
+
+def _weights_operand(logw: torch.Tensor) -> torch.Tensor:
+    """`logw [b, M, K + 1]` as the kernels read it: where it is a view of rows `WEIGHTS_STRIDE` wide (the leaf's,
+    `top_k_leaf_fused.slot_rows`), those rows -- no copy --, else contiguous (the kernels pad it)."""
+    b, M, S = logw.shape
+    if logw.dtype == torch.float32 and S <= WEIGHTS_STRIDE and logw.stride() == (M * WEIGHTS_STRIDE, WEIGHTS_STRIDE, 1):
+        return logw.as_strided((b, M, WEIGHTS_STRIDE), (M * WEIGHTS_STRIDE, WEIGHTS_STRIDE, 1))
+    return logw.float().contiguous()
 
 
 def forward(A, ops, node_mars: torch.Tensor, nid0: int) -> None:
@@ -94,4 +107,15 @@ def sum_forward(desc, layer, ns_info, tensors, geo, params, element_mars, node_m
     theta = desc._dense_params(geo, params, dtype = torch.float32)
     ops = prep(Bm, G, element_mars, geo["eid"], None if geo["full"] else geo["has"], theta, slot, rows_m, logw_m, emap)
     forward(A, ops, node_mars, ns_info.nid_start)
+    if kwargs.get("_grad_enabled", False):
+        # (a backward may follow: the operands kept for it -- `top_k_backward.terms` takes them, `prep_of`)
+        layer.__dict__["_lr_state"][("prep", id(ns_info.ns))] = (B, ops)
     return True
+
+
+def prep_of(layer, ns, B: int):
+    """The forward's operands of the node vector (`prep`'s, kept where a backward may follow: `sum_forward`), taken --
+    a backward uses them once, a second one makes its own --; None where the forward kept none, or for another batch."""
+    st = layer.__dict__.get("_lr_state")
+    got = st.pop(("prep", id(ns)), None) if isinstance(st, dict) else None
+    return got[1] if got is not None and got[0] == B else None

@@ -301,7 +301,7 @@ def sum_backward(desc, layer, ns_tensors, ns_grad_tensors, node_flows, element_f
     the shared slot's spread over its candidates as P_b(c | i)), d / d logit(c) = rho - f P_b(c | i): the evidence's
     gradient (summed over i), the tilt's, and the leaf's EM statistics there, F+ += rho, F- += f P_b(c | i).
     """
-    from . import top_k_leaf_fused, top_k_backward
+    from . import top_k_leaf_fused, top_k_backward, top_k_fused
     dev = node_flows.device
     sibs = layer.__dict__["_sibling_leaves"]
     gviews, fresh = _grads_kw(kwargs)
@@ -327,7 +327,8 @@ def sum_backward(desc, layer, ns_tensors, ns_grad_tensors, node_flows, element_f
             # (the gradients added into their destinations by the kernels; the counts into the leaf's buffer)
             counts = top_k_leaf_fused.counts_buffer(sib, desc.top_k, B) if rows.numel() > 0 else None
             ef, a_rows, flows = top_k_backward.terms(*tensors, theta, element_mars, geo, slot, rows, logw_rows, nf,
-                                                     external_rows(kwargs), grads, gviews, fresh, want_flows, pm, counts)
+                                                     external_rows(kwargs), grads, gviews, fresh, want_flows, pm, counts,
+                                                     top_k_fused.prep_of(layer, ns_info.ns, B))
             Fp, Fm = flows if want_flows else (None, None)
         else:
             f = _d(nf.t()).exp()

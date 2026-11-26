@@ -82,9 +82,10 @@ def _operand_columns(readers, batch_size: int) -> int:
     return min(batch_size if p is None else p.param_operand_columns(batch_size) for p in readers)
 
 # The forward options a fused product forward serves (`_stream_fusion_groups`): the plain regime's, and the external
-# parameters' (a gated layer whose parameterization takes the fused forward, `fuses_stream_children`)
+# parameters' (a gated layer whose parameterization takes the fused forward, `fuses_stream_children`); and the call's
+# grad mode, a hint of what a layer may keep for a backward (`_grad_enabled`), which changes no value
 _STREAM_FUSION_FW_OPTS = frozenset(("precision", "pflow_temperature", "sum_external_params",
-                                    "sum_external_params_buffer"))
+                                    "sum_external_params_buffer", "_grad_enabled"))
 
 # The backward options of the plain regime a fused product backward serves (`_stream_fusion_bk_groups`)
 _STREAM_FUSION_BK_OPTS = frozenset(("param_flows", "denom_param_flows", "allow_modify_flows", "logspace_flows",
@@ -713,6 +714,7 @@ class TensorCircuit(_BuildMixin, _CudaGraphsMixin, _ExternalParamsMixin, _Learni
         _pop_removed_precision_flags(kwargs)
         differentiable = bool(kwargs.pop("differentiable", False))
         param_flows_mask = kwargs.pop("param_flows_mask", None)               # (the backward's: below)
+        grad_enabled = torch.is_grad_enabled()                                 # (the call's, before the layers' no_grad)
         self._num_runs = getattr(self, "_num_runs", 0) + 1
 
         with device_grad_controller(device = self.device, no_grad = True):
@@ -786,6 +788,9 @@ class TensorCircuit(_BuildMixin, _CudaGraphsMixin, _ExternalParamsMixin, _Learni
             if self.__dict__.get("_sums_read_inputs", False):
                 # (a sum whose parameters read the leaf beside it reads the inputs: `SumParameterization.reads_sibling_leaf`)
                 sum_opts["_inputs"] = origin_inputs
+            if grad_enabled:
+                # (the call made with grad on: a backward of it may follow -- what a layer may keep for one)
+                sum_opts["_grad_enabled"] = True
 
             def _run_inner_layers():
                 # The buffers and parameters looked up once, and a group without hooks called at its `forward` -- what

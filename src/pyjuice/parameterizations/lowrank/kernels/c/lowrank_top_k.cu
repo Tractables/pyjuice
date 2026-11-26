@@ -945,7 +945,7 @@ __global__ void tk_prep_kernel(
             __syncthreads();
         }
     } else {                                                                 // the masked samples' weights, fp32, padded
-        const long total = (long)Rm * M * SP;
+        const long total = logwin != nullptr ? (long)Rm * M * SP : 0;      // (none to copy: given padded)
         for (long q = tid0; q < total; q += nth) {
             const int s = (int)(q % SP);
             logw[q] = s < S ? logwin[(q / SP) * S + s] : NEG;
@@ -1877,9 +1877,12 @@ std::vector<torch::Tensor> top_k_prep(torch::Tensor Bm, torch::Tensor G, torch::
     TORCH_CHECK(B <= 4096, "top_k: at most 4096 samples (the work items' scans)");
     const bool full = has.numel() == 0;
     if (!full) TORCH_CHECK(has.is_cuda() && has.scalar_type() == at::kBool && has.numel() == N, "top_k: has [N] bool");
+    // (the weights already in the operand's rows -- 72 wide, slots S .. 71 never read -- taken as they are)
+    const bool padded = Rm > 0 && logwin.size(2) == SP;
     if (Rm > 0) {
         check(logwin, at::kFloat, "logw");
-        TORCH_CHECK(logwin.size(0) == Rm && logwin.size(1) == M && logwin.size(2) == S, "top_k: logw [Rm, M, S]");
+        TORCH_CHECK(logwin.size(0) == Rm && logwin.size(1) == M && (logwin.size(2) == S || padded),
+                    "top_k: logw [Rm, M, S] or [Rm, M, 72]");
     }
     const int KP = padded_rank(r);
     auto f32 = Bm.options(), f16 = Bm.options().dtype(at::kHalf), i32 = Bm.options().dtype(at::kInt);
@@ -1889,7 +1892,7 @@ std::vector<torch::Tensor> top_k_prep(torch::Tensor Bm, torch::Tensor G, torch::
     const long ocap = std::max((B - Rm + 1) / 2, 1);
     auto mitems = torch::empty({std::max(Rm, 1), 4}, i32), oitems = torch::empty({2 * ocap + 1, 4}, i32);
     auto noitems = torch::empty({1}, i32), slot32 = torch::empty({B}, i32);
-    auto logw = torch::empty({std::max(Rm, 1), M, SP}, f32);
+    auto logw = padded ? logwin : torch::empty({std::max(Rm, 1), M, SP}, f32);
     // the forward's grid (each kind's launch): a CTA an SM, at least ~4 chunks a CTA (the observed items' count an
     // upper bound here); its flags, the masked launch's and the observed one's
     const int sms = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
@@ -1900,7 +1903,8 @@ std::vector<torch::Tensor> top_k_prep(torch::Tensor Bm, torch::Tensor G, torch::
     tk_prep_kernel<<<dim3(296, 5), 256, 0, stream>>>(
         Bm.data_ptr<float>(), Bm.stride(0), G.data_ptr<float>(), G.stride(0), em.data_ptr<float>(), em.stride(0),
         eid.data_ptr<long>(),
-        full ? nullptr : has.data_ptr<bool>(), theta.data_ptr<float>(), Rm > 0 ? logwin.data_ptr<float>() : nullptr,
+        full ? nullptr : has.data_ptr<bool>(), theta.data_ptr<float>(),
+        Rm > 0 && !padded ? logwin.data_ptr<float>() : nullptr,
         reinterpret_cast<__half*>(BP.data_ptr<at::Half>()), E.data_ptr<float>(), ev.data_ptr<float>(),
         cmax.data_ptr<float>(), reinterpret_cast<uint2*>(LTh.data_ptr<int>()), logw.data_ptr<float>(),
         Bx, B, M, N, r, KP, S, Rm);

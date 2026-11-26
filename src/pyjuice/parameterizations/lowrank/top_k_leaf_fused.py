@@ -162,7 +162,7 @@ def slot_rows(sib: dict, K: int, batch_size: int):
     o0, o1 = st["offs"][t], st["offs"][t + 1]
     if st.get("slot") is None:                                     # (every position's, once a forward)
         st["slot"] = st["place"].long().clamp_(0, K)
-    return st["slot"][t], st["rows"][o0:o1], st["logw"][o0:o1]
+    return st["slot"][t], st["rows"][o0:o1], st["logw"][o0:o1, :, :K + 1]       # (its rows 72 wide: slots 0 .. K)
 
 
 #: The counts' rows as the sums' backward kernels write them (`SA` of `kernels/c/lowrank_top_k.cu`: K + 1 padded)
