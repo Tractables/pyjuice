@@ -642,6 +642,51 @@ def test_the_kernels_together_are_the_torch_passes():
         assert _rel(a, r_) < 5e-3, (name, _rel(a, r_))
 
 
+@pytest.mark.parametrize("kernels", [False, True])
+def test_evidence_of_the_rows_batch_is_read_through_the_map(kernels):
+    """The conditional in one call with its evidence given a row each -- the rows' batch, read through
+    `external_params_rows` -- is the call with it repeated a sample each: the values, every gradient (the evidence's
+    folded into its rows, each sample's times its sign) and the EM statistics of the all-observed pass."""
+    pc, (ext, ids, lp, x, miss), (T, N, b) = _mask_case(kernels)
+    pext, lp = _pc_ext(ext, T, N), lp.float()
+    rows = torch.arange(b, device = DEV).repeat(2)
+    wt = torch.linspace(0.5, 2.0, b, device = DEV)
+
+    def conditional(by_row):
+        ts = {g_: tuple(t.clone().requires_grad_(True) for t in v) for g_, v in pext.items()}
+        lpg = lp.clone().requires_grad_(True)
+        evi = dict(categorical_evidence_logp = lpg, soft_evidence_cat_ids = ids) if by_row else \
+            dict(categorical_evidence_logp = lpg.repeat(2, 1, 1), soft_evidence_cat_ids = ids.repeat(2, 1, 1))
+        pc.init_param_flows(flows_memory = 0.0)
+        pc._cum_flow = 0.0
+        ll = pc(x.repeat(2, 1), missing_mask = torch.cat([torch.zeros_like(miss), miss]), external_params = ts,
+                external_params_rows = rows, differentiable = True,
+                param_flows_mask = torch.arange(2 * b, device = DEV) < b, **evi).view(-1)
+        (-(wt * (ll[:b] - ll[b:])).sum()).backward()
+        return [ll.detach()] + [t.grad for v in ts.values() for t in v] + [lpg.grad] + _stats(pc)
+
+    with _paths(kernels):
+        got = conditional(True)
+        want = conditional(False)
+    names = ("ll", "A", "B", "G", "U", "D", "lp", "sums' F+", "sums' F- / theta", "leaves' F")
+    for name, a, w_ in zip(names, got, want):
+        assert _rel(a, w_) < 1e-5, (name, _rel(a, w_))
+
+
+def test_a_plain_soft_evidence_leaf_refuses_evidence_of_another_batch():
+    """Evidence of the rows' batch is read through the map by a `LowRank(top_k)` leaf only: a plain
+    `SoftEvidenceCategorical` reads it a sample each, and refuses another batch rather than read past it."""
+    with juice.set_block_size(4):
+        xs = [inputs(v, num_node_blocks = 1, dist = dists.SoftEvidenceCategorical(num_cats = V)) for v in range(2)]
+        root = summate(multiply(*xs), num_node_blocks = 1, block_size = 1)
+    pc = juice.compile(root).to(DEV)
+    x = torch.randint(0, 4, (6, 2), device = DEV)
+    ids = torch.arange(4, device = DEV).repeat(3, 2, 1)                          # [3, 2, 4]: the batch of 3 rows
+    lp = torch.log_softmax(torch.randn(3, 2, 4, device = DEV), dim = -1)
+    with pytest.raises(ValueError, match = "rows' batch"):
+        pc(x, categorical_evidence_logp = lp, soft_evidence_cat_ids = ids)
+
+
 def test_zero_tensors_are_the_plain_circuit():
     """A, B, G, U, D all zero: the circuit of plain soft-evidence leaves and plain sums, as pyjuice evaluates it."""
     T, N, C, K, r, re, b = 4, 4, 5, 2, 3, 2, 6

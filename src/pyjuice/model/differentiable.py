@@ -128,5 +128,8 @@ class _DifferentiableLLs(torch.autograd.Function):
                     continue
             else:
                 g = evi_grads[f"{key}_grad"]
+                if g.size(0) != w.size(0):
+                    out.append(g.to(t.dtype))                         # (evidence of the rows' batch: signed and folded)
+                    continue
             out.append((g * sign.view(-1, *([1] * (g.dim() - 1))).to(g.dtype)).to(t.dtype))
         return (None, None, None, None, None, None, *out)

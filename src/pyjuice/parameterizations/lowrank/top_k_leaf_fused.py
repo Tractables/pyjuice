@@ -138,13 +138,26 @@ def leaf_forward(desc, layer, data: torch.Tensor, node_mars: torch.Tensor, kwarg
     lp = kwargs["categorical_evidence_logp"].float().contiguous()
     emap32 = torch.empty(0, dtype = torch.int32, device = dev) if emap is None else emap.to(torch.int32).contiguous()
     tok = data.index_select(0, plan["vars"]).to(torch.int32).contiguous()
+    ord_, rank = _by_row(emap32, B) if ids.size(0) != B else (_none_i32(dev), _none_i32(dev))   # (evidence by row)
     lz, lb, place, logw = mod.top_k_leaf_forward(tab, plan["nv_tab"], tau, emap32, ids, lp, plan["nv_lvid"],
                                                  plan["nv_row0"], tok, miss.to(torch.uint8).contiguous(), wrow, R, S, K,
-                                                 node_mars)
+                                                 node_mars, ord_)
     layer.__dict__[_STATE] = dict(B = B, K = K, S = S, tab = tab, tau = tau, emap = emap32, ids = ids, lp = lp, lz = lz,
                                   lb = lb, place = place, miss = miss, wrow = wrow, logw = logw, offs = offs, rows = rows,
-                                  counts = None)
+                                  counts = None, ord = ord_, rank = rank)
     return True
+
+
+def _none_i32(dev):
+    return torch.empty(0, dtype = torch.int32, device = dev)
+
+
+def _by_row(emap32: torch.Tensor, B: int):
+    """`(ord, rank)` int32 [B]: the samples by the row of evidence they read (stable) -- the forward's CTAs in that
+    order --, and each place's rank among its row's (the backward's CTA a row's samples: no host synchronization)."""
+    srt, ord_ = torch.sort(emap32.long(), stable = True)
+    rank = torch.arange(B, device = srt.device) - torch.searchsorted(srt, srt)
+    return ord_.to(torch.int32).contiguous(), rank.to(torch.int32).contiguous()
 
 
 def _state(layer, B: int):
@@ -242,7 +255,7 @@ def leaf_backward(desc, layer, data, node_flows: torch.Tensor, kwargs: dict, log
                   batch_first: bool, compute_param_flows: bool) -> bool:
     """`top_k.leaf_backward` by the kernels, from the layer's forward state and the reading sums' counts; False where
     the forward left none (the torch passes then)."""
-    from .top_k import _staged, _grads_kw, external_rows
+    from .top_k import _staged, _grads_kw, external_rows, evidence_rows
     st = _state(layer, node_flows.size(1))
     if st is None or node_flows.dtype != torch.float32 or not node_flows.is_contiguous():
         return False
@@ -267,10 +280,17 @@ def leaf_backward(desc, layer, data, node_flows: torch.Tensor, kwargs: dict, log
     drow, dsgn, Bd = none.int(), none, 0
     if fold is not None:
         drow, dsgn, Bd = fold[0].to(torch.int32).contiguous(), fold[1].float().contiguous(), staged[graded[0]["ns"]][0].size(0)
+    # (evidence of the rows' batch: each sample's gradient into the row it read, times its sign where the backward folds)
+    gsgn = none
+    if glp is not None and evidence_rows(kwargs) is not None:
+        from pyjuice.layer.parameterized_sum_layer import EXTERNAL_PARAMS_GRAD_SIGNS_KWARG
+        sg = kwargs.get(EXTERNAL_PARAMS_GRAD_SIGNS_KWARG)
+        gsgn = torch.ones(node_flows.size(1), device = dev) if sg is None else sg.float().contiguous()
     dtau = mod.top_k_leaf_backward(st["tab"], plan["nv_tab"], st["tau"], st["emap"], st["ids"], st["lp"], plan["nv_lvid"],
                                    plan["nv_row0"], st["lz"], st["lb"], st["place"], node_flows, logspace_flows,
                                    st["wrow"], st["logw"], counts, st["S"], st["K"], glp if glp is not None else none,
-                                   fpT, fmT, none.bool() if pm is None else pm.contiguous(), bool(graded), drow, dsgn, Bd)
+                                   fpT, fmT, none.bool() if pm is None else pm.contiguous(), gsgn, bool(graded), drow,
+                                   dsgn, Bd, st["ord"], st["rank"])
     if em:                                                                              # (F+ then F- of each block's rows)
         V = nodes[0]["ns"].dist.num_cats
         for k, spf in enumerate(plan["flows"]):

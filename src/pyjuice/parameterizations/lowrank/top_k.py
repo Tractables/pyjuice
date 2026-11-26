@@ -56,6 +56,43 @@ def per_sample(tensors, rows):
     return tensors if rows is None else tuple(t.index_select(0, rows) for t in tensors)
 
 
+def evidence_rows(kwargs):
+    """`[B]` long: the row of the leaves' evidence (`categorical_evidence_logp`, `soft_evidence_cat_ids`) each sample
+    reads where the evidence has the rows' batch -- that of the external tensors, through `external_params_rows`:
+    samples sharing a row share its evidence --, or None (the samples' batch: a sample's own)."""
+    lp, rows = kwargs.get("categorical_evidence_logp"), external_rows(kwargs)
+    if lp is None or rows is None or lp.size(0) == rows.numel():
+        return None
+    return rows
+
+
+def per_sample_evidence(kwargs):
+    """`(lp, ids)` a sample each: the evidence as given, or its rows gathered (`evidence_rows`)."""
+    lp, ids, er = kwargs.get("categorical_evidence_logp"), kwargs.get("soft_evidence_cat_ids"), evidence_rows(kwargs)
+    if er is None or lp is None or ids is None:
+        return lp, ids
+    return lp.index_select(0, er), ids.index_select(0, er)
+
+
+def add_evidence_grad(glp, lvid: int, values, kwargs, samples = None) -> None:
+    """`glp[:, lvid, :]` += the samples' `values [b, C]` (the samples `samples`, or every one): each into its own
+    row, or (evidence of the rows' batch, `evidence_rows`) into the row it read, times its sign where the backward folds
+    the gradients (`EXTERNAL_PARAMS_GRAD_SIGNS_KWARG`)."""
+    from pyjuice.layer.parameterized_sum_layer import EXTERNAL_PARAMS_GRAD_SIGNS_KWARG
+    er = evidence_rows(kwargs)
+    if er is None:
+        if samples is None:
+            glp[:, lvid, :] += values.to(glp.dtype)
+        else:
+            glp[samples, lvid, :] += values.to(glp.dtype)
+        return
+    sg = kwargs.get(EXTERNAL_PARAMS_GRAD_SIGNS_KWARG)
+    if samples is not None:
+        er, sg = er[samples], (None if sg is None else sg[samples])
+    v = values if sg is None else values * sg.to(values.dtype)[:, None]
+    glp[:, lvid, :].index_add_(0, er, v.to(glp.dtype))
+
+
 def _leaf_rows(layer, ns):
     """`(first node row, end, variable, its layer-local id, the nodes' first parameter ids [M])` of a soft-evidence
     leaf node vector of input layer `layer`."""
@@ -104,7 +141,7 @@ def leaf_forward(desc, layer, data: torch.Tensor, node_mars: torch.Tensor, kwarg
     staged = _staged(kwargs)
     if not staged:
         return None
-    lp, ids = kwargs.get("categorical_evidence_logp"), kwargs.get("soft_evidence_cat_ids")
+    lp, ids = per_sample_evidence(kwargs)
     for ns in layer.nodes:
         tilt = staged.get(ns)
         if tilt is None:
@@ -135,7 +172,7 @@ def slot_parts(desc, sib: dict, batch_size: int, kwargs: dict, device):
         return (*made, None, None)
     leaf_layer, xs, v = sib["layer"], sib["ns"], sib["var"]
     s, e, _, lvid, _ = _leaf_rows(leaf_layer, xs)
-    lp, ids = kwargs.get("categorical_evidence_logp"), kwargs.get("soft_evidence_cat_ids")
+    lp, ids = per_sample_evidence(kwargs)
     assert ids is not None and lp is not None, \
         "A `LowRank(top_k)` sum reads its leaf's candidates: `soft_evidence_cat_ids` and `categorical_evidence_logp`."
     K, M = desc.top_k, e - s
@@ -376,7 +413,7 @@ def _leaf_terms(desc, sib, rows, logp, tilt, logw, a, f, kwargs, glp, gviews, fr
     P = logp.exp()
     dlogit = rho - f[:, :, None] * P                                                  # [b, M, C]
     if glp is not None:
-        glp[rows, lvid, :] += dlogit.sum(dim = 1).to(glp.dtype)
+        add_evidence_grad(glp, lvid, dlogit.sum(dim = 1), kwargs, samples = rows)
     leaf_grads = gviews.get(xs) if gviews is not None else None
     if tilt is not None and leaf_grads is not None:
         Kl = xs.parameterization.top_k
@@ -386,8 +423,9 @@ def _leaf_terms(desc, sib, rows, logp, tilt, logw, a, f, kwargs, glp, gviews, fr
     if want_flows and leaf_layer.param_flows is not None:
         pf, V = leaf_layer.param_flows, xs.dist.num_cats
         l0 = leaf_layer._output_ind_range[0]
-        idx = leaf_layer.s_pfids[s - l0:e - l0][None, :, None] + \
-            kwargs["soft_evidence_cat_ids"][rows, lvid, :].long()[:, None, :]           # [b, M, C]
+        er = evidence_rows(kwargs)
+        ids = kwargs["soft_evidence_cat_ids"][rows if er is None else er[rows], lvid, :]
+        idx = leaf_layer.s_pfids[s - l0:e - l0][None, :, None] + ids.long()[:, None, :]  # [b, M, C]
         keep = 1.0 if pm is None else pm[rows][:, None, None].to(rho.dtype)
         pf.index_add_(0, idx.reshape(-1), (rho * keep).reshape(-1).to(pf.dtype))        # F+: the posterior counts
         pf.index_add_(0, (idx + V).reshape(-1), (f[:, :, None] * P * keep).reshape(-1).to(pf.dtype))   # F-
@@ -419,7 +457,7 @@ def leaf_backward(desc, layer, data, node_flows, kwargs, logspace_flows: bool, m
                                       compute_param_flows):
         return True
     gviews, fresh = _grads_kw(kwargs)
-    lp, ids = kwargs.get("categorical_evidence_logp"), kwargs.get("soft_evidence_cat_ids")
+    lp, ids = per_sample_evidence(kwargs)
     glp = kwargs.get("categorical_evidence_logp_grad")
     pf = layer.param_flows if compute_param_flows else None
     pm = kwargs.get("param_flows_mask") if pf is not None else None     # (the samples the EM statistics take)
@@ -448,7 +486,7 @@ def leaf_backward(desc, layer, data, node_flows, kwargs, logspace_flows: bool, m
         onehot = torch.zeros(B, C, dtype = PASSES_DTYPE, device = dev).scatter_(1, place[:, None], 1.0)
         dlogit = fo[:, :, None] * (onehot[:, None, :] - P)                             # [B, M, C]
         if glp is not None:
-            glp[:, lvid, :] += dlogit.sum(dim = 1).to(glp.dtype)
+            add_evidence_grad(glp, lvid, dlogit.sum(dim = 1), kwargs)
         grads = gviews.get(ns) if gviews is not None else None
         if grads is not None:
             slot = torch.arange(C, device = dev).clamp(max = K)

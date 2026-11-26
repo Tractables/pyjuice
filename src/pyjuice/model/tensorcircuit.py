@@ -707,7 +707,10 @@ class TensorCircuit(_BuildMixin, _CudaGraphsMixin, _ExternalParamsMixin, _Learni
             the tensors then have a batch of their own, and samples sharing a row share the work their tensors alone
             determine (both passes of a conditional in one batch). Only where every supplied node's parameterization
             reads through the map (`SumParameterization.takes_external_rows`: `LowRank(top_k)`). A backward reads the
-            forward's map; the gradients it writes stay per sample (`model/differentiable.py` adds them into the rows)
+            forward's map; the gradients it writes stay per sample (`model/differentiable.py` adds them into the rows).
+            The evidence too may have the rows' batch (`categorical_evidence_logp`, `soft_evidence_cat_ids`: a row of
+            evidence each, read through the map -- by the leaves of a `LowRank(top_k)` parameterization only), and then
+            so does its gradient, each sample's added into its row
         :type external_params_rows: torch.Tensor
         """
 

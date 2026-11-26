@@ -123,6 +123,7 @@ struct Tile {
     const float* tab; long tab_stride; const int* nv_tab;       // log2 theta^T [ntab][V][M]; a node vector's table
     const float* tau; int Bx; const int* emap;                   // tilts [T][Bx][S][M] (log2; null: none); a sample's row
     const int* ids; const float* lp; int nvars; const int* nv_lvid;   // the evidence [B][nvars][C]; a node vector's
+    const int* erow;                                             // the evidence's row a sample reads (null: its own)
     const int* nv_row0;                                          // a node vector's first row of node values / flows
     int B, M, C, S, K, H;                                        // S = Kl + 1; H = min(C, max(K, Kl))
 };
@@ -134,6 +135,8 @@ struct FwArgs {
     float* lz; float* lb; int* place;                            // [T][B][M] log2 Z, log2 of the bulk's sum; [T][B]
     const int* wrow; float* logw; int lws;                       // [T][B] -> row of logw [R][M][lws] (slots 0 .. K;
                                                                  // -1: none): lws = 72, the sums' operand stride
+    const int* ord;                                              // [B] the samples by their evidence's row (null:
+                                                                 // in their order)
 };
 
 __global__ void __launch_bounds__(NW * 32) tk_leaf_forward_kernel(const FwArgs a) {
@@ -141,14 +144,16 @@ __global__ void __launch_bounds__(NW * 32) tk_leaf_forward_kernel(const FwArgs a
     __shared__ float s_lp[CH];
     __shared__ int s_place;
     const Tile& g = a.g;
-    const int b = blockIdx.x, t = blockIdx.y, lane = threadIdx.x & 31;
+    // (a CTA a sample; with the evidence a row each, the samples in their rows' order: a row's samples run side by
+    // side and read its candidates' table rows from the cache -- MEASURED faster than one CTA walking them for both)
+    const int b = a.ord != nullptr ? a.ord[blockIdx.x] : blockIdx.x, t = blockIdx.y, lane = threadIdx.x & 31;
     const int blk = blockIdx.z * NW + (threadIdx.x >> 5);             // this warp's 128 nodes
     const bool act = blk * 128 < g.M;
     const int i0 = act ? blk * 128 + 4 * lane : 0;
     const long tb = (long)t * g.B + b;
     const int tok = a.tok[tb];
     const bool miss = a.miss[tb] != 0;
-    const long e0 = ((long)b * g.nvars + g.nv_lvid[t]) * g.C;
+    const long e0 = ((long)(g.erow != nullptr ? g.erow[b] : b) * g.nvars + g.nv_lvid[t]) * g.C;
     const float* tab = g.tab + (long)g.nv_tab[t] * g.tab_stride + i0;
     const int Kl = g.S - 1;
     const float* tau = g.tau == nullptr ? nullptr
@@ -259,6 +264,9 @@ struct BwArgs {
     const int* drow; const float* dsgn; int Bd;
     float* fpT; float* fmT;                                      // EM: F+, F- [ntab][V][M] (added into; null: none)
     const bool* pmask;                                           // [B] the samples the EM statistics take (null: all)
+    const float* gsgn;                                           // [B] the evidence gradient's sign a sample (null: 1)
+    const int* ord; const int* rank;                             // [B] the samples by their evidence's row and a
+                                                                 // place's rank within its row (null: a sample a CTA)
 };
 
 // dtau's writes of a thread's 4 nodes: stores into the sample's row, or (fold) its values times its sign added into
@@ -273,81 +281,135 @@ struct DtauOut {
     __device__ __forceinline__ void zero(long off) const { if (p != nullptr && !fold) st4(p + off, 0.f, 0.f, 0.f, 0.f); }
 };
 
+// The backward of a CTA's samples: one (NS = 1), or (the evidence a row each) up to NS of a row, walking its candidates
+// once -- the bulk's terms and the EM statistics summed over the samples before they are added, the head's a sample each
+template <int NS>
 __global__ void __launch_bounds__(NW * 32) tk_leaf_backward_kernel(const BwArgs a) {
     __shared__ int s_ids[CH];
     __shared__ float s_lp[CH];
     const Tile& g = a.g;
-    const int b = blockIdx.x, t = blockIdx.y, lane = threadIdx.x & 31;
+    const int t = blockIdx.y, lane = threadIdx.x & 31;
+    int bs[NS], ns = 1;
+    if constexpr (NS == 1) {
+        bs[0] = blockIdx.x;
+    } else {                                                           // (`ord` the samples by row, `rank` within it)
+        const int q = blockIdx.x;
+        if (a.rank[q] % NS != 0) return;                               // (the group's first place's CTA)
+        bs[0] = a.ord[q];
+        const int er = g.erow[bs[0]];
+#pragma unroll
+        for (int m = 1; m < NS; ++m) {
+            const bool in = ns == m && q + m < g.B && g.erow[a.ord[q + m]] == er;
+            bs[m] = in ? a.ord[q + m] : bs[0];
+            ns += in ? 1 : 0;
+        }
+    }
     const int blk = blockIdx.z * NW + (threadIdx.x >> 5);
     const bool act = blk * 128 < g.M;
     const int i0 = act ? blk * 128 + 4 * lane : 0;
-    const long tb = (long)t * g.B + b;
     const int Kl = g.S - 1;
-    const int p = a.place[tb];                                         // >= 0 found, -1 none of the candidates, -2 missing
-    const bool miss = p == -2;
-    const int r = miss && a.wrow != nullptr ? a.wrow[tb] : -1;
     const bool fold = a.drow != nullptr;
-    const DtauOut dt{a.dtau == nullptr ? nullptr
-                     : a.dtau + ((long)t * (fold ? a.Bd : g.B) + (fold ? a.drow[b] : b)) * g.S * g.M + i0,
-                     fold ? a.dsgn[b] : 1.f, fold};
-    const bool em = a.fmT != nullptr && p != -1                        // EM statistics: every token among the candidates
-                    && (a.pmask == nullptr || a.pmask[b]);
-    const bool alone = miss && r < 0;                                  // a missing token no one reads: its leaf is 1
-    if (p == -1 || (alone && !em)) {                                   // no gradient: a -inf value, or a token no one reads
-        if (act) for (int s = 0; s < g.S; ++s) dt.zero((long)s * g.M);
-        return;
+    int p[NS], r[NS];
+    bool miss[NS], em[NS], alone[NS], live[NS], grad[NS];
+    float gs[NS];
+    DtauOut dt[NS];
+    bool any = false;
+#pragma unroll
+    for (int m = 0; m < NS; ++m) {
+        const int b = bs[m];
+        const long tb = (long)t * g.B + b;
+        p[m] = a.place[tb];                                            // >= 0 found, -1 none of the candidates, -2 missing
+        miss[m] = p[m] == -2;
+        r[m] = miss[m] && a.wrow != nullptr ? a.wrow[tb] : -1;
+        dt[m] = DtauOut{a.dtau == nullptr ? nullptr
+                        : a.dtau + ((long)t * (fold ? a.Bd : g.B) + (fold ? a.drow[b] : b)) * g.S * g.M + i0,
+                        fold ? a.dsgn[b] : 1.f, fold};
+        em[m] = m < ns && a.fmT != nullptr && p[m] != -1              // EM statistics: every token among the candidates
+                && (a.pmask == nullptr || a.pmask[b]);
+        alone[m] = miss[m] && r[m] < 0;                                // a missing token no one reads: its leaf is 1
+        live[m] = m < ns && !(p[m] == -1 || (alone[m] && !em[m]));
+        grad[m] = live[m] && !alone[m];                                // (a missing token no one reads: EM alone)
+        gs[m] = a.gsgn != nullptr ? a.gsgn[b] : 1.f;                   // (the evidence gradient's sign: its row's)
+        if (m < ns && !live[m] && act)                                 // no gradient: a -inf value, or a token no one reads
+            for (int s = 0; s < g.S; ++s) dt[m].zero((long)s * g.M);
+        any = any || live[m];
     }
-    const long e0 = ((long)b * g.nvars + g.nv_lvid[t]) * g.C;
+    if (!any) return;
+    const int b0 = bs[0];
+    const long e0 = ((long)(g.erow != nullptr ? g.erow[b0] : b0) * g.nvars + g.nv_lvid[t]) * g.C;
     const float* tab = g.tab + (long)g.nv_tab[t] * g.tab_stride + i0;
     const float* tau = g.tau == nullptr ? nullptr
-                     : g.tau + ((long)t * g.Bx + (g.emap != nullptr ? g.emap[b] : b)) * g.S * g.M + i0;
+                     : g.tau + ((long)t * g.Bx + (g.emap != nullptr ? g.emap[b0] : b0)) * g.S * g.M + i0;
+    // (one write of the tilt's gradient for the samples where they fold into one row; else a sample each)
+    const bool merge = NS > 1 && fold && ns > 1 && a.drow[bs[0]] == a.drow[bs[NS - 1]];
+    const DtauOut dtm{dt[0].p, 1.f, true};
 
     // a node's terms: dlogit(i, c) = P(i, c) g(i, c) + d(i, c) -- observed: g = -f, d = f at the token; missing: below K
     // g = -f, d = the slot's count, from K on g = a_K / P(rest) - f (the rest's count spread as P), d = 0. EM: F- += fm P,
     // F+ the posterior counts -- observed f at the token (after the walk), a missing token a sum reads its count below K
-    // and cp P from K on, one no one reads f P (fm = cp = f, the leaf's flow)
-    float lzs[4], gH[4], gB[4], qB[4], fo[4], dR[4], fm[4], cp[4];
-    const float* ac = nullptr;
+    // and cp P from K on, one no one reads f P (fm = cp = f, the leaf's flow). P is the row's: lz and the tilt its own.
+    float lzs[4], qB[4], gH[NS][4], gB[NS][4], fo[NS][4], dR[NS][4], fm[NS][4], cp[NS][4];
+    float gBs[4], fmE[4], cpE[4];                                      // (summed over the samples: the bulk, the EM)
+    const float* ac[NS];
+    bool emAny = false, cpAny = false;
     if (act) {
+        const long tb0 = (long)t * g.B + b0;
         const float4 tK = tau != nullptr ? ld4(tau + (long)Kl * g.M) : make_float4(0.f, 0.f, 0.f, 0.f);
-        const float4 z = ld4(a.lz + tb * g.M + i0), lbv = ld4(a.lb + tb * g.M + i0);
-        if (!miss || alone) {
-            const long r0 = g.nv_row0[t] + i0;
+        const float4 z = ld4(a.lz + tb0 * g.M + i0), lbv = ld4(a.lb + tb0 * g.M + i0);
+#pragma unroll
+        for (int j = 0; j < 4; ++j) { lzs[j] = at(z, j); qB[j] = at(tK, j) - lzs[j]; gBs[j] = fmE[j] = cpE[j] = 0.f; }
+#pragma unroll
+        for (int m = 0; m < NS; ++m) {
+            ac[m] = nullptr;
+#pragma unroll
+            for (int j = 0; j < 4; ++j) fo[m][j] = fm[m][j] = cp[m][j] = gH[m][j] = gB[m][j] = dR[m][j] = 0.f;
+            if (!live[m]) continue;
+            const int b = bs[m];
+            if (!miss[m] || alone[m]) {
+                const long r0 = g.nv_row0[t] + i0;
+#pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    const float f = a.flows[(r0 + j) * g.B + b];
+                    fo[m][j] = a.logspace ? ex2(f * LOG2E) : f;
+                    fm[m][j] = fo[m][j];
+                    cp[m][j] = alone[m] ? fo[m][j] : 0.f;
+                    gH[m][j] = gB[m][j] = alone[m] ? 0.f : -fo[m][j];
+                }
+            } else {
+                ac[m] = a.acnt + ((long)r[m] * g.M + i0) * a.acs;
+                const float* lw = a.logw + ((long)r[m] * g.M + i0) * a.lws;
+#pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    float f = 0.f;
+                    for (int s = 0; s <= g.K; ++s) f += ac[m][j * a.acs + s];
+                    const float pr = ex2(lw[j * a.lws + g.K] * LOG2E), aK = ac[m][j * a.acs + g.K];
+                    fo[m][j] = 0.f;
+                    fm[m][j] = f;
+                    cp[m][j] = pr > 0.f ? aK / pr : 0.f;
+                    gH[m][j] = -f;
+                    gB[m][j] = cp[m][j] - f;
+                }
+            }
 #pragma unroll
             for (int j = 0; j < 4; ++j) {
-                const float f = a.flows[(r0 + j) * g.B + b];
-                fo[j] = a.logspace ? ex2(f * LOG2E) : f;
-                fm[j] = fo[j];
-                cp[j] = alone ? fo[j] : 0.f;
-                gH[j] = gB[j] = alone ? 0.f : -fo[j];
+                dR[m][j] = gB[m][j] * ex2(at(lbv, j) - lzs[j]);        // the bulk's share of the rest slot
+                if (grad[m]) gBs[j] += gs[m] * gB[m][j];
+                if (em[m]) { fmE[j] += fm[m][j]; if (miss[m]) cpE[j] += cp[m][j]; }
             }
-        } else {
-            ac = a.acnt + ((long)r * g.M + i0) * a.acs;
-            const float* lw = a.logw + ((long)r * g.M + i0) * a.lws;
-#pragma unroll
-            for (int j = 0; j < 4; ++j) {
-                float f = 0.f;
-                for (int s = 0; s <= g.K; ++s) f += ac[j * a.acs + s];
-                const float pr = ex2(lw[j * a.lws + g.K] * LOG2E), aK = ac[j * a.acs + g.K];
-                fo[j] = 0.f;
-                fm[j] = f;
-                cp[j] = pr > 0.f ? aK / pr : 0.f;
-                gH[j] = -f;
-                gB[j] = cp[j] - f;
-            }
-        }
-#pragma unroll
-        for (int j = 0; j < 4; ++j) {
-            lzs[j] = at(z, j);
-            qB[j] = at(tK, j) - lzs[j];
-            dR[j] = gB[j] * ex2(at(lbv, j) - lzs[j]);                  // the bulk's share of the rest slot
+            emAny = emAny || em[m];
+            cpAny = cpAny || (em[m] && miss[m]);
         }
     }
 
-    const bool grad = !alone;                                          // (a missing token no one reads: EM alone)
-    float* fpT = em ? a.fpT + (long)g.nv_tab[t] * g.tab_stride + i0 : nullptr;
-    float* fmT = em ? a.fmT + (long)g.nv_tab[t] * g.tab_stride + i0 : nullptr;
-    const int Cend = (a.glp != nullptr && grad) || em ? g.C : g.H;     // (only d / d tau: the head alone)
+    bool gradAny = false, wide = false;
+#pragma unroll
+    for (int m = 0; m < NS; ++m) {
+        gradAny = gradAny || grad[m];
+        wide = wide || (a.glp != nullptr && grad[m]) || em[m];
+    }
+    float* fpT = emAny ? a.fpT + (long)g.nv_tab[t] * g.tab_stride + i0 : nullptr;
+    float* fmT = emAny ? a.fmT + (long)g.nv_tab[t] * g.tab_stride + i0 : nullptr;
+    const int Cend = wide ? g.C : g.H;                                 // (only d / d tau: the head alone)
     for (int c0 = 0; c0 < Cend; c0 += CH) {
         const int n = min(CH, Cend - c0);
         __syncthreads();
@@ -370,31 +432,51 @@ __global__ void __launch_bounds__(NW * 32) tk_leaf_backward_kernel(const BwArgs 
                     const float l = s_lp[k];
                     if (c >= g.H) {
                         float P[4] = {ex2(th.x + l + qB[0]), ex2(th.y + l + qB[1]), ex2(th.z + l + qB[2]), ex2(th.w + l + qB[3])};
-                        pt[u] = P[0] * gB[0] + P[1] * gB[1] + P[2] * gB[2] + P[3] * gB[3];
-                        if (em) {
+                        pt[u] = P[0] * gBs[0] + P[1] * gBs[1] + P[2] * gBs[2] + P[3] * gBs[3];
+                        if (emAny) {
                             const long o = (long)s_ids[k] * g.M;
-                            red4(fmT + o, fm[0] * P[0], fm[1] * P[1], fm[2] * P[2], fm[3] * P[3]);
-                            if (miss) red4(fpT + o, cp[0] * P[0], cp[1] * P[1], cp[2] * P[2], cp[3] * P[3]);
+                            red4(fmT + o, fmE[0] * P[0], fmE[1] * P[1], fmE[2] * P[2], fmE[3] * P[3]);
+                            if (cpAny) red4(fpT + o, cpE[0] * P[0], cpE[1] * P[1], cpE[2] * P[2], cpE[3] * P[3]);
                         }
                         continue;
                     }
                     const float4 tc = tau != nullptr ? ld4(tau + (long)min(c, Kl) * g.M) : make_float4(0.f, 0.f, 0.f, 0.f);
-                    float dl[4], P[4], fp[4];
+                    float P[4], fpS[4] = {0.f, 0.f, 0.f, 0.f}, dlS[4] = {0.f, 0.f, 0.f, 0.f};
 #pragma unroll
-                    for (int j = 0; j < 4; ++j) {
-                        P[j] = ex2(at(th, j) + l + at(tc, j) - lzs[j]);
-                        const float d = miss ? (c < g.K && !alone ? ac[j * a.acs + c] : 0.f) : (c == p ? fo[j] : 0.f);
-                        dl[j] = P[j] * (c < g.K ? gH[j] : gB[j]) + d;
-                        fp[j] = alone ? cp[j] * P[j] : (c < g.K ? d : cp[j] * P[j]);
+                    for (int j = 0; j < 4; ++j) P[j] = ex2(at(th, j) + l + at(tc, j) - lzs[j]);
+                    float ptu = 0.f;
+#pragma unroll
+                    for (int m = 0; m < NS; ++m) {
+                        if (!live[m]) continue;
+                        float dl[4];
+#pragma unroll
+                        for (int j = 0; j < 4; ++j) {
+                            const float d = miss[m] ? (c < g.K && !alone[m] ? ac[m][j * a.acs + c] : 0.f)
+                                                    : (c == p[m] ? fo[m][j] : 0.f);
+                            dl[j] = P[j] * (c < g.K ? gH[m][j] : gB[m][j]) + d;
+                            if (em[m] && miss[m]) fpS[j] += alone[m] ? cp[m][j] * P[j] : (c < g.K ? d : cp[m][j] * P[j]);
+                        }
+                        if (!grad[m]) continue;
+                        ptu += gs[m] * (dl[0] + dl[1] + dl[2] + dl[3]);
+                        if (c < Kl) {
+                            if (merge) {
+#pragma unroll
+                                for (int j = 0; j < 4; ++j) dlS[j] += dt[m].sg * dl[j];
+                            } else {
+                                dt[m].put((long)c * g.M, dl[0], dl[1], dl[2], dl[3]);
+                            }
+                        } else {
+#pragma unroll
+                            for (int j = 0; j < 4; ++j) dR[m][j] += dl[j];
+                        }
                     }
-                    pt[u] = dl[0] + dl[1] + dl[2] + dl[3];
-                    if (em) {
+                    pt[u] = ptu;
+                    if (emAny) {
                         const long o = (long)s_ids[k] * g.M;
-                        red4(fmT + o, fm[0] * P[0], fm[1] * P[1], fm[2] * P[2], fm[3] * P[3]);
-                        if (miss) red4(fpT + o, fp[0], fp[1], fp[2], fp[3]);
+                        red4(fmT + o, fmE[0] * P[0], fmE[1] * P[1], fmE[2] * P[2], fmE[3] * P[3]);
+                        if (cpAny) red4(fpT + o, fpS[0], fpS[1], fpS[2], fpS[3]);
                     }
-                    if (c < Kl) dt.put((long)c * g.M, dl[0], dl[1], dl[2], dl[3]);
-                    else { dR[0] += dl[0]; dR[1] += dl[1]; dR[2] += dl[2]; dR[3] += dl[3]; }
+                    if (merge && c < Kl) dtm.put((long)c * g.M, dlS[0], dlS[1], dlS[2], dlS[3]);
                 }
             } else {                                                   // the bulk
 #pragma unroll
@@ -409,35 +491,46 @@ __global__ void __launch_bounds__(NW * 32) tk_leaf_backward_kernel(const BwArgs 
                         const float l = k0 + u0 + u < n ? s_lp[k0 + u0 + u] : 0.f;
                         const float P0 = ex2(th[u].x + l + qB[0]), P1 = ex2(th[u].y + l + qB[1]);
                         const float P2 = ex2(th[u].z + l + qB[2]), P3 = ex2(th[u].w + l + qB[3]);
-                        pt[u0 + u] = P0 * gB[0] + P1 * gB[1] + P2 * gB[2] + P3 * gB[3];
-                        if (em && k0 + u0 + u < n) {
+                        pt[u0 + u] = P0 * gBs[0] + P1 * gBs[1] + P2 * gBs[2] + P3 * gBs[3];
+                        if (emAny && k0 + u0 + u < n) {
                             const long o = (long)s_ids[k0 + u0 + u] * g.M;
-                            red4(fmT + o, fm[0] * P0, fm[1] * P1, fm[2] * P2, fm[3] * P3);
-                            if (miss) red4(fpT + o, cp[0] * P0, cp[1] * P1, cp[2] * P2, cp[3] * P3);
+                            red4(fmT + o, fmE[0] * P0, fmE[1] * P1, fmE[2] * P2, fmE[3] * P3);
+                            if (cpAny) red4(fpT + o, cpE[0] * P0, cpE[1] * P1, cpE[2] * P2, cpE[3] * P3);
                         }
                     }
                 }
             }
             const float tot = xreduce32(pt, lane);
-            if (a.glp != nullptr && grad && k0 + lane < n) atomicAdd(a.glp + e0 + cg + lane, tot);
+            if (a.glp != nullptr && gradAny && k0 + lane < n) atomicAdd(a.glp + e0 + cg + lane, tot);
         }
     }
     if (!act) return;
-    if (em && !miss) red4(fpT + (long)g.ids[e0 + p] * g.M, fo[0], fo[1], fo[2], fo[3]);   // F+: the observed token's flow
-    if (!grad) {
-        for (int s = 0; s < g.S; ++s) dt.zero((long)s * g.M);
-        return;
-    }
-    if (!miss && p >= g.H) {                                           // the observed token past the head
-        float s = fo[0] + fo[1] + fo[2] + fo[3];
+    float dRS[4] = {0.f, 0.f, 0.f, 0.f};
 #pragma unroll
-        for (int d = 16; d >= 1; d >>= 1) s += __shfl_xor_sync(0xffffffffu, s, d);
-        if (lane == 0 && a.glp != nullptr) atomicAdd(a.glp + e0 + p, s);
+    for (int m = 0; m < NS; ++m) {
+        if (!live[m]) continue;
+        if (em[m] && !miss[m]) red4(fpT + (long)g.ids[e0 + p[m]] * g.M, fo[m][0], fo[m][1], fo[m][2], fo[m][3]);
+        if (!grad[m]) {                                                // (F+ at its token: the observed token's flow)
+            for (int s = 0; s < g.S; ++s) dt[m].zero((long)s * g.M);
+            continue;
+        }
+        if (!miss[m] && p[m] >= g.H) {                                 // the observed token past the head
+            float sv = fo[m][0] + fo[m][1] + fo[m][2] + fo[m][3];
 #pragma unroll
-        for (int j = 0; j < 4; ++j) dR[j] += fo[j];
+            for (int d = 16; d >= 1; d >>= 1) sv += __shfl_xor_sync(0xffffffffu, sv, d);
+            if (lane == 0 && a.glp != nullptr) atomicAdd(a.glp + e0 + p[m], gs[m] * sv);
+#pragma unroll
+            for (int j = 0; j < 4; ++j) dR[m][j] += fo[m][j];
+        }
+        for (int s = min(g.C, Kl); s < Kl; ++s) dt[m].zero((long)s * g.M);        // (slots past the candidates)
+        if (merge) {
+#pragma unroll
+            for (int j = 0; j < 4; ++j) dRS[j] += dt[m].sg * dR[m][j];
+        } else {
+            dt[m].put((long)Kl * g.M, dR[m][0], dR[m][1], dR[m][2], dR[m][3]);
+        }
     }
-    for (int s = min(g.C, Kl); s < Kl; ++s) dt.zero((long)s * g.M);                // (slots past the candidates)
-    dt.put((long)Kl * g.M, dR[0], dR[1], dR[2], dR[3]);
+    if (merge) dtm.put((long)Kl * g.M, dRS[0], dRS[1], dRS[2], dRS[3]);
 }
 
 
@@ -548,7 +641,7 @@ Tile make_tile(const torch::Tensor& tab, const torch::Tensor& nv_tab, const torc
                const torch::Tensor& nv_row0, int64_t B, int64_t S, int64_t K) {
     check(tab, at::kFloat, "tables"); check(nv_tab, at::kInt, "nv_tab"); check(ids, at::kInt, "ids");
     check(lp, at::kFloat, "lp"); check(nv_lvid, at::kInt, "nv_lvid"); check(nv_row0, at::kInt, "nv_row0");
-    TORCH_CHECK(tab.dim() == 3 && ids.dim() == 3 && lp.sizes() == ids.sizes() && ids.size(0) == B, "top_k leaf: shapes");
+    TORCH_CHECK(tab.dim() == 3 && ids.dim() == 3 && lp.sizes() == ids.sizes(), "top_k leaf: shapes");
     Tile g;
     const int M = (int)tab.size(2), C = (int)ids.size(2);
     TORCH_CHECK(M % 128 == 0, "top_k leaf: M % 128");
@@ -561,6 +654,12 @@ Tile make_tile(const torch::Tensor& tab, const torch::Tensor& nv_tab, const torc
     }
     g.emap = nullptr;
     if (emap.numel() > 0) { check(emap, at::kInt, "emap"); g.emap = emap.data_ptr<int>(); }
+    // (the evidence a sample each, or -- the rows' batch -- a row of tensors each, read through the map)
+    g.erow = nullptr;
+    if (ids.size(0) != B) {
+        TORCH_CHECK(g.emap != nullptr && ids.size(0) == g.Bx, "top_k leaf: the evidence of the samples' or the rows' batch");
+        g.erow = g.emap;
+    }
     g.ids = ids.data_ptr<int>(); g.lp = lp.data_ptr<float>(); g.nvars = (int)ids.size(1);
     g.nv_lvid = nv_lvid.data_ptr<int>(); g.nv_row0 = nv_row0.data_ptr<int>();
     g.B = (int)B; g.M = M; g.C = C; g.S = (int)S; g.K = (int)K;
@@ -590,7 +689,7 @@ std::vector<torch::Tensor> top_k_leaf_forward(torch::Tensor tab, torch::Tensor n
                                               torch::Tensor ids, torch::Tensor lp, torch::Tensor nv_lvid,
                                               torch::Tensor nv_row0, torch::Tensor tok, torch::Tensor miss,
                                               torch::Tensor wrow, int64_t R, int64_t S, int64_t K,
-                                              torch::Tensor node_mars) {
+                                              torch::Tensor node_mars, torch::Tensor ord) {
     const at::cuda::CUDAGuard guard(tab.device());
     const int64_t T = nv_tab.size(0), B = tok.size(1);
     FwArgs a;
@@ -605,6 +704,12 @@ std::vector<torch::Tensor> top_k_leaf_forward(torch::Tensor tab, torch::Tensor n
     a.tok = tok.data_ptr<int>(); a.miss = miss.data_ptr<uint8_t>(); a.node_mars = node_mars.data_ptr<float>();
     a.lz = lz.data_ptr<float>(); a.lb = lb.data_ptr<float>(); a.place = place.data_ptr<int>();
     a.wrow = nullptr; a.logw = nullptr; a.lws = (int)logw.size(2);
+    a.ord = nullptr;
+    if (ord.numel() > 0) {
+        check(ord, at::kInt, "ord");
+        TORCH_CHECK(ord.numel() == B, "top_k leaf: ord [B]");
+        a.ord = ord.data_ptr<int>();
+    }
     if (R > 0) { check(wrow, at::kInt, "wrow"); a.wrow = wrow.data_ptr<int>(); a.logw = logw.data_ptr<float>(); }
     dim3 grid((unsigned)B, (unsigned)T, (unsigned)((M + NW * 128 - 1) / (NW * 128)));
     tk_leaf_forward_kernel<<<grid, NW * 32, 0, at::cuda::getCurrentCUDAStream()>>>(a);
@@ -621,8 +726,8 @@ torch::Tensor top_k_leaf_backward(torch::Tensor tab, torch::Tensor nv_tab, torch
                                   torch::Tensor lz, torch::Tensor lb, torch::Tensor place, torch::Tensor flows,
                                   bool logspace, torch::Tensor wrow, torch::Tensor logw, torch::Tensor acnt,
                                   int64_t S, int64_t K, torch::Tensor glp, torch::Tensor fpT, torch::Tensor fmT,
-                                  torch::Tensor pmask, bool dtau_out, torch::Tensor drow, torch::Tensor dsgn,
-                                  int64_t Bd) {
+                                  torch::Tensor pmask, torch::Tensor gsgn, bool dtau_out, torch::Tensor drow,
+                                  torch::Tensor dsgn, int64_t Bd, torch::Tensor ord, torch::Tensor rank) {
     const at::cuda::CUDAGuard guard(tab.device());
     const int64_t T = nv_tab.size(0), B = place.size(1);
     BwArgs a;
@@ -661,6 +766,18 @@ torch::Tensor top_k_leaf_backward(torch::Tensor tab, torch::Tensor nv_tab, torch
         TORCH_CHECK(fpT.sizes() == tab.sizes() && fmT.sizes() == tab.sizes(), "top_k leaf: the flows' buffers as the tables");
         a.fpT = fpT.data_ptr<float>(); a.fmT = fmT.data_ptr<float>();
     }
+    a.ord = nullptr; a.rank = nullptr;
+    if (ord.numel() > 0) {                                  // (a row's samples a CTA: the evidence a row each)
+        check(ord, at::kInt, "ord"); check(rank, at::kInt, "rank");
+        TORCH_CHECK(a.g.erow != nullptr && ord.numel() == B && rank.numel() == B, "top_k leaf: ord, rank [B]");
+        a.ord = ord.data_ptr<int>(); a.rank = rank.data_ptr<int>();
+    }
+    a.gsgn = nullptr;
+    if (gsgn.numel() > 0) {
+        check(gsgn, at::kFloat, "gsgn");
+        TORCH_CHECK(gsgn.numel() == B, "top_k leaf: gsgn [B]");
+        a.gsgn = gsgn.data_ptr<float>();
+    }
     a.pmask = nullptr;
     if (pmask.numel() > 0) {
         check(pmask, at::kBool, "pmask");
@@ -668,7 +785,8 @@ torch::Tensor top_k_leaf_backward(torch::Tensor tab, torch::Tensor nv_tab, torch
         a.pmask = pmask.data_ptr<bool>();
     }
     dim3 grid((unsigned)B, (unsigned)T, (unsigned)((M + NW * 128 - 1) / (NW * 128)));
-    tk_leaf_backward_kernel<<<grid, NW * 32, 0, at::cuda::getCurrentCUDAStream()>>>(a);
+    if (a.ord != nullptr) tk_leaf_backward_kernel<2><<<grid, NW * 32, 0, at::cuda::getCurrentCUDAStream()>>>(a);
+    else tk_leaf_backward_kernel<1><<<grid, NW * 32, 0, at::cuda::getCurrentCUDAStream()>>>(a);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return dtau;
 }

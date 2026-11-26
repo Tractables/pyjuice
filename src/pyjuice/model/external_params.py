@@ -1163,8 +1163,9 @@ class _ExternalParamsMixin:
         # keeps working either way.
         dsts = kwargs.pop(EXTERNAL_PARAMS_GRAD_KWARG, None)
         # (one sign a sample, the private fold of `pc(..., differentiable = True)`: the destinations at the tensors' own
-        # batch, each sample's gradient added into the row it read times its sign -- `StagedExternalParams.fold`)
-        signs = kwargs.pop(EXTERNAL_PARAMS_GRAD_SIGNS_KWARG, None)
+        # batch, each sample's gradient added into the row it read times its sign -- `StagedExternalParams.fold`; left in
+        # the call's keywords for the layers whose evidence has the rows' batch, its gradients folded alike)
+        signs = kwargs.get(EXTERNAL_PARAMS_GRAD_SIGNS_KWARG)
         fold = None
         if signs is not None:
             rows = self.__dict__.get("_staged_external_rows")

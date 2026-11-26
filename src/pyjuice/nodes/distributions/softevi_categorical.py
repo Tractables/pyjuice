@@ -245,6 +245,13 @@ class SoftEvidenceCategorical(_KernelsMixin, Distribution):
         """
         if kwargs.get("soft_evidence_cat_ids", None) is None:
             return
+        # (the evidence a sample each: one of the rows' batch -- `external_params_rows` -- is read through the map by a
+        # parameterization of the layer that takes it, `LowRank(top_k)`, and never by these kernels)
+        lp, common = kwargs.get("categorical_evidence_logp"), kwargs.get("_fw_launch_common")
+        if lp is not None and common is not None and lp.size(0) != common["batch_size"]:
+            raise ValueError(f"`categorical_evidence_logp` has {lp.size(0)} rows for {common['batch_size']} samples: "
+                             f"evidence of the rows' batch (`external_params_rows`) is read by a layer whose "
+                             f"parameterization takes it (`LowRank(top_k)`), not by a plain `SoftEvidenceCategorical`.")
         if not kwargs.get("sort_soft_evidence", getattr(self, "sort_soft_evidence", True)):
             return
         if os.environ.get("PYJUICE_SOFTEVI_SORT", "1") == "0":
