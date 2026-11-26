@@ -118,6 +118,15 @@ constexpr float LOG2E = 1.4426950408889634f;
 
 __device__ __forceinline__ unsigned smem_u32(const void* p) { return (unsigned)__cvta_generic_to_shared(p); }
 
+// A launch of the chain of programmatic dependents (`launch_pdl`): the launch after it may be scheduled from here on (it
+// waits for this one before reading anything), and this one waits for the launch before it -- so its reads of the
+// chain's buffers come after this, by plain loads: no `__ldg` or `const __restrict__`, which ptxas may issue above the
+// wait (a dependent can start while the launches before it still write)
+__device__ __forceinline__ void pdl_entry() {
+    cudaTriggerProgrammaticLaunchCompletion();
+    cudaGridDependencySynchronize();
+}
+
 __device__ __forceinline__ void cp16(unsigned dst, const void* src) {
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" :: "r"(dst), "l"(src) : "memory");
 }
@@ -224,8 +233,8 @@ __device__ __forceinline__ void a_frags(unsigned (&af)[NK][4], const float* __re
         #pragma unroll
         for (int h = 0; h < 2; ++h) {
             const int k = ks * 16 + h * 8 + 2 * t;
-            const float x0 = k < r ? __ldg(p0 + k) : 0.f, x1 = k + 1 < r ? __ldg(p0 + k + 1) : 0.f;
-            const float y0 = k < r ? __ldg(p1 + k) : 0.f, y1 = k + 1 < r ? __ldg(p1 + k + 1) : 0.f;
+            const float x0 = k < r ? p0[k] : 0.f, x1 = k + 1 < r ? p0[k + 1] : 0.f;
+            const float y0 = k < r ? p1[k] : 0.f, y1 = k + 1 < r ? p1[k + 1] : 0.f;
             af[ks][2 * h] = h2u(__floats2half2_rn(x0 * LOG2E, x1 * LOG2E));
             af[ks][2 * h + 1] = h2u(__floats2half2_rn(y0 * LOG2E, y1 * LOG2E));
         }
@@ -908,12 +917,13 @@ __global__ void __launch_bounds__(NW * 32, 1) tk_sk_kernel(const TkArgs a) {
 // The operands, one launch: blockIdx.y the task, blockIdx.x grid-stride over its items. B and G a row of tensors each
 // (Bx of them), the children's values a sample each (B).
 __global__ void tk_prep_kernel(
-        const float* __restrict__ Bm, long sB, const float* __restrict__ Gt, long sG, const float* __restrict__ em,
+        const float* Bm, long sB, const float* Gt, long sG, const float* em,
         long em_stride,
-        const long* __restrict__ eid, const bool* __restrict__ has, const float* __restrict__ theta,
-        const float* __restrict__ logwin, __half* __restrict__ BP, float* __restrict__ E, float* __restrict__ ev,
-        float* __restrict__ cmax, uint2* __restrict__ LTh, float* __restrict__ logw,
+        const long* eid, const bool* has, const float* theta,
+        const float* logwin, __half* BP, float* E, float* ev,
+        float* cmax, uint2* LTh, float* logw,
         int Bx, int B, int M, int N, int r, int KP, int S, int Rm) {
+    pdl_entry();
     const int task = blockIdx.y;
     const long tid0 = (long)blockIdx.x * blockDim.x + threadIdx.x, nth = (long)gridDim.x * blockDim.x;
     const long wid = tid0 >> 5, nwarp = nth >> 5;
@@ -997,9 +1007,10 @@ __global__ void tk_prep_kernel(
 // scans in shared memory (deterministic: in the samples' order). `emap` the row each sample reads (null: its own);
 // `pair` 0: no partners, a sample an item (the backward where a row's samples keep their gradients apart).
 __global__ void __launch_bounds__(1024) tk_items_kernel(
-        const long* __restrict__ emap, const long* __restrict__ rows, const long* __restrict__ slot64,
-        int4* __restrict__ mitems, int4* __restrict__ oitems, int* __restrict__ noitems, int* __restrict__ slot32,
-        int* __restrict__ flags, int B, int Rm, int P, int pair) {
+        const long* emap, const long* rows, const long* slot64,
+        int4* mitems, int4* oitems, int* noitems, int* slot32,
+        int* flags, int B, int Rm, int P, int pair) {
+    pdl_entry();
     extern __shared__ int sm[];
     int* se = sm;                                                            // [B] its group (pair: the row it reads)
     int* sk = se + B;                                                        // [B] its kind (1: masked)
@@ -1194,7 +1205,7 @@ __device__ __forceinline__ void da_segment(const BwArgs& a, int y, int x, int c0
     const uint2* ltp = a.LTh + ((long)(x * NW + warp) * nchunks * 8) * 32 + lane;
     uint2 lt[8];
     #pragma unroll
-    for (int nt = 0; nt < 8; ++nt) lt[nt] = __ldg(ltp + (c0 * 8 + nt) * 32);
+    for (int nt = 0; nt < 8; ++nt) lt[nt] = *(ltp + (c0 * 8 + nt) * 32);
 
     for (int jc = c0; jc < c1; ++jc) {
         const int st = (jc - c0) & 1;
@@ -1215,7 +1226,7 @@ __device__ __forceinline__ void da_segment(const BwArgs& a, int y, int x, int c0
             logits4<NK>(W, af, Bs, lt, lane, hh);
             if (more && hh == 1) {
                 #pragma unroll
-                for (int nt = 0; nt < 8; ++nt) lt[nt] = __ldg(ltp + ((jc + 1) * 8 + nt) * 32);
+                for (int nt = 0; nt < 8; ++nt) lt[nt] = *(ltp + ((jc + 1) * 8 + nt) * 32);
             }
             #pragma unroll
             for (int q = 0; q < 4; ++q) {
@@ -1272,6 +1283,7 @@ __device__ __forceinline__ void da_segment(const BwArgs& a, int y, int x, int c0
 template <int NK>
 __global__ void __launch_bounds__(NW * 32, 1) tk_bw_da_kernel(const BwArgs a) {
     extern __shared__ __align__(128) unsigned char smem[];
+    pdl_entry();
     const int ntile = a.M / TM, nch = a.N / TN;
     const long U = 2L * (*a.noitems) * ntile * nch;
     const long P = gridDim.x, k = blockIdx.x;
@@ -1413,7 +1425,7 @@ __device__ __forceinline__ void cols_segment(const BwArgs& a, int y, int x, int 
     const uint2* ltp = a.LTc + ((long)(x * NW + warp) * (M / 8)) * 32 + lane;   // the warp's child tile, node tiles in order
     uint2 lt[4];
     #pragma unroll
-    for (int nt = 0; nt < 4; ++nt) lt[nt] = __ldg(ltp + (c0 * 4 + nt) * 32);
+    for (int nt = 0; nt < 4; ++nt) lt[nt] = *(ltp + (c0 * 4 + nt) * 32);
 
     for (int ic = c0; ic < c1; ++ic) {
         const int st = (ic - c0) & 1;
@@ -1450,7 +1462,7 @@ __device__ __forceinline__ void cols_segment(const BwArgs& a, int y, int x, int 
         }
         if (more) {
             #pragma unroll
-            for (int nt = 0; nt < 4; ++nt) lt[nt] = __ldg(ltp + ((ic + 1) * 4 + nt) * 32);
+            for (int nt = 0; nt < 4; ++nt) lt[nt] = *(ltp + ((ic + 1) * 4 + nt) * 32);
         }
         // the shift a node: W = 2^(logits - h)
         #pragma unroll
@@ -1630,6 +1642,7 @@ __device__ __forceinline__ void cols_segment(const BwArgs& a, int y, int x, int 
 template <int NK, bool MASKED, bool GRADS>
 __global__ void __launch_bounds__(NW * 32, 1) tk_bw_cols_kernel(const BwArgs a) {
     extern __shared__ __align__(128) unsigned char smem[];
+    pdl_entry();
     const int ntile = a.N / CN, nch = a.M / CM;
     const long items = MASKED ? a.m1 - a.m0 : 2L * (*a.noitems);
     const long U = items * ntile * nch;
@@ -1720,7 +1733,7 @@ __device__ __forceinline__ void da_gemm_segment(const BwArgs& a, int yi, int x, 
     // into the destination row, Gl's scale taken out: ranks 2t, 2t + 1 of each 8 (pairs where r is even)
     float* DA = a.DA + (long)a.drow[hb] * a.sDA;
     const bool pair = (r & 1) == 0;
-    const float iv = __ldg(a.GLS + yi);
+    const float iv = a.GLS[yi];
     #pragma unroll
     for (int mt = 0; mt < 2; ++mt) {
         const int node0 = x * GMN + warp * 32 + mt * 16 + g;
@@ -1742,6 +1755,7 @@ __device__ __forceinline__ void da_gemm_segment(const BwArgs& a, int yi, int x, 
 template <int NK>
 __global__ void __launch_bounds__(GWN * 32) tk_bw_da_gemm_kernel(const BwArgs a) {
     extern __shared__ __align__(128) unsigned char smem[];
+    pdl_entry();
     const int ntile = a.M / GMN, nch = a.N / GKC;
     const long items = a.m1 - a.m0;
     const long U = items * ntile * nch;
@@ -1820,7 +1834,7 @@ __device__ __forceinline__ void em_segment(const EmArgs& a, int tile, int l0, in
     #pragma unroll
     for (int ch = 0; ch < ECH; ++ch)
         #pragma unroll
-        for (int nt = 0; nt < 8; ++nt) lt[ch][nt] = __ldg(ltp + ((c + ch) * 8 + nt) * 32);
+        for (int nt = 0; nt < 8; ++nt) lt[ch][nt] = *(ltp + ((c + ch) * 8 + nt) * 32);
     float Fp[ECH][8][4], Fm[ECH][8][4];
     #pragma unroll
     for (int ch = 0; ch < ECH; ++ch)
@@ -1842,8 +1856,8 @@ __device__ __forceinline__ void em_segment(const EmArgs& a, int tile, int l0, in
         const unsigned* p1 = p0 + 8 * KP / 2;
         #pragma unroll
         for (int ks = 0; ks < NK; ++ks) {
-            af[ks][0] = __ldg(p0 + ks * 8 + t); af[ks][1] = __ldg(p1 + ks * 8 + t);
-            af[ks][2] = __ldg(p0 + ks * 8 + 4 + t); af[ks][3] = __ldg(p1 + ks * 8 + 4 + t);
+            af[ks][0] = p0[ks * 8 + t]; af[ks][1] = p1[ks * 8 + t];
+            af[ks][2] = p0[ks * 8 + 4 + t]; af[ks][3] = p1[ks * 8 + 4 + t];
         }
         const float h0 = a.hrow[(long)b * M + node0], h1 = a.hrow[(long)b * M + node1];
         const float a0 = a.ao[(long)b * M + node0], a1 = a.ao[(long)b * M + node1];
@@ -1885,6 +1899,7 @@ __device__ __forceinline__ void em_segment(const EmArgs& a, int tile, int l0, in
 template <int NK>
 __global__ void __launch_bounds__(NW * 32, 1) tk_bw_em_obs_kernel(const EmArgs a) {
     extern __shared__ __align__(128) unsigned char smem[];
+    pdl_entry();
     const int ntile = (a.M / TM) * (a.N / (TN * ECH));
     const long U = (long)ntile * a.nl, P = gridDim.x, k = blockIdx.x;
     const long u0 = U * k / P, u1 = U * (k + 1) / P;
@@ -1899,8 +1914,9 @@ __global__ void __launch_bounds__(NW * 32, 1) tk_bw_em_obs_kernel(const EmArgs a
 // The backward's operands beside the prep's (one launch, blockIdx.y the task): AH [Bx, M, KP] = fp16(log2 e A), the
 // ranks zero-padded (a thread 8 of a row's, one 16-byte store); l2t [M, N] fp16 = log2 theta less its row's largest
 // (the forward's values, row-major; a warp a row)
-__global__ void tk_bw_prep_kernel(const float* __restrict__ A, long sA, const float* __restrict__ theta,
-                                  __half* __restrict__ AH, __half* __restrict__ L2T, int Bx, int M, int N, int r, int KP) {
+__global__ void tk_bw_prep_kernel(const float* A, long sA, const float* theta,
+                                  __half* AH, __half* L2T, int Bx, int M, int N, int r, int KP) {
+    pdl_entry();
     const int task = blockIdx.y;
     const long tid0 = (long)blockIdx.x * blockDim.x + threadIdx.x, nth = (long)gridDim.x * blockDim.x;
     if (task == 0) {
@@ -1912,7 +1928,7 @@ __global__ void tk_bw_prep_kernel(const float* __restrict__ A, long sA, const fl
             const float* src = A + (row / M) * sA + (row % M) * r;
             float v[8];
             #pragma unroll
-            for (int u = 0; u < 8; ++u) v[u] = k0 + u < r ? __ldg(src + k0 + u) * LOG2E : 0.f;
+            for (int u = 0; u < 8; ++u) v[u] = k0 + u < r ? src[k0 + u] * LOG2E : 0.f;
             uint4 o;
             o.x = h2u(__floats2half2_rn(v[0], v[1])); o.y = h2u(__floats2half2_rn(v[2], v[3]));
             o.z = h2u(__floats2half2_rn(v[4], v[5])); o.w = h2u(__floats2half2_rn(v[6], v[7]));
@@ -1935,7 +1951,8 @@ __global__ void tk_bw_prep_kernel(const float* __restrict__ A, long sA, const fl
 // l2t in the cols kernel's fragment order (`LTc`): a 16-child tile J, a node 8-tile I, a lane (g, t): {l2t[8I + 2t][16J
 // + g], l2t[8I + 2t + 1][16J + g]}, the same at child 16J + g + 8 -- the C operand of W^T's first k-step, a warp's load
 // one 256-byte run
-__global__ void tk_bw_ltc_kernel(const __half* __restrict__ L2T, uint2* __restrict__ LTc, int M, int N) {
+__global__ void tk_bw_ltc_kernel(const __half* L2T, uint2* LTc, int M, int N) {
+    pdl_entry();
     const long total = (long)(N / 16) * (M / 8) * 32;
     for (long q = (long)blockIdx.x * blockDim.x + threadIdx.x; q < total; q += (long)gridDim.x * blockDim.x) {
         const int lane = (int)(q & 31), g = lane >> 2, t = lane & 3;
@@ -1954,9 +1971,10 @@ __global__ void tk_bw_ltc_kernel(const __half* __restrict__ L2T, uint2* __restri
 // task 0: fl [B, M] the sample's flows where its ao is > 0 (a node with mass), fmx [B] their largest, and its ao, bo
 // [B, M] times them (an observed sample's alpha, beta); task 1 (acnt given: the leaf's buffer): the masked row's flows
 // into the slot after its posterior's, where the stash left 1.
-__global__ void tk_flows_kernel(const float* __restrict__ nf, long fld, float* __restrict__ ao, float* __restrict__ bo,
-                                float* __restrict__ fl, float* __restrict__ fmx, const long* __restrict__ rows,
-                                float* __restrict__ acnt, int B, int M, int Rm) {
+__global__ void tk_flows_kernel(const float* nf, long fld, float* ao, float* bo,
+                                float* fl, float* fmx, const long* rows,
+                                float* acnt, int B, int M, int Rm) {
+    pdl_entry();
     __shared__ float wm[32];
     const int y = blockIdx.x, tid = threadIdx.x;
     if (blockIdx.y == 1) {
@@ -1985,6 +2003,19 @@ __global__ void tk_flows_kernel(const float* __restrict__ nf, long fld, float* _
     }
 }
 
+// `kernel<<<grid, block, smem, st>>>(args...)` as a programmatic dependent of the launch before it (`pdl_entry`): its
+// launch overlaps that one's tail -- the ~2 us between the backward's ~15 launches a node vector, back to back
+template <typename... P, typename... A>
+void launch_pdl(void (*kernel)(P...), dim3 grid, dim3 block, int smem, cudaStream_t st, A... args) {
+    cudaLaunchConfig_t lc = {};
+    lc.gridDim = grid; lc.blockDim = block; lc.dynamicSmemBytes = smem; lc.stream = st;
+    cudaLaunchAttribute at[1];
+    at[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    at[0].val.programmaticStreamSerializationAllowed = 1;
+    lc.attrs = at; lc.numAttrs = 1;
+    C10_CUDA_CHECK(cudaLaunchKernelEx(&lc, kernel, static_cast<P>(args)...));
+}
+
 void check(const torch::Tensor& x, at::ScalarType dt, const char* name) {
     TORCH_CHECK(x.is_cuda() && x.is_contiguous() && x.scalar_type() == dt, "top_k: ", name,
                 " must be a contiguous CUDA tensor of ", dt);
@@ -2011,7 +2042,7 @@ template <int NK>
 void da_launch(const BwArgs& args, int grid, int dev, cudaStream_t stream) {
     static bool done[64] = {};
     smem_attr(tk_bw_da_kernel<NK>, DaGeo<NK>::BYTES, dev, done);
-    tk_bw_da_kernel<NK><<<grid, NW * 32, DaGeo<NK>::BYTES, stream>>>(args);
+    launch_pdl(tk_bw_da_kernel<NK>, dim3(grid), dim3(NW * 32), DaGeo<NK>::BYTES, stream, args);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
@@ -2026,7 +2057,7 @@ void gemm_launch(const BwArgs& args, long items, int sms, int dev, cudaStream_t 
                                                                      GemmGeo<NK>::BYTES));
     const long units = items * (args.M / GMN) * (args.N / GKC);
     const int grid = (int)std::max(1L, std::min((long)sms * std::max(fit[dev], 1), units));
-    tk_bw_da_gemm_kernel<NK><<<grid, GWN * 32, GemmGeo<NK>::BYTES, stream>>>(args);
+    launch_pdl(tk_bw_da_gemm_kernel<NK>, dim3(grid), dim3(GWN * 32), GemmGeo<NK>::BYTES, stream, args);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
@@ -2034,7 +2065,7 @@ template <int NK, bool MASKED, bool GRADS>
 void cols_launch(const BwArgs& args, int grid, int dev, cudaStream_t stream) {
     static bool done[64] = {};
     smem_attr(tk_bw_cols_kernel<NK, MASKED, GRADS>, ColsGeo<NK, MASKED>::BYTES, dev, done);
-    tk_bw_cols_kernel<NK, MASKED, GRADS><<<grid, NW * 32, ColsGeo<NK, MASKED>::BYTES, stream>>>(args);
+    launch_pdl(tk_bw_cols_kernel<NK, MASKED, GRADS>, dim3(grid), dim3(NW * 32), ColsGeo<NK, MASKED>::BYTES, stream, args);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
@@ -2114,7 +2145,7 @@ std::vector<torch::Tensor> top_k_prep(torch::Tensor Bm, torch::Tensor G, torch::
     const int P = (int)std::max(2L, std::min((long)sms, chunks / 4));       // (two at least: a CTA for each kind)
     auto flags = torch::empty({2 * P}, i32);
     auto stream = at::cuda::getCurrentCUDAStream();
-    tk_prep_kernel<<<dim3(296, 5), 256, 0, stream>>>(
+    launch_pdl(tk_prep_kernel, dim3(296, 5), dim3(256), 0, stream,
         Bm.data_ptr<float>(), Bm.stride(0), G.data_ptr<float>(), G.stride(0), em.data_ptr<float>(), em.stride(0),
         eid.data_ptr<long>(),
         full ? nullptr : has.data_ptr<bool>(), theta.data_ptr<float>(),
@@ -2126,7 +2157,7 @@ std::vector<torch::Tensor> top_k_prep(torch::Tensor Bm, torch::Tensor G, torch::
     static bool done[64] = {};
     const int ibytes = 5 * B * 4;
     if (ibytes > 48 * 1024) smem_attr(tk_items_kernel, ibytes, Bm.get_device(), done);
-    tk_items_kernel<<<1, 1024, ibytes, stream>>>(
+    launch_pdl(tk_items_kernel, dim3(1), dim3(1024), (int)ibytes, stream,
         mapped ? emap.data_ptr<long>() : nullptr, rows.data_ptr<long>(), slot64.data_ptr<long>(),
         reinterpret_cast<int4*>(mitems.data_ptr<int>()), reinterpret_cast<int4*>(oitems.data_ptr<int>()),
         noitems.data_ptr<int>(), slot32.data_ptr<int>(), flags.data_ptr<int>(), B, Rm, 2 * P, pair ? 1 : 0);
@@ -2257,7 +2288,7 @@ std::vector<torch::Tensor> top_k_flows(torch::Tensor nf, torch::Tensor ao, torch
         TORCH_CHECK(acnt.size(0) == Rm && acnt.size(1) == M && acnt.size(2) == SA, "top_k: acnt [Rm, M, 72]");
     }
     auto fl = torch::empty_like(ao), fmx = torch::empty({B}, ao.options());
-    tk_flows_kernel<<<dim3(std::max(B, Rm), Rm > 0 ? 2 : 1), 256, 0, at::cuda::getCurrentCUDAStream()>>>(
+    launch_pdl(tk_flows_kernel, dim3(std::max(B, Rm), Rm > 0 ? 2 : 1), dim3(256), 0, at::cuda::getCurrentCUDAStream(),
         nf.data_ptr<float>(), nf.stride(0), ao.data_ptr<float>(), bo.data_ptr<float>(), fl.data_ptr<float>(),
         fmx.data_ptr<float>(), Rm > 0 ? rows.data_ptr<long>() : nullptr, Rm > 0 ? acnt.data_ptr<float>() : nullptr,
         B, M, Rm);
@@ -2276,11 +2307,11 @@ std::vector<torch::Tensor> top_k_bw_prep(torch::Tensor A, torch::Tensor theta, i
     auto L2T = torch::empty({M, N}, A.options().dtype(at::kHalf));
     auto LTc = torch::empty({(long)M * N / 2}, A.options().dtype(at::kInt));
     auto stream = at::cuda::getCurrentCUDAStream();
-    tk_bw_prep_kernel<<<dim3(296, 2), 256, 0, stream>>>(A.data_ptr<float>(), A.stride(0), theta.data_ptr<float>(),
+    launch_pdl(tk_bw_prep_kernel, dim3(296, 2), dim3(256), 0, stream, A.data_ptr<float>(), A.stride(0), theta.data_ptr<float>(),
         reinterpret_cast<__half*>(AH.data_ptr<at::Half>()), reinterpret_cast<__half*>(L2T.data_ptr<at::Half>()),
         Bx, M, N, r, (int)KP);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
-    tk_bw_ltc_kernel<<<296, 256, 0, stream>>>(reinterpret_cast<const __half*>(L2T.data_ptr<at::Half>()),
+    launch_pdl(tk_bw_ltc_kernel, dim3(296), dim3(256), 0, stream, reinterpret_cast<const __half*>(L2T.data_ptr<at::Half>()),
         reinterpret_cast<uint2*>(LTc.data_ptr<int>()), M, N);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return {AH, L2T, LTc};
@@ -2383,7 +2414,7 @@ void top_k_bw_em_observed(torch::Tensor AH, torch::Tensor BP, torch::Tensor E, t
     case NKV: {                                                                                                    \
         static bool done[64] = {};                                                                                 \
         smem_attr(tk_bw_em_obs_kernel<NKV>, EmGeo<NKV>::BYTES, dev, done);                                         \
-        tk_bw_em_obs_kernel<NKV><<<grid, NW * 32, EmGeo<NKV>::BYTES, stream>>>(args);                              \
+        launch_pdl(tk_bw_em_obs_kernel<NKV>, dim3(grid), dim3(NW * 32), EmGeo<NKV>::BYTES, stream, args);         \
         C10_CUDA_KERNEL_LAUNCH_CHECK();                                                                            \
         break;                                                                                                     \
     }
@@ -2432,9 +2463,10 @@ __device__ __forceinline__ int2 block_scan2(int2 v, int2& tot) {
 // [max(Rm, 1)] the masked ones in order then -1, NM [1] their count, OLIST [max(B - Rm, 1)] the observed ones in order
 // then -1. kind [B] and nothing else in shared memory.
 __global__ void __launch_bounds__(1024) tk_em_index_kernel(
-        const int* __restrict__ slot32, const long* __restrict__ rows, const long* __restrict__ emap,
-        const bool* __restrict__ pmask, int* __restrict__ SLOT, int* __restrict__ LWIDX, int* __restrict__ EMAP,
-        int* __restrict__ MROWS, int* __restrict__ NM, int* __restrict__ OLIST, int B, int Rm) {
+        const int* slot32, const long* rows, const long* emap,
+        const bool* pmask, int* SLOT, int* LWIDX, int* EMAP,
+        int* MROWS, int* NM, int* OLIST, int B, int Rm) {
+    pdl_entry();
     extern __shared__ int kind[];
     const int tid = threadIdx.x, nth = blockDim.x;
     for (int b = tid; b < B; b += nth) {
@@ -2475,7 +2507,7 @@ std::vector<torch::Tensor> top_k_em_index(torch::Tensor slot32, torch::Tensor ro
     auto o = slot32.options();
     auto SLOT = torch::empty({B}, o), LWIDX = torch::empty({B}, o), EMAP = torch::empty({B}, o);
     auto MROWS = torch::empty({std::max(Rm, 1)}, o), NM = torch::empty({1}, o), OLIST = torch::empty({std::max(B - Rm, 1)}, o);
-    tk_em_index_kernel<<<1, 1024, B * sizeof(int), at::cuda::getCurrentCUDAStream()>>>(
+    launch_pdl(tk_em_index_kernel, dim3(1), dim3(1024), (int)(B * sizeof(int)), at::cuda::getCurrentCUDAStream(),
         slot32.data_ptr<int>(), rows.data_ptr<long>(), emap.numel() > 0 ? emap.data_ptr<long>() : nullptr,
         pmask.numel() > 0 ? pmask.data_ptr<bool>() : nullptr, SLOT.data_ptr<int>(), LWIDX.data_ptr<int>(),
         EMAP.data_ptr<int>(), MROWS.data_ptr<int>(), NM.data_ptr<int>(), OLIST.data_ptr<int>(), B, Rm);
@@ -2485,8 +2517,9 @@ std::vector<torch::Tensor> top_k_em_index(torch::Tensor slot32, torch::Tensor ro
 
 // element_flows[kids[k], b] = logaddexp(element_flows[kids[k], b], log EF[b, cols[k]]): the children's element flows
 // (log space, a sample a column) from the backward's EF [B, N] (linear), a 32 x 32 tile a CTA through shared memory
-__global__ void tk_scatter_ef_kernel(const float* __restrict__ EF, const long* __restrict__ cols,
-                                     const long* __restrict__ kids, float* __restrict__ ef, long ld, int B, int N, int nk) {
+__global__ void tk_scatter_ef_kernel(const float* EF, const long* cols,
+                                     const long* kids, float* ef, long ld, int B, int N, int nk) {
+    pdl_entry();
     __shared__ float tile[32][33];
     const int k0 = blockIdx.x * 32, b0 = blockIdx.y * 32, tx = threadIdx.x, ty = threadIdx.y;
     const int kx = k0 + tx;
@@ -2515,7 +2548,7 @@ void top_k_scatter_ef(torch::Tensor EF, torch::Tensor cols, torch::Tensor kids, 
     const int B = EF.size(0), N = EF.size(1), nk = cols.numel();
     if (nk == 0 || B == 0) return;
     dim3 grid((unsigned)((nk + 31) / 32), (unsigned)((B + 31) / 32)), block(32, 8);
-    tk_scatter_ef_kernel<<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
+    launch_pdl(tk_scatter_ef_kernel, grid, block, 0, at::cuda::getCurrentCUDAStream(),
         EF.data_ptr<float>(), cols.data_ptr<long>(), kids.data_ptr<long>(), element_flows.data_ptr<float>(),
         element_flows.stride(0), B, N, nk);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
@@ -2524,9 +2557,10 @@ void top_k_scatter_ef(torch::Tensor EF, torch::Tensor cols, torch::Tensor kids, 
 // The EM statistics onto a node vector's slots where its parameters lie block-major (`LowRank._scatter_add`'s grid:
 // (i, j) at ((i / bs * Nb + j / cbs) * cbs + j % cbs) * bs + i % bs): pf[pf0 + .] += FP[i, j], and where `den` is
 // given den[den0 + .] += FM[i, j] / theta (0 where theta = 0), theta = params[p0 + .] -- a 32 x 32 tile a CTA
-__global__ void tk_scatter_em_kernel(const float* __restrict__ FP, const float* __restrict__ FM,
-                                     const float* __restrict__ params, float* __restrict__ pf, float* __restrict__ den,
+__global__ void tk_scatter_em_kernel(const float* FP, const float* FM,
+                                     const float* params, float* pf, float* den,
                                      long p0, long pf0, long den0, int M, int N, int Nb, int cbs, int bs) {
+    pdl_entry();
     __shared__ float tp[32][33], tm[32][33];
     const int i0 = blockIdx.y * 32, j0 = blockIdx.x * 32, tx = threadIdx.x, ty = threadIdx.y;
     for (int u = ty; u < 32; u += 8) {
@@ -2558,7 +2592,7 @@ void top_k_scatter_em(torch::Tensor FP, torch::Tensor FM, torch::Tensor params, 
     TORCH_CHECK(M % bs == 0 && N % cbs == 0 && N == Nb * cbs && (!wd || FM.sizes() == FP.sizes()),
                 "top_k: the statistics' grid");
     dim3 grid((unsigned)((N + 31) / 32), (unsigned)((M + 31) / 32)), block(32, 8);
-    tk_scatter_em_kernel<<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
+    launch_pdl(tk_scatter_em_kernel, grid, block, 0, at::cuda::getCurrentCUDAStream(),
         FP.data_ptr<float>(), wd ? FM.data_ptr<float>() : nullptr, wd ? params.data_ptr<float>() : nullptr,
         pf.data_ptr<float>(), wd ? den.data_ptr<float>() : nullptr, p0, pf0, den0, M, N, (int)Nb, (int)cbs, (int)bs);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
