@@ -308,7 +308,9 @@ struct ObservedGeo {                   // a stage: 2 slots x { B chunk [KP][BROW
 // (each part's running maxima its own: rescaled to the larger) and makes the values. A CTA runs its partial first and
 // waits on lower CTAs only (dispatched first): no deadlock, short waits.
 
-constexpr int WM = 7, WO = 5;          // a masked chunk's cost and an observed one's (67 : 48 us a tile in place)
+constexpr int WM = 6, WO = 5;          // a masked chunk's cost and an observed one's (with the stash ending: the best
+                                       // Codpula head's two kinds took 141 : 140 us a transition at 6 : 5; 7 : 5 left
+                                       // the observed share 161 us)
 
 struct MState {                         // a thread's sums of a masked tile: its rows g, g + 8
     float m0, m1, zr0, zr1, ur0, ur1;
