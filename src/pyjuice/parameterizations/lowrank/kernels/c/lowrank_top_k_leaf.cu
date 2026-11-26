@@ -13,11 +13,13 @@
 //   tk_leaf_backward  the same tiles: the evidence's gradient (summed over the nodes, into the caller's) and the tilt's
 //                     (dtau [S, M] a sample: d / d tau) from the node flows (an observed token) or the sum's posterior
 //                     counts of its slots (a missing token a sum reads: the slots' posterior a node, K + 1 of them, then
-//                     the node's flow -- their product the counts); and the EM statistics (F+, F-) into transposed
-//                     buffers [V, M] a block of parameters (`red.v4`: a lane's 4 nodes one atomic), F+ the posterior
-//                     counts (the observed token's flow, a sum's counts, or f P where no one reads a missing token),
-//                     F- f P
-//   tk_leaf_fold      a transposed buffer of flows added into the layer's parameter flows
+//                     the node's flow -- their product the counts); and for the EM statistics (F+, F-) the observed
+//                     tokens' F+ (their flows, into the layer's parameter flows), the tile's entries (its candidates,
+//                     keyed by their category) and its rows (log2 of the flows over Z)
+//   tk_leaf_em        the EM statistics of the entries sorted by category: a CTA a run of them and 128 nodes, a
+//                     category's F- = sum f P (F+ the posterior counts: a sum's counts, or cp P past its slots / f P
+//                     where no one reads a missing token) over its entries, then a block of categories' sums added into
+//                     the layer's parameter flows, a node's line at once -- no atomic a candidate, no V x M buffer
 //
 // A warp takes 128 nodes (4 a lane: a candidate's row one float4 a lane) and walks the candidates. Every sum in fp32,
 // log2 units, each node's exponentials against a lazily raised running max (raised only past 8).
@@ -101,21 +103,6 @@ __global__ void tk_leaf_table_kernel(const float* __restrict__ params, const lon
     for (int k = ty; k < 32; k += 8) {
         const int v = v0 + k, i = i0 + tx;
         if (v < V && i < M) tab[(long)v * M + i] = __log2f(tile[tx][k]);
-    }
-}
-
-__global__ void tk_leaf_fold_kernel(const float* __restrict__ fT, const long* __restrict__ spfids, float* __restrict__ pf,
-                                    int M, int V, long off) {
-    __shared__ float tile[32][33];
-    const int v0 = blockIdx.x * 32, i0 = blockIdx.y * 32, tx = threadIdx.x, ty = threadIdx.y;
-    for (int k = ty; k < 32; k += 8) {
-        const int v = v0 + k, i = i0 + tx;
-        tile[k][tx] = (v < V && i < M) ? fT[(long)v * M + i] : 0.f;
-    }
-    __syncthreads();
-    for (int k = ty; k < 32; k += 8) {
-        const int i = i0 + k, v = v0 + tx;
-        if (v < V && i < M) pf[spfids[i] + off + v] += tile[tx][k];
     }
 }
 
@@ -267,7 +254,10 @@ struct BwArgs {
     float* dtau;                                                 // [T][B][S][M] written, or (drow) [T][Bd][S][M] added
                                                                  // into: a sample's times dsgn into row drow; null: none
     const int* drow; const float* dsgn; int Bd;
-    float* fpT; float* fmT;                                      // EM: F+, F- [ntab][V][M] (added into; null: none)
+    int* ekey; float* emr; int4* emeta; int* eplus; int Vb;      // EM (null: none): a tile's entries [T][B][C] (key
+                                                                 // k Vb + v; preset: no entry), rows [T][B][4][M],
+                                                                 // (sample, cp's first candidate, count rows) [T][B]
+    float* pf; const long* spf;                                  // the observed tokens' F+ into pf[spf[k][i] + v]
     const bool* pmask;                                           // [B] the samples the EM statistics take (null: all)
     const float* gsgn;                                           // [B] the evidence gradient's sign a sample (null: 1)
     const int* ord; const int* rank;                             // [B] the samples by their evidence's row and a
@@ -290,6 +280,7 @@ struct DtauOut {
 // once -- the bulk's terms and the EM statistics summed over the samples before they are added, the head's a sample each
 template <int NS>
 __global__ void __launch_bounds__(NW * 32) tk_leaf_backward_kernel(const BwArgs a) {
+    static_assert(NS <= 2, "the EM statistics' tiles: up to two count rows");
     __shared__ int s_ids[CH];
     __shared__ float s_lp[CH];
     const Tile& g = a.g;
@@ -329,7 +320,7 @@ __global__ void __launch_bounds__(NW * 32) tk_leaf_backward_kernel(const BwArgs 
         dt[m] = DtauOut{a.dtau == nullptr ? nullptr
                         : a.dtau + ((long)t * (fold ? a.Bd : g.B) + (fold ? a.drow[b] : b)) * g.S * g.M + i0,
                         fold ? a.dsgn[b] : 1.f, fold};
-        em[m] = m < ns && a.fmT != nullptr && p[m] != -1              // EM statistics: every token among the candidates
+        em[m] = m < ns && a.ekey != nullptr && p[m] != -1             // EM statistics: every token among the candidates
                 && (a.pmask == nullptr || a.pmask[b]);
         alone[m] = miss[m] && r[m] < 0;                                // a missing token no one reads: its leaf is 1
         live[m] = m < ns && !(p[m] == -1 || (alone[m] && !em[m]));
@@ -348,6 +339,25 @@ __global__ void __launch_bounds__(NW * 32) tk_leaf_backward_kernel(const BwArgs 
     // (one write of the tilt's gradient for the samples where they fold into one row; else a sample each)
     const bool merge = NS > 1 && fold && ns > 1 && a.drow[bs[0]] == a.drow[bs[NS - 1]];
     const DtauOut dtm{dt[0].p, 1.f, true};
+    // EM: the tile's entries and its rows (`tk_leaf_em` reads them), where a sample's statistics are taken -- its
+    // samples' cp from candidate 0 (a missing token no one reads) or K (a sum reads it: the slots' counts below K, by
+    // their rows of the counts), none (C) where every token is observed
+    const long gi = (long)t * g.B + blockIdx.x;
+    bool emc = false, cpc = false;
+    int cpf = g.C, hr[2] = {-1, -1};
+#pragma unroll
+    for (int m = 0; m < NS; ++m) {
+        emc = emc || em[m];
+        if (em[m] && miss[m]) {
+            cpc = true;
+            cpf = alone[m] ? 0 : g.K;
+            if (!alone[m]) hr[m] = r[m];
+        }
+    }
+    if (emc && blockIdx.z == 0 && threadIdx.x == 0) {
+        a.emeta[gi] = make_int4(b0, cpf, hr[0], hr[1]);
+        if (cpc) *a.eplus = 1;
+    }
 
     // a node's terms: dlogit(i, c) = P(i, c) g(i, c) + d(i, c) -- observed: g = -f, d = f at the token; missing: below K
     // g = -f, d = the slot's count, from K on g = a_K / P(rest) - f (the rest's count spread as P), d = 0. EM: F- += fm P,
@@ -356,7 +366,6 @@ __global__ void __launch_bounds__(NW * 32) tk_leaf_backward_kernel(const BwArgs 
     float lzs[4], qB[4], gH[NS][4], gB[NS][4], fo[NS][4], dR[NS][4], fm[NS][4], cp[NS][4];
     float gBs[4], fmE[4], cpE[4];                                      // (summed over the samples: the bulk, the EM)
     const float* ac[NS];
-    bool emAny = false, cpAny = false;
     if (act) {
         const long tb0 = (long)t * g.B + b0;
         const float4 tK = tau != nullptr ? ld4(tau + (long)Kl * g.M) : make_float4(0.f, 0.f, 0.f, 0.f);
@@ -400,8 +409,19 @@ __global__ void __launch_bounds__(NW * 32) tk_leaf_backward_kernel(const BwArgs 
                 if (grad[m]) gBs[j] += gs[m] * gB[m][j];
                 if (em[m]) { fmE[j] += fm[m][j]; if (miss[m]) cpE[j] += cp[m][j]; }
             }
-            emAny = emAny || em[m];
-            cpAny = cpAny || (em[m] && miss[m]);
+        }
+        if (emc) {                                                     // the rows: log2 (fm, cp) - log2 Z, and with
+            float* q = a.emr + gi * 4 * g.M + i0;                      // the bulk's tilt
+            float w[4][4];
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {                              // (log2 in fp64: no error past the fp32 flows')
+                const float lf = fmE[j] > 0.f ? (float)log2((double)fmE[j]) : -INFINITY;
+                const float lc = cpE[j] > 0.f ? (float)log2((double)cpE[j]) : -INFINITY;
+                w[0][j] = lf - lzs[j]; w[1][j] = lf + qB[j]; w[2][j] = lc - lzs[j]; w[3][j] = lc + qB[j];
+            }
+#pragma unroll
+            for (int x = 0; x < 4; ++x)
+                if (x < 2 || cpc) st4(q + (long)x * g.M, w[x][0], w[x][1], w[x][2], w[x][3]);
         }
     }
 
@@ -411,15 +431,17 @@ __global__ void __launch_bounds__(NW * 32) tk_leaf_backward_kernel(const BwArgs 
         gradAny = gradAny || grad[m];
         wide = wide || (a.glp != nullptr && grad[m]) || em[m];
     }
-    float* fpT = emAny ? a.fpT + (long)g.nv_tab[t] * g.tab_stride + i0 : nullptr;
-    float* fmT = emAny ? a.fmT + (long)g.nv_tab[t] * g.tab_stride + i0 : nullptr;
+    int* ekey = emc && blockIdx.z == 0 ? a.ekey + gi * g.C : nullptr;
+    const int kbase = g.nv_tab[t] * a.Vb;
     const int Cend = wide ? g.C : g.H;                                 // (only d / d tau: the head alone)
     for (int c0 = 0; c0 < Cend; c0 += CH) {
         const int n = min(CH, Cend - c0);
         __syncthreads();
         for (int k = threadIdx.x; k < n; k += NW * 32) {
-            s_ids[k] = g.ids[e0 + c0 + k];
+            const int id = g.ids[e0 + c0 + k];
+            s_ids[k] = id;
             s_lp[k] = g.lp[e0 + c0 + k] * LOG2E;
+            if (ekey != nullptr) ekey[c0 + k] = kbase + id;
         }
         __syncthreads();
         if (!act) continue;
@@ -435,32 +457,25 @@ __global__ void __launch_bounds__(NW * 32) tk_leaf_backward_kernel(const BwArgs 
                     const float4 th = ld4(tab + (long)s_ids[k] * g.M);
                     const float l = s_lp[k];
                     if (c >= g.H) {
-                        float P[4] = {ex2(th.x + l + qB[0]), ex2(th.y + l + qB[1]), ex2(th.z + l + qB[2]), ex2(th.w + l + qB[3])};
-                        pt[u] = P[0] * gBs[0] + P[1] * gBs[1] + P[2] * gBs[2] + P[3] * gBs[3];
-                        if (emAny) {
-                            const long o = (long)s_ids[k] * g.M;
-                            red4(fmT + o, fmE[0] * P[0], fmE[1] * P[1], fmE[2] * P[2], fmE[3] * P[3]);
-                            if (cpAny) red4(fpT + o, cpE[0] * P[0], cpE[1] * P[1], cpE[2] * P[2], cpE[3] * P[3]);
-                        }
+                        pt[u] = ex2(th.x + l + qB[0]) * gBs[0] + ex2(th.y + l + qB[1]) * gBs[1]
+                              + ex2(th.z + l + qB[2]) * gBs[2] + ex2(th.w + l + qB[3]) * gBs[3];
                         continue;
                     }
                     const float4 tc = tau != nullptr ? ld4(tau + (long)min(c, Kl) * g.M) : make_float4(0.f, 0.f, 0.f, 0.f);
-                    float P[4], fpS[4] = {0.f, 0.f, 0.f, 0.f}, dlS[4] = {0.f, 0.f, 0.f, 0.f};
+                    float P[4], dlS[4] = {0.f, 0.f, 0.f, 0.f};
 #pragma unroll
                     for (int j = 0; j < 4; ++j) P[j] = ex2(at(th, j) + l + at(tc, j) - lzs[j]);
                     float ptu = 0.f;
 #pragma unroll
                     for (int m = 0; m < NS; ++m) {
-                        if (!live[m]) continue;
+                        if (!grad[m]) continue;
                         float dl[4];
 #pragma unroll
                         for (int j = 0; j < 4; ++j) {
-                            const float d = miss[m] ? (c < g.K && !alone[m] ? fm[m][j] * ac[m][j * a.acs + c] : 0.f)
+                            const float d = miss[m] ? (c < g.K ? fm[m][j] * ac[m][j * a.acs + c] : 0.f)
                                                     : (c == p[m] ? fo[m][j] : 0.f);
                             dl[j] = P[j] * (c < g.K ? gH[m][j] : gB[m][j]) + d;
-                            if (em[m] && miss[m]) fpS[j] += alone[m] ? cp[m][j] * P[j] : (c < g.K ? d : cp[m][j] * P[j]);
                         }
-                        if (!grad[m]) continue;
                         ptu += gs[m] * (dl[0] + dl[1] + dl[2] + dl[3]);
                         if (c < Kl) {
                             if (merge) {
@@ -475,11 +490,6 @@ __global__ void __launch_bounds__(NW * 32) tk_leaf_backward_kernel(const BwArgs 
                         }
                     }
                     pt[u] = ptu;
-                    if (emAny) {
-                        const long o = (long)s_ids[k] * g.M;
-                        red4(fmT + o, fmE[0] * P[0], fmE[1] * P[1], fmE[2] * P[2], fmE[3] * P[3]);
-                        if (cpAny) red4(fpT + o, fpS[0], fpS[1], fpS[2], fpS[3]);
-                    }
                     if (merge && c < Kl) dtm.put((long)c * g.M, dlS[0], dlS[1], dlS[2], dlS[3]);
                 }
             } else {                                                   // the bulk
@@ -493,14 +503,8 @@ __global__ void __launch_bounds__(NW * 32) tk_leaf_backward_kernel(const BwArgs 
 #pragma unroll
                     for (int u = 0; u < 8; ++u) {
                         const float l = k0 + u0 + u < n ? s_lp[k0 + u0 + u] : 0.f;
-                        const float P0 = ex2(th[u].x + l + qB[0]), P1 = ex2(th[u].y + l + qB[1]);
-                        const float P2 = ex2(th[u].z + l + qB[2]), P3 = ex2(th[u].w + l + qB[3]);
-                        pt[u0 + u] = P0 * gBs[0] + P1 * gBs[1] + P2 * gBs[2] + P3 * gBs[3];
-                        if (emAny && k0 + u0 + u < n) {
-                            const long o = (long)s_ids[k0 + u0 + u] * g.M;
-                            red4(fmT + o, fmE[0] * P0, fmE[1] * P1, fmE[2] * P2, fmE[3] * P3);
-                            if (cpAny) red4(fpT + o, cpE[0] * P0, cpE[1] * P1, cpE[2] * P2, cpE[3] * P3);
-                        }
+                        pt[u0 + u] = ex2(th[u].x + l + qB[0]) * gBs[0] + ex2(th[u].y + l + qB[1]) * gBs[1]
+                                   + ex2(th[u].z + l + qB[2]) * gBs[2] + ex2(th[u].w + l + qB[3]) * gBs[3];
                     }
                 }
             }
@@ -513,8 +517,13 @@ __global__ void __launch_bounds__(NW * 32) tk_leaf_backward_kernel(const BwArgs 
 #pragma unroll
     for (int m = 0; m < NS; ++m) {
         if (!live[m]) continue;
-        if (em[m] && !miss[m]) red4(fpT + (long)g.ids[e0 + p[m]] * g.M, fo[m][0], fo[m][1], fo[m][2], fo[m][3]);
-        if (!grad[m]) {                                                // (F+ at its token: the observed token's flow)
+        if (em[m] && !miss[m]) {                                       // F+ at its token: the observed token's flow
+            const long v = g.ids[e0 + p[m]];
+            const long* sp = a.spf + (long)g.nv_tab[t] * g.M + i0;
+#pragma unroll
+            for (int j = 0; j < 4; ++j) atomicAdd(a.pf + sp[j] + v, fo[m][j]);
+        }
+        if (!grad[m]) {
             for (int s = 0; s < g.S; ++s) dt[m].zero((long)s * g.M);
             continue;
         }
@@ -535,6 +544,150 @@ __global__ void __launch_bounds__(NW * 32) tk_leaf_backward_kernel(const BwArgs 
         }
     }
     if (merge) dtm.put((long)Kl * g.M, dRS[0], dRS[1], dRS[2], dRS[3]);
+}
+
+// The EM statistics of the backward's entries sorted by key (k Vb + v, Vb = V up to EB: a block of EB categories in one
+// table; `offs` [nbins + 1] where each key's run starts), a CTA a run of EC of them and EN nodes, the run's blocks one
+// after another: the block's log2 theta rows and sums in shared memory, its entries split among the warps (a warp a
+// share, a lane 4 nodes; F- += 2^(log2 theta + l + log2 fm - log2 Z + tau), PLUS: F+, cp's terms from the tile's first
+// candidate of them and below K a sum's counts of the slots), then the block's sums added into the layer's parameter
+// flows (F- at spf[k][i] + V + v, F+ V before it), a node's EB categories at once (a block two runs share: both parts
+// added). MEASURED (48 blocks): a CTA every 1024 nodes and a lane's 4 categories one red.v4 a node (a node's flows
+// 1 MB apart) made those adds 2/3 of the pass; blocks of 16 (3 CTAs an SM) beat 32 (2) and 8
+constexpr int EC = 512;             // entries a run
+constexpr int EB = 16;              // categories a block: a node's 64 B of flows
+constexpr int EN = 128;             // nodes a CTA (32 lanes x 4)
+
+struct EmArgs {
+    const int* skey; const long* sidx; const int* offs; int nbins;   // the entries sorted: keys, ids (tile C + c), runs
+    const float* emr; const int4* emeta;                             // the backward's rows; (sample, cp, rows) a tile
+    const int* eplus;                                                // any F+ term (a sample's token missing)
+    const float* acnt; int acs;                                      // the sums' counts [R][M][acs] (null: none)
+    const float* tab; long tab_stride;                               // log2 theta^T [ntab][V][M]
+    const float* tau; int Bx; const int* emap;                       // tilts [T][Bx][S][M] (null: none); a sample's row
+    const float* lp; const int* erow; int nvars; const int* nv_lvid;  // the evidence, as the tiles read it
+    float* pf; const long* spf;                                      // the layer's parameter flows; [ntab][M] node i's
+    int B, M, C, S, K, V, Vb;
+    bool vec;                                                        // every block's flows 16 B aligned
+};
+
+__device__ __forceinline__ float4 add4(const float4& x, const float4& y) {
+    return make_float4(x.x + y.x, x.y + y.y, x.z + y.z, x.w + y.w);
+}
+
+template <bool PLUS>
+__global__ void __launch_bounds__(NW * 32) tk_leaf_em_kernel(const EmArgs a) {
+    __shared__ int s_g[EC], s_c[EC], s_k[EC];
+    __shared__ float s_l[EC];
+    __shared__ long s_t[EC];
+    __shared__ __align__(16) float s_th[EB][EN];                       // the block's log2 theta rows
+    __shared__ float s_sum[EB][EN + 1];                                // its sums (padded: read transposed)
+    __shared__ int s_plus;
+    if (PLUS && *a.eplus == 0) return;                                 // (every token observed: no F+ term)
+    const int n = a.offs[a.nbins];                                     // (the entries: those before the unset keys)
+    const int s0 = blockIdx.x * EC;
+    if (s0 >= n) return;
+    const int ne = min(EC, n - s0), Kl = a.S - 1;
+    if (threadIdx.x == 0) s_plus = 0;
+    __syncthreads();
+    for (int x = threadIdx.x; x < ne; x += NW * 32) {                  // the run's entries: tile, candidate, l, tilt
+        const long id = a.sidx[s0 + x];
+        const int gi = (int)(id / a.C), c = (int)(id - (long)gi * a.C), t = gi / a.B;
+        const int4 mt = a.emeta[gi];
+        const long e0 = ((long)(a.erow != nullptr ? a.erow[mt.x] : mt.x) * a.nvars + a.nv_lvid[t]) * a.C;
+        s_g[x] = gi; s_c[x] = c; s_k[x] = a.skey[s0 + x];
+        s_l[x] = a.lp[e0 + c] * LOG2E;
+        s_t[x] = a.tau != nullptr && c < Kl
+               ? (((long)t * a.Bx + (a.emap != nullptr ? a.emap[mt.x] : mt.x)) * a.S + c) * a.M : -1;
+        if (PLUS && (c >= mt.y || (c < a.K && (mt.z >= 0 || mt.w >= 0)))) s_plus = 1;
+    }
+    __syncthreads();
+    if (PLUS && s_plus == 0) return;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int n0 = blockIdx.y * EN, i0 = n0 + 4 * lane;               // the CTA's nodes; a lane's 4
+    for (int x = 0; x < ne;) {
+        const int b0 = s_k[x] / EB * EB, k = b0 / a.Vb, v0 = b0 - k * a.Vb;
+        const int xe = min(a.offs[b0 + EB] - s0, ne);                  // the block's entries in the run
+        const float* tb = a.tab + (long)k * a.tab_stride + (long)v0 * a.M + n0;
+        for (int q = threadIdx.x; q < EB * EN / 4; q += NW * 32) {     // the block's rows staged, its sums zeroed
+            const int r = q / (EN / 4), c4 = 4 * (q % (EN / 4));
+            *reinterpret_cast<float4*>(&s_th[r][c4]) = v0 + r < a.V ? ld4(tb + (long)r * a.M + c4)
+                                                                    : make_float4(-INFINITY, -INFINITY, -INFINITY, -INFINITY);
+            s_sum[r][c4] = s_sum[r][c4 + 1] = s_sum[r][c4 + 2] = s_sum[r][c4 + 3] = 0.f;
+        }
+        __syncthreads();
+        // a warp's share of the block's entries, 8 rows in flight: a category's terms summed until it changes
+        const int per = (xe - x + NW - 1) / NW, ya = x + warp * per, yb = min(ya + per, xe);
+        float acc[4] = {0.f, 0.f, 0.f, 0.f};
+        int cur = -1;
+        for (int y = ya; y < yb; y += 8) {
+            float4 w[8];
+#pragma unroll
+            for (int z = 0; z < 8; ++z) {
+                w[z] = make_float4(0.f, 0.f, 0.f, 0.f);
+                if (y + z >= yb) continue;
+                const long to = s_t[y + z];
+                w[z] = ld4(a.emr + ((long)s_g[y + z] * 4 + (PLUS ? 2 : 0) + (to < 0 ? 1 : 0)) * a.M + i0);
+                if (to >= 0) w[z] = add4(w[z], ld4(a.tau + to + i0));
+            }
+#pragma unroll
+            for (int z = 0; z < 8; ++z) {
+                const int e = y + z;
+                if (e >= yb) break;
+                const int r = s_k[e] - b0;
+                if (r != cur) {
+                    if (cur >= 0) {
+#pragma unroll
+                        for (int j = 0; j < 4; ++j) atomicAdd(&s_sum[cur][4 * lane + j], acc[j]);
+                    }
+                    acc[0] = acc[1] = acc[2] = acc[3] = 0.f;
+                    cur = r;
+                }
+                const float4 th = *reinterpret_cast<const float4*>(&s_th[r][4 * lane]);
+                const float l = s_l[e];
+                bool ex = true;
+                if (PLUS) {                                            // F+: where a token is missing
+                    const int c = s_c[e];
+                    const int4 mt = a.emeta[s_g[e]];
+                    ex = c >= mt.y;                                    // (cp P)
+                    if (c < a.K) {                                     // (a sum's count of the slot: its flow times
+                        const int hr[2] = {mt.z, mt.w};                // the slot's posterior)
+#pragma unroll
+                        for (int h = 0; h < 2; ++h) {
+                            if (hr[h] < 0) continue;
+                            const float* ac = a.acnt + ((long)hr[h] * a.M + i0) * a.acs;
+#pragma unroll
+                            for (int j = 0; j < 4; ++j) acc[j] += ac[j * a.acs + a.K + 1] * ac[j * a.acs + c];
+                        }
+                    }
+                }
+                if (ex) {
+                    acc[0] += ex2(th.x + l + w[z].x); acc[1] += ex2(th.y + l + w[z].y);
+                    acc[2] += ex2(th.z + l + w[z].z); acc[3] += ex2(th.w + l + w[z].w);
+                }
+            }
+        }
+        if (cur >= 0) {
+#pragma unroll
+            for (int j = 0; j < 4; ++j) atomicAdd(&s_sum[cur][4 * lane + j], acc[j]);
+        }
+        __syncthreads();
+        for (int q = threadIdx.x; q < EN * EB / 4; q += NW * 32) {     // the block's sums into the flows: a node's EB
+            const int i = q / (EB / 4), c4 = 4 * (q % (EB / 4));       // categories, 4 a thread (none: no add)
+            const float s[4] = {s_sum[c4][i], s_sum[c4 + 1][i], s_sum[c4 + 2][i], s_sum[c4 + 3][i]};
+            if (s[0] == 0.f && s[1] == 0.f && s[2] == 0.f && s[3] == 0.f) continue;
+            float* o = a.pf + a.spf[(long)k * a.M + n0 + i] + (PLUS ? 0 : a.V) + v0 + c4;
+            if (a.vec) {
+                red4(o, s[0], s[1], s[2], s[3]);
+            } else {
+#pragma unroll
+                for (int j = 0; j < 4; ++j)
+                    if (v0 + c4 + j < a.V) atomicAdd(o + j, s[j]);
+            }
+        }
+        __syncthreads();                                               // (the block's staging reused)
+        x = xe;
+    }
 }
 
 void check(const torch::Tensor& t, at::ScalarType dt, const char* name) {
@@ -626,16 +779,18 @@ std::vector<torch::Tensor> top_k_leaf_forward(torch::Tensor tab, torch::Tensor n
 }
 
 // the backward of the same tiles: adds the evidence's gradient into glp [B, nvars, C] (empty: none) and the EM
-// statistics into fpT, fmT [ntab, V, M] (empty: none; of the samples `pmask` [B] bool holds, if not empty); returns
-// dtau -- [T, B, S, M] a sample each, or where `drow` [B] (int32) is given each sample's times `dsgn` [B] summed into
-// the row drow of [T, Bd, S, M]; empty where not `dtau_out`
+// statistics into the layer's parameter flows pf (empty: none; of the samples `pmask` [B] bool holds, if not empty),
+// table k's node i's F+ at pf[spf[k, i] + v] and F- V past it (`spf_aligned`: every spf % 4 == 0); returns dtau --
+// [T, B, S, M] a sample each, or where `drow` [B] (int32) is given each sample's times `dsgn` [B] summed into the row
+// drow of [T, Bd, S, M]; empty where not `dtau_out`
 torch::Tensor top_k_leaf_backward(torch::Tensor tab, torch::Tensor nv_tab, torch::Tensor tau, torch::Tensor emap,
                                   torch::Tensor ids, torch::Tensor lp, torch::Tensor nv_lvid, torch::Tensor nv_row0,
                                   torch::Tensor lz, torch::Tensor lb, torch::Tensor place, torch::Tensor flows,
                                   bool logspace, torch::Tensor wrow, torch::Tensor logw, torch::Tensor acnt,
-                                  int64_t S, int64_t K, torch::Tensor glp, torch::Tensor fpT, torch::Tensor fmT,
-                                  torch::Tensor pmask, torch::Tensor gsgn, bool dtau_out, torch::Tensor drow,
-                                  torch::Tensor dsgn, int64_t Bd, torch::Tensor ord, torch::Tensor rank) {
+                                  int64_t S, int64_t K, torch::Tensor glp, torch::Tensor pf, torch::Tensor spf,
+                                  bool spf_aligned, torch::Tensor pmask, torch::Tensor gsgn, bool dtau_out,
+                                  torch::Tensor drow, torch::Tensor dsgn, int64_t Bd, torch::Tensor ord,
+                                  torch::Tensor rank) {
     const at::cuda::CUDAGuard guard(tab.device());
     const int64_t T = nv_tab.size(0), B = place.size(1);
     BwArgs a;
@@ -668,11 +823,23 @@ torch::Tensor top_k_leaf_backward(torch::Tensor tab, torch::Tensor nv_tab, torch
         a.acs = (int)acnt.size(2);
     }
     a.glp = glp.numel() > 0 ? glp.data_ptr<float>() : nullptr; a.dtau = dtau_out ? dtau.data_ptr<float>() : nullptr;
-    a.fpT = nullptr; a.fmT = nullptr;
-    if (fmT.numel() > 0) {
-        check(fpT, at::kFloat, "fpT"); check(fmT, at::kFloat, "fmT");
-        TORCH_CHECK(fpT.sizes() == tab.sizes() && fmT.sizes() == tab.sizes(), "top_k leaf: the flows' buffers as the tables");
-        a.fpT = fpT.data_ptr<float>(); a.fmT = fmT.data_ptr<float>();
+    // EM: the tiles' entries (a key a candidate, unset: none), rows and (sample, cp's first candidate, count rows)
+    const bool em = pf.numel() > 0;
+    const int64_t ntab = tab.size(0), V = tab.size(1), C = ids.size(2), Vb = (V + EB - 1) / EB * EB, nbins = ntab * Vb;
+    torch::Tensor ekey, emr, emeta, eplus;
+    a.ekey = nullptr; a.emr = nullptr; a.emeta = nullptr; a.eplus = nullptr; a.Vb = (int)Vb; a.pf = nullptr;
+    a.spf = nullptr;
+    if (em) {
+        check(pf, at::kFloat, "pf"); check(spf, at::kLong, "spf");
+        TORCH_CHECK(spf.dim() == 2 && spf.size(0) == ntab && spf.size(1) == M, "top_k leaf: spf [ntab, M]");
+        TORCH_CHECK(T * B * C < INT_MAX && nbins < INT_MAX, "top_k leaf: the EM entries past int32");
+        ekey = torch::full({T * B * C}, nbins, ids.options());
+        emr = torch::empty({T * B, 4, M}, tab.options());
+        emeta = torch::empty({T * B, 4}, ids.options());
+        eplus = torch::zeros({1}, ids.options());
+        a.ekey = ekey.data_ptr<int>(); a.emr = emr.data_ptr<float>();
+        a.emeta = reinterpret_cast<int4*>(emeta.data_ptr<int>()); a.eplus = eplus.data_ptr<int>();
+        a.pf = pf.data_ptr<float>(); a.spf = spf.data_ptr<long>();
     }
     a.ord = nullptr; a.rank = nullptr;
     if (ord.numel() > 0) {                                  // (a row's samples a CTA: the evidence a row each)
@@ -692,28 +859,34 @@ torch::Tensor top_k_leaf_backward(torch::Tensor tab, torch::Tensor nv_tab, torch
         TORCH_CHECK(pmask.numel() == B, "top_k leaf: pmask [B]");
         a.pmask = pmask.data_ptr<bool>();
     }
+    const auto stream = at::cuda::getCurrentCUDAStream();
     dim3 grid((unsigned)B, (unsigned)T, (unsigned)((M + NW * 128 - 1) / (NW * 128)));
-    if (a.ord != nullptr) tk_leaf_backward_kernel<2><<<grid, NW * 32, 0, at::cuda::getCurrentCUDAStream()>>>(a);
-    else tk_leaf_backward_kernel<1><<<grid, NW * 32, 0, at::cuda::getCurrentCUDAStream()>>>(a);
+    if (a.ord != nullptr) tk_leaf_backward_kernel<2><<<grid, NW * 32, 0, stream>>>(a);
+    else tk_leaf_backward_kernel<1><<<grid, NW * 32, 0, stream>>>(a);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    if (!em) return dtau;
+    // the entries by category (stable: a category's terms in the tiles' order), where each key's run starts
+    auto sorted = torch::sort(ekey, /*stable=*/true, /*dim=*/0, /*descending=*/false);
+    auto skey = std::get<0>(sorted), sidx = std::get<1>(sorted);
+    auto offs = torch::searchsorted(skey, torch::arange(nbins + 1, ids.options()), /*out_int32=*/true);
+    EmArgs e;
+    e.skey = skey.data_ptr<int>(); e.sidx = sidx.data_ptr<long>(); e.offs = offs.data_ptr<int>(); e.nbins = (int)nbins;
+    e.emr = a.emr; e.emeta = a.emeta; e.eplus = a.eplus; e.acnt = a.acnt; e.acs = a.acs;
+    e.tab = a.g.tab; e.tab_stride = a.g.tab_stride;
+    e.tau = a.g.tau; e.Bx = a.g.Bx; e.emap = a.g.emap;
+    e.lp = a.g.lp; e.erow = a.g.erow; e.nvars = a.g.nvars; e.nv_lvid = a.g.nv_lvid;
+    e.pf = a.pf; e.spf = a.spf;
+    e.B = (int)B; e.M = M; e.C = (int)C; e.S = (int)S; e.K = (int)K; e.V = (int)V; e.Vb = (int)Vb;
+    e.vec = spf_aligned && V % 4 == 0 && reinterpret_cast<uintptr_t>(e.pf) % 16 == 0;
+    dim3 egrid((unsigned)((T * B * C + EC - 1) / EC), (unsigned)(M / EN));     // (F-; F+ where a token is missing)
+    tk_leaf_em_kernel<false><<<egrid, NW * 32, 0, stream>>>(e);
+    tk_leaf_em_kernel<true><<<egrid, NW * 32, 0, stream>>>(e);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return dtau;
-}
-
-// pf[spfids[i] + off + v] += fT[v, i]: a block's flows [V, M] (transposed) into the layer's parameter flows
-void top_k_leaf_fold(torch::Tensor fT, torch::Tensor spfids, torch::Tensor pf, int64_t off) {
-    check(fT, at::kFloat, "fT"); check(spfids, at::kLong, "spfids"); check(pf, at::kFloat, "pf");
-    const at::cuda::CUDAGuard guard(fT.device());
-    const int V = (int)fT.size(0), M = (int)fT.size(1);
-    TORCH_CHECK(spfids.size(0) == M, "top_k leaf: spfids [M]");
-    dim3 grid((unsigned)((V + 31) / 32), (unsigned)((M + 31) / 32)), block(32, 8);
-    tk_leaf_fold_kernel<<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
-        fT.data_ptr<float>(), spfids.data_ptr<long>(), pf.data_ptr<float>(), M, V, off);
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("top_k_leaf_table", &top_k_leaf_table, "log2 theta^T of a soft-evidence leaf node vector");
     m.def("top_k_leaf_forward", &top_k_leaf_forward, "LowRank(top_k) leaves' forward");
-    m.def("top_k_leaf_backward", &top_k_leaf_backward, "LowRank(top_k) leaves' backward");
-    m.def("top_k_leaf_fold", &top_k_leaf_fold, "a transposed block of flows into the parameter flows");
+    m.def("top_k_leaf_backward", &top_k_leaf_backward, "LowRank(top_k) leaves' backward and EM statistics");
 }

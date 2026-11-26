@@ -10,8 +10,8 @@
 * a reading sum hands the leaf its posterior counts of those slots (`counts_buffer`: the slots' posterior a node and
   the node's flow, which its kernels write; `add_counts`);
 * the backward (`leaf_backward`): the evidence's gradient (summed over the nodes) and the tilt's, every sample, and the
-  parameters' EM statistics (`compute_param_flows`): F+ and F- into transposed buffers a block of parameters, then
-  added into the layer's flows.
+  parameters' EM statistics (`compute_param_flows`): the candidates of the samples they take sorted by category, then
+  a category's sums over them added into the layer's flows -- no buffer of every category.
 
 The tilt's products -- the forward's log2 e (A B)^T, the backward's gradients of A and B from d / d tau -- by their own
 kernels (`kernels/c/lowrank_top_k_tilt.cu`: exact fp32, a launch a run of positions), else cuBLAS's.
@@ -70,8 +70,10 @@ def _plan(layer) -> dict:
         nodes.append(dict(ns = ns, s = s, e = e, v = v, lvid = lvid, tab = keys[key],
                           K = sorted({pz.top_k for pz in readers.get(id(ns), ())})))
     i32 = lambda xs: torch.tensor(xs, dtype = torch.int32, device = dev)
+    spf = torch.stack(flows) if len({f.numel() for f in flows}) == 1 else None       # [ntab, M] (the kernels' M one)
     plan = layer.__dict__["_lr_top_k_leaf_plan"] = dict(
-        device = dev, nodes = nodes, tables = tables, flows = flows, index = {id(n["ns"]): t for t, n in enumerate(nodes)},
+        device = dev, nodes = nodes, tables = tables, index = {id(n["ns"]): t for t, n in enumerate(nodes)},
+        spf = spf, spf_aligned = spf is not None and bool((spf % 4 == 0).all()),
         nv_tab = i32([n["tab"] for n in nodes]), nv_lvid = i32([n["lvid"] for n in nodes]),
         nv_row0 = i32([n["s"] for n in nodes]), vars = torch.tensor([n["v"] for n in nodes], dtype = torch.long, device = dev),
         read = torch.tensor([len(n["K"]) > 0 for n in nodes], dtype = torch.bool, device = dev),
@@ -320,7 +322,6 @@ def leaf_backward(desc, layer, data, node_flows: torch.Tensor, kwargs: dict, log
     none = torch.empty(0, device = dev)
     counts = st["counts"] if st["counts"] is not None else none
     em = compute_param_flows and layer.param_flows is not None
-    fpT, fmT = (torch.zeros_like(st["tab"]), torch.zeros_like(st["tab"])) if em else (none, none)
     pm = kwargs.get("param_flows_mask") if em else None                 # (the samples the EM statistics take)
     # the tilt's gradients' dtau: where any is wanted; where the destinations fold, each sample's times its sign summed
     # into the row it read by the kernel -- a row's gradients then one product
@@ -338,13 +339,9 @@ def leaf_backward(desc, layer, data, node_flows: torch.Tensor, kwargs: dict, log
     dtau = mod.top_k_leaf_backward(st["tab"], plan["nv_tab"], st["tau"], st["emap"], st["ids"], st["lp"], plan["nv_lvid"],
                                    plan["nv_row0"], st["lz"], st["lb"], st["place"], node_flows, logspace_flows,
                                    st["wrow"], st["logw"], counts, st["S"], st["K"], glp if glp is not None else none,
-                                   fpT, fmT, none.bool() if pm is None else pm.contiguous(), gsgn, bool(graded), drow,
-                                   dsgn, Bd, st["ord"], st["rank"])
-    if em:                                                                              # (F+ then F- of each block's rows)
-        V = nodes[0]["ns"].dist.num_cats
-        for k, spf in enumerate(plan["flows"]):
-            mod.top_k_leaf_fold(fpT[k], spf, layer.param_flows, 0)
-            mod.top_k_leaf_fold(fmT[k], spf, layer.param_flows, V)
+                                   layer.param_flows if em else none, plan["spf"] if em else none.long(),
+                                   plan["spf_aligned"], none.bool() if pm is None else pm.contiguous(), gsgn,
+                                   bool(graded), drow, dsgn, Bd, st["ord"], st["rank"])
     if glp is not None and glp is not glp_out:
         glp_out += glp.to(glp_out.dtype)
     if graded:
