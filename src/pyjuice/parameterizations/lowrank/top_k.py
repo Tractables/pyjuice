@@ -365,7 +365,7 @@ def sum_backward(desc, layer, ns_tensors, ns_grad_tensors, node_flows, element_f
             counts = top_k_leaf_fused.counts_buffer(sib, desc.top_k, B) if rows.numel() > 0 else None
             ef, a_rows, flows = top_k_backward.terms(*tensors, theta, element_mars, geo, slot, rows, logw_rows, nf,
                                                      external_rows(kwargs), grads, gviews, fresh, want_flows, pm, counts,
-                                                     top_k_fused.prep_of(layer, ns_info.ns, B))
+                                                     top_k_fused.kept_of(layer, ns_info.ns, B))
             Fp, Fm = flows if want_flows else (None, None)
         else:
             f = _d(nf.t()).exp()
@@ -391,7 +391,7 @@ def sum_backward(desc, layer, ns_tensors, ns_grad_tensors, node_flows, element_f
                 desc._scatter_add(geo, param_flows, pf0, Fp.float())
                 if want_denom:
                     desc._scatter_add(geo, denom_param_flows, d0, _safe_div(Fm, theta).float())
-        if rows.numel() > 0 and not top_k_leaf_fused.add_counts(sib, desc.top_k, B, a_rows):
+        if rows.numel() > 0 and a_rows is not None and not top_k_leaf_fused.add_counts(sib, desc.top_k, B, a_rows):
             f = _d(nf.t()).exp() if f is None else f
             _leaf_terms(desc, sib, rows, logp, tilt, logw_rows, a_rows, f[rows], kwargs, glp, gviews, fresh, want_flows,
                         pm)

@@ -87,9 +87,15 @@ def _weights_operand(logw: torch.Tensor) -> torch.Tensor:
     return logw.float().contiguous()
 
 
-def forward(A, ops, node_mars: torch.Tensor, nid0: int) -> None:
-    """The values from the caller's `A [Bx, M, r]` and `prep`'s operands into `node_mars` from row `nid0` on."""
-    top_k_module().top_k_forward(_rows(A), *ops, node_mars, nid0)
+def forward(A, ops, node_mars, nid0: int, stash: bool = False, counts = None):
+    """The values from the caller's `A [Bx, M, r]` and `prep`'s operands into `node_mars` from row `nid0` on (None: no
+    values). With `stash`, what a backward takes from the sums, returned (`top_k_forward`'s notes; the node flows are
+    not in it: `top_k_backward.terms` puts them in) -- the masked samples' posterior of the slots into `counts` where
+    given (their leaf's buffer: `top_k_leaf_fused.counts_buffer`)."""
+    none = _empty(A.device, torch.float32)
+    got = top_k_module().top_k_forward(_rows(A), *ops, none if node_mars is None else node_mars, nid0, stash,
+                                       none if counts is None else counts)
+    return got if stash else None
 
 
 def sum_forward(desc, layer, ns_info, tensors, geo, params, element_mars, node_mars, sib, kwargs) -> bool:
@@ -97,6 +103,7 @@ def sum_forward(desc, layer, ns_info, tensors, geo, params, element_mars, node_m
     where they do not serve (the reference then). Samples reading the same row of tensors (`external_params_rows`)
     share its tile."""
     from .top_k import slot_parts, external_rows
+    from . import top_k_backward, top_k_leaf_fused
     B = node_mars.size(1)
     emap = external_rows(kwargs)
     A, Bm, G = tensors
@@ -106,16 +113,21 @@ def sum_forward(desc, layer, ns_info, tensors, geo, params, element_mars, node_m
     slot, rows_m, logw_m, _, _ = slot_parts(desc, sib, B, kwargs, node_mars.device)
     theta = desc._dense_params(geo, params, dtype = torch.float32)
     ops = prep(Bm, G, element_mars, geo["eid"], None if geo["full"] else geo["has"], theta, slot, rows_m, logw_m, emap)
-    forward(A, ops, node_mars, ns_info.nid_start)
-    if kwargs.get("_grad_enabled", False):
-        # (a backward may follow: the operands kept for it -- `top_k_backward.terms` takes them, `prep_of`)
-        layer.__dict__["_lr_state"][("prep", id(ns_info.ns))] = (B, ops)
+    # (a backward may follow -- the call had grad on -- and its kernels serve: the operands and the sums' stash kept
+    # for it, which `top_k_backward.terms` takes: `kept_of`)
+    keep = kwargs.get("_grad_enabled", False) and \
+        top_k_backward.serves(desc, geo["M"], geo["N"], A.size(2), B, node_mars.device, kwargs, False)
+    counts = top_k_leaf_fused.counts_buffer(sib, desc.top_k, B) if keep and rows_m.numel() > 0 else None
+    stash = forward(A, ops, node_mars, ns_info.nid_start, keep, counts)
+    if keep:
+        layer.__dict__["_lr_state"][("kept", id(ns_info.ns))] = (B, ops, stash)
     return True
 
 
-def prep_of(layer, ns, B: int):
-    """The forward's operands of the node vector (`prep`'s, kept where a backward may follow: `sum_forward`), taken --
-    a backward uses them once, a second one makes its own --; None where the forward kept none, or for another batch."""
+def kept_of(layer, ns, B: int):
+    """`(ops, stash)`: the forward's operands of the node vector (`prep`'s) and its sums' stash (`forward`'s), kept
+    where a backward may follow (`sum_forward`), taken -- a backward uses them once (the flows go into the stash), a
+    second one makes its own --; None where the forward kept none, or for another batch."""
     st = layer.__dict__.get("_lr_state")
-    got = st.pop(("prep", id(ns)), None) if isinstance(st, dict) else None
-    return got[1] if got is not None and got[0] == B else None
+    got = st.pop(("kept", id(ns)), None) if isinstance(st, dict) else None
+    return got[1:] if got is not None and got[0] == B else None

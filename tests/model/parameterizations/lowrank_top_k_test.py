@@ -522,6 +522,48 @@ def test_the_backward_kernels_are_the_reference():
         assert _rel(a, r_) < 5e-3, (k, _rel(a, r_))
 
 
+@pytest.mark.parametrize("keep", [False, True])
+def test_the_backward_kernels_give_a_sample_its_own_gradients_through_the_map(keep):
+    """The kernels' backward with a map of rows and a gradient a SAMPLE (no fold: a sample a work item, whatever the
+    items of the forward whose sums' stash it takes -- `keep`: the forward ran with grad on and kept it, else the
+    backward makes its own) against the torch passes: every gradient and the EM statistics."""
+    import pyjuice.parameterizations.lowrank.top_k_fused as tkf
+    import pyjuice.parameterizations.lowrank.top_k_backward as tkb
+    if tkf.top_k_module() is None or tkb.triton is None:
+        pytest.skip("the CUDA module did not build, or no Triton")
+    T, N, C, K, r, re, V2 = 3, 128, 70, 64, 20, 8, 80
+    pc, _, _ = _hmm_pc(T, N, K, r, re, _tables(N, 33, V2), V2)
+    ext = _batch(4, T, N, C, K, r, re, 34, V = V2)[0]
+    rows = torch.tensor([3, 0, 0, 2, 1, 3, 0], device = DEV)                  # (rows read by one, two and three samples)
+    _, ids, lp, x, miss = _batch(rows.numel(), T, N, C, K, r, re, 35, V = V2)
+    pext, evi = _pc_ext(ext, T, N), dict(categorical_evidence_logp = lp.float(), soft_evidence_cat_ids = ids)
+    ran, real_terms = [], tkb.terms
+    tkb.terms = lambda *a, **k: (ran.append(k.get("kept", a[-1]) is not None), real_terms(*a, **k))[1]
+
+    def run():
+        g = {k_: tuple(torch.zeros(rows.numel(), *t.shape[1:], device = DEV) for t in v) for k_, v in pext.items()}
+        pc.init_param_flows(flows_memory = 0.0)
+        with torch.set_grad_enabled(keep):
+            pc(x, missing_mask = miss, external_params = pext, external_params_rows = rows, **evi)
+        pc.backward(x, missing_mask = miss, compute_param_flows = True, flows_memory = 1.0, logspace_flows = True,
+                    allow_modify_flows = False, external_params_grad = g, **evi)
+        return [t for v in g.values() for t in v] + [pc.param_flows.clone(), pc.denom_param_flows.clone(),
+                                                     pc.input_layer_group[0].param_flows.clone()]
+
+    try:
+        tkf.TOP_K_FUSED = False
+        ref = run()
+        tkf.TOP_K_FUSED = True
+        got = run()
+    finally:
+        tkf.TOP_K_FUSED = True
+        tkb.terms = real_terms
+    assert ran == [keep] * (T - 1), ran                                      # (the kernels; the stash kept or made)
+    assert len(got) == len(ref)
+    for k, (a, r_) in enumerate(zip(got, ref)):
+        assert _rel(a, r_) < 5e-3, (k, _rel(a, r_))
+
+
 # ---------------------------------------------------------------------------------------------- param_flows_mask
 
 def _mask_case(kernels):

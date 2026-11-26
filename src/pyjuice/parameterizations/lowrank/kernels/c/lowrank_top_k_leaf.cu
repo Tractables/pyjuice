@@ -12,7 +12,8 @@
 //                     sum's K slots one by one, the rest summed)
 //   tk_leaf_backward  the same tiles: the evidence's gradient (summed over the nodes, into the caller's) and the tilt's
 //                     (dtau [S, M] a sample: d / d tau) from the node flows (an observed token) or the sum's posterior
-//                     counts of its slots (a missing token a sum reads); and the EM statistics (F+, F-) into transposed
+//                     counts of its slots (a missing token a sum reads: the slots' posterior a node, K + 1 of them, then
+//                     the node's flow -- their product the counts); and the EM statistics (F+, F-) into transposed
 //                     buffers [V, M] a block of parameters (`red.v4`: a lane's 4 nodes one atomic), F+ the posterior
 //                     counts (the observed token's flow, a sum's counts, or f P where no one reads a missing token),
 //                     F- f P
@@ -257,7 +258,8 @@ struct BwArgs {
     const float* lz; const float* lb; const int* place;          // the forward's
     const float* flows; int logspace;                            // node flows [rows][B]
     const int* wrow; const float* logw; int lws; const float* acnt; int acs;   // a missing token a sum reads: its row of the slots'
-                                                                 // log-weights and posterior counts [R][M][K + 1]
+                                                                 // log-weights [R][M][K + 1] and of the sum's posterior
+                                                                 // [R][M][K + 2]: the slots', then the node's flow
     float* glp;                                                  // [B][nvars][C] (added into; null: not wanted)
     float* dtau;                                                 // [T][B][S][M] written, or (drow) [T][Bd][S][M] added
                                                                  // into: a sample's times dsgn into row drow; null: none
@@ -380,9 +382,8 @@ __global__ void __launch_bounds__(NW * 32) tk_leaf_backward_kernel(const BwArgs 
                 const float* lw = a.logw + ((long)r[m] * g.M + i0) * a.lws;
 #pragma unroll
                 for (int j = 0; j < 4; ++j) {
-                    float f = 0.f;
-                    for (int s = 0; s <= g.K; ++s) f += ac[m][j * a.acs + s];
-                    const float pr = ex2(lw[j * a.lws + g.K] * LOG2E), aK = ac[m][j * a.acs + g.K];
+                    const float f = ac[m][j * a.acs + g.K + 1];
+                    const float pr = ex2(lw[j * a.lws + g.K] * LOG2E), aK = f * ac[m][j * a.acs + g.K];
                     fo[m][j] = 0.f;
                     fm[m][j] = f;
                     cp[m][j] = pr > 0.f ? aK / pr : 0.f;
@@ -451,7 +452,7 @@ __global__ void __launch_bounds__(NW * 32) tk_leaf_backward_kernel(const BwArgs 
                         float dl[4];
 #pragma unroll
                         for (int j = 0; j < 4; ++j) {
-                            const float d = miss[m] ? (c < g.K && !alone[m] ? ac[m][j * a.acs + c] : 0.f)
+                            const float d = miss[m] ? (c < g.K && !alone[m] ? fm[m][j] * ac[m][j * a.acs + c] : 0.f)
                                                     : (c == p[m] ? fo[m][j] : 0.f);
                             dl[j] = P[j] * (c < g.K ? gH[m][j] : gB[m][j]) + d;
                             if (em[m] && miss[m]) fpS[j] += alone[m] ? cp[m][j] * P[j] : (c < g.K ? d : cp[m][j] * P[j]);
@@ -753,8 +754,8 @@ torch::Tensor top_k_leaf_backward(torch::Tensor tab, torch::Tensor nv_tab, torch
     a.wrow = nullptr; a.logw = nullptr; a.lws = 0; a.acnt = nullptr; a.acs = 0;
     if (acnt.numel() > 0) {
         check(wrow, at::kInt, "wrow"); check(logw, at::kFloat, "logw"); check(acnt, at::kFloat, "acnt");
-        TORCH_CHECK(acnt.size(0) == logw.size(0) && acnt.size(1) == logw.size(1) && acnt.size(2) >= K + 1 &&
-                    logw.size(2) >= K + 1, "top_k leaf: acnt, logw [R, M, >= K + 1]");
+        TORCH_CHECK(acnt.size(0) == logw.size(0) && acnt.size(1) == logw.size(1) && acnt.size(2) >= K + 2 &&
+                    logw.size(2) >= K + 1, "top_k leaf: acnt [R, M, >= K + 2], logw [R, M, >= K + 1]");
         a.wrow = wrow.data_ptr<int>(); a.logw = logw.data_ptr<float>(); a.acnt = acnt.data_ptr<float>();
         a.lws = (int)logw.size(2);
         a.acs = (int)acnt.size(2);

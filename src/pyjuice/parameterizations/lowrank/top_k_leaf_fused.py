@@ -7,7 +7,8 @@
   by every forward: nothing tells a changed parameter), each node's normalizer over its candidates, the observed
   tokens' values, and where the token is missing and a sum reads it, the slots' log-weights that sum takes in its
   forward and its backward (`slot_rows`) -- the forward's state, kept on the layer for the passes that follow;
-* a reading sum's backward hands the leaf its posterior counts of those slots (`add_counts`);
+* a reading sum hands the leaf its posterior counts of those slots (`counts_buffer`: the slots' posterior a node and
+  the node's flow, which its kernels write; `add_counts`);
 * the backward (`leaf_backward`): the evidence's gradient (summed over the nodes) and the tilt's, every sample, and the
   parameters' EM statistics (`compute_param_flows`): F+ and F- into transposed buffers a block of parameters, then
   added into the layer's flows.
@@ -178,16 +179,16 @@ def slot_rows(sib: dict, K: int, batch_size: int):
     return st["slot"][t], st["rows"][o0:o1], st["logw"][o0:o1, :, :K + 1]       # (its rows 72 wide: slots 0 .. K)
 
 
-#: The counts' rows as the sums' backward kernels write them (`SA` of `kernels/c/lowrank_top_k.cu`: K + 1 padded)
+#: The counts' rows as the sums' kernels write them (`SA` of `kernels/c/lowrank_top_k.cu`: K + 2 padded)
 COUNTS_STRIDE = 72
 
 
 def counts_buffer(sib: dict, K: int, batch_size: int):
     """The leaf's buffer `[b, M, COUNTS_STRIDE]` of a reading sum's posterior counts at its missing tokens (the rows
-    `slot_rows` named) -- the sum's backward kernels write them there --, or None where its layer has no forward state
-    or K is past the stride."""
+    `slot_rows` named), which the sum's kernels write: a node's row the posterior of its K + 1 slots, then its flow
+    (their product the counts) -- or None where its layer has no forward state or K is past the stride."""
     st = _state(sib["layer"], batch_size)
-    if st is None or st["K"] != K or K + 1 > COUNTS_STRIDE:
+    if st is None or st["K"] != K or K + 2 > COUNTS_STRIDE:
         return None
     t = _plan(sib["layer"])["index"][id(sib["ns"])]
     return _counts(st)[st["offs"][t]:st["offs"][t + 1]]
@@ -195,22 +196,25 @@ def counts_buffer(sib: dict, K: int, batch_size: int):
 
 def _counts(st: dict) -> torch.Tensor:
     if st["counts"] is None:                                       # (zeros: a row no sum writes reads none)
-        R, M, S1 = st["logw"].shape
-        st["counts"] = torch.zeros(R, M, max(S1, COUNTS_STRIDE), dtype = st["logw"].dtype, device = st["logw"].device)
+        R, M, _ = st["logw"].shape
+        st["counts"] = torch.zeros(R, M, max(st["K"] + 2, COUNTS_STRIDE), dtype = st["logw"].dtype,
+                                   device = st["logw"].device)
     return st["counts"]
 
 
 def add_counts(sib: dict, K: int, batch_size: int, a_rows: torch.Tensor) -> bool:
     """A reading sum's posterior counts of its slots `a_rows [b, M, K + 1]` at the leaf's missing tokens (the rows
-    `slot_rows` named), for the leaf's backward -- nothing to do where they are already its buffer's
-    (`counts_buffer`); False where its layer has no forward state (`top_k._leaf_terms` then)."""
+    `slot_rows` named), for the leaf's backward, into its buffer as that holds them (`counts_buffer`); False where
+    its layer has no forward state (`top_k._leaf_terms` then)."""
     st = _state(sib["layer"], batch_size)
     if st is None or st["K"] != K:
         return False
     t = _plan(sib["layer"])["index"][id(sib["ns"])]
     dst = _counts(st)[st["offs"][t]:st["offs"][t + 1]]
-    if dst.numel() > 0 and a_rows.data_ptr() != dst.data_ptr():
-        dst[:, :, :a_rows.size(2)] = a_rows
+    if dst.numel() > 0:
+        f = a_rows.sum(dim = 2, keepdim = True)                    # (a node's flow; its slots' posterior)
+        dst[:, :, :K + 1] = torch.where(f > 0, a_rows / f, torch.zeros_like(a_rows))
+        dst[:, :, K + 1] = f[:, :, 0]
     return True
 
 

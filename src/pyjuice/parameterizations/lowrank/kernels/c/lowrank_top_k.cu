@@ -54,10 +54,13 @@
 //     ef[j] = ev[j] sum_i W[i, j] X[i, j]               the element flows
 //     dG[s, j] = E[s, j] sum_i (alpha[i, s] ev[j] - beta[i, s]) W[i, j],      dA = Gl B^T,      dB = A^T Gl
 //
-// is three passes over the same work items, each a persistent launch a kind of item:
+// takes from the forward's sums a STASH (`tk_sk_kernel`'s STASH ending: the forward's own launch where a backward may
+// follow, else that launch again without the values): the slots' posterior pi (for the leaf beside the sum), pi / U,
+// pi / Z, the partners' 1 / u, 1 / z, the shift h of W a sample (the tile's running maximum) -- no node flows in it,
+// which are a factor a node's row: the flows kernel (`tk_flows_kernel`) puts them into the [B, M] terms, the passes
+// multiply a masked sample's terms by its nodes'. Then two passes over the same work items, each a persistent launch
+// a kind of item:
 //
-//  * ROWS (`tk_sk_kernel`'s COUNTS ending): the forward's sums (Z, U, the partners' z, u) -> a, alpha, beta, the
-//    shift h of W a sample (the tile's running maximum); the counts a for the leaf beside the sum.
 //  * dA (`tk_bw_da_kernel`, the forward's tiling: 128 nodes x an item, the children in chunks of 64): W, X, Y by MMAs
 //    (alpha's and beta's fragments the A operand, kept by the warp), Gl summed over the item's samples, each times its
 //    sign (the samples of a row of tensors share its gradients: `external_params_rows`' fold), dA += Gl B^T (Gl's
@@ -295,16 +298,10 @@ struct TkArgs {
     const int4* mitems; const int4* oitems; const int* noitems; const int* slot32; const float* logw;
     float* out; float* ws; int* flags;
     long nid0, ostride, sA; int r, M, N, S, Rm;                    // sA: A's batch stride (its rows contiguous)
-    // the backward's rows pass (COUNTS): the node flows' log-space rows f [M][fld] (the circuit's buffer, a sample a
-    // column); out alpha, beta, the counts [Rm, M, SA] (a masked sample's), ao, bo [B, M] (an observed one's), W's
-    // shift h [B, M] (every sample's)
-    const float* f; long fld; float* alpha; float* beta; float* acnt; float* ao; float* bo; float* hrow;
+    // the STASH ending's (what a backward takes from the forward's sums; `out` may be null then: no values): alpha,
+    // beta, the slots' posterior [Rm, M, SA] (a masked sample's), ao, bo [B, M], W's shift h [B, M] (every sample's)
+    float* alpha; float* beta; float* acnt; float* ao; float* bo; float* hrow;
 };
-
-// a node's flow in sample b: its log-space row's entry, exponentiated
-__device__ __forceinline__ float node_flow(const TkArgs& a, int b, int node) {
-    return __expf(__ldg(a.f + (long)node * a.fld + b));
-}
 
 // the masked item y's sums over its tile x's chunks c0 .. c1 - 1
 template <int NK>
@@ -601,9 +598,12 @@ __device__ __forceinline__ void observed_values(const OState& St, const TkArgs& 
     }
 }
 
-// The rows pass's ending (COUNTS) of a masked item y's tile x: the slots' counts a = f w (U / Z) / sum_s w (U / Z), alpha
-// = a / U, beta = a / Z (the masked sample's); a partner's a = f where u / z > 0, its alpha, beta; W's shift h.
-__device__ __forceinline__ void masked_counts(const MState& St, const TkArgs& a, int y, int x) {
+// The STASH ending of a masked item y's tile x -- what the backward takes from the forward's sums, the node flows not
+// in it (they scale a node's row: `tk_flows_kernel`, the backward's kernels): the slots' posterior pi = w (U / Z) /
+// sum_s w (U / Z), alpha = pi / U, beta = pi / Z (the masked sample's rows; the slot after the rest's: 1 where the node
+// has mass, the place of its flow), its ao 1 where the node has mass (its flow's place too); a partner's ao = 1 / u,
+// bo = 1 / z where u / z > 0; W's shift h.
+__device__ __forceinline__ void masked_stash(const MState& St, const TkArgs& a, int y, int x) {
     const int4 item = a.mitems[y];
     const int b = item.x, o1 = item.z, o2 = item.w;
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, g = lane >> 2, t = lane & 3;
@@ -625,7 +625,7 @@ __device__ __forceinline__ void masked_counts(const MState& St, const TkArgs& a,
     const float wr0 = __expf(__ldg(lw0 - 2 * t + 8 * NS8)) * ratio(ur0, zr0);
     const float wr1 = __expf(__ldg(lw1 - 2 * t + 8 * NS8)) * ratio(ur1, zr1);
     R0 += wr0; R1 += wr1;
-    const float c0 = sdiv(node_flow(a, b, node0), R0), c1 = sdiv(node_flow(a, b, node1), R1);
+    const float c0 = sdiv(1.f, R0), c1 = sdiv(1.f, R1);
     const long q0 = ((long)y * M + node0) * SA + 2 * t, q1 = q0 + 8L * SA;
     #pragma unroll
     for (int sn = 0; sn < NS8; ++sn) {
@@ -651,17 +651,21 @@ __device__ __forceinline__ void masked_counts(const MState& St, const TkArgs& a,
         for (int h = 0; h < 2; ++h) { pz[k][h] = quad_sum(St.pz[k][h]); pu[k][h] = quad_sum(St.pu[k][h]); }
     if (t == 0) {
         const long r0 = q0 - 2 * t + 8 * NS8, r1 = q1 - 2 * t + 8 * NS8;          // (the rest slot)
+        const float l0 = R0 > 0.f ? 1.f : 0.f, l1 = R1 > 0.f ? 1.f : 0.f;         // (the node has mass)
         a.acnt[r0] = wr0 * c0; a.acnt[r1] = wr1 * c1;
+        a.acnt[r0 + 1] = l0; a.acnt[r1 + 1] = l1;
         a.alpha[r0] = sdiv(wr0 * c0, ur0); a.alpha[r1] = sdiv(wr1 * c1, ur1);
         a.beta[r0] = sdiv(wr0 * c0, zr0); a.beta[r1] = sdiv(wr1 * c1, zr1);
         const float h0 = St.m0 == NEG ? 0.f : St.m0, h1 = St.m1 == NEG ? 0.f : St.m1;
         a.hrow[(long)b * M + node0] = h0; a.hrow[(long)b * M + node1] = h1;
+        a.ao[(long)b * M + node0] = l0; a.ao[(long)b * M + node1] = l1;
+        a.bo[(long)b * M + node0] = 0.f; a.bo[(long)b * M + node1] = 0.f;
         #pragma unroll
         for (int k = 0; k < 2; ++k) {
             const int o = k == 0 ? o1 : o2;
             if (o < 0) continue;
-            const float f0 = ratio(pu[k][0], pz[k][0]) > 0.f ? node_flow(a, o, node0) : 0.f;
-            const float f1 = ratio(pu[k][1], pz[k][1]) > 0.f ? node_flow(a, o, node1) : 0.f;
+            const float f0 = ratio(pu[k][0], pz[k][0]) > 0.f ? 1.f : 0.f;
+            const float f1 = ratio(pu[k][1], pz[k][1]) > 0.f ? 1.f : 0.f;
             a.ao[(long)o * M + node0] = sdiv(f0, pu[k][0]); a.ao[(long)o * M + node1] = sdiv(f1, pu[k][1]);
             a.bo[(long)o * M + node0] = sdiv(f0, pz[k][0]); a.bo[(long)o * M + node1] = sdiv(f1, pz[k][1]);
             a.hrow[(long)o * M + node0] = h0; a.hrow[(long)o * M + node1] = h1;
@@ -669,8 +673,8 @@ __device__ __forceinline__ void masked_counts(const MState& St, const TkArgs& a,
     }
 }
 
-// ... of an observed item y's tile x: each sample's a = f where u / z > 0, alpha = a / u, beta = a / z, W's shift
-__device__ __forceinline__ void observed_counts(const OState& St, const TkArgs& a, int y, int x) {
+// ... of an observed item y's tile x: each sample's ao = 1 / u, bo = 1 / z where u / z > 0, W's shift
+__device__ __forceinline__ void observed_stash(const OState& St, const TkArgs& a, int y, int x) {
     const int4 sa = a.oitems[2 * y], sb = a.oitems[2 * y + 1];
     const int rk[2][2] = {{sa.y, sa.z}, {sb.y, sb.z}};
     const bool two = sb.x >= 0;
@@ -693,8 +697,8 @@ __device__ __forceinline__ void observed_counts(const OState& St, const TkArgs& 
             const float z1 = quad_sum(z_of_0 ? St.zs[k][0][1] : St.zs[k][j][1]);
             const float u0 = quad_sum(St.us[k][j][0]), u1 = quad_sum(St.us[k][j][1]);
             if (t == 0 && row >= 0 && (k == 0 || two)) {
-                const float f0 = sdiv(u0, z0) > 0.f ? node_flow(a, row, node0) : 0.f;
-                const float f1 = sdiv(u1, z1) > 0.f ? node_flow(a, row, node1) : 0.f;
+                const float f0 = sdiv(u0, z0) > 0.f ? 1.f : 0.f;
+                const float f1 = sdiv(u1, z1) > 0.f ? 1.f : 0.f;
                 a.ao[(long)row * M + node0] = sdiv(f0, u0); a.ao[(long)row * M + node1] = sdiv(f1, u1);
                 a.bo[(long)row * M + node0] = sdiv(f0, z0); a.bo[(long)row * M + node1] = sdiv(f1, z1);
                 a.hrow[(long)row * M + node0] = St.m[k][0] == NEG ? 0.f : St.m[k][0];
@@ -807,7 +811,7 @@ __device__ __forceinline__ void fold_in(OState& S, const TkArgs& a, int kp) {
     S.m[0][0] = nm0; S.m[0][1] = nm1; S.m[1][0] = nm2; S.m[1][1] = nm3;
 }
 
-template <int NK, bool MASKED, bool COUNTS>
+template <int NK, bool MASKED, bool STASH>
 __global__ void __launch_bounds__(NW * 32, 1) tk_sk_kernel(const TkArgs a) {
     extern __shared__ __align__(128) unsigned char smem[];
     using St = typename std::conditional<MASKED, MState, OState>::type;
@@ -862,8 +866,13 @@ __global__ void __launch_bounds__(NW * 32, 1) tk_sk_kernel(const TkArgs a) {
                 fold_in(S, a, kp);
                 if (s0 <= tt * nch) break;                                   // (the tile's first part)
             }
-        if constexpr (MASKED) { if constexpr (COUNTS) masked_counts(S, a, item, x); else masked_values(S, a, item, x); }
-        else { if constexpr (COUNTS) observed_counts(S, a, item, x); else observed_values(S, a, item, x); }
+        if constexpr (MASKED) {
+            if (a.out != nullptr) masked_values(S, a, item, x);
+            if constexpr (STASH) masked_stash(S, a, item, x);
+        } else {
+            if (a.out != nullptr) observed_values(S, a, item, x);
+            if constexpr (STASH) observed_stash(S, a, item, x);
+        }
     }
 }
 
@@ -1030,7 +1039,7 @@ __global__ void __launch_bounds__(1024) tk_items_kernel(
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
-// The backward's dA and cols passes (the rows pass is `tk_sk_kernel`'s COUNTS ending): see the notes at the top.
+// The backward's dA and cols passes (their operands' stash is `tk_sk_kernel`'s STASH ending): see the notes at the top.
 
 struct BwArgs {                         // the dA and cols passes' (see `top_k_bw_grads`)
     const __half* AH;                    // [Bx, M, KP] fp16(log2 e A), the ranks zero-padded (the cols' staged chunks)
@@ -1039,8 +1048,9 @@ struct BwArgs {                         // the dA and cols passes' (see `top_k_b
     const float* ev;                     // [B, N] the children's values over their largest (the prep's)
     const uint2* LTc;                    // l2t in the cols kernel's fragment order
     const int4* mitems; const int4* oitems; const int* noitems; const int* slot32;   // the prep's work items
-    const float* alpha; const float* beta;   // [Rm, M, SA] a masked sample's (the rows pass's; slots 0 .. 63 TF32)
-    const float* ao; const float* bo;        // [B, M] an observed sample's
+    const float* alpha; const float* beta;   // [Rm, M, SA] a masked sample's, its node flows not in them (the stash's;
+                                             // slots 0 .. 63 TF32)
+    const float* ao; const float* bo;        // [B, M] an observed sample's; ao of a masked one: its node flows
     const float* hrow;                       // [B, M] W's shift (log2 units) a sample
     const int* drow; const float* sgn;       // [B] the row of the destinations a sample's gradients go to, its sign
     float* EF;                               // [B, N] the element flows (added into)
@@ -1155,6 +1165,9 @@ __device__ __forceinline__ void da_segment(const BwArgs& a, int y, int x, int c0
         br0 = __ldg(be0 + 8 * NS8); br1 = __ldg(be0 + 8 * SA + 8 * NS8);
     }
     const float h0 = a.hrow[(long)hb * M + node0], h1 = a.hrow[(long)hb * M + node1];
+    // (the masked sample's terms: its nodes' flows -- not in alpha, beta -- times its sign)
+    const float smf0 = MASKED ? sm * a.ao[(long)bm * M + node0] : 0.f;
+    const float smf1 = MASKED ? sm * a.ao[(long)bm * M + node1] : 0.f;
     float aop[2][2], bop[2][2];
     #pragma unroll
     for (int p = 0; p < 2; ++p) {
@@ -1217,7 +1230,7 @@ __device__ __forceinline__ void da_segment(const BwArgs& a, int y, int x, int c0
                     const float ys[4] = {Y[0] + er.x * br0, Y[1] + er.y * br0, Y[2] + er.x * br1, Y[3] + er.y * br1};
                     const float ev4[4] = {evm.x, evm.y, evm.x, evm.y};
                     #pragma unroll
-                    for (int c = 0; c < 4; ++c) gs[q][c] = sm * W[q][c] * (ev4[c] * xs[c] - ys[c]);
+                    for (int c = 0; c < 4; ++c) gs[q][c] = (c < 2 ? smf0 : smf1) * W[q][c] * (ev4[c] * xs[c] - ys[c]);
                 }
                 #pragma unroll
                 for (int pp = 0; pp < 2; ++pp) {
@@ -1276,11 +1289,13 @@ __global__ void __launch_bounds__(NW * 32, 1) tk_bw_da_kernel(const BwArgs a) {
 // --- cols
 
 template <int NK, bool MASKED>
-struct ColsGeo {   // a stage: A' chunk [CM][AR] fp16, alpha, beta chunks [CM][SA] (masked), h, ao/bo of 2 samples [5][CM]
+struct ColsGeo {   // a stage: A' chunk [CM][AR] fp16, alpha, beta chunks [CM][SA] (masked), h, ao/bo of 2 samples [5][CM],
+                   // the masked sample's node flows [CM]
     static constexpr int KP = 16 * NK, AR = KP + 8;
     static constexpr int A_BYTES = CM * AR * 2;
     static constexpr int AB_BYTES = MASKED ? CM * SA * 4 : 0;
-    static constexpr int V_BYTES = 5 * CM * 4;
+    static constexpr int NV = MASKED ? 6 : 5;
+    static constexpr int V_BYTES = NV * CM * 4;
     static constexpr int STAGE = A_BYTES + 2 * AB_BYTES + V_BYTES;
     // the dB^T and dG^T transposes, a buffer a warp: a row a rank, and (masked) a slot -- 64 of them whatever the ranks
     static constexpr int EROWS = MASKED && KP < 64 ? 64 : KP;
@@ -1309,7 +1324,7 @@ __device__ __forceinline__ void cols_segment(const BwArgs& a, int y, int x, int 
     const int j0 = jw + g, j1 = j0 + 8;                                      // the thread's (rows of W^T)
 
     constexpr int NA = CM * (KP / 8), NAB = MASKED ? CM * (SA / 4) : 0, NV = CM / 4;
-    constexpr int NSEG = NA + 2 * NAB + 5 * NV;
+    constexpr int NSEG = NA + 2 * NAB + G::NV * NV;
     auto load_seg = [&](int qq, int st, int i0) {
         const unsigned bs = smem_u32(smem + st * G::STAGE);
         if (qq < NA) {
@@ -1320,9 +1335,11 @@ __device__ __forceinline__ void cols_segment(const BwArgs& a, int y, int x, int 
             const float* src = (k2 == 0 ? a.alpha : a.beta) + ((long)y * M + i0 + row) * SA + s * 4;
             cp16(bs + G::A_BYTES + k2 * G::AB_BYTES + (row * SA + s * 4) * 4, src);
         } else {
-            const int v = (qq - NA - 2 * NAB) / NV, s = (qq - NA - 2 * NAB) % NV;   // h, ao 0, bo 0, ao 1, bo 1
+            // h, ao 0, bo 0, ao 1, bo 1, the masked sample's flows
+            const int v = (qq - NA - 2 * NAB) / NV, s = (qq - NA - 2 * NAB) % NV;
             const float* src;
             if (v == 0) src = a.hrow + (long)hb * M;
+            else if (v == 5) src = a.ao + (long)bm * M;
             else {
                 const int op = v < 3 ? o[0] : o[1];                          // (selects: a run-time index would
                 if (op < 0) return;                                          // keep o on the stack)
@@ -1439,7 +1456,7 @@ __device__ __forceinline__ void cols_segment(const BwArgs& a, int y, int x, int 
         #pragma unroll
         for (int nt = 0; nt < 4; ++nt) {
             const int i0 = nt * 8 + 2 * t;
-            float gs[4] = {0.f, 0.f, 0.f, 0.f};
+            float gs[4] = {0.f, 0.f, 0.f, 0.f}, wf[4] = {0.f, 0.f, 0.f, 0.f};
             if constexpr (MASKED) {
                 float X[4] = {0.f, 0.f, 0.f, 0.f}, Y[4] = {0.f, 0.f, 0.f, 0.f};
                 #pragma unroll
@@ -1454,9 +1471,12 @@ __device__ __forceinline__ void cols_segment(const BwArgs& a, int y, int x, int 
                 const float arx[2] = {Als[i0 * SA + 8 * NS8], Als[(i0 + 1) * SA + 8 * NS8]};
                 float brx[2] = {0.f, 0.f};
                 if constexpr (GRADS) { brx[0] = Bes[i0 * SA + 8 * NS8]; brx[1] = Bes[(i0 + 1) * SA + 8 * NS8]; }
+                // (the masked sample's terms, each linear in W: W times its nodes' flows -- not in alpha, beta)
+                const float2 fn = *reinterpret_cast<const float2*>(Vs + 5 * CM + i0);
+                wf[0] = W[nt][0] * fn.x; wf[1] = W[nt][1] * fn.y; wf[2] = W[nt][2] * fn.x; wf[3] = W[nt][3] * fn.y;
                 #pragma unroll
                 for (int c = 0; c < 4; ++c) {
-                    const float w = W[nt][c];
+                    const float w = wf[c];
                     const float erj = c < 2 ? er0 : er1, evj = c < 2 ? evm0 : evm1;
                     const float xx = X[c] + erj * arx[c & 1];
                     const float wev = w * evj, qv = wev * xx;
@@ -1511,10 +1531,10 @@ __device__ __forceinline__ void cols_segment(const BwArgs& a, int y, int x, int 
                 }
                 if constexpr (MASKED) {
                     // dG^T [16 children x 64 slots] += (W ev)^T alpha - W^T beta (alpha, beta: nodes 2t, 2t + 1, slot g)
-                    const unsigned v0 = to_tf32(W[nt][0] * evm0), v1 = to_tf32(W[nt][2] * evm1);
-                    const unsigned v2 = to_tf32(W[nt][1] * evm0), v3 = to_tf32(W[nt][3] * evm1);
-                    const unsigned n0 = to_tf32(-W[nt][0]), n1 = to_tf32(-W[nt][2]);
-                    const unsigned n2 = to_tf32(-W[nt][1]), n3 = to_tf32(-W[nt][3]);
+                    const unsigned v0 = to_tf32(wf[0] * evm0), v1 = to_tf32(wf[2] * evm1);
+                    const unsigned v2 = to_tf32(wf[1] * evm0), v3 = to_tf32(wf[3] * evm1);
+                    const unsigned n0 = to_tf32(-wf[0]), n1 = to_tf32(-wf[2]);
+                    const unsigned n2 = to_tf32(-wf[1]), n3 = to_tf32(-wf[3]);
                     #pragma unroll
                     for (int sn = 0; sn < NS8; ++sn) {
                         const int s = sn * 8 + g;
@@ -1794,6 +1814,27 @@ __global__ void tk_bw_ltc_kernel(const __half* __restrict__ L2T, uint2* __restri
     }
 }
 
+// The node flows into the stash, in place (the backward's first step; blockIdx.y the task, blockIdx.x grid-stride): f
+// = exp of the log-space rows nf [M][fld] (the circuit's buffer, a sample a column) -- task 0: each sample's ao, bo [B,
+// M] times f where they are > 0 (an observed sample's alpha, beta; a masked one's ao: its flow where the node has
+// mass); task 1 (acnt given: the leaf's buffer): a masked row's flow into the slot after its posterior's, where the
+// stash left 1.
+__global__ void tk_flows_kernel(const float* __restrict__ nf, long fld, float* __restrict__ ao, float* __restrict__ bo,
+                                const long* __restrict__ rows, float* __restrict__ acnt, int B, int M, int Rm) {
+    const long n = blockIdx.y == 0 ? (long)B * M : (long)Rm * M;
+    for (long q = (long)blockIdx.x * blockDim.x + threadIdx.x; q < n; q += (long)gridDim.x * blockDim.x) {
+        const int i = (int)(q % M), y = (int)(q / M);
+        if (blockIdx.y == 0) {
+            const float f = __expf(nf[(long)i * fld + y]), x = ao[q], z = bo[q];
+            ao[q] = x > 0.f ? x * f : 0.f;
+            bo[q] = z > 0.f ? z * f : 0.f;
+        } else {
+            float* c = acnt + q * SA + 8 * NS8 + 1;
+            *c = *c > 0.f ? __expf(nf[(long)i * fld + rows[y]]) : 0.f;
+        }
+    }
+}
+
 void check(const torch::Tensor& x, at::ScalarType dt, const char* name) {
     TORCH_CHECK(x.is_cuda() && x.is_contiguous() && x.scalar_type() == dt, "top_k: ", name,
                 " must be a contiguous CUDA tensor of ", dt);
@@ -1922,8 +1963,8 @@ std::vector<torch::Tensor> top_k_prep(torch::Tensor Bm, torch::Tensor G, torch::
 }
 
 // The sums' persistent launches (`tk_sk_kernel`): the masked items' and the observed items' beside it on a side stream
-// (joined), each taking its kind's share of the SMs -- the forward's values or (COUNTS) the backward's rows pass.
-template <bool COUNTS>
+// (joined), each taking its kind's share of the SMs -- the forward's values and (STASH) the backward's stash.
+template <bool STASH>
 void sk_launch(const TkArgs& args, int KP, int P, int Rm, int B, int dev) {
     cudaStream_t main = at::cuda::getCurrentCUDAStream(), side = main;
     static cudaEvent_t fork[64] = {}, join[64] = {};
@@ -1941,13 +1982,13 @@ void sk_launch(const TkArgs& args, int KP, int P, int Rm, int B, int dev) {
     case NKV: {                                                                                                    \
         static bool dm[64] = {}, dob[64] = {};                                                                     \
         if (Rm > 0) {                                                                                              \
-            smem_attr(tk_sk_kernel<NKV, true, COUNTS>, MaskedGeo<NKV>::BYTES, dev, dm);                            \
-            tk_sk_kernel<NKV, true, COUNTS><<<P, NW * 32, MaskedGeo<NKV>::BYTES, main>>>(args);                    \
+            smem_attr(tk_sk_kernel<NKV, true, STASH>, MaskedGeo<NKV>::BYTES, dev, dm);                             \
+            tk_sk_kernel<NKV, true, STASH><<<P, NW * 32, MaskedGeo<NKV>::BYTES, main>>>(args);                     \
             C10_CUDA_KERNEL_LAUNCH_CHECK();                                                                        \
         }                                                                                                          \
         if (B > Rm) {                                                                                              \
-            smem_attr(tk_sk_kernel<NKV, false, COUNTS>, ObservedGeo<NKV>::BYTES, dev, dob);                        \
-            tk_sk_kernel<NKV, false, COUNTS><<<P, NW * 32, ObservedGeo<NKV>::BYTES, side>>>(args);                 \
+            smem_attr(tk_sk_kernel<NKV, false, STASH>, ObservedGeo<NKV>::BYTES, dev, dob);                         \
+            tk_sk_kernel<NKV, false, STASH><<<P, NW * 32, ObservedGeo<NKV>::BYTES, side>>>(args);                  \
             C10_CUDA_KERNEL_LAUNCH_CHECK();                                                                        \
         }                                                                                                          \
         break;                                                                                                     \
@@ -1986,50 +2027,64 @@ TkArgs sk_args(const torch::Tensor& A, const torch::Tensor& BP, const torch::Ten
 }
 
 // One node vector's values from the caller's A [Bx, M, r] (fp32) and `top_k_prep`'s operands, into `out` [nodes,
-// batch] from node `nid0` on (`sk_launch`).
-void top_k_forward(torch::Tensor A, torch::Tensor BP, torch::Tensor E, torch::Tensor ev, torch::Tensor cmax,
-                   torch::Tensor LTh, torch::Tensor mitems, torch::Tensor oitems, torch::Tensor noitems,
-                   torch::Tensor slot32, torch::Tensor logw, torch::Tensor flags, torch::Tensor out, int64_t nid0) {
-    const c10::cuda::CUDAGuard guard(A.device());
-    TORCH_CHECK(out.is_cuda() && out.is_contiguous() && out.scalar_type() == at::kFloat && out.size(1) == ev.size(0),
-                "top_k: the node values, a contiguous CUDA float32 [nodes, batch] tensor");
-    TORCH_CHECK(nid0 >= 0 && nid0 + A.size(1) <= out.size(0), "top_k: the node vector's rows of the node values");
-    const int P = flags.size(0) / 2;
-    auto ws = torch::empty({(long)P * (WS_M + WS_O) * NW * 32}, A.options());
-    TkArgs args = sk_args(A, BP, E, ev, cmax, LTh, mitems, oitems, noitems, slot32, logw, flags, ws);
-    args.out = out.data_ptr<float>(); args.nid0 = nid0; args.ostride = out.size(1);
-    sk_launch<false>(args, BP.size(1), P, args.Rm, (int)ev.size(0), A.get_device());
-}
-
-// The backward's rows pass of one node vector (`tk_sk_kernel`'s COUNTS ending) from `top_k_prep`'s operands and the
-// node flows f [B, M] (fp32): (alpha, beta, the counts [max(Rm, 1), M, SA] -- a masked sample's, by its place in the
-// prep's `rows` --, ao, bo [B, M] -- an observed sample's --, W's shift h [B, M] -- every sample's).
-std::vector<torch::Tensor> top_k_bw_rows(torch::Tensor A, torch::Tensor BP, torch::Tensor E, torch::Tensor ev,
+// batch] from node `nid0` on (`sk_launch`; an empty `out`: no values). With `stash`, what a backward takes from the
+// sums, returned (else nothing): (alpha, beta, the slots' posterior [max(Rm, 1), M, SA] -- a masked sample's, by its
+// place in the prep's `rows`, the node's flow not in them; the posterior into `acnt_out` [Rm, M, SA] where given, its
+// leaf's buffer --, ao, bo [B, M], W's shift h [B, M]): `masked_stash`'s notes; `top_k_flows` puts the flows in.
+std::vector<torch::Tensor> top_k_forward(torch::Tensor A, torch::Tensor BP, torch::Tensor E, torch::Tensor ev,
                                          torch::Tensor cmax, torch::Tensor LTh, torch::Tensor mitems,
                                          torch::Tensor oitems, torch::Tensor noitems, torch::Tensor slot32,
-                                         torch::Tensor logw, torch::Tensor flags, torch::Tensor f, torch::Tensor acnt_out) {
+                                         torch::Tensor logw, torch::Tensor flags, torch::Tensor out, int64_t nid0,
+                                         bool stash, torch::Tensor acnt_out) {
     const c10::cuda::CUDAGuard guard(A.device());
+    const bool values = out.numel() > 0;
     const int M = A.size(1), B = ev.size(0), Rm = mitems.size(0);
-    TORCH_CHECK(f.is_cuda() && f.scalar_type() == at::kFloat && f.dim() == 2 && f.size(0) == M && f.size(1) == B &&
-                f.stride(1) == 1, "top_k: the node flows' log-space rows f [M, B] (a sample a column)");
+    TORCH_CHECK(values || stash, "top_k: the values or the stash");
+    if (values) {
+        TORCH_CHECK(out.is_cuda() && out.is_contiguous() && out.scalar_type() == at::kFloat && out.size(1) == B,
+                    "top_k: the node values, a contiguous CUDA float32 [nodes, batch] tensor");
+        TORCH_CHECK(nid0 >= 0 && nid0 + M <= out.size(0), "top_k: the node vector's rows of the node values");
+    }
     const int P = flags.size(0) / 2;
     auto o = A.options();
     auto ws = torch::empty({(long)P * (WS_M + WS_O) * NW * 32}, o);
+    TkArgs args = sk_args(A, BP, E, ev, cmax, LTh, mitems, oitems, noitems, slot32, logw, flags, ws);
+    if (values) { args.out = out.data_ptr<float>(); args.nid0 = nid0; args.ostride = out.size(1); }
+    if (!stash) {
+        sk_launch<false>(args, BP.size(1), P, Rm, B, A.get_device());
+        return {};
+    }
     auto alpha = torch::empty({std::max(Rm, 1), M, SA}, o), beta = torch::empty_like(alpha);
-    // (the counts into the caller's buffer where it gives one: [Rm, M, SA], its leaf's)
     auto acnt = acnt_out.numel() > 0 ? acnt_out : torch::empty_like(alpha);
     if (acnt_out.numel() > 0) {
         check(acnt_out, at::kFloat, "acnt_out");
         TORCH_CHECK(acnt_out.size(0) == Rm && acnt_out.size(1) == M && acnt_out.size(2) == SA, "top_k: acnt_out [Rm, M, 72]");
     }
     auto ao = torch::empty({B, M}, o), bo = torch::empty_like(ao), hrow = torch::empty_like(ao);
-    TkArgs args = sk_args(A, BP, E, ev, cmax, LTh, mitems, oitems, noitems, slot32, logw, flags, ws);
-    args.f = f.data_ptr<float>(); args.fld = f.stride(0);
     args.alpha = alpha.data_ptr<float>(); args.beta = beta.data_ptr<float>();
     args.acnt = acnt.data_ptr<float>(); args.ao = ao.data_ptr<float>(); args.bo = bo.data_ptr<float>();
     args.hrow = hrow.data_ptr<float>();
     sk_launch<true>(args, BP.size(1), P, Rm, B, A.get_device());
     return {alpha, beta, acnt, ao, bo, hrow};
+}
+
+// The node flows into a stash, in place (`tk_flows_kernel`): `nf` [M, B] the node vector's log-space rows of the node
+// flows (fp32, a sample a column), ao, bo [B, M]; `rows` [Rm] the masked samples and `acnt` their rows of the leaf's
+// buffer [Rm, M, SA] (empty: none) -- the flow into the slot after the posterior's.
+void top_k_flows(torch::Tensor nf, torch::Tensor ao, torch::Tensor bo, torch::Tensor rows, torch::Tensor acnt) {
+    const c10::cuda::CUDAGuard guard(ao.device());
+    check(ao, at::kFloat, "ao"); check(bo, at::kFloat, "bo");
+    const int B = ao.size(0), M = ao.size(1), Rm = acnt.numel() > 0 ? (int)rows.size(0) : 0;
+    TORCH_CHECK(nf.is_cuda() && nf.scalar_type() == at::kFloat && nf.dim() == 2 && nf.size(0) == M && nf.size(1) == B &&
+                nf.stride(1) == 1, "top_k: the node flows' log-space rows [M, B] (a sample a column)");
+    if (Rm > 0) {
+        check(rows, at::kLong, "rows"); check(acnt, at::kFloat, "acnt");
+        TORCH_CHECK(acnt.size(0) == Rm && acnt.size(1) == M && acnt.size(2) == SA, "top_k: acnt [Rm, M, 72]");
+    }
+    tk_flows_kernel<<<dim3(64, Rm > 0 ? 2 : 1), 256, 0, at::cuda::getCurrentCUDAStream()>>>(
+        nf.data_ptr<float>(), nf.stride(0), ao.data_ptr<float>(), bo.data_ptr<float>(),
+        Rm > 0 ? rows.data_ptr<long>() : nullptr, Rm > 0 ? acnt.data_ptr<float>() : nullptr, B, M, Rm);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
 // The backward's operands beside the prep's: (AH [Bx, M, KP] = fp16(log2 e A), ranks zero-padded; l2t [M, N] fp16 (the
@@ -2103,8 +2158,9 @@ void top_k_bw_grads(torch::Tensor A, torch::Tensor AH, torch::Tensor BP, torch::
 }
 
 // The EM statistics of the observed samples (slot >= 0; -1 a masked one, skipped) added into FP, FM [M, N] (fp32):
-// from the operands (AH, BP, E, ev, LTh) and the rows pass's ao, bo, hrow; emap the row a sample reads (empty: its own).
-// `olist` the samples to walk, -1 padded (`top_k_em_index`; empty: every sample) -- the work split over them.
+// from the operands (AH, BP, E, ev, LTh) and the stash's ao, bo (the flows in them), hrow; emap the row a sample reads
+// (empty: its own). `olist` the samples to walk, -1 padded (`top_k_em_index`; empty: every sample) -- the work split
+// over them.
 void top_k_bw_em_observed(torch::Tensor AH, torch::Tensor BP, torch::Tensor E, torch::Tensor ev, torch::Tensor LTh,
                           torch::Tensor ao, torch::Tensor bo, torch::Tensor hrow, torch::Tensor slot, torch::Tensor emap,
                           torch::Tensor olist, torch::Tensor FP, torch::Tensor FM) {
@@ -2319,8 +2375,9 @@ void top_k_scatter_em(torch::Tensor FP, torch::Tensor FM, torch::Tensor params, 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("top_k_prep", &top_k_prep, "a LowRank(top_k) sum node vector's operands and work items for `top_k_forward`");
     m.def("top_k_forward", &top_k_forward,
-          "a LowRank(top_k) sum node vector's values: a persistent stream-K launch for each kind of work item");
-    m.def("top_k_bw_rows", &top_k_bw_rows, "the backward's rows pass: the counts, alpha, beta and W's shift");
+          "a LowRank(top_k) sum node vector's values and its backward's stash: a persistent stream-K launch for each "
+          "kind of work item");
+    m.def("top_k_flows", &top_k_flows, "the node flows into the forward's stash, in place");
     m.def("top_k_bw_prep", &top_k_bw_prep, "the backward's operands beside the prep's: fp16 A', l2t, l2t for the cols");
     m.def("top_k_bw_em_observed", &top_k_bw_em_observed,
           "the backward's EM statistics of the observed samples (a tile of the parameters a CTA, over the samples)");
