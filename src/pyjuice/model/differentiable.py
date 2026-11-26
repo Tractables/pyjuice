@@ -15,8 +15,10 @@ scale with its own weight). Where the circuit's latest pass is not this call's f
 ran since: the circuit keeps the node values of its latest forward only) the backward runs the forward again first. With
 `external_params_rows` the backward itself adds each sample's gradient, times its sign, into the row of the tensors it
 read (`EXTERNAL_PARAMS_GRAD_SIGNS_KWARG`): no gradient a sample is kept. The circuit's own
-parameters get no gradient here (`compute_param_flows = False`): their EM statistics are a backward of their own, on
-the pass they train on.
+parameters get no gradient here: their EM statistics are a backward of their own, on the pass they train on -- or, with
+the call's `param_flows_mask` (the samples of that pass), this backward's too: the flows of those samples added into
+the parameter flows (`backward(param_flows_mask = ...)`), weighted by |w| as every flow of the pass is, and so is the EM
+step's normalizer (`_cum_flow`).
 
 A conditional in one call -- both of its passes one batch, the samples of a pass reading the same rows of tensors:
 
@@ -81,8 +83,8 @@ class _DifferentiableLLs(torch.autograd.Function):
     """`lls` as an op of the call's tensors that require grad (`differentiable_entries`); see the module's notes."""
 
     @staticmethod
-    def forward(ctx, lls, pc, inputs, given, entries, *tensors):
-        ctx.pc, ctx.inputs, ctx.given, ctx.entries = pc, inputs, given, entries
+    def forward(ctx, lls, pc, inputs, given, entries, pmask, *tensors):
+        ctx.pc, ctx.inputs, ctx.given, ctx.entries, ctx.pmask = pc, inputs, given, entries, pmask
         ctx.run = pc.__dict__.get("_num_runs", 0)                        # (this forward's place among the circuit's passes)
         return lls.clone()
 
@@ -95,7 +97,7 @@ class _DifferentiableLLs(torch.autograd.Function):
         ext = given.get(EXTERNAL_PARAMS_KWARG) or {}
         rows = given.get(EXTERNAL_PARAMS_ROWS_KWARG)
         if not bool((w != 0).any()):
-            return (None, None, None, None, None, *[torch.zeros_like(t) for _, _, _, t in entries])
+            return (None, None, None, None, None, None, *[torch.zeros_like(t) for _, _, _, t in entries])
         rest = {k: v for k, v in given.items() if k != EXTERNAL_PARAMS_KWARG}
         sign = torch.where(w < 0, -1.0, 1.0)
         # (with a map of rows the backward folds the samples' gradients into the tensors' rows, each times its sign: the
@@ -110,7 +112,8 @@ class _DifferentiableLLs(torch.autograd.Function):
         with torch.no_grad():
             if pc.__dict__.get("_num_runs", 0) != ctx.run:
                 pc(inputs, **given)                                       # (another pass ran since: this call's values)
-            pc.backward(inputs, ll_weights = w.abs(), compute_param_flows = False, logspace_flows = True,
+            pc.backward(inputs, ll_weights = w.abs(), compute_param_flows = ctx.pmask is not None,
+                        param_flows_mask = ctx.pmask, logspace_flows = True,
                         allow_modify_flows = False, **rest, **evi_grads, **fold,
                         **({EXTERNAL_PARAMS_GRAD_KWARG: ext_grads} if ext_grads else {}))
         out = []
@@ -124,4 +127,4 @@ class _DifferentiableLLs(torch.autograd.Function):
             else:
                 g = evi_grads[f"{key}_grad"]
             out.append((g * sign.view(-1, *([1] * (g.dim() - 1))).to(g.dtype)).to(t.dtype))
-        return (None, None, None, None, None, *out)
+        return (None, None, None, None, None, None, *out)

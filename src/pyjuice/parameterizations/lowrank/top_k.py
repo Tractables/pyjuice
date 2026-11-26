@@ -219,10 +219,11 @@ def _sum_values(A, Bm, G, ltheta, lc, logw) -> torch.Tensor:
     return torch.where(none, torch.full_like(val, -float("inf")), val)
 
 
-def _sum_backward_terms(A, Bm, G, ltheta, lc, logw, f):
+def _sum_backward_terms(A, Bm, G, ltheta, lc, logw, f, pm = None):
     """The backward of one `LowRank(top_k)` node vector (`PASSES_DTYPE`). With `pi_b[i, s]` the posterior of slot s given node
     i (`w r / sum_s w r`, r = U / Z) and `a = f pi` the flow into each (node, slot), the counts along the edges and
-    their normalizers' -- q[i, s, j] = a W E c / U, t[i, s, j] = a W E / Z -- make everything:
+    their normalizers' -- q[i, s, j] = a W E c / U, t[i, s, j] = a W E / Z -- make everything (F+, F- over the samples
+    `pm` [B] holds, if given):
 
         ef [B, N]     = sum_i sum_s q                 the element flows (d / d log c)
         Fp, Fm [M, N] = sum_b sum_s q,  sum_b sum_s t   F+ and F- (d / d log theta in the values' / normalizers' terms)
@@ -237,7 +238,8 @@ def _sum_backward_terms(A, Bm, G, ltheta, lc, logw, f):
     Q = W * torch.bmm(alpha, E) * ev[:, None, :]                                    # sum_s q
     Tm = W * torch.bmm(beta, E)                                                     # sum_s t
     dG = E * (torch.bmm(alpha.transpose(1, 2), W) * ev[:, None, :] - torch.bmm(beta.transpose(1, 2), W))
-    return Q.sum(dim = 1), Q.sum(dim = 0), Tm.sum(dim = 0), Q - Tm, dG, a
+    keep = 1.0 if pm is None else pm[:, None, None].to(Q.dtype)
+    return Q.sum(dim = 1), (Q * keep).sum(dim = 0), (Tm * keep).sum(dim = 0), Q - Tm, dG, a
 
 
 def sum_forward(desc, layer, ns_tensors, node_mars, element_mars, params, kwargs) -> None:
@@ -305,6 +307,7 @@ def sum_backward(desc, layer, ns_tensors, ns_grad_tensors, node_flows, element_f
     gviews, fresh = _grads_kw(kwargs)
     want_flows = param_flows is not None
     want_denom = want_flows and denom_param_flows is not None and desc.apply_z_correction
+    pm = kwargs.get("param_flows_mask") if want_flows else None          # (the samples the EM statistics take)
     glp = kwargs.get("categorical_evidence_logp_grad")
 
     geos = [desc._geometry(layer, ns_info, dev) for ns_info, _ in ns_tensors]
@@ -320,13 +323,13 @@ def sum_backward(desc, layer, ns_tensors, ns_grad_tensors, node_flows, element_f
                 and element_mars.stride(1) == 1:
             # (the gradients added into their destinations by the kernels)
             ef, a_rows, flows = top_k_backward.terms(*tensors, theta, element_mars, geo, slot, rows, logw_rows, f,
-                                                     external_rows(kwargs), grads, gviews, fresh, want_flows)
+                                                     external_rows(kwargs), grads, gviews, fresh, want_flows, pm)
             Fp, Fm = flows if want_flows else (None, None)
         else:
             A, Bm, G = (_d(t) for t in per_sample(tensors, external_rows(kwargs)))
             lc = _d(desc._child_values(geo, element_mars))
             logw = slot_weights(slot, rows, logw_rows, f.size(0), geo["M"], desc.top_k)
-            ef, Fp, Fm, Gl, dG, a = _sum_backward_terms(A, Bm, G, theta.log(), lc, logw, f)
+            ef, Fp, Fm, Gl, dG, a = _sum_backward_terms(A, Bm, G, theta.log(), lc, logw, f, pm)
             if grads is not None:
                 _store(gviews, fresh, grads, [torch.bmm(Gl, Bm.transpose(1, 2)), torch.bmm(A.transpose(1, 2), Gl), dG])
             a_rows = a[rows]
@@ -339,13 +342,15 @@ def sum_backward(desc, layer, ns_tensors, ns_grad_tensors, node_flows, element_f
             desc._scatter_add(geo, denom_param_flows, desc._denom_offsets(layer)[id(ns_info.ns)][0],
                               _safe_div(Fm, theta).float())
         if rows.numel() > 0 and not top_k_leaf_fused.add_counts(sib, desc.top_k, f.size(0), a_rows):
-            _leaf_terms(desc, sib, rows, logp, tilt, logw_rows, a_rows, f[rows], kwargs, glp, gviews, fresh, want_flows)
+            _leaf_terms(desc, sib, rows, logp, tilt, logw_rows, a_rows, f[rows], kwargs, glp, gviews, fresh, want_flows,
+                        pm)
     return None
 
 
-def _leaf_terms(desc, sib, rows, logp, tilt, logw, a, f, kwargs, glp, gviews, fresh, want_flows) -> None:
+def _leaf_terms(desc, sib, rows, logp, tilt, logw, a, f, kwargs, glp, gviews, fresh, want_flows, pm = None) -> None:
     """What a `LowRank(top_k)` sum hands its leaf at the samples `rows` whose token is missing (`sum_backward`): `logp`
-    the leaf's log P_b(c | i) there, `logw` its slots', `a` the posterior counts of the slots, `f` the node flows."""
+    the leaf's log P_b(c | i) there, `logw` its slots', `a` the posterior counts of the slots, `f` the node flows; the
+    EM statistics of the samples `pm` [B] holds, if given."""
     leaf_layer, xs = sib["layer"], sib["ns"]
     s, e, _, lvid, _ = _leaf_rows(leaf_layer, xs)
     K = desc.top_k
@@ -369,8 +374,9 @@ def _leaf_terms(desc, sib, rows, logp, tilt, logw, a, f, kwargs, glp, gviews, fr
         l0 = leaf_layer._output_ind_range[0]
         idx = leaf_layer.s_pfids[s - l0:e - l0][None, :, None] + \
             kwargs["soft_evidence_cat_ids"][rows, lvid, :].long()[:, None, :]           # [b, M, C]
-        pf.index_add_(0, idx.reshape(-1), rho.reshape(-1).to(pf.dtype))                 # F+: the posterior counts
-        pf.index_add_(0, (idx + V).reshape(-1), (f[:, :, None] * P).reshape(-1).to(pf.dtype))   # F-
+        keep = 1.0 if pm is None else pm[rows][:, None, None].to(rho.dtype)
+        pf.index_add_(0, idx.reshape(-1), (rho * keep).reshape(-1).to(pf.dtype))        # F+: the posterior counts
+        pf.index_add_(0, (idx + V).reshape(-1), (f[:, :, None] * P * keep).reshape(-1).to(pf.dtype))   # F-
 
 
 def leaf_backward(desc, layer, data, node_flows, kwargs, logspace_flows: bool, missing_mask, batch_first: bool,
@@ -402,6 +408,7 @@ def leaf_backward(desc, layer, data, node_flows, kwargs, logspace_flows: bool, m
     lp, ids = kwargs.get("categorical_evidence_logp"), kwargs.get("soft_evidence_cat_ids")
     glp = kwargs.get("categorical_evidence_logp_grad")
     pf = layer.param_flows if compute_param_flows else None
+    pm = kwargs.get("param_flows_mask") if pf is not None else None     # (the samples the EM statistics take)
     dev = node_flows.device
     l0 = layer._output_ind_range[0]
     K = desc.top_k
@@ -415,10 +422,11 @@ def leaf_backward(desc, layer, data, node_flows, kwargs, logspace_flows: bool, m
         lp_v, ids_v = lp[:, lvid, :], ids[:, lvid, :]
         C = ids_v.size(1)
         P = leaf_log_probs(layer, ns, lp_v, ids_v, tilt, K).exp()                       # [B, M, C]
+        fe = f if pm is None else f * _d(pm[:, None])                                 # [B, M]: the EM statistics'
         if pf is not None and bool(miss.any()) and id(ns) not in layer.__dict__.get("_read_by_sums", ()):
             V = ns.dist.num_cats
             idx = layer.s_pfids[s - l0:e - l0][None, :, None] + ids_v.long()[:, None, :]  # [B, M, C]
-            fP = ((f * _d(miss[:, None]))[:, :, None] * P).reshape(-1).to(pf.dtype)       # the posterior counts f P
+            fP = ((fe * _d(miss[:, None]))[:, :, None] * P).reshape(-1).to(pf.dtype)      # the posterior counts f P
             pf.index_add_(0, idx.reshape(-1), fP)                                       # F+
             pf.index_add_(0, (idx + V).reshape(-1), fP)                                 # F-
         place, found = _candidate_place(ids_v, data[v, :])
@@ -436,9 +444,10 @@ def leaf_backward(desc, layer, data, node_flows, kwargs, logspace_flows: bool, m
         if pf is not None:
             V = ns.dist.num_cats
             spf = layer.s_pfids[s - l0:e - l0]                                          # [M]
-            keep = fo > 0
+            foe = fo if pm is None else fo * _d(pm[:, None])
+            keep = foe > 0
             idx = (spf[None, :] + data[v, :].long()[:, None])                           # [B, M]: F+ at the token
-            pf.index_add_(0, idx[keep], fo[keep].to(pf.dtype))
+            pf.index_add_(0, idx[keep], foe[keep].to(pf.dtype))
             idx2 = spf[None, :, None] + V + ids_v.long()[:, None, :]                     # [B, M, C]: F- over the candidates
-            pf.index_add_(0, idx2.reshape(-1), (fo[:, :, None] * P).reshape(-1).to(pf.dtype))
+            pf.index_add_(0, idx2.reshape(-1), (foe[:, :, None] * P).reshape(-1).to(pf.dtype))
     return True

@@ -119,6 +119,12 @@ class LowRank(_ForwardMixin, _BackwardMixin, _DenominatorsMixin, SumParameteriza
     #: ... and so are both flows
     replaces_shared_backward = True
     computes_external_grads = True
+
+    @property
+    def honors_param_flows_mask(self) -> bool:
+        """The `top_k` form's backward takes `param_flows_mask` (`lowrank/top_k.py`)."""
+        return self.top_k is not None
+
     #: A forward may be handed the product layer below, its own forward not run (`stream_fusion_plan`): the mixture's
     #: virtual batch reads the products' values from their children, every other pass forms them first
     fuses_stream_children = True

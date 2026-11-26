@@ -669,10 +669,26 @@ class InputLayer(Layer, nn.Module):
         # An external parameterization: the layer's backward is its descriptor's where its node vectors were given tensors
         # (True: done -- the parameter flows, the evidence's and the tensors' gradients); else the plain leaf's below
         compute_param_flows = kwargs.pop("_compute_param_flows", True)
+        # (`param_flows_mask`: the samples whose flows the parameter flows take -- the parameterization's, where it
+        # takes one, else the plain leaf's: the other samples' node flows zero for its kernels, its rows restored after)
+        pmask = kwargs.get("param_flows_mask")
+        if pmask is not None and self.parameterization is not None and \
+                not self.parameterization.honors_param_flows_mask:
+            raise NotImplementedError(f"{self.parameterization.get_signature()} does not take `param_flows_mask`.")
         if self.parameterization is not None and self.parameterization.input_backward(
                 self, data, node_flows, node_mars, kwargs, logspace_flows = logspace_flows, missing_mask = missing_mask,
                 batch_first = _batch_first, compute_param_flows = compute_param_flows):
             return None
+        kwargs.pop("param_flows_mask", None)
+        kept = None
+        if pmask is not None and self.param_flows is not None:
+            grads = [k for k in getattr(self.dist, "call_kwargs", ()) if k.endswith("_grad") and kwargs.get(k) is not None]
+            if grads:
+                raise NotImplementedError(f"`param_flows_mask` with the gradients {grads}: the plain leaf's kernels "
+                                          f"make both from the same node flows.")
+            sid, eid = self._output_ind_range
+            kept = node_flows[sid:eid].clone()
+            node_flows[sid:eid].masked_fill_(~pmask[None, :], -float("inf") if logspace_flows else 0.0)
 
         if "cuda" in self.device.type:
             # Need to flatten data to ensure the memory is aligned following [num_vars, batch_size]
@@ -810,6 +826,8 @@ class InputLayer(Layer, nn.Module):
                                        logspace_flows)
         else:
             raise NotImplementedError("CPU backward fn for input nodes is not implemented.")
+        if kept is not None:
+            node_flows[self._output_ind_range[0]:self._output_ind_range[1]] = kept
 
     def _backward_missing(self, node_flows: torch.Tensor, missing_mask: torch.Tensor,
                           missing_mask_mode: int, num_vars: Optional[int],

@@ -32,13 +32,14 @@ if triton is not None:
         return ((x.to(tl.int32, bitcast = True) + 0x1000) & -8192).to(tl.float32, bitcast = True)
 
     @triton.jit
-    def _bw_em_kernel(AH, BH, L2T, E, EV, ALPHA, BETA, HROW, SLOT, LWIDX, EMAP, FP, FM, M, N, B,
+    def _bw_em_kernel(AH, BH, L2T, E, EV, ALPHA, BETA, HROW, MROWS, NM, LWIDX, EMAP, FP, FM, M, N,
                       KP: tl.constexpr, K0: tl.constexpr, K1: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr,
                       SA: tl.constexpr):
-        """a CTA a 64 x 64 tile of the parameters: over the masked samples, F+ = sum_b Q, F- = sum_b T ([M, N]: q, t
-        summed over the slots), stored -- the observed samples' then added by `top_k_bw_em_observed` (CUDA). W from the
-        CUDA passes' operands -- AH = fp16(log2 e A) [Bx, M, KP], BH [Bx, KP, N] fp16, l2t [M, N] fp16 -- and the rows
-        pass's shift HROW [B, M]; a masked sample's alpha, beta [Rm, M, SA] at its place LWIDX."""
+        """a CTA a 64 x 64 tile of the parameters: over the masked samples MROWS[:NM] (NM on the device), F+ = sum_b
+        Q, F- = sum_b T ([M, N]: q, t summed over the slots), stored -- the observed samples' then added by
+        `top_k_bw_em_observed` (CUDA). W from the CUDA passes' operands -- AH = fp16(log2 e A) [Bx, M, KP], BH [Bx, KP,
+        N] fp16, l2t [M, N] fp16 -- and the rows pass's shift HROW [B, M]; a masked sample's alpha, beta [Rm, M, SA] at
+        its place LWIDX."""
         rows = tl.program_id(0) * BM + tl.arange(0, BM)
         cols = tl.program_id(1) * BN + tl.arange(0, BN)
         s = tl.arange(0, 64)
@@ -46,27 +47,26 @@ if triton is not None:
         l2t = tl.load(L2T + rows[:, None] * N + cols[None, :]).to(tl.float32)
         Fp = tl.zeros([BM, BN], tl.float32)
         Fm = tl.zeros([BM, BN], tl.float32)
-        for b in range(0, B):
-            b64 = b.to(tl.int64)
-            if tl.load(SLOT + b64) < 0:                                         # (a masked sample)
-                eb = tl.load(EMAP + b64).to(tl.int64)
-                lg = tl.dot(tl.load(AH + (eb * M + rows[:, None]) * KP + k[None, :]),
-                            tl.load(BH + (eb * KP + k[:, None]) * N + cols[None, :]))
-                if K1 > 0:
-                    k1 = K0 + tl.arange(0, K1)
-                    lg += tl.dot(tl.load(AH + (eb * M + rows[:, None]) * KP + k1[None, :]),
-                                 tl.load(BH + (eb * KP + k1[:, None]) * N + cols[None, :]))
-                W = tl.exp2(lg + l2t - tl.load(HROW + b64 * M + rows)[:, None])
-                ev = tl.load(EV + b64 * N + cols)
-                base = (tl.load(LWIDX + b64).to(tl.int64) * M + rows) * SA
-                Es = tl.load(E + (eb * 65 + s[:, None]) * N + cols[None, :])
-                er = tl.load(E + (eb * 65 + 64) * N + cols)
-                X = tl.dot(_tf32(tl.load(ALPHA + base[:, None] + s[None, :])), Es, input_precision = "tf32") + \
-                    tl.load(ALPHA + base + 64)[:, None] * er[None, :]
-                Y = tl.dot(_tf32(tl.load(BETA + base[:, None] + s[None, :])), Es, input_precision = "tf32") + \
-                    tl.load(BETA + base + 64)[:, None] * er[None, :]
-                Fp += W * X * ev[None, :]
-                Fm += W * Y
+        for j in range(0, tl.load(NM)):
+            b64 = tl.load(MROWS + j).to(tl.int64)
+            eb = tl.load(EMAP + b64).to(tl.int64)
+            lg = tl.dot(tl.load(AH + (eb * M + rows[:, None]) * KP + k[None, :]),
+                        tl.load(BH + (eb * KP + k[:, None]) * N + cols[None, :]))
+            if K1 > 0:
+                k1 = K0 + tl.arange(0, K1)
+                lg += tl.dot(tl.load(AH + (eb * M + rows[:, None]) * KP + k1[None, :]),
+                             tl.load(BH + (eb * KP + k1[:, None]) * N + cols[None, :]))
+            W = tl.exp2(lg + l2t - tl.load(HROW + b64 * M + rows)[:, None])
+            ev = tl.load(EV + b64 * N + cols)
+            base = (tl.load(LWIDX + b64).to(tl.int64) * M + rows) * SA
+            Es = tl.load(E + (eb * 65 + s[:, None]) * N + cols[None, :])
+            er = tl.load(E + (eb * 65 + 64) * N + cols)
+            X = tl.dot(_tf32(tl.load(ALPHA + base[:, None] + s[None, :])), Es, input_precision = "tf32") + \
+                tl.load(ALPHA + base + 64)[:, None] * er[None, :]
+            Y = tl.dot(_tf32(tl.load(BETA + base[:, None] + s[None, :])), Es, input_precision = "tf32") + \
+                tl.load(BETA + base + 64)[:, None] * er[None, :]
+            Fp += W * X * ev[None, :]
+            Fm += W * Y
         out = rows[:, None] * N + cols[None, :]
         tl.store(FP + out, Fp)
         tl.store(FM + out, Fm)
@@ -89,9 +89,10 @@ def _dest_ok(g: torch.Tensor) -> bool:
 
 
 def terms(A, Bm, G, theta, element_mars, geo, slot, rows, logw_rows, f, emap, grads, gviews, fresh: bool,
-          want_flows: bool = False):
+          want_flows: bool = False, pmask = None):
     """`top_k._sum_backward_terms`' element flows `[B, N]`, the posterior counts `a` of the masked samples `rows`
-    `[b, M, 65]` and the EM statistics `(F+, F-)` `[M, N]` (None unless `want_flows`) by the kernels; the gradients of
+    `[b, M, 65]` and the EM statistics `(F+, F-)` `[M, N]` (None unless `want_flows`; of the samples `pmask` [B] holds,
+    if given) by the kernels; the gradients of
     `A [Bx, M, r]`, `Bm [Bx, r, N]`, `G [Bx, 65, N]` (a row of tensors each) ADDED into the destinations `grads` (None:
     none) -- where they fold (`StagedExternalParams.fold`) each sample's times its sign into the row it read, else
     into its own. `emap [B]` the row a sample reads (None: its own); the parameters `theta [M, N]` (0 where none); the
@@ -135,15 +136,22 @@ def terms(A, Bm, G, theta, element_mars, geo, slot, rows, logw_rows, f, emap, gr
         EMAP = (torch.arange(B, device = dev) if emap is None else emap).to(torch.int32).contiguous()
         LWIDX = torch.full((B,), -1, dtype = torch.int32, device = dev)
         LWIDX[rows] = torch.arange(Rm, dtype = torch.int32, device = dev)
-        SLOT = torch.where(LWIDX >= 0, -1, slot.to(torch.int32)).to(torch.int32).contiguous()
+        # (the observed samples the statistics take: a slot; -1 the others)
+        SLOT = torch.where((LWIDX >= 0) if pmask is None else (LWIDX >= 0) | ~pmask, -1, slot.to(torch.int32))
+        SLOT = SLOT.to(torch.int32).contiguous()
         # the masked samples' (Triton: stored, or zeros where none), then the observed ones' added (CUDA: a tile of
         # the parameters a CTA walking the samples)
         if Rm > 0:
             FP = torch.empty(M, N, dtype = torch.float32, device = dev)
             FM = torch.empty_like(FP)
-            _bw_em_kernel[(M // BM, N // BN)](AH, BP, L2T, E, ev, alpha, beta, hrow, SLOT, LWIDX, EMAP, FP, FM, M, N,
-                                              B, KP = KP, K0 = K0, K1 = KP - K0, BM = BM, BN = BN, SA = SA, num_warps = 4,
-                                              num_stages = 1)
+            if pmask is None:                                     # (the masked samples the statistics take, first)
+                mrows, nm = rows, torch.full((1,), Rm, dtype = torch.int32, device = dev)
+            else:
+                keep = pmask[rows]
+                mrows, nm = rows[torch.argsort((~keep).to(torch.int8), stable = True)], keep.sum(dtype = torch.int32)
+            _bw_em_kernel[(M // BM, N // BN)](AH, BP, L2T, E, ev, alpha, beta, hrow, mrows.to(torch.int32).contiguous(),
+                                              nm.reshape(1), LWIDX, EMAP, FP, FM, M, N, KP = KP, K0 = K0, K1 = KP - K0,
+                                              BM = BM, BN = BN, SA = SA, num_warps = 4, num_stages = 1)
         else:
             FP = torch.zeros(M, N, dtype = torch.float32, device = dev)
             FM = torch.zeros_like(FP)

@@ -255,6 +255,7 @@ struct BwArgs {
                                                                  // into: a sample's times dsgn into row drow; null: none
     const int* drow; const float* dsgn; int Bd;
     float* fpT; float* fmT;                                      // EM: F+, F- [ntab][V][M] (added into; null: none)
+    const bool* pmask;                                           // [B] the samples the EM statistics take (null: all)
 };
 
 // dtau's writes of a thread's 4 nodes: stores into the sample's row, or (fold) its values times its sign added into
@@ -286,7 +287,8 @@ __global__ void __launch_bounds__(NW * 32) tk_leaf_backward_kernel(const BwArgs 
     const DtauOut dt{a.dtau == nullptr ? nullptr
                      : a.dtau + ((long)t * (fold ? a.Bd : g.B) + (fold ? a.drow[b] : b)) * g.S * g.M + i0,
                      fold ? a.dsgn[b] : 1.f, fold};
-    const bool em = a.fmT != nullptr && p != -1;                       // EM statistics: every token among the candidates
+    const bool em = a.fmT != nullptr && p != -1                        // EM statistics: every token among the candidates
+                    && (a.pmask == nullptr || a.pmask[b]);
     const bool alone = miss && r < 0;                                  // a missing token no one reads: its leaf is 1
     if (p == -1 || (alone && !em)) {                                   // no gradient: a -inf value, or a token no one reads
         if (act) for (int s = 0; s < g.S; ++s) dt.zero((long)s * g.M);
@@ -607,14 +609,16 @@ std::vector<torch::Tensor> top_k_leaf_forward(torch::Tensor tab, torch::Tensor n
 }
 
 // the backward of the same tiles: adds the evidence's gradient into glp [B, nvars, C] (empty: none) and the EM
-// statistics into fpT, fmT [ntab, V, M] (empty: none); returns dtau -- [T, B, S, M] a sample each, or where `drow` [B]
-// (int32) is given each sample's times `dsgn` [B] summed into the row drow of [T, Bd, S, M]; empty where not `dtau_out`
+// statistics into fpT, fmT [ntab, V, M] (empty: none; of the samples `pmask` [B] bool holds, if not empty); returns
+// dtau -- [T, B, S, M] a sample each, or where `drow` [B] (int32) is given each sample's times `dsgn` [B] summed into
+// the row drow of [T, Bd, S, M]; empty where not `dtau_out`
 torch::Tensor top_k_leaf_backward(torch::Tensor tab, torch::Tensor nv_tab, torch::Tensor tau, torch::Tensor emap,
                                   torch::Tensor ids, torch::Tensor lp, torch::Tensor nv_lvid, torch::Tensor nv_row0,
                                   torch::Tensor lz, torch::Tensor lb, torch::Tensor place, torch::Tensor flows,
                                   bool logspace, torch::Tensor wrow, torch::Tensor logw, torch::Tensor acnt,
                                   int64_t S, int64_t K, torch::Tensor glp, torch::Tensor fpT, torch::Tensor fmT,
-                                  bool dtau_out, torch::Tensor drow, torch::Tensor dsgn, int64_t Bd) {
+                                  torch::Tensor pmask, bool dtau_out, torch::Tensor drow, torch::Tensor dsgn,
+                                  int64_t Bd) {
     const at::cuda::CUDAGuard guard(tab.device());
     const int64_t T = nv_tab.size(0), B = place.size(1);
     BwArgs a;
@@ -649,6 +653,12 @@ torch::Tensor top_k_leaf_backward(torch::Tensor tab, torch::Tensor nv_tab, torch
         check(fpT, at::kFloat, "fpT"); check(fmT, at::kFloat, "fmT");
         TORCH_CHECK(fpT.sizes() == tab.sizes() && fmT.sizes() == tab.sizes(), "top_k leaf: the flows' buffers as the tables");
         a.fpT = fpT.data_ptr<float>(); a.fmT = fmT.data_ptr<float>();
+    }
+    a.pmask = nullptr;
+    if (pmask.numel() > 0) {
+        check(pmask, at::kBool, "pmask");
+        TORCH_CHECK(pmask.numel() == B, "top_k leaf: pmask [B]");
+        a.pmask = pmask.data_ptr<bool>();
     }
     dim3 grid((unsigned)B, (unsigned)T, (unsigned)((M + NW * 128 - 1) / (NW * 128)));
     tk_leaf_backward_kernel<<<grid, NW * 32, 0, at::cuda::getCurrentCUDAStream()>>>(a);

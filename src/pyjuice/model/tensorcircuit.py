@@ -696,6 +696,12 @@ class TensorCircuit(_BuildMixin, _CudaGraphsMixin, _ExternalParamsMixin, _Learni
             log-likelihoods' backward runs the circuit's backward for its EM flows, as ever
         :type differentiable: bool
 
+        :param param_flows_mask: (keyword) `[B]` bool: the samples whose flows the returned log-likelihoods' backward
+            adds into the parameter flows (`backward`'s `param_flows_mask`). With `differentiable = True` that backward
+            then also gives these EM flows -- one backward for the gradients and the EM statistics, the flows of each
+            sample weighted by |its upstream gradient|, as the gradients' are --, none without it
+        :type param_flows_mask: torch.Tensor
+
         :param external_params_rows: (keyword) `[B]` integers: the row of the external tensors each sample reads --
             the tensors then have a batch of their own, and samples sharing a row share the work their tensors alone
             determine (both passes of a conditional in one batch). Only where every supplied node's parameterization
@@ -706,6 +712,7 @@ class TensorCircuit(_BuildMixin, _CudaGraphsMixin, _ExternalParamsMixin, _Learni
 
         _pop_removed_precision_flags(kwargs)
         differentiable = bool(kwargs.pop("differentiable", False))
+        param_flows_mask = kwargs.pop("param_flows_mask", None)               # (the backward's: below)
         self._num_runs = getattr(self, "_num_runs", 0) + 1
 
         with device_grad_controller(device = self.device, no_grad = True):
@@ -856,7 +863,8 @@ class TensorCircuit(_BuildMixin, _CudaGraphsMixin, _ExternalParamsMixin, _Learni
             entries = differentiable_entries(self, given)
             if not entries:
                 return lls.clone()
-            return _DifferentiableLLs.apply(lls.detach(), self, origin_inputs, given, entries, *[e[3] for e in entries])
+            return _DifferentiableLLs.apply(lls.detach(), self, origin_inputs, given, entries, param_flows_mask,
+                                            *[e[3] for e in entries])
 
         if torch.is_grad_enabled():
             lls.requires_grad = True
@@ -868,7 +876,8 @@ class TensorCircuit(_BuildMixin, _CudaGraphsMixin, _ExternalParamsMixin, _Learni
                     record_cudagraph = record_cudagraph, 
                     apply_cudagraph = apply_cudagraph,
                     propagation_alg = propagation_alg,
-                    **kwargs
+                    **kwargs,
+                    **({} if param_flows_mask is None else {"param_flows_mask": param_flows_mask})
                 )
             )
 
@@ -954,6 +963,7 @@ class TensorCircuit(_BuildMixin, _CudaGraphsMixin, _ExternalParamsMixin, _Learni
                  pflow_temperature: float = 1.0,
                  temper_eflow: bool = False,
                  compute_external_grads: bool = True,
+                 param_flows_mask: Optional[torch.Tensor] = None,
                  **kwargs):
         """
         Backward evaluation of the PC that computes node flows as well as parameter flows.
@@ -963,7 +973,14 @@ class TensorCircuit(_BuildMixin, _CudaGraphsMixin, _ExternalParamsMixin, _Learni
 
         :param ll_weights: weights of the log-likelihoods of size [B] or [num_roots, B]
         :type ll_weights: torch.Tensor
-        
+
+        :param param_flows_mask: `[B]` bool: the samples whose flows the parameter flows take (and `_cum_flow`, the EM
+            step's normalizer: their weights); the node flows and the gradients stay every sample's. With
+            `compute_param_flows`; a pass with one runs eagerly, its layers' parameter flows not deferred. A layer
+            with an external parameterization takes it where the parameterization does
+            (`SumParameterization.honors_param_flows_mask`), and raises NotImplementedError elsewhere
+        :type param_flows_mask: Optional[torch.Tensor]
+
         :param input_layer_fn: Custom forward function for input layers; if it is a string, then try to call the corresponding member function of the input layers
         :type input_layer_fn: Optional[Union[str,Callable]]
 
@@ -993,6 +1010,10 @@ class TensorCircuit(_BuildMixin, _CudaGraphsMixin, _ExternalParamsMixin, _Learni
         with device_grad_controller(device = self.device, no_grad = True):
 
             B = self.node_mars.size(1)
+            pmask = param_flows_mask if compute_param_flows else None
+            if pmask is not None:
+                assert pmask.dtype == torch.bool and pmask.shape == (B,), "`param_flows_mask`: a [B] bool tensor."
+                assert input_layer_fn is None, "`param_flows_mask`: the input layers' own backward (no `input_layer_fn`)."
 
             ## Initialize buffers for backward pass ##
 
@@ -1026,9 +1047,10 @@ class TensorCircuit(_BuildMixin, _CudaGraphsMixin, _ExternalParamsMixin, _Learni
             # Accumulate the total amount of flows added to the PC
             if compute_param_flows:
                 if ll_weights is None:
-                    self._cum_flow += (self._root_node_range[1] - self._root_node_range[0]) * B
+                    self._cum_flow += (self._root_node_range[1] - self._root_node_range[0]) * \
+                        (B if pmask is None else int(pmask.sum().item()))
                 else:
-                    self._cum_flow += ll_weights.sum().item()
+                    self._cum_flow += (ll_weights if pmask is None else ll_weights * pmask).sum().item()
 
             # Load cached node flows
             if self._buffer_matches(name = "node_flows", cache = cache):
@@ -1037,7 +1059,10 @@ class TensorCircuit(_BuildMixin, _CudaGraphsMixin, _ExternalParamsMixin, _Learni
             ## Initialize parameter flows ##
             # (`flows_memory = 0`: the pass's first writer of a slot stores it, the reset folded into its write --
             # `_plan_param_flow_stores`; only the slots no storing writer covers are zeroed here)
-            pf_defer = sum_layer_pre_backward_callback is None and sum_layer_post_backward_callback is None
+            # (not where a mask restricts the parameter flows to some samples: the layers mask the node flows the
+            # parameter-flow kernels read for the time of their call)
+            pf_defer = sum_layer_pre_backward_callback is None and sum_layer_post_backward_callback is None and \
+                pmask is None
             if compute_param_flows:
                 zero_ranges = self._plan_param_flow_stores(B, flows_memory, pflow_temperature, propagation_alg, pf_defer,
                                                            kwargs.get("mode"))
@@ -1069,6 +1094,8 @@ class TensorCircuit(_BuildMixin, _CudaGraphsMixin, _ExternalParamsMixin, _Learni
                             pf_store_first = compute_param_flows and flows_memory == 0.0)
             if self.__dict__.get("_sums_read_inputs", False):
                 sum_opts["_inputs"] = call_inputs
+            if pmask is not None:
+                sum_opts["param_flows_mask"] = pmask
 
             def _inner_layers():
 
@@ -1135,8 +1162,10 @@ class TensorCircuit(_BuildMixin, _CudaGraphsMixin, _ExternalParamsMixin, _Learni
                     _inner_layers()
                     deferred.run()
 
-            # Callbacks run inside the captured region and could do anything, so they make the pass eager.
-            use_graphs = sum_layer_pre_backward_callback is None and sum_layer_post_backward_callback is None
+            # Callbacks run inside the captured region and could do anything, so they make the pass eager; so does a
+            # mask of the parameter flows (the layers' masking is host work around their kernels)
+            use_graphs = sum_layer_pre_backward_callback is None and sum_layer_post_backward_callback is None and \
+                pmask is None
             record, on_repeat = (self.cuda_graphs, True) if record_cudagraph is None else (record_cudagraph, False)
             # The copy the forward made -- the parameters it computed the node values with -- else made here, before the
             # pass (outside a capture, so a replayed pass is preceded by it as an eager one is); for the groups that take
@@ -1161,6 +1190,8 @@ class TensorCircuit(_BuildMixin, _CudaGraphsMixin, _ExternalParamsMixin, _Learni
                     if input_layer_fn is None:
                         # (an input layer with an external parameterization is told whether parameter flows are wanted)
                         extra = {} if layer.parameterization is None else {"_compute_param_flows": compute_param_flows}
+                        if pmask is not None:
+                            extra["param_flows_mask"] = pmask
                         layer.backward(inputs, self.node_flows, self.node_mars, logspace_flows = logspace_flows, **kwargs,
                                        **extra)
 

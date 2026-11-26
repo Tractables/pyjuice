@@ -105,6 +105,12 @@ class SumParameterization():
     #: `replaces_shared_forward` makes it own the node values.
     replaces_shared_backward: bool = False
 
+    #: Whether a backward of the layers this parameterization serves takes `param_flows_mask` (`TensorCircuit.backward`):
+    #: the samples whose flows its parameter flows -- and denominator flows -- take, every sample's node flows and
+    #: gradients as without it. `False` -- the default -- refuses a mask (NotImplementedError) where it would serve a
+    #: call: the hooks may add statistics of their own from the node flows.
+    honors_param_flows_mask: bool = False
+
     #: Whether the backward writes `d LL / d(external parameters)` into the gradient buffer. `True` --
     #: the default -- is the complete parameterization. A descriptor that contributes the element and
     #: parameter flows but not yet its own gradient sets this to `False`, which leaves `pc.backward()`

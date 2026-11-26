@@ -722,10 +722,15 @@ class ParameterizedSumLayer(SumLayer):
         (`SumParameterization.reads_param_operands`).
         """
 
+        # (`param_flows_mask`: the samples whose flows the parameter flows take -- the plain path's by the plain layer's
+        # masking, a gated call's where the parameterization takes it)
+        pmask = kwargs.get("param_flows_mask") if param_flows is not None else None
+        honors = pmask is None or self.parameterization.honors_param_flows_mask
+
         # (a call the parameterization settled, as the forward's: `_settled_backward`)
         settled = self.__dict__.get("_settled_backward")
-        if settled is not None and settled(self, node_flows, element_flows, node_mars, element_mars, params, param_flows,
-                                           denom_param_flows, propagation_alg, op_params, kwargs):
+        if settled is not None and honors and settled(self, node_flows, element_flows, node_mars, element_mars, params,
+                                                      param_flows, denom_param_flows, propagation_alg, op_params, kwargs):
             return None
         if kwargs.get("partition_runs") is not None:
             raise ValueError("An external-parameter sum layer computes whole partitions: no `partition_runs`.")
@@ -748,8 +753,10 @@ class ParameterizedSumLayer(SumLayer):
             # full-batch one (pseudocount 0) overflowed to nan.
             # (Where THIS layer's parameterization keeps one: the circuit's buffer may be there for another's.)
             if param_flows is not None and denom_param_flows is not None and self.requests_denom_param_flows:
-                self._accumulate_ungated_denom(node_flows, denom_param_flows, kwargs.get("logspace_flows", False))
+                self._accumulate_ungated_denom(node_flows, denom_param_flows, kwargs.get("logspace_flows", False), pmask)
             return out
+        if not honors:
+            raise NotImplementedError(f"{self.parameterization.get_signature()} does not take `param_flows_mask`.")
 
         # The product layer below fused into the parameterization's element and parameter-flow kernels where every
         # partition settled on them (`_bk_fusion_ready`); else its values formed for the kernels that read them, the
@@ -795,7 +802,7 @@ class ParameterizedSumLayer(SumLayer):
         pkey, expected = self._backward_plan_key(ns_tensors, ns_grad_tensors, node_flows, node_mars, params,
                                                  param_flows, denom_param_flows, propagation_alg, kwargs)
         if pkey is not None:
-            pkey = pkey + (op is not None, sc is not None)
+            pkey = None if pmask is not None else pkey + (op is not None, sc is not None)
         if pkey is not None:
             plan = LaunchPlans.of(self).lookup(pkey)
             if plan is not None:
@@ -848,14 +855,15 @@ class ParameterizedSumLayer(SumLayer):
         return None
 
     def _accumulate_ungated_denom(self, node_flows: torch.Tensor, denom_param_flows: torch.Tensor,
-                                  logspace_flows: bool) -> None:
+                                  logspace_flows: bool, pmask: Optional[torch.Tensor] = None) -> None:
         """The denominator flow of a backward that supplied nothing for this layer (see `backward`), through
         :func:`SumParameterization.accumulate_denom_top_down`: it takes a value per node of the circuit, here the
-        layer's node flows summed over the batch."""
+        layer's node flows summed over the batch (the samples `pmask` [B] holds, if given)."""
         sid, eid = self._layer_nid_range
         flows = node_flows[sid:eid]
+        flows = flows.exp() if logspace_flows else flows
         per_node = torch.zeros(node_flows.size(0), dtype = torch.float32, device = node_flows.device)
-        per_node[sid:eid] = (flows.exp() if logspace_flows else flows).sum(dim = 1)
+        per_node[sid:eid] = (flows if pmask is None else flows * pmask[None, :]).sum(dim = 1)
         self.parameterization.accumulate_denom_top_down(self, per_node, denom_param_flows, 1.0)
 
     def _bk_fusion_ready(self, batch_size: int, dtype: torch.dtype, op: bool, param_flows: bool) -> bool:

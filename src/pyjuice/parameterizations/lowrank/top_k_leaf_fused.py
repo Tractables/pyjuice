@@ -235,6 +235,7 @@ def leaf_backward(desc, layer, data, node_flows: torch.Tensor, kwargs: dict, log
     counts = st["counts"] if st["counts"] is not None else none
     em = compute_param_flows and layer.param_flows is not None
     fpT, fmT = (torch.zeros_like(st["tab"]), torch.zeros_like(st["tab"])) if em else (none, none)
+    pm = kwargs.get("param_flows_mask") if em else None                 # (the samples the EM statistics take)
     # the tilt's gradients' dtau: where any is wanted; where the destinations fold, each sample's times its sign summed
     # into the row it read by the kernel -- a row's gradients then one product
     graded = [n for n in nodes if gviews is not None and gviews.get(n["ns"]) is not None]
@@ -245,7 +246,7 @@ def leaf_backward(desc, layer, data, node_flows: torch.Tensor, kwargs: dict, log
     dtau = mod.top_k_leaf_backward(st["tab"], plan["nv_tab"], st["tau"], st["emap"], st["ids"], st["lp"], plan["nv_lvid"],
                                    plan["nv_row0"], st["lz"], st["lb"], st["place"], node_flows, logspace_flows,
                                    st["wrow"], st["logw"], counts, st["S"], st["K"], glp if glp is not None else none,
-                                   fpT, fmT, bool(graded), drow, dsgn, Bd)
+                                   fpT, fmT, none.bool() if pm is None else pm.contiguous(), bool(graded), drow, dsgn, Bd)
     if em:                                                                              # (F+ then F- of each block's rows)
         V = nodes[0]["ns"].dist.num_cats
         for k, spf in enumerate(plan["flows"]):

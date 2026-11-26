@@ -12,6 +12,8 @@ the evidence, the EM statistics (F+ - F- = d / d log-parameters, the tables' row
 conditional, a tree whose product holds a reading sum beside a plain one, and the structures the compiler refuses.
 """
 
+import contextlib
+
 import pytest
 import torch
 
@@ -486,6 +488,123 @@ def test_the_backward_kernels_are_the_reference():
     assert len(got) == len(ref) and len(got) > 7
     for k, (a, r_) in enumerate(zip(got[7:], ref[7:])):                    # (the EM statistics: the sums', the leaves')
         assert _rel(a, r_) < 5e-3, (k, _rel(a, r_))
+
+
+# ---------------------------------------------------------------------------------------------- param_flows_mask
+
+def _mask_case(kernels):
+    """A circuit and a batch for the masked backward: the kernels' shapes (128 nodes, top_k 64), else small ones."""
+    if kernels:
+        T, N, C, K, r, re, b, V2 = 3, 128, 70, 64, 20, 8, 4, 80
+    else:
+        T, N, C, K, r, re, b, V2 = 4, 4, 5, 2, 3, 2, 6, V
+    pc, _, _ = _hmm_pc(T, N, K, r, re, _tables(N, 41, V2), V2)
+    return pc, _batch(b, T, N, C, K, r, re, 42, V = V2), (T, N, b)
+
+
+@contextlib.contextmanager
+def _paths(kernels):
+    """The sums and the leaves by the kernels (each asserted to have run), or by the torch passes."""
+    import pyjuice.parameterizations.lowrank.top_k_fused as tkf
+    import pyjuice.parameterizations.lowrank.top_k_leaf_fused as tlf
+    import pyjuice.parameterizations.lowrank.top_k_backward as tkb
+    if kernels and (tkf.top_k_module() is None or tlf.module() is None or tkb.triton is None):
+        pytest.skip("the CUDA modules did not build, or no Triton")
+    ran = set()
+    real_terms, real_leaf = tkb.terms, tlf.leaf_backward
+    tkb.terms = lambda *a, **k: (ran.add("sums"), real_terms(*a, **k))[1]
+    tlf.leaf_backward = lambda *a, **k: (lambda got: (ran.add("leaves") if got else None, got)[1])(real_leaf(*a, **k))
+    tkf.TOP_K_FUSED = kernels
+    try:
+        yield
+    finally:
+        tkf.TOP_K_FUSED = True
+        tkb.terms, tlf.leaf_backward = real_terms, real_leaf
+    assert ran == ({"sums", "leaves"} if kernels else set()), ran
+
+
+def _stats(pc):
+    return [pc.param_flows.clone(), pc.denom_param_flows.clone(), pc.input_layer_group[0].param_flows.clone()]
+
+
+@pytest.mark.parametrize("kernels", [False, True])
+def test_masked_em_statistics_are_the_sub_batch(kernels):
+    """`param_flows_mask` on a batch of both kinds of sample (every token observed, some missing): the EM statistics --
+    the sums' F+ and F- / theta, the leaves' at observed and at missing tokens -- and `_cum_flow` are those of a backward
+    of the samples it holds; the node flows and every gradient stay the whole batch's."""
+    pc, (ext, ids, lp, x, miss), (T, N, b) = _mask_case(kernels)
+    X, MISS = x.repeat(2, 1), torch.cat([torch.zeros_like(miss), miss])
+    E = tuple(t.repeat(2, *([1] * (t.dim() - 1))) for t in ext)
+    IDS, LP = ids.repeat(2, 1, 1), lp.float().repeat(2, 1, 1)
+    m = torch.arange(2 * b, device = DEV) < b
+    m[1], m[b], m[b + 2] = False, True, True                                    # (an observed sample out, two masked in)
+    w = torch.linspace(0.5, 2.0, 2 * b, device = DEV)
+
+    def run(sel, pmask = None):
+        rows = torch.arange(2 * b, device = DEV) if sel is None else sel.nonzero().reshape(-1)
+        pext = _pc_ext(tuple(t[rows] for t in E), T, N)
+        evi = dict(categorical_evidence_logp = LP[rows].contiguous(), soft_evidence_cat_ids = IDS[rows].contiguous())
+        g = {k_: tuple(torch.zeros_like(t) for t in v) for k_, v in pext.items()}
+        glp = torch.zeros_like(evi["categorical_evidence_logp"])
+        pc.init_param_flows(flows_memory = 0.0)
+        pc._cum_flow = 0.0
+        with torch.no_grad():
+            pc(X[rows], missing_mask = MISS[rows], external_params = pext, **evi)
+        pc.backward(X[rows], ll_weights = w[rows], missing_mask = MISS[rows], compute_param_flows = True,
+                    logspace_flows = True, allow_modify_flows = False, external_params_grad = g,
+                    categorical_evidence_logp_grad = glp, param_flows_mask = pmask, **evi)
+        return _stats(pc), pc._cum_flow, pc.node_flows.clone(), [t for v in g.values() for t in v] + [glp]
+
+    with _paths(kernels):
+        got, cum, nf, grads = run(None, m)
+        _, _, nf_all, grads_all = run(None)
+        want, cum_want, _, _ = run(m)
+    assert torch.allclose(nf, nf_all, rtol = 1e-6, atol = 1e-6)
+    for a, b_ in zip(grads, grads_all):                                     # (the kernels' adds in any order)
+        assert _rel(a, b_) < 1e-5, _rel(a, b_)
+    for k, (a, w_) in enumerate(zip(got, want)):
+        assert _rel(a, w_) < 1e-5, (k, _rel(a, w_))
+    assert abs(cum - cum_want) < 1e-5 * cum_want, (cum, cum_want)
+
+
+@pytest.mark.parametrize("kernels", [False, True])
+def test_one_backward_for_the_gradients_and_the_em_statistics(kernels):
+    """The differentiable conditional in one call (the map) with `param_flows_mask` on its all-observed pass: the
+    gradients are those without the mask, and the EM statistics (the sums', their denominators, the leaves') and
+    `_cum_flow` those of the EM pass on the all-observed samples, weighted by |the upstream gradient|."""
+    pc, (ext, ids, lp, x, miss), (T, N, b) = _mask_case(kernels)
+    pext, lp = _pc_ext(ext, T, N), lp.float()
+    rows = torch.arange(b, device = DEV).repeat(2)
+    wt = torch.linspace(0.5, 2.0, b, device = DEV)
+    evi = dict(categorical_evidence_logp = lp, soft_evidence_cat_ids = ids)
+
+    def conditional(pmask):
+        ts = {g_: tuple(t.clone().requires_grad_(True) for t in v) for g_, v in pext.items()}
+        lpg = lp.clone().requires_grad_(True)
+        pc.init_param_flows(flows_memory = 0.0)
+        pc._cum_flow = 0.0
+        ll = pc(x.repeat(2, 1), missing_mask = torch.cat([torch.zeros_like(miss), miss]), external_params = ts,
+                external_params_rows = rows, categorical_evidence_logp = lpg.repeat(2, 1, 1),
+                soft_evidence_cat_ids = ids.repeat(2, 1, 1), differentiable = True,
+                **({} if pmask is None else {"param_flows_mask": pmask})).view(-1)
+        (-(wt * (ll[:b] - ll[b:])).sum()).backward()
+        return [t.grad for v in ts.values() for t in v] + [lpg.grad], _stats(pc), pc._cum_flow
+
+    with _paths(kernels):
+        grads, got, cum = conditional(torch.arange(2 * b, device = DEV) < b)
+        grads0, _, _ = conditional(None)
+        pc.init_param_flows(flows_memory = 0.0)
+        pc._cum_flow = 0.0
+        with torch.no_grad():
+            pc(x, external_params = pext, **evi)
+        pc.backward(x, ll_weights = wt, compute_param_flows = True, logspace_flows = True, allow_modify_flows = False,
+                    **evi)
+        want, cum_want = _stats(pc), pc._cum_flow
+    for name, a, b_ in zip(("A", "B", "G", "U", "D", "lp"), grads, grads0):   # (the kernels' adds in any order)
+        assert _rel(a, b_) < 1e-5, (name, _rel(a, b_))
+    for k, (a, w_) in enumerate(zip(got, want)):
+        assert _rel(a, w_) < 1e-5, (k, _rel(a, w_))
+    assert abs(cum - cum_want) < 1e-5 * cum_want, (cum, cum_want)
 
 
 def test_zero_tensors_are_the_plain_circuit():
