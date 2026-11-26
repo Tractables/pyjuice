@@ -2,9 +2,10 @@
 `LowRank(top_k)` sum layers' BACKWARD by the CUDA kernels of `kernels/c/lowrank_top_k.cu` where they serve
 (`top_k_fused.TOP_K_FUSED`, the module built, the fused forward's shapes, at most 4096 samples): from the STASH of
 the forward's sums (pi the slots' posterior a node, pi / U, pi / Z, W's shift -- kept by the forward where a backward
-may follow, else made here by its kernel) and the node flows, two passes over the forward's work items -- dA (a CTA
-128 nodes), COLS (a CTA 128 children: the element flows, dB, dG) -- their notes at the top of the .cu file. The
-gradients go straight into their destinations (each sample's into the row of tensors it read, times
+may follow, else made here by its kernel) and the node flows: COLS over the forward's work items (a CTA 128 children:
+the element flows, dB, dG, and a masked item's Gl stored), dA's GEMM of the stored Gl, an observed slot's dA pass --
+their notes at the top of the .cu file.
+The gradients go straight into their destinations (each sample's into the row of tensors it read, times
 its sign, where `external_params_rows` folds them; else into its own); the EM statistics (F+, F- over the samples, a
 tile of the parameters a CTA) by a CUDA kernel for the observed samples, the Triton one below for the masked.
 Else `top_k._sum_backward_terms`, the reference.

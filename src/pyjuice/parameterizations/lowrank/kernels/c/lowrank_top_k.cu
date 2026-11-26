@@ -61,18 +61,22 @@
 // multiply a masked sample's terms by its nodes'. Then two passes over the same work items, each a persistent launch
 // a kind of item:
 //
-//  * dA (`tk_bw_da_kernel`, the forward's tiling: 128 nodes x an item, the children in chunks of 64): W, X, Y by MMAs
-//    (alpha's and beta's fragments the A operand, kept by the warp), Gl summed over the item's samples, each times its
-//    sign (the samples of a row of tensors share its gradients: `external_params_rows`' fold), dA += Gl B^T (B the
-//    staged fp16 chunk: the forward's operand).
 //  * COLS (`tk_bw_cols_kernel`: 128 children x an item, eight warps of 16, the nodes in chunks of 32): the transposed
 //    tile -- W^T = B^T A'^T (+ l2t^T), X^T = E^T alpha^T, Y^T = E^T beta^T, the children the MMAs' M -- so the sums over
-//    the nodes stay in the warp: the element flows, dB^T += Gl^T A' (A' the forward's fp16 operand), dG^T += (W ev)^T
-//    alpha - W^T beta.
+//    the nodes stay in the warp: the element flows, Gl^T summed over the item's samples, each times its sign (the
+//    samples of a row of tensors share its gradients: `external_params_rows`' fold), dB^T += Gl^T A' (A' the forward's
+//    fp16 operand), dG^T += (W ev)^T alpha - W^T beta; and Gl^T itself, stored (fp16, [items, N, M]).
+//  * dA (`tk_bw_da_gemm_kernel`): a masked item's dA += Gl B^T, a GEMM of the stored Gl and the item's row of B (a CTA
+//    128 nodes x the ranks, the children in chunks of 32, stream-K) -- its tile made once, by the cols pass (a dA pass
+//    of its own made W, X and Y again in the forward's orientation: 1.8x the GEMM's MMAs, and the elementwise work
+//    again); the masked items in groups, a group's Gl about 2/5 of the L2 (all of them overflowed it: the GEMM 2.5x
+//    slower). An observed slot's dA (`tk_bw_da_kernel`): W again, Gl in the forward's orientation (their count is on
+//    the device: a store for them sized by its bound, ~2 MB a sample, for a few slots).
 //
 // Gl is dA's and dB's fp16 MMA operand (m16n8k16 against the fp16 factors as they lie, the sums in fp32): |Gl[i, j]|
-// <= f[i] a sample, so a power of 2 takes it into fp16's range -- a node's row by its samples' flows there (dA), the
-// item by its samples' largest flows (dB: its sum runs over the nodes) -- and comes back out of the sums. An entry
+// <= f[i] a sample, so a power of 2 takes it into fp16's range -- a node's row by its samples' flows there (dA: the
+// stored Gl, its rows' inverse scales beside it), the item by its samples' largest flows (dB: its sum runs over the
+// nodes) -- and comes back out of the sums. An entry
 // below 2^-14 of that bound loses bits (below 2^-24: all of them), what TF32 kept: MEASURED on the head's inputs
 // against float64, dA and dB are what their TF32 operand gave to every printed digit (dA 1.5e-3 .. 4.4e-3, dB 1.1e-3
 // .. 1.8e-3 of the gradient's norm: the forward's fp16 logits); the same inputs through both kernels: dA 4.4e-7, dB
@@ -80,7 +84,7 @@
 // reaches 2^8 (the forward's lazy shift), so the scale (up to 2^126, for flows ~1e-35) multiplies the bounded product,
 // last; the conversion saturates (`sat_h2`) where rounding takes a value past it.
 //
-// dA's and the cols' sums are linear in the chunks: a CTA takes an equal share of the items' chunks (stream-K) and
+// The cols' and the GEMM's sums are linear in the chunks: a CTA takes an equal share of the items' chunks (stream-K) and
 // adds (red) each segment's sums into the destinations at its end -- the gradients into the rows of tensors the samples
 // read, the element flows a sample each. MEASURED (the best Codpula head, 48 rows x both passes, 96 samples, RTX PRO
 // 6000): dA 190 us, cols 287 us a transition (the Triton kernels before: 537 + 940); vs float64 dA 1.0e-3, dB 3.9e-4,
@@ -1062,9 +1066,9 @@ __global__ void __launch_bounds__(1024) tk_items_kernel(
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
-// The backward's dA and cols passes (their operands' stash is `tk_sk_kernel`'s STASH ending): see the notes at the top.
+// The backward's cols pass and dA's GEMM (their operands' stash is `tk_sk_kernel`'s STASH ending): the notes at the top.
 
-struct BwArgs {                         // the dA and cols passes' (see `top_k_bw_grads`)
+struct BwArgs {                         // the cols pass's and dA's GEMM's (see `top_k_bw_grads`)
     const __half* AH;                    // [Bx, M, KP] fp16(log2 e A), the ranks zero-padded (the cols' staged chunks)
     const __half* BP;                    // [Bx, KP, N] fp16 (the prep's)
     const float* E;                      // [Bx, S, N] TF32-rounded (the prep's)
@@ -1078,23 +1082,25 @@ struct BwArgs {                         // the dA and cols passes' (see `top_k_b
     const float* hrow;                       // [B, M] W's shift (log2 units) a sample
     const int* drow; const float* sgn;       // [B] the row of the destinations a sample's gradients go to, its sign
     float* EF;                               // [B, N] the element flows (added into)
-    const float* A; long sA;                 // the caller's A [Bx, M, r] (rows contiguous): dA's A' fragments
-    const uint2* LTh;                        // l2t in the forward's fragment order (dA)
+    const float* A; long sA;                 // the caller's A [Bx, M, r] (rows contiguous): the observed dA's A' fragments
+    const uint2* LTh;                        // l2t in the forward's fragment order (the observed dA's)
+    __half* GLT; float* GLS;                 // [m1 - m0, N, M] a masked item's Gl^T, dB's fp16 operand; [m1 - m0] its
+                                             // scale's inverse (the cols pass's: dA's GEMM's operands)
+    int m0, m1;                              // the masked items a launch takes (a group: its Gl about 2/5 of the L2)
     float* DA; long sDA;                     // [Bd, M, r] (rows contiguous; added into)
     float* DB; long sDB;                     // [Bd, r, N]
     float* DG; long sDG;                     // [Bd, S, N]
     int r, M, N, S, Rm;
 };
 
-// --- dA
+// --- dA of the observed slots (the masked items': a GEMM of the cols pass's Gl, below)
 
-template <int NK, bool MASKED>
-struct DaGeo {   // a stage: B chunk [KP][BROW] fp16, E chunk [65 or 2][FE], ev chunks [3][TN]
+template <int NK>
+struct DaGeo {   // a stage: B chunk [KP][BROW] fp16, the samples' slots' E rows [2][FE], their ev chunks [2][TN]
     static constexpr int KP = 16 * NK;
     static constexpr int B_BYTES = KP * BROW * 2;
-    static constexpr int E_ROWS = MASKED ? 8 * NS8 + 1 : 2;
-    static constexpr int E_BYTES = E_ROWS * FE * 4;
-    static constexpr int STAGE = B_BYTES + E_BYTES + 3 * TN * 4;
+    static constexpr int E_BYTES = 2 * FE * 4;
+    static constexpr int STAGE = B_BYTES + E_BYTES + 2 * TN * 4;
     static constexpr int BYTES = 2 * STAGE;
 };
 
@@ -1123,27 +1129,25 @@ __device__ __forceinline__ void logits4(float (&Sx)[4][4], const unsigned (&af)[
     }
 }
 
-// One segment of the dA pass: item y's (masked: mitems; else an observed slot of oitems) node tile x, its children's
-// chunks c0 .. c1 - 1 -- the item's samples' Gl, each times its sign, summed; dA added into the row at the end.
-template <int NK, bool MASKED>
+// One segment of the observed slots' dA pass: slot y's (oitems) node tile x, its children's chunks c0 .. c1 - 1 -- its
+// samples' Gl, each times its sign, summed; dA added into the row at the end.
+template <int NK>
 __device__ __forceinline__ void da_segment(const BwArgs& a, int y, int x, int c0, int c1, unsigned char* smem) {
-    using G = DaGeo<NK, MASKED>;
+    using G = DaGeo<NK>;
     constexpr int KP = G::KP;
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, g = lane >> 2, t = lane & 3;
     const int N = a.N, M = a.M, S = a.S, r = a.r, nchunks = N / TN;
-    int e, bm = -1, o[2];
-    if constexpr (MASKED) { const int4 it = a.mitems[y]; bm = it.x; e = it.y; o[0] = it.z; o[1] = it.w; }
-    else { const int4 it = a.oitems[y]; e = it.x; o[0] = it.y; o[1] = it.z; }
+    const int4 it = a.oitems[y];
+    const int e = it.x;
+    int o[2] = {it.y, it.z};
     if (e < 0) return;
-    const int hb = MASKED ? bm : o[0];
+    const int hb = o[0];
     int so[2]; float sg[2];
     #pragma unroll
     for (int p = 0; p < 2; ++p) { so[p] = o[p] >= 0 ? a.slot32[o[p]] : 0; sg[p] = o[p] >= 0 ? a.sgn[o[p]] : 0.f; }
-    const float sm = MASKED ? a.sgn[bm] : 0.f;
     const int node0 = x * TM + warp * 16 + g, node1 = node0 + 8;
-    // the samples' ev chunks: masked bm, o1, o2 (v 0, 1, 2); observed o1, o2 (v 0, 1). E's rows: masked all; observed
-    // the samples' slots' (rows 0, 1)
-    constexpr int NB = KP * (TN / 8), NE = G::E_ROWS * (TN / 4), NSEG = NB + NE + 3 * (TN / 4);
+    // the samples' slots' E rows (0, 1), their ev chunks (0, 1)
+    constexpr int NB = KP * (TN / 8), NE = 2 * (TN / 4), NSEG = NB + NE + 2 * (TN / 4);
     auto load_seg = [&](int q, int st, int j0) {
         const unsigned bs = smem_u32(smem + st * G::STAGE);
         if (q < NB) {
@@ -1151,15 +1155,11 @@ __device__ __forceinline__ void da_segment(const BwArgs& a, int y, int x, int c0
             cp16(bs + (k * BROW + s * 8) * 2, a.BP + ((long)e * KP + k) * N + j0 + s * 8);
         } else if (q < NB + NE) {
             const int rr = (q - NB) / (TN / 4), s = (q - NB) % (TN / 4);
-            int srow = rr;
-            if constexpr (!MASKED) {
-                if ((rr == 0 ? o[0] : o[1]) < 0) return;
-                srow = rr == 0 ? so[0] : so[1];
-            }
-            cp16(bs + G::B_BYTES + (rr * FE + s * 4) * 4, a.E + ((long)e * S + srow) * N + j0 + s * 4);
+            if ((rr == 0 ? o[0] : o[1]) < 0) return;
+            cp16(bs + G::B_BYTES + (rr * FE + s * 4) * 4, a.E + ((long)e * S + (rr == 0 ? so[0] : so[1])) * N + j0 + s * 4);
         } else if (q < NSEG) {
             const int v = (q - NB - NE) / (TN / 4), s = (q - NB - NE) % (TN / 4);
-            const int row = MASKED ? (v == 0 ? bm : (v == 1 ? o[0] : o[1])) : (v == 0 ? o[0] : (v == 1 ? o[1] : -1));
+            const int row = v == 0 ? o[0] : o[1];
             if (row >= 0) cp16(bs + G::B_BYTES + G::E_BYTES + (v * TN + s * 4) * 4, a.ev + (long)row * N + j0 + s * 4);
         }
     };
@@ -1169,32 +1169,13 @@ __device__ __forceinline__ void da_segment(const BwArgs& a, int y, int x, int c0
 
     unsigned af[NK][4];
     a_frags<NK>(af, a.A + (long)e * a.sA + (long)node0 * r, r, t);
-    unsigned aF[MASKED ? NS8 : 1][4], bF[MASKED ? NS8 : 1][4];
-    float ar0 = 0.f, ar1 = 0.f, br0 = 0.f, br1 = 0.f;
-    if constexpr (MASKED) {
-        const float* al0 = a.alpha + ((long)y * M + node0) * SA;
-        const float* be0 = a.beta + ((long)y * M + node0) * SA;
-        #pragma unroll
-        for (int ks = 0; ks < NS8; ++ks) {
-            const float2 u = __ldg(reinterpret_cast<const float2*>(al0 + ks * 8 + 2 * t));
-            const float2 v = __ldg(reinterpret_cast<const float2*>(al0 + 8 * SA + ks * 8 + 2 * t));
-            aF[ks][0] = __float_as_uint(u.x); aF[ks][1] = __float_as_uint(v.x);
-            aF[ks][2] = __float_as_uint(u.y); aF[ks][3] = __float_as_uint(v.y);
-            const float2 w = __ldg(reinterpret_cast<const float2*>(be0 + ks * 8 + 2 * t));
-            const float2 z = __ldg(reinterpret_cast<const float2*>(be0 + 8 * SA + ks * 8 + 2 * t));
-            bF[ks][0] = __float_as_uint(w.x); bF[ks][1] = __float_as_uint(z.x);
-            bF[ks][2] = __float_as_uint(w.y); bF[ks][3] = __float_as_uint(z.y);
-        }
-        ar0 = __ldg(al0 + 8 * NS8); ar1 = __ldg(al0 + 8 * SA + 8 * NS8);
-        br0 = __ldg(be0 + 8 * NS8); br1 = __ldg(be0 + 8 * SA + 8 * NS8);
-    }
     const float h0 = a.hrow[(long)hb * M + node0], h1 = a.hrow[(long)hb * M + node1];
     float aop[2][2], bop[2][2];
     // Gl is dA's fp16 MMA operand: a node's row times a power of 2 (sc0, sc1) that takes its bound -- the flows of the
-    // item's samples there: |Gl[i, j]| <= f[i] a sample -- into fp16's range, in the samples' factors (applied LAST: W
+    // slot's samples there: |Gl[i, j]| <= f[i] a sample -- into fp16's range, in the samples' factors (applied LAST: W
     // alone reaches 2^8, the forward's lazy shift, and the scale 2^126 -- a flow ~1e-35 -- times it overflowed); the
     // row's sums (fp32) take it back out
-    float bd0 = MASKED ? a.fl[(long)bm * M + node0] : 0.f, bd1 = MASKED ? a.fl[(long)bm * M + node1] : 0.f;
+    float bd0 = 0.f, bd1 = 0.f;
     #pragma unroll
     for (int p = 0; p < 2; ++p) {
         const long r0 = o[p] >= 0 ? (long)o[p] * M + node0 : 0;
@@ -1203,9 +1184,6 @@ __device__ __forceinline__ void da_segment(const BwArgs& a, int y, int x, int c0
         bd0 += o[p] >= 0 ? a.fl[r0] : 0.f; bd1 += o[p] >= 0 ? a.fl[r0 + 8] : 0.f;
     }
     const float sc0 = fp16_scale(bd0), sc1 = fp16_scale(bd1);
-    // (the masked sample's terms: its nodes' flows -- not in alpha, beta -- times its sign)
-    const float smf0 = MASKED ? sm * sc0 * a.fl[(long)bm * M + node0] : 0.f;
-    const float smf1 = MASKED ? sm * sc1 * a.fl[(long)bm * M + node1] : 0.f;
     const float sgs[2][2] = {{sg[0] * sc0, sg[0] * sc1}, {sg[1] * sc0, sg[1] * sc1}};
     float dA[2 * NK][4];
     #pragma unroll
@@ -1247,28 +1225,11 @@ __device__ __forceinline__ void da_segment(const BwArgs& a, int y, int x, int c0
             for (int q = 0; q < 4; ++q) {
                 const int jc0 = (4 * hh + q) * 8 + 2 * t;                     // the thread's children: jc0, jc0 + 1
                 gs[q][0] = gs[q][1] = gs[q][2] = gs[q][3] = 0.f;
-                if constexpr (MASKED) {
-                    float X[4] = {0.f, 0.f, 0.f, 0.f}, Y[4] = {0.f, 0.f, 0.f, 0.f};
-                    #pragma unroll
-                    for (int ks = 0; ks < NS8; ++ks) {
-                        const unsigned b0 = __float_as_uint(Es[(ks * 8 + 2 * t) * FE + (4 * hh + q) * 8 + g]);
-                        const unsigned b1 = __float_as_uint(Es[(ks * 8 + 2 * t + 1) * FE + (4 * hh + q) * 8 + g]);
-                        mma_tf32(X, aF[ks][0], aF[ks][1], aF[ks][2], aF[ks][3], b0, b1);
-                        mma_tf32(Y, bF[ks][0], bF[ks][1], bF[ks][2], bF[ks][3], b0, b1);
-                    }
-                    const float2 evm = *reinterpret_cast<const float2*>(Vs + jc0);
-                    const float2 er = *reinterpret_cast<const float2*>(Es + (8 * NS8) * FE + jc0);
-                    const float xs[4] = {X[0] + er.x * ar0, X[1] + er.y * ar0, X[2] + er.x * ar1, X[3] + er.y * ar1};
-                    const float ys[4] = {Y[0] + er.x * br0, Y[1] + er.y * br0, Y[2] + er.x * br1, Y[3] + er.y * br1};
-                    const float ev4[4] = {evm.x, evm.y, evm.x, evm.y};
-                    #pragma unroll
-                    for (int c = 0; c < 4; ++c) gs[q][c] = W[q][c] * (ev4[c] * xs[c] - ys[c]) * (c < 2 ? smf0 : smf1);
-                }
                 #pragma unroll
                 for (int pp = 0; pp < 2; ++pp) {
                     if (o[pp] < 0) continue;
-                    const float2 es = *reinterpret_cast<const float2*>(Es + (MASKED ? so[pp] : pp) * FE + jc0);
-                    const float2 eo = *reinterpret_cast<const float2*>(Vs + (MASKED ? 1 + pp : pp) * TN + jc0);
+                    const float2 es = *reinterpret_cast<const float2*>(Es + pp * FE + jc0);
+                    const float2 eo = *reinterpret_cast<const float2*>(Vs + pp * TN + jc0);
                     gs[q][0] += W[q][0] * es.x * (aop[pp][0] * eo.x - bop[pp][0]) * sgs[pp][0];
                     gs[q][1] += W[q][1] * es.y * (aop[pp][0] * eo.y - bop[pp][0]) * sgs[pp][0];
                     gs[q][2] += W[q][2] * es.x * (aop[pp][1] * eo.x - bop[pp][1]) * sgs[pp][1];
@@ -1306,19 +1267,18 @@ __device__ __forceinline__ void da_segment(const BwArgs& a, int y, int x, int c0
     }
 }
 
-template <int NK, bool MASKED>
+template <int NK>
 __global__ void __launch_bounds__(NW * 32, 1) tk_bw_da_kernel(const BwArgs a) {
     extern __shared__ __align__(128) unsigned char smem[];
     const int ntile = a.M / TM, nch = a.N / TN;
-    const long items = MASKED ? a.Rm : 2L * (*a.noitems);
-    const long U = items * ntile * nch;
+    const long U = 2L * (*a.noitems) * ntile * nch;
     const long P = gridDim.x, k = blockIdx.x;
     const long u0 = U * k / P, u1 = U * (k + 1) / P;
     for (long u = u0; u < u1;) {
         const long tt = u / nch;
         const int c0 = (int)(u % nch);
         const int c1 = (int)min((long)nch, c0 + (u1 - u));
-        da_segment<NK, MASKED>(a, (int)(tt / ntile), (int)(tt % ntile), c0, c1, smem);
+        da_segment<NK>(a, (int)(tt / ntile), (int)(tt % ntile), c0, c1, smem);
         u += c1 - c0;
     }
 }
@@ -1366,6 +1326,10 @@ __device__ __forceinline__ void cols_segment(const BwArgs& a, int y, int x, int 
     const float sm = MASKED ? a.sgn[bm] : 0.f, sms = sm * sci;
     const float sgs[2] = {sg[0] * sci, sg[1] * sci};
     const int jw = x * CN + warp * 16;                                       // the warp's first child
+    // (a masked item's dB operand, Gl^T, stored -- dA's GEMM's, a group's items' --, and its scale's inverse, by the
+    // segment that starts the item)
+    __half* glt0 = MASKED && GRADS ? a.GLT + ((long)(y - a.m0) * N + jw + g) * M : nullptr;
+    if (MASKED && GRADS && x == 0 && c0 == 0 && tid == 0) a.GLS[y - a.m0] = 1.f / sci;
     const int j0 = jw + g, j1 = j0 + 8;                                      // the thread's (rows of W^T)
 
     constexpr int NA = CM * (KP / 8), NAB = MASKED ? CM * (SA / 4) : 0, NV = CM / 4;
@@ -1557,6 +1521,10 @@ __device__ __forceinline__ void cols_segment(const BwArgs& a, int y, int x, int 
                 // A' from the staged chunk by `ldmatrix.trans` (two rank tiles a load)
                 ga[2 * (nt & 1)] = sat_h2(gs[0], gs[1]);
                 ga[2 * (nt & 1) + 1] = sat_h2(gs[2], gs[3]);
+                if constexpr (MASKED) {                                      // (rows j0, j1: nodes i0, i0 + 1)
+                    *reinterpret_cast<unsigned*>(glt0 + (long)ic * CM + i0) = ga[2 * (nt & 1)];
+                    *reinterpret_cast<unsigned*>(glt0 + 8L * M + (long)ic * CM + i0) = ga[2 * (nt & 1) + 1];
+                }
                 if (nt & 1) {
                     #pragma unroll
                     for (int rt = 0; rt < 2 * NK; rt += 2) {
@@ -1661,7 +1629,7 @@ template <int NK, bool MASKED, bool GRADS>
 __global__ void __launch_bounds__(NW * 32, 1) tk_bw_cols_kernel(const BwArgs a) {
     extern __shared__ __align__(128) unsigned char smem[];
     const int ntile = a.N / CN, nch = a.M / CM;
-    const long items = MASKED ? a.Rm : 2L * (*a.noitems);
+    const long items = MASKED ? a.m1 - a.m0 : 2L * (*a.noitems);
     const long U = items * ntile * nch;
     const long P = gridDim.x, k = blockIdx.x;
     const long u0 = U * k / P, u1 = U * (k + 1) / P;
@@ -1669,12 +1637,121 @@ __global__ void __launch_bounds__(NW * 32, 1) tk_bw_cols_kernel(const BwArgs a) 
         const long tt = u / nch;
         const int c0 = (int)(u % nch);
         const int c1 = (int)min((long)nch, c0 + (u1 - u));
-        cols_segment<NK, MASKED, GRADS>(a, (int)(tt / ntile), (int)(tt % ntile), c0, c1, smem);
+        cols_segment<NK, MASKED, GRADS>(a, (MASKED ? a.m0 : 0) + (int)(tt / ntile), (int)(tt % ntile), c0, c1, smem);
         u += c1 - c0;
     }
 }
 
 
+
+// --- dA: a GEMM of the items' Gl (the cols pass's, stored) and their rows' B
+
+constexpr int GMN = 128, GKC = 32, GWN = 4;  // nodes a CTA (4 warps x 32), children a stage, warps a CTA
+
+template <int NK>
+struct GemmGeo {   // a stage: Gl^T chunk [GKC][GMN + 8] fp16, B chunk [KP][GKC + 8] fp16; three stages
+    static constexpr int KP = 16 * NK, GTS = GMN + 8, BR = GKC + 8, ST = 3;
+    static constexpr int G_BYTES = GKC * GTS * 2, B_BYTES = KP * BR * 2, STAGE = G_BYTES + B_BYTES;
+    static constexpr int BYTES = ST * STAGE;
+};
+
+// the group's masked item yi (m0 + yi) node tile x, its children's chunks c0 .. c1 - 1: dA [128 x KP] += Gl B^T -- a
+// warp 32 nodes x KP ranks, Gl^T's chunk by `ldmatrix.trans` (rows its nodes), B's as it lies --, Gl's scale taken
+// out, added into the destination row at the end
+template <int NK>
+__device__ __forceinline__ void da_gemm_segment(const BwArgs& a, int yi, int x, int c0, int c1, unsigned char* smem) {
+    using G = GemmGeo<NK>;
+    constexpr int KP = G::KP, GTS = G::GTS, BR = G::BR, ST = G::ST;
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, g = lane >> 2, t = lane & 3;
+    const int N = a.N, M = a.M, r = a.r;
+    const int4 it = a.mitems[a.m0 + yi];
+    const int e = it.y, hb = it.x;
+    const __half* G0 = a.GLT + (long)yi * N * M + x * GMN;
+    const __half* B0 = a.BP + (long)e * KP * N;
+    auto load = [&](int st, int j0) {
+        const unsigned s = smem_u32(smem + st * G::STAGE);
+        for (int q = tid; q < GKC * (GMN / 8); q += GWN * 32) {
+            const int row = q / (GMN / 8), c = q % (GMN / 8);
+            cp16(s + (row * GTS + c * 8) * 2, G0 + (long)(j0 + row) * M + c * 8);
+        }
+        for (int q = tid; q < KP * (GKC / 8); q += GWN * 32) {
+            const int row = q / (GKC / 8), c = q % (GKC / 8);
+            cp16(s + G::G_BYTES + (row * BR + c * 8) * 2, B0 + (long)row * N + j0 + c * 8);
+        }
+    };
+    __syncthreads();                                                         // (the last segment's stages read by all)
+    #pragma unroll
+    for (int st = 0; st < ST - 1; ++st) { if (c0 + st < c1) load(st, (c0 + st) * GKC); cp_commit(); }
+    float acc[2][KP / 8][4];
+    #pragma unroll
+    for (int mt = 0; mt < 2; ++mt)
+        #pragma unroll
+        for (int n = 0; n < KP / 8; ++n) acc[mt][n][0] = acc[mt][n][1] = acc[mt][n][2] = acc[mt][n][3] = 0.f;
+    for (int jc = c0; jc < c1; ++jc) {
+        cp_wait<ST - 2>();
+        __syncthreads();
+        if (jc + ST - 1 < c1) load((jc - c0 + ST - 1) % ST, (jc + ST - 1) * GKC);
+        cp_commit();
+        const unsigned char* p = smem + ((jc - c0) % ST) * G::STAGE;
+        const __half* Gs = reinterpret_cast<const __half*>(p);
+        const __half* Bs = reinterpret_cast<const __half*>(p + G::G_BYTES);
+        #pragma unroll
+        for (int ks = 0; ks < GKC / 16; ++ks) {
+            unsigned af[2][4];
+            const int m = lane >> 3;                                         // (matrix m: children half m >> 1, nodes m & 1)
+            #pragma unroll
+            for (int mt = 0; mt < 2; ++mt)
+                ldsm4t(af[mt], smem_u32(Gs + (ks * 16 + (m >> 1) * 8 + (lane & 7)) * GTS + warp * 32 + mt * 16 + (m & 1) * 8));
+            #pragma unroll
+            for (int n = 0; n < KP / 8; n += 2) {
+                unsigned bf[4];
+                ldsm4(bf, smem_u32(Bs + ((n + (lane >> 4)) * 8 + (lane & 7)) * BR + ks * 16 + ((lane >> 3) & 1) * 8));
+                #pragma unroll
+                for (int mt = 0; mt < 2; ++mt) {
+                    mma_f16(acc[mt][n], af[mt], bf[0], bf[1]);
+                    mma_f16(acc[mt][n + 1], af[mt], bf[2], bf[3]);
+                }
+            }
+        }
+    }
+    // into the destination row, Gl's scale taken out: ranks 2t, 2t + 1 of each 8 (pairs where r is even)
+    float* DA = a.DA + (long)a.drow[hb] * a.sDA;
+    const bool pair = (r & 1) == 0;
+    const float iv = __ldg(a.GLS + yi);
+    #pragma unroll
+    for (int mt = 0; mt < 2; ++mt) {
+        const int node0 = x * GMN + warp * 32 + mt * 16 + g;
+        float* D0 = DA + (long)node0 * r;
+        float* D1 = D0 + 8L * r;
+        #pragma unroll
+        for (int n = 0; n < KP / 8; ++n) {
+            const int k = n * 8 + 2 * t;
+            if (k + 1 < r) {
+                red2(D0 + k, acc[mt][n][0] * iv, acc[mt][n][1] * iv, pair);
+                red2(D1 + k, acc[mt][n][2] * iv, acc[mt][n][3] * iv, pair);
+            } else if (k < r) { red1(D0 + k, acc[mt][n][0] * iv); red1(D1 + k, acc[mt][n][2] * iv); }
+        }
+    }
+}
+
+// a persistent launch over the group's masked items' node tiles' children chunks (stream-K: a CTA an equal share,
+// each segment's sums added at its end)
+template <int NK>
+__global__ void __launch_bounds__(GWN * 32) tk_bw_da_gemm_kernel(const BwArgs a) {
+    extern __shared__ __align__(128) unsigned char smem[];
+    const int ntile = a.M / GMN, nch = a.N / GKC;
+    const long items = a.m1 - a.m0;
+    const long U = items * ntile * nch;
+    const long P = gridDim.x, k = blockIdx.x;
+    const long u0 = U * k / P, u1 = U * (k + 1) / P;
+    for (long u = u0; u < u1;) {
+        const long tt = u / nch;
+        const int c0 = (int)(u % nch);
+        const int c1 = (int)min((long)nch, c0 + (u1 - u));
+        da_gemm_segment<NK>(a, (int)(tt / ntile), (int)(tt % ntile), c0, c1, smem);
+        u += c1 - c0;
+    }
+}
 
 // --- EM statistics of the observed samples
 
@@ -1909,11 +1986,26 @@ void smem_attr(K kern, int bytes, int dev, bool* done) {
     }
 }
 
-template <int NK, bool MASKED>
+template <int NK>
 void da_launch(const BwArgs& args, int grid, int dev, cudaStream_t stream) {
     static bool done[64] = {};
-    smem_attr(tk_bw_da_kernel<NK, MASKED>, DaGeo<NK, MASKED>::BYTES, dev, done);
-    tk_bw_da_kernel<NK, MASKED><<<grid, NW * 32, DaGeo<NK, MASKED>::BYTES, stream>>>(args);
+    smem_attr(tk_bw_da_kernel<NK>, DaGeo<NK>::BYTES, dev, done);
+    tk_bw_da_kernel<NK><<<grid, NW * 32, DaGeo<NK>::BYTES, stream>>>(args);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+// dA's GEMM of a group of masked items: a CTA a unit at most, as many CTAs as fit on the SMs
+template <int NK>
+void gemm_launch(const BwArgs& args, long items, int sms, int dev, cudaStream_t stream) {
+    static bool done[64] = {};
+    static int fit[64] = {};
+    smem_attr(tk_bw_da_gemm_kernel<NK>, GemmGeo<NK>::BYTES, dev, done);
+    if (fit[dev] == 0)
+        C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&fit[dev], tk_bw_da_gemm_kernel<NK>, GWN * 32,
+                                                                     GemmGeo<NK>::BYTES));
+    const long units = items * (args.M / GMN) * (args.N / GKC);
+    const int grid = (int)std::max(1L, std::min((long)sms * std::max(fit[dev], 1), units));
+    tk_bw_da_gemm_kernel<NK><<<grid, GWN * 32, GemmGeo<NK>::BYTES, stream>>>(args);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
@@ -1925,19 +2017,27 @@ void cols_launch(const BwArgs& args, int grid, int dev, cudaStream_t stream) {
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
-// the backward's dA and cols launches of a node vector: a pass and a kind of item a launch, each a CTA an SM at most (a
-// CTA a unit of work: the observed slots' count -- on the device -- bounded by the observed samples')
+// the backward's launches of a node vector, each a CTA an SM at most (a CTA a unit of work: the observed slots' count --
+// on the device -- bounded by the observed samples'): the cols pass a kind of item a launch -- with gradients, the masked
+// items in groups of `gsz` (their Gl about 2/5 of the L2), each group's dA's GEMM after its cols pass (its Gl read where
+// that left it) --, then the observed slots' dA
 template <int NK>
-void bw_launches(const BwArgs& args, bool grads, int B, int sms, int dev, cudaStream_t stream) {
+void bw_launches(BwArgs args, bool grads, int B, long gsz, int sms, int dev, cudaStream_t stream) {
     const long Rm = args.Rm, nob = B - Rm;
     auto grid = [&](long items, long units) { return (int)std::max(1L, std::min((long)sms, items * units)); };
     const long uda = (long)(args.M / TM) * (args.N / TN), ucols = (long)(args.N / CN) * (args.M / CM);
     if (grads) {
-        if (Rm > 0) da_launch<NK, true>(args, grid(Rm, uda), dev, stream);
-        if (nob > 0) da_launch<NK, false>(args, grid(nob, uda), dev, stream);
-        if (Rm > 0) cols_launch<NK, true, true>(args, grid(Rm, ucols), dev, stream);
-        if (nob > 0) cols_launch<NK, false, true>(args, grid(nob, ucols), dev, stream);
+        for (long m0 = 0; m0 < Rm; m0 += gsz) {
+            args.m0 = (int)m0; args.m1 = (int)std::min(Rm, m0 + gsz);
+            cols_launch<NK, true, true>(args, grid(args.m1 - args.m0, ucols), dev, stream);
+            gemm_launch<NK>(args, args.m1 - args.m0, sms, dev, stream);
+        }
+        if (nob > 0) {
+            cols_launch<NK, false, true>(args, grid(nob, ucols), dev, stream);
+            da_launch<NK>(args, grid(nob, uda), dev, stream);
+        }
     } else {
+        args.m0 = 0; args.m1 = (int)Rm;
         if (Rm > 0) cols_launch<NK, true, false>(args, grid(Rm, ucols), dev, stream);
         if (nob > 0) cols_launch<NK, false, false>(args, grid(nob, ucols), dev, stream);
     }
@@ -2165,10 +2265,11 @@ std::vector<torch::Tensor> top_k_bw_prep(torch::Tensor A, torch::Tensor theta, i
     return {AH, L2T, LTc};
 }
 
-// The backward's dA and cols passes of one node vector, from the operands (the prep's, `top_k_bw_prep`'s) and the rows
-// pass's terms: the element flows into EF [B, N]; with gradients (DA non-empty) dA, dB, dG, each sample's times its
-// sign `sgn` [B], into the rows `drow` [B] of DA [Bd, M, r], DB [Bd, r, N], DG [Bd, S, N] (fp32, rows contiguous, batch
-// strides a multiple of 4 floats) -- every destination ADDED into.
+// The backward's passes of one node vector, from the operands (the prep's, `top_k_bw_prep`'s) and the stash's terms
+// (the flows in them: `top_k_flows`): the element flows into EF [B, N]; with gradients (DA non-empty) dA, dB, dG, each
+// sample's times its sign `sgn` [B], into the rows `drow` [B] of DA [Bd, M, r], DB [Bd, r, N], DG [Bd, S, N] (fp32,
+// rows contiguous, batch strides a multiple of 4 floats) -- every destination ADDED into. A [Bx, M, r] the caller's. With
+// gradients, a group's masked items' Gl (fp16, ~2 MB an item at N = M = 1024) is made for dA's GEMM, then freed.
 void top_k_bw_grads(torch::Tensor A, torch::Tensor AH, torch::Tensor BP, torch::Tensor E, torch::Tensor ev,
                     torch::Tensor LTh, torch::Tensor LTc, torch::Tensor mitems, torch::Tensor oitems,
                     torch::Tensor noitems, torch::Tensor slot32, torch::Tensor alpha, torch::Tensor beta,
@@ -2193,6 +2294,17 @@ void top_k_bw_grads(torch::Tensor A, torch::Tensor AH, torch::Tensor BP, torch::
     args.fl = fl.data_ptr<float>(); args.fmx = fmx.data_ptr<float>();
     args.EF = EF.data_ptr<float>(); args.A = A.data_ptr<float>(); args.sA = A.stride(0);
     args.LTh = reinterpret_cast<const uint2*>(LTh.data_ptr<int>());
+    torch::Tensor GLT, GLS;
+    long gsz = std::max(Rm, 1);
+    if (grads && Rm > 0) {
+        const long l2 = at::cuda::getCurrentDeviceProperties()->l2CacheSize, ib = (long)N * M * 2;
+        gsz = std::max(1L, std::min((long)Rm, l2 * 2 / 5 / ib));
+        const long ng = (Rm + gsz - 1) / gsz;
+        gsz = (Rm + ng - 1) / ng;                                            // (the groups even)
+        GLT = torch::empty({gsz, N, M}, A.options().dtype(at::kHalf));
+        GLS = torch::empty({gsz}, A.options());
+        args.GLT = reinterpret_cast<__half*>(GLT.data_ptr<at::Half>()); args.GLS = GLS.data_ptr<float>();
+    }
     if (grads) {
         check(drow, at::kInt, "drow"); check(sgn, at::kFloat, "sgn");
         check_rows(DA, at::kFloat, "dA"); check_rows(DB, at::kFloat, "dB"); check_rows(DG, at::kFloat, "dG");
@@ -2208,10 +2320,10 @@ void top_k_bw_grads(torch::Tensor A, torch::Tensor AH, torch::Tensor BP, torch::
     const int sms = at::cuda::getCurrentDeviceProperties()->multiProcessorCount, dev = A.get_device();
     auto stream = at::cuda::getCurrentCUDAStream();
     switch (KP / 16) {
-        case 2: bw_launches<2>(args, grads, B, sms, dev, stream); break;
-        case 4: bw_launches<4>(args, grads, B, sms, dev, stream); break;
-        case 6: bw_launches<6>(args, grads, B, sms, dev, stream); break;
-        case 8: bw_launches<8>(args, grads, B, sms, dev, stream); break;
+        case 2: bw_launches<2>(args, grads, B, gsz, sms, dev, stream); break;
+        case 4: bw_launches<4>(args, grads, B, gsz, sms, dev, stream); break;
+        case 6: bw_launches<6>(args, grads, B, gsz, sms, dev, stream); break;
+        case 8: bw_launches<8>(args, grads, B, gsz, sms, dev, stream); break;
         default: TORCH_CHECK(false, "top_k: ranks padded to 32, 64, 96 or 128");
     }
 }
