@@ -1610,6 +1610,124 @@ __global__ void __launch_bounds__(NW * 32, 1) tk_bw_cols_kernel(const BwArgs a) 
 }
 
 
+
+// --- EM statistics of the observed samples
+
+// F+[i, j] = sum_b W_b[i, j] es_b[j] ev_b[j] ao_b[i],  F-[i, j] = sum_b W_b[i, j] es_b[j] bo_b[i] over the observed
+// samples b (es_b: E's row of its slot): a CTA owns tiles of the parameters (128 nodes x 64 children, the forward's
+// warp tiling) and walks the samples -- stream-K over (tile, sample), each segment's sums added (red) into FP, FM at its
+// end. l2t's fragments once a segment; a sample's B chunk (with its es, ev) staged by cp.async, double-buffered across
+// samples; its A' fragments from AH straight into registers (each warp its own 16 nodes).
+struct EmArgs {
+    const __half* AH; const __half* BP; const float* E; const float* ev; const uint2* LTh;
+    const float* ao; const float* bo; const float* hrow; const int* slot; const int* emap;   // slot -1: masked
+    float* FP; float* FM;
+    int M, N, S, B;
+};
+
+template <int NK>
+struct EmGeo {                         // a stage: B chunk [KP][BROW] fp16, es and ev [2][TN]
+    static constexpr int KP = 16 * NK;
+    static constexpr int B_BYTES = KP * BROW * 2;
+    static constexpr int STAGE = B_BYTES + 2 * TN * 4;
+    static constexpr int BYTES = 2 * STAGE;
+};
+
+template <int NK>
+__device__ __forceinline__ void em_segment(const EmArgs& a, int tile, int b0, int b1, unsigned char* smem) {
+    using G = EmGeo<NK>;
+    constexpr int KP = G::KP;
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, g = lane >> 2, t = lane & 3;
+    const int N = a.N, M = a.M, S = a.S, nchunks = N / TN;
+    const int x = tile / nchunks, c = tile % nchunks, j0 = c * TN;
+    const int node0 = x * TM + warp * 16 + g, node1 = node0 + 8;
+    auto next_obs = [&](int b) { while (b < b1 && a.slot[b] < 0) ++b; return b; };
+    constexpr int NB = KP * (TN / 8), NSEG = NB + 2 * (TN / 4);
+    auto load_seg = [&](int q, int st, int b) {
+        const int e = a.emap != nullptr ? a.emap[b] : b;
+        const unsigned bs = smem_u32(smem + st * G::STAGE);
+        if (q < NB) {
+            const int k = q / (TN / 8), s = q % (TN / 8);
+            cp16(bs + (k * BROW + s * 8) * 2, a.BP + ((long)e * KP + k) * N + j0 + s * 8);
+        } else {
+            const int v = (q - NB) / (TN / 4), s = (q - NB) % (TN / 4);
+            const float* src = v == 0 ? a.E + ((long)e * S + a.slot[b]) * N : a.ev + (long)b * N;
+            cp16(bs + G::B_BYTES + (v * TN + s * 4) * 4, src + j0 + s * 4);
+        }
+    };
+    int b = next_obs(b0);
+    if (b >= b1) return;                                                     // (no observed sample: the CTA's)
+    __syncthreads();                                                         // (the last segment's stages read by all)
+    for (int q = tid; q < NSEG; q += NW * 32) load_seg(q, 0, b);
+    cp_commit();
+    uint2 lt[8];
+    const uint2* ltp = a.LTh + ((long)(x * NW + warp) * nchunks * 8) * 32 + lane;
+    #pragma unroll
+    for (int nt = 0; nt < 8; ++nt) lt[nt] = __ldg(ltp + (c * 8 + nt) * 32);
+    float Fp[8][4], Fm[8][4];
+    #pragma unroll
+    for (int nt = 0; nt < 8; ++nt)
+        #pragma unroll
+        for (int q = 0; q < 4; ++q) Fp[nt][q] = Fm[nt][q] = 0.f;
+    for (int st = 0; b < b1; st ^= 1) {
+        const int bn = next_obs(b + 1);
+        cp_wait<0>();
+        __syncthreads();                     // (this sample's stage complete; the other free)
+        if (bn < b1) {
+            for (int q = tid; q < NSEG; q += NW * 32) load_seg(q, st ^ 1, bn);
+            cp_commit();
+        }
+        const int e = a.emap != nullptr ? a.emap[b] : b;
+        unsigned af[NK][4];                                                  // A' fragments: AH's half pairs
+        const unsigned* p0 = reinterpret_cast<const unsigned*>(a.AH + ((long)e * M + node0) * KP);
+        const unsigned* p1 = p0 + 8 * KP / 2;
+        #pragma unroll
+        for (int ks = 0; ks < NK; ++ks) {
+            af[ks][0] = __ldg(p0 + ks * 8 + t); af[ks][1] = __ldg(p1 + ks * 8 + t);
+            af[ks][2] = __ldg(p0 + ks * 8 + 4 + t); af[ks][3] = __ldg(p1 + ks * 8 + 4 + t);
+        }
+        const float h0 = a.hrow[(long)b * M + node0], h1 = a.hrow[(long)b * M + node1];
+        const float a0 = a.ao[(long)b * M + node0], a1 = a.ao[(long)b * M + node1];
+        const float c0 = a.bo[(long)b * M + node0], c1 = a.bo[(long)b * M + node1];
+        const unsigned char* sp = smem + st * G::STAGE;
+        const float* Vs = reinterpret_cast<const float*>(sp + G::B_BYTES);
+        float W[8][4];
+        logits<NK>(W, af, reinterpret_cast<const __half*>(sp), lt, lane);
+        #pragma unroll
+        for (int nt = 0; nt < 8; ++nt) {
+            const float2 es = *reinterpret_cast<const float2*>(Vs + nt * 8 + 2 * t);
+            const float2 ev = *reinterpret_cast<const float2*>(Vs + TN + nt * 8 + 2 * t);
+            const float w0 = exp2f(W[nt][0] - h0) * es.x, w1 = exp2f(W[nt][1] - h0) * es.y;
+            const float w2 = exp2f(W[nt][2] - h1) * es.x, w3 = exp2f(W[nt][3] - h1) * es.y;
+            Fp[nt][0] += w0 * ev.x * a0; Fp[nt][1] += w1 * ev.y * a0;
+            Fp[nt][2] += w2 * ev.x * a1; Fp[nt][3] += w3 * ev.y * a1;
+            Fm[nt][0] += w0 * c0; Fm[nt][1] += w1 * c0; Fm[nt][2] += w2 * c1; Fm[nt][3] += w3 * c1;
+        }
+        b = bn;
+    }
+    float* P0 = a.FP + (long)node0 * N + j0 + 2 * t;
+    float* Q0 = a.FM + (long)node0 * N + j0 + 2 * t;
+    #pragma unroll
+    for (int nt = 0; nt < 8; ++nt) {
+        red2(P0 + nt * 8, Fp[nt][0], Fp[nt][1], true); red2(P0 + 8L * N + nt * 8, Fp[nt][2], Fp[nt][3], true);
+        red2(Q0 + nt * 8, Fm[nt][0], Fm[nt][1], true); red2(Q0 + 8L * N + nt * 8, Fm[nt][2], Fm[nt][3], true);
+    }
+}
+
+template <int NK>
+__global__ void __launch_bounds__(NW * 32, 1) tk_bw_em_obs_kernel(const EmArgs a) {
+    extern __shared__ __align__(128) unsigned char smem[];
+    const int ntile = (a.M / TM) * (a.N / TN);
+    const long U = (long)ntile * a.B, P = gridDim.x, k = blockIdx.x;
+    const long u0 = U * k / P, u1 = U * (k + 1) / P;
+    for (long u = u0; u < u1;) {
+        const int tile = (int)(u / a.B), b0 = (int)(u % a.B);
+        const int b1 = (int)min((long)a.B, b0 + (u1 - u));
+        em_segment<NK>(a, tile, b0, b1, smem);
+        u += b1 - b0;
+    }
+}
+
 // The backward's operands beside the prep's (one launch, blockIdx.y the task): AH [Bx, M, KP] = fp16(log2 e A), the
 // ranks zero-padded (a thread 8 of a row's, one 16-byte store); l2t [M, N] fp16 = log2 theta less its row's largest
 // (the forward's values, row-major; a warp a row)
@@ -1961,12 +2079,55 @@ void top_k_bw_grads(torch::Tensor A, torch::Tensor AH, torch::Tensor BP, torch::
     }
 }
 
+// The EM statistics of the observed samples (slot >= 0; -1 a masked one, skipped) added into FP, FM [M, N] (fp32):
+// from the operands (AH, BP, E, ev, LTh) and the rows pass's ao, bo, hrow; emap the row a sample reads (empty: its own).
+void top_k_bw_em_observed(torch::Tensor AH, torch::Tensor BP, torch::Tensor E, torch::Tensor ev, torch::Tensor LTh,
+                          torch::Tensor ao, torch::Tensor bo, torch::Tensor hrow, torch::Tensor slot, torch::Tensor emap,
+                          torch::Tensor FP, torch::Tensor FM) {
+    const c10::cuda::CUDAGuard guard(AH.device());
+    check(slot, at::kInt, "slot"); check(FP, at::kFloat, "FP"); check(FM, at::kFloat, "FM");
+    const int M = AH.size(1), KP = AH.size(2), N = BP.size(2), S = E.size(1), B = ev.size(0);
+    TORCH_CHECK(M % TM == 0 && N % TN == 0 && FP.size(0) == M && FP.size(1) == N && FM.sizes() == FP.sizes() &&
+                slot.size(0) == B, "top_k: the EM statistics' shapes");
+    EmArgs args{};
+    args.AH = reinterpret_cast<const __half*>(AH.data_ptr<at::Half>());
+    args.BP = reinterpret_cast<const __half*>(BP.data_ptr<at::Half>()); args.E = E.data_ptr<float>();
+    args.ev = ev.data_ptr<float>(); args.LTh = reinterpret_cast<const uint2*>(LTh.data_ptr<int>());
+    args.ao = ao.data_ptr<float>(); args.bo = bo.data_ptr<float>(); args.hrow = hrow.data_ptr<float>();
+    args.slot = slot.data_ptr<int>(); args.emap = emap.numel() > 0 ? emap.data_ptr<int>() : nullptr;
+    args.FP = FP.data_ptr<float>(); args.FM = FM.data_ptr<float>();
+    args.M = M; args.N = N; args.S = S; args.B = B;
+    if (emap.numel() > 0) check(emap, at::kInt, "emap");
+    const int sms = at::cuda::getCurrentDeviceProperties()->multiProcessorCount, dev = AH.get_device();
+    const long units = (long)(M / TM) * (N / TN) * B;
+    const int grid = (int)std::max(1L, std::min((long)sms, units));
+    auto stream = at::cuda::getCurrentCUDAStream();
+#define EM_CASE(NKV)                                                                                               \
+    case NKV: {                                                                                                    \
+        static bool done[64] = {};                                                                                 \
+        smem_attr(tk_bw_em_obs_kernel<NKV>, EmGeo<NKV>::BYTES, dev, done);                                         \
+        tk_bw_em_obs_kernel<NKV><<<grid, NW * 32, EmGeo<NKV>::BYTES, stream>>>(args);                              \
+        C10_CUDA_KERNEL_LAUNCH_CHECK();                                                                            \
+        break;                                                                                                     \
+    }
+    switch (KP / 16) {
+        EM_CASE(2)
+        EM_CASE(4)
+        EM_CASE(6)
+        EM_CASE(8)
+        default: TORCH_CHECK(false, "top_k: ranks padded to 32, 64, 96 or 128");
+    }
+#undef EM_CASE
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("top_k_prep", &top_k_prep, "a LowRank(top_k) sum node vector's operands and work items for `top_k_forward`");
     m.def("top_k_forward", &top_k_forward,
           "a LowRank(top_k) sum node vector's values: a persistent stream-K launch for each kind of work item");
     m.def("top_k_bw_rows", &top_k_bw_rows, "the backward's rows pass: the counts, alpha, beta and W's shift");
     m.def("top_k_bw_prep", &top_k_bw_prep, "the backward's operands beside the prep's: fp16 A', l2t, l2t for the cols");
+    m.def("top_k_bw_em_observed", &top_k_bw_em_observed,
+          "the backward's EM statistics of the observed samples (a tile of the parameters a CTA, over the samples)");
     m.def("top_k_bw_grads", &top_k_bw_grads,
           "the backward's dA and cols passes: the element flows and the gradients, added into their destinations");
 }
