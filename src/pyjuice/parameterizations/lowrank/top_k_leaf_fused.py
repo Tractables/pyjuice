@@ -231,14 +231,20 @@ def counts_buffer(sib: dict, K: int, batch_size: int):
     if st is None or st["K"] != K or K + 2 > COUNTS_STRIDE:
         return None
     t = _plan(sib["layer"])["index"][id(sib["ns"])]
-    return _counts(st)[st["offs"][t]:st["offs"][t + 1]]
+    buf = _counts(st)
+    st["written"].add(t)                                           # (its rows the sum's kernels' to write)
+    return buf[st["offs"][t]:st["offs"][t + 1]]
 
 
 def _counts(st: dict) -> torch.Tensor:
-    if st["counts"] is None:                                       # (zeros: a row no sum writes reads none)
+    # (not zeroed: a leaf's rows are written whole -- the posterior and the flow, entries 0 .. K + 1 of a node, the
+    # rest never read -- by the sum that reads it, before the leaf's backward; `written` the leaves whose rows a sum
+    # took, the others' zeroed there)
+    if st["counts"] is None:
         R, M, _ = st["logw"].shape
-        st["counts"] = torch.zeros(R, M, max(st["K"] + 2, COUNTS_STRIDE), dtype = st["logw"].dtype,
+        st["counts"] = torch.empty(R, M, max(st["K"] + 2, COUNTS_STRIDE), dtype = st["logw"].dtype,
                                    device = st["logw"].device)
+        st["written"] = set()
     return st["counts"]
 
 
@@ -251,6 +257,7 @@ def add_counts(sib: dict, K: int, batch_size: int, a_rows: torch.Tensor) -> bool
         return False
     t = _plan(sib["layer"])["index"][id(sib["ns"])]
     dst = _counts(st)[st["offs"][t]:st["offs"][t + 1]]
+    st["written"].add(t)
     if dst.numel() > 0:
         f = a_rows.sum(dim = 2, keepdim = True)                    # (a node's flow; its slots' posterior)
         dst[:, :, :K + 1] = torch.where(f > 0, a_rows / f, torch.zeros_like(a_rows))
@@ -349,6 +356,10 @@ def leaf_backward(desc, layer, data, node_flows: torch.Tensor, kwargs: dict, log
     dev = node_flows.device
     none = torch.empty(0, device = dev)
     counts = st["counts"] if st["counts"] is not None else none
+    if counts.numel() > 0:                                             # (the rows of a leaf no sum wrote: none read)
+        for t in range(len(st["offs"]) - 1):
+            if st["offs"][t + 1] > st["offs"][t] and t not in st["written"]:
+                counts[st["offs"][t]:st["offs"][t + 1]].zero_()
     em = compute_param_flows and layer.param_flows is not None
     pm = kwargs.get("param_flows_mask") if em else None                 # (the samples the EM statistics take)
     # the tilt's gradients' dtau: where any is wanted; where the destinations fold, each sample's times its sign summed
