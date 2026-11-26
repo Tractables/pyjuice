@@ -1648,12 +1648,13 @@ __global__ void __launch_bounds__(NW * 32, 1) tk_bw_cols_kernel(const BwArgs a) 
 
 // --- dA: a GEMM of the items' Gl (the cols pass's, stored) and their rows' B
 
-constexpr int GMN = 128, GKC = 32, GWN = 4;  // nodes a CTA (4 warps x 32), children a stage, warps a CTA
+constexpr int GMN = 128, GKC = 64, GWN = 4;  // nodes a CTA (4 warps x 32), children a stage, warps a CTA
 
 template <int NK>
-struct GemmGeo {   // a stage: Gl^T chunk [GKC][GMN + 8] fp16, B chunk [KP][GKC + 8] fp16; three stages
-    static constexpr int KP = 16 * NK, GTS = GMN + 8, BR = GKC + 8, ST = 3;
+struct GemmGeo {   // a stage: Gl^T chunk [GKC][GMN + 8] fp16, B chunk [KP][GKC + 8] fp16; three stages where they fit
+    static constexpr int KP = 16 * NK, GTS = GMN + 8, BR = GKC + 8;
     static constexpr int G_BYTES = GKC * GTS * 2, B_BYTES = KP * BR * 2, STAGE = G_BYTES + B_BYTES;
+    static constexpr int ST = 3 * STAGE <= 99 * 1024 ? 3 : 2;
     static constexpr int BYTES = ST * STAGE;
 };
 
@@ -1758,10 +1759,12 @@ __global__ void __launch_bounds__(GWN * 32) tk_bw_da_gemm_kernel(const BwArgs a)
 // --- EM statistics of the observed samples
 
 // F+[i, j] = sum_b W_b[i, j] es_b[j] ev_b[j] ao_b[i],  F-[i, j] = sum_b W_b[i, j] es_b[j] bo_b[i] over the observed
-// samples b (es_b: E's row of its slot): a CTA owns tiles of the parameters (128 nodes x 64 children, the forward's
-// warp tiling) and walks the samples -- stream-K over (tile, sample), each segment's sums added (red) into FP, FM at its
-// end. l2t's fragments once a segment; a sample's B chunk (with its es, ev) staged by cp.async, double-buffered across
-// samples; its A' fragments from AH straight into registers (each warp its own 16 nodes).
+// samples b (es_b: E's row of its slot): a CTA owns tiles of the parameters (128 nodes x two chunks of 64 children, the
+// forward's warp tiling) and walks the samples -- stream-K over (tile, sample), each segment's sums added (red) into FP,
+// FM at its end. l2t's fragments once a segment; a sample's B chunks (with its es, ev) staged by cp.async,
+// double-buffered across samples; its A' fragments from AH straight into registers (each warp its own 16 nodes), read
+// once for both chunks (their L2 traffic, a sample a tile, the kernel's largest cost after the MMAs: 85 -> 76 us a
+// transition at the best Codpula head; staging them in shared memory instead took 93).
 struct EmArgs {
     const __half* AH; const __half* BP; const float* E; const float* ev; const uint2* LTh;
     const float* ao; const float* bo; const float* hrow; const int* slot; const int* emap;   // slot -1: masked
@@ -1770,11 +1773,14 @@ struct EmArgs {
     int M, N, S, B, nl;
 };
 
+constexpr int ECH = 2;                 // an EM tile's children chunks
+
 template <int NK>
-struct EmGeo {                         // a stage: B chunk [KP][BROW] fp16, es and ev [2][TN]
+struct EmGeo {                         // a stage: ECH x { B chunk [KP][BROW] fp16, es and ev [2][TN] }
     static constexpr int KP = 16 * NK;
     static constexpr int B_BYTES = KP * BROW * 2;
-    static constexpr int STAGE = B_BYTES + 2 * TN * 4;
+    static constexpr int CHUNK = B_BYTES + 2 * TN * 4;
+    static constexpr int STAGE = ECH * CHUNK;
     static constexpr int BYTES = 2 * STAGE;
 };
 
@@ -1783,23 +1789,24 @@ __device__ __forceinline__ void em_segment(const EmArgs& a, int tile, int l0, in
     using G = EmGeo<NK>;
     constexpr int KP = G::KP;
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, g = lane >> 2, t = lane & 3;
-    const int N = a.N, M = a.M, S = a.S, nchunks = N / TN;
-    const int x = tile / nchunks, c = tile % nchunks, j0 = c * TN;
+    const int N = a.N, M = a.M, S = a.S, nchunks = N / TN, ntc = nchunks / ECH;
+    const int x = tile / ntc, c = (tile % ntc) * ECH, j0 = c * TN;           // (c: the tile's first chunk)
     const int node0 = x * TM + warp * 16 + g, node1 = node0 + 8;
     // (the walk's places l0 .. l1 - 1: a place's sample, -1 where none -- the list's padding, or a masked sample)
     auto smp = [&](int l) { const int b = a.olist != nullptr ? a.olist[l] : l; return b >= 0 && a.slot[b] >= 0 ? b : -1; };
     auto next_obs = [&](int l) { while (l < l1 && smp(l) < 0) ++l; return l; };
-    constexpr int NB = KP * (TN / 8), NSEG = NB + 2 * (TN / 4);
-    auto load_seg = [&](int q, int st, int b) {
+    constexpr int NB = KP * (TN / 8), NC = NB + 2 * (TN / 4), NSEG = ECH * NC;
+    auto load_seg = [&](int qq, int st, int b) {
         const int e = a.emap != nullptr ? a.emap[b] : b;
-        const unsigned bs = smem_u32(smem + st * G::STAGE);
+        const int ch = qq / NC, q = qq % NC, jc = j0 + ch * TN;
+        const unsigned bs = smem_u32(smem + st * G::STAGE + ch * G::CHUNK);
         if (q < NB) {
             const int k = q / (TN / 8), s = q % (TN / 8);
-            cp16(bs + (k * BROW + s * 8) * 2, a.BP + ((long)e * KP + k) * N + j0 + s * 8);
+            cp16(bs + (k * BROW + s * 8) * 2, a.BP + ((long)e * KP + k) * N + jc + s * 8);
         } else {
             const int v = (q - NB) / (TN / 4), s = (q - NB) % (TN / 4);
             const float* src = v == 0 ? a.E + ((long)e * S + a.slot[b]) * N : a.ev + (long)b * N;
-            cp16(bs + G::B_BYTES + (v * TN + s * 4) * 4, src + j0 + s * 4);
+            cp16(bs + G::B_BYTES + (v * TN + s * 4) * 4, src + jc + s * 4);
         }
     };
     int l = next_obs(l0);
@@ -1808,15 +1815,19 @@ __device__ __forceinline__ void em_segment(const EmArgs& a, int tile, int l0, in
     __syncthreads();                                                         // (the last segment's stages read by all)
     for (int q = tid; q < NSEG; q += NW * 32) load_seg(q, 0, b);
     cp_commit();
-    uint2 lt[8];
+    uint2 lt[ECH][8];
     const uint2* ltp = a.LTh + ((long)(x * NW + warp) * nchunks * 8) * 32 + lane;
     #pragma unroll
-    for (int nt = 0; nt < 8; ++nt) lt[nt] = __ldg(ltp + (c * 8 + nt) * 32);
-    float Fp[8][4], Fm[8][4];
-    #pragma unroll
-    for (int nt = 0; nt < 8; ++nt)
+    for (int ch = 0; ch < ECH; ++ch)
         #pragma unroll
-        for (int q = 0; q < 4; ++q) Fp[nt][q] = Fm[nt][q] = 0.f;
+        for (int nt = 0; nt < 8; ++nt) lt[ch][nt] = __ldg(ltp + ((c + ch) * 8 + nt) * 32);
+    float Fp[ECH][8][4], Fm[ECH][8][4];
+    #pragma unroll
+    for (int ch = 0; ch < ECH; ++ch)
+        #pragma unroll
+        for (int nt = 0; nt < 8; ++nt)
+            #pragma unroll
+            for (int q = 0; q < 4; ++q) Fp[ch][nt][q] = Fm[ch][nt][q] = 0.f;
     for (int st = 0; l < l1; st ^= 1) {
         const int ln = next_obs(l + 1), bn = ln < l1 ? smp(ln) : -1;
         cp_wait<0>();
@@ -1837,36 +1848,44 @@ __device__ __forceinline__ void em_segment(const EmArgs& a, int tile, int l0, in
         const float h0 = a.hrow[(long)b * M + node0], h1 = a.hrow[(long)b * M + node1];
         const float a0 = a.ao[(long)b * M + node0], a1 = a.ao[(long)b * M + node1];
         const float c0 = a.bo[(long)b * M + node0], c1 = a.bo[(long)b * M + node1];
-        const unsigned char* sp = smem + st * G::STAGE;
-        const float* Vs = reinterpret_cast<const float*>(sp + G::B_BYTES);
-        float W[8][4];
-        logits<NK>(W, af, reinterpret_cast<const __half*>(sp), lt, lane);
         #pragma unroll
-        for (int nt = 0; nt < 8; ++nt) {
-            const float2 es = *reinterpret_cast<const float2*>(Vs + nt * 8 + 2 * t);
-            const float2 ev = *reinterpret_cast<const float2*>(Vs + TN + nt * 8 + 2 * t);
-            const float w0 = exp2f(W[nt][0] - h0) * es.x, w1 = exp2f(W[nt][1] - h0) * es.y;
-            const float w2 = exp2f(W[nt][2] - h1) * es.x, w3 = exp2f(W[nt][3] - h1) * es.y;
-            Fp[nt][0] += w0 * ev.x * a0; Fp[nt][1] += w1 * ev.y * a0;
-            Fp[nt][2] += w2 * ev.x * a1; Fp[nt][3] += w3 * ev.y * a1;
-            Fm[nt][0] += w0 * c0; Fm[nt][1] += w1 * c0; Fm[nt][2] += w2 * c1; Fm[nt][3] += w3 * c1;
+        for (int ch = 0; ch < ECH; ++ch) {
+            const unsigned char* sp = smem + st * G::STAGE + ch * G::CHUNK;
+            const float* Vs = reinterpret_cast<const float*>(sp + G::B_BYTES);
+            float W[8][4];
+            logits<NK>(W, af, reinterpret_cast<const __half*>(sp), lt[ch], lane);
+            #pragma unroll
+            for (int nt = 0; nt < 8; ++nt) {
+                const float2 es = *reinterpret_cast<const float2*>(Vs + nt * 8 + 2 * t);
+                const float2 ev = *reinterpret_cast<const float2*>(Vs + TN + nt * 8 + 2 * t);
+                const float w0 = exp2f(W[nt][0] - h0) * es.x, w1 = exp2f(W[nt][1] - h0) * es.y;
+                const float w2 = exp2f(W[nt][2] - h1) * es.x, w3 = exp2f(W[nt][3] - h1) * es.y;
+                Fp[ch][nt][0] += w0 * ev.x * a0; Fp[ch][nt][1] += w1 * ev.y * a0;
+                Fp[ch][nt][2] += w2 * ev.x * a1; Fp[ch][nt][3] += w3 * ev.y * a1;
+                Fm[ch][nt][0] += w0 * c0; Fm[ch][nt][1] += w1 * c0; Fm[ch][nt][2] += w2 * c1; Fm[ch][nt][3] += w3 * c1;
+            }
         }
         l = ln;
         b = bn;
     }
-    float* P0 = a.FP + (long)node0 * N + j0 + 2 * t;
-    float* Q0 = a.FM + (long)node0 * N + j0 + 2 * t;
     #pragma unroll
-    for (int nt = 0; nt < 8; ++nt) {
-        red2(P0 + nt * 8, Fp[nt][0], Fp[nt][1], true); red2(P0 + 8L * N + nt * 8, Fp[nt][2], Fp[nt][3], true);
-        red2(Q0 + nt * 8, Fm[nt][0], Fm[nt][1], true); red2(Q0 + 8L * N + nt * 8, Fm[nt][2], Fm[nt][3], true);
+    for (int ch = 0; ch < ECH; ++ch) {
+        float* P0 = a.FP + (long)node0 * N + j0 + ch * TN + 2 * t;
+        float* Q0 = a.FM + (long)node0 * N + j0 + ch * TN + 2 * t;
+        #pragma unroll
+        for (int nt = 0; nt < 8; ++nt) {
+            red2(P0 + nt * 8, Fp[ch][nt][0], Fp[ch][nt][1], true);
+            red2(P0 + 8L * N + nt * 8, Fp[ch][nt][2], Fp[ch][nt][3], true);
+            red2(Q0 + nt * 8, Fm[ch][nt][0], Fm[ch][nt][1], true);
+            red2(Q0 + 8L * N + nt * 8, Fm[ch][nt][2], Fm[ch][nt][3], true);
+        }
     }
 }
 
 template <int NK>
 __global__ void __launch_bounds__(NW * 32, 1) tk_bw_em_obs_kernel(const EmArgs a) {
     extern __shared__ __align__(128) unsigned char smem[];
-    const int ntile = (a.M / TM) * (a.N / TN);
+    const int ntile = (a.M / TM) * (a.N / (TN * ECH));
     const long U = (long)ntile * a.nl, P = gridDim.x, k = blockIdx.x;
     const long u0 = U * k / P, u1 = U * (k + 1) / P;
     for (long u = u0; u < u1;) {
@@ -2340,7 +2359,7 @@ void top_k_bw_em_observed(torch::Tensor AH, torch::Tensor BP, torch::Tensor E, t
     const c10::cuda::CUDAGuard guard(AH.device());
     check(slot, at::kInt, "slot"); check(FP, at::kFloat, "FP"); check(FM, at::kFloat, "FM");
     const int M = AH.size(1), KP = AH.size(2), N = BP.size(2), S = E.size(1), B = ev.size(0);
-    TORCH_CHECK(M % TM == 0 && N % TN == 0 && FP.size(0) == M && FP.size(1) == N && FM.sizes() == FP.sizes() &&
+    TORCH_CHECK(M % TM == 0 && N % (TN * ECH) == 0 && FP.size(0) == M && FP.size(1) == N && FM.sizes() == FP.sizes() &&
                 slot.size(0) == B, "top_k: the EM statistics' shapes");
     EmArgs args{};
     args.AH = reinterpret_cast<const __half*>(AH.data_ptr<at::Half>());
@@ -2357,7 +2376,7 @@ void top_k_bw_em_observed(torch::Tensor AH, torch::Tensor BP, torch::Tensor E, t
         args.olist = olist.data_ptr<int>(); args.nl = (int)olist.numel();
     }
     const int sms = at::cuda::getCurrentDeviceProperties()->multiProcessorCount, dev = AH.get_device();
-    const long units = (long)(M / TM) * (N / TN) * args.nl;
+    const long units = (long)(M / TM) * (N / (TN * ECH)) * args.nl;
     const int grid = (int)std::max(1L, std::min((long)sms, units));
     auto stream = at::cuda::getCurrentCUDAStream();
 #define EM_CASE(NKV)                                                                                               \
