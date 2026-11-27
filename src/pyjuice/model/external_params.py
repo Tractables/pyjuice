@@ -286,6 +286,12 @@ class _ExternalParamsMixin:
 
         return layout
 
+    def _external_params_device(self) -> torch.device:
+        """The device the staging buffers live on, whether or not they are allocated (a pass that reads every node in
+        place allocates neither): the circuit's parameters' -- concrete, unlike `self.device`, which may be index-less
+        (`torch.device("cuda")`) and so compare unequal to an otherwise identical `cuda:0`."""
+        return self.params.device
+
     def _external_params_views(self, name: str, batch_size: int, set_value: Optional[float] = None):
         """
         (Re)allocate the staging buffer `name` for `batch_size` and return one contiguous view per
@@ -713,10 +719,6 @@ class _ExternalParamsMixin:
                 self._staged_external_rows = kwargs[EXTERNAL_PARAMS_ROWS_KWARG]
                 self._staged_external_batch = batch_size
 
-        views = StagedExternalParams(self._external_params_views(
-            name = name, batch_size = batch_size
-        ))
-
         # A group whose members land on a contiguous run of the buffer stages as ONE transpose; the
         # rest resolve to per-node views and go through the loop below, which never learns that groups
         # exist. Tried before the expansion because it is the concatenated tensor that is contiguous,
@@ -747,18 +749,22 @@ class _ExternalParamsMixin:
         if owns_forward_state:
             keys = frozenset(ns2tensors)
             ns2tensors, in_place, in_place_versions = self._take_in_place(
-                ns2tensors, batch_size, self.__dict__[name].device)
+                ns2tensors, batch_size, self._external_params_device())
             if in_place and not ns2tensors:
                 # (every entry read in place: what the steps below make of it -- the nodes whose storage group was
                 # supplied, each handed its group's tensors, in the buffer's order -- from a plan kept per (keys,
-                # batch size), no node looked at one by one)
+                # batch size), no node looked at one by one. And no staging buffer: nothing is copied into one, and
+                # the layers that read it are those of nodes staged by copy, none here -- not allocating it is its
+                # size kept off the device, MEASURED 1.76 GB for the Codpula head at 48 blocks, and as much again for
+                # the gradient buffer, `_init_external_params_grads`)
                 memo = self.__dict__.setdefault("_ext_in_place_plans", {})
                 plan = memo.get((keys, batch_size))
                 if plan is None:
                     member = {}
                     for ns in in_place:
                         member[self._ext_ns_static(ns)[1]] = ns
-                    pairs = tuple((ns, member[self._ext_ns_static(ns)[1]]) for ns in views
+                    pairs = tuple((ns, member[self._ext_ns_static(ns)[1]])
+                                  for ns in self._external_params_layout(batch_size)[1]
                                   if self._ext_ns_static(ns)[1] in member)
                     plan = memo[(keys, batch_size)] = (
                         pairs, frozenset(member), all(ns.parameterization.initializes_grads(ns) for ns, _ in pairs))
@@ -768,9 +774,13 @@ class _ExternalParamsMixin:
                 views.in_place_plan = plan[0]
                 views.in_place_initializes = plan[2]
                 kwargs[EXTERNAL_PARAMS_KWARG] = views
-                kwargs[EXTERNAL_PARAMS_BUFFER_KWARG] = self.__dict__[name]
+                kwargs[EXTERNAL_PARAMS_BUFFER_KWARG] = None
                 self._staged_external_params = views
                 return None
+
+        views = StagedExternalParams(self._external_params_views(
+            name = name, batch_size = batch_size
+        ))
 
         group_fast, group_done, fast_keys = [], set(), set()
         for key, tensors in ns2tensors.items():
@@ -1030,7 +1040,9 @@ class _ExternalParamsMixin:
                         "An external-parameter tensor that the forward pass read in place was modified in place "
                         "before the backward pass. Run the forward again, or hand the forward a copy.")
             kwargs[EXTERNAL_PARAMS_KWARG] = staged
-            kwargs[EXTERNAL_PARAMS_BUFFER_KWARG] = self.external_params
+            # (none where the forward read every node in place: it staged nothing into the buffer)
+            kwargs[EXTERNAL_PARAMS_BUFFER_KWARG] = \
+                None if getattr(staged, "in_place_plan", None) is not None else self.external_params
         # (the forward's map of rows, as it checked it: a backward reads the samples' rows as the forward did)
         rows = self.__dict__.get("_staged_external_rows")
         assert rows is not None or kwargs.get(EXTERNAL_PARAMS_ROWS_KWARG) is None, \
@@ -1089,7 +1101,7 @@ class _ExternalParamsMixin:
                 named.append(key)
         if len(named) != len(set(named)):
             return dsts, {}, []
-        device = self.external_params.device
+        device = self._external_params_device()
         # (a destination sharing memory with what the forward read in place would be zeroed under the backward's feet)
         read = {t.untyped_storage().data_ptr() for t, _ in getattr(self._staged_external_params, "in_place_versions", ())}
         rest, taken, zero = {}, {}, []
@@ -1126,7 +1138,10 @@ class _ExternalParamsMixin:
         """The destinations that are whole groups going back in one launch (`_group_batched`) noted for the end of the
         backward (`_external_grad_groups`); what is left of `dsts` returned for the per-node path. Nothing is taken where
         a node is named twice, or a group's member got no external parameters: the per-node path says so."""
-        if not any(isinstance(k, str) for k in dsts):
+        # (nor where the forward read every node in place: the value buffer, which the checks below take the layout of,
+        # was not staged by it -- not allocated, or cut for another batch size)
+        if not any(isinstance(k, str) for k in dsts) or \
+                getattr(self._staged_external_params, "in_place_plan", None) is not None:
             return dsts
         seen = {k for k in dsts if not isinstance(k, str)}
         for key in dsts:
@@ -1198,7 +1213,7 @@ class _ExternalParamsMixin:
                     f"`{EXTERNAL_PARAMS_GRAD_KWARG}` names {ns}, which was not given external " \
                     f"parameters in the forward pass."
                 validate_external_tensors(ns, ns.parameterization, tensors, batch_size,
-                                          self.external_params.device, require_contiguous = False)
+                                          self._external_params_device(), require_contiguous = False)
             self._external_grad_dsts = dsts
             compute_external_grads = True          # asking for them is asking for them
 
@@ -1208,10 +1223,9 @@ class _ExternalParamsMixin:
 
         # (the destinations the layers write themselves: their storage groups need nothing of the buffer -- which is
         # not filled at all where that is every node; where the forward read every node in place and the destinations
-        # are its plan's, the views straight from them)
+        # are its plan's, the views straight from them, and no buffer at all: no layer of this backward reads one)
         plan = getattr(self._staged_external_params, "in_place_plan", None)
         if plan is not None and in_place_grads and all(m in in_place_grads for _, m in plan):
-            self._external_params_views(name = "external_params_grad", batch_size = batch_size, set_value = None)
             grad_views = StagedExternalParams({ns: in_place_grads[m] for ns, m in plan})
             if getattr(self._staged_external_params, "in_place_initializes", False):
                 grad_views.fresh = True         # (not zeroed: each destination's first writer initializes it; the end
@@ -1223,7 +1237,7 @@ class _ExternalParamsMixin:
                 torch._foreach_zero_(list(seen.values()))
             grad_views.fold = fold
             kwargs[EXTERNAL_PARAMS_GRAD_KWARG] = grad_views
-            kwargs[EXTERNAL_PARAMS_GRAD_BUFFER_KWARG] = self.external_params_grad
+            kwargs[EXTERNAL_PARAMS_GRAD_BUFFER_KWARG] = None
             self._staged_external_params_grad = grad_views
             return None
         owned = {self._ext_ns_static(ns)[1]: tensors for ns, tensors in in_place_grads.items()}
