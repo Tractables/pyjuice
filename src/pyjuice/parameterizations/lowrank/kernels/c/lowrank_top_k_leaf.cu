@@ -1081,7 +1081,10 @@ __global__ void __launch_bounds__(256) tk_dtau_rows_kernel(const int* drow, cons
 // candidate of them and below K a sum's counts of the slots), then the block's sums added into the layer's parameter
 // flows (F- at spf[k][i] + V + v, F+ V before it), a node's EB categories at once (a block two runs share: both parts
 // added). MEASURED (48 blocks): a CTA every 1024 nodes and a lane's 4 categories one red.v4 a node (a node's flows
-// 1 MB apart) made those adds 2/3 of the pass; blocks of 16 (3 CTAs an SM) beat 32 (2) and 8
+// 1 MB apart) made those adds 2/3 of the pass; blocks of 16 (3 CTAs an SM) beat 32 (2) and 8. F- staged from the
+// entries' records (`tk_leaf_em_rec_kernel`) and a block's rows loaded a block ahead: 2.00 -> 1.74 ms (DISTINCT=1 rows).
+// REFUTED (same shapes): a warp a run with its sums in registers and a red.v4 a node at each block of 4 categories
+// (2.13-3.04 ms: 16-B reds into rows 1 MB apart), and a CTA a whole block of categories (2.87: frequent blocks' tails)
 constexpr int EC = 512;             // entries a run
 constexpr int EB = 16;              // categories a block: a node's 64 B of flows
 constexpr int EN = 128;             // nodes a CTA (32 lanes x 4)
@@ -1103,8 +1106,22 @@ __device__ __forceinline__ float4 add4(const float4& x, const float4& y) {
     return make_float4(x.x + y.x, x.y + y.y, x.z + y.z, x.w + y.w);
 }
 
+// The records of the entries sorted by key, the F- kernel's staging (one 16-B read an entry, not its chain of four):
+// (key, the row of `emr` its term takes -- the tile's first (the head's: its tilt added) or second (the bulk's) --,
+// l in log2 units, its tilt's row of tau [T][Bx][S] (-1: the bulk's, in the second row already))
+__global__ void __launch_bounds__(256) tk_leaf_em_rec_kernel(const EmArgs a, int4* __restrict__ rec) {
+    const int k = blockIdx.x * 256 + threadIdx.x;
+    if (k >= a.offs[a.nbins]) return;
+    const long id = a.sidx[k];
+    const int gi = (int)(id / a.C), c = (int)(id - (long)gi * a.C), t = gi / a.B, Kl = a.S - 1;
+    const int b = a.emeta[gi].x;
+    const long e0 = ((long)(a.erow != nullptr ? a.erow[b] : b) * a.nvars + a.nv_lvid[t]) * a.C;
+    const int to = a.tau != nullptr && c < Kl ? ((t * a.Bx + (a.emap != nullptr ? a.emap[b] : b)) * a.S + c) : -1;
+    rec[k] = make_int4(a.skey[k], gi * 4 + (to < 0 ? 1 : 0), __float_as_int(a.lp[e0 + c] * LOG2E), to);
+}
+
 template <bool PLUS>
-__global__ void __launch_bounds__(NW * 32) tk_leaf_em_kernel(const EmArgs a) {
+__global__ void __launch_bounds__(NW * 32) tk_leaf_em_kernel(const EmArgs a, const int4* __restrict__ rec) {
     __shared__ int s_g[EC], s_c[EC], s_k[EC];
     __shared__ float s_l[EC];
     __shared__ long s_t[EC];
@@ -1119,6 +1136,12 @@ __global__ void __launch_bounds__(NW * 32) tk_leaf_em_kernel(const EmArgs a) {
     if (threadIdx.x == 0) s_plus = 0;
     __syncthreads();
     for (int x = threadIdx.x; x < ne; x += NW * 32) {                  // the run's entries: tile, candidate, l, tilt
+        if constexpr (!PLUS) {                                         // (F-: their records; s_g the term's row)
+            const int4 r = rec[s0 + x];
+            s_k[x] = r.x; s_g[x] = r.y; s_l[x] = __int_as_float(r.z);
+            s_t[x] = r.w >= 0 ? (long)r.w * a.M : -1;
+            continue;
+        }
         const long id = a.sidx[s0 + x];
         const int gi = (int)(id / a.C), c = (int)(id - (long)gi * a.C), t = gi / a.B;
         const int4 mt = a.emeta[gi];
@@ -1133,17 +1156,30 @@ __global__ void __launch_bounds__(NW * 32) tk_leaf_em_kernel(const EmArgs a) {
     if (PLUS && s_plus == 0) return;
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int n0 = blockIdx.y * EN, i0 = n0 + 4 * lane;               // the CTA's nodes; a lane's 4
+    // a block's rows: 2 float4 a thread (EB x EN / 4 = 512 of them), loaded a block ahead into registers
+    static_assert(EB * EN / 4 == 2 * NW * 32, "a block's rows two float4 a thread");
+    float4 nxt[2];
+    const auto load_rows = [&](int bb) {
+        const int k = bb / a.Vb, v0 = bb - k * a.Vb;
+        const float* tb = a.tab + (long)k * a.tab_stride + (long)v0 * a.M + n0;
+#pragma unroll
+        for (int u = 0; u < 2; ++u) {
+            const int q = threadIdx.x + u * NW * 32, r = q / (EN / 4), c4 = 4 * (q % (EN / 4));
+            nxt[u] = v0 + r < a.V ? ld4(tb + (long)r * a.M + c4) : make_float4(-INFINITY, -INFINITY, -INFINITY, -INFINITY);
+        }
+    };
+    load_rows(s_k[0] / EB * EB);
     for (int x = 0; x < ne;) {
         const int b0 = s_k[x] / EB * EB, k = b0 / a.Vb, v0 = b0 - k * a.Vb;
         const int xe = min(a.offs[b0 + EB] - s0, ne);                  // the block's entries in the run
-        const float* tb = a.tab + (long)k * a.tab_stride + (long)v0 * a.M + n0;
-        for (int q = threadIdx.x; q < EB * EN / 4; q += NW * 32) {     // the block's rows staged, its sums zeroed
-            const int r = q / (EN / 4), c4 = 4 * (q % (EN / 4));
-            *reinterpret_cast<float4*>(&s_th[r][c4]) = v0 + r < a.V ? ld4(tb + (long)r * a.M + c4)
-                                                                    : make_float4(-INFINITY, -INFINITY, -INFINITY, -INFINITY);
+#pragma unroll
+        for (int u = 0; u < 2; ++u) {                                  // the block's rows staged, its sums zeroed
+            const int q = threadIdx.x + u * NW * 32, r = q / (EN / 4), c4 = 4 * (q % (EN / 4));
+            *reinterpret_cast<float4*>(&s_th[r][c4]) = nxt[u];
             s_sum[r][c4] = s_sum[r][c4 + 1] = s_sum[r][c4 + 2] = s_sum[r][c4 + 3] = 0.f;
         }
         __syncthreads();
+        if (xe < ne) load_rows(s_k[xe] / EB * EB);                     // (the next block's, in flight meanwhile)
         // a warp's share of the block's entries, 8 rows in flight: a category's terms summed until it changes
         const int per = (xe - x + NW - 1) / NW, ya = x + warp * per, yb = min(ya + per, xe);
         float acc[4] = {0.f, 0.f, 0.f, 0.f};
@@ -1155,7 +1191,7 @@ __global__ void __launch_bounds__(NW * 32) tk_leaf_em_kernel(const EmArgs a) {
                 w[z] = make_float4(0.f, 0.f, 0.f, 0.f);
                 if (y + z >= yb) continue;
                 const long to = s_t[y + z];
-                w[z] = ld4(a.emr + ((long)s_g[y + z] * 4 + (PLUS ? 2 : 0) + (to < 0 ? 1 : 0)) * a.M + i0);
+                w[z] = ld4(a.emr + (PLUS ? (long)s_g[y + z] * 4 + 2 + (to < 0 ? 1 : 0) : (long)s_g[y + z]) * a.M + i0);
                 if (to >= 0) w[z] = add4(w[z], ld4(a.tau + to + i0));
             }
 #pragma unroll
@@ -1493,9 +1529,13 @@ torch::Tensor top_k_leaf_backward(torch::Tensor tab, torch::Tensor nv_tab, torch
     e.pf = a.pf; e.spf = a.spf;
     e.B = (int)B; e.M = M; e.C = (int)C; e.S = (int)S; e.K = (int)K; e.V = (int)V; e.Vb = (int)Vb;
     e.vec = spf_aligned && V % 4 == 0 && reinterpret_cast<uintptr_t>(e.pf) % 16 == 0;
-    dim3 egrid((unsigned)((T * B * C + EC - 1) / EC), (unsigned)(M / EN));     // (F-; F+ where a token is missing)
-    tk_leaf_em_kernel<false><<<egrid, NW * 32, 0, stream>>>(e);
-    tk_leaf_em_kernel<true><<<egrid, NW * 32, 0, stream>>>(e);
+    // (F-: from the entries' records; F+ where a token is missing)
+    auto rec = torch::empty({T * B * C, 4}, ids.options());
+    int4* recp = reinterpret_cast<int4*>(rec.data_ptr<int>());
+    tk_leaf_em_rec_kernel<<<(unsigned)((T * B * C + 255) / 256), 256, 0, stream>>>(e, recp);
+    dim3 egrid((unsigned)((T * B * C + EC - 1) / EC), (unsigned)(M / EN));
+    tk_leaf_em_kernel<false><<<egrid, NW * 32, 0, stream>>>(e, recp);
+    tk_leaf_em_kernel<true><<<egrid, NW * 32, 0, stream>>>(e, recp);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     join();
     return dtau;
