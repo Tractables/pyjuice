@@ -22,26 +22,23 @@ except ImportError:                                              # pragma: no co
     triton = None
 
 BM, BN = 64, 64                                                  # the EM kernel's tile: nodes, children
-SA = 72                                                          # alpha's, beta's, the counts' row stride (65 slots)
+SH = 72                                                          # the stash's fp16 alpha / beta rows (halves; 64 slots, a tail)
 MAX_SAMPLES = 4096                                               # (the work items' scans)
 
 
 if triton is not None:
 
     @triton.jit
-    def _tf32(x):
-        """fp32 `x` (finite) rounded to the nearest TF32 value, as `cvt.rna` rounds: a TF32 dot then drops nothing"""
-        return ((x.to(tl.int32, bitcast = True) + 0x1000) & -8192).to(tl.float32, bitcast = True)
-
-    @triton.jit
-    def _bw_em_kernel(AH, BH, L2T, E, EV, ALPHA, BETA, HROW, FLOW, MROWS, NM, LWIDX, EMAP, FP, FM, M, N,
-                      KP: tl.constexpr, K0: tl.constexpr, K1: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr,
-                      SA: tl.constexpr):
+    def _bw_em_kernel(AH, BH, L2T, E, EV, ALPHA, BETA, ALPHA_T, BETA_T, INVD, HROW, FLOW, MROWS, NM, LWIDX, EMAP, FP, FM,
+                      M, N, KP: tl.constexpr, K0: tl.constexpr, K1: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr,
+                      SH: tl.constexpr):
         """a CTA a 64 x 64 tile of the parameters: over the masked samples MROWS[:NM] (NM on the device), F+ = sum_b
         Q, F- = sum_b T ([M, N]: q, t summed over the slots), stored -- the observed samples' then added by
         `top_k_bw_em_observed` (CUDA). W from the CUDA passes' operands -- AH = fp16(log2 e A) [Bx, M, KP], BH [Bx, KP,
-        N] fp16, l2t [M, N] fp16 -- and the stash's shift HROW [B, M]; a masked sample's alpha, beta [Rm, M, SA] at
-        its place LWIDX (its node flows not in them: FLOW [B, M], `top_k_flows`', times W)."""
+        N] fp16, l2t [M, N] fp16 -- and the stash's shift HROW [B, M]; a masked sample's alpha, beta [Rm, M, SH] fp16
+        rows at its place LWIDX (its node flows not in them: FLOW [B, M], `top_k_flows`', times W): the slots times a
+        node's power of 2 d by fp16 dots against E -- the same 10-bit operands as TF32's, fp32 sums --, the rest slot
+        times d from the rows' tail (ALPHA_T, BETA_T: their float32 view), 1 / d (INVD [Rm, M]) into W."""
         rows = tl.program_id(0) * BM + tl.arange(0, BM)
         cols = tl.program_id(1) * BN + tl.arange(0, BN)
         s = tl.arange(0, 64)
@@ -58,15 +55,17 @@ if triton is not None:
                 k1 = K0 + tl.arange(0, K1)
                 lg += tl.dot(tl.load(AH + (eb * M + rows[:, None]) * KP + k1[None, :]),
                              tl.load(BH + (eb * KP + k1[:, None]) * N + cols[None, :]))
-            W = tl.exp2(lg + l2t - tl.load(HROW + b64 * M + rows)[:, None]) * tl.load(FLOW + b64 * M + rows)[:, None]
+            lrow = tl.load(LWIDX + b64).to(tl.int64) * M + rows
+            W = tl.exp2(lg + l2t - tl.load(HROW + b64 * M + rows)[:, None]) * \
+                (tl.load(FLOW + b64 * M + rows) * tl.load(INVD + lrow))[:, None]
             ev = tl.load(EV + b64 * N + cols)
-            base = (tl.load(LWIDX + b64).to(tl.int64) * M + rows) * SA
-            Es = tl.load(E + (eb * 65 + s[:, None]) * N + cols[None, :])
+            base = lrow * SH
+            Es = tl.load(E + (eb * 65 + s[:, None]) * N + cols[None, :]).to(tl.float16)
             er = tl.load(E + (eb * 65 + 64) * N + cols)
-            X = tl.dot(_tf32(tl.load(ALPHA + base[:, None] + s[None, :])), Es, input_precision = "tf32") + \
-                tl.load(ALPHA + base + 64)[:, None] * er[None, :]
-            Y = tl.dot(_tf32(tl.load(BETA + base[:, None] + s[None, :])), Es, input_precision = "tf32") + \
-                tl.load(BETA + base + 64)[:, None] * er[None, :]
+            X = tl.dot(tl.load(ALPHA + base[:, None] + s[None, :]), Es) + \
+                tl.load(ALPHA_T + lrow * (SH // 2) + 32)[:, None] * er[None, :]
+            Y = tl.dot(tl.load(BETA + base[:, None] + s[None, :]), Es) + \
+                tl.load(BETA_T + lrow * (SH // 2) + 32)[:, None] * er[None, :]
             Fp += W * X * ev[None, :]
             Fm += W * Y
         out = rows[:, None] * N + cols[None, :]
@@ -162,7 +161,7 @@ def terms(A, Bm, G, tab, element_mars, geo, slot, rows, logw_rows, nf, emap, gra
     tab.setdefault("LTc", LTc)
     if stash is None:
         stash = tkf.forward(A_, ops, None, 0, True, counts)
-    alpha, beta, acnt, ao, bo, hrow, alpha16, beta16, invd = stash
+    alpha16, beta16, invd, acnt, ao, bo, hrow = stash
     # the node flows: into the stash's ao, bo, and beside the masked samples' posterior where that lies in their leaf's
     # buffer; fl [B, M] the flows themselves (a masked sample's terms' factor in the passes below), fmx [B] their largest
     Rm = rows.numel()
@@ -174,15 +173,15 @@ def terms(A, Bm, G, tab, element_mars, geo, slot, rows, logw_rows, nf, emap, gra
         gviews.init_grads(grads) if fresh else None
         drow, sgn = _fold_operands(gviews, fold, B, dev)
         dests = [g if _dest_ok(g) else torch.zeros(g.shape, dtype = torch.float32, device = dev) for g in grads]
-        mod.top_k_bw_grads(A_, AH, BP, E, ev, LTh, LTc, mitems, oitems, noitems, slot32, alpha, beta, ao, bo, hrow,
-                           fl, fmx, drow, sgn, EF, *dests, alpha16, beta16, invd)
+        mod.top_k_bw_grads(A_, AH, BP, E, ev, LTh, LTc, mitems, oitems, noitems, slot32, alpha16, beta16, invd, ao,
+                           bo, hrow, fl, fmx, drow, sgn, EF, *dests)
         for g, d in zip(grads, dests):
             if d is not g:
                 g.add_(d.to(g.dtype))
     else:
         none = torch.empty(0, dtype = torch.float32, device = dev)
-        mod.top_k_bw_grads(A_, AH, BP, E, ev, LTh, LTc, mitems, oitems, noitems, slot32, alpha, beta, ao, bo, hrow,
-                           fl, fmx, none, none, EF, none, none, none, alpha16, beta16, invd)
+        mod.top_k_bw_grads(A_, AH, BP, E, ev, LTh, LTc, mitems, oitems, noitems, slot32, alpha16, beta16, invd, ao,
+                           bo, hrow, fl, fmx, none, none, EF, none, none, none)
     flows = None
     if want_flows:
         KP = BP.size(1)
@@ -198,8 +197,9 @@ def terms(A, Bm, G, tab, element_mars, geo, slot, rows, logw_rows, nf, emap, gra
         if Rm > 0:
             FP = torch.empty(M, N, dtype = torch.float32, device = dev)
             FM = torch.empty_like(FP)
-            _bw_em_kernel[(M // BM, N // BN)](AH, BP, L2T, E, ev, alpha, beta, hrow, fl, MROWS, NM, LWIDX, EMAP, FP,
-                                              FM, M, N, KP = KP, K0 = K0, K1 = KP - K0, BM = BM, BN = BN, SA = SA,
+            _bw_em_kernel[(M // BM, N // BN)](AH, BP, L2T, E, ev, alpha16, beta16, alpha16.view(torch.float32),
+                                              beta16.view(torch.float32), invd, hrow, fl, MROWS, NM, LWIDX, EMAP, FP,
+                                              FM, M, N, KP = KP, K0 = K0, K1 = KP - K0, BM = BM, BN = BN, SH = SH,
                                               num_warps = 4, num_stages = 1)
         else:
             FP = torch.zeros(M, N, dtype = torch.float32, device = dev)

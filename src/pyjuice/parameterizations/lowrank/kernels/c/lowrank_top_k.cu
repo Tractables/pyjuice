@@ -179,9 +179,6 @@ __device__ __forceinline__ void mma_tf32(float (&d)[4], unsigned a0, unsigned a1
 // x rounded to TF32 as `cvt.rna` rounds a finite non-negative x (to nearest, ties away): half a TF32 ulp added to its
 // bits, the MMA ignoring the low 13 (`cvt.rna.tf32.f32` itself compiles to three instructions, the inf / NaN guard)
 __device__ __forceinline__ unsigned to_tf32(float x) { return __float_as_uint(x) + 0x1000u; }
-// ... as a float holding the TF32 value exactly (its low 13 bits cleared): an MMA operand stored for later passes
-__device__ __forceinline__ float rtf32(float x) { return __uint_as_float((__float_as_uint(x) + 0x1000u) & ~0x1FFFu); }
-
 __device__ __forceinline__ unsigned h2u(__half2 h) { return *reinterpret_cast<unsigned*>(&h); }
 // 2^e with b 2^e in [2^14, 2^15) (e at most 126: its inverse a normal float; 1 where b is 0 or subnormal): what takes
 // values bounded by b (>= 0, finite) into fp16's range -- an fp16 MMA operand of fp32 values, the scale taken back out
@@ -347,11 +344,11 @@ struct TkArgs {
     const int4* mitems; const int4* oitems; const int* noitems; const int* slot32; const float* logw;
     float* out; float* ws; int* flags;
     long nid0, ostride, sA; int r, M, N, S, Rm;                    // sA: A's batch stride (its rows contiguous)
-    // the STASH ending's (what a backward takes from the forward's sums; `out` may be null then: no values): alpha,
-    // beta, the slots' posterior [Rm, M, SA] (a masked sample's), ao, bo [B, M], W's shift h [B, M] (every sample's)
-    float* alpha; float* beta; float* acnt; float* ao; float* bo; float* hrow;
-    // the cols pass's fp16 operands of a masked row [Rm, M, SH]: alpha, beta of the slots times a node's d (a power of
-    // 2: `masked_stash`), the rest slot times d and 1 / d in the row's tail; 1 / d again [Rm, M]
+    // the STASH ending's (what a backward takes from the forward's sums; `out` may be null then: no values): the
+    // slots' posterior [Rm, M, SA] (a masked sample's), ao, bo [B, M], W's shift h [B, M] (every sample's); a masked
+    // row's alpha, beta [Rm, M, SH] fp16: the slots times a node's d (a power of 2: `masked_stash`), the rest slot
+    // times d and 1 / d in the row's tail; 1 / d again [Rm, M]
+    float* acnt; float* ao; float* bo; float* hrow;
     __half* alpha16; __half* beta16; float* invd;
 };
 
@@ -703,14 +700,9 @@ __device__ __forceinline__ void masked_stash(const MState& St, const TkArgs& a, 
         be[1][2 * sn] = sdiv(a10, St.Zc[sn][2]); be[1][2 * sn + 1] = sdiv(a11, St.Zc[sn][3]);
         mx0 = fmaxf(mx0, fmaxf(al[0][2 * sn], al[0][2 * sn + 1]));
         mx1 = fmaxf(mx1, fmaxf(al[1][2 * sn], al[1][2 * sn + 1]));
-        // (slots 0 .. 63: the masked EM statistics' TF32 operands, stored TF32-rounded -- read as they are)
-        auto pair = [&](float x, float y) { return make_float2(rtf32(x), rtf32(y)); };
-        *reinterpret_cast<float2*>(a.alpha + q0 + sn * 8) = pair(al[0][2 * sn], al[0][2 * sn + 1]);
-        *reinterpret_cast<float2*>(a.alpha + q1 + sn * 8) = pair(al[1][2 * sn], al[1][2 * sn + 1]);
-        *reinterpret_cast<float2*>(a.beta + q0 + sn * 8) = pair(be[0][2 * sn], be[0][2 * sn + 1]);
-        *reinterpret_cast<float2*>(a.beta + q1 + sn * 8) = pair(be[1][2 * sn], be[1][2 * sn + 1]);
     }
-    // the cols pass's fp16 operands: a node's slots times its d (`node_scale` of its largest alpha; beta takes alpha's)
+    // alpha, beta (the backward's fp16 operands): a node's slots times its d (`node_scale` of its largest alpha; beta
+    // takes alpha's)
     const float d0 = node_scale(quad_max(mx0)), d1 = node_scale(quad_max(mx1));
     __half* const A16 = a.alpha16 + ((long)y * M + node0) * SH;
     __half* const B16 = a.beta16 + ((long)y * M + node0) * SH;
@@ -732,15 +724,13 @@ __device__ __forceinline__ void masked_stash(const MState& St, const TkArgs& a, 
         const float l0 = R0 > 0.f ? 1.f : 0.f, l1 = R1 > 0.f ? 1.f : 0.f;         // (the node has mass)
         a.acnt[r0] = wr0 * c0; a.acnt[r1] = wr1 * c1;
         a.acnt[r0 + 1] = l0; a.acnt[r1 + 1] = l1;
-        a.alpha[r0] = sdiv(wr0 * c0, ur0); a.alpha[r1] = sdiv(wr1 * c1, ur1);
-        a.beta[r0] = sdiv(wr0 * c0, zr0); a.beta[r1] = sdiv(wr1 * c1, zr1);
-        // (the fp16 rows' tail: the rest slot times d, 1 / d)
+        // (the rows' tail: the rest slot times d, 1 / d)
         float* const ta0 = reinterpret_cast<float*>(A16 + 8 * NS8);
         float* const ta1 = reinterpret_cast<float*>(A16 + 8 * SH + 8 * NS8);
         float* const tb0 = reinterpret_cast<float*>(B16 + 8 * NS8);
         float* const tb1 = reinterpret_cast<float*>(B16 + 8 * SH + 8 * NS8);
-        ta0[0] = a.alpha[r0] * d0; ta0[1] = 1.f / d0; ta1[0] = a.alpha[r1] * d1; ta1[1] = 1.f / d1;
-        tb0[0] = a.beta[r0] * d0; tb0[1] = 1.f / d0; tb1[0] = a.beta[r1] * d1; tb1[1] = 1.f / d1;
+        ta0[0] = sdiv(wr0 * c0, ur0) * d0; ta0[1] = 1.f / d0; ta1[0] = sdiv(wr1 * c1, ur1) * d1; ta1[1] = 1.f / d1;
+        tb0[0] = sdiv(wr0 * c0, zr0) * d0; tb0[1] = 1.f / d0; tb1[0] = sdiv(wr1 * c1, zr1) * d1; tb1[1] = 1.f / d1;
         a.invd[(long)y * M + node0] = 1.f / d0; a.invd[(long)y * M + node1] = 1.f / d1;
         const float h0 = St.m0 == NEG ? 0.f : St.m0, h1 = St.m1 == NEG ? 0.f : St.m1;
         a.hrow[(long)b * M + node0] = h0; a.hrow[(long)b * M + node1] = h1;
@@ -1157,10 +1147,9 @@ struct BwArgs {                         // the cols pass's and dA's GEMM's (see 
     const float* ev;                     // [B, N] the children's values over their largest (the prep's)
     const uint2* LTc;                    // l2t in the cols kernel's fragment order
     const int4* mitems; const int4* oitems; const int* noitems; const int* slot32;   // the prep's work items
-    const float* alpha; const float* beta;   // [Rm, M, SA] a masked sample's, its node flows not in them (the stash's;
-                                             // slots 0 .. 63 TF32)
-    const __half* alpha16; const __half* beta16;   // [Rm, M, SH] the cols pass's: the slots times a node's d, the rest
-    const float* invd;                             // slot times d and 1 / d in the tail; [Rm, M] 1 / d again
+    const __half* alpha16; const __half* beta16;   // [Rm, M, SH] a masked sample's alpha, beta (the stash's; its node
+    const float* invd;                             // flows not in them): the slots times a node's d, the rest slot
+                                                   // times d and 1 / d in the tail; [Rm, M] 1 / d again
     const float* ao; const float* bo;        // [B, M] an observed sample's
     const float* fl; const float* fmx;       // [B, M] a sample's node flows, [B] their largest (`tk_flows_kernel`)
     const float* hrow;                       // [B, M] W's shift (log2 units) a sample
@@ -2391,10 +2380,10 @@ TkArgs sk_args(const torch::Tensor& A, const torch::Tensor& BP, const torch::Ten
 
 // One node vector's values from the caller's A [Bx, M, r] (fp32) and `top_k_prep`'s operands, into `out` [nodes,
 // batch] from node `nid0` on (`sk_launch`; an empty `out`: no values). With `stash`, what a backward takes from the
-// sums, returned (else nothing): (alpha, beta, the slots' posterior [max(Rm, 1), M, SA] -- a masked sample's, by its
-// place in the prep's `rows`, the node's flow not in them; the posterior into `acnt_out` [Rm, M, SA] where given, its
-// leaf's buffer --, ao, bo [B, M], W's shift h [B, M], the cols pass's fp16 alpha, beta [max(Rm, 1), M, SH] and 1 / d
-// [max(Rm, 1), M]): `masked_stash`'s notes; `top_k_flows` puts the flows in.
+// sums, returned (else nothing): (alpha, beta [max(Rm, 1), M, SH] fp16 and 1 / d [max(Rm, 1), M] -- a masked sample's,
+// by its place in the prep's `rows`, the node's flow not in them --, the slots' posterior [max(Rm, 1), M, SA] (into
+// `acnt_out` [Rm, M, SA] where given, its leaf's buffer), ao, bo [B, M], W's shift h [B, M]): `masked_stash`'s notes;
+// `top_k_flows` puts the flows in.
 std::vector<torch::Tensor> top_k_forward(torch::Tensor A, torch::Tensor BP, torch::Tensor E, torch::Tensor ev,
                                          torch::Tensor cmax, torch::Tensor LTh, torch::Tensor mitems,
                                          torch::Tensor oitems, torch::Tensor noitems, torch::Tensor slot32,
@@ -2418,8 +2407,7 @@ std::vector<torch::Tensor> top_k_forward(torch::Tensor A, torch::Tensor BP, torc
         sk_launch<false>(args, BP.size(1), P, Rm, B, A.get_device());
         return {};
     }
-    auto alpha = torch::empty({std::max(Rm, 1), M, SA}, o), beta = torch::empty_like(alpha);
-    auto acnt = acnt_out.numel() > 0 ? acnt_out : torch::empty_like(alpha);
+    auto acnt = acnt_out.numel() > 0 ? acnt_out : torch::empty({std::max(Rm, 1), M, SA}, o);
     if (acnt_out.numel() > 0) {
         check(acnt_out, at::kFloat, "acnt_out");
         TORCH_CHECK(acnt_out.size(0) == Rm && acnt_out.size(1) == M && acnt_out.size(2) == SA, "top_k: acnt_out [Rm, M, 72]");
@@ -2427,13 +2415,12 @@ std::vector<torch::Tensor> top_k_forward(torch::Tensor A, torch::Tensor BP, torc
     auto ao = torch::empty({B, M}, o), bo = torch::empty_like(ao), hrow = torch::empty_like(ao);
     auto alpha16 = torch::empty({std::max(Rm, 1), M, SH}, o.dtype(at::kHalf)), beta16 = torch::empty_like(alpha16);
     auto invd = torch::empty({std::max(Rm, 1), M}, o);
-    args.alpha = alpha.data_ptr<float>(); args.beta = beta.data_ptr<float>();
     args.acnt = acnt.data_ptr<float>(); args.ao = ao.data_ptr<float>(); args.bo = bo.data_ptr<float>();
     args.hrow = hrow.data_ptr<float>();
     args.alpha16 = reinterpret_cast<__half*>(alpha16.data_ptr<at::Half>());
     args.beta16 = reinterpret_cast<__half*>(beta16.data_ptr<at::Half>()); args.invd = invd.data_ptr<float>();
     sk_launch<true>(args, BP.size(1), P, Rm, B, A.get_device());
-    return {alpha, beta, acnt, ao, bo, hrow, alpha16, beta16, invd};
+    return {alpha16, beta16, invd, acnt, ao, bo, hrow};
 }
 
 // The node flows into a stash, in place (`tk_flows_kernel`): `nf` [M, B] the node vector's log-space rows of the node
@@ -2492,18 +2479,17 @@ std::vector<torch::Tensor> top_k_bw_prep(torch::Tensor A, torch::Tensor theta, i
 }
 
 // The backward's passes of one node vector, from the operands (the prep's, `top_k_bw_prep`'s) and the stash's terms
-// (the flows in them: `top_k_flows`; the masked samples' alpha, beta also in the stash's fp16 rows `alpha16`, `beta16`
-// [Rm, M, SH] with 1 / d `invd` [Rm, M], the cols pass's): the element flows into EF [B, N]; with gradients (DA
-// non-empty) dA, dB, dG, each
+// (the flows in them: `top_k_flows`; the masked samples' alpha, beta the stash's fp16 rows [Rm, M, SH] with 1 / d
+// `invd` [Rm, M]): the element flows into EF [B, N]; with gradients (DA non-empty) dA, dB, dG, each
 // sample's times its sign `sgn` [B], into the rows `drow` [B] of DA [Bd, M, r], DB [Bd, r, N], DG [Bd, S, N] (fp32,
 // rows contiguous, batch strides a multiple of 4 floats) -- every destination ADDED into. A [Bx, M, r] the caller's. With
 // gradients, a group's masked items' Gl (fp16, ~2 MB an item at N = M = 1024) is made for dA's GEMM, then freed.
 void top_k_bw_grads(torch::Tensor A, torch::Tensor AH, torch::Tensor BP, torch::Tensor E, torch::Tensor ev,
                     torch::Tensor LTh, torch::Tensor LTc, torch::Tensor mitems, torch::Tensor oitems,
-                    torch::Tensor noitems, torch::Tensor slot32, torch::Tensor alpha, torch::Tensor beta,
-                    torch::Tensor ao, torch::Tensor bo, torch::Tensor hrow, torch::Tensor fl, torch::Tensor fmx,
-                    torch::Tensor drow, torch::Tensor sgn, torch::Tensor EF, torch::Tensor DA, torch::Tensor DB,
-                    torch::Tensor DG, torch::Tensor alpha16, torch::Tensor beta16, torch::Tensor invd) {
+                    torch::Tensor noitems, torch::Tensor slot32, torch::Tensor alpha16, torch::Tensor beta16,
+                    torch::Tensor invd, torch::Tensor ao, torch::Tensor bo, torch::Tensor hrow, torch::Tensor fl,
+                    torch::Tensor fmx, torch::Tensor drow, torch::Tensor sgn, torch::Tensor EF, torch::Tensor DA,
+                    torch::Tensor DB, torch::Tensor DG) {
     const c10::cuda::CUDAGuard guard(A.device());
     check_rows(A, at::kFloat, "A"); check(EF, at::kFloat, "EF");
     const int M = A.size(1), r = A.size(2), KP = BP.size(1), N = BP.size(2), S = E.size(1), Rm = mitems.size(0);
@@ -2517,8 +2503,8 @@ void top_k_bw_grads(torch::Tensor A, torch::Tensor AH, torch::Tensor BP, torch::
     args.ev = ev.data_ptr<float>(); args.LTc = reinterpret_cast<const uint2*>(LTc.data_ptr<int>());
     args.mitems = reinterpret_cast<const int4*>(mitems.data_ptr<int>());
     args.oitems = reinterpret_cast<const int4*>(oitems.data_ptr<int>()); args.noitems = noitems.data_ptr<int>();
-    args.slot32 = slot32.data_ptr<int>(); args.alpha = alpha.data_ptr<float>(); args.beta = beta.data_ptr<float>();
-    if (Rm > 0) {                                                            // (the cols pass's fp16 operands: the stash's)
+    args.slot32 = slot32.data_ptr<int>();
+    if (Rm > 0) {                                                            // (the masked samples' alpha, beta: the stash's)
         check(alpha16, at::kHalf, "alpha16"); check(beta16, at::kHalf, "beta16"); check(invd, at::kFloat, "invd");
         TORCH_CHECK(alpha16.dim() == 3 && alpha16.size(0) >= Rm && alpha16.size(1) == M && alpha16.size(2) == SH &&
                     beta16.sizes() == alpha16.sizes() && invd.size(0) == alpha16.size(0) && invd.size(1) == M,
