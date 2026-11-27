@@ -119,6 +119,9 @@
 <li><p><strong>params</strong> (<em>Optional</em><em>[</em><em>Tensor</em><em>]</em>) – an optional tensor that defines the parameters of the nodes</p></li>
 <li><p><strong>num_nodes</strong> (<a class="reference external" href="https://docs.python.org/3/builtins/functions.html#int" title="(in Python v3.15)"><em>int</em></a>) – an alternative of <cite>num_node_blocks</cite>; if set, it should be divicible by <cite>block_size</cite></p></li>
 <li><p><strong>block_size</strong> (<a class="reference external" href="https://docs.python.org/3/builtins/functions.html#int" title="(in Python v3.15)"><em>int</em></a>) – block size of the nodes; it does not change the semantics of the nodes, but will affect the speed of the compiled PC</p></li>
+<li><p><strong>parameterization</strong> (<em>Optional</em><em>[</em><a class="reference internal" href="pyjuice.parameterizations.SumParameterization.html#pyjuice.parameterizations.SumParameterization" title="pyjuice.parameterizations.SumParameterization"><em>SumParameterization</em></a><em>]</em>) – (keyword) a per-sample external parameterization of the nodes’ parameters, from
+<cite>pyjuice.parameterizations</cite> – e.g. <cite>LowRank(rank, top_k = K)</cite> on a <cite>SoftEvidenceCategorical</cite>
+leaf –, its tensors supplied at call time (<cite>external_params</cite>) as a sum node’s are</p></li>
 </ul>
 </dd>
 <dt class="field-even">Returns<span class="colon">:</span></dt>
