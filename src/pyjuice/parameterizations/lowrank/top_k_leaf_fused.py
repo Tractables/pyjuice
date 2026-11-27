@@ -150,7 +150,7 @@ def leaf_forward(desc, layer, data: torch.Tensor, node_mars: torch.Tensor, kwarg
     lp = kwargs["categorical_evidence_logp"].float().contiguous()
     emap32 = torch.empty(0, dtype = torch.int32, device = dev) if emap is None else emap.to(torch.int32).contiguous()
     tok = data.index_select(0, plan["vars"]).to(torch.int32).contiguous()
-    ord_, rank = _by_row(emap32, B) if ids.size(0) != B else (_none_i32(dev), _none_i32(dev))   # (evidence by row)
+    ord_, rank, rowstart = _by_row(emap32, B, Bx) if ids.size(0) != B else (_none_i32(dev),) * 3   # (evidence by row)
 
     if copied is not None:
         copied.synchronize()
@@ -169,7 +169,7 @@ def leaf_forward(desc, layer, data: torch.Tensor, node_mars: torch.Tensor, kwarg
                                                  node_mars, ord_, rank, sids, slp)
     layer.__dict__[_STATE] = dict(B = B, K = K, S = S, tab = tab, tau = tau, emap = emap32, ids = ids, lp = lp, lz = lz,
                                   lb = lb, place = place, miss = miss, wrow = wrow, logw = logw, offs = offs, rows = rows,
-                                  counts = None, ord = ord_, rank = rank)
+                                  counts = None, ord = ord_, rank = rank, rowstart = rowstart)
     return True
 
 
@@ -195,12 +195,14 @@ def _to_device(t: torch.Tensor, dev) -> torch.Tensor:
     return h.to(dev, non_blocking = True)
 
 
-def _by_row(emap32: torch.Tensor, B: int):
-    """`(ord, rank)` int32 [B]: the samples by the row of evidence they read (stable) -- the forward's CTAs in that
-    order --, and each place's rank among its row's (the backward's CTA a row's samples: no host synchronization)."""
+def _by_row(emap32: torch.Tensor, B: int, rows: int):
+    """`(ord, rank, rowstart)` int32: the samples [B] by the row of evidence they read (stable) -- the forward's CTAs in
+    that order --, each place's rank among its row's (the backward's CTA a row's samples: no host synchronization), and
+    where each of the `rows` rows' samples start among the places [rows + 1]."""
     srt, ord_ = torch.sort(emap32.long(), stable = True)
     rank = torch.arange(B, device = srt.device) - torch.searchsorted(srt, srt)
-    return ord_.to(torch.int32).contiguous(), rank.to(torch.int32).contiguous()
+    rowstart = torch.searchsorted(srt, torch.arange(rows + 1, device = srt.device))
+    return ord_.to(torch.int32).contiguous(), rank.to(torch.int32).contiguous(), rowstart.to(torch.int32).contiguous()
 
 
 def _state(layer, B: int):
@@ -347,6 +349,28 @@ def _tilt_grads(nodes, graded, dtau, staged, gviews, fresh, emap) -> None:
         k = j
 
 
+def _head_grad_args(nodes, graded, staged, gviews, fresh, st, Bd: int):
+    """The tilt's gradients with the head's walk in them (`tk_leaf_head_grad_kernel`: no dtau made, written and read
+    back) -- where every position is graded, the gradients fold into the rows of tensors the evidence was given at (a
+    row's samples then one tile: the fold's rows are the forward's map) and the operands fit the kernel --: `(ptrs,
+    strides, ranks, stores)`, the destinations claimed; else None (dtau then, and `_tilt_grads`)."""
+    # (the sums' top_k the leaves' own -- K != Kl's slots, past the tests' reach, keep dtau --; the kernel's head: 80
+    # candidates)
+    if not graded or len(graded) != len(nodes) or len(nodes) > 64 or st["rowstart"].numel() != Bd + 1 or \
+            st["K"] != st["S"] - 1 or min(st["ids"].size(2), st["K"]) > 80:
+        return None
+    dests = [gviews.get(n["ns"]) for n in graded]
+    ops = [tuple(staged[n["ns"]]) + tuple(g) for n, g in zip(graded, dests)]
+    A0, B0 = ops[0][0], ops[0][1]
+    if not (A0.size(2) <= 64 and A0.size(2) % 4 == 0 and B0.size(2) <= 65 and A0.size(1) % 64 == 0 and
+            all(x.dtype == torch.float32 for o in ops for x in o) and
+            all(x.stride() == y.stride() for o in ops for x, y in zip(o, ops[0])) and all(_vec(o[0], o[2]) for o in ops)
+            and len({o[2].data_ptr() for o in ops}) == len(ops) and len({o[3].data_ptr() for o in ops}) == len(ops)):
+        return None
+    stores = [bool(fresh) and gviews.claim(g) for g in dests]
+    return [o[q].data_ptr() for q in range(4) for o in ops], [s for x in ops[0] for s in x.stride()], A0.size(2), stores
+
+
 def leaf_backward(desc, layer, data, node_flows: torch.Tensor, kwargs: dict, logspace_flows: bool, missing_mask,
                   batch_first: bool, compute_param_flows: bool) -> bool:
     """`top_k.leaf_backward` by the kernels, from the layer's forward state and the reading sums' counts; False where
@@ -385,15 +409,20 @@ def leaf_backward(desc, layer, data, node_flows: torch.Tensor, kwargs: dict, log
         from pyjuice.layer.parameterized_sum_layer import EXTERNAL_PARAMS_GRAD_SIGNS_KWARG
         sg = kwargs.get(EXTERNAL_PARAMS_GRAD_SIGNS_KWARG)
         gsgn = torch.ones(node_flows.size(1), device = dev) if sg is None else sg.float().contiguous()
+    # (the gradients folded, the evidence a row each: the head's walk in the tilt's gradients, no dtau)
+    hg = _head_grad_args(nodes, graded, staged, gviews, fresh, st, Bd) \
+        if fold is not None and st["ids"].size(0) != node_flows.size(1) else None
+    tptrs, tstrides, re, tstores = hg if hg is not None else ([], [], 0, [])
     dtau = mod.top_k_leaf_backward(st["tab"], plan["nv_tab"], st["tau"], st["emap"], st["ids"], st["lp"], plan["nv_lvid"],
                                    plan["nv_row0"], st["lz"], st["lb"], st["place"], node_flows, logspace_flows,
                                    st["wrow"], st["logw"], counts, st["S"], st["K"], glp if glp is not None else none,
                                    layer.param_flows if em else none, plan["spf"] if em else none.long(),
                                    plan["spf_aligned"], none.bool() if pm is None else pm.contiguous(), gsgn,
-                                   bool(graded), drow, dsgn, Bd, st["ord"], st["rank"])
+                                   bool(graded), drow, dsgn, Bd, st["ord"], st["rank"], tptrs, tstrides,
+                                   st["rowstart"] if hg is not None else none.int(), re, tstores)
     if glp is not None and glp is not glp_out:
         glp_out += glp.to(glp_out.dtype)
-    if graded:
+    if graded and hg is None:
         _tilt_grads(nodes, graded, dtau, staged, gviews, fresh, None if fold is not None else external_rows(kwargs))
     # the forward's state used: released, nothing of the pass held after it (MEASURED, 48 blocks: 1.3 GB -- the tables,
     # the tilts, the slots' log-weights). A second backward of the same forward takes the torch passes (no state).
