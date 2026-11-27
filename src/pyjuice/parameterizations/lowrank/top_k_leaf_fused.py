@@ -153,8 +153,14 @@ def leaf_forward(desc, layer, data: torch.Tensor, node_mars: torch.Tensor, kwarg
     emap = external_rows(kwargs)
     tilts = [staged[n["ns"]] for n in nodes]
     Bx, S = tilts[0][0].size(0), tilts[0][1].size(2)
-    tau = torch.empty(T, Bx, S, M, dtype = torch.float32, device = dev)
-    _tilts(tilts, tau)
+    # the tilts made in the forward's kernel where it can (no tau [T, Bx, S, M] made, read, nor kept for the backward:
+    # its rest slot alone, tauK), else by their own kernel
+    fw = _fw_tilt_args(tilts, K, S, T)
+    if fw is None:
+        tau, tauK, fw = torch.empty(T, Bx, S, M, dtype = torch.float32, device = dev), None, ([], [], 0)
+        _tilts(tilts, tau)
+    else:
+        tau, tauK = None, torch.empty(T, Bx, M, dtype = torch.float32, device = dev)
     lp = kwargs["categorical_evidence_logp"].float().contiguous()
     emap32 = torch.empty(0, dtype = torch.int32, device = dev) if emap is None else emap.to(torch.int32).contiguous()
     tok = data.index_select(0, plan["vars"]).to(torch.int32).contiguous()
@@ -174,13 +180,33 @@ def leaf_forward(desc, layer, data: torch.Tensor, node_mars: torch.Tensor, kwarg
     wrow[nz[:, 0], nz[:, 1]] = torch.arange(R, dtype = torch.int32)
     wrow, rows = _to_device(wrow, dev), _to_device(nz[:, 1], dev)
     sids, slp = _bulk_by_id(ids, lp, min(ids.size(2), max(K, S - 1)))
-    lz, lb, place, logw = mod.top_k_leaf_forward(tab, plan["nv_tab"], tau, emap32, ids, lp, plan["nv_lvid"],
-                                                 plan["nv_row0"], tok, miss.to(torch.uint8).contiguous(), wrow, R, S, K,
-                                                 node_mars, ord_, rank, crow[sids.long()], slp, crow)
-    layer.__dict__[_STATE] = dict(B = B, K = K, S = S, tab = tab, tau = tau, emap = emap32, ids = ids, lp = lp, lz = lz,
-                                  lb = lb, place = place, miss = miss, wrow = wrow, logw = logw, offs = offs, rows = rows,
-                                  counts = None, ord = ord_, rank = rank, rowstart = rowstart, crow = crow)
+    none = torch.empty(0, device = dev)
+    lz, lb, place, logw = mod.top_k_leaf_forward(tab, plan["nv_tab"], none if tau is None else tau, emap32, ids, lp,
+                                                 plan["nv_lvid"], plan["nv_row0"], tok, miss.to(torch.uint8).contiguous(),
+                                                 wrow, R, S, K, node_mars, ord_, rank, crow[sids.long()], slp, crow,
+                                                 *fw, none if tauK is None else tauK)
+    layer.__dict__[_STATE] = dict(B = B, K = K, S = S, tab = tab, tau = tau, tauK = tauK, emap = emap32, ids = ids,
+                                  lp = lp, lz = lz, lb = lb, place = place, miss = miss, wrow = wrow, logw = logw,
+                                  offs = offs, rows = rows, counts = None, ord = ord_, rank = rank, rowstart = rowstart,
+                                  crow = crow)
     return True
+
+
+def _fw_tilt_args(tilts, K: int, S: int, T: int):
+    """`(ptrs, strides, re)` of the tilts' tensors for the forward's kernel to make them in (`tk_leaf_forward_kernel`'s
+    INL): each position's `(A [Bx, M, re], B [Bx, re, S])` fp32, A's rows 16-B aligned with their ranks contiguous,
+    every position's strides alike, re <= 64 a multiple of 4, K = Kl <= 64 (S = K + 1), at most 64 positions; else
+    None (tau then, by `_tilts`)."""
+    A0, B0 = tilts[0]
+    re = A0.size(2)
+    if T > 64 or S != K + 1 or K > 64 or re > 64 or re % 4 != 0:
+        return None
+    for A, Bt in tilts:
+        if A.dtype != torch.float32 or Bt.dtype != torch.float32 or not _vec(A) or A.stride() != A0.stride() or \
+                Bt.stride() != B0.stride() or Bt.size(1) != re or Bt.size(2) != S:
+            return None
+    return ([A.data_ptr() for A, _ in tilts] + [Bt.data_ptr() for _, Bt in tilts], list(A0.stride()) + list(B0.stride()),
+            re)
 
 
 def _none_i32(dev):
@@ -423,13 +449,18 @@ def leaf_backward(desc, layer, data, node_flows: torch.Tensor, kwargs: dict, log
     hg = _head_grad_args(nodes, graded, staged, gviews, fresh, st, Bd) \
         if fold is not None and st["ids"].size(0) != node_flows.size(1) else None
     tptrs, tstrides, re, tstores = hg if hg is not None else ([], [], 0, [])
-    dtau = mod.top_k_leaf_backward(st["tab"], plan["nv_tab"], st["tau"], st["emap"], st["ids"], st["lp"], plan["nv_lvid"],
+    tau, tauK = st["tau"], st["tauK"]
+    if tau is None:                                                    # (made in the forward's kernel: made again)
+        tau = torch.empty(len(nodes), tauK.size(1), st["S"], tauK.size(2), dtype = torch.float32, device = dev)
+        _tilts([staged[n["ns"]] for n in nodes], tau)
+    dtau = mod.top_k_leaf_backward(st["tab"], plan["nv_tab"], tau, st["emap"], st["ids"], st["lp"], plan["nv_lvid"],
                                    plan["nv_row0"], st["lz"], st["lb"], st["place"], node_flows, logspace_flows,
                                    st["wrow"], st["logw"], counts, st["S"], st["K"], glp if glp is not None else none,
                                    layer.param_flows if em else none, plan["spf"] if em else none.long(),
                                    plan["spf_aligned"], none.bool() if pm is None else pm.contiguous(), gsgn,
                                    bool(graded), drow, dsgn, Bd, st["ord"], st["rank"], tptrs, tstrides,
-                                   st["rowstart"] if hg is not None else none.int(), re, tstores, st["crow"])
+                                   st["rowstart"] if hg is not None else none.int(), re, tstores, st["crow"],
+                                   none if tauK is None else tauK)
     if glp is not None and glp is not glp_out:
         glp_out += glp.to(glp_out.dtype)
     if graded and hg is None:

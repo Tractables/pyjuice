@@ -143,10 +143,17 @@ struct FwArgs {
                                                                  // the evidence][nvars][C - H], by token id; their lp
     int pos_y;                                                   // the grid's positions in y, the samples in x (more
                                                                  // samples than grid.y holds); else the other way
+    // (INL) the tilts made in the kernel -- tau[s][i] = log2 e A[i] . Bt[:, s] --: a position's tensors A [Bx][M][re]
+    // (ranks contiguous, rows 16-B aligned, re % 4 = 0) and Bt [Bx][re][S]; their rest slot written [T][Bx][M]
+    const float* tA[64]; const float* tB[64];
+    long sab, sam, sbb, sbr, sbs; int re;
+    float* tauK;
 };
 
 constexpr int FB = 8;               // the bulk's candidates in flight a warp
 constexpr int HB = 4;               // the head's (each with its tilt's row)
+constexpr int FW_MAXT = 64;         // (INL) positions a launch
+constexpr int FW_BTS = 68;          // (INL) log2 e Bt^T's staged rows (16-B aligned)
 
 // The forward of a CTA's samples: one (NS = 1), or (the evidence a row each) up to NS of a row -- their tiles the same
 // but for the tokens (the evidence and the tilt are the row's) -- walking the candidates ONCE: the normalizers are the
@@ -159,8 +166,17 @@ constexpr int HB = 4;               // the head's (each with its tilt's row)
 // DRAM-bound; a sample's positions side by side (blockIdx.x the position: neighbours share 41% of their candidates)
 // 1.79, and the bulk walked by token id (the CTAs side by side read the table rows they share at about the same time)
 // 1.56 -- against 1.57 with the repeats (1.38 the samples side by side).
-template <int NS>
-__global__ void __launch_bounds__(NW * 32, 1) tk_leaf_forward_kernel(const FwArgs a) {
+// INL: the tilts made here, no tau [T, Bx, S, M] read (nor made, nor kept: a pass's 409 MB at 48 blocks) -- after the
+// bulk, a warp's nodes 16 at a time, a node's two lanes holding its row of A (lane h the rank quads 2j + h, as
+// `tk_tau_kernel`) against log2 e Bt^T in shared memory: every slot's tilt of the node (tk_tau_kernel's sums, bit for
+// bit), lane h keeping its head slots [32 h, 32 h + 32) -- the candidates it walks -- and the rest's. Then the node's
+// epilogue in the same two lanes: the bulk's sums (in shared memory by node), lz, lb, the rest slot (tauK), the node
+// values, and the slots' log-weights' rows (a lane its half of a row) -- no tilt nor table row read twice. K = Kl.
+// MEASURED (48 blocks, DISTINCT=1 rows): the kernel's tilt reads 0.40 ms of 1.53 (1.13 without them); INL 1.80 at 2
+// CTAs an SM (128 registers; 2.35 at one, 255) -- the tilts' FMAs and their Bt reads from shared memory 0.67 ms, more
+// than the reads they replace. The pass's peak (the sums' backward, tau no longer held there) 385 MiB lower.
+template <int NS, bool INL>
+__global__ void __launch_bounds__(NW * 32, INL ? 2 : 1) tk_leaf_forward_kernel(const FwArgs a) {
     __shared__ int s_ids[CH];
     __shared__ float s_lp[CH];
     __shared__ int s_place[NS];
@@ -240,6 +256,165 @@ __global__ void __launch_bounds__(NW * 32, 1) tk_leaf_forward_kernel(const FwArg
             const float l = s_lp[k];
             lse_add(bulk[0], th.x + l); lse_add(bulk[1], th.y + l); lse_add(bulk[2], th.z + l); lse_add(bulk[3], th.w + l);
         }
+    }
+    if constexpr (INL) {
+        __shared__ float s_bm[NW * 128], s_bs[NW * 128];               // the bulk's sums by node (the CTA's)
+        __shared__ __align__(16) float s_bt[65][FW_BTS];                // log2 e Bt^T, ranks past re zeros
+        const int n0 = blockIdx.z * NW * 128;
+        if (act) {
+            const int q = (threadIdx.x >> 5) * 128 + 4 * lane;
+#pragma unroll
+            for (int j = 0; j < 4; ++j) { s_bm[q + j] = bulk[j].m; s_bs[q + j] = bulk[j].s; }
+        }
+        const int row = g.emap != nullptr ? g.emap[b0] : b0;           // (the tilt's row of tensors)
+        const float* Bt = a.tB[t] + (long)row * a.sbb;
+        __syncthreads();                                               // (the bulk's staging read)
+        if (a.sbs == 1) {                                              // (read in the order Bt lies in)
+            for (int k = threadIdx.x; k < g.S * a.re; k += NW * 32) {
+                const int r = k / g.S, s = k % g.S;
+                s_bt[s][r] = LOG2E * __ldg(Bt + (long)r * a.sbr + s);
+            }
+        } else {
+            for (int k = threadIdx.x; k < g.S * a.re; k += NW * 32) {
+                const int s = k / a.re, r = k % a.re;
+                s_bt[s][r] = LOG2E * __ldg(Bt + (long)r * a.sbr + (long)s * a.sbs);
+            }
+        }
+        for (int k = threadIdx.x; k < g.S * (64 - a.re); k += NW * 32) s_bt[k / (64 - a.re)][a.re + k % (64 - a.re)] = 0.f;
+        for (int k = threadIdx.x; k < g.H; k += NW * 32) {               // the head's candidates: rows, lp (log2)
+            s_ids[k] = trow(g, g.ids[e0 + k]);
+            s_lp[k] = g.lp[e0 + k] * LOG2E;
+        }
+        __syncthreads();                                               // (and the places found)
+        if (blockIdx.z == 0 && threadIdx.x == 0) {
+#pragma unroll
+            for (int m = 0; m < NS; ++m) {
+                if (m >= ns) continue;
+                const int p = s_place[m];
+                a.place[(long)t * g.B + bs[m]] = miss[m] ? -2 : (p == INT_MAX ? -1 : p);
+            }
+        }
+        if (!act) return;                                              // (no barrier past here)
+        const int h = lane & 1, Kl = g.S - 1;
+        int wr[NS], pl[NS];
+#pragma unroll
+        for (int m = 0; m < NS; ++m) {
+            wr[m] = m < ns && miss[m] && a.wrow != nullptr ? a.wrow[(long)t * g.B + bs[m]] : -1;
+            pl[m] = s_place[m];
+        }
+        const float* Ab = a.tA[t] + (long)row * a.sab;
+        const float* tn0 = g.tab + (long)g.nv_tab[t] * g.tab_stride;
+        const long r0g = g.nv_row0[t];
+#pragma unroll 1
+        for (int ck = 0; ck < 128; ck += 16) {
+            const int n = blk * 128 + ck + (lane >> 1);                 // the lane pair's node
+            float4 av[8];                                              // its row of A, this lane's rank quads
+            const float4* Ar = reinterpret_cast<const float4*>(Ab + (long)n * a.sam);
+#pragma unroll
+            for (int j = 0; j < 8; ++j)
+                av[j] = 4 * (2 * j + h) < a.re ? __ldg(Ar + 2 * j + h) : make_float4(0.f, 0.f, 0.f, 0.f);
+            const auto tilt = [&](int s) -> float {                    // slot s's tilt at the node (both lanes)
+                float x0 = 0.f, x1 = 0.f, x2 = 0.f, x3 = 0.f;
+#pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    const float4 bv = *reinterpret_cast<const float4*>(&s_bt[s][4 * (2 * j + h)]);
+                    x0 = fmaf(av[j].x, bv.x, x0); x1 = fmaf(av[j].y, bv.y, x1);
+                    x2 = fmaf(av[j].z, bv.z, x2); x3 = fmaf(av[j].w, bv.w, x3);
+                }
+                const float v = (x0 + x1) + (x2 + x3);
+                return v + __shfl_xor_sync(0xffffffffu, v, 1);
+            };
+            float xv[32];                                              // this lane's head slots [32 h, 32 h + 32)
+#pragma unroll
+            for (int q = 0; q < 32; ++q) {
+                const float v0 = q < Kl ? tilt(q) : 0.f, v1 = 32 + q < Kl ? tilt(32 + q) : 0.f;
+                xv[q] = h ? v1 : v0;
+            }
+            const float tk = tilt(Kl);                                 // the rest's
+            // the head's logits at the node, this lane's candidates: (log theta + lp) + tilt (as the walk's order); a
+            // sample's token's, where it is one of them
+            Lse own = {FLOOR, 0.f};
+            const float* tn = tn0 + n;
+            float xt[NS];
+#pragma unroll
+            for (int m = 0; m < NS; ++m) xt[m] = -INFINITY;
+#pragma unroll
+            for (int q0 = 0; q0 < 32; q0 += 8) {
+                float th8[8];
+#pragma unroll
+                for (int u = 0; u < 8; ++u) {
+                    const int c = 32 * h + q0 + u;
+                    th8[u] = c < g.H ? __ldg(tn + (long)s_ids[c] * g.M) : 0.f;
+                }
+#pragma unroll
+                for (int u = 0; u < 8; ++u) {
+                    const int c = 32 * h + q0 + u;
+                    if (c < g.H) {
+                        xv[q0 + u] = th8[u] + s_lp[c] + xv[q0 + u];
+                        lse_add(own, xv[q0 + u]);
+                    } else {
+                        xv[q0 + u] = -INFINITY;
+                    }
+#pragma unroll
+                    for (int m = 0; m < NS; ++m)
+                        if (c == pl[m]) xt[m] = xv[q0 + u];
+                }
+            }
+            {                                                          // (the two halves, merged in one order)
+                const Lse o = {__shfl_xor_sync(0xffffffffu, own.m, 1), __shfl_xor_sync(0xffffffffu, own.s, 1)};
+                own = h ? lse_merge(o, own) : lse_merge(own, o);
+            }
+            const Lse bk = {s_bm[n - n0] + tk, s_bs[n - n0]};           // (the bulk's tilt the rest's)
+            const Lse none = {FLOOR, 0.f};                             // (no candidate from K to H: K = Kl)
+            const float lz0 = lse_log2(lse_merge(lse_merge(own, none), bk));
+            const float lz = lz0 == -INFINITY ? 0.f : lz0;
+            const float lbv = lse_log2(bk);
+            const float xrv = (lse_log2(lse_merge(none, bk)) - lz) * LN2;
+            if (h == 0) {
+#pragma unroll
+                for (int m = 0; m < NS; ++m) {
+                    if (m >= ns) continue;
+                    const long tb = (long)t * g.B + bs[m];
+                    a.lz[tb * g.M + n] = lz;
+                    a.lb[tb * g.M + n] = lbv;
+                }
+                a.tauK[((long)t * g.Bx + row) * g.M + n] = tk;
+            }
+#pragma unroll
+            for (int m = 0; m < NS; ++m) {                             // the node values: log P(x | i)
+                if (m >= ns || miss[m]) continue;
+                const int p = pl[m];
+                float x = -INFINITY;
+                bool mine = h == 0;
+                if (p < g.H) {                                         // (the head: the lane holding its slot)
+                    mine = (p >> 5) == h;
+                    x = xt[m];
+                } else if (p != INT_MAX && mine) {
+                    x = __ldg(tn + (long)trow(g, g.ids[e0 + p]) * g.M) + g.lp[e0 + p] * LOG2E + tk;
+                }
+                if (mine) a.node_mars[(r0g + n) * g.B + bs[m]] = (x - lz) * LN2;
+            }
+#pragma unroll
+            for (int m = 0; m < NS; ++m) {                             // the slots' log-weights: this lane's half of
+                if (wr[m] < 0) continue;                               // the row, the head's below K, K the rest's,
+                float* out = a.logw + ((long)wr[m] * g.M + n) * LW_STRIDE;   // past it 0
+#pragma unroll
+                for (int q = 0; q < 32; q += 4) {
+                    float v[4];
+#pragma unroll
+                    for (int u = 0; u < 4; ++u) {
+                        const int s = 32 * h + q + u;
+                        v[u] = s < g.K ? (s < g.C ? (xv[q + u] - lz) * LN2 : -INFINITY) : (s == g.K ? xrv : 0.f);
+                    }
+                    st4(out + 32 * h + q, v[0], v[1], v[2], v[3]);
+                }
+                if (h == 1) {
+                    st4(out + 64, g.K == 64 ? xrv : 0.f, 0.f, 0.f, 0.f);
+                    st4(out + 68, 0.f, 0.f, 0.f, 0.f);
+                }
+            }
+        }
+        return;
     }
     // the head (slots of their own), its chunks last to first: chunk 0 the one staged for the epilogue
     for (int ci = (g.H + CH - 1) / CH - 1; ci >= 0; --ci) {
@@ -422,6 +597,9 @@ struct BwArgs {
                                                                  // dtau, no head evidence gradient here) a sample's node
                                                                  // terms [T][B][5][M] for `tk_leaf_head_grad_kernel`: g
                                                                  // at the head, g past it, f, the counts' f, dR
+    const float* tauK;                                           // the tilts' rest slot [T][Bx][M] (log2; null: tau's
+                                                                 // slot Kl) -- the headless kernel reads no other: tau
+                                                                 // then made beside it, on a stream of its own
 };
 
 // dtau's writes of a thread's 4 nodes, times the sample's sign (1 where nothing folds): stored into a row the CTA holds
@@ -545,7 +723,9 @@ __global__ void __launch_bounds__(NW * 32) tk_leaf_backward_kernel(const BwArgs 
     const float* ac[NS];
     if (act) {
         const long tb0 = (long)t * g.B + b0;
-        const float4 tK = tau != nullptr ? ld4(tau + (long)Kl * g.M) : make_float4(0.f, 0.f, 0.f, 0.f);
+        const float4 tK = a.tauK != nullptr
+                        ? ld4(a.tauK + ((long)t * g.Bx + (g.emap != nullptr ? g.emap[b0] : b0)) * g.M + i0)
+                        : tau != nullptr ? ld4(tau + (long)Kl * g.M) : make_float4(0.f, 0.f, 0.f, 0.f);
         const float4 z = ld4(a.lz + tb0 * g.M + i0), lbv = ld4(a.lb + tb0 * g.M + i0);
 #pragma unroll
         for (int j = 0; j < 4; ++j) { lzs[j] = at(z, j); qB[j] = at(tK, j) - lzs[j]; gBs[j] = fmE[j] = cpE[j] = 0.f; }
@@ -1291,7 +1471,8 @@ template <typename T> T* ptr_or_null(const torch::Tensor& t) { return t.numel() 
 
 Tile make_tile(const torch::Tensor& tab, const torch::Tensor& nv_tab, const torch::Tensor& tau, const torch::Tensor& emap,
                const torch::Tensor& ids, const torch::Tensor& lp, const torch::Tensor& nv_lvid,
-               const torch::Tensor& nv_row0, int64_t B, int64_t S, int64_t K, const torch::Tensor& crow) {
+               const torch::Tensor& nv_row0, int64_t B, int64_t S, int64_t K, const torch::Tensor& crow,
+               const torch::Tensor& tauK) {
     check(tab, at::kFloat, "tables"); check(nv_tab, at::kInt, "nv_tab"); check(ids, at::kInt, "ids");
     check(lp, at::kFloat, "lp"); check(nv_lvid, at::kInt, "nv_lvid"); check(nv_row0, at::kInt, "nv_row0");
     TORCH_CHECK(tab.dim() == 3 && ids.dim() == 3 && lp.sizes() == ids.sizes(), "top_k leaf: shapes");
@@ -1304,6 +1485,9 @@ Tile make_tile(const torch::Tensor& tab, const torch::Tensor& nv_tab, const torc
         check(tau, at::kFloat, "tau");
         TORCH_CHECK(tau.dim() == 4 && tau.size(2) == S && tau.size(3) == M, "top_k leaf: tau [T, Bx, S, M]");
         g.tau = tau.data_ptr<float>(); g.Bx = (int)tau.size(1);
+    } else if (tauK.numel() > 0) {                          // (the tilts made in the forward: their rows' count)
+        TORCH_CHECK(tauK.dim() == 3 && tauK.size(2) == M, "top_k leaf: tauK [T, Bx, M]");
+        g.Bx = (int)tauK.size(1);
     }
     g.emap = nullptr;
     if (emap.numel() > 0) { check(emap, at::kInt, "emap"); g.emap = emap.data_ptr<int>(); }
@@ -1344,17 +1528,39 @@ torch::Tensor top_k_leaf_table(torch::Tensor params, torch::Tensor spids, int64_
 // kernels read them (the rest zeros, or not written past 72) --) -- R the rows wrow names (logw empty where none).
 // `ord`, `rank` [B] int32 (the evidence a row each): the samples by their row and each place's rank within it -- a
 // CTA the samples of a row two at a time (empty: a sample a CTA); `sids`, `slp` [rows of ids, nvars, C - H] each
-// tile's candidates past the head H = min(C, max(K, S - 1)) sorted by token id and their lp (`top_k_leaf_fused`)
+// tile's candidates past the head H = min(C, max(K, S - 1)) sorted by token id and their lp (`top_k_leaf_fused`).
+// `fptrs` (2T: each position's A [Bx, M, re], then its Bt [Bx, re, S]), `fstrides` (A's three, Bt's three), `re`: the
+// tilts made in the kernel (tau empty; K = S - 1), their rest slot written into `tauK` [T, Bx, M]; empty: tau's
 std::vector<torch::Tensor> top_k_leaf_forward(torch::Tensor tab, torch::Tensor nv_tab, torch::Tensor tau, torch::Tensor emap,
                                               torch::Tensor ids, torch::Tensor lp, torch::Tensor nv_lvid,
                                               torch::Tensor nv_row0, torch::Tensor tok, torch::Tensor miss,
                                               torch::Tensor wrow, int64_t R, int64_t S, int64_t K,
                                               torch::Tensor node_mars, torch::Tensor ord, torch::Tensor rank,
-                                              torch::Tensor sids, torch::Tensor slp, torch::Tensor crow) {
+                                              torch::Tensor sids, torch::Tensor slp, torch::Tensor crow,
+                                              std::vector<int64_t> fptrs, std::vector<int64_t> fstrides, int64_t re,
+                                              torch::Tensor tauK) {
     const at::cuda::CUDAGuard guard(tab.device());
     const int64_t T = nv_tab.size(0), B = tok.size(1);
     FwArgs a;
-    a.g = make_tile(tab, nv_tab, tau, emap, ids, lp, nv_lvid, nv_row0, B, S, K, crow);
+    a.g = make_tile(tab, nv_tab, tau, emap, ids, lp, nv_lvid, nv_row0, B, S, K, crow, tauK);
+    // (the tilts made in the kernel -- `fptrs` a position's A then its Bt, `fstrides` A's then Bt's -- no tau given,
+    // their rest slot into tauK [T, Bx, M])
+    const bool inl = !fptrs.empty();
+    a.tauK = nullptr; a.re = 0;
+    if (inl) {
+        TORCH_CHECK(tau.numel() == 0 && (int64_t)fptrs.size() == 2 * T && T <= FW_MAXT && fstrides.size() == 6 &&
+                    fstrides[2] == 1 && re > 0 && re <= 64 && re % 4 == 0 && K == S - 1 && S <= 65 &&
+                    a.g.H <= K && tauK.numel() == T * a.g.Bx * a.g.M,
+                    "top_k leaf: the tilts made in the forward: their shapes");
+        check(tauK, at::kFloat, "tauK");
+        for (int k = 0; k < T; ++k) {
+            a.tA[k] = reinterpret_cast<const float*>(fptrs[k]); a.tB[k] = reinterpret_cast<const float*>(fptrs[T + k]);
+            TORCH_CHECK(fptrs[k] % 16 == 0 && fstrides[0] % 4 == 0 && fstrides[1] % 4 == 0,
+                        "top_k leaf: the tilts' rows of A 16-B aligned");
+        }
+        a.sab = fstrides[0]; a.sam = fstrides[1]; a.sbb = fstrides[3]; a.sbr = fstrides[4]; a.sbs = fstrides[5];
+        a.re = (int)re; a.tauK = tauK.data_ptr<float>();
+    }
     check(tok, at::kInt, "tok"); check(miss, at::kByte, "miss"); check(node_mars, at::kFloat, "node_mars");
     TORCH_CHECK(node_mars.size(1) == B, "top_k leaf: node_mars [rows, B]");
     const int M = a.g.M;
@@ -1384,8 +1590,11 @@ std::vector<torch::Tensor> top_k_leaf_forward(torch::Tensor tab, torch::Tensor n
     const unsigned gz = (unsigned)((M + NW * 128 - 1) / (NW * 128));
     const dim3 grid = a.pos_y ? dim3((unsigned)B, (unsigned)T, gz) : dim3((unsigned)T, (unsigned)B, gz);
     const auto stream = at::cuda::getCurrentCUDAStream();
-    if (a.ord != nullptr) tk_leaf_forward_kernel<2><<<grid, NW * 32, 0, stream>>>(a);
-    else tk_leaf_forward_kernel<1><<<grid, NW * 32, 0, stream>>>(a);
+    TORCH_CHECK(!inl || a.lws == LW_STRIDE, "top_k leaf: the tilts made in the forward: the slots' rows 72 wide");
+    if (inl && a.ord != nullptr) tk_leaf_forward_kernel<2, true><<<grid, NW * 32, 0, stream>>>(a);
+    else if (inl) tk_leaf_forward_kernel<1, true><<<grid, NW * 32, 0, stream>>>(a);
+    else if (a.ord != nullptr) tk_leaf_forward_kernel<2, false><<<grid, NW * 32, 0, stream>>>(a);
+    else tk_leaf_forward_kernel<1, false><<<grid, NW * 32, 0, stream>>>(a);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return {lz, lb, place, logw};
 }
@@ -1403,11 +1612,12 @@ torch::Tensor top_k_leaf_backward(torch::Tensor tab, torch::Tensor nv_tab, torch
                                   bool spf_aligned, torch::Tensor pmask, torch::Tensor gsgn, bool dtau_out,
                                   torch::Tensor drow, torch::Tensor dsgn, int64_t Bd, torch::Tensor ord,
                                   torch::Tensor rank, std::vector<int64_t> tptrs, std::vector<int64_t> tstrides,
-                                  torch::Tensor rowstart, int64_t re, std::vector<bool> tstores, torch::Tensor crow) {
+                                  torch::Tensor rowstart, int64_t re, std::vector<bool> tstores, torch::Tensor crow,
+                                  torch::Tensor tauK) {
     const at::cuda::CUDAGuard guard(tab.device());
     const int64_t T = nv_tab.size(0), B = place.size(1);
     BwArgs a;
-    a.g = make_tile(tab, nv_tab, tau, emap, ids, lp, nv_lvid, nv_row0, B, S, K, crow);
+    a.g = make_tile(tab, nv_tab, tau, emap, ids, lp, nv_lvid, nv_row0, B, S, K, crow, tauK);
     check(lz, at::kFloat, "lz"); check(lb, at::kFloat, "lb"); check(place, at::kInt, "place");
     check(flows, at::kFloat, "flows");
     if (glp.numel() > 0) {
@@ -1435,6 +1645,14 @@ torch::Tensor top_k_leaf_backward(torch::Tensor tab, torch::Tensor nv_tab, torch
     at::cuda::CUDAEvent hg_fork, hg_join;
     torch::Tensor nterm;
     a.nterm = nullptr;
+    // (the tilts' rest slot as the forward wrote it, where it made its tilts itself: the headless kernel reads no other)
+    a.tauK = nullptr;
+    if (tauK.numel() > 0) {
+        check(tauK, at::kFloat, "tauK");
+        TORCH_CHECK(tauK.dim() == 3 && tauK.size(0) == T && tauK.size(1) == a.g.Bx && tauK.size(2) == a.g.M,
+                    "top_k leaf: tauK [T, Bx, M]");
+        a.tauK = tauK.data_ptr<float>();
+    }
     if (hg) {
         nterm = torch::empty({T, B, 5, M}, tab.options());
         a.nterm = nterm.data_ptr<float>();
