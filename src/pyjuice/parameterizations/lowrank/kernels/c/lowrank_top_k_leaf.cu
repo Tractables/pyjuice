@@ -127,6 +127,8 @@ struct FwArgs {
                                                                  // -1: none): lws = 72, the sums' operand stride
     const int* ord; const int* rank;                             // [B] the samples by their evidence's row and a
                                                                  // place's rank within its row (null: a sample a CTA)
+    const int* sids; const float* slp;                           // the candidates past the head of each tile [rows of
+                                                                 // the evidence][nvars][C - H], by token id; their lp
 };
 
 constexpr int FB = 8;               // the bulk's candidates in flight a warp
@@ -134,23 +136,27 @@ constexpr int HB = 4;               // the head's (each with its tilt's row)
 
 // The forward of a CTA's samples: one (NS = 1), or (the evidence a row each) up to NS of a row -- their tiles the same
 // but for the tokens (the evidence and the tilt are the row's) -- walking the candidates ONCE: the normalizers are the
-// group's, the node values and the slots' log-weights each sample's from them. The chunks of candidates walked last
-// to first, the head after the bulk: the epilogue's head rows (the slots' log-weights) are the last read, and chunk 0
-// the one staged. MEASURED (48 blocks, a row's two samples): 2.77 ms a sample a CTA -> 1.73 one walk a row -> 1.38
-// with the slots' log-weights stored as whole blocks of rows (1.10 without them: the walk ~5.7 TB/s of table rows
-// from L2). With the rows' evidence made distinct (the repeats' tokens permuted) 3.77 -> 2.29: DRAM-bound there.
+// group's, the node values and the slots' log-weights each sample's from them. The bulk first, by token id, then the
+// head, its chunks last to first: the epilogue's head rows (the slots' log-weights) are the last read, and the head's
+// first chunk the one staged. MEASURED (48 blocks, a row's two samples): 2.77 ms a sample a CTA -> 1.73 one walk a row
+// -> 1.38 with the slots' log-weights stored as whole blocks of rows (1.10 without them: the walk ~5.7 TB/s of table
+// rows from L2) -- with the dump's rows (each repeated 3 times: they share every candidate at a position). With the
+// rows' evidence made distinct (the repeats' tokens permuted, as the real head's rows are) that kernel 2.29 ms:
+// DRAM-bound; a sample's positions side by side (blockIdx.x the position: neighbours share 41% of their candidates)
+// 1.79, and the bulk walked by token id (the CTAs side by side read the table rows they share at about the same time)
+// 1.56 -- against 1.57 with the repeats (1.38 the samples side by side).
 template <int NS>
 __global__ void __launch_bounds__(NW * 32, 1) tk_leaf_forward_kernel(const FwArgs a) {
     __shared__ int s_ids[CH];
     __shared__ float s_lp[CH];
     __shared__ int s_place[NS];
     const Tile& g = a.g;
-    const int t = blockIdx.y, lane = threadIdx.x & 31;
+    const int t = blockIdx.x, qx = blockIdx.y, lane = threadIdx.x & 31;
     int bs[NS], ns = 1;
     if constexpr (NS == 1) {
-        bs[0] = blockIdx.x;
+        bs[0] = qx;
     } else {                                                           // (`ord` the samples by row, `rank` within it)
-        const int q = blockIdx.x;
+        const int q = qx;
         if (a.rank[q] % NS != 0) return;                               // (the group's first place's CTA)
         bs[0] = a.ord[q];
         const int er = g.erow[bs[0]];
@@ -184,24 +190,27 @@ __global__ void __launch_bounds__(NW * 32, 1) tk_leaf_forward_kernel(const FwArg
 #pragma unroll
     for (int j = 0; j < 4; ++j) { own[j] = {FLOOR, 0.f}; mid[j] = {FLOOR, 0.f}; bulk[j] = {FLOOR, 0.f}; }
     if (threadIdx.x < NS) s_place[threadIdx.x] = INT_MAX;
-
-    const int nch = (g.C + CH - 1) / CH;
-    for (int ci = nch - 1; ci >= 0; --ci) {
-        const int c0 = ci * CH, n = min(CH, g.C - c0);
+    __syncthreads();
+    for (int c = threadIdx.x; c < g.C; c += NW * 32) {                // each sample's token's first place
+        const int id = g.ids[e0 + c];
+#pragma unroll
+        for (int m = 0; m < NS; ++m)
+            if (!miss[m] && id == tok[m]) atomicMin(&s_place[m], c);
+    }
+    // the bulk (the candidates past the head; the tilt's slot Kl: added after), by token id
+    const int nb = g.C - g.H;
+    const long eb = ((long)(g.erow != nullptr ? g.erow[b0] : b0) * g.nvars + g.nv_lvid[t]) * nb;
+    for (int c0 = 0; c0 < nb; c0 += CH) {
+        const int n = min(CH, nb - c0);
         __syncthreads();
         for (int k = threadIdx.x; k < n; k += NW * 32) {
-            const int id = g.ids[e0 + c0 + k];
-            s_ids[k] = id;
-            s_lp[k] = g.lp[e0 + c0 + k] * LOG2E;
-#pragma unroll
-            for (int m = 0; m < NS; ++m)
-                if (!miss[m] && id == tok[m]) atomicMin(&s_place[m], c0 + k);
+            s_ids[k] = a.sids[eb + c0 + k];
+            s_lp[k] = a.slp[eb + c0 + k] * LOG2E;
         }
         __syncthreads();
         if (!act) continue;
-        const int kh = max(0, min(n, g.H - c0));                       // the chunk's head: k < kh
-        int k = kh;
-        for (; k + FB <= n; k += FB) {                                 // the bulk (the tilt's slot Kl: added after)
+        int k = 0;
+        for (; k + FB <= n; k += FB) {
             float4 th[FB];
 #pragma unroll
             for (int u = 0; u < FB; ++u) th[u] = ld4(tab + (long)s_ids[k + u] * g.M);
@@ -217,7 +226,18 @@ __global__ void __launch_bounds__(NW * 32, 1) tk_leaf_forward_kernel(const FwArg
             const float l = s_lp[k];
             lse_add(bulk[0], th.x + l); lse_add(bulk[1], th.y + l); lse_add(bulk[2], th.z + l); lse_add(bulk[3], th.w + l);
         }
-        for (k = 0; k < kh; k += HB) {                                 // the head: slots of their own
+    }
+    // the head (slots of their own), its chunks last to first: chunk 0 the one staged for the epilogue
+    for (int ci = (g.H + CH - 1) / CH - 1; ci >= 0; --ci) {
+        const int c0 = ci * CH, kh = min(CH, g.H - c0);
+        __syncthreads();
+        for (int k = threadIdx.x; k < kh; k += NW * 32) {
+            s_ids[k] = g.ids[e0 + c0 + k];
+            s_lp[k] = g.lp[e0 + c0 + k] * LOG2E;
+        }
+        __syncthreads();
+        if (!act) continue;
+        for (int k = 0; k < kh; k += HB) {
             float4 th[HB], tc[HB];
 #pragma unroll
             for (int u = 0; u < HB; ++u) {
@@ -238,6 +258,8 @@ __global__ void __launch_bounds__(NW * 32, 1) tk_leaf_forward_kernel(const FwArg
             }
         }
     }
+    __syncthreads();                                                   // (the places found)
+    const int hs = min(g.H, CH);                                       // (s_ids: the head's first hs candidates)
     // (from here the warps without nodes take part in the barriers only)
     float lzs[4], xr[4];
     if (act) {
@@ -265,8 +287,8 @@ __global__ void __launch_bounds__(NW * 32, 1) tk_leaf_forward_kernel(const FwArg
             if (miss[m]) continue;
             float v[4] = {-INFINITY, -INFINITY, -INFINITY, -INFINITY};    // the node values: log P(x | i)
             if (p != INT_MAX) {
-                const int id = p < CH ? s_ids[p] : g.ids[e0 + p];      // (chunk 0 the one staged)
-                const float l = p < CH ? s_lp[p] : g.lp[e0 + p] * LOG2E;
+                const int id = p < hs ? s_ids[p] : g.ids[e0 + p];      // (the head's first chunk the one staged)
+                const float l = p < hs ? s_lp[p] : g.lp[e0 + p] * LOG2E;
                 const float4 th = ld4(tab + (long)id * g.M);
                 const float4 tc = tau == nullptr ? make_float4(0.f, 0.f, 0.f, 0.f) : p >= Kl ? tK : ld4(tau + (long)p * g.M);
 #pragma unroll
@@ -305,9 +327,9 @@ __global__ void __launch_bounds__(NW * 32, 1) tk_leaf_forward_kernel(const FwArg
                     x = -INFINITY;
                     if (s < g.C) {
                         const float* tr = g.tab + (long)g.nv_tab[t] * g.tab_stride + n0 + n;
-                        const float l = s < CH ? s_lp[s] : g.lp[e0 + s] * LOG2E;
+                        const float l = s < hs ? s_lp[s] : g.lp[e0 + s] * LOG2E;
                         const float tc = tau == nullptr ? 0.f : tau[(long)min(s, Kl) * g.M + n0 + n - i0];
-                        x = (tr[(long)(s < CH ? s_ids[s] : g.ids[e0 + s]) * g.M] + l + tc - s_lz[n]) * LN2;
+                        x = (tr[(long)(s < hs ? s_ids[s] : g.ids[e0 + s]) * g.M] + l + tc - s_lz[n]) * LN2;
                     }
                 }
 #pragma unroll
@@ -326,8 +348,8 @@ __global__ void __launch_bounds__(NW * 32, 1) tk_leaf_forward_kernel(const FwArg
         for (int s = threadIdx.x >> 2; s < g.K; s += NW * 8) {
             float v[8];
             if (s < g.C) {
-                const int id = s < CH ? s_ids[s] : g.ids[e0 + s];
-                const float l = s < CH ? s_lp[s] : g.lp[e0 + s] * LOG2E;
+                const int id = s < hs ? s_ids[s] : g.ids[e0 + s];
+                const float l = s < hs ? s_lp[s] : g.lp[e0 + s] * LOG2E;
                 const float* tr = tab0 + (long)id * g.M + p0 + nq;
                 const float4 a0 = ld4(tr), a1 = ld4(tr + 4);
                 float4 c0 = make_float4(0.f, 0.f, 0.f, 0.f), c1 = c0;
@@ -914,12 +936,14 @@ torch::Tensor top_k_leaf_table(torch::Tensor params, torch::Tensor spids, int64_
 // (lz [T, B, M], lb [T, B, M], place [T, B], logw [R, M, max(K + 1, 72)] -- slots 0 .. K, the rows 72 wide as the sums'
 // kernels read them (the rest zeros, or not written past 72) --) -- R the rows wrow names (logw empty where none).
 // `ord`, `rank` [B] int32 (the evidence a row each): the samples by their row and each place's rank within it -- a
-// CTA the samples of a row two at a time (empty: a sample a CTA)
+// CTA the samples of a row two at a time (empty: a sample a CTA); `sids`, `slp` [rows of ids, nvars, C - H] each
+// tile's candidates past the head H = min(C, max(K, S - 1)) sorted by token id and their lp (`top_k_leaf_fused`)
 std::vector<torch::Tensor> top_k_leaf_forward(torch::Tensor tab, torch::Tensor nv_tab, torch::Tensor tau, torch::Tensor emap,
                                               torch::Tensor ids, torch::Tensor lp, torch::Tensor nv_lvid,
                                               torch::Tensor nv_row0, torch::Tensor tok, torch::Tensor miss,
                                               torch::Tensor wrow, int64_t R, int64_t S, int64_t K,
-                                              torch::Tensor node_mars, torch::Tensor ord, torch::Tensor rank) {
+                                              torch::Tensor node_mars, torch::Tensor ord, torch::Tensor rank,
+                                              torch::Tensor sids, torch::Tensor slp) {
     const at::cuda::CUDAGuard guard(tab.device());
     const int64_t T = nv_tab.size(0), B = tok.size(1);
     FwArgs a;
@@ -941,7 +965,15 @@ std::vector<torch::Tensor> top_k_leaf_forward(torch::Tensor tab, torch::Tensor n
         a.ord = ord.data_ptr<int>(); a.rank = rank.data_ptr<int>();
     }
     if (R > 0) { check(wrow, at::kInt, "wrow"); a.wrow = wrow.data_ptr<int>(); a.logw = logw.data_ptr<float>(); }
-    dim3 grid((unsigned)B, (unsigned)T, (unsigned)((M + NW * 128 - 1) / (NW * 128)));
+    const int nb = a.g.C - a.g.H;                           // (the bulk by token id: every tile's, beside its lp)
+    TORCH_CHECK(sids.dim() == 3 && slp.sizes() == sids.sizes() && sids.size(0) == ids.size(0) &&
+                sids.size(1) == ids.size(1) && sids.size(2) == nb, "top_k leaf: sids, slp [rows, nvars, C - H]");
+    a.sids = nullptr; a.slp = nullptr;
+    if (nb > 0) {
+        check(sids, at::kInt, "sids"); check(slp, at::kFloat, "slp");
+        a.sids = sids.data_ptr<int>(); a.slp = slp.data_ptr<float>();
+    }
+    dim3 grid((unsigned)T, (unsigned)B, (unsigned)((M + NW * 128 - 1) / (NW * 128)));   // (a sample's positions side by side)
     const auto stream = at::cuda::getCurrentCUDAStream();
     if (a.ord != nullptr) tk_leaf_forward_kernel<2><<<grid, NW * 32, 0, stream>>>(a);
     else tk_leaf_forward_kernel<1><<<grid, NW * 32, 0, stream>>>(a);
