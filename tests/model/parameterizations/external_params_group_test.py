@@ -377,6 +377,16 @@ def _cats(factors):
     return tuple(torch.cat(slot, dim = 1) for slot in zip(*factors))
 
 
+def _staged_buffer(pc):
+    """The staging buffer's contents -- None where no pass allocated one (every node read in place: nothing copied)."""
+    return None if pc.external_params is None else pc.external_params.clone()
+
+
+def _buffer_unchanged(pc, before) -> bool:
+    """Nothing copied into the staging buffer since `_staged_buffer` (none allocated where there was none)."""
+    return pc.external_params is None if before is None else torch.equal(pc.external_params, before)
+
+
 @cuda_only
 @pytest.mark.parametrize("form", ["sum_exp", "exp_sum"])
 def test_a_group_of_several_tensors_goes_in_one_launch_each_way(monkeypatch, form):
@@ -393,7 +403,7 @@ def test_a_group_of_several_tensors_goes_in_one_launch_each_way(monkeypatch, for
     factors = _factors(members, batch, dev, 5)
 
     ll_p = pc(data, sum_external_params = dict(zip(members, factors))).clone()
-    staged_p = pc.external_params.clone()
+    staged_p = _staged_buffer(pc)
     pc.backward(data, flows_memory = 0.0)
     grads_p = [tuple(g.clone() for g in pc.get_external_params_grad(m)) for m in members]
 
@@ -401,10 +411,12 @@ def test_a_group_of_several_tensors_goes_in_one_launch_each_way(monkeypatch, for
     cats = _cats(factors)
     one_launch = dict(batched = [2 * T] if form == "sum_exp" else [], copies = 0)    # (exp_sum: no per-node copies)
     if form == "exp_sum":
-        assert pc._group_strided("tr", cats, batch, pc.external_params) is not None
+        buf = pc.external_params if pc.external_params is not None else \
+            torch.empty(pc._external_params_layout(batch)[0], device = dev)          # (the layout's: none allocated)
+        assert pc._group_strided("tr", cats, batch, buf) is not None
     ll_g = pc(data, sum_external_params = {"tr": cats}).clone()
     assert calls == one_launch, calls
-    assert torch.equal(pc.external_params, staged_p) and torch.equal(ll_g, ll_p)
+    assert _buffer_unchanged(pc, staged_p) and torch.equal(ll_g, ll_p)
 
     calls.update(batched = [], copies = 0)
     grads = tuple(torch.full_like(c, float("nan")) for c in cats)
@@ -473,14 +485,14 @@ def test_a_group_whose_members_differ_along_the_group_axis_in_one_launch(monkeyp
     assert factors[0][0].size(1) != factors[1][0].size(1)
 
     ll_p = pc(data, sum_external_params = {s0: factors[0], s1: factors[1]}).clone()
-    staged_p = pc.external_params.clone()
+    staged_p = _staged_buffer(pc)
     pc.backward(data, flows_memory = 0.0)
     want = tuple(torch.cat([pc.get_external_params_grad(m)[slot] for m in (s0, s1)], dim = 1) for slot in range(2))
 
     calls = _counting_staging(monkeypatch)
     cats = _cats(factors)
     assert torch.equal(pc(data, sum_external_params = {"two": cats}), ll_p)
-    assert torch.equal(pc.external_params, staged_p) and calls == dict(batched = [4], copies = 0), calls
+    assert _buffer_unchanged(pc, staged_p) and calls == dict(batched = [4], copies = 0), calls
     grads = tuple(torch.empty_like(c) for c in cats)
     pc.backward(data, flows_memory = 0.0, sum_external_params_grad = {"two": grads})
     torch.cuda.synchronize()
@@ -659,7 +671,7 @@ def test_what_a_group_in_one_launch_does_not_take_goes_the_per_node_way(monkeypa
     factors = _factors(members, batch, dev, 9)
     cats = _cats(factors)
     pc(data, sum_external_params = dict(zip(members, factors)))
-    staged_p = pc.external_params.clone()
+    staged_p = _staged_buffer(pc)
     calls = _counting_staging(monkeypatch)
 
     # not contiguous: every other row of a taller tensor
@@ -671,7 +683,7 @@ def test_what_a_group_in_one_launch_does_not_take_goes_the_per_node_way(monkeypa
     # and the staged views are the spaced tensors' own)
     spaced_cats = tuple(spaced(c) for c in cats)
     pc(data, sum_external_params = {"tr": spaced_cats})
-    assert calls["copies"] == 0 and torch.equal(pc.external_params, staged_p), calls
+    assert calls["copies"] == 0 and _buffer_unchanged(pc, staged_p), calls
     for m, tensors in zip(members, factors):
         for staged, t, cat in zip(pc._staged_external_params[m], tensors, spaced_cats):
             assert torch.equal(staged, t) and staged.untyped_storage().data_ptr() == cat.untyped_storage().data_ptr()
@@ -679,7 +691,7 @@ def test_what_a_group_in_one_launch_does_not_take_goes_the_per_node_way(monkeypa
     # a group with the nodes it leaves out, in one dict: in place, both kinds
     calls.update(batched = [], copies = 0)
     pc(data, sum_external_params = {"head": _cats(factors[:2]), **dict(zip(members[2:], factors[2:]))})
-    assert calls["copies"] == 0 and torch.equal(pc.external_params, staged_p), calls
+    assert calls["copies"] == 0 and _buffer_unchanged(pc, staged_p), calls
     for m, tensors in zip(members[2:], factors[2:]):
         assert all(s_.data_ptr() == t.data_ptr() for s_, t in zip(pc._staged_external_params[m], tensors))
 

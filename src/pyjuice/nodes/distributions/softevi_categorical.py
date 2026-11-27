@@ -245,6 +245,13 @@ class SoftEvidenceCategorical(_KernelsMixin, Distribution):
         """
         if kwargs.get("soft_evidence_cat_ids", None) is None:
             return
+        # (the evidence a sample each: one of the rows' batch -- `external_params_rows` -- is read through the map by a
+        # parameterization of the layer that takes it, `LowRank(top_k)`, and never by these kernels)
+        lp, common = kwargs.get("categorical_evidence_logp"), kwargs.get("_fw_launch_common")
+        if lp is not None and common is not None and lp.size(0) != common["batch_size"]:
+            raise ValueError(f"`categorical_evidence_logp` has {lp.size(0)} rows for {common['batch_size']} samples: "
+                             f"evidence of the rows' batch (`external_params_rows`) is read by a layer whose "
+                             f"parameterization takes it (`LowRank(top_k)`), not by a plain `SoftEvidenceCategorical`.")
         if not kwargs.get("sort_soft_evidence", getattr(self, "sort_soft_evidence", True)):
             return
         if os.environ.get("PYJUICE_SOFTEVI_SORT", "1") == "0":
@@ -466,9 +473,14 @@ class SoftEvidenceCategorical(_KernelsMixin, Distribution):
             # of beta) so they can't underflow, and reduces exactly to (F+ + pc/K)/(sum F+ + pc) when
             # p_theta is uniform (F- = beta*Gamma).
             flow = param * (flow_num + numerate_pseudocount) / (flow_denom + pseudocount * param)
-            # A category no flow reached, without a pseudocount (0 / 0), keeps its parameter: a ratio of 1
-            flow = tl.where((param * (flow_num + numerate_pseudocount) == 0.0)
-                            & (flow_denom + pseudocount * param == 0.0), param, flow)
+            # A category no flow reached -- no statistic in either phase -- keeps its parameter: a ratio of 1, whatever
+            # the pseudocount. The update has no information about it, and the prior is a floor for the categories
+            # it estimates, not a reset of the ones it does not see: with a pseudocount, (pc / K) / (pc * beta) took
+            # every such category to the uniform 1 / K. A mini-batch EM step whose top-down term covers each row's
+            # own candidates only (external parameters) leaves the rest of the vocabulary without statistics, so
+            # that reset hit nearly every category on every update (MEASURED, the best Codpula head: one update moved
+            # 110M of 129M emission entries by > 50%, at any step size)
+            flow = tl.where((flow_num == 0.0) & (flow_denom == 0.0), param, flow)
             # Padding lanes (cat_id >= num_cats) load param/flows as 0 => 0/0 = NaN; zero them out.
             flow = tl.where(cat_mask, flow, 0.0)
 
@@ -488,9 +500,8 @@ class SoftEvidenceCategorical(_KernelsMixin, Distribution):
             flow_denom = tl.load(param_flows_ptr + s_pfids + num_cats + cat_id, mask = cat_mask, other = 0)
 
             new_param = param * ((1.0 - step_size) + step_size * (flow_num + numerate_pseudocount) / (flow_denom + pseudocount * param)) / cum_flow
-            # (a ratio of 1 where it is 0 / 0, as in the normalizer's pass)
-            new_param = tl.where((param * (flow_num + numerate_pseudocount) == 0.0)
-                                 & (flow_denom + pseudocount * param == 0.0),
+            # (a ratio of 1 where no flow reached it, as in the normalizer's pass)
+            new_param = tl.where((flow_num == 0.0) & (flow_denom == 0.0),
                                  param * ((1.0 - step_size) + step_size) / cum_flow, new_param)
 
             # Numerical guard: the MAP denominator self-floors only when F- is computed fresh from
@@ -526,9 +537,8 @@ class SoftEvidenceCategorical(_KernelsMixin, Distribution):
 
             # MAP M-step (Dirichlet prior): denominator F- + pseudocount*beta (see small_ncats variant).
             flow = param * (flow_num + numerate_pseudocount[:,None]) / (flow_denom + pseudocount * param)
-            # A category no flow reached, without a pseudocount (0 / 0), keeps its parameter: a ratio of 1
-            flow = tl.where((param * (flow_num + numerate_pseudocount[:,None]) == 0.0)
-                            & (flow_denom + pseudocount * param == 0.0), param, flow)
+            # A category no flow reached keeps its parameter, whatever the pseudocount (see small_ncats variant)
+            flow = tl.where((flow_num == 0.0) & (flow_denom == 0.0), param, flow)
             # Padding lanes (cat_id >= num_cats) load param/flows as 0 => 0/0 = NaN; zero them out.
             flow = tl.where(cat_mask, flow, 0.0)
 
@@ -551,9 +561,8 @@ class SoftEvidenceCategorical(_KernelsMixin, Distribution):
             flow_denom = tl.load(param_flows_ptr + s_pfids[:,None] + num_cats[:,None] + cat_ids[None,:], mask = cat_mask, other = 0)
 
             new_param = param * ((1.0 - step_size) + step_size * (flow_num + numerate_pseudocount[:,None]) / (flow_denom + pseudocount * param)) / cum_flow[:,None]
-            # (a ratio of 1 where it is 0 / 0, as in the normalizer's pass)
-            new_param = tl.where((param * (flow_num + numerate_pseudocount[:,None]) == 0.0)
-                                 & (flow_denom + pseudocount * param == 0.0),
+            # (a ratio of 1 where no flow reached it, as in the normalizer's pass)
+            new_param = tl.where((flow_num == 0.0) & (flow_denom == 0.0),
                                  param * ((1.0 - step_size) + step_size) / cum_flow[:,None], new_param)
 
             # Numerical guard against momentum-induced underflow (see small_ncats variant).

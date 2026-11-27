@@ -602,6 +602,9 @@ class SumLayer(Layer, nn.Module):
                           circuit's passes: `TensorCircuit._stream_fusion_groups`.)
         """
         op = op_params if op_params is not None and self.__dict__.get("_reads_param_operands", False) else None
+        # (the call's grad mode: a hint of what a parameterized layer may keep for a backward -- a plain sum keeps nothing,
+        # and the hint is no option of its call)
+        kwargs.pop("_grad_enabled", None)
 
         # A plain call -- LL, no tempering, whole partitions, nothing else passed -- whose every partition the full
         # dispatch below sent to a tuned CUDA tlmm kernel launches those kernels straight away (`_fw_fast_launch`, which
@@ -951,7 +954,7 @@ class SumLayer(Layer, nn.Module):
                  temper_eflow: bool = False, partition_runs: Optional[Sequence] = None,
                  compute_children: Optional[Tuple[torch.Tensor, int]] = None,
                  op_params: Optional[torch.Tensor] = None, stream_children: Optional[Tuple[torch.Tensor, int]] = None,
-                 **kwargs) -> None:
+                 param_flows_mask: Optional[torch.Tensor] = None, **kwargs) -> None:
         """
         Computes the forward pass of a sum layer:
         ```
@@ -994,6 +997,9 @@ class SumLayer(Layer, nn.Module):
                           `TensorCircuit._stream_fusion_bk_groups`), where `_stream_fusion_bk` holds (a call whose
                           parameter-flow deferral declines forms the element values itself for the per-step kernels).
                           Set on the layer per call (`_bk_stream_children`), read by the launchers as `_bk_copy` is.
+        `param_flows_mask`: None, or `[B]` bool, the samples whose flows the parameter flows take: the others' node
+                          flows are zero for the parameter-flow kernels, the layer's rows restored after them. An eager
+                          call (no launch plan, no deferral).
         """
         # The copy this call's element flows may read (`_bk_copy`): set before the plan lookup, as
         # `_defer_param_flows` below, since a plan's element launchers read it too
@@ -1020,10 +1026,11 @@ class SumLayer(Layer, nn.Module):
         # `defer_param_flows` (the circuit's backward sets it when no layer callback sees the flows between layers): a
         # tied partition may leave its parameter flows to the end of the pass (`deferred_par`). Read per call by the
         # parameter-flow site and a plan's launcher alike -- so before the lookup --, past `nn.Module.__setattr__`.
-        self.__dict__["_defer_param_flows"] = bool(kwargs.get("defer_param_flows", False))
+        masked = param_flows is not None and param_flows_mask is not None
+        self.__dict__["_defer_param_flows"] = bool(kwargs.get("defer_param_flows", False)) and not masked
         pkey = None
         if (partition_runs is None and compute_children is None and not allow_modify_flows and propagation_alg == "LL"
-                and pflow_temperature == 1.0 and not temper_eflow):
+                and pflow_temperature == 1.0 and not temper_eflow and not masked):
             pkey = ("backward", node_flows.size(1), node_flows.device, node_flows.dtype, params.dtype,
                     None if param_flows is None else param_flows.dtype, logspace_flows, negate_pflows,
                     accumulate_ch_flows, allow_neg_flows, precision, self._ext_bw_ele_hook is not None,
@@ -1115,6 +1122,11 @@ class SumLayer(Layer, nn.Module):
 
             ## Compute flows w.r.t. sum parameters ##
             if param_flows is not None:
+                if masked:                                 # (the other samples' flows zero for the kernels below)
+                    sid, eid = self._layer_nid_range
+                    kept = node_flows[sid:eid].clone()
+                    node_flows[sid:eid].masked_fill_(~param_flows_mask[None, :],
+                                                     -float("inf") if logspace_flows or allow_modify_flows else 0.0)
                 for partition_id in range(self.num_fw_partitions):
                     nids = self.partitioned_nids[partition_id]
                     cids = self.partitioned_cids[partition_id]
@@ -1136,6 +1148,8 @@ class SumLayer(Layer, nn.Module):
                         temper_eflow = temper_eflow,
                         **kwargs
                     )
+                if masked:
+                    node_flows[sid:eid] = kept
 
         if pkey is not None:
             LaunchPlans.of(self).store(pkey, rec, self.num_bk_partitions + (self.num_fw_partitions

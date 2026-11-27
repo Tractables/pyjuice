@@ -28,10 +28,15 @@ class InputNodes(CircuitNodes):
 
     :param block_size: block size
     :type block_size: int
+
+    :param parameterization: a per-sample external parameterization of the nodes' parameters (a descriptor of
+                             `pyjuice.parameterizations`, e.g. `LowRank(rank, top_k = K)` on a `SoftEvidenceCategorical`
+                             leaf), whose tensors are supplied at call time as a sum node's are; None (the default): none
+    :type parameterization: Optional[SumParameterization]
     """
     def __init__(self, num_node_blocks: int, scope: Union[Sequence,BitSet], dist: Distribution, 
                  params: Optional[torch.Tensor] = None, block_size: int = 0, 
-                 _no_set_meta_params: bool = False, **kwargs) -> None:
+                 _no_set_meta_params: bool = False, parameterization = None, **kwargs) -> None:
 
         rg_node = InputRegionNode(scope)
         super(InputNodes, self).__init__(num_node_blocks, rg_node, block_size = block_size, **kwargs)
@@ -39,6 +44,15 @@ class InputNodes(CircuitNodes):
         self.chs = [] # InputNodes has no children
 
         self.dist = dist
+
+        # The external parameterization, as a sum node's (`ParameterizedSumNodes`): stateless configuration, shared by
+        # the node's tied copies and rebuilt nodes (`_construction_kwargs`); the input layers are grouped by it too
+        self.parameterization = parameterization
+        if parameterization is not None:
+            from pyjuice.parameterizations import SumParameterization       # (lazily: that package imports this one)
+            assert isinstance(parameterization, SumParameterization), \
+                f"`parameterization` should be a descriptor of `pyjuice.parameterizations`, got {type(parameterization)}."
+            parameterization.validate_ns(self)
 
         # Init parameters and meta-parameters
         if not _no_set_meta_params and self.dist.need_meta_parameters:
@@ -78,7 +92,8 @@ class InputNodes(CircuitNodes):
 
         dist = deepcopy(self.dist)
 
-        ns = InputNodes(self.num_node_blocks, scope = scope, dist = dist, block_size = self.block_size, source_node = self if tie_params else None)
+        ns = InputNodes(self.num_node_blocks, scope = scope, dist = dist, block_size = self.block_size, source_node = self if tie_params else None,
+                        **self._construction_kwargs())
 
         if hasattr(self, "_params") and self._params is not None and not tie_params:
             ns._params = self._params.clone()
@@ -165,5 +180,15 @@ class InputNodes(CircuitNodes):
     def get_data_dtype(self):
         return self.dist.get_data_dtype()
 
+    def get_parameterization_signature(self) -> Optional[str]:
+        """The signature of the external parameterization (input layers are grouped by it beside the distribution's),
+        None without one."""
+        return None if self.parameterization is None else self.parameterization.get_signature()
+
+    def _construction_kwargs(self) -> dict:
+        # (the descriptor is stateless configuration: rebuilt nodes and tied copies share it)
+        return {} if self.parameterization is None else {"parameterization": self.parameterization}
+
     def __repr__(self):
-        return f"InputNodes(num_node_blocks={self.num_node_blocks}, block_size={self.block_size}, dist={type(self.dist)})"
+        extra = "" if self.parameterization is None else f", parameterization={self.parameterization}"
+        return f"InputNodes(num_node_blocks={self.num_node_blocks}, block_size={self.block_size}, dist={type(self.dist)}{extra})"

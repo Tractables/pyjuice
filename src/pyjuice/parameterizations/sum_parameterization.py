@@ -105,6 +105,12 @@ class SumParameterization():
     #: `replaces_shared_forward` makes it own the node values.
     replaces_shared_backward: bool = False
 
+    #: Whether a backward of the layers this parameterization serves takes `param_flows_mask` (`TensorCircuit.backward`):
+    #: the samples whose flows its parameter flows -- and denominator flows -- take, every sample's node flows and
+    #: gradients as without it. `False` -- the default -- refuses a mask (NotImplementedError) where it would serve a
+    #: call: the hooks may add statistics of their own from the node flows.
+    honors_param_flows_mask: bool = False
+
     #: Whether the backward writes `d LL / d(external parameters)` into the gradient buffer. `True` --
     #: the default -- is the complete parameterization. A descriptor that contributes the element and
     #: parameter flows but not yet its own gradient sets this to `False`, which leaves `pc.backward()`
@@ -199,6 +205,18 @@ class SumParameterization():
         """
         return False
 
+    def takes_external_rows(self, ns) -> bool:
+        """
+        Whether this parameterization's passes take `external_params_rows`: the batch's samples reading rows of the
+        external tensors through a map (sample b reads row `rows[b]`; the tensors staged at their own batch, the map in
+        the passes' keywords as `EXTERNAL_PARAMS_ROWS_KWARG`) -- so samples sharing a row of tensors can share the work
+        their tensors alone determine (a conditional's two passes in one batch). The gradients stay per sample: the
+        backward writes them at the batch's rows -- unless the destinations fold (`StagedExternalParams.fold`, the
+        private signs of `pc(..., differentiable = True)`): then at the tensors' rows, each sample's times its sign.
+        False by default: the circuit then refuses the map.
+        """
+        return False
+
     def reads_in_place(self, ns) -> bool:
         """
         Whether the FORWARD pass hands `ns`'s tensors to the layers as the caller gave them -- views of the
@@ -207,8 +225,9 @@ class SumParameterization():
         False by default. A parameterization returning True stores its tensors in the caller's layout
         (:func:`storage_perm` None, the default :func:`to_storage`) and its kernels take each tensor's batch
         stride as it comes (every axis but the batch contiguous; a tensor that is not is copied as before).
-        What the copy guaranteed is kept: the views hold the caller's tensors alive until the next forward,
-        and the backward refuses to run if one of them was modified in place in between
+        What the copy guaranteed is kept: the views hold the caller's tensors alive until the next forward
+        (a differentiable call's: until its autograd backward has run, `_release_external_params`), and
+        the backward refuses to run if one of them was modified in place in between
         (`Tensor._version`). Other stagings -- sampling, the decoder -- copy as before. Not where the
         parameterization is :attr:`cuda_graph_safe`: a graph replays the addresses its capture read, which
         only the staging buffer keeps (such a node is copied whatever this returns).
@@ -231,6 +250,42 @@ class SumParameterization():
         :type ns: ParameterizedSumNodes
         """
         pass
+
+    #: Whether a sum node's effective parameters depend on the VALUE of the leaf beside it in its one parent product
+    #: (`LowRank(top_k)`: the token that leaf emits). The circuit then finds that leaf at compile time -- one parent
+    #: product, one input node vector in it, paired node i with node i, checked by :func:`validate_sibling_leaf` --
+    #: notes it on the layer (`_sibling_leaves[id(ns)]`: the leaf, its input layer, its variable) and on the leaf's
+    #: input layer (`_read_by_sums`), and hands the layer the call's inputs (`_inputs`, `[B, num_vars]`). A missing
+    #: value is the parameterization's to sum out: the circuit it defines must stay smooth and decomposable.
+    reads_sibling_leaf: bool = False
+
+    def validate_sibling_leaf(self, ns, leaf) -> None:
+        """Check, at compile time, the leaf whose value the effective parameters of `ns` read (:attr:`reads_sibling_leaf`)."""
+        pass
+
+    def input_forward(self, layer, data, node_mars, kwargs) -> None:
+        """
+        For a parameterization of INPUT nodes (`juice.inputs(..., parameterization = ...)`): the values of `layer`'s node
+        vectors that were given tensors, written over the distribution's (its missing mask applies after); `data`
+        `[num_vars, B]` and `kwargs` the call's evidence as the caller gave it.
+        """
+        raise NotImplementedError(f"{self.get_signature()} does not parameterize input nodes.")
+
+    def input_forward_replaces(self, layer, kwargs) -> bool:
+        """
+        Whether this call's :func:`input_forward` writes every node value of `layer` (each of its node vectors was given
+        tensors) -- the distribution's own forward kernels are then skipped, their values overwritten anyway --, and
+        :func:`input_backward` then does the layer's whole backward. False by default.
+        """
+        return False
+
+    def input_backward(self, layer, data, node_flows, node_mars, kwargs, logspace_flows: bool = False,
+                       missing_mask = None, batch_first: bool = True, compute_param_flows: bool = True) -> bool:
+        """
+        The backward of an input layer whose node vectors were given tensors -- its parameter flows, the evidence's and
+        the tensors' gradients --: True, done (the distribution's own backward does not run); False, none were given.
+        """
+        raise NotImplementedError(f"{self.get_signature()} does not parameterize input nodes.")
 
     def tensor_shapes(self, ns, batch_size: int) -> Tuple[Tuple[int,...],...]:
         """
@@ -476,6 +531,32 @@ class SumParameterization():
             "`accumulate_denom_top_down`, so `mini_batch_em(step_size_rescaling = True)` cannot build "
             "a denominator that matches the numerator."
         )
+
+    def collapsed_top_down(self, layer, node_flows, element_flows, params, param_flows, denom_param_flows, scale) -> bool:
+        """
+        The mini-batch-EM top-down step of a sum layer whose rows ran under PER-SAMPLE parameters, through the model
+        they collapse to; False (the default) leaves the layer to the circuit's own step -- `P_td[n] * theta[n, c]`
+        from the shared parameters, which is the model's expected counts only when every row ran under them.
+
+        Each row has a model of its own, and the flows hold what they collapse to at a node: `F-[n, .]` is the
+        posterior-weighted sum of the rows' own parameters there, so its normalized row `theta~[n, .]` is the node's
+        mean conditional. With `node_flows[n]` = `P_td[n]` (one "sample") the hook
+
+        * adds `P_td[n] * theta~[n, c]` to the children's `element_flows` (the top-down pass goes on through it), and
+        * adds the term `scale * P_td[n] * (theta~[n, c] + theta[n, c]) / 2` to `F+` and to `F-`, in its own layouts:
+          the collapsed half steps the entries the rows use by about the node's step `s f / (s f + (1 - s) P_td)`
+          (`f` its flow), the shared half damps the entries they give almost no probability (their `F-` is tiny, and
+          against it alone one observation is a step of `1 / probability`).
+
+        A node no flow reached has no collapsed row: its shared one, as the circuit's own step does.
+        """
+        return False
+
+    def input_top_down(self, layer, node_flows, scale) -> bool:
+        """:func:`collapsed_top_down` for an input layer given a parameterization: the term `scale * P_td[n] x` the
+        node's collapsed distribution into both phases of its flows; False (the default): the layer's own
+        (`add_missing_flows`)."""
+        return False
 
     def materialize_denom_flows(self, ns, params, denom_param_flows, denom_sources, out = None):
         """

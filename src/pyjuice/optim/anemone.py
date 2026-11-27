@@ -30,6 +30,17 @@ class Anemone(CircuitOptimizer):
         buffer  <- momentum * buffer + f
         f       <- buffer / (1 - momentum ** (update_count + 1))   # bias correction
 
+    The update is EM on ``step_size`` x the data plus ``1 - step_size`` x the model's own distribution;
+    the second part is the model's expected counts, the TOP-DOWN term ``P_td[n] * theta[n, c]``. Where the
+    rows ran under external parameters, each under a model of its own, the term is that of the model they
+    collapse to: at each node the posterior-weighted mean of the rows' own parameters (its ``F-`` row,
+    normalized), the top-down probabilities one pass through those -- so every node takes one step,
+    ``s f / (s f + (1 - s) P_td)`` of the way to its batch update (``f`` its share of the data's flow).
+    The prior (``pseudocount``) enters an update with the step's weight, as the data does.
+
+    ``step_size`` is the share of ONE update's rows in the parameters: they average over about
+    ``rows per update / step_size`` rows, whatever the rows' number -- few rows an update want a small step.
+
     :param step_size: EM step size in ``(0, 1]`` (used by the rescaled update)
     :type step_size: float
 

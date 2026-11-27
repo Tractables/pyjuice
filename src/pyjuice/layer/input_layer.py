@@ -126,6 +126,13 @@ class InputLayer(Layer, nn.Module):
         self.num_nodes = layer_num_nodes
         self.dist_signature = dist_signature
 
+        # The nodes' external parameterization (`InputNodes.parameterization`): one for the layer (compilation groups
+        # input nodes by it beside the distribution), None for plain leaves
+        par_signatures = set(ns.get_parameterization_signature() for ns in self.nodes)
+        assert len(par_signatures) == 1, \
+            f"Nodes of an InputLayer must share one external parameterization, got {par_signatures}."
+        self.parameterization = self.nodes[0].parameterization
+
         # Store the triton kernel functions implemented by the target `Distribution`
         self.fw_mar_fn = self.dist.get_fw_mar_fn()
         self.bk_flow_fn = self.dist.get_bk_flow_fn()
@@ -416,6 +423,11 @@ class InputLayer(Layer, nn.Module):
 
         assert params.dim() == 1
 
+        # (an external parameterization's pass reads the data and the evidence as the caller gave them: the
+        #  distribution's preprocessing below may hand its kernels re-ordered copies)
+        if self.parameterization is not None:
+            given = (data, dict(kwargs, missing_mask = missing_mask, _batch_first = _batch_first))
+
         if "cuda" in self.device.type:
             # Need to flatten data to ensure the memory is aligned following [num_vars, batch_size]
             data = data.reshape(-1).contiguous()
@@ -442,8 +454,12 @@ class InputLayer(Layer, nn.Module):
 
             grid = (triton.cdiv(layer_num_nodes * batch_size, BLOCK_SIZE),)
 
+            # (an external parameterization writing every node value of the layer this call: the distribution's kernels,
+            #  whose values it would overwrite, skipped -- its backward is the layer's whole backward too)
+            replaced = self.parameterization is not None and self.parameterization.input_forward_replaces(self, given[1])
+
             if not _apply_missing_mask_only:
-                if self._mars_kernel is not None:
+                if self._mars_kernel is not None and not replaced:
                     self._mars_kernel[grid](
                         params_ptr = self.params, 
                         node_mars_ptr = node_mars, 
@@ -467,16 +483,22 @@ class InputLayer(Layer, nn.Module):
             #
             # Built here rather than at scope entry so that a circuit never run inside the scope
             # never pays for a copy, and so the scope needs no list of the circuits it covers.
-            self._ensure_fast_inference_params(kwargs)
-            # Handed to the distribution like the backward's `_bk_launch_common`, and from the start:
-            # `preprocess_fw_kwargs` is where a distribution may first decide between kernel sets.
-            fw_launch_common = self._fw_launch_common(data, node_mars)
-            kwargs["_fw_launch_common"] = fw_launch_common
-            self.dist.preprocess_fw_kwargs(self, kwargs)
-            self.dist.set_custom_kernel_kwargs(kwargs)
-            kwargs["_fw_data"] = data
-            self._run_post(self.post_fw_fns, kwargs, fw_launch_common)
-            kwargs.pop("_fw_launch_common", None)
+            if not replaced:
+                self._ensure_fast_inference_params(kwargs)
+                # Handed to the distribution like the backward's `_bk_launch_common`, and from the start:
+                # `preprocess_fw_kwargs` is where a distribution may first decide between kernel sets.
+                fw_launch_common = self._fw_launch_common(data, node_mars)
+                kwargs["_fw_launch_common"] = fw_launch_common
+                self.dist.preprocess_fw_kwargs(self, kwargs)
+                self.dist.set_custom_kernel_kwargs(kwargs)
+                kwargs["_fw_data"] = data
+                self._run_post(self.post_fw_fns, kwargs, fw_launch_common)
+                kwargs.pop("_fw_launch_common", None)
+
+            # An external parameterization: the values of the node vectors it was given tensors for, over the shared
+            # ones (the missing mask below applies to them too)
+            if self.parameterization is not None:
+                self.parameterization.input_forward(self, given[0], node_mars, given[1])
 
             # Apply missing mask if required
             if missing_mask is not None:
@@ -644,6 +666,30 @@ class InputLayer(Layer, nn.Module):
 
         assert params.dim() == 1
 
+        # An external parameterization: the layer's backward is its descriptor's where its node vectors were given tensors
+        # (True: done -- the parameter flows, the evidence's and the tensors' gradients); else the plain leaf's below
+        compute_param_flows = kwargs.pop("_compute_param_flows", True)
+        # (`param_flows_mask`: the samples whose flows the parameter flows take -- the parameterization's, where it
+        # takes one, else the plain leaf's: the other samples' node flows zero for its kernels, its rows restored after)
+        pmask = kwargs.get("param_flows_mask")
+        if pmask is not None and self.parameterization is not None and \
+                not self.parameterization.honors_param_flows_mask:
+            raise NotImplementedError(f"{self.parameterization.get_signature()} does not take `param_flows_mask`.")
+        if self.parameterization is not None and self.parameterization.input_backward(
+                self, data, node_flows, node_mars, kwargs, logspace_flows = logspace_flows, missing_mask = missing_mask,
+                batch_first = _batch_first, compute_param_flows = compute_param_flows):
+            return None
+        kwargs.pop("param_flows_mask", None)
+        kept = None
+        if pmask is not None and self.param_flows is not None:
+            grads = [k for k in getattr(self.dist, "call_kwargs", ()) if k.endswith("_grad") and kwargs.get(k) is not None]
+            if grads:
+                raise NotImplementedError(f"`param_flows_mask` with the gradients {grads}: the plain leaf's kernels "
+                                          f"make both from the same node flows.")
+            sid, eid = self._output_ind_range
+            kept = node_flows[sid:eid].clone()
+            node_flows[sid:eid].masked_fill_(~pmask[None, :], -float("inf") if logspace_flows else 0.0)
+
         if "cuda" in self.device.type:
             # Need to flatten data to ensure the memory is aligned following [num_vars, batch_size]
             data = data.reshape(-1).contiguous()
@@ -780,6 +826,8 @@ class InputLayer(Layer, nn.Module):
                                        logspace_flows)
         else:
             raise NotImplementedError("CPU backward fn for input nodes is not implemented.")
+        if kept is not None:
+            node_flows[self._output_ind_range[0]:self._output_ind_range[1]] = kept
 
     def _backward_missing(self, node_flows: torch.Tensor, missing_mask: torch.Tensor,
                           missing_mask_mode: int, num_vars: Optional[int],
