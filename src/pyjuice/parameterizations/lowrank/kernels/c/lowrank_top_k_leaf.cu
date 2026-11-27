@@ -407,10 +407,10 @@ struct BwArgs {
     const int* ord; const int* rank;                             // [B] the samples by their evidence's row and a
                                                                  // place's rank within its row (null: a sample a CTA)
     int pos_y;                                                   // (as the forward's)
-    int headless;                                                // the head's walk another kernel's (no dtau, no head
-                                                                 // evidence gradient here: `tk_leaf_head_grad_kernel`)
-    float* nterm;                                                // (headless) a sample's node terms [T][B][5][M] for
-                                                                 // it: g at the head, g past it, f, the counts' f, dR
+    float* nterm;                                                // (HEADLESS: the head's walk another kernel's, no
+                                                                 // dtau, no head evidence gradient here) a sample's node
+                                                                 // terms [T][B][5][M] for `tk_leaf_head_grad_kernel`: g
+                                                                 // at the head, g past it, f, the counts' f, dR
 };
 
 // dtau's writes of a thread's 4 nodes, times the sample's sign (1 where nothing folds): stored into a row the CTA holds
@@ -431,12 +431,14 @@ struct DtauOut {
 };
 
 // The backward of a CTA's samples: one (NS = 1), or (the evidence a row each) up to NS of a row, walking its candidates
-// once -- the bulk's terms and the EM statistics summed over the samples before they are added, the head's a sample each.
+// once -- the bulk's terms and the EM statistics summed over the samples before they are added, the head's a sample each
+// (HEADLESS: the bulk alone, the head's walk `tk_leaf_head_grad_kernel`'s -- a kernel of its own at 128 registers, 2 CTAs
+// an SM: MEASURED 1.43 -> 1.17 ms against a runtime flag in the one at 198).
 // The CTAs a sample's (a group's) positions side by side, blockIdx.x the position: the positions of a row share many of
 // their candidates (their table rows then read from the cache) -- MEASURED (48 blocks, the rows' evidence made distinct:
 // the dump's repeats' tokens permuted) 2.77 -> 2.29 ms against the samples side by side; with the dump's repeated rows
 // (they share every candidate at a position) 2.32 -> 2.30
-template <int NS>
+template <int NS, bool HEADLESS>
 __global__ void __launch_bounds__(NW * 32) tk_leaf_backward_kernel(const BwArgs a) {
     static_assert(NS <= 2, "the EM statistics' tiles: up to two count rows");
     __shared__ int s_ids[CH];
@@ -617,7 +619,7 @@ __global__ void __launch_bounds__(NW * 32) tk_leaf_backward_kernel(const BwArgs 
                 for (int u = 0; u < 32; ++u) {
                     const int k = k0 + u, c = cg + u;
                     pt[u] = 0.f;
-                    if (k >= n || (a.headless && c < g.H)) continue;       // (headless: the head's not here)
+                    if (k >= n || (HEADLESS && c < g.H)) continue;         // (headless: the head's not here)
                     const float4 th = ld4(tab + (long)s_ids[k] * g.M);
                     const float l = s_lp[k];
                     if (c >= g.H) {
@@ -1400,7 +1402,6 @@ torch::Tensor top_k_leaf_backward(torch::Tensor tab, torch::Tensor nv_tab, torch
     }
     auto dtau = !dtau_out || hg ? torch::empty({0}, tab.options())
               : fold ? torch::empty({T, Bd, S, M}, tab.options()) : torch::empty({T, B, S, M}, tab.options());
-    a.headless = hg ? 1 : 0;
     at::cuda::CUDAEvent hg_fork, hg_join;
     torch::Tensor nterm;
     a.nterm = nullptr;
@@ -1478,8 +1479,9 @@ torch::Tensor top_k_leaf_backward(torch::Tensor tab, torch::Tensor nv_tab, torch
     a.pos_y = B > 65535 ? 1 : 0;                            // (a sample's positions side by side, where grid.y holds B)
     const unsigned gz = (unsigned)((M + NW * 128 - 1) / (NW * 128));
     const dim3 grid = a.pos_y ? dim3((unsigned)B, (unsigned)T, gz) : dim3((unsigned)T, (unsigned)B, gz);
-    if (a.ord != nullptr) tk_leaf_backward_kernel<2><<<grid, NW * 32, 0, stream>>>(a);
-    else tk_leaf_backward_kernel<1><<<grid, NW * 32, 0, stream>>>(a);
+    if (hg) tk_leaf_backward_kernel<2, true><<<grid, NW * 32, 0, stream>>>(a);         // (`hg`: evidence a row each)
+    else if (a.ord != nullptr) tk_leaf_backward_kernel<2, false><<<grid, NW * 32, 0, stream>>>(a);
+    else tk_leaf_backward_kernel<1, false><<<grid, NW * 32, 0, stream>>>(a);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     if (hg) {                                               // (the head's walk and the tilt's gradients: a CTA a
         HgArgs hga;                                         // position and a row of the destinations)
