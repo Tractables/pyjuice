@@ -641,7 +641,7 @@ def test_the_backward_kernels_are_the_reference():
                         soft_evidence_cat_ids = ids)
             out += [pc.param_flows.clone(), pc.input_layer_group[0].param_flows.clone()]
             if pc.denom_param_flows is not None:
-                out.append(pc.denom_param_flows.clone())
+                out.append(_denoms(pc))
         return out
 
     try:
@@ -688,7 +688,7 @@ def test_the_backward_kernels_give_a_sample_its_own_gradients_through_the_map(ke
             pc(x, missing_mask = miss, external_params = pext, external_params_rows = rows, **evi)
         pc.backward(x, missing_mask = miss, compute_param_flows = True, flows_memory = 1.0, logspace_flows = True,
                     allow_modify_flows = False, external_params_grad = g, **evi)
-        return [t for v in g.values() for t in v] + [pc.param_flows.clone(), pc.denom_param_flows.clone(),
+        return [t for v in g.values() for t in v] + [pc.param_flows.clone(), _denoms(pc),
                                                      pc.input_layer_group[0].param_flows.clone()]
 
     try:
@@ -738,8 +738,17 @@ def _paths(kernels):
     assert ran == ({"sums", "leaves"} if kernels else set()), ran
 
 
+def _denoms(pc):
+    """The denominators as the M-step reads them: every parameterized sum's F-, its tied copies' slices summed
+    (`materialize_denom_flows`) -- not the raw buffer, whose split of a node's statistics among its copies' slices is
+    the kernels' choice (they add a flow block's copies' at once, into the first copy's)."""
+    out = [sources[0][0].parameterization.materialize_denom_flows(src, pc.params, pc.denom_param_flows, sources).double()
+           for src, sources in pc._denom_correction_nss().items()]
+    return torch.cat(out)
+
+
 def _stats(pc):
-    return [pc.param_flows.clone(), pc.denom_param_flows.clone(), pc.input_layer_group[0].param_flows.clone()]
+    return [pc.param_flows.clone(), _denoms(pc), pc.input_layer_group[0].param_flows.clone()]
 
 
 @pytest.mark.parametrize("kernels", [False, True])

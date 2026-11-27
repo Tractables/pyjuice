@@ -363,12 +363,19 @@ def sum_backward(desc, layer, ns_tensors, ns_grad_tensors, node_flows, element_f
         # (the parameters: the kernels' fp32 grid and its tables, once a pass -- the forward's --; torch's in PASSES_DTYPE)
         tab = top_k_fused.theta_tables(desc, sib, ns_info.ns, geo, params, B) if kernels else None
         theta = tab["theta"] if kernels else desc._dense_params(geo, params, dtype = PASSES_DTYPE)
+        pf0 = ns_info.ns._param_flow_range[0] if want_flows else None
+        d0 = desc._denom_offsets(layer)[id(ns_info.ns)][0] if want_denom else None
+        em_out = None
         if kernels:
-            # (the gradients added into their destinations by the kernels; the counts into the leaf's buffer)
+            # (the gradients added into their destinations by the kernels; the counts into the leaf's buffer; the EM
+            # statistics into a pass's accumulator of the flow block, where there is one: scattered at the pass's end)
             counts = top_k_leaf_fused.counts_buffer(sib, desc.top_k, B) if rows.numel() > 0 else None
+            if want_flows:
+                em_out = top_k_backward.em_accumulator(geo, params, param_flows, pf0,
+                                                       denom_param_flows if want_denom else None, d0, dev)
             ef, a_rows, flows = top_k_backward.terms(*tensors, tab, element_mars, geo, slot, rows, logw_rows, nf,
                                                      external_rows(kwargs), grads, gviews, fresh, want_flows, pm, counts,
-                                                     top_k_fused.kept_of(layer, ns_info.ns, B))
+                                                     top_k_fused.kept_of(layer, ns_info.ns, B), em_out = em_out)
             Fp, Fm = flows if want_flows else (None, None)
         else:
             f = _d(nf.t()).exp()
@@ -386,9 +393,7 @@ def sum_backward(desc, layer, ns_tensors, ns_grad_tensors, node_flows, element_f
         else:
             element_flows[kids, :] = torch.logaddexp(element_flows[kids, :],
                                                      ef.log().t()[geo["cols"], :].to(element_flows.dtype))
-        if want_flows:
-            pf0 = ns_info.ns._param_flow_range[0]
-            d0 = desc._denom_offsets(layer)[id(ns_info.ns)][0] if want_denom else None
+        if want_flows and em_out is None:
             if not (kernels and top_k_backward.scatter_statistics(geo, Fp, Fm, params, param_flows, pf0,
                                                                     denom_param_flows if want_denom else None, d0)):
                 desc._scatter_add(geo, param_flows, pf0, Fp.float())

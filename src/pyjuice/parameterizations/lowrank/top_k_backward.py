@@ -31,14 +31,18 @@ if triton is not None:
     @triton.jit
     def _bw_em_kernel(AH, BH, L2T, E, EV, ALPHA, BETA, ALPHA_T, BETA_T, INVD, HROW, FLOW, MROWS, NM, LWIDX, EMAP, FP, FM,
                       M, N, KP: tl.constexpr, K0: tl.constexpr, K1: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr,
-                      SH: tl.constexpr):
+                      SH: tl.constexpr, ADD: tl.constexpr):
         """a CTA a 64 x 64 tile of the parameters: over the masked samples MROWS[:NM] (NM on the device), F+ = sum_b
         Q, F- = sum_b T ([M, N]: q, t summed over the slots), stored -- the observed samples' then added by
         `top_k_bw_em_observed` (CUDA). W from the CUDA passes' operands -- AH = fp16(log2 e A) [Bx, M, KP], BH [Bx, KP,
         N] fp16, l2t [M, N] fp16 -- and the stash's shift HROW [B, M]; a masked sample's alpha, beta [Rm, M, SH] fp16
         rows at its place LWIDX (its node flows not in them: FLOW [B, M], `top_k_flows`', times W): the slots times a
         node's power of 2 d by fp16 dots against E -- the same 10-bit operands as TF32's, fp32 sums --, the rest slot
-        times d from the rows' tail (ALPHA_T, BETA_T: their float32 view), 1 / d (INVD [Rm, M]) into W."""
+        times d from the rows' tail (ALPHA_T, BETA_T: their float32 view), 1 / d (INVD [Rm, M]) into W. ADD: added
+        into FP, FM (a pass's accumulator: `em_accumulator`) -- nothing at all where no masked sample is taken."""
+        if ADD:
+            if tl.load(NM) == 0:
+                return
         rows = tl.program_id(0) * BM + tl.arange(0, BM)
         cols = tl.program_id(1) * BN + tl.arange(0, BN)
         s = tl.arange(0, 64)
@@ -69,6 +73,9 @@ if triton is not None:
             Fp += W * X * ev[None, :]
             Fm += W * Y
         out = rows[:, None] * N + cols[None, :]
+        if ADD:
+            Fp += tl.load(FP + out)
+            Fm += tl.load(FM + out)
         tl.store(FP + out, Fp)
         tl.store(FM + out, Fm)
 
@@ -105,6 +112,30 @@ def scatter_statistics(geo, Fp, Fm, params, param_flows, pf0: int, denom, d0) ->
     return True
 
 
+def em_accumulator(geo, params, param_flows, pf0: int, denom, d0, dev):
+    """`(F+, F-)` [M, N] zeros to add a node vector's EM statistics into, shared by the node vectors whose statistics
+    go into the same flow block (tied copies: compilation gives up to `max_tied_ns_per_parflow_block` of them one
+    `_param_flow_range`) in the backward's deferred scope (`pyjuice.utils.deferred`), scattered once at its end
+    (`scatter_statistics`: F+ into the block, F- / theta into the first copy's denominators -- `materialize_denom_flows`
+    sums a node's tied copies' denominators, so the sum is where it was) -- or None (no scope, or the scatter does not
+    serve): each its own then, scattered at once."""
+    from pyjuice.utils.deferred import current_scope
+    scope = current_scope()
+    grid = geo["grid"]
+    if scope is None or grid is None or params.dtype != torch.float32 or param_flows.dtype != torch.float32 or \
+            (denom is not None and denom.dtype != torch.float32):
+        return None
+    acc = scope.__dict__.setdefault("_top_k_em", {})
+    key = (id(param_flows), param_flows.data_ptr(), pf0, geo["p0"], tuple(grid), geo["M"], geo["N"], denom is None)
+    got = acc.get(key)
+    if got is None:
+        FP = torch.zeros(geo["M"], geo["N"], dtype = torch.float32, device = dev)
+        FM = torch.zeros_like(FP)
+        got = acc[key] = (FP, FM)
+        scope.defer(lambda: scatter_statistics(geo, FP, FM, params, param_flows, pf0, denom, d0))
+    return got
+
+
 def _fold_operands(gviews, fold, B: int, dev):
     """`(drow, sgn)` int32, float32 [B]: the row each sample's gradient goes into and its sign -- the fold's
     (`StagedExternalParams.fold`), made once a backward, else a sample's own row, sign 1"""
@@ -124,7 +155,7 @@ def _dest_ok(g: torch.Tensor) -> bool:
 
 
 def terms(A, Bm, G, tab, element_mars, geo, slot, rows, logw_rows, nf, emap, grads, gviews, fresh: bool,
-          want_flows: bool = False, pmask = None, counts = None, kept = None):
+          want_flows: bool = False, pmask = None, counts = None, kept = None, em_out = None):
     """`top_k._sum_backward_terms`' element flows `[B, N]`, the posterior counts `a` of the masked samples `rows`
     `[b, M, 65]` (None where they went into `counts`) and the EM statistics `(F+, F-)` `[M, N]` (None unless
     `want_flows`; of the samples `pmask` [B] holds, if given) by the kernels; the gradients of
@@ -194,14 +225,19 @@ def terms(A, Bm, G, tab, element_mars, geo, slot, rows, logw_rows, nf, emap, gra
             tkf._empty(dev, torch.bool) if pmask is None else pmask.contiguous())
         # the masked samples' (Triton: stored, or zeros where none), then the observed ones' added (CUDA: a tile of
         # the parameters a CTA walking the samples)
+        # (or added into `em_out`, a pass's accumulator of the node vectors sharing a flow block: `em_accumulator`)
+        add = em_out is not None
+        if add:
+            FP, FM = em_out
         if Rm > 0:
-            FP = torch.empty(M, N, dtype = torch.float32, device = dev)
-            FM = torch.empty_like(FP)
+            if not add:
+                FP = torch.empty(M, N, dtype = torch.float32, device = dev)
+                FM = torch.empty_like(FP)
             _bw_em_kernel[(M // BM, N // BN)](AH, BP, L2T, E, ev, alpha16, beta16, alpha16.view(torch.float32),
                                               beta16.view(torch.float32), invd, hrow, fl, MROWS, NM, LWIDX, EMAP, FP,
                                               FM, M, N, KP = KP, K0 = K0, K1 = KP - K0, BM = BM, BN = BN, SH = SH,
-                                              num_warps = 4, num_stages = 1)
-        else:
+                                              ADD = add, num_warps = 4, num_stages = 1)
+        elif not add:
             FP = torch.zeros(M, N, dtype = torch.float32, device = dev)
             FM = torch.zeros_like(FP)
         if B > Rm:
