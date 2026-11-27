@@ -127,26 +127,34 @@ def leaf_forward(desc, layer, data: torch.Tensor, node_mars: torch.Tensor, kwarg
     T, B, dev = len(nodes), node_mars.size(1), node_mars.device
     M, K = plan["M"][0], (plan["Ks"][0] if plan["Ks"] else desc.top_k)
 
-    # the missing tokens a sum reads: their rows of the slot weights -- the pass's one synchronization, its copy started
-    # here and waited on after the launches that need none of it (the tables, the tilts), so the host plans while the
-    # device works
+    # the categories some tile takes among its candidates: their rows of the tables (the others none -- never read:
+    # the tables hold the pass's categories alone, MEASURED 48 blocks: 494 -> 193 MiB on the dump's rows, -> 383 with
+    # DISTINCT=1 rows)
+    V = nodes[0]["ns"].dist.num_cats
+    ids = kwargs["soft_evidence_cat_ids"].to(torch.int32).contiguous()
+    used = torch.zeros(V, dtype = torch.bool, device = dev)
+    used[ids.reshape(-1).long()] = True
+    crow = torch.cumsum(used, 0, dtype = torch.int32) - 1
+    nrows_d = crow[-1:] + 1
+    crow = torch.where(used, crow, torch.full_like(crow, -1))
+    # the missing tokens a sum reads: their rows of the slot weights -- the pass's one synchronization (with the
+    # tables' rows), its copy started here and waited on after the launches that need none of it (the tilts), so the
+    # host plans while the device works
     miss = _missing_all(kwargs.get("missing_mask"), plan["vars"], B, dev, kwargs.get("_batch_first", True))
     rmask_d = miss & plan["read"][:, None]
     rmask = torch.empty(rmask_d.shape, dtype = rmask_d.dtype, pin_memory = rmask_d.is_cuda)
     rmask.copy_(rmask_d, non_blocking = True)
+    nrows = torch.empty(1, dtype = torch.int32, pin_memory = rmask_d.is_cuda)
+    nrows.copy_(nrows_d, non_blocking = True)
     copied = torch.cuda.Event() if rmask_d.is_cuda else None
     if copied is not None:
         copied.record(torch.cuda.current_stream(dev))
 
-    V = nodes[0]["ns"].dist.num_cats
-    tables = [mod.top_k_leaf_table(layer.params, spids, V) for spids in plan["tables"]]
-    tab = tables[0][None] if len(tables) == 1 else torch.stack(tables)
     emap = external_rows(kwargs)
     tilts = [staged[n["ns"]] for n in nodes]
     Bx, S = tilts[0][0].size(0), tilts[0][1].size(2)
     tau = torch.empty(T, Bx, S, M, dtype = torch.float32, device = dev)
     _tilts(tilts, tau)
-    ids = kwargs["soft_evidence_cat_ids"].to(torch.int32).contiguous()
     lp = kwargs["categorical_evidence_logp"].float().contiguous()
     emap32 = torch.empty(0, dtype = torch.int32, device = dev) if emap is None else emap.to(torch.int32).contiguous()
     tok = data.index_select(0, plan["vars"]).to(torch.int32).contiguous()
@@ -154,6 +162,8 @@ def leaf_forward(desc, layer, data: torch.Tensor, node_mars: torch.Tensor, kwarg
 
     if copied is not None:
         copied.synchronize()
+    tables = [mod.top_k_leaf_table(layer.params, spids, V, crow, int(nrows[0])) for spids in plan["tables"]]
+    tab = tables[0][None] if len(tables) == 1 else torch.stack(tables)
     counts = rmask.sum(dim = 1).tolist()
     offs = [0]
     for c in counts:
@@ -166,10 +176,10 @@ def leaf_forward(desc, layer, data: torch.Tensor, node_mars: torch.Tensor, kwarg
     sids, slp = _bulk_by_id(ids, lp, min(ids.size(2), max(K, S - 1)))
     lz, lb, place, logw = mod.top_k_leaf_forward(tab, plan["nv_tab"], tau, emap32, ids, lp, plan["nv_lvid"],
                                                  plan["nv_row0"], tok, miss.to(torch.uint8).contiguous(), wrow, R, S, K,
-                                                 node_mars, ord_, rank, sids, slp)
+                                                 node_mars, ord_, rank, crow[sids.long()], slp, crow)
     layer.__dict__[_STATE] = dict(B = B, K = K, S = S, tab = tab, tau = tau, emap = emap32, ids = ids, lp = lp, lz = lz,
                                   lb = lb, place = place, miss = miss, wrow = wrow, logw = logw, offs = offs, rows = rows,
-                                  counts = None, ord = ord_, rank = rank, rowstart = rowstart)
+                                  counts = None, ord = ord_, rank = rank, rowstart = rowstart, crow = crow)
     return True
 
 
@@ -419,7 +429,7 @@ def leaf_backward(desc, layer, data, node_flows: torch.Tensor, kwargs: dict, log
                                    layer.param_flows if em else none, plan["spf"] if em else none.long(),
                                    plan["spf_aligned"], none.bool() if pm is None else pm.contiguous(), gsgn,
                                    bool(graded), drow, dsgn, Bd, st["ord"], st["rank"], tptrs, tstrides,
-                                   st["rowstart"] if hg is not None else none.int(), re, tstores)
+                                   st["rowstart"] if hg is not None else none.int(), re, tstores, st["crow"])
     if glp is not None and glp is not glp_out:
         glp_out += glp.to(glp_out.dtype)
     if graded and hg is None:

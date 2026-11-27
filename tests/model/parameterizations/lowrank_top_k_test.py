@@ -545,11 +545,12 @@ def test_the_kernels_initialize_the_gradient_destinations():
         assert _rel(a, z) < 1e-5 and _rel(o, z) < 1e-5, (name, _rel(a, z), _rel(o, z))
 
 
-@pytest.mark.parametrize("N, V2, tied", [(128, 301, True), (256, 300, False), (2048, 300, True)])
+@pytest.mark.parametrize("N, V2, tied", [(128, 301, True), (256, 300, False), (2048, 300, True), (128, 3001, False)])
 def test_the_fused_leaf_em_statistics_are_the_torch_passes(N, V2, tied):
     """The leaves' EM statistics by the kernels (the candidates sorted by category, a category's sums added into the
     layer's flows) against their torch passes where the flows' units are not 16 B aligned (V % 4 != 0), where each
-    position has a table of its own (untied leaves) and past one CTA's 1024 nodes: an EM backward's statistics on the
+    position has a table of its own (untied leaves), past one CTA's 1024 nodes, and where most categories are no
+    candidate's (the tables' rows those of the categories some candidate takes): an EM backward's statistics on the
     all-observed pass and on the visible-only one, and the conditional's with the mask on its all-observed half."""
     import pyjuice.parameterizations.lowrank.top_k_fused as tkf
     import pyjuice.parameterizations.lowrank.top_k_leaf_fused as tlf

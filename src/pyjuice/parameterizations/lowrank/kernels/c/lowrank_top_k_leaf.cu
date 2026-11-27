@@ -95,9 +95,15 @@ __device__ __forceinline__ float xreduce32(float (&p)[32], int lane) {
 }
 
 __global__ void tk_leaf_table_kernel(const float* __restrict__ params, const long* __restrict__ spids,
-                                     float* __restrict__ tab, int M, int V) {
+                                     const int* __restrict__ crow, float* __restrict__ tab, int M, int V) {
     __shared__ float tile[32][33];
+    __shared__ int s_any;
     const int v0 = blockIdx.x * 32, i0 = blockIdx.y * 32, tx = threadIdx.x, ty = threadIdx.y;
+    if (tx == 0 && ty == 0) s_any = 0;
+    __syncthreads();
+    if (ty == 0 && v0 + tx < V && crow[v0 + tx] >= 0) s_any = 1;     // (a block of categories none takes: nothing)
+    __syncthreads();
+    if (s_any == 0) return;
     for (int k = ty; k < 32; k += 8) {
         const int i = i0 + k, v = v0 + tx;
         tile[k][tx] = (i < M && v < V) ? params[spids[i] + v] : 1.f;
@@ -105,7 +111,8 @@ __global__ void tk_leaf_table_kernel(const float* __restrict__ params, const lon
     __syncthreads();
     for (int k = ty; k < 32; k += 8) {
         const int v = v0 + k, i = i0 + tx;
-        if (v < V && i < M) tab[(long)v * M + i] = __log2f(tile[tx][k]);
+        const int r = v < V ? crow[v] : -1;
+        if (r >= 0 && i < M) tab[(long)r * M + i] = __log2f(tile[tx][k]);
     }
 }
 
@@ -116,8 +123,12 @@ struct Tile {
     const int* ids; const float* lp; int nvars; const int* nv_lvid;   // the evidence [B][nvars][C]; a node vector's
     const int* erow;                                             // the evidence's row a sample reads (null: its own)
     const int* nv_row0;                                          // a node vector's first row of node values / flows
+    const int* crow;                                             // [V] a category's row of the tables (-1: no tile's
+                                                                 // candidate; null: its own)
     int B, M, C, S, K, H;                                        // S = Kl + 1; H = min(C, max(K, Kl))
 };
+
+__device__ __forceinline__ int trow(const Tile& g, int id) { return g.crow != nullptr ? __ldg(g.crow + id) : id; }
 
 struct FwArgs {
     Tile g;
@@ -235,7 +246,7 @@ __global__ void __launch_bounds__(NW * 32, 1) tk_leaf_forward_kernel(const FwArg
         const int c0 = ci * CH, kh = min(CH, g.H - c0);
         __syncthreads();
         for (int k = threadIdx.x; k < kh; k += NW * 32) {
-            s_ids[k] = g.ids[e0 + c0 + k];
+            s_ids[k] = trow(g, g.ids[e0 + c0 + k]);                    // (their rows of the table)
             s_lp[k] = g.lp[e0 + c0 + k] * LOG2E;
         }
         __syncthreads();
@@ -290,7 +301,7 @@ __global__ void __launch_bounds__(NW * 32, 1) tk_leaf_forward_kernel(const FwArg
             if (miss[m]) continue;
             float v[4] = {-INFINITY, -INFINITY, -INFINITY, -INFINITY};    // the node values: log P(x | i)
             if (p != INT_MAX) {
-                const int id = p < hs ? s_ids[p] : g.ids[e0 + p];      // (the head's first chunk the one staged)
+                const int id = p < hs ? s_ids[p] : trow(g, g.ids[e0 + p]);   // (the head's first chunk the one staged)
                 const float l = p < hs ? s_lp[p] : g.lp[e0 + p] * LOG2E;
                 const float4 th = ld4(tab + (long)id * g.M);
                 const float4 tc = tau == nullptr ? make_float4(0.f, 0.f, 0.f, 0.f) : p >= Kl ? tK : ld4(tau + (long)p * g.M);
@@ -332,7 +343,7 @@ __global__ void __launch_bounds__(NW * 32, 1) tk_leaf_forward_kernel(const FwArg
                         const float* tr = g.tab + (long)g.nv_tab[t] * g.tab_stride + n0 + n;
                         const float l = s < hs ? s_lp[s] : g.lp[e0 + s] * LOG2E;
                         const float tc = tau == nullptr ? 0.f : tau[(long)min(s, Kl) * g.M + n0 + n - i0];
-                        x = (tr[(long)(s < hs ? s_ids[s] : g.ids[e0 + s]) * g.M] + l + tc - s_lz[n]) * LN2;
+                        x = (tr[(long)(s < hs ? s_ids[s] : trow(g, g.ids[e0 + s])) * g.M] + l + tc - s_lz[n]) * LN2;
                     }
                 }
 #pragma unroll
@@ -351,7 +362,7 @@ __global__ void __launch_bounds__(NW * 32, 1) tk_leaf_forward_kernel(const FwArg
         for (int s = threadIdx.x >> 2; s < g.K; s += NW * 8) {
             float v[8];
             if (s < g.C) {
-                const int id = s < hs ? s_ids[s] : g.ids[e0 + s];
+                const int id = s < hs ? s_ids[s] : trow(g, g.ids[e0 + s]);
                 const float l = s < hs ? s_lp[s] : g.lp[e0 + s] * LOG2E;
                 const float* tr = tab0 + (long)id * g.M + p0 + nq;
                 const float4 a0 = ld4(tr), a1 = ld4(tr + 4);
@@ -605,7 +616,7 @@ __global__ void __launch_bounds__(NW * 32) tk_leaf_backward_kernel(const BwArgs 
         __syncthreads();
         for (int k = threadIdx.x; k < n; k += NW * 32) {
             const int id = g.ids[e0 + c0 + k];
-            s_ids[k] = id;
+            s_ids[k] = trow(g, id);                                    // (its row of the table; its key the category)
             s_lp[k] = g.lp[e0 + c0 + k] * LOG2E;
             if (ekey != nullptr) ekey[c0 + k] = kbase + id;
         }
@@ -810,7 +821,7 @@ __global__ void __launch_bounds__(HG_T, 2) tk_leaf_head_grad_kernel(const HgArgs
         As[0][n][r] = 0.f;
     }
     for (int k = tid; k < H; k += HG_T) {
-        s_id[k] = g.ids[e0 + k];
+        s_id[k] = trow(g, g.ids[e0 + k]);
         s_l[k] = g.lp[e0 + k] * LOG2E;
         s_glp[k] = 0.f;
     }
@@ -1096,7 +1107,8 @@ struct EmArgs {
     const float* emr; const int4* emeta;                             // the backward's rows; (sample, cp, rows) a tile
     const int* eplus;                                                // any F+ term (a sample's token missing)
     const float* acnt; int acs;                                      // the sums' counts [R][M][acs] (null: none)
-    const float* tab; long tab_stride;                               // log2 theta^T [ntab][V][M]
+    const float* tab; long tab_stride;                               // log2 theta^T [ntab][rows][M]
+    const int* crow;                                                 // [V] a category's row (-1: none; null: its own)
     const float* tau; int Bx; const int* emap;                       // tilts [T][Bx][S][M] (null: none); a sample's row
     const float* lp; const int* erow; int nvars; const int* nv_lvid;  // the evidence, as the tiles read it
     float* pf; const long* spf;                                      // the layer's parameter flows; [ntab][M] node i's
@@ -1163,11 +1175,12 @@ __global__ void __launch_bounds__(NW * 32) tk_leaf_em_kernel(const EmArgs a, con
     float4 nxt[2];
     const auto load_rows = [&](int bb) {
         const int k = bb / a.Vb, v0 = bb - k * a.Vb;
-        const float* tb = a.tab + (long)k * a.tab_stride + (long)v0 * a.M + n0;
+        const float* tb = a.tab + (long)k * a.tab_stride + n0;
 #pragma unroll
         for (int u = 0; u < 2; ++u) {
             const int q = threadIdx.x + u * NW * 32, r = q / (EN / 4), c4 = 4 * (q % (EN / 4));
-            nxt[u] = v0 + r < a.V ? ld4(tb + (long)r * a.M + c4) : make_float4(-INFINITY, -INFINITY, -INFINITY, -INFINITY);
+            const int row = v0 + r < a.V ? (a.crow != nullptr ? __ldg(a.crow + v0 + r) : v0 + r) : -1;
+            nxt[u] = row >= 0 ? ld4(tb + (long)row * a.M + c4) : make_float4(-INFINITY, -INFINITY, -INFINITY, -INFINITY);
         }
     };
     load_rows(s_k[0] / EB * EB);
@@ -1265,7 +1278,7 @@ template <typename T> T* ptr_or_null(const torch::Tensor& t) { return t.numel() 
 
 Tile make_tile(const torch::Tensor& tab, const torch::Tensor& nv_tab, const torch::Tensor& tau, const torch::Tensor& emap,
                const torch::Tensor& ids, const torch::Tensor& lp, const torch::Tensor& nv_lvid,
-               const torch::Tensor& nv_row0, int64_t B, int64_t S, int64_t K) {
+               const torch::Tensor& nv_row0, int64_t B, int64_t S, int64_t K, const torch::Tensor& crow) {
     check(tab, at::kFloat, "tables"); check(nv_tab, at::kInt, "nv_tab"); check(ids, at::kInt, "ids");
     check(lp, at::kFloat, "lp"); check(nv_lvid, at::kInt, "nv_lvid"); check(nv_row0, at::kInt, "nv_row0");
     TORCH_CHECK(tab.dim() == 3 && ids.dim() == 3 && lp.sizes() == ids.sizes(), "top_k leaf: shapes");
@@ -1289,6 +1302,8 @@ Tile make_tile(const torch::Tensor& tab, const torch::Tensor& nv_tab, const torc
     }
     g.ids = ids.data_ptr<int>(); g.lp = lp.data_ptr<float>(); g.nvars = (int)ids.size(1);
     g.nv_lvid = nv_lvid.data_ptr<int>(); g.nv_row0 = nv_row0.data_ptr<int>();
+    g.crow = nullptr;
+    if (crow.numel() > 0) { check(crow, at::kInt, "crow"); g.crow = crow.data_ptr<int>(); }
     g.B = (int)B; g.M = M; g.C = C; g.S = (int)S; g.K = (int)K;
     g.H = std::min<int>(C, std::max<int>((int)K, (int)S - 1));
     return g;
@@ -1296,15 +1311,17 @@ Tile make_tile(const torch::Tensor& tab, const torch::Tensor& nv_tab, const torc
 
 }  // namespace
 
-// log2 theta^T [V, M] of a node vector's M nodes, node i's V probabilities at params[spids[i]:]
-torch::Tensor top_k_leaf_table(torch::Tensor params, torch::Tensor spids, int64_t V) {
-    check(params, at::kFloat, "params"); check(spids, at::kLong, "spids");
+// log2 theta^T [rows, M] of a node vector's M nodes, node i's V probabilities at params[spids[i]:] -- the categories
+// `crow` [V] int32 gives a row (-1: none: no tile has it among its candidates), `rows` of them
+torch::Tensor top_k_leaf_table(torch::Tensor params, torch::Tensor spids, int64_t V, torch::Tensor crow, int64_t rows) {
+    check(params, at::kFloat, "params"); check(spids, at::kLong, "spids"); check(crow, at::kInt, "crow");
+    TORCH_CHECK(crow.numel() == V, "top_k leaf: crow [V]");
     const at::cuda::CUDAGuard guard(params.device());
     const int M = (int)spids.size(0);
-    auto tab = torch::empty({V, M}, params.options());
+    auto tab = torch::empty({rows, M}, params.options());
     dim3 grid((unsigned)((V + 31) / 32), (unsigned)((M + 31) / 32)), block(32, 8);
     tk_leaf_table_kernel<<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
-        params.data_ptr<float>(), spids.data_ptr<long>(), tab.data_ptr<float>(), M, (int)V);
+        params.data_ptr<float>(), spids.data_ptr<long>(), crow.data_ptr<int>(), tab.data_ptr<float>(), M, (int)V);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return tab;
 }
@@ -1320,11 +1337,11 @@ std::vector<torch::Tensor> top_k_leaf_forward(torch::Tensor tab, torch::Tensor n
                                               torch::Tensor nv_row0, torch::Tensor tok, torch::Tensor miss,
                                               torch::Tensor wrow, int64_t R, int64_t S, int64_t K,
                                               torch::Tensor node_mars, torch::Tensor ord, torch::Tensor rank,
-                                              torch::Tensor sids, torch::Tensor slp) {
+                                              torch::Tensor sids, torch::Tensor slp, torch::Tensor crow) {
     const at::cuda::CUDAGuard guard(tab.device());
     const int64_t T = nv_tab.size(0), B = tok.size(1);
     FwArgs a;
-    a.g = make_tile(tab, nv_tab, tau, emap, ids, lp, nv_lvid, nv_row0, B, S, K);
+    a.g = make_tile(tab, nv_tab, tau, emap, ids, lp, nv_lvid, nv_row0, B, S, K, crow);
     check(tok, at::kInt, "tok"); check(miss, at::kByte, "miss"); check(node_mars, at::kFloat, "node_mars");
     TORCH_CHECK(node_mars.size(1) == B, "top_k leaf: node_mars [rows, B]");
     const int M = a.g.M;
@@ -1373,11 +1390,11 @@ torch::Tensor top_k_leaf_backward(torch::Tensor tab, torch::Tensor nv_tab, torch
                                   bool spf_aligned, torch::Tensor pmask, torch::Tensor gsgn, bool dtau_out,
                                   torch::Tensor drow, torch::Tensor dsgn, int64_t Bd, torch::Tensor ord,
                                   torch::Tensor rank, std::vector<int64_t> tptrs, std::vector<int64_t> tstrides,
-                                  torch::Tensor rowstart, int64_t re, std::vector<bool> tstores) {
+                                  torch::Tensor rowstart, int64_t re, std::vector<bool> tstores, torch::Tensor crow) {
     const at::cuda::CUDAGuard guard(tab.device());
     const int64_t T = nv_tab.size(0), B = place.size(1);
     BwArgs a;
-    a.g = make_tile(tab, nv_tab, tau, emap, ids, lp, nv_lvid, nv_row0, B, S, K);
+    a.g = make_tile(tab, nv_tab, tau, emap, ids, lp, nv_lvid, nv_row0, B, S, K, crow);
     check(lz, at::kFloat, "lz"); check(lb, at::kFloat, "lb"); check(place, at::kInt, "place");
     check(flows, at::kFloat, "flows");
     if (glp.numel() > 0) {
@@ -1427,7 +1444,9 @@ torch::Tensor top_k_leaf_backward(torch::Tensor tab, torch::Tensor nv_tab, torch
     a.dtau = dtau_out && !hg ? dtau.data_ptr<float>() : nullptr;
     // EM: the tiles' entries (a key a candidate, unset: none), rows and (sample, cp's first candidate, count rows)
     const bool em = pf.numel() > 0;
-    const int64_t ntab = tab.size(0), V = tab.size(1), C = ids.size(2), Vb = (V + EB - 1) / EB * EB, nbins = ntab * Vb;
+    // (the categories: crow's, the tables holding only the rows some tile takes; else the tables')
+    const int64_t ntab = tab.size(0), V = crow.numel() > 0 ? crow.numel() : tab.size(1), C = ids.size(2),
+                  Vb = (V + EB - 1) / EB * EB, nbins = ntab * Vb;
     torch::Tensor ekey, emr, emeta, eplus;
     a.ekey = nullptr; a.emr = nullptr; a.emeta = nullptr; a.eplus = nullptr; a.Vb = (int)Vb; a.pf = nullptr;
     a.spf = nullptr;
@@ -1525,7 +1544,7 @@ torch::Tensor top_k_leaf_backward(torch::Tensor tab, torch::Tensor nv_tab, torch
     EmArgs e;
     e.skey = skey.data_ptr<int>(); e.sidx = sidx.data_ptr<long>(); e.offs = offs.data_ptr<int>(); e.nbins = (int)nbins;
     e.emr = a.emr; e.emeta = a.emeta; e.eplus = a.eplus; e.acnt = a.acnt; e.acs = a.acs;
-    e.tab = a.g.tab; e.tab_stride = a.g.tab_stride;
+    e.tab = a.g.tab; e.tab_stride = a.g.tab_stride; e.crow = a.g.crow;
     e.tau = a.g.tau; e.Bx = a.g.Bx; e.emap = a.g.emap;
     e.lp = a.g.lp; e.erow = a.g.erow; e.nvars = a.g.nvars; e.nv_lvid = a.g.nv_lvid;
     e.pf = a.pf; e.spf = a.spf;
