@@ -833,6 +833,34 @@ def test_one_backward_for_the_gradients_and_the_em_statistics(kernels):
 
 
 @pytest.mark.parametrize("kernels", [False, True])
+def test_a_second_backward_of_one_forward_is_the_first(kernels):
+    """The leaves' kernels release their forward's state once their backward has used it (nothing of a pass held after
+    it): a second backward of the same forward -- the leaves by the torch passes then, the sums' kernels making their
+    own operands -- gives the first's EM statistics, node flows and gradients."""
+    pc, (ext, ids, lp, x, miss), (T, N, b) = _mask_case(kernels)
+    pext = _pc_ext(ext, T, N)
+    evi = dict(categorical_evidence_logp = lp.float(), soft_evidence_cat_ids = ids)
+    w = torch.linspace(0.5, 2.0, b, device = DEV)
+
+    def backward():
+        g = {k_: tuple(torch.zeros_like(t) for t in v) for k_, v in pext.items()}
+        glp = torch.zeros_like(evi["categorical_evidence_logp"])
+        pc.init_param_flows(flows_memory = 0.0)
+        pc.backward(x, ll_weights = w, missing_mask = miss, compute_param_flows = True, logspace_flows = True,
+                    allow_modify_flows = False, external_params_grad = g, categorical_evidence_logp_grad = glp, **evi)
+        return _stats(pc) + [pc.node_flows.exp()] + [t for v in g.values() for t in v] + [glp]   # (flows in log space)
+
+    with _paths(kernels):
+        with torch.no_grad():
+            pc(x, missing_mask = miss, external_params = pext, **evi)
+        first = backward()
+        assert pc.input_layer_group[0].__dict__.get("_lr_top_k_leaf") is None           # (released)
+        second = backward()
+    for k, (a, b_) in enumerate(zip(second, first)):
+        assert torch.isfinite(a).all() and _rel(a, b_) < 5e-3, (k, _rel(a, b_))
+
+
+@pytest.mark.parametrize("kernels", [False, True])
 def test_impossible_evidence_has_no_mass(kernels):
     """A sample whose soft evidence is impossible (every candidate's -inf): its leaves' log-probabilities -inf, not
     the NaN of a normalizer -inf - -inf -- its log-likelihood -inf in both passes of the conditional --, every other
@@ -909,6 +937,14 @@ def test_tied_sums_make_their_parameters_tables_once_a_pass(monkeypatch):
     wt = torch.linspace(0.5, 2.0, b, device = DEV)
     seen = []
 
+    real_leaf_backward = tlf.leaf_backward
+
+    def leaf_backward(desc, layer, *a, **k):                            # (the pass's cache as the leaf's backward
+        cache = tlf.pass_cache(dict(layer = layer), 2 * b)              # finds it: released by it, with its state)
+        seen.append(None if cache is None else
+                    (sorted(k_ for v in cache.values() if isinstance(v, dict) for k_ in v), "items" in cache))
+        return real_leaf_backward(desc, layer, *a, **k)
+
     def conditional():
         ts = {g_: tuple(t.clone().requires_grad_(True) for t in v) for g_, v in pext.items()}
         lpg = lp.clone().requires_grad_(True)
@@ -918,10 +954,9 @@ def test_tied_sums_make_their_parameters_tables_once_a_pass(monkeypatch):
                 soft_evidence_cat_ids = ids.repeat(2, 1, 1), differentiable = True,
                 param_flows_mask = torch.arange(2 * b, device = DEV) < b).view(-1)
         (-(wt * (ll[:b] - ll[b:])).sum()).backward()
-        cache = tlf.pass_cache(dict(layer = pc.input_layer_group[0]), 2 * b)
-        seen.append(None if cache is None else
-                    (sorted(k_ for v in cache.values() if isinstance(v, dict) for k_ in v), "items" in cache))
         return [ll.detach()] + [t.grad for v in ts.values() for t in v] + [lpg.grad] + _stats(pc)
+
+    monkeypatch.setattr(tlf, "leaf_backward", leaf_backward)
 
     def same(a, b_):
         assert len(a) == len(b_)
