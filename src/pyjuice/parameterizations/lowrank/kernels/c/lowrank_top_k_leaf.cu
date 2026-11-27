@@ -129,6 +129,8 @@ struct FwArgs {
                                                                  // place's rank within its row (null: a sample a CTA)
     const int* sids; const float* slp;                           // the candidates past the head of each tile [rows of
                                                                  // the evidence][nvars][C - H], by token id; their lp
+    int pos_y;                                                   // the grid's positions in y, the samples in x (more
+                                                                 // samples than grid.y holds); else the other way
 };
 
 constexpr int FB = 8;               // the bulk's candidates in flight a warp
@@ -151,7 +153,7 @@ __global__ void __launch_bounds__(NW * 32, 1) tk_leaf_forward_kernel(const FwArg
     __shared__ float s_lp[CH];
     __shared__ int s_place[NS];
     const Tile& g = a.g;
-    const int t = blockIdx.x, qx = blockIdx.y, lane = threadIdx.x & 31;
+    const int t = a.pos_y ? blockIdx.y : blockIdx.x, qx = a.pos_y ? blockIdx.x : blockIdx.y, lane = threadIdx.x & 31;
     int bs[NS], ns = 1;
     if constexpr (NS == 1) {
         bs[0] = qx;
@@ -403,6 +405,7 @@ struct BwArgs {
     const float* gsgn;                                           // [B] the evidence gradient's sign a sample (null: 1)
     const int* ord; const int* rank;                             // [B] the samples by their evidence's row and a
                                                                  // place's rank within its row (null: a sample a CTA)
+    int pos_y;                                                   // (as the forward's)
 };
 
 // dtau's writes of a thread's 4 nodes, times the sample's sign (1 where nothing folds): stored into a row the CTA holds
@@ -434,7 +437,7 @@ __global__ void __launch_bounds__(NW * 32) tk_leaf_backward_kernel(const BwArgs 
     __shared__ int s_ids[CH];
     __shared__ float s_lp[CH];
     const Tile& g = a.g;
-    const int t = blockIdx.x, qx = blockIdx.y, lane = threadIdx.x & 31;
+    const int t = a.pos_y ? blockIdx.y : blockIdx.x, qx = a.pos_y ? blockIdx.x : blockIdx.y, lane = threadIdx.x & 31;
     int bs[NS], ns = 1;
     if constexpr (NS == 1) {
         bs[0] = qx;
@@ -973,7 +976,9 @@ std::vector<torch::Tensor> top_k_leaf_forward(torch::Tensor tab, torch::Tensor n
         check(sids, at::kInt, "sids"); check(slp, at::kFloat, "slp");
         a.sids = sids.data_ptr<int>(); a.slp = slp.data_ptr<float>();
     }
-    dim3 grid((unsigned)T, (unsigned)B, (unsigned)((M + NW * 128 - 1) / (NW * 128)));   // (a sample's positions side by side)
+    a.pos_y = B > 65535 ? 1 : 0;                            // (a sample's positions side by side, where grid.y holds B)
+    const unsigned gz = (unsigned)((M + NW * 128 - 1) / (NW * 128));
+    const dim3 grid = a.pos_y ? dim3((unsigned)B, (unsigned)T, gz) : dim3((unsigned)T, (unsigned)B, gz);
     const auto stream = at::cuda::getCurrentCUDAStream();
     if (a.ord != nullptr) tk_leaf_forward_kernel<2><<<grid, NW * 32, 0, stream>>>(a);
     else tk_leaf_forward_kernel<1><<<grid, NW * 32, 0, stream>>>(a);
@@ -1078,7 +1083,9 @@ torch::Tensor top_k_leaf_backward(torch::Tensor tab, torch::Tensor nv_tab, torch
                                                                owned.data_ptr<bool>(), a.dtau);
         C10_CUDA_KERNEL_LAUNCH_CHECK();
     }
-    dim3 grid((unsigned)T, (unsigned)B, (unsigned)((M + NW * 128 - 1) / (NW * 128)));   // (a sample's positions side by side)
+    a.pos_y = B > 65535 ? 1 : 0;                            // (a sample's positions side by side, where grid.y holds B)
+    const unsigned gz = (unsigned)((M + NW * 128 - 1) / (NW * 128));
+    const dim3 grid = a.pos_y ? dim3((unsigned)B, (unsigned)T, gz) : dim3((unsigned)T, (unsigned)B, gz);
     if (a.ord != nullptr) tk_leaf_backward_kernel<2><<<grid, NW * 32, 0, stream>>>(a);
     else tk_leaf_backward_kernel<1><<<grid, NW * 32, 0, stream>>>(a);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
