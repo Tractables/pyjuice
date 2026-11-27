@@ -1997,11 +1997,14 @@ __global__ void __launch_bounds__(GWN * 32) tk_bw_da_gemm_kernel(const BwArgs a)
 
 // F+[i, j] = sum_b W_b[i, j] es_b[j] ev_b[j] ao_b[i],  F-[i, j] = sum_b W_b[i, j] es_b[j] bo_b[i] over the observed
 // samples b (es_b: E's row of its slot): a CTA owns tiles of the parameters (128 nodes x two chunks of 64 children, the
-// forward's warp tiling) and walks the samples -- stream-K over (tile, sample), each segment's sums added (red) into FP,
-// FM at its end. l2t's fragments once a segment; a sample's B chunks (with its es, ev) staged by cp.async,
-// double-buffered across samples; its A' fragments from AH straight into registers (each warp its own 16 nodes), read
-// once for both chunks (their L2 traffic, a sample a tile, the kernel's largest cost after the MMAs: 85 -> 76 us a
-// transition at the best Codpula head; staging them in shared memory instead took 93).
+// forward's warp tiling) and walks the samples -- stream-K over (tile, sample), each segment's sums added into FP, FM at
+// its end by bulk reductions. l2t's fragments once a segment; the segment's walk (its samples, rows of tensors, slots)
+// staged in shared memory once; a sample's B chunks (with its es, ev) staged by cp.async in a ring of mbarrier'd stages;
+// its A' fragments from AH straight into registers (each warp its own 16 nodes), read once for both chunks (staging them
+// in shared memory instead took 93 us a transition against 85). MEASURED (the best Codpula head, one transition, 48
+// observed samples): 68.4 us with a barrier a sample, the walk's indices from global in the loop and reds; 64.1 with the
+// walk staged; 60.8 with the ring; 53.8 with the stage copies' addresses a thread's constants (the register pressure
+// down: no spill) and the bulk-reduced epilogue (red pairs of floats: 58.4).
 struct EmArgs {
     const __half* AH; const __half* BP; const float* E; const float* ev; const uint2* LTh;
     const float* ao; const float* bo; const float* hrow; const int* slot; const int* emap;   // slot -1: masked
@@ -2012,46 +2015,98 @@ struct EmArgs {
 
 constexpr int ECH = 2;                 // an EM tile's children chunks
 
+constexpr int EWL = NW * 32;           // an EM segment's places at most (its walk staged in shared memory, a thread a place)
+
+__device__ __forceinline__ void mbar_init(unsigned bar, unsigned cnt) {
+    asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;" :: "r"(bar), "r"(cnt) : "memory");
+}
+__device__ __forceinline__ void mbar_arrive(unsigned bar) {
+    asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];" :: "r"(bar) : "memory");
+}
+// the arrive once the thread's cp.async copies before it land (the phase's count holds it: no increment)
+__device__ __forceinline__ void mbar_cp_arrive(unsigned bar) {
+    asm volatile("cp.async.mbarrier.arrive.noinc.shared::cta.b64 [%0];" :: "r"(bar) : "memory");
+}
+__device__ __forceinline__ void mbar_wait(unsigned bar, unsigned parity) {
+    asm volatile("{\n .reg .pred p;\n W_%=:\n mbarrier.try_wait.parity.shared::cta.b64 p, [%0], %1;\n @!p bra W_%=;\n}"
+                 :: "r"(bar), "r"(parity) : "memory");
+}
+
+constexpr int ETR = ECH * TN + 8;      // the EM epilogue's staged row of sums (floats: 16-byte aligned, banks shifted a row)
+
 template <int NK>
-struct EmGeo {                         // a stage: ECH x { B chunk [KP][BROW] fp16, es and ev [2][TN] }
+struct EmGeo {   // NST stages of ECH x { B chunk [KP][BROW] fp16, es and ev [2][TN] } (the epilogue's rows [TM][ETR] after
+                 // them); the segment's walk [EWL] int4; the stages' full and empty mbarriers; the walk's per-warp counts
     static constexpr int KP = 16 * NK;
     static constexpr int B_BYTES = KP * BROW * 2;
     static constexpr int CHUNK = B_BYTES + 2 * TN * 4;
     static constexpr int STAGE = ECH * CHUNK;
-    static constexpr int BYTES = 2 * STAGE;
+    static constexpr int TAIL = EWL * 16 + 2 * 3 * 8 + NW * 4;
+    static constexpr int NST = 3 * STAGE + TAIL <= 99 * 1024 ? 3 : 2;   // (three where they fit: ranks <= 96)
+    static constexpr int STG = NST * STAGE > TM * ETR * 4 ? NST * STAGE : TM * ETR * 4;
+    static constexpr int WL = STG, BAR = WL + EWL * 16, CNT = BAR + 2 * 3 * 8;
+    static constexpr int BYTES = STG + TAIL;
 };
 
+// A segment of a CTA's walk: its tile's sums over the observed samples at places l0 .. l1 - 1 (at most EWL). The
+// samples' stages in a ring of NST (`EmGeo`), each released by its warps (empty) and filled by every thread's copies
+// (full) -- no CTA barrier a sample: a warp runs up to a sample ahead of the slowest (with a barrier a sample, the
+// warps of a scheduler kept the same phase -- MMAs or FP32 together; 64 -> 59 us a transition without it, racing)
 template <int NK>
 __device__ __forceinline__ void em_segment(const EmArgs& a, int tile, int l0, int l1, unsigned char* smem) {
     using G = EmGeo<NK>;
-    constexpr int KP = G::KP;
+    constexpr int KP = G::KP, NST = G::NST;
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, g = lane >> 2, t = lane & 3;
     const int N = a.N, M = a.M, S = a.S, nchunks = N / TN, ntc = nchunks / ECH;
     const int x = tile / ntc, c = (tile % ntc) * ECH, j0 = c * TN;           // (c: the tile's first chunk)
-    const int node0 = x * TM + warp * 16 + g, node1 = node0 + 8;
-    // (the walk's places l0 .. l1 - 1: a place's sample, -1 where none -- the list's padding, or a masked sample)
-    auto smp = [&](int l) { const int b = a.olist != nullptr ? a.olist[l] : l; return b >= 0 && a.slot[b] >= 0 ? b : -1; };
-    auto next_obs = [&](int l) { while (l < l1 && smp(l) < 0) ++l; return l; };
-    constexpr int NB = KP * (TN / 8), NC = NB + 2 * (TN / 4), NSEG = ECH * NC;
-    auto load_seg = [&](int qq, int st, int b) {
-        const int e = a.emap != nullptr ? a.emap[b] : b;
-        const int ch = qq / NC, q = qq % NC, jc = j0 + ch * TN;
-        const unsigned bs = smem_u32(smem + st * G::STAGE + ch * G::CHUNK);
-        if (q < NB) {
-            const int k = q / (TN / 8), s = q % (TN / 8);
-            cp16(bs + (k * BROW + s * 8) * 2, a.BP + ((long)e * KP + k) * N + jc + s * 8);
-        } else {
-            const int v = (q - NB) / (TN / 4), s = (q - NB) % (TN / 4);
-            const float* src = v == 0 ? a.E + ((long)e * S + a.slot[b]) * N : a.ev + (long)b * N;
-            cp16(bs + G::B_BYTES + (v * TN + s * 4) * 4, src + jc + s * 4);
+    const int node0 = x * TM + warp * 16 + g;
+    int4* const wl = reinterpret_cast<int4*>(smem + G::WL);
+    int* const wcnt = reinterpret_cast<int*>(smem + G::CNT);
+    const unsigned full0 = smem_u32(smem + G::BAR), empty0 = full0 + 3 * 8;
+    // the walk, staged once and compacted: the segment's walked samples (not the list's padding, not a masked one), in
+    // order -- a sample, its row of tensors, its slot -- with no global index loads in the sample loop
+    __syncthreads();                                   // (the last segment's stages, walk and barriers no longer in use)
+    int4 rec = make_int4(-1, 0, -1, 0);
+    if (tid < l1 - l0) {
+        const int bb = a.olist != nullptr ? a.olist[l0 + tid] : l0 + tid;
+        const int sl = bb >= 0 ? a.slot[bb] : -1;
+        rec = make_int4(bb, bb >= 0 ? (a.emap != nullptr ? a.emap[bb] : bb) : 0, sl, 0);
+    }
+    const bool walked = rec.x >= 0 && rec.z >= 0;
+    const unsigned bal = __ballot_sync(0xffffffffu, walked);
+    if (lane == 0) wcnt[warp] = __popc(bal);
+    if (tid < NST) { mbar_init(full0 + 8 * tid, NW * 32); mbar_init(empty0 + 8 * tid, NW); }
+    __syncthreads();
+    int nobs = 0, off = 0;
+    #pragma unroll
+    for (int w2 = 0; w2 < NW; ++w2) { const int cw = wcnt[w2]; off += w2 < warp ? cw : 0; nobs += cw; }
+    if (walked) wl[off + __popc(bal & ((1u << lane) - 1))] = rec;
+    __syncthreads();
+    if (nobs == 0) return;                                                   // (no observed sample: the CTA's)
+    // a sample's stage: its row's B chunks (a thread its 16 bytes of rows tid / 8 + 32 i: KP / 32 a chunk), its slot's E
+    // row and its ev (threads 0 .. 63); every thread's copies, then its arrive on full
+    static_assert(TN == 64 && NW * 32 == 256 && KP % 32 == 0, "the EM stage's copy layout");
+    const unsigned so = ((tid >> 3) * BROW + (tid & 7) * 8) * 2;             // (the thread's B row, segment: in a chunk)
+    const long go = (long)(tid >> 3) * N + (tid & 7) * 8;
+    const int ech = (tid >> 5) & 1, ev_ = (tid >> 4) & 1, eseg = tid & 15;  // (tid < 64: chunk, E or ev, segment)
+    auto load_stage = [&](int st, const int4 w) {
+        const __half* bsrc = a.BP + (long)w.y * KP * N + j0 + go;
+        const unsigned bs = smem_u32(smem + st * G::STAGE) + so;
+        #pragma unroll
+        for (int ch = 0; ch < ECH; ++ch)
+            #pragma unroll
+            for (int i = 0; i < KP / 32; ++i)
+                cp16(bs + ch * G::CHUNK + i * 32 * BROW * 2, bsrc + ch * TN + (long)i * 32 * N);
+        if (tid < 2 * ECH * (TN / 4)) {
+            const float* src = ev_ == 0 ? a.E + ((long)w.y * S + w.z) * N : a.ev + (long)w.x * N;
+            cp16(smem_u32(smem + st * G::STAGE + ech * G::CHUNK + G::B_BYTES) + (ev_ * TN + eseg * 4) * 4,
+                 src + j0 + ech * TN + eseg * 4);
         }
+        mbar_cp_arrive(full0 + 8 * st);
     };
-    int l = next_obs(l0);
-    if (l >= l1) return;                                                     // (no observed sample: the CTA's)
-    int b = smp(l);
-    __syncthreads();                                                         // (the last segment's stages read by all)
-    for (int q = tid; q < NSEG; q += NW * 32) load_seg(q, 0, b);
-    cp_commit();
+    #pragma unroll
+    for (int m = 0; m < NST - 1; ++m)
+        if (m < nobs) load_stage(m, wl[m]);
     uint2 lt[ECH][8];
     const uint2* ltp = a.LTh + ((long)(x * NW + warp) * nchunks * 8) * 32 + lane;
     #pragma unroll
@@ -2066,31 +2121,26 @@ __device__ __forceinline__ void em_segment(const EmArgs& a, int tile, int l0, in
             #pragma unroll
             for (int q = 0; q < 4; ++q) Fp[ch][nt][q] = Fm[ch][nt][q] = 0.f;
     // a sample's own operands -- its A' fragments (AH's half pairs), W's shift, ao, bo -- the next sample's loaded right
-    // after the current one's last use: the stage wait and the barrier then hide their latency (the index chain's too)
+    // after the current one's last use: the stage wait hides their latency
     unsigned af[NK][4];
     float h0, h1, a0, a1, c0, c1;
-    auto own = [&](int bb) {
-        const int e = a.emap != nullptr ? a.emap[bb] : bb;
-        const unsigned* p0 = reinterpret_cast<const unsigned*>(a.AH + ((long)e * M + node0) * KP);
+    auto own = [&](const int4 ww) {
+        const unsigned* p0 = reinterpret_cast<const unsigned*>(a.AH + ((long)ww.y * M + node0) * KP);
         const unsigned* p1 = p0 + 8 * KP / 2;
         #pragma unroll
         for (int ks = 0; ks < NK; ++ks) {
             af[ks][0] = p0[ks * 8 + t]; af[ks][1] = p1[ks * 8 + t];
             af[ks][2] = p0[ks * 8 + 4 + t]; af[ks][3] = p1[ks * 8 + 4 + t];
         }
-        h0 = a.hrow[(long)bb * M + node0]; h1 = a.hrow[(long)bb * M + node1];
-        a0 = a.ao[(long)bb * M + node0]; a1 = a.ao[(long)bb * M + node1];
-        c0 = a.bo[(long)bb * M + node0]; c1 = a.bo[(long)bb * M + node1];
+        const long r0 = (long)ww.x * M + node0;
+        h0 = a.hrow[r0]; h1 = a.hrow[r0 + 8];
+        a0 = a.ao[r0]; a1 = a.ao[r0 + 8];
+        c0 = a.bo[r0]; c1 = a.bo[r0 + 8];
     };
-    own(b);
-    for (int st = 0; l < l1; st ^= 1) {
-        const int ln = next_obs(l + 1), bn = ln < l1 ? smp(ln) : -1;
-        cp_wait<0>();
-        __syncthreads();                     // (this sample's stage complete; the other free)
-        if (ln < l1) {
-            for (int q = tid; q < NSEG; q += NW * 32) load_seg(q, st ^ 1, bn);
-            cp_commit();
-        }
+    own(wl[0]);
+    for (int n = 0; n < nobs; ++n) {
+        const int st = n % NST;
+        mbar_wait(full0 + 8 * st, (n / NST) & 1);                           // (this sample's stage complete)
         #pragma unroll
         for (int ch = 0; ch < ECH; ++ch) {
             const unsigned char* sp = smem + st * G::STAGE + ch * G::CHUNK;
@@ -2108,20 +2158,42 @@ __device__ __forceinline__ void em_segment(const EmArgs& a, int tile, int l0, in
                 Fm[ch][nt][0] += w0 * c0; Fm[ch][nt][1] += w1 * c0; Fm[ch][nt][2] += w2 * c1; Fm[ch][nt][3] += w3 * c1;
             }
         }
-        if (ln < l1) own(bn);
-        l = ln;
-        b = bn;
+        // (the stage released by the warp: its last reads -- the B fragments the MMAs took, es and ev the products
+        // took -- consumed above; its next copies, a full L2 round trip later)
+        __syncwarp();
+        if (lane == 0) mbar_arrive(empty0 + 8 * st);
+        if (n + 1 < nobs) own(wl[n + 1]);
+        const int m = n + NST - 1;                                           // (the sample whose copies go out now)
+        if (m < nobs) {
+            const int sm = m % NST;
+            if (m >= NST) mbar_wait(empty0 + 8 * sm, ((m / NST) - 1) & 1);   // (its stage released by every warp)
+            load_stage(sm, wl[m]);
+        }
     }
+    // the sums into FP, FM: the tile staged in shared memory (the stages free once every warp is past its last sample),
+    // F+ then F-, each of its rows added by one bulk reduction (the L2 adding 512 bytes an op; a red a pair of floats
+    // each took 6.7 us of the 61 a transition)
+    float* const ts = reinterpret_cast<float*>(smem);                        // [TM][ETR]
     #pragma unroll
-    for (int ch = 0; ch < ECH; ++ch) {
-        float* P0 = a.FP + (long)node0 * N + j0 + ch * TN + 2 * t;
-        float* Q0 = a.FM + (long)node0 * N + j0 + ch * TN + 2 * t;
+    for (int pass = 0; pass < 2; ++pass) {
+        __syncthreads();                     // (the stages, or the last pass's rows, read by all)
         #pragma unroll
-        for (int nt = 0; nt < 8; ++nt) {
-            red2(P0 + nt * 8, Fp[ch][nt][0], Fp[ch][nt][1], true);
-            red2(P0 + 8L * N + nt * 8, Fp[ch][nt][2], Fp[ch][nt][3], true);
-            red2(Q0 + nt * 8, Fm[ch][nt][0], Fm[ch][nt][1], true);
-            red2(Q0 + 8L * N + nt * 8, Fm[ch][nt][2], Fm[ch][nt][3], true);
+        for (int ch = 0; ch < ECH; ++ch)
+            #pragma unroll
+            for (int nt = 0; nt < 8; ++nt) {
+                const float* F = pass == 0 ? Fp[ch][nt] : Fm[ch][nt];
+                float* r0 = ts + (warp * 16 + g) * ETR + ch * TN + nt * 8 + 2 * t;
+                *reinterpret_cast<float2*>(r0) = make_float2(F[0], F[1]);
+                *reinterpret_cast<float2*>(r0 + 8 * ETR) = make_float2(F[2], F[3]);
+            }
+        asm volatile("fence.proxy.async.shared::cta;" ::: "memory");     // (the rows, seen by the bulk reductions)
+        __syncthreads();
+        if (tid < TM) {
+            float* dst = (pass == 0 ? a.FP : a.FM) + (long)(x * TM + tid) * N + j0;
+            asm volatile("cp.reduce.async.bulk.global.shared::cta.bulk_group.add.f32 [%0], [%1], %2;"
+                         :: "l"(dst), "r"(smem_u32(ts + tid * ETR)), "r"(ECH * TN * 4) : "memory");
+            asm volatile("cp.async.bulk.commit_group;" ::: "memory");
+            asm volatile("cp.async.bulk.wait_group.read 0;" ::: "memory");   // (the rows read: free again)
         }
     }
 }
@@ -2135,7 +2207,7 @@ __global__ void __launch_bounds__(NW * 32, 1) tk_bw_em_obs_kernel(const EmArgs a
     const long u0 = U * k / P, u1 = U * (k + 1) / P;
     for (long u = u0; u < u1;) {
         const int tile = (int)(u / a.nl), l0 = (int)(u % a.nl);
-        const int l1 = (int)min((long)a.nl, l0 + (u1 - u));
+        const int l1 = (int)min(min((long)a.nl, l0 + (u1 - u)), (long)l0 + EWL);     // (a segment's walk: EWL at most)
         em_segment<NK>(a, tile, l0, l1, smem);
         u += l1 - l0;
     }
