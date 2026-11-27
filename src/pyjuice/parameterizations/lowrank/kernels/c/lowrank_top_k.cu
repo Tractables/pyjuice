@@ -228,6 +228,55 @@ __device__ __forceinline__ void red4(float* p, float4 v) {
 #endif
 }
 
+// A gradient destination tile's first writer in a backward (`grad_init_row` sets its flag 0): it claims the tile
+// (0 -> 1), stores its sums over every element of it rather than adding them, and publishes 2 (`tile_release`); every
+// other writer waits for the 2 and adds into them. A flag 2 from the start, or no flag: every writer adds (the tile
+// initialized already). The CTA's answer (every thread calls it: a barrier).
+__device__ __forceinline__ bool tile_claim(int* f) {
+    __shared__ int s_first;
+    if (threadIdx.x == 0) {
+        int first = 0;
+        if (f != nullptr) {
+            first = atomicCAS(f, 0, 1) == 0;
+            if (!first) {
+                int v;
+                do {
+                    asm volatile("ld.acquire.gpu.global.b32 %0, [%1];" : "=r"(v) : "l"(f) : "memory");
+                    if (v != 2) __nanosleep(32);
+                } while (v != 2);
+            }
+        }
+        s_first = first;
+    }
+    __syncthreads();
+    return s_first != 0;
+}
+
+__device__ __forceinline__ void tile_release(int* f, bool first) {
+    __syncthreads();                                                         // (every thread's stores of the tile issued)
+    if (first && threadIdx.x == 0) {
+        __threadfence();
+        atomicExch(f, 2);
+    }
+}
+
+// p[0 .. 3] = v, or += v (`add`)
+__device__ __forceinline__ void put4(float* p, float4 v, bool add) {
+    if (add) red4(p, v);
+    else *reinterpret_cast<float4*>(p) = v;
+}
+
+__device__ __forceinline__ void put2(float* p, float a, float b, bool pair, bool add) {
+    if (add) { red2(p, a, b, pair); return; }
+    if (pair) *reinterpret_cast<float2*>(p) = make_float2(a, b);
+    else { p[0] = a; p[1] = b; }
+}
+
+__device__ __forceinline__ void put1(float* p, float v, bool add) {
+    if (add) red1(p, v);
+    else *p = v;
+}
+
 __device__ __forceinline__ float quad_sum(float v) {
     v += __shfl_xor_sync(0xffffffffu, v, 1);
     return v + __shfl_xor_sync(0xffffffffu, v, 2);
@@ -1222,6 +1271,10 @@ struct BwArgs {                         // the cols pass's and dA's GEMM's (see 
     float* DA; long sDA;                     // [Bd, M, r] (rows contiguous; added into)
     float* DB; long sDB;                     // [Bd, r, N]
     float* DG; long sDG;                     // [Bd, S, N]
+    // [Bd, M / GMN + N / CN] a destination row's tiles' flags -- its dA tiles (nodes by GMN), then its dB / dG tiles
+    // (children by CN) -- where the masked passes' first writers store (`tile_claim`; set by `grad_init_row`),
+    // null where every writer adds; dfa the dA tiles a row, dft all its tiles
+    int* dflag; int dfa, dft;
     int r, M, N, S, Rm;
 };
 
@@ -1745,21 +1798,19 @@ __device__ __forceinline__ void cols_segment(const BwArgs& a, int y, int x, int 
     if constexpr (GRADS) {
         const int drw = a.drow[hb];
         float* DGr = a.DG + (long)drw * a.sDG;
-        if (t == 0) {
-            if constexpr (MASKED) {
-                red1(DGr + (long)(8 * NS8) * N + j0, sm * er0 * dgr0);
-                red1(DGr + (long)(8 * NS8) * N + j1, sm * er1 * dgr1);
-            }
-            #pragma unroll
-            for (int pp = 0; pp < 2; ++pp) {
-                if (o[pp] < 0) continue;
-                red1(DGr + (long)so[pp] * N + j0, sg[pp] * eso[pp][0] * (evo[pp][0] * po[pp][0] - ro[pp][0]));
-                red1(DGr + (long)so[pp] * N + j1, sg[pp] * eso[pp][1] * (evo[pp][1] * po[pp][1] - ro[pp][1]));
+        // (a masked item's segment writes the whole dB / dG tile (drw, x): its first writer stores it, the others add --
+        // after that store; the observed slots' terms, added, after the masked rows they land in: `tile_claim`)
+        cp_wait<0>();
+        int* flag = MASKED && a.dflag != nullptr ? a.dflag + (long)drw * a.dft + a.dfa + x : nullptr;
+        const bool add = !(MASKED && tile_claim(flag));                      // (its barrier: every warp past the stages)
+        if constexpr (!MASKED) __syncthreads();                              // (every warp past the stages)
+        if constexpr (MASKED) {
+            if (t == 0) {
+                put1(DGr + (long)(8 * NS8) * N + j0, sm * er0 * dgr0, add);
+                put1(DGr + (long)(8 * NS8) * N + j1, sm * er1 * dgr1, add);
             }
         }
-        // dB^T and dG^T through a buffer a warp (transposed: a rank's / a slot's 16 children adjacent), red.v4 rows
-        cp_wait<0>();
-        __syncthreads();                                                     // (every warp past the stages)
+        // dB^T and dG^T through a buffer a warp (transposed: a rank's / a slot's 16 children adjacent), v4 rows
         float* buf = reinterpret_cast<float*>(smem) + warp * (G::EROWS * TBUF);
         const float SC = 1.f / (LOG2E * sci);                                // (A' = log2 e A; Gl's scale)
         #pragma unroll
@@ -1772,7 +1823,7 @@ __device__ __forceinline__ void cols_segment(const BwArgs& a, int y, int x, int 
         float* DBr = a.DB + (long)drw * a.sDB + jw;
         for (int qq = lane; qq < a.r * 4; qq += 32) {
             const int k = qq >> 2, cc = qq & 3;
-            red4(DBr + (long)k * N + 4 * cc, *reinterpret_cast<const float4*>(buf + k * TBUF + 4 * cc));
+            put4(DBr + (long)k * N + 4 * cc, *reinterpret_cast<const float4*>(buf + k * TBUF + 4 * cc), add);
         }
         if constexpr (MASKED) {
             __syncwarp();
@@ -1789,10 +1840,20 @@ __device__ __forceinline__ void cols_segment(const BwArgs& a, int y, int x, int 
                 const int s = qq >> 2, cc = qq & 3;
                 const float4 v = *reinterpret_cast<const float4*>(buf + s * TBUF + 4 * cc);
                 const float4 ee = *reinterpret_cast<const float4*>(E0 + (long)s * N + jw + 4 * cc);
-                red4(DGr + (long)s * N + jw + 4 * cc,
-                     make_float4(smc * ee.x * v.x, smc * ee.y * v.y, smc * ee.z * v.z, smc * ee.w * v.w));
+                put4(DGr + (long)s * N + jw + 4 * cc,
+                     make_float4(smc * ee.x * v.x, smc * ee.y * v.y, smc * ee.z * v.z, smc * ee.w * v.w), add);
+            }
+            __syncwarp();                                                    // (the warp's rows before its slots' adds)
+        }
+        if (t == 0) {
+            #pragma unroll
+            for (int pp = 0; pp < 2; ++pp) {
+                if (o[pp] < 0) continue;
+                red1(DGr + (long)so[pp] * N + j0, sg[pp] * eso[pp][0] * (evo[pp][0] * po[pp][0] - ro[pp][0]));
+                red1(DGr + (long)so[pp] * N + j1, sg[pp] * eso[pp][1] * (evo[pp][1] * po[pp][1] - ro[pp][1]));
             }
         }
+        if constexpr (MASKED) tile_release(flag, !add);
     }
 }
 
@@ -1887,8 +1948,12 @@ __device__ __forceinline__ void da_gemm_segment(const BwArgs& a, int yi, int x, 
             }
         }
     }
-    // into the destination row, Gl's scale taken out: ranks 2t, 2t + 1 of each 8 (pairs where r is even)
-    float* DA = a.DA + (long)a.drow[hb] * a.sDA;
+    // into the destination row, Gl's scale taken out: ranks 2t, 2t + 1 of each 8 (pairs where r is even) -- stored by
+    // the tile's (row, x) first writer, added by the others (`tile_claim`)
+    const int drw = a.drow[hb];
+    float* DA = a.DA + (long)drw * a.sDA;
+    int* flag = a.dflag != nullptr ? a.dflag + (long)drw * a.dft + x : nullptr;
+    const bool add = !tile_claim(flag);
     const bool pair = (r & 1) == 0;
     const float iv = a.GLS[yi];
     #pragma unroll
@@ -1900,11 +1965,12 @@ __device__ __forceinline__ void da_gemm_segment(const BwArgs& a, int yi, int x, 
         for (int n = 0; n < KP / 8; ++n) {
             const int k = n * 8 + 2 * t;
             if (k + 1 < r) {
-                red2(D0 + k, acc[mt][n][0] * iv, acc[mt][n][1] * iv, pair);
-                red2(D1 + k, acc[mt][n][2] * iv, acc[mt][n][3] * iv, pair);
-            } else if (k < r) { red1(D0 + k, acc[mt][n][0] * iv); red1(D1 + k, acc[mt][n][2] * iv); }
+                put2(D0 + k, acc[mt][n][0] * iv, acc[mt][n][1] * iv, pair, add);
+                put2(D1 + k, acc[mt][n][2] * iv, acc[mt][n][3] * iv, pair, add);
+            } else if (k < r) { put1(D0 + k, acc[mt][n][0] * iv, add); put1(D1 + k, acc[mt][n][2] * iv, add); }
         }
     }
+    tile_release(flag, !add);
 }
 
 // a persistent launch over the group's masked items' node tiles' children chunks (stream-K: a CTA an equal share,
@@ -2135,12 +2201,43 @@ __global__ void tk_bw_ltc_kernel(const __half* L2T, uint2* LTc, int M, int N) {
 // task 0: fl [B, M] the sample's flows where its ao is > 0 (a node with mass), fmx [B] their largest, and its ao, bo
 // [B, M] times them (an observed sample's alpha, beta); task 1 (acnt given: the leaf's buffer): the masked row's flows
 // into the slot after its posterior's, where the stash left 1.
+// The destinations' tile flags before a backward's masked passes (`tile_claim`), a CTA a destination row d: 0 where a
+// masked item writes the row (its first writer of a tile stores it), else 2 -- the row zeroed here, its dA [M r], dB
+// [r N], dG [S N] (float4s: rows contiguous, 16 B aligned), for the observed passes to add into (none in a backward whose
+// every row has a masked sample). The flows kernel's CTAs (`tk_flows_kernel`: the launch before the backward's).
+struct GradInit {
+    const int4* mitems; int nm; const int* drow; int* dflag; int ntiles, Bd;
+    float* DA; long sDA, nA4; float* DB; long sDB, nB4; float* DG; long sDG, nG4;
+};
+
+__device__ __forceinline__ void grad_init_row(const GradInit& gi, int d) {
+    int mine = 0;
+    for (int i = threadIdx.x; i < gi.nm; i += blockDim.x) {
+        const int b = gi.mitems[i].x;
+        mine |= b >= 0 && gi.drow[b] == d;
+    }
+    const int has = __syncthreads_or(mine);
+    for (int q = threadIdx.x; q < gi.ntiles; q += blockDim.x) gi.dflag[(long)d * gi.ntiles + q] = has ? 0 : 2;
+    if (has) return;
+    const float4 z = make_float4(0.f, 0.f, 0.f, 0.f);
+    float4* pa = reinterpret_cast<float4*>(gi.DA + (long)d * gi.sDA);
+    float4* pb = reinterpret_cast<float4*>(gi.DB + (long)d * gi.sDB);
+    float4* pg = reinterpret_cast<float4*>(gi.DG + (long)d * gi.sDG);
+    for (long q = threadIdx.x; q < gi.nA4; q += blockDim.x) pa[q] = z;
+    for (long q = threadIdx.x; q < gi.nB4; q += blockDim.x) pb[q] = z;
+    for (long q = threadIdx.x; q < gi.nG4; q += blockDim.x) pg[q] = z;
+}
+
 __global__ void tk_flows_kernel(const float* nf, long fld, float* ao, float* bo,
                                 float* fl, float* fmx, const long* rows,
-                                float* acnt, int B, int M, int Rm) {
+                                float* acnt, int B, int M, int Rm, float* EF, int N, const GradInit gi) {
     pdl_entry();
     __shared__ float wm[32];
     const int y = blockIdx.x, tid = threadIdx.x;
+    if (blockIdx.y == 2) {                                                   // (the destinations' init: a row a CTA)
+        if (y < gi.Bd) grad_init_row(gi, y);
+        return;
+    }
     if (blockIdx.y == 1) {
         if (y >= Rm) return;
         const long b = rows[y];
@@ -2151,6 +2248,8 @@ __global__ void tk_flows_kernel(const float* nf, long fld, float* ao, float* bo,
         return;
     }
     if (y >= B) return;
+    if (EF != nullptr)                                                       // (the element flows, added into after)
+        for (int j = tid; j < N; j += blockDim.x) EF[(long)y * N + j] = 0.f;
     float mx = 0.f;
     for (int i = tid; i < M; i += blockDim.x) {
         const long q = (long)y * M + i;
@@ -2500,7 +2599,8 @@ std::vector<torch::Tensor> top_k_forward(torch::Tensor A, torch::Tensor BP, torc
 // buffer [Rm, M, SA] (empty: none) -- the flow into the slot after the posterior's. Returns (fl [B, M] the samples'
 // node flows, fmx [B] their largest).
 std::vector<torch::Tensor> top_k_flows(torch::Tensor nf, torch::Tensor ao, torch::Tensor bo, torch::Tensor rows,
-                                       torch::Tensor acnt) {
+                                       torch::Tensor acnt, torch::Tensor EF, torch::Tensor mitems, torch::Tensor drow,
+                                       torch::Tensor dflag, torch::Tensor DA, torch::Tensor DB, torch::Tensor DG) {
     const c10::cuda::CUDAGuard guard(ao.device());
     check(ao, at::kFloat, "ao"); check(bo, at::kFloat, "bo");
     const int B = ao.size(0), M = ao.size(1), Rm = acnt.numel() > 0 ? (int)rows.size(0) : 0;
@@ -2511,10 +2611,34 @@ std::vector<torch::Tensor> top_k_flows(torch::Tensor nf, torch::Tensor ao, torch
         TORCH_CHECK(acnt.size(0) == Rm && acnt.size(1) == M && acnt.size(2) == SA, "top_k: acnt [Rm, M, 72]");
     }
     auto fl = torch::empty_like(ao), fmx = torch::empty({B}, ao.options());
-    launch_pdl(tk_flows_kernel, dim3(std::max(B, Rm), Rm > 0 ? 2 : 1), dim3(256), 0, at::cuda::getCurrentCUDAStream(),
+    // (EF [B, N] zeroed beside the flows where given; `dflag` non-empty: the gradient destinations' init, a slice of
+    // its own -- `grad_init_row`, for `top_k_bw_grads`' masked passes' first writers)
+    const int N = EF.numel() > 0 ? (int)EF.size(1) : 0;
+    if (EF.numel() > 0) {
+        check(EF, at::kFloat, "EF");
+        TORCH_CHECK(EF.dim() == 2 && EF.size(0) == B, "top_k: EF [B, N]");
+    }
+    GradInit gi{};
+    if (dflag.numel() > 0) {
+        check(dflag, at::kInt, "dflag"); check(drow, at::kInt, "drow");
+        check_rows(DA, at::kFloat, "dA"); check_rows(DB, at::kFloat, "dB"); check_rows(DG, at::kFloat, "dG");
+        const long Bd = DA.size(0), Mg = DA.size(1), r = DA.size(2), Ng = DB.size(2), S = DG.size(1);
+        TORCH_CHECK(DB.size(0) == Bd && DG.size(0) == Bd && Mg % GMN == 0 && Ng % CN == 0 &&
+                    dflag.numel() == Bd * (Mg / GMN + Ng / CN) && drow.size(0) == B && mitems.dim() == 2 &&
+                    mitems.size(1) == 4 && Mg * r % 4 == 0 && r * Ng % 4 == 0 && S * Ng % 4 == 0,
+                    "top_k: the destinations' init: dflag [Bd, M / 128 + N / 128] int32, drow [B], the masked items");
+        gi.mitems = reinterpret_cast<const int4*>(mitems.data_ptr<int>()); gi.nm = (int)mitems.size(0);
+        gi.drow = drow.data_ptr<int>(); gi.dflag = dflag.data_ptr<int>(); gi.ntiles = (int)(Mg / GMN + Ng / CN);
+        gi.Bd = (int)Bd;
+        gi.DA = DA.data_ptr<float>(); gi.sDA = DA.stride(0); gi.nA4 = Mg * r / 4;
+        gi.DB = DB.data_ptr<float>(); gi.sDB = DB.stride(0); gi.nB4 = r * Ng / 4;
+        gi.DG = DG.data_ptr<float>(); gi.sDG = DG.stride(0); gi.nG4 = S * Ng / 4;
+    }
+    const int ny = gi.Bd > 0 ? 3 : (Rm > 0 ? 2 : 1);
+    launch_pdl(tk_flows_kernel, dim3(std::max({B, Rm, gi.Bd}), ny), dim3(256), 0, at::cuda::getCurrentCUDAStream(),
         nf.data_ptr<float>(), nf.stride(0), ao.data_ptr<float>(), bo.data_ptr<float>(), fl.data_ptr<float>(),
         fmx.data_ptr<float>(), Rm > 0 ? rows.data_ptr<long>() : nullptr, Rm > 0 ? acnt.data_ptr<float>() : nullptr,
-        B, M, Rm);
+        B, M, Rm, EF.numel() > 0 ? EF.data_ptr<float>() : nullptr, N, gi);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return {fl, fmx};
 }
@@ -2554,14 +2678,17 @@ std::vector<torch::Tensor> top_k_bw_prep(torch::Tensor A, torch::Tensor theta, i
 // (the flows in them: `top_k_flows`; the masked samples' alpha, beta the stash's fp16 rows [Rm, M, SH] with 1 / d
 // `invd` [Rm, M]): the element flows into EF [B, N]; with gradients (DA non-empty) dA, dB, dG, each
 // sample's times its sign `sgn` [B], into the rows `drow` [B] of DA [Bd, M, r], DB [Bd, r, N], DG [Bd, S, N] (fp32,
-// rows contiguous, batch strides a multiple of 4 floats) -- every destination ADDED into. A [Bx, M, r] the caller's. With
-// gradients, a group's masked items' Gl (fp16, ~2 MB an item at N = M = 1024) is made for dA's GEMM, then freed.
+// rows contiguous, batch strides a multiple of 4 floats) -- every destination ADDED into, or with `dflag` (int32
+// [Bd, M / 128 + N / 128] as `top_k_flows` set it; empty: none) initialized: the masked passes' first writer of a
+// destination tile stores it, the rows no masked item writes zeroed first (`tile_claim`, `grad_init_row`) --
+// destinations handed over unzeroed then need no zeroing pass. A [Bx, M, r] the caller's. With gradients, a group's masked items' Gl (fp16,
+// ~2 MB an item at N = M = 1024) is made for dA's GEMM, then freed.
 void top_k_bw_grads(torch::Tensor A, torch::Tensor AH, torch::Tensor BP, torch::Tensor E, torch::Tensor ev,
                     torch::Tensor LTh, torch::Tensor LTc, torch::Tensor mitems, torch::Tensor oitems,
                     torch::Tensor noitems, torch::Tensor slot32, torch::Tensor alpha16, torch::Tensor beta16,
                     torch::Tensor invd, torch::Tensor ao, torch::Tensor bo, torch::Tensor hrow, torch::Tensor fl,
                     torch::Tensor fmx, torch::Tensor drow, torch::Tensor sgn, torch::Tensor EF, torch::Tensor DA,
-                    torch::Tensor DB, torch::Tensor DG) {
+                    torch::Tensor DB, torch::Tensor DG, torch::Tensor dflag) {
     const c10::cuda::CUDAGuard guard(A.device());
     check_rows(A, at::kFloat, "A"); check(EF, at::kFloat, "EF");
     const int M = A.size(1), r = A.size(2), KP = BP.size(1), N = BP.size(2), S = E.size(1), Rm = mitems.size(0);
@@ -2610,6 +2737,18 @@ void top_k_bw_grads(torch::Tensor A, torch::Tensor AH, torch::Tensor BP, torch::
         args.DG = DG.data_ptr<float>(); args.sDG = DG.stride(0);
     }
     args.r = r; args.M = M; args.N = N; args.S = S; args.Rm = Rm;
+    // (destinations handed over uninitialized -- `dflag` [Bd, M / GMN + N / CN] int32, initialized by `top_k_flows`, else
+    // empty: every writer adds --: the masked passes' first writer of a tile stores it, rows no masked item writes
+    // zeroed first)
+    if (grads && dflag.numel() > 0) {
+        const long Bd = DA.size(0);
+        args.dfa = M / GMN; args.dft = M / GMN + N / CN;
+        check(dflag, at::kInt, "dflag");
+        TORCH_CHECK(dflag.numel() == Bd * args.dft && DB.size(0) == Bd && DG.size(0) == Bd &&
+                    (long)M * r % 4 == 0 && (long)r * N % 4 == 0 && (long)S * N % 4 == 0,
+                    "top_k: dflag [destination rows, M / 128 + N / 128] int32; rows of a multiple of 4 floats");
+        args.dflag = dflag.data_ptr<int>();                              // (set by `top_k_flows`, the launch before)
+    }
     // a launch a pass and a kind, each a CTA an SM (at most a CTA a unit: the observed slots' count an upper bound)
     const int sms = at::cuda::getCurrentDeviceProperties()->multiProcessorCount, dev = A.get_device();
     auto stream = at::cuda::getCurrentCUDAStream();

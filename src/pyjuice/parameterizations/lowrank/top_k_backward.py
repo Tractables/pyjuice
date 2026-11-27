@@ -198,21 +198,36 @@ def terms(A, Bm, G, tab, element_mars, geo, slot, rows, logw_rows, nf, emap, gra
     Rm = rows.numel()
     own = counts is not None and Rm > 0 and acnt.data_ptr() == counts.data_ptr()
     none32 = tkf._empty(dev, torch.float32)
-    fl, fmx = mod.top_k_flows(nf, ao, bo, rows.long().contiguous(), acnt if own else none32)
-    EF = torch.zeros(B, N, dtype = torch.float32, device = dev)
+    # (the gradients' destinations: handed over unzeroed with this node vector their first writer, the kernels initialize
+    # them -- the masked passes' first writer of a tile stores it, the rows no masked sample writes are zeroed
+    # (`top_k_flows`' init, `top_k_bw_grads`' `dflag`) -- instead of a zeroing pass (MEASURED, the best Codpula head:
+    # 0.87 ms of fills a step); else zeroed here, or added into)
+    stores, dflag, nonei = False, None, tkf._empty(dev, torch.int32)
     if grads is not None:
-        gviews.init_grads(grads) if fresh else None
         drow, sgn = _fold_operands(gviews, fold, B, dev)
         dests = [g if _dest_ok(g) else torch.zeros(g.shape, dtype = torch.float32, device = dev) for g in grads]
+        first = fresh and gviews.claim(grads)
+        stores = first and all(d is g for g, d in zip(grads, dests))
+        if first and not stores:
+            torch._foreach_zero_(list(grads))
+        if stores:
+            Bd, M_, N_ = grads[0].size(0), grads[0].size(1), grads[1].size(2)
+            dflag = torch.empty(Bd * (M_ // 128 + N_ // 128), dtype = torch.int32, device = dev)
+    # (the node flows into the stash; EF zeroed by the same launch, the destinations' init too where the kernels store)
+    EF = torch.empty(B, N, dtype = torch.float32, device = dev)
+    fl, fmx = mod.top_k_flows(nf, ao, bo, rows.long().contiguous(), acnt if own else none32, EF,
+                              mitems if stores else nonei, drow if stores else nonei, dflag if stores else nonei,
+                              *(dests if stores else (none32, none32, none32)))
+    if grads is not None:
         mod.top_k_bw_grads(A_, AH, BP, E, ev, LTh, LTc, mitems, oitems, noitems, slot32, alpha16, beta16, invd, ao,
-                           bo, hrow, fl, fmx, drow, sgn, EF, *dests)
+                           bo, hrow, fl, fmx, drow, sgn, EF, *dests, dflag if stores else nonei)
         for g, d in zip(grads, dests):
             if d is not g:
                 g.add_(d.to(g.dtype))
     else:
         none = torch.empty(0, dtype = torch.float32, device = dev)
         mod.top_k_bw_grads(A_, AH, BP, E, ev, LTh, LTc, mitems, oitems, noitems, slot32, alpha16, beta16, invd, ao,
-                           bo, hrow, fl, fmx, none, none, EF, none, none, none)
+                           bo, hrow, fl, fmx, none, none, EF, none, none, none, nonei)
     flows = None
     if want_flows:
         KP = BP.size(1)

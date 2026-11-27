@@ -509,8 +509,9 @@ def test_the_tilt_kernels_are_the_products(re, S, layout, T):
 def test_the_kernels_initialize_the_gradient_destinations():
     """Destinations handed over unzeroed (`StagedExternalParams.fresh`: every node's backward initializes what it
     writes) keep whatever they held -- NaN here -- until written: the kernels' backward (the leaves' tilt products
-    storing theirs whole, the sums' zeroing theirs before they add) gives the gradients of zeroed destinations and of
-    the circuit's own buffer (zeroed, added into)."""
+    storing theirs whole, the sums' masked passes' first writer of each tile storing it, the rows no masked sample writes
+    zeroed: `top_k_bw_grads`'s `dflag`) gives the gradients of zeroed destinations and of the circuit's own buffer
+    (zeroed, added into)."""
     import pyjuice.parameterizations.lowrank.top_k_leaf_fused as tlf
     pc, (ext, ids, lp, x, miss), (T, N, b) = _mask_case(True)
     if tlf.tilt_module() is None:
