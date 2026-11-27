@@ -1095,7 +1095,10 @@ __global__ void __launch_bounds__(256) tk_dtau_rows_kernel(const int* drow, cons
 // flows (F- at spf[k][i] + V + v, F+ V before it), a node's EB categories at once (a block two runs share: both parts
 // added). MEASURED (48 blocks): a CTA every 1024 nodes and a lane's 4 categories one red.v4 a node (a node's flows
 // 1 MB apart) made those adds 2/3 of the pass; blocks of 16 (3 CTAs an SM) beat 32 (2) and 8. F- staged from the
-// entries' records (`tk_leaf_em_rec_kernel`) and a block's rows loaded a block ahead: 2.00 -> 1.74 ms (DISTINCT=1 rows).
+// entries' records (`tk_leaf_em_rec_kernel`) and a block's rows loaded a block ahead: 2.00 -> 1.74 ms (DISTINCT=1 rows);
+// the head's tilts added after every row's load, their rows prefetched into L2 at a block's start: 1.83 -> 1.56 ms
+// (ABLATIONS, 1.83 ms: no tilt loads 1.34, no flush 1.59, no emr loads 1.54, no terms at all 0.32, no shared atomics
+// 1.80, a category's theta row read once 1.80, the carveout all shared memory 1.83).
 // REFUTED (same shapes): a warp a run with its sums in registers and a red.v4 a node at each block of 4 categories
 // (2.13-3.04 ms: 16-B reds into rows 1 MB apart), and a CTA a whole block of categories (2.87: frequent blocks' tails)
 constexpr int EC = 512;             // entries a run
@@ -1197,6 +1200,11 @@ __global__ void __launch_bounds__(NW * 32) tk_leaf_em_kernel(const EmArgs a, con
         if (xe < ne) load_rows(s_k[xe] / EB * EB);                     // (the next block's, in flight meanwhile)
         // a warp's share of the block's entries, 8 rows in flight: a category's terms summed until it changes
         const int per = (xe - x + NW - 1) / NW, ya = x + warp * per, yb = min(ya + per, xe);
+        if (!PLUS)                                                     // (the share's head's tilt rows into L2 first: 8
+            for (int y = ya + (lane >> 2); y < yb; y += 8) {           // entries a pass, a lane each of their 4 lines)
+                const long to = s_t[y];
+                if (to >= 0) asm volatile("prefetch.global.L2 [%0];" :: "l"(a.tau + to + n0 + 32 * (lane & 3)));
+            }
         float acc[4] = {0.f, 0.f, 0.f, 0.f};
         int cur = -1;
         for (int y = ya; y < yb; y += 8) {
@@ -1207,6 +1215,11 @@ __global__ void __launch_bounds__(NW * 32) tk_leaf_em_kernel(const EmArgs a, con
                 if (y + z >= yb) continue;
                 const long to = s_t[y + z];
                 w[z] = ld4(a.emr + (PLUS ? (long)s_g[y + z] * 4 + 2 + (to < 0 ? 1 : 0) : (long)s_g[y + z]) * a.M + i0);
+            }
+#pragma unroll
+            for (int z = 0; z < 8; ++z) {                              // the head's tilts: after every row's load (a
+                if (y + z >= yb) continue;                             // tilt's add waiting on its load held back the
+                const long to = s_t[y + z];                            // rows after it)
                 if (to >= 0) w[z] = add4(w[z], ld4(a.tau + to + i0));
             }
 #pragma unroll
