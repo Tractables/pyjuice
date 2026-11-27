@@ -1940,6 +1940,24 @@ __device__ __forceinline__ void em_segment(const EmArgs& a, int tile, int l0, in
         for (int nt = 0; nt < 8; ++nt)
             #pragma unroll
             for (int q = 0; q < 4; ++q) Fp[ch][nt][q] = Fm[ch][nt][q] = 0.f;
+    // a sample's own operands -- its A' fragments (AH's half pairs), W's shift, ao, bo -- the next sample's loaded right
+    // after the current one's last use: the stage wait and the barrier then hide their latency (the index chain's too)
+    unsigned af[NK][4];
+    float h0, h1, a0, a1, c0, c1;
+    auto own = [&](int bb) {
+        const int e = a.emap != nullptr ? a.emap[bb] : bb;
+        const unsigned* p0 = reinterpret_cast<const unsigned*>(a.AH + ((long)e * M + node0) * KP);
+        const unsigned* p1 = p0 + 8 * KP / 2;
+        #pragma unroll
+        for (int ks = 0; ks < NK; ++ks) {
+            af[ks][0] = p0[ks * 8 + t]; af[ks][1] = p1[ks * 8 + t];
+            af[ks][2] = p0[ks * 8 + 4 + t]; af[ks][3] = p1[ks * 8 + 4 + t];
+        }
+        h0 = a.hrow[(long)bb * M + node0]; h1 = a.hrow[(long)bb * M + node1];
+        a0 = a.ao[(long)bb * M + node0]; a1 = a.ao[(long)bb * M + node1];
+        c0 = a.bo[(long)bb * M + node0]; c1 = a.bo[(long)bb * M + node1];
+    };
+    own(b);
     for (int st = 0; l < l1; st ^= 1) {
         const int ln = next_obs(l + 1), bn = ln < l1 ? smp(ln) : -1;
         cp_wait<0>();
@@ -1948,18 +1966,6 @@ __device__ __forceinline__ void em_segment(const EmArgs& a, int tile, int l0, in
             for (int q = tid; q < NSEG; q += NW * 32) load_seg(q, st ^ 1, bn);
             cp_commit();
         }
-        const int e = a.emap != nullptr ? a.emap[b] : b;
-        unsigned af[NK][4];                                                  // A' fragments: AH's half pairs
-        const unsigned* p0 = reinterpret_cast<const unsigned*>(a.AH + ((long)e * M + node0) * KP);
-        const unsigned* p1 = p0 + 8 * KP / 2;
-        #pragma unroll
-        for (int ks = 0; ks < NK; ++ks) {
-            af[ks][0] = p0[ks * 8 + t]; af[ks][1] = p1[ks * 8 + t];
-            af[ks][2] = p0[ks * 8 + 4 + t]; af[ks][3] = p1[ks * 8 + 4 + t];
-        }
-        const float h0 = a.hrow[(long)b * M + node0], h1 = a.hrow[(long)b * M + node1];
-        const float a0 = a.ao[(long)b * M + node0], a1 = a.ao[(long)b * M + node1];
-        const float c0 = a.bo[(long)b * M + node0], c1 = a.bo[(long)b * M + node1];
         #pragma unroll
         for (int ch = 0; ch < ECH; ++ch) {
             const unsigned char* sp = smem + st * G::STAGE + ch * G::CHUNK;
@@ -1977,6 +1983,7 @@ __device__ __forceinline__ void em_segment(const EmArgs& a, int tile, int l0, in
                 Fm[ch][nt][0] += w0 * c0; Fm[ch][nt][1] += w1 * c0; Fm[ch][nt][2] += w2 * c1; Fm[ch][nt][3] += w3 * c1;
             }
         }
+        if (ln < l1) own(bn);
         l = ln;
         b = bn;
     }
