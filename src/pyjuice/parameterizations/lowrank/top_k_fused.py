@@ -177,6 +177,7 @@ def sum_forward(desc, layer, ns_info, tensors, geo, params, element_mars, node_m
         top_k_backward.serves(desc, geo["M"], geo["N"], A.size(2), B, node_mars.device, kwargs, False)
     counts = top_k_leaf_fused.counts_buffer(sib, desc.top_k, B) if keep and rows_m.numel() > 0 else None
     stash = forward(A, ops, node_mars, ns_info.nid_start, keep, counts)
+    ops.e16 = None                                                         # (the masked forward's alone: not kept)
     if keep:
         layer.__dict__["_lr_state"][("kept", id(ns_info.ns))] = (B, ops, stash)
     return True
