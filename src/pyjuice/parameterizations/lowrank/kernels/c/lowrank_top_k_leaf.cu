@@ -401,19 +401,23 @@ struct DtauOut {
 };
 
 // The backward of a CTA's samples: one (NS = 1), or (the evidence a row each) up to NS of a row, walking its candidates
-// once -- the bulk's terms and the EM statistics summed over the samples before they are added, the head's a sample each
+// once -- the bulk's terms and the EM statistics summed over the samples before they are added, the head's a sample each.
+// The CTAs a sample's (a group's) positions side by side, blockIdx.x the position: the positions of a row share many of
+// their candidates (their table rows then read from the cache) -- MEASURED (48 blocks, the rows' evidence made distinct:
+// the dump's repeats' tokens permuted) 2.77 -> 2.29 ms against the samples side by side; with the dump's repeated rows
+// (they share every candidate at a position) 2.32 -> 2.30
 template <int NS>
 __global__ void __launch_bounds__(NW * 32) tk_leaf_backward_kernel(const BwArgs a) {
     static_assert(NS <= 2, "the EM statistics' tiles: up to two count rows");
     __shared__ int s_ids[CH];
     __shared__ float s_lp[CH];
     const Tile& g = a.g;
-    const int t = blockIdx.y, lane = threadIdx.x & 31;
+    const int t = blockIdx.x, qx = blockIdx.y, lane = threadIdx.x & 31;
     int bs[NS], ns = 1;
     if constexpr (NS == 1) {
-        bs[0] = blockIdx.x;
+        bs[0] = qx;
     } else {                                                           // (`ord` the samples by row, `rank` within it)
-        const int q = blockIdx.x;
+        const int q = qx;
         if (a.rank[q] % NS != 0) return;                               // (the group's first place's CTA)
         bs[0] = a.ord[q];
         const int er = g.erow[bs[0]];
@@ -472,7 +476,7 @@ __global__ void __launch_bounds__(NW * 32) tk_leaf_backward_kernel(const BwArgs 
     // EM: the tile's entries and its rows (`tk_leaf_em` reads them), where a sample's statistics are taken -- its
     // samples' cp from candidate 0 (a missing token no one reads) or K (a sum reads it: the slots' counts below K, by
     // their rows of the counts), none (C) where every token is observed
-    const long gi = (long)t * g.B + blockIdx.x;
+    const long gi = (long)t * g.B + qx;
     bool emc = false, cpc = false;
     int cpf = g.C, hr[2] = {-1, -1};
 #pragma unroll
@@ -1042,7 +1046,7 @@ torch::Tensor top_k_leaf_backward(torch::Tensor tab, torch::Tensor nv_tab, torch
                                                                owned.data_ptr<bool>(), a.dtau);
         C10_CUDA_KERNEL_LAUNCH_CHECK();
     }
-    dim3 grid((unsigned)B, (unsigned)T, (unsigned)((M + NW * 128 - 1) / (NW * 128)));
+    dim3 grid((unsigned)T, (unsigned)B, (unsigned)((M + NW * 128 - 1) / (NW * 128)));   // (a sample's positions side by side)
     if (a.ord != nullptr) tk_leaf_backward_kernel<2><<<grid, NW * 32, 0, stream>>>(a);
     else tk_leaf_backward_kernel<1><<<grid, NW * 32, 0, stream>>>(a);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
