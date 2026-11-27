@@ -3,7 +3,7 @@
 (`TOP_K_FUSED`, the module built, the shapes they hold, the default precision); else the float64 reference
 (`top_k.py`), which stays what both are checked against. A node vector takes two launches: the prep (`top_k_prep`:
 every operand from the caller's tensors, the circuit's element values and the shared parameters -- fp16 factors,
-TF32 token rows (their slots also in fp16, scaled: the masked rows' MMAs), the children's values over their largest,
+the token rows in fp16, scaled (E16: TF32's 10 bits, every reader's), the children's values over their largest,
 log2 theta in the MMAs' fragment order, the masked rows' slot weights) and the values (`top_k_forward`: the masked
 rows' kernel, the observed rows' beside it on a side stream). Measured precision (the best Codpula head vs float64):
 ~3e-5 nats a masked token's read-out.
@@ -77,13 +77,6 @@ def theta_tables(desc, sib, ns, geo, params, batch_size: int) -> dict:
     return tab
 
 
-class Operands(list):
-    """`prep`'s operands: the list the forward and the backward both read -- (BP, E, ev, cmax, LTh, mitems, oitems,
-    noitems, slot32, logw, flags) -- and the masked forward's own beside it, `e16` (E's slots 0 .. 63 in fp16, times
-    2^15: its MMAs' operand)."""
-    e16 = None
-
-
 def prep(Bm, G, element_mars, eid, has, theta, slot, rows_m, logw_m, emap = None, pair: bool = True, lth = None,
          items = None):
     """`top_k_prep`'s operands: `B [Bx, r, N]`, `G [Bx, K + 1, N]` a row of tensors each; the children's values
@@ -92,7 +85,8 @@ def prep(Bm, G, element_mars, eid, has, theta, slot, rows_m, logw_m, emap = None
     tensors it reads (None: its own, Bx = B); `rows_m` the samples whose token is missing and their slots' log-weights
     `logw_m [b, M, K + 1]` (None where none); `pair`: the samples reading a row share its work items (else a sample an
     item); `lth` theta's l2t as an earlier call made it (`theta_tables`' "LTh": not made again), or None; `items` its
-    work items as `work_items` made them, or None (made by the prep)."""
+    work items as `work_items` made them, or None (made by the prep). The operands the forward and the backward both
+    read: (BP, E16, ev, cmax, LTh, mitems, oitems, noitems, slot32, logw, flags)."""
     dev = Bm.device
     f = lambda t: t.float().contiguous()
     got = top_k_module().top_k_prep(
@@ -100,9 +94,7 @@ def prep(Bm, G, element_mars, eid, has, theta, slot, rows_m, logw_m, emap = None
         slot.long().contiguous(), _empty(dev, torch.long) if emap is None else emap.long().contiguous(),
         rows_m.long().contiguous(), _empty(dev, torch.float32) if logw_m is None else _weights_operand(logw_m), pair,
         _empty(dev, torch.int32) if lth is None else lth, [] if items is None else items)
-    ops = Operands(got[:11])
-    ops.e16 = got[11]
-    return ops
+    return got
 
 
 def work_items(sib: dict, batch_size: int, emap):
@@ -149,7 +141,7 @@ def forward(A, ops, node_mars, nid0: int, stash: bool = False, counts = None):
     not in it: `top_k_backward.terms` puts them in) -- the masked samples' posterior of the slots into `counts` where
     given (their leaf's buffer: `top_k_leaf_fused.counts_buffer`)."""
     none = _empty(A.device, torch.float32)
-    got = top_k_module().top_k_forward(_rows(A), *ops, ops.e16, none if node_mars is None else node_mars, nid0, stash,
+    got = top_k_module().top_k_forward(_rows(A), *ops, none if node_mars is None else node_mars, nid0, stash,
                                        none if counts is None else counts)
     return got if stash else None
 
@@ -177,7 +169,6 @@ def sum_forward(desc, layer, ns_info, tensors, geo, params, element_mars, node_m
         top_k_backward.serves(desc, geo["M"], geo["N"], A.size(2), B, node_mars.device, kwargs, False)
     counts = top_k_leaf_fused.counts_buffer(sib, desc.top_k, B) if keep and rows_m.numel() > 0 else None
     stash = forward(A, ops, node_mars, ns_info.nid_start, keep, counts)
-    ops.e16 = None                                                         # (the masked forward's alone: not kept)
     if keep:
         layer.__dict__["_lr_state"][("kept", id(ns_info.ns))] = (B, ops, stash)
     return True

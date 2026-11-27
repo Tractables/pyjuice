@@ -28,8 +28,10 @@ MAX_SAMPLES = 4096                                               # (the work ite
 
 if triton is not None:
 
+    E16_UNIT = tl.constexpr(2.0 ** -15)                          # E16's unit: the prep's E16 is E times 2^15
+
     @triton.jit
-    def _bw_em_kernel(AH, BH, L2T, E, EV, ALPHA, BETA, ALPHA_T, BETA_T, INVD, HROW, FLOW, MROWS, NM, LWIDX, EMAP, FP, FM,
+    def _bw_em_kernel(AH, BH, L2T, E16, EV, ALPHA, BETA, ALPHA_T, BETA_T, INVD, HROW, FLOW, MROWS, NM, LWIDX, EMAP, FP, FM,
                       M, N, KP: tl.constexpr, K0: tl.constexpr, K1: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr,
                       SH: tl.constexpr, ADD: tl.constexpr):
         """a CTA a 64 x 64 tile of the parameters: over the masked samples MROWS[:NM] (NM on the device), F+ = sum_b
@@ -37,9 +39,10 @@ if triton is not None:
         `top_k_bw_em_observed` (CUDA). W from the CUDA passes' operands -- AH = fp16(log2 e A) [Bx, M, KP], BH [Bx, KP,
         N] fp16, l2t [M, N] fp16 -- and the stash's shift HROW [B, M]; a masked sample's alpha, beta [Rm, M, SH] fp16
         rows at its place LWIDX (its node flows not in them: FLOW [B, M], `top_k_flows`', times W): the slots times a
-        node's power of 2 d by fp16 dots against E -- the same 10-bit operands as TF32's, fp32 sums --, the rest slot
-        times d from the rows' tail (ALPHA_T, BETA_T: their float32 view), 1 / d (INVD [Rm, M]) into W. ADD: added
-        into FP, FM (a pass's accumulator: `em_accumulator`) -- nothing at all where no masked sample is taken."""
+        node's power of 2 d by fp16 dots against E16 [Bx, 65, N] (E times 2^15, the prep's: the same 10-bit operands
+        as TF32's, fp32 sums; its 2^15 out of the sums at the end), the rest slot times d from the rows' tail (ALPHA_T,
+        BETA_T: their float32 view), 1 / d (INVD [Rm, M]) into W. ADD: added into FP, FM (a pass's accumulator:
+        `em_accumulator`) -- nothing at all where no masked sample is taken."""
         if ADD:
             if tl.load(NM) == 0:
                 return
@@ -64,14 +67,16 @@ if triton is not None:
                 (tl.load(FLOW + b64 * M + rows) * tl.load(INVD + lrow))[:, None]
             ev = tl.load(EV + b64 * N + cols)
             base = lrow * SH
-            Es = tl.load(E + (eb * 65 + s[:, None]) * N + cols[None, :]).to(tl.float16)
-            er = tl.load(E + (eb * 65 + 64) * N + cols)
+            Es = tl.load(E16 + (eb * 65 + s[:, None]) * N + cols[None, :])
+            er = tl.load(E16 + (eb * 65 + 64) * N + cols).to(tl.float32)
             X = tl.dot(tl.load(ALPHA + base[:, None] + s[None, :]), Es) + \
                 tl.load(ALPHA_T + lrow * (SH // 2) + 32)[:, None] * er[None, :]
             Y = tl.dot(tl.load(BETA + base[:, None] + s[None, :]), Es) + \
                 tl.load(BETA_T + lrow * (SH // 2) + 32)[:, None] * er[None, :]
             Fp += W * X * ev[None, :]
             Fm += W * Y
+        Fp = Fp * E16_UNIT
+        Fm = Fm * E16_UNIT
         out = rows[:, None] * N + cols[None, :]
         if ADD:
             Fp += tl.load(FP + out)
@@ -189,7 +194,7 @@ def terms(A, Bm, G, tab, element_mars, geo, slot, rows, logw_rows, nf, emap, gra
         ops = tkf.prep(Bm, G, element_mars, geo["eid"], None if geo["full"] else geo["has"], tab["theta"], slot, rows,
                        logw_rows, emap, pair = pair, lth = tab.get("LTh"))
         tab.setdefault("LTh", ops[4])
-    BP, E, ev, cmax, LTh, mitems, oitems, noitems, slot32, logw, flags = ops
+    BP, E16, ev, cmax, LTh, mitems, oitems, noitems, slot32, logw, flags = ops
     none_h = tkf._empty(dev, torch.float16)
     AH, L2T, LTc = mod.top_k_bw_prep(A_, tab["theta"], BP.size(1), tab.get("L2T", none_h),
                                      tab.get("LTc", tkf._empty(dev, torch.int32)))
@@ -224,14 +229,14 @@ def terms(A, Bm, G, tab, element_mars, geo, slot, rows, logw_rows, nf, emap, gra
                               mitems if stores else nonei, drow if stores else nonei, dflag if stores else nonei,
                               *(dests if stores else (none32, none32, none32)))
     if grads is not None:
-        mod.top_k_bw_grads(A_, AH, BP, E, ev, LTh, LTc, mitems, oitems, noitems, slot32, alpha16, beta16, invd, ao,
+        mod.top_k_bw_grads(A_, AH, BP, E16, ev, LTh, LTc, mitems, oitems, noitems, slot32, alpha16, beta16, invd, ao,
                            bo, hrow, fl, fmx, drow, sgn, EF, *dests, dflag if stores else nonei)
         for g, d in zip(grads, dests):
             if d is not g:
                 g.add_(d.to(g.dtype))
     else:
         none = torch.empty(0, dtype = torch.float32, device = dev)
-        mod.top_k_bw_grads(A_, AH, BP, E, ev, LTh, LTc, mitems, oitems, noitems, slot32, alpha16, beta16, invd, ao,
+        mod.top_k_bw_grads(A_, AH, BP, E16, ev, LTh, LTc, mitems, oitems, noitems, slot32, alpha16, beta16, invd, ao,
                            bo, hrow, fl, fmx, none, none, EF, none, none, none, nonei)
     flows = None
     if want_flows:
@@ -253,7 +258,7 @@ def terms(A, Bm, G, tab, element_mars, geo, slot, rows, logw_rows, nf, emap, gra
             if not add:
                 FP = torch.empty(M, N, dtype = torch.float32, device = dev)
                 FM = torch.empty_like(FP)
-            _bw_em_kernel[(M // BM, N // BN)](AH, BP, L2T, E, ev, alpha16, beta16, alpha16.view(torch.float32),
+            _bw_em_kernel[(M // BM, N // BN)](AH, BP, L2T, E16, ev, alpha16, beta16, alpha16.view(torch.float32),
                                               beta16.view(torch.float32), invd, hrow, fl, MROWS, NM, LWIDX, EMAP, FP,
                                               FM, M, N, KP = KP, K0 = K0, K1 = KP - K0, BM = BM, BN = BN, SH = SH,
                                               ADD = add, num_warps = 4, num_stages = 1)
@@ -261,7 +266,7 @@ def terms(A, Bm, G, tab, element_mars, geo, slot, rows, logw_rows, nf, emap, gra
             FP = torch.zeros(M, N, dtype = torch.float32, device = dev)
             FM = torch.zeros_like(FP)
         if B > Rm:
-            mod.top_k_bw_em_observed(AH, BP, E, ev, LTh, ao, bo, hrow, SLOT,
+            mod.top_k_bw_em_observed(AH, BP, E16, ev, LTh, ao, bo, hrow, SLOT,
                                      tkf._empty(dev, torch.int32) if emap is None else EMAP, OLIST, FP, FM)
         flows = (FP, FM)
     # (the counts: in the leaf's rows as it holds them -- the slots' posterior, the flow beside it --, else their product)
