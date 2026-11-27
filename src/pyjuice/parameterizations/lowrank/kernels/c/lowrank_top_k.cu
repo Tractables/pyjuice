@@ -3019,7 +3019,7 @@ __global__ void tk_scatter_em_kernel(const float* FP, const float* FM,
     for (int u = ty; u < 32; u += 8) {
         const int i = i0 + u, j = j0 + tx;
         const bool in = i < M && j < N;
-        tp[u][tx] = in ? FP[(long)i * N + j] : 0.f;
+        if (pf != nullptr) tp[u][tx] = in ? FP[(long)i * N + j] : 0.f;
         if (den != nullptr) tm[u][tx] = in ? FM[(long)i * N + j] : 0.f;
     }
     __syncthreads();
@@ -3027,7 +3027,7 @@ __global__ void tk_scatter_em_kernel(const float* FP, const float* FM,
         const int i = i0 + tx, j = j0 + u;                                    // (i fastest: the slots' order)
         if (i >= M || j >= N) continue;
         const long o = ((long)(i / bs) * Nb + j / cbs) * cbs * bs + (long)(j % cbs) * bs + i % bs;
-        pf[pf0 + o] += tp[tx][u];
+        if (pf != nullptr) pf[pf0 + o] += tp[tx][u];
         if (den != nullptr) {
             const float th = params[p0 + o];
             den[den0 + o] += th > 0.f ? tm[tx][u] / th : 0.f;
@@ -3035,19 +3035,24 @@ __global__ void tk_scatter_em_kernel(const float* FP, const float* FM,
     }
 }
 
+// F+ [M, N] added into the parameter flows `pf` from pf0 on (`pf` empty: none) and F- [M, N] as F- / theta into the
+// denominators `den` from den0 on (`den` empty: none), in the parameters' block-major order
 void top_k_scatter_em(torch::Tensor FP, torch::Tensor FM, torch::Tensor params, torch::Tensor pf, torch::Tensor den,
                       int64_t p0, int64_t pf0, int64_t den0, int64_t Nb, int64_t cbs, int64_t bs) {
-    const c10::cuda::CUDAGuard guard(FP.device());
-    check(FP, at::kFloat, "FP"); check(pf, at::kFloat, "param flows");
-    const int M = FP.size(0), N = FP.size(1);
-    const bool wd = den.numel() > 0;
+    const bool wp = pf.numel() > 0, wd = den.numel() > 0;
+    if (!wp && !wd) return;
+    const torch::Tensor& ref = wp ? FP : FM;
+    const c10::cuda::CUDAGuard guard(ref.device());
+    if (wp) { check(FP, at::kFloat, "FP"); check(pf, at::kFloat, "param flows"); }
     if (wd) { check(FM, at::kFloat, "FM"); check(den, at::kFloat, "denominators"); check(params, at::kFloat, "params"); }
-    TORCH_CHECK(M % bs == 0 && N % cbs == 0 && N == Nb * cbs && (!wd || FM.sizes() == FP.sizes()),
+    const int M = ref.size(0), N = ref.size(1);
+    TORCH_CHECK(M % bs == 0 && N % cbs == 0 && N == Nb * cbs && (!wp || !wd || FM.sizes() == FP.sizes()),
                 "top_k: the statistics' grid");
     dim3 grid((unsigned)((N + 31) / 32), (unsigned)((M + 31) / 32)), block(32, 8);
     launch_pdl(tk_scatter_em_kernel, grid, block, 0, at::cuda::getCurrentCUDAStream(),
-        FP.data_ptr<float>(), wd ? FM.data_ptr<float>() : nullptr, wd ? params.data_ptr<float>() : nullptr,
-        pf.data_ptr<float>(), wd ? den.data_ptr<float>() : nullptr, p0, pf0, den0, M, N, (int)Nb, (int)cbs, (int)bs);
+        wp ? FP.data_ptr<float>() : nullptr, wd ? FM.data_ptr<float>() : nullptr, wd ? params.data_ptr<float>() : nullptr,
+        wp ? pf.data_ptr<float>() : nullptr, wd ? den.data_ptr<float>() : nullptr, p0, pf0, den0, M, N, (int)Nb,
+        (int)cbs, (int)bs);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 

@@ -643,7 +643,7 @@ def test_the_backward_kernels_are_the_reference():
                         soft_evidence_cat_ids = ids)
             out += [pc.param_flows.clone(), pc.input_layer_group[0].param_flows.clone()]
             if pc.denom_param_flows is not None:
-                out.append(_denoms(pc))
+                out.append(pc.denom_param_flows.clone())
         return out
 
     try:
@@ -690,7 +690,7 @@ def test_the_backward_kernels_give_a_sample_its_own_gradients_through_the_map(ke
             pc(x, missing_mask = miss, external_params = pext, external_params_rows = rows, **evi)
         pc.backward(x, missing_mask = miss, compute_param_flows = True, flows_memory = 1.0, logspace_flows = True,
                     allow_modify_flows = False, external_params_grad = g, **evi)
-        return [t for v in g.values() for t in v] + [pc.param_flows.clone(), _denoms(pc),
+        return [t for v in g.values() for t in v] + [pc.param_flows.clone(), pc.denom_param_flows.clone(),
                                                      pc.input_layer_group[0].param_flows.clone()]
 
     try:
@@ -740,17 +740,42 @@ def _paths(kernels):
     assert ran == ({"sums", "leaves"} if kernels else set()), ran
 
 
-def _denoms(pc):
-    """The denominators as the M-step reads them: every parameterized sum's F-, its tied copies' slices summed
-    (`materialize_denom_flows`) -- not the raw buffer, whose split of a node's statistics among its copies' slices is
-    the kernels' choice (they add a flow block's copies' at once, into the first copy's)."""
-    out = [sources[0][0].parameterization.materialize_denom_flows(src, pc.params, pc.denom_param_flows, sources).double()
-           for src, sources in pc._denom_correction_nss().items()]
-    return torch.cat(out)
-
-
 def _stats(pc):
-    return [pc.param_flows.clone(), _denoms(pc), pc.input_layer_group[0].param_flows.clone()]
+    return [pc.param_flows.clone(), pc.denom_param_flows.clone(), pc.input_layer_group[0].param_flows.clone()]
+
+
+def test_a_rescaled_em_step_after_the_kernels_is_the_one_after_the_torch_passes():
+    """The mini-batch EM step Anemone takes (`mini_batch_em(step_size_rescaling = True)`), after EM backwards by the
+    kernels, moves the sums' and the leaves' parameters as after the torch passes'. Its top-down step reads each tied
+    copy's own F- row (`LowRank.collapsed_top_down`: a step's collapsed model), so a layout of the denominators that
+    keeps their sums -- what the M-step's `materialize_denom_flows` reads -- but not each copy's row (a flow block's F-
+    in one copy's slice) leaves every statistic's check and the M-step's own passing, yet moves the parameters wrong."""
+    pc, (ext, ids, lp, x, miss), (T, N, b) = _mask_case(True)
+    pext, lp = _pc_ext(ext, T, N), lp.float()
+    evi = dict(categorical_evidence_logp = lp, soft_evidence_cat_ids = ids)
+    p0, l0 = pc.params.detach().clone(), pc.input_layer_group[0].params.detach().clone()
+
+    def step(kernels):
+        with torch.no_grad():
+            pc.params.data.copy_(p0)
+            pc.input_layer_group[0].params.data.copy_(l0)
+        torch.autograd.graph.increment_version(pc.params)
+        pc.init_param_flows(flows_memory = 0.0)
+        pc._cum_flow = 0.0
+        with _paths(kernels):
+            for m_ in (None, miss):                                  # (two EM backwards accumulated, as Anemone's window)
+                with torch.no_grad():
+                    pc(x, missing_mask = m_, external_params = pext, **evi)
+                pc.backward(x, missing_mask = m_, compute_param_flows = True, flows_memory = 1.0, logspace_flows = True,
+                            allow_modify_flows = False, external_params = pext, **evi)
+        pc.mini_batch_em(step_size = 0.5, pseudocount = 0.0, step_size_rescaling = True)
+        return pc.params.detach() - p0, pc.input_layer_group[0].params.detach() - l0
+
+    ref = step(False)
+    got = step(True)
+    for name, a, r_ in zip(("sums", "leaves"), got, ref):
+        assert float(r_.abs().max()) > 0, name                        # (the step moved them)
+        assert _rel(a, r_) < 1e-3, (name, _rel(a, r_))
 
 
 @pytest.mark.parametrize("kernels", [False, True])

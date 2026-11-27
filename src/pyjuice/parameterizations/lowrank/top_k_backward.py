@@ -98,27 +98,29 @@ def scatter_element_flows(EF, cols, kids, element_flows) -> None:
 
 def scatter_statistics(geo, Fp, Fm, params, param_flows, pf0: int, denom, d0) -> bool:
     """The EM statistics onto the node vector's slots by one kernel (`LowRank._scatter_add`'s): F+ into the parameter
-    flows from `pf0` on, F- / theta into the denominators from `d0` on (`denom` None: none) -- where its parameters lie
-    block-major (`geo["grid"]`) and all is fp32; False else (the torch passes then)."""
+    flows from `pf0` on (`Fp` None: none), F- / theta into the denominators from `d0` on (`denom` None: none) -- where
+    its parameters lie block-major (`geo["grid"]`) and all is fp32; False else (the torch passes then)."""
     from . import top_k_fused as tkf
     grid = geo["grid"]
     if grid is None or params.dtype != torch.float32 or param_flows.dtype != torch.float32 or \
             (denom is not None and denom.dtype != torch.float32):
         return False
     off, _, Nb, cbs, bs = grid
-    tkf.top_k_module().top_k_scatter_em(Fp, Fm, params, param_flows,
-                                        tkf._empty(Fp.device, torch.float32) if denom is None else denom, geo["p0"],
-                                        pf0 + off, 0 if denom is None else d0 + off, Nb, cbs, bs)
+    none = tkf._empty(params.device, torch.float32)
+    tkf.top_k_module().top_k_scatter_em(none if Fp is None else Fp, none if denom is None else Fm, params,
+                                        none if Fp is None else param_flows, none if denom is None else denom,
+                                        geo["p0"], pf0 + off, 0 if denom is None else d0 + off, Nb, cbs, bs)
     return True
 
 
 def em_accumulator(geo, params, param_flows, pf0: int, denom, d0, dev):
-    """`(F+, F-)` [M, N] zeros to add a node vector's EM statistics into, shared by the node vectors whose statistics
-    go into the same flow block (tied copies: compilation gives up to `max_tied_ns_per_parflow_block` of them one
-    `_param_flow_range`) in the backward's deferred scope (`pyjuice.utils.deferred`), scattered once at its end
-    (`scatter_statistics`: F+ into the block, F- / theta into the first copy's denominators -- `materialize_denom_flows`
-    sums a node's tied copies' denominators, so the sum is where it was) -- or None (no scope, or the scatter does not
-    serve): each its own then, scattered at once."""
+    """`(F+, F-)` [M, N] zeros to add a node vector's EM statistics into in the backward's deferred scope
+    (`pyjuice.utils.deferred`), scattered at its end -- or None (no scope, or the scatter does not serve): each its own
+    then, scattered at once. F+ is SHARED by the node vectors whose statistics go into the same flow block (tied copies:
+    compilation gives up to `max_tied_ns_per_parflow_block` of them one `_param_flow_range`), scattered once into it. F-
+    is the node vector's OWN, scattered (as F- / theta) into its own denominators: a copy's F- row is its collapsed model
+    (`LowRank.collapsed_top_down`, the mini-batch EM's top-down step, reads each copy's slice) -- not interchangeable
+    with the tie group's sum, though `materialize_denom_flows` only ever reads the sum."""
     from pyjuice.utils.deferred import current_scope
     scope = current_scope()
     grid = geo["grid"]
@@ -126,14 +128,17 @@ def em_accumulator(geo, params, param_flows, pf0: int, denom, d0, dev):
             (denom is not None and denom.dtype != torch.float32):
         return None
     acc = scope.__dict__.setdefault("_top_k_em", {})
-    key = (id(param_flows), param_flows.data_ptr(), pf0, geo["p0"], tuple(grid), geo["M"], geo["N"], denom is None)
+    key = (id(param_flows), param_flows.data_ptr(), pf0, geo["p0"], tuple(grid), geo["M"], geo["N"])
     got = acc.get(key)
     if got is None:
         FP = torch.zeros(geo["M"], geo["N"], dtype = torch.float32, device = dev)
-        FM = torch.zeros_like(FP)
-        got = acc[key] = (FP, FM)
-        scope.defer(lambda: scatter_statistics(geo, FP, FM, params, param_flows, pf0, denom, d0))
-    return got
+        got = acc[key] = (FP, torch.empty_like(FP))           # (F+, and the F- the kernels write where none is kept)
+        scope.defer(lambda: scatter_statistics(geo, FP, None, params, param_flows, pf0, None, None))
+    if denom is None:
+        return got
+    FM = torch.zeros_like(got[0])
+    scope.defer(lambda: scatter_statistics(geo, None, FM, params, param_flows, pf0, denom, d0))
+    return got[0], FM
 
 
 def _fold_operands(gviews, fold, B: int, dev):
