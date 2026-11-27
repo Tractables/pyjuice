@@ -225,8 +225,9 @@ class SumParameterization():
         False by default. A parameterization returning True stores its tensors in the caller's layout
         (:func:`storage_perm` None, the default :func:`to_storage`) and its kernels take each tensor's batch
         stride as it comes (every axis but the batch contiguous; a tensor that is not is copied as before).
-        What the copy guaranteed is kept: the views hold the caller's tensors alive until the next forward,
-        and the backward refuses to run if one of them was modified in place in between
+        What the copy guaranteed is kept: the views hold the caller's tensors alive until the next forward
+        (a differentiable call's: until its autograd backward has run, `_release_external_params`), and
+        the backward refuses to run if one of them was modified in place in between
         (`Tensor._version`). Other stagings -- sampling, the decoder -- copy as before. Not where the
         parameterization is :attr:`cuda_graph_safe`: a graph replays the addresses its capture read, which
         only the staging buffer keeps (such a node is copied whatever this returns).

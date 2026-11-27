@@ -112,13 +112,16 @@ class _DifferentiableLLs(torch.autograd.Function):
                 ext_grads[key] = torch.empty_like(ts) if torch.is_tensor(ts) else tuple(torch.empty_like(t) for t in ts)
         evi_grads = {f"{key}_grad": torch.zeros_like(given[key]) for kind, key, _, _ in entries if kind == "evi"}
         with torch.no_grad():
-            if pc.__dict__.get("_num_runs", 0) != ctx.run:
-                pc(inputs, **given)                                       # (another pass ran since: this call's values)
+            if pc.__dict__.get("_num_runs", 0) != ctx.run or pc.__dict__.get("_staged_external_released", False):
+                pc(inputs, **given)                                       # (another pass ran since, or this one's tensors
+                                                                          # were released by an earlier backward of the
+                                                                          # graph: this call's values)
             pc.backward(inputs, ll_weights = w.abs(), compute_param_flows = ctx.pmask is not None,
                         param_flows_mask = ctx.pmask, logspace_flows = True,
                         allow_modify_flows = False, **rest, **evi_grads, **fold,
                         **({EXTERNAL_PARAMS_GRAD_KWARG: ext_grads} if ext_grads else {}))
             pc._release_external_params_grads()                           # (the destinations: autograd's from here)
+            pc._release_external_params()                                 # (and the call's tensors)
         out = []
         for kind, key, slot, t in entries:
             if kind == "ext":

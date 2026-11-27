@@ -684,6 +684,7 @@ class _ExternalParamsMixin:
         ns2tensors = kwargs.get(EXTERNAL_PARAMS_KWARG, None)
         if owns_forward_state and not isinstance(ns2tensors, StagedExternalParams):
             self._staged_external_rows = self._staged_external_batch = None
+            self._staged_external_released = False
 
         if ns2tensors is None:
             assert kwargs.get(EXTERNAL_PARAMS_ROWS_KWARG) is None, \
@@ -1018,6 +1019,11 @@ class _ExternalParamsMixin:
         A caller may still pass `sum_external_params` (the autograd hook forwards it), but it only has
         to name the same set of nodes; the staged values are what gets used.
         """
+        if self.__dict__.get("_staged_external_released", False):
+            raise RuntimeError(
+                "The external parameters of the last forward pass were released by its autograd backward "
+                "(`pc(..., differentiable = True)`: its tensors are autograd's from there) -- run the forward pass "
+                "again before `pc.backward()` or a conditional `queries.sample()` on it.")
         staged = self._staged_external_params
 
         ns2tensors = kwargs.get(EXTERNAL_PARAMS_KWARG, None)
@@ -1267,6 +1273,22 @@ class _ExternalParamsMixin:
         # offsets as the forward uses for the tensors themselves (the two buffers share a layout).
         kwargs[EXTERNAL_PARAMS_GRAD_BUFFER_KWARG] = self.external_params_grad
         self._staged_external_params_grad = grad_views
+
+    def _release_external_params(self) -> None:
+        """
+        Drop the circuit's hold on the last forward's external tensors: `pc(..., differentiable = True)` once its
+        autograd backward has run. The tensors are autograd's then (its graph keeps what another backward of it needs),
+        and the circuit's views of them kept them allocated until the next forward staged others (MEASURED, the best
+        Codpula head at 48 blocks: 1.76 GB, held through the next step's forward). What would read them afterwards --
+        `pc.backward()` or a conditional `queries.sample()` on that forward -- raises
+        (`_resolve_backward_external_params`): run the forward again, as the autograd backward itself does for a graph
+        kept (`_DifferentiableLLs`). A forward that staged none keeps meaning "ungated" (nothing to release).
+        """
+        if self.__dict__.get("_staged_external_params") is None:
+            return None
+        self._staged_external_params = None
+        self._staged_external_rows = self._staged_external_batch = None
+        self._staged_external_released = True
 
     def _release_external_params_grads(self) -> None:
         """

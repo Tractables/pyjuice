@@ -277,6 +277,38 @@ def test_the_autograd_backward_leaves_no_gradients_on_the_circuit():
     assert all(w() is None for w in seen), sum(w() is not None for w in seen)
 
 
+def test_the_autograd_backward_leaves_no_external_tensors_on_the_circuit():
+    """Once the autograd backward of a differentiable call returns, the call's external tensors are autograd's alone: the
+    circuit keeps no view of them (they stayed allocated until its next forward staged others) -- a later `pc.backward()`
+    on that forward says to run the forward again, and a second backward of the graph kept (`retain_graph`) runs it
+    itself (its gradients the first's again)."""
+    import gc, weakref
+    T, N, C, K, r, re, b = 4, 4, 5, 2, 3, 2, 6
+    pc, _, _ = _hmm_pc(T, N, K, r, re, _tables(N, 4))
+    ext, ids, lp, x, miss = _batch(b, T, N, C, K, r, re, 5)
+    leaves = [t.float().clone().requires_grad_(True) for t in ext] + [lp.float().clone().requires_grad_(True)]
+    made = [t * 1.0 for t in leaves[:5]]                    # (the call's tensors: an op's outputs, autograd's to keep)
+    seen = [weakref.ref(t) for t in made]
+    ll = pc(x, missing_mask = miss, external_params = _pc_ext(made, T, N), categorical_evidence_logp = leaves[5],
+            soft_evidence_cat_ids = ids, differentiable = True)
+    ll.sum().backward(retain_graph = True)
+    first = [t.grad.clone() for t in leaves]
+    ll.sum().backward()                                     # (the graph kept: the forward run again from its tensors)
+    for name, t, f in zip(("A", "B", "G", "U", "D", "lp"), leaves, first):
+        assert float(f.abs().sum()) > 0 and _rel(t.grad, 2 * f) < 1e-5, (name, _rel(t.grad, 2 * f))
+    with pytest.raises(RuntimeError, match = "run the forward pass"):
+        pc.backward(x, missing_mask = miss, compute_param_flows = False, logspace_flows = True, allow_modify_flows = False,
+                    categorical_evidence_logp = leaves[5].detach(), soft_evidence_cat_ids = ids)
+    del ll, made
+    gc.collect()
+    assert all(w() is None for w in seen), sum(w() is not None for w in seen)
+    with torch.no_grad():                                   # (a new forward stages again: its backward runs)
+        pc(x, missing_mask = miss, external_params = _pc_ext([t.detach() for t in leaves[:5]], T, N),
+           categorical_evidence_logp = leaves[5].detach(), soft_evidence_cat_ids = ids)
+    pc.backward(x, missing_mask = miss, compute_param_flows = False, logspace_flows = True, allow_modify_flows = False,
+                categorical_evidence_logp = leaves[5].detach(), soft_evidence_cat_ids = ids)
+
+
 # ---------------------------------------------------------------------------------------------- a map of rows
 
 def test_hmm_conditional_in_one_batch():
