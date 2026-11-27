@@ -7,8 +7,8 @@ project = 'PyJuice'
 copyright = '2026, Anji Liu'
 author = 'Anji Liu'
 
-release = '2.7.0'
-version = '2.7.0'
+release = '2.7.1'
+version = '2.7.1'
 
 # -- General configuration
 
