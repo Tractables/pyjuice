@@ -3,9 +3,10 @@
 (`TOP_K_FUSED`, the module built, the shapes they hold, the default precision); else the float64 reference
 (`top_k.py`), which stays what both are checked against. A node vector takes two launches: the prep (`top_k_prep`:
 every operand from the caller's tensors, the circuit's element values and the shared parameters -- fp16 factors,
-TF32 token rows, the children's values over their largest, log2 theta in the MMAs' fragment order, the masked rows'
-slot weights) and the values (`top_k_forward`: the masked rows' kernel, the observed rows' beside it on a side
-stream). Measured precision (the best Codpula head vs float64): ~3e-5 nats a masked token's read-out.
+TF32 token rows (their slots also in fp16, scaled: the masked rows' MMAs), the children's values over their largest,
+log2 theta in the MMAs' fragment order, the masked rows' slot weights) and the values (`top_k_forward`: the masked
+rows' kernel, the observed rows' beside it on a side stream). Measured precision (the best Codpula head vs float64):
+~3e-5 nats a masked token's read-out.
 """
 
 from __future__ import annotations
@@ -76,6 +77,13 @@ def theta_tables(desc, sib, ns, geo, params, batch_size: int) -> dict:
     return tab
 
 
+class Operands(list):
+    """`prep`'s operands: the list the forward and the backward both read -- (BP, E, ev, cmax, LTh, mitems, oitems,
+    noitems, slot32, logw, flags) -- and the masked forward's own beside it, `e16` (E's slots 0 .. 63 in fp16, times
+    2^15: its MMAs' operand)."""
+    e16 = None
+
+
 def prep(Bm, G, element_mars, eid, has, theta, slot, rows_m, logw_m, emap = None, pair: bool = True, lth = None,
          items = None):
     """`top_k_prep`'s operands: `B [Bx, r, N]`, `G [Bx, K + 1, N]` a row of tensors each; the children's values
@@ -87,11 +95,14 @@ def prep(Bm, G, element_mars, eid, has, theta, slot, rows_m, logw_m, emap = None
     work items as `work_items` made them, or None (made by the prep)."""
     dev = Bm.device
     f = lambda t: t.float().contiguous()
-    return top_k_module().top_k_prep(
+    got = top_k_module().top_k_prep(
         _rows(Bm), _rows(G), element_mars, eid.long().contiguous(), _empty(dev, torch.bool) if has is None else has, f(theta),
         slot.long().contiguous(), _empty(dev, torch.long) if emap is None else emap.long().contiguous(),
         rows_m.long().contiguous(), _empty(dev, torch.float32) if logw_m is None else _weights_operand(logw_m), pair,
         _empty(dev, torch.int32) if lth is None else lth, [] if items is None else items)
+    ops = Operands(got[:11])
+    ops.e16 = got[11]
+    return ops
 
 
 def work_items(sib: dict, batch_size: int, emap):
@@ -138,7 +149,7 @@ def forward(A, ops, node_mars, nid0: int, stash: bool = False, counts = None):
     not in it: `top_k_backward.terms` puts them in) -- the masked samples' posterior of the slots into `counts` where
     given (their leaf's buffer: `top_k_leaf_fused.counts_buffer`)."""
     none = _empty(A.device, torch.float32)
-    got = top_k_module().top_k_forward(_rows(A), *ops, none if node_mars is None else node_mars, nid0, stash,
+    got = top_k_module().top_k_forward(_rows(A), *ops, ops.e16, none if node_mars is None else node_mars, nid0, stash,
                                        none if counts is None else counts)
     return got if stash else None
 

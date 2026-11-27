@@ -13,9 +13,16 @@
 //
 // PRECISION, measured on the best Codpula head against float64 (`check_tk_kernel_e2e.py`): phi' from fp16-rounded
 // factors (one m16n8k16 MMA a 16 ranks), l2t in fp16 (its row's largest 0: the dominant entries near 0, where fp16 is
-// finest), the contraction W [ev E, E] in TF32 (m16n8k8, round to nearest): ~3e-5 nats a masked token's read-out. A
-// bf16 contraction moved it by 1.4e-4 (over the 1e-4 gate), an fp16 one underflows (a slot's weights E_b[s, j] W_b[i, j]
-// peak where the row's and the slot's maxima do not meet).
+// finest), the masked samples' contraction W [ev E, E] in fp16 (m16n8k16, round to nearest: TF32's 10 bits) with each
+// operand scaled to the top of fp16's range -- W by 2^14 (its reference lazy by 2^1 only), E by 2^15 (a slot's largest
+// 1) --: ~3e-5 nats a masked token's read-out. The scales matter: a slot's weights E_b[s, j] W_b[i, j] peak where the
+// row's and the slot's maxima do not meet, so its dominant products' factors sit far below both maxima; these keep
+// their bits down to 2^-28 (W) and 2^-29 (E) of them. MEASURED (three transitions of the head, the operands' rounding
+// emulated in float64): the node values' max and flow-weighted errors TF32's (8e-4, 1e-4 nats), Z and U within TF32's
+// 9e-4 (relative) wherever the slot's posterior exceeds 1e-6 (2 binades of W's headroom given away: U 1.1e-3 there;
+// 4: 3.7e-3); W and E as they are (maxima 1): values 1e-2 .. 6e-2 nats off; W lazy by 2^8 (times 2^7): values as
+// TF32's, Z / U up to 1e-2 off at a posterior of 1e-4. A bf16 contraction moved the read-out by 1.4e-4 (over the 1e-4
+// gate).
 //
 // SAMPLES SHARING A ROW OF TENSORS (`external_params_rows`: both passes of a conditional one batch) share the tile W,
 // which their tensors alone determine: the WORK ITEMS (`tk_items_kernel`) gather them -- a MASKED item a sample whose
@@ -26,15 +33,16 @@
 //
 // TWO PERSISTENT LAUNCHES a node vector (`tk_sk_kernel`, stream-K: its notes below), one a kind of item:
 //
-//  * MASKED items (~250 registers, one CTA an SM): 128 nodes (eight warps of 16) x one item, its children in chunks of
+//  * MASKED items (255 registers, one CTA an SM): 128 nodes (eight warps of 16) x one item, its children in chunks of
 //    64 -- double-buffered cp.async stages of the row's B chunk (rank-major: `ldmatrix.trans` makes the MMA's
-//    fragments), E's chunk and the samples' ev chunks. A warp keeps its A' fragments (made once from the caller's fp32
+//    fragments), the chunk of E's slots 0 .. 63 in fp16 (`E16`, the prep's), E's rows of the rest slot and of the
+//    partners' slots (fp32) and the samples' ev chunks. A warp keeps its A' fragments (made once from the caller's fp32
 //    A), its accumulators, its rows' running maxima and l2t's fragments of the next chunk (read from global in FRAGMENT
 //    ORDER, `LTh`: one 256-byte run a warp's load; the C operand the logits' MMAs start from). The masked sample's slots
-//    0 .. 63 by TF32 MMAs, the shared "rest" slot -- the last of E's rows -- and the partners' sums (their slot's E row,
-//    their ev) by FP32; ev on the A side (W ev beside W), so both contractions read the same B operand E; the logits'
-//    accumulator fragment IS the TF32 MMA's A fragment with the k index permuted (column t <-> child 2t, t + 4 <-> child
-//    2t + 1): E's B fragment is then two adjacent children of one slot, one 64-bit shared load, no shuffles.
+//    0 .. 63 by fp16 MMAs (m16n8k16: half the TF32 m16n8k8 MMAs of the same cost each), the shared "rest" slot and the
+//    partners' sums (their slot's E row, their ev) by FP32; ev on the A side (W ev beside W), so both contractions read
+//    the same B operand E; the logits' accumulator fragments of two n-tiles ARE the MMA's A fragment (rows g, g + 8 x
+//    children 2t, 2t + 1 of each: one conversion a pair), E's B fragments two slot tiles an `ldmatrix`.
 //  * OBSERVED items: the same tile a slot (a row of tensors, its l2t's reads shared by the two slots), FP32 sums only
 //    (z once where a slot's two samples take the same slot of E).
 //
@@ -42,12 +50,13 @@
 // well -- the kernels' time ~ compute + their bytes' time -- so the bytes a CTA reads are cut where they can be: l2t
 // fp16 and shared by two slots, A' made in the kernel, one barrier a chunk, the next stage's loads issued right after
 // it. The conditional of the best Codpula head (48 blocks, 31 transitions): two passes 271 us a transition, one batch
-// through the map 159 us.
+// through the map 159 us; its masked slots by fp16 MMAs (E16 a stage: 22 KB a chunk, was 31) 152 -> 123 us.
 //
 // The PREP kernel (`tk_prep_kernel`, one launch a node vector) makes the other operands: a row of tensors each, B [Bx,
-// KP, N] fp16 (ranks zero-padded to KP = 32, 64, 96 or 128) and E [Bx, S, N] fp32 (TF32-rounded; S = 65); a sample
-// each, the children's values from the circuit's (ev [B, N], their largest c [B], -inf where every child's is) and the
-// observed slots; l2t in fragment order; the masked samples' weights [Rm, M, SP] fp32 (SP = 72: aligned pairs).
+// KP, N] fp16 (ranks zero-padded to KP = 32, 64, 96 or 128), E [Bx, S, N] fp32 (TF32-rounded; S = 65) and its slots
+// 0 .. 63 in fp16 times 2^15 (E16 [Bx, 64, N]: the masked forward's); a sample each, the children's values from the
+// circuit's (ev [B, N], their largest c [B], -inf where every child's is) and the observed slots; l2t in fragment
+// order; the masked samples' weights [Rm, M, SP] fp32 (SP = 72: aligned pairs).
 //
 // The BACKWARD (`top_k._sum_backward_terms`), from the node flows f, with a = f pi the flow into each (node, slot),
 // alpha = a / U, beta = a / Z:
@@ -113,7 +122,6 @@ constexpr int TM = 128;                // nodes a CTA
 constexpr int NW = 8;                  // warps a CTA (16 nodes each)
 constexpr int TN = 64;                 // children a chunk
 constexpr int BROW = TN + 8;           // halves a staged B row (ldmatrix rows conflict-free)
-constexpr int FS = TN + 8;             // a staged fp32 row's stride (64-bit fragment loads conflict-free)
 constexpr int SP = 72;                 // the masked rows' weights' row stride (aligned float2 pairs)
 constexpr int NS8 = 8;                 // slot tiles (top_k = 64; the 65th slot by FP32 sums)
 constexpr int RPC = 2;                 // observed rows a CTA
@@ -125,6 +133,11 @@ constexpr int CM = 32;                 // nodes a cols chunk
 constexpr int TBUF = 20;               // the cols epilogue's transpose buffer: a row's stride (16 children + pad)
 constexpr int FE = TN + 12;            // dA's staged E row (floats: the slot pairs 2t, 2t + 1 conflict-free)
 constexpr float LOG2E = 1.4426950408889634f;
+// the masked forward's fp16 MMA operands' scales (log2): W (< 2^W_LAZY by its lazy reference) times 2^(15 - W_LAZY), E
+// (a slot's largest 1) times 2^15 -- each operand at most 2^15, fp16's range used to its top; its sums handed on with
+// the reference less S_OFF (W < 2^8 in their units: the range the backward's fp16 operands take W in)
+constexpr int W_LAZY_I = 1, W_OFF_I = 15 - W_LAZY_I, E_OFF_I = 15, S_OFF_I = 8 - W_LAZY_I;
+constexpr float W_LAZY = (float)W_LAZY_I, W_OFF = (float)W_OFF_I;
 #define NEG (-CUDART_INF_F)
 
 __device__ __forceinline__ unsigned smem_u32(const void* p) { return (unsigned)__cvta_generic_to_shared(p); }
@@ -273,10 +286,11 @@ __device__ __forceinline__ void logits(float (&Sx)[8][4], const unsigned (&af)[N
 }
 
 // The rows' reference maxima (log2 units) moved -- `rescale(a0, a1)` applied to the accumulators -- only where the
-// chunk's exceeds them by more than 2^8 (LAZY: W = 2^(logits - reference) stays below 256, the sums far from fp32's
-// range); then W = 2^(logits - reference) in place.
+// chunk's exceeds them by more than 2^lazy (LAZY: W = 2^(logits - reference) stays below 2^lazy, the sums far from
+// fp32's range); then 2^off W = 2^(logits - reference + off) in place.
 template <typename F>
-__device__ __forceinline__ void exp_tile(float (&Sx)[8][4], float& m0, float& m1, F&& rescale) {
+__device__ __forceinline__ void exp_tile(float (&Sx)[8][4], float& m0, float& m1, F&& rescale, float off = 0.f,
+                                         float lazy = 8.f) {
     float x0 = NEG, x1 = NEG;
     #pragma unroll
     for (int nt = 0; nt < 8; ++nt) {
@@ -284,12 +298,12 @@ __device__ __forceinline__ void exp_tile(float (&Sx)[8][4], float& m0, float& m1
         x1 = fmaxf(x1, fmaxf(Sx[nt][2], Sx[nt][3]));
     }
     x0 = quad_max(x0); x1 = quad_max(x1);
-    const bool up0 = x0 > m0 + 8.f, up1 = x1 > m1 + 8.f;
+    const bool up0 = x0 > m0 + lazy, up1 = x1 > m1 + lazy;
     if (__any_sync(0xffffffffu, up0 || up1)) {
         rescale(up0 ? exp2f(m0 - x0) : 1.f, up1 ? exp2f(m1 - x1) : 1.f);
         m0 = up0 ? x0 : m0; m1 = up1 ? x1 : m1;
     }
-    const float h0 = m0 == NEG ? 0.f : m0, h1 = m1 == NEG ? 0.f : m1;
+    const float h0 = (m0 == NEG ? 0.f : m0) - off, h1 = (m1 == NEG ? 0.f : m1) - off;
     #pragma unroll
     for (int nt = 0; nt < 8; ++nt) {
         Sx[nt][0] = exp2f(Sx[nt][0] - h0); Sx[nt][1] = exp2f(Sx[nt][1] - h0);
@@ -297,12 +311,14 @@ __device__ __forceinline__ void exp_tile(float (&Sx)[8][4], float& m0, float& m1
     }
 }
 
+// a masked stage: { B chunk [KP][BROW] fp16, E16 chunk [64][BROW] fp16, E rows [3][TN] fp32, ev chunks [3][TN] fp32 }
 template <int NK>
-struct MaskedGeo {                     // a stage: { B chunk [KP][BROW] fp16, E chunk [65][FS] fp32, ev chunks [3][TN] fp32 }
+struct MaskedGeo {
     static constexpr int KP = 16 * NK;
     static constexpr int B_BYTES = KP * BROW * 2;
-    static constexpr int E_BYTES = (8 * NS8 + 1) * FS * 4;
-    static constexpr int STAGE = B_BYTES + E_BYTES + 3 * TN * 4;
+    static constexpr int H_BYTES = 8 * NS8 * BROW * 2;    // (the MMAs' slots, fp16: ldmatrix rows conflict-free)
+    static constexpr int R_BYTES = 3 * TN * 4;            // (the rest slot's row, the partners' slots' rows)
+    static constexpr int STAGE = B_BYTES + H_BYTES + R_BYTES + 3 * TN * 4;
     static constexpr int BYTES = 2 * STAGE;
 };
 
@@ -325,9 +341,9 @@ struct ObservedGeo {                   // a stage: 2 slots x { B chunk [KP][BROW
 // (each part's running maxima its own: rescaled to the larger) and makes the values. A CTA runs its partial first and
 // waits on lower CTAs only (dispatched first): no deadlock, short waits.
 
-constexpr int WM = 6, WO = 5;          // a masked chunk's cost and an observed one's (with the stash ending: the best
-                                       // Codpula head's two kinds took 141 : 140 us a transition at 6 : 5; 7 : 5 left
-                                       // the observed share 161 us)
+constexpr int WM = 11, WO = 12;        // a masked chunk's cost and an observed one's (with the stash ending: the best
+                                       // Codpula head's two kinds took 113 : 108 us a transition at 11 : 12; 5 : 5 left
+                                       // the observed share 118 us, 5 : 6 the masked one 115)
 
 struct MState {                         // a thread's sums of a masked tile: its rows g, g + 8
     float m0, m1, zr0, zr1, ur0, ur1;
@@ -341,6 +357,7 @@ constexpr int WS_M = 6 + 8 * NS8 * 2 + 8, WS_O = 4 + 16;   // a partial's floats
 
 struct TkArgs {
     const float* A; const __half* BP; const uint2* LTh; const float* E; const float* ev; const float* cmax;
+    const __half* E16;                  // [Bx, 64, N] E's slots 0 .. 63 times 2^15, fp16 (the masked items' MMAs)
     const int4* mitems; const int4* oitems; const int* noitems; const int* slot32; const float* logw;
     float* out; float* ws; int* flags;
     long nid0, ostride, sA; int r, M, N, S, Rm;                    // sA: A's batch stride (its rows contiguous)
@@ -371,20 +388,25 @@ __device__ __forceinline__ void masked_run(MState& St, const TkArgs& a, int y, i
     const int N = a.N, S = a.S, nchunks = N / TN;
     const int node0 = x * TM + warp * 16 + g;
 
-    constexpr int NB = KP * (TN / 8), NE = (8 * NS8 + 1) * (TN / 4), NSEG = NB + NE + 3 * (TN / 4);
+    constexpr int NB = KP * (TN / 8), NH = 8 * NS8 * (TN / 8), NR = 3 * (TN / 4), NSEG = NB + NH + NR + 3 * (TN / 4);
     auto load_seg = [&](int q, int st, int j0) {
         const unsigned bs = smem_u32(smem + st * G::STAGE);
         if (q < NB) {
             const int k = q / (TN / 8), s = q % (TN / 8);
             cp16(bs + (k * BROW + s * 8) * 2, a.BP + ((long)e * KP + k) * N + j0 + s * 8);
-        } else if (q < NB + NE) {
-            const int rr = (q - NB) / (TN / 4), s = (q - NB) % (TN / 4);
-            const int srow = rr < 8 * NS8 ? rr : S - 1;
-            cp16(bs + G::B_BYTES + (rr * FS + s * 4) * 4, a.E + ((long)e * S + srow) * N + j0 + s * 4);
+        } else if (q < NB + NH) {                                            // (the MMAs' slots, fp16)
+            const int sl = (q - NB) / (TN / 8), s = (q - NB) % (TN / 8);
+            cp16(bs + G::B_BYTES + (sl * BROW + s * 8) * 2, a.E16 + ((long)e * (8 * NS8) + sl) * N + j0 + s * 8);
+        } else if (q < NB + NH + NR) {                                       // (the rest slot's row, the partners')
+            const int v = (q - NB - NH) / (TN / 4), s = (q - NB - NH) % (TN / 4);
+            if (v > 0 && (v == 1 ? o1 : o2) < 0) return;
+            const int srow = v == 0 ? S - 1 : (v == 1 ? s1 : s2);
+            cp16(bs + G::B_BYTES + G::H_BYTES + (v * TN + s * 4) * 4, a.E + ((long)e * S + srow) * N + j0 + s * 4);
         } else if (q < NSEG) {
-            const int v = (q - NB - NE) / (TN / 4), s = (q - NB - NE) % (TN / 4);
+            const int v = (q - NB - NH - NR) / (TN / 4), s = (q - NB - NH - NR) % (TN / 4);
             const int row = v == 0 ? b : (v == 1 ? o1 : o2);
-            if (row >= 0) cp16(bs + G::B_BYTES + G::E_BYTES + (v * TN + s * 4) * 4, a.ev + (long)row * N + j0 + s * 4);
+            if (row >= 0)
+                cp16(bs + G::B_BYTES + G::H_BYTES + G::R_BYTES + (v * TN + s * 4) * 4, a.ev + (long)row * N + j0 + s * 4);
         }
     };
     __syncthreads();                                                         // (the last tile's stages read by all)
@@ -417,8 +439,10 @@ __device__ __forceinline__ void masked_run(MState& St, const TkArgs& a, int y, i
             cp_commit();
         }
         const unsigned char* p = smem + st * G::STAGE;
-        const float* Es = reinterpret_cast<const float*>(p + G::B_BYTES);
-        const float* Vs = reinterpret_cast<const float*>(p + G::B_BYTES + G::E_BYTES);
+        const float* Rs = reinterpret_cast<const float*>(p + G::B_BYTES + G::H_BYTES);
+        const float* Vs = reinterpret_cast<const float*>(p + G::B_BYTES + G::H_BYTES + G::R_BYTES);
+        // (this lane's row of the slots' ldmatrix: matrices slots 16q .. +7, +8 .. +15 x children 16k .. +7, +8 .. +15)
+        const unsigned hb = smem_u32(p + G::B_BYTES) + (((lane & 7) + ((lane >> 4) << 3)) * BROW + ((lane >> 3) & 1) * 8) * 2;
 
         float Sx[8][4];
         logits<NK>(Sx, af, reinterpret_cast<const __half*>(p), lt, lane);
@@ -431,37 +455,67 @@ __device__ __forceinline__ void masked_run(MState& St, const TkArgs& a, int y, i
             St.zr0 *= a0; St.ur0 *= a0; St.zr1 *= a1; St.ur1 *= a1;
             #pragma unroll
             for (int k = 0; k < 2; ++k) { St.pz[k][0] *= a0; St.pu[k][0] *= a0; St.pz[k][1] *= a1; St.pu[k][1] *= a1; }
-        });
+        }, W_OFF, W_LAZY);
 
         #pragma unroll
-        for (int nt = 0; nt < 8; ++nt) {
-            if (more) lt[nt] = __ldg(ltp + ((jc + 1) * 8 + nt) * 32);
-            const float2 ec = *reinterpret_cast<const float2*>(Vs + nt * 8 + 2 * t);
-            const float w00 = Sx[nt][0], w01 = Sx[nt][1], w10 = Sx[nt][2], w11 = Sx[nt][3];
-            const float u00 = w00 * ec.x, u01 = w01 * ec.y, u10 = w10 * ec.x, u11 = w11 * ec.y;
-            const unsigned az0 = to_tf32(w00), az1 = to_tf32(w10), az2 = to_tf32(w01), az3 = to_tf32(w11);
-            const unsigned au0 = to_tf32(u00), au1 = to_tf32(u10), au2 = to_tf32(u01), au3 = to_tf32(u11);
-            #pragma unroll
-            for (int sn = 0; sn < NS8; ++sn) {
-                const float2 bb = *reinterpret_cast<const float2*>(Es + (sn * 8 + g) * FS + nt * 8 + 2 * t);
-                const unsigned b0 = __float_as_uint(bb.x), b1 = __float_as_uint(bb.y);
-                mma_tf32(St.Zc[sn], az0, az1, az2, az3, b0, b1);
-                mma_tf32(St.Uc[sn], au0, au1, au2, au3, b0, b1);
+        for (int ks = 0; ks < TN / 16; ++ks) {                                 // (a k-step of 16 children: n-tiles 2ks, 2ks + 1)
+            if (more) {
+                lt[2 * ks] = __ldg(ltp + ((jc + 1) * 8 + 2 * ks) * 32);
+                lt[2 * ks + 1] = __ldg(ltp + ((jc + 1) * 8 + 2 * ks + 1) * 32);
             }
-            const float2 rr = *reinterpret_cast<const float2*>(Es + (8 * NS8) * FS + nt * 8 + 2 * t);
-            St.zr0 += w00 * rr.x + w01 * rr.y; St.zr1 += w10 * rr.x + w11 * rr.y;
-            St.ur0 += u00 * rr.x + u01 * rr.y; St.ur1 += u10 * rr.x + u11 * rr.y;
+            float u[2][4];
             #pragma unroll
-            for (int k = 0; k < 2; ++k) {
-                if ((k == 0 ? o1 : o2) < 0) continue;
-                const float2 pr = *reinterpret_cast<const float2*>(Es + (k == 0 ? s1 : s2) * FS + nt * 8 + 2 * t);
-                const float2 pv = *reinterpret_cast<const float2*>(Vs + (1 + k) * TN + nt * 8 + 2 * t);
-                const float er0 = pv.x * pr.x, er1 = pv.y * pr.y;
-                St.pz[k][0] += w00 * pr.x + w01 * pr.y; St.pz[k][1] += w10 * pr.x + w11 * pr.y;
-                St.pu[k][0] += w00 * er0 + w01 * er1; St.pu[k][1] += w10 * er0 + w11 * er1;
+            for (int h = 0; h < 2; ++h) {
+                const float2 ec = *reinterpret_cast<const float2*>(Vs + (2 * ks + h) * 8 + 2 * t);
+                u[h][0] = Sx[2 * ks + h][0] * ec.x; u[h][1] = Sx[2 * ks + h][1] * ec.y;
+                u[h][2] = Sx[2 * ks + h][2] * ec.x; u[h][3] = Sx[2 * ks + h][3] * ec.y;
+            }
+            // the logits' fragments of two n-tiles ARE the m16n8k16 A fragment (rows g, g + 8 x children 2t, 2t + 1 of
+            // each): W and W ev in fp16
+            const float (&w0)[4] = Sx[2 * ks], (&w1)[4] = Sx[2 * ks + 1];
+            const unsigned az[4] = {sat_h2(w0[0], w0[1]), sat_h2(w0[2], w0[3]), sat_h2(w1[0], w1[1]), sat_h2(w1[2], w1[3])};
+            const unsigned au[4] = {sat_h2(u[0][0], u[0][1]), sat_h2(u[0][2], u[0][3]), sat_h2(u[1][0], u[1][1]),
+                                    sat_h2(u[1][2], u[1][3])};
+            #pragma unroll
+            for (int q = 0; q < NS8 / 2; ++q) {                              // (two slot tiles a load)
+                unsigned bf[4];
+                ldsm4(bf, hb + (q * 16 * BROW + ks * 16) * 2);
+                mma_f16(St.Zc[2 * q], az, bf[0], bf[1]);
+                mma_f16(St.Uc[2 * q], au, bf[0], bf[1]);
+                mma_f16(St.Zc[2 * q + 1], az, bf[2], bf[3]);
+                mma_f16(St.Uc[2 * q + 1], au, bf[2], bf[3]);
+            }
+            #pragma unroll
+            for (int h = 0; h < 2; ++h) {
+                const int nt = 2 * ks + h;
+                const float w00 = Sx[nt][0], w01 = Sx[nt][1], w10 = Sx[nt][2], w11 = Sx[nt][3];
+                const float u00 = u[h][0], u01 = u[h][1], u10 = u[h][2], u11 = u[h][3];
+                const float2 rr = *reinterpret_cast<const float2*>(Rs + nt * 8 + 2 * t);
+                St.zr0 += w00 * rr.x + w01 * rr.y; St.zr1 += w10 * rr.x + w11 * rr.y;
+                St.ur0 += u00 * rr.x + u01 * rr.y; St.ur1 += u10 * rr.x + u11 * rr.y;
+                #pragma unroll
+                for (int k = 0; k < 2; ++k) {
+                    if ((k == 0 ? o1 : o2) < 0) continue;
+                    const float2 pr = *reinterpret_cast<const float2*>(Rs + (1 + k) * TN + nt * 8 + 2 * t);
+                    const float2 pv = *reinterpret_cast<const float2*>(Vs + (1 + k) * TN + nt * 8 + 2 * t);
+                    const float er0 = pv.x * pr.x, er1 = pv.y * pr.y;
+                    St.pz[k][0] += w00 * pr.x + w01 * pr.y; St.pz[k][1] += w10 * pr.x + w11 * pr.y;
+                    St.pu[k][0] += w00 * er0 + w01 * er1; St.pu[k][1] += w10 * er0 + w11 * er1;
+                }
             }
         }
     }
+    // (the sums handed on in the units of W = 2^(logits - reference) and E, the reference less S_OFF: the MMAs' sums
+    // times 2^(S_OFF - W_OFF - E_OFF), the FP32 sums' times 2^(S_OFF - W_OFF) -- powers of 2, exact)
+    constexpr float UZ = 1.f / (float)(1 << (W_OFF_I + E_OFF_I - S_OFF_I)), UR = 1.f / (float)(1 << (W_OFF_I - S_OFF_I));
+    #pragma unroll
+    for (int sn = 0; sn < NS8; ++sn)
+        #pragma unroll
+        for (int k = 0; k < 4; ++k) { St.Zc[sn][k] *= UZ; St.Uc[sn][k] *= UZ; }
+    St.zr0 *= UR; St.zr1 *= UR; St.ur0 *= UR; St.ur1 *= UR;
+    #pragma unroll
+    for (int k = 0; k < 2; ++k) { St.pz[k][0] *= UR; St.pz[k][1] *= UR; St.pu[k][0] *= UR; St.pu[k][1] *= UR; }
+    St.m0 = St.m0 == NEG ? NEG : St.m0 - S_OFF_I; St.m1 = St.m1 == NEG ? NEG : St.m1 - S_OFF_I;
 }
 
 // the masked item y's values over its tile x from its sums: log sum_s w U / Z + c; the partners' log u / z + c
@@ -958,7 +1012,7 @@ __global__ void tk_prep_kernel(
         const float* Bm, long sB, const float* Gt, long sG, const float* em,
         long em_stride,
         const long* eid, const bool* has, const float* theta,
-        const float* logwin, __half* BP, float* E, float* ev,
+        const float* logwin, __half* BP, float* E, __half* E16, float* ev,
         float* cmax, uint2* LTh, float* logw,
         int Bx, int B, int M, int N, int r, int KP, int S, int Rm, int* flags, int nflags) {
     pdl_entry();
@@ -986,9 +1040,14 @@ __global__ void tk_prep_kernel(
             for (int j = lane; j < N; j += 32) mx = fmaxf(mx, gr[j]);
             mx = warp_max(mx);
             const float sh = isfinite(mx) ? mx : 0.f;
+            // (the MMAs' slots also in fp16, times 2^E_OFF: the masked forward's operand, where it has items)
+            const int sl = (int)(row % S);
+            __half* hr = E16 != nullptr && sl < 8 * NS8 ? E16 + ((row / S) * (8 * NS8) + sl) * N : nullptr;
             for (int j = lane; j < N; j += 32) {
                 const unsigned u = __float_as_uint(__expf(gr[j] - sh));
-                E[row * N + j] = __uint_as_float((u + 0x1000u) & ~0x1FFFu);
+                const float x = __uint_as_float((u + 0x1000u) & ~0x1FFFu);
+                E[row * N + j] = x;
+                if (hr != nullptr) hr[j] = __float2half_rn(x * (float)(1 << E_OFF_I));
             }
         }
     } else if (task == 2) {                                                  // the children's values, a warp a sample
@@ -2209,7 +2268,8 @@ void bw_launches(BwArgs args, bool grads, int B, long gsz, int sms, int dev, cud
 // empty where none); `pair`: a row's samples in one item (else a sample an item); `lth` theta's l2t as an earlier
 // call made it (int32 [M N / 2], its LTh: not made again), or an empty tensor; `items` the work items (mitems, oitems,
 // noitems, slot32) `top_k_items` made for it with the others reading the leaf layer (pair), or empty (made here):
-// (BP, E, ev, cmax, LTh, mitems, oitems, noitems, slot32, logw, flags).
+// (BP, E, ev, cmax, LTh, mitems, oitems, noitems, slot32, logw, flags, E16) -- E16 [Bx, 64, N] the slots 0 .. 63 of E
+// in fp16, times 2^15: the masked forward's MMA operand (empty where no sample is masked).
 std::vector<torch::Tensor> top_k_prep(torch::Tensor Bm, torch::Tensor G, torch::Tensor em, torch::Tensor eid,
                                       torch::Tensor has, torch::Tensor theta, torch::Tensor slot64, torch::Tensor emap,
                                       torch::Tensor rows, torch::Tensor logwin, bool pair, torch::Tensor lth,
@@ -2240,6 +2300,7 @@ std::vector<torch::Tensor> top_k_prep(torch::Tensor Bm, torch::Tensor G, torch::
     const int KP = padded_rank(r);
     auto f32 = Bm.options(), f16 = Bm.options().dtype(at::kHalf), i32 = Bm.options().dtype(at::kInt);
     auto BP = torch::empty({Bx, KP, N}, f16), E = torch::empty({Bx, S, N}, f32);
+    auto E16 = torch::empty({Rm > 0 ? Bx : 0, 8 * NS8, N}, f16);              // (the masked forward's: none without)
     auto ev = torch::empty({B, N}, f32), cmax = torch::empty({B}, f32);
     const bool reuse = lth.numel() > 0;
     if (reuse) TORCH_CHECK(lth.is_cuda() && lth.scalar_type() == at::kInt && lth.is_contiguous() && lth.numel() == (long)M * N / 2,
@@ -2269,7 +2330,8 @@ std::vector<torch::Tensor> top_k_prep(torch::Tensor Bm, torch::Tensor G, torch::
         eid.data_ptr<long>(),
         full ? nullptr : has.data_ptr<bool>(), reuse ? nullptr : theta.data_ptr<float>(),
         Rm > 0 && !padded ? logwin.data_ptr<float>() : nullptr,
-        reinterpret_cast<__half*>(BP.data_ptr<at::Half>()), E.data_ptr<float>(), ev.data_ptr<float>(),
+        reinterpret_cast<__half*>(BP.data_ptr<at::Half>()), E.data_ptr<float>(),
+        Rm > 0 ? reinterpret_cast<__half*>(E16.data_ptr<at::Half>()) : nullptr, ev.data_ptr<float>(),
         cmax.data_ptr<float>(), reinterpret_cast<uint2*>(LTh.data_ptr<int>()), logw.data_ptr<float>(),
         Bx, B, M, N, r, KP, S, Rm, flags.data_ptr<int>(), 2 * P);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
@@ -2284,7 +2346,7 @@ std::vector<torch::Tensor> top_k_prep(torch::Tensor Bm, torch::Tensor G, torch::
         C10_CUDA_KERNEL_LAUNCH_CHECK();
     }
     if (Rm == 0) mitems = mitems.narrow(0, 0, 0);
-    return {BP, E, ev, cmax, LTh, mitems, oitems, noitems, slot32, logw, flags};
+    return {BP, E, ev, cmax, LTh, mitems, oitems, noitems, slot32, logw, flags, E16};
 }
 
 // The paired work items of the T node vectors reading a leaf layer's T leaves, in one launch (`tk_items_kernel`, a CTA
@@ -2369,13 +2431,16 @@ void sk_launch(const TkArgs& args, int KP, int P, int Rm, int B, int dev) {
 TkArgs sk_args(const torch::Tensor& A, const torch::Tensor& BP, const torch::Tensor& E, const torch::Tensor& ev,
                const torch::Tensor& cmax, const torch::Tensor& LTh, const torch::Tensor& mitems,
                const torch::Tensor& oitems, const torch::Tensor& noitems, const torch::Tensor& slot32,
-               const torch::Tensor& logw, const torch::Tensor& flags, const torch::Tensor& ws) {
+               const torch::Tensor& logw, const torch::Tensor& flags, const torch::Tensor& E16, const torch::Tensor& ws) {
     check_rows(A, at::kFloat, "A");
+    check(E16, at::kHalf, "E16");
     const int r = A.size(2), KP = BP.size(1);
-    TORCH_CHECK(KP == padded_rank(r) && BP.size(0) == A.size(0), "top_k: A and the prep's operands disagree");
+    TORCH_CHECK(KP == padded_rank(r) && BP.size(0) == A.size(0) && E16.size(0) == (mitems.size(0) > 0 ? E.size(0) : 0) &&
+                E16.size(1) == 8 * NS8 && E16.size(2) == E.size(2), "top_k: A and the prep's operands disagree");
     TkArgs args{};
     args.A = A.data_ptr<float>(); args.BP = reinterpret_cast<const __half*>(BP.data_ptr<at::Half>());
     args.LTh = reinterpret_cast<const uint2*>(LTh.data_ptr<int>()); args.E = E.data_ptr<float>();
+    args.E16 = reinterpret_cast<const __half*>(E16.data_ptr<at::Half>());
     args.ev = ev.data_ptr<float>(); args.cmax = cmax.data_ptr<float>();
     args.mitems = reinterpret_cast<const int4*>(mitems.data_ptr<int>());
     args.oitems = reinterpret_cast<const int4*>(oitems.data_ptr<int>()); args.noitems = noitems.data_ptr<int>();
@@ -2394,8 +2459,8 @@ TkArgs sk_args(const torch::Tensor& A, const torch::Tensor& BP, const torch::Ten
 std::vector<torch::Tensor> top_k_forward(torch::Tensor A, torch::Tensor BP, torch::Tensor E, torch::Tensor ev,
                                          torch::Tensor cmax, torch::Tensor LTh, torch::Tensor mitems,
                                          torch::Tensor oitems, torch::Tensor noitems, torch::Tensor slot32,
-                                         torch::Tensor logw, torch::Tensor flags, torch::Tensor out, int64_t nid0,
-                                         bool stash, torch::Tensor acnt_out) {
+                                         torch::Tensor logw, torch::Tensor flags, torch::Tensor E16, torch::Tensor out,
+                                         int64_t nid0, bool stash, torch::Tensor acnt_out) {
     const c10::cuda::CUDAGuard guard(A.device());
     const bool values = out.numel() > 0;
     const int M = A.size(1), B = ev.size(0), Rm = mitems.size(0);
@@ -2408,7 +2473,7 @@ std::vector<torch::Tensor> top_k_forward(torch::Tensor A, torch::Tensor BP, torc
     const int P = flags.size(0) / 2;
     auto o = A.options();
     auto ws = torch::empty({(long)P * (WS_M + WS_O) * NW * 32}, o);
-    TkArgs args = sk_args(A, BP, E, ev, cmax, LTh, mitems, oitems, noitems, slot32, logw, flags, ws);
+    TkArgs args = sk_args(A, BP, E, ev, cmax, LTh, mitems, oitems, noitems, slot32, logw, flags, E16, ws);
     if (values) { args.out = out.data_ptr<float>(); args.nid0 = nid0; args.ostride = out.size(1); }
     if (!stash) {
         sk_launch<false>(args, BP.size(1), P, Rm, B, A.get_device());
