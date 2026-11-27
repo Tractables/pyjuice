@@ -153,7 +153,21 @@ struct FwArgs {
 constexpr int FB = 8;               // the bulk's candidates in flight a warp
 constexpr int HB = 4;               // the head's (each with its tilt's row)
 constexpr int FW_MAXT = 64;         // (INL) positions a launch
-constexpr int FW_BTS = 68;          // (INL) log2 e Bt^T's staged rows (16-B aligned)
+constexpr int FW_BS = 74;           // (INL) log2 e Bt's staged rows (74 floats: a fragment's reads conflict-free)
+constexpr int FW_SMEM = 2 * 64 * FW_BS * 4;   // (INL) its hi and lo halves
+
+__device__ __forceinline__ unsigned tf32_of(float x) {
+    unsigned y;
+    asm("cvt.rna.tf32.f32 %0, %1;" : "=r"(y) : "f"(x));
+    return y;
+}
+
+// c += a b, a m16n8k8 TF32 product (fp32 accumulators)
+__device__ __forceinline__ void mma_tf32(float (&c)[4], const unsigned (&a)[4], unsigned b0, unsigned b1) {
+    asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
+                 "{%0,%1,%2,%3};" : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
 
 // The forward of a CTA's samples: one (NS = 1), or (the evidence a row each) up to NS of a row -- their tiles the same
 // but for the tokens (the evidence and the tilt are the row's) -- walking the candidates ONCE: the normalizers are the
@@ -167,14 +181,15 @@ constexpr int FW_BTS = 68;          // (INL) log2 e Bt^T's staged rows (16-B ali
 // 1.79, and the bulk walked by token id (the CTAs side by side read the table rows they share at about the same time)
 // 1.56 -- against 1.57 with the repeats (1.38 the samples side by side).
 // INL: the tilts made here, no tau [T, Bx, S, M] read (nor made, nor kept: a pass's 409 MB at 48 blocks) -- after the
-// bulk, a warp's nodes 16 at a time, a node's two lanes holding its row of A (lane h the rank quads 2j + h, as
-// `tk_tau_kernel`) against log2 e Bt^T in shared memory: every slot's tilt of the node (tk_tau_kernel's sums, bit for
-// bit), lane h keeping its head slots [32 h, 32 h + 32) -- the candidates it walks -- and the rest's. Then the node's
-// epilogue in the same two lanes: the bulk's sums (in shared memory by node), lz, lb, the rest slot (tauK), the node
-// values, and the slots' log-weights' rows (a lane its half of a row) -- no tilt nor table row read twice. K = Kl.
-// MEASURED (48 blocks, DISTINCT=1 rows): the kernel's tilt reads 0.40 ms of 1.53 (1.13 without them); INL 1.80 at 2
-// CTAs an SM (128 registers; 2.35 at one, 255) -- the tilts' FMAs and their Bt reads from shared memory 0.67 ms, more
-// than the reads they replace. The pass's peak (the sums' backward, tau no longer held there) 385 MiB lower.
+// bulk, a warp's nodes 16 at a time on the tensor cores: C [16 nodes][72 slots] = A B in 3xTF32 (fp32-accurate: hi lo +
+// lo hi + hi hi, mma.sync m16n8k8), A's rows straight from memory as the fragments' rows (a lane its nodes g, g + 8),
+// log2 e Bt split hi / lo once a CTA in shared memory. The head's walk and the epilogue in the fragments' layout -- a
+// lane its two nodes' slots 8 nt + 2 q, + 1, a node's four lanes' sums merged --: lz, lb, the rest slot (tauK), the
+// node values, the slots' log-weights' rows (a lane's pairs of them) -- no tilt nor table row read twice. K = Kl.
+// MEASURED (48 blocks, DISTINCT=1 rows): the kernel's tilt reads 0.40 ms of 1.53 (1.13 without them); the tilts by
+// FMAs (a node's two lanes against Bt in shared memory, as `tk_tau_kernel`) 1.80 -- their Bt reads from shared memory
+// 0.67 ms, more than the reads they replace. The pass's peak (the sums' backward, tau no longer held there) 385 MiB
+// lower.
 template <int NS, bool INL>
 __global__ void __launch_bounds__(NW * 32, INL ? 2 : 1) tk_leaf_forward_kernel(const FwArgs a) {
     __shared__ int s_ids[CH];
@@ -258,29 +273,21 @@ __global__ void __launch_bounds__(NW * 32, INL ? 2 : 1) tk_leaf_forward_kernel(c
         }
     }
     if constexpr (INL) {
-        __shared__ float s_bm[NW * 128], s_bs[NW * 128];               // the bulk's sums by node (the CTA's)
-        __shared__ __align__(16) float s_bt[65][FW_BTS];                // log2 e Bt^T, ranks past re zeros
-        const int n0 = blockIdx.z * NW * 128;
-        if (act) {
-            const int q = (threadIdx.x >> 5) * 128 + 4 * lane;
-#pragma unroll
-            for (int j = 0; j < 4; ++j) { s_bm[q + j] = bulk[j].m; s_bs[q + j] = bulk[j].s; }
-        }
+        // log2 e Bt [64 ranks][72 slots] split for 3xTF32 -- hi = tf32(b), lo = tf32(b - hi) -- ranks past re and
+        // slots past S zeros (rows FW_BS apart: a fragment's 32 reads in 32 banks)
+        extern __shared__ __align__(16) float fw_sm[];
+        float* s_bh = fw_sm;
+        float* s_bl = fw_sm + 64 * FW_BS;
         const int row = g.emap != nullptr ? g.emap[b0] : b0;           // (the tilt's row of tensors)
         const float* Bt = a.tB[t] + (long)row * a.sbb;
         __syncthreads();                                               // (the bulk's staging read)
-        if (a.sbs == 1) {                                              // (read in the order Bt lies in)
-            for (int k = threadIdx.x; k < g.S * a.re; k += NW * 32) {
-                const int r = k / g.S, s = k % g.S;
-                s_bt[s][r] = LOG2E * __ldg(Bt + (long)r * a.sbr + s);
-            }
-        } else {
-            for (int k = threadIdx.x; k < g.S * a.re; k += NW * 32) {
-                const int s = k / a.re, r = k % a.re;
-                s_bt[s][r] = LOG2E * __ldg(Bt + (long)r * a.sbr + (long)s * a.sbs);
-            }
+        for (int k = threadIdx.x; k < 64 * 72; k += NW * 32) {         // (read in the order Bt lies in)
+            const int r = a.sbs == 1 ? k / 72 : k % 64, sl = a.sbs == 1 ? k % 72 : k / 64;
+            const float b = r < a.re && sl < g.S ? LOG2E * __ldg(Bt + (long)r * a.sbr + (long)sl * a.sbs) : 0.f;
+            const float hi = __uint_as_float(tf32_of(b));
+            s_bh[r * FW_BS + sl] = hi;
+            s_bl[r * FW_BS + sl] = __uint_as_float(tf32_of(b - hi));
         }
-        for (int k = threadIdx.x; k < g.S * (64 - a.re); k += NW * 32) s_bt[k / (64 - a.re)][a.re + k % (64 - a.re)] = 0.f;
         for (int k = threadIdx.x; k < g.H; k += NW * 32) {               // the head's candidates: rows, lp (log2)
             s_ids[k] = trow(g, g.ids[e0 + k]);
             s_lp[k] = g.lp[e0 + k] * LOG2E;
@@ -295,7 +302,8 @@ __global__ void __launch_bounds__(NW * 32, INL ? 2 : 1) tk_leaf_forward_kernel(c
             }
         }
         if (!act) return;                                              // (no barrier past here)
-        const int h = lane & 1, Kl = g.S - 1;
+        const int gq = lane >> 2, q = lane & 3, Kl = g.S - 1;
+        const int ntK = Kl >> 3, qK = (Kl & 7) >> 1, sK = Kl & 1;     // (the rest slot's fragment place)
         int wr[NS], pl[NS];
 #pragma unroll
         for (int m = 0; m < NS; ++m) {
@@ -305,112 +313,150 @@ __global__ void __launch_bounds__(NW * 32, INL ? 2 : 1) tk_leaf_forward_kernel(c
         const float* Ab = a.tA[t] + (long)row * a.sab;
         const float* tn0 = g.tab + (long)g.nv_tab[t] * g.tab_stride;
         const long r0g = g.nv_row0[t];
+        // (a node's bulk sums: the lane of the walk that holds them, this warp's)
+        const auto bulk_of = [&](int i) -> Lse {
+            Lse r = {FLOOR, 0.f};
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const float bm = __shfl_sync(0xffffffffu, bulk[j].m, i >> 2), bsum = __shfl_sync(0xffffffffu, bulk[j].s, i >> 2);
+                if (j == (i & 3)) r = {bm, bsum};
+            }
+            return r;
+        };
+        // (a node's four lanes' sums merged, in one order in all four)
+        const auto quad = [&](Lse o) -> Lse {
+#pragma unroll
+            for (int d = 1; d <= 2; d <<= 1) {
+                const Lse r = {__shfl_xor_sync(0xffffffffu, o.m, d), __shfl_xor_sync(0xffffffffu, o.s, d)};
+                o = (lane & d) ? lse_merge(r, o) : lse_merge(o, r);
+            }
+            return o;
+        };
 #pragma unroll 1
         for (int ck = 0; ck < 128; ck += 16) {
-            const int n = blk * 128 + ck + (lane >> 1);                 // the lane pair's node
-            float4 av[8];                                              // its row of A, this lane's rank quads
-            const float4* Ar = reinterpret_cast<const float4*>(Ab + (long)n * a.sam);
+            // the tilts of the chunk's 16 nodes, 72 slots: C = A B (3xTF32), A's rows the nodes -- k-step j's
+            // columns q, q + 4 the ranks 16 (j / 2) + 4 q + 2 (j % 2) and + 1 (a lane's A one float4 a node a pair)
+            const int n1 = blk * 128 + ck + gq, n2 = n1 + 8;
+            float4 av1[4], av2[4];
+            const float4* A1 = reinterpret_cast<const float4*>(Ab + (long)n1 * a.sam);
+            const float4* A2 = reinterpret_cast<const float4*>(Ab + (long)n2 * a.sam);
 #pragma unroll
-            for (int j = 0; j < 8; ++j)
-                av[j] = 4 * (2 * j + h) < a.re ? __ldg(Ar + 2 * j + h) : make_float4(0.f, 0.f, 0.f, 0.f);
-            const auto tilt = [&](int s) -> float {                    // slot s's tilt at the node (both lanes)
-                float x0 = 0.f, x1 = 0.f, x2 = 0.f, x3 = 0.f;
-#pragma unroll
-                for (int j = 0; j < 8; ++j) {
-                    const float4 bv = *reinterpret_cast<const float4*>(&s_bt[s][4 * (2 * j + h)]);
-                    x0 = fmaf(av[j].x, bv.x, x0); x1 = fmaf(av[j].y, bv.y, x1);
-                    x2 = fmaf(av[j].z, bv.z, x2); x3 = fmaf(av[j].w, bv.w, x3);
-                }
-                const float v = (x0 + x1) + (x2 + x3);
-                return v + __shfl_xor_sync(0xffffffffu, v, 1);
-            };
-            float xv[32];                                              // this lane's head slots [32 h, 32 h + 32)
-#pragma unroll
-            for (int q = 0; q < 32; ++q) {
-                const float v0 = q < Kl ? tilt(q) : 0.f, v1 = 32 + q < Kl ? tilt(32 + q) : 0.f;
-                xv[q] = h ? v1 : v0;
+            for (int jj = 0; jj < 4; ++jj) {
+                const bool in = 16 * jj + 4 * q < a.re;
+                av1[jj] = in ? __ldg(A1 + 4 * jj + q) : make_float4(0.f, 0.f, 0.f, 0.f);
+                av2[jj] = in ? __ldg(A2 + 4 * jj + q) : make_float4(0.f, 0.f, 0.f, 0.f);
             }
-            const float tk = tilt(Kl);                                 // the rest's
-            // the head's logits at the node, this lane's candidates: (log theta + lp) + tilt (as the walk's order); a
-            // sample's token's, where it is one of them
-            Lse own = {FLOOR, 0.f};
-            const float* tn = tn0 + n;
-            float xt[NS];
+            float c[9][4];
 #pragma unroll
-            for (int m = 0; m < NS; ++m) xt[m] = -INFINITY;
+            for (int nt = 0; nt < 9; ++nt) c[nt][0] = c[nt][1] = c[nt][2] = c[nt][3] = 0.f;
 #pragma unroll
-            for (int q0 = 0; q0 < 32; q0 += 8) {
-                float th8[8];
+            for (int j = 0; j < 8; ++j) {
+                const int jj = j >> 1;
+                const float x[4] = {j & 1 ? av1[jj].z : av1[jj].x, j & 1 ? av2[jj].z : av2[jj].x,
+                                    j & 1 ? av1[jj].w : av1[jj].y, j & 1 ? av2[jj].w : av2[jj].y};
+                unsigned ah[4], al[4];
 #pragma unroll
-                for (int u = 0; u < 8; ++u) {
-                    const int c = 32 * h + q0 + u;
-                    th8[u] = c < g.H ? __ldg(tn + (long)s_ids[c] * g.M) : 0.f;
+                for (int u = 0; u < 4; ++u) { ah[u] = tf32_of(x[u]); al[u] = tf32_of(x[u] - __uint_as_float(ah[u])); }
+                const int r0 = 16 * jj + 4 * q + 2 * (j & 1);
+#pragma unroll
+                for (int nt = 0; nt < 9; ++nt) {
+                    const int sl = 8 * nt + gq;
+                    const unsigned bh0 = __float_as_uint(s_bh[r0 * FW_BS + sl]), bh1 = __float_as_uint(s_bh[(r0 + 1) * FW_BS + sl]);
+                    const unsigned bl0 = __float_as_uint(s_bl[r0 * FW_BS + sl]), bl1 = __float_as_uint(s_bl[(r0 + 1) * FW_BS + sl]);
+                    mma_tf32(c[nt], al, bh0, bh1);                    // (the small terms first)
+                    mma_tf32(c[nt], ah, bl0, bl1);
+                    mma_tf32(c[nt], ah, bh0, bh1);
                 }
+            }
+            // the rest slot's tilt at the lane's nodes (from the quad's lane holding it)
+            float t1 = 0.f, t2 = 0.f;
 #pragma unroll
-                for (int u = 0; u < 8; ++u) {
-                    const int c = 32 * h + q0 + u;
-                    if (c < g.H) {
-                        xv[q0 + u] = th8[u] + s_lp[c] + xv[q0 + u];
-                        lse_add(own, xv[q0 + u]);
+            for (int nt = 0; nt < 9; ++nt)
+                if (nt == ntK) { t1 = sK ? c[nt][1] : c[nt][0]; t2 = sK ? c[nt][3] : c[nt][2]; }
+            const float tk1 = __shfl_sync(0xffffffffu, t1, (lane & ~3) | qK);
+            const float tk2 = __shfl_sync(0xffffffffu, t2, (lane & ~3) | qK);
+            // the head's logits at the lane's nodes, its slots 8 nt + 2 q (+ 1): (log theta + lp) + tilt; a sample's
+            // token's, where it is one of them
+            Lse o1 = {FLOOR, 0.f}, o2 = {FLOOR, 0.f};
+            float xt1[NS], xt2[NS];
+#pragma unroll
+            for (int m = 0; m < NS; ++m) xt1[m] = xt2[m] = -INFINITY;
+            const float* tn1 = tn0 + n1;
+            const float* tn2 = tn0 + n2;
+#pragma unroll
+            for (int nt = 0; nt < 8; ++nt) {
+#pragma unroll
+                for (int sb = 0; sb < 2; ++sb) {
+                    const int cnd = 8 * nt + 2 * q + sb;
+                    if (cnd < g.H) {
+                        const long ro = (long)s_ids[cnd] * g.M;
+                        const float l = s_lp[cnd];
+                        c[nt][sb] = __ldg(tn1 + ro) + l + c[nt][sb];
+                        c[nt][2 + sb] = __ldg(tn2 + ro) + l + c[nt][2 + sb];
+                        lse_add(o1, c[nt][sb]);
+                        lse_add(o2, c[nt][2 + sb]);
                     } else {
-                        xv[q0 + u] = -INFINITY;
+                        c[nt][sb] = c[nt][2 + sb] = -INFINITY;
                     }
 #pragma unroll
                     for (int m = 0; m < NS; ++m)
-                        if (c == pl[m]) xt[m] = xv[q0 + u];
+                        if (cnd == pl[m]) { xt1[m] = c[nt][sb]; xt2[m] = c[nt][2 + sb]; }
                 }
             }
-            {                                                          // (the two halves, merged in one order)
-                const Lse o = {__shfl_xor_sync(0xffffffffu, own.m, 1), __shfl_xor_sync(0xffffffffu, own.s, 1)};
-                own = h ? lse_merge(o, own) : lse_merge(own, o);
-            }
-            const Lse bk = {s_bm[n - n0] + tk, s_bs[n - n0]};           // (the bulk's tilt the rest's)
-            const Lse none = {FLOOR, 0.f};                             // (no candidate from K to H: K = Kl)
-            const float lz0 = lse_log2(lse_merge(lse_merge(own, none), bk));
-            const float lz = lz0 == -INFINITY ? 0.f : lz0;
-            const float lbv = lse_log2(bk);
-            const float xrv = (lse_log2(lse_merge(none, bk)) - lz) * LN2;
-            if (h == 0) {
+            o1 = quad(o1);
+            o2 = quad(o2);
+            const Lse bb1 = bulk_of(ck + gq), bb2 = bulk_of(ck + gq + 8);
 #pragma unroll
-                for (int m = 0; m < NS; ++m) {
-                    if (m >= ns) continue;
-                    const long tb = (long)t * g.B + bs[m];
-                    a.lz[tb * g.M + n] = lz;
-                    a.lb[tb * g.M + n] = lbv;
-                }
-                a.tauK[((long)t * g.Bx + row) * g.M + n] = tk;
-            }
+            for (int hn = 0; hn < 2; ++hn) {                           // the lane's two nodes
+                const int n = hn ? n2 : n1;
+                const float tk = hn ? tk2 : tk1;
+                const Lse own = hn ? o2 : o1, bb = hn ? bb2 : bb1;
+                const Lse bk = {bb.m + tk, bb.s};                      // (the bulk's tilt the rest's)
+                const Lse none = {FLOOR, 0.f};                         // (no candidate from K to H: K = Kl)
+                const float lz0 = lse_log2(lse_merge(lse_merge(own, none), bk));
+                const float lz = lz0 == -INFINITY ? 0.f : lz0;
+                const float lbv = lse_log2(bk);
+                const float xrv = (lse_log2(lse_merge(none, bk)) - lz) * LN2;
+                if (q == 0) {
 #pragma unroll
-            for (int m = 0; m < NS; ++m) {                             // the node values: log P(x | i)
-                if (m >= ns || miss[m]) continue;
-                const int p = pl[m];
-                float x = -INFINITY;
-                bool mine = h == 0;
-                if (p < g.H) {                                         // (the head: the lane holding its slot)
-                    mine = (p >> 5) == h;
-                    x = xt[m];
-                } else if (p != INT_MAX && mine) {
-                    x = __ldg(tn + (long)trow(g, g.ids[e0 + p]) * g.M) + g.lp[e0 + p] * LOG2E + tk;
-                }
-                if (mine) a.node_mars[(r0g + n) * g.B + bs[m]] = (x - lz) * LN2;
-            }
-#pragma unroll
-            for (int m = 0; m < NS; ++m) {                             // the slots' log-weights: this lane's half of
-                if (wr[m] < 0) continue;                               // the row, the head's below K, K the rest's,
-                float* out = a.logw + ((long)wr[m] * g.M + n) * LW_STRIDE;   // past it 0
-#pragma unroll
-                for (int q = 0; q < 32; q += 4) {
-                    float v[4];
-#pragma unroll
-                    for (int u = 0; u < 4; ++u) {
-                        const int s = 32 * h + q + u;
-                        v[u] = s < g.K ? (s < g.C ? (xv[q + u] - lz) * LN2 : -INFINITY) : (s == g.K ? xrv : 0.f);
+                    for (int m = 0; m < NS; ++m) {
+                        if (m >= ns) continue;
+                        const long tb = (long)t * g.B + bs[m];
+                        a.lz[tb * g.M + n] = lz;
+                        a.lb[tb * g.M + n] = lbv;
                     }
-                    st4(out + 32 * h + q, v[0], v[1], v[2], v[3]);
+                    a.tauK[((long)t * g.Bx + row) * g.M + n] = tk;
                 }
-                if (h == 1) {
-                    st4(out + 64, g.K == 64 ? xrv : 0.f, 0.f, 0.f, 0.f);
-                    st4(out + 68, 0.f, 0.f, 0.f, 0.f);
+                const float* tn = hn ? tn2 : tn1;
+#pragma unroll
+                for (int m = 0; m < NS; ++m) {                         // the node values: log P(x | i)
+                    if (m >= ns || miss[m]) continue;
+                    const int p = pl[m];
+                    float xx = -INFINITY;
+                    bool mine = q == 0;
+                    if (p < g.H) {                                     // (the head: the lane holding its slot)
+                        mine = q == ((p & 7) >> 1);
+                        xx = hn ? xt2[m] : xt1[m];
+                    } else if (p != INT_MAX && mine) {
+                        xx = __ldg(tn + (long)trow(g, g.ids[e0 + p]) * g.M) + g.lp[e0 + p] * LOG2E + tk;
+                    }
+                    if (mine) a.node_mars[(r0g + n) * g.B + bs[m]] = (xx - lz) * LN2;
+                }
+#pragma unroll
+                for (int m = 0; m < NS; ++m) {                         // the slots' log-weights: the lane's pairs of
+                    if (wr[m] < 0) continue;                           // the row, the head's below K, K the rest's,
+                    float* out = a.logw + ((long)wr[m] * g.M + n) * LW_STRIDE;   // past it 0
+#pragma unroll
+                    for (int nt = 0; nt < 9; ++nt) {
+                        float v[2];
+#pragma unroll
+                        for (int sb = 0; sb < 2; ++sb) {
+                            const int sl = 8 * nt + 2 * q + sb;
+                            v[sb] = sl < g.K ? (sl < g.C ? (c[nt][2 * hn + sb] - lz) * LN2 : -INFINITY)
+                                             : (sl == g.K ? xrv : 0.f);
+                        }
+                        *reinterpret_cast<float2*>(out + 8 * nt + 2 * q) = make_float2(v[0], v[1]);
+                    }
                 }
             }
         }
@@ -1591,8 +1637,8 @@ std::vector<torch::Tensor> top_k_leaf_forward(torch::Tensor tab, torch::Tensor n
     const dim3 grid = a.pos_y ? dim3((unsigned)B, (unsigned)T, gz) : dim3((unsigned)T, (unsigned)B, gz);
     const auto stream = at::cuda::getCurrentCUDAStream();
     TORCH_CHECK(!inl || a.lws == LW_STRIDE, "top_k leaf: the tilts made in the forward: the slots' rows 72 wide");
-    if (inl && a.ord != nullptr) tk_leaf_forward_kernel<2, true><<<grid, NW * 32, 0, stream>>>(a);
-    else if (inl) tk_leaf_forward_kernel<1, true><<<grid, NW * 32, 0, stream>>>(a);
+    if (inl && a.ord != nullptr) tk_leaf_forward_kernel<2, true><<<grid, NW * 32, FW_SMEM, stream>>>(a);
+    else if (inl) tk_leaf_forward_kernel<1, true><<<grid, NW * 32, FW_SMEM, stream>>>(a);
     else if (a.ord != nullptr) tk_leaf_forward_kernel<2, false><<<grid, NW * 32, 0, stream>>>(a);
     else tk_leaf_forward_kernel<1, false><<<grid, NW * 32, 0, stream>>>(a);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
