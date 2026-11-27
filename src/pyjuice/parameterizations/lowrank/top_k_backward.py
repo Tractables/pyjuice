@@ -162,7 +162,7 @@ def terms(A, Bm, G, tab, element_mars, geo, slot, rows, logw_rows, nf, emap, gra
     tab.setdefault("LTc", LTc)
     if stash is None:
         stash = tkf.forward(A_, ops, None, 0, True, counts)
-    alpha, beta, acnt, ao, bo, hrow = stash
+    alpha, beta, acnt, ao, bo, hrow, alpha16, beta16, invd = stash
     # the node flows: into the stash's ao, bo, and beside the masked samples' posterior where that lies in their leaf's
     # buffer; fl [B, M] the flows themselves (a masked sample's terms' factor in the passes below), fmx [B] their largest
     Rm = rows.numel()
@@ -175,14 +175,14 @@ def terms(A, Bm, G, tab, element_mars, geo, slot, rows, logw_rows, nf, emap, gra
         drow, sgn = _fold_operands(gviews, fold, B, dev)
         dests = [g if _dest_ok(g) else torch.zeros(g.shape, dtype = torch.float32, device = dev) for g in grads]
         mod.top_k_bw_grads(A_, AH, BP, E, ev, LTh, LTc, mitems, oitems, noitems, slot32, alpha, beta, ao, bo, hrow,
-                           fl, fmx, drow, sgn, EF, *dests)
+                           fl, fmx, drow, sgn, EF, *dests, alpha16, beta16, invd)
         for g, d in zip(grads, dests):
             if d is not g:
                 g.add_(d.to(g.dtype))
     else:
         none = torch.empty(0, dtype = torch.float32, device = dev)
         mod.top_k_bw_grads(A_, AH, BP, E, ev, LTh, LTc, mitems, oitems, noitems, slot32, alpha, beta, ao, bo, hrow,
-                           fl, fmx, none, none, EF, none, none, none)
+                           fl, fmx, none, none, EF, none, none, none, alpha16, beta16, invd)
     flows = None
     if want_flows:
         KP = BP.size(1)
