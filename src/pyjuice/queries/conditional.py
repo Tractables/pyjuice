@@ -4,6 +4,7 @@ import torch
 from typing import Union, Callable, Optional, Sequence
 from functools import partial
 
+from pyjuice.layer.parameterized_sum_layer import QUERY_RECORDS_KWARG
 from pyjuice.model import TensorCircuit
 from .base import query
 from . import distributions
@@ -57,6 +58,8 @@ def conditional(pc: TensorCircuit, data: torch.Tensor, missing_mask: Optional[to
     _wrapped_bk_input_fn = partial(_conditional_bk_input_fn, outputs = outputs)
 
     kwargs["target_vars"] = target_vars
+    # (what the inner layers' backward hands the input layers' read-out: `SumParameterization.input_conditional`)
+    kwargs[QUERY_RECORDS_KWARG] = dict()
 
     query(pc, inputs = data, run_backward = True,
           fw_input_fn = _conditional_fw_input_fn if fw_input_fn is None else fw_input_fn,

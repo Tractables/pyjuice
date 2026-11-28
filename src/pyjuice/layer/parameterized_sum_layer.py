@@ -39,6 +39,12 @@ EXTERNAL_PARAMS_ROWS_KWARG = "external_params_rows"
 # its sign (the destinations' `fold`; `SumParameterization.takes_external_rows`)
 EXTERNAL_PARAMS_GRAD_SIGNS_KWARG = "_external_params_grad_signs"
 
+# Query kwarg (private: `juice.queries.conditional`'s and `juice.queries.sample`'s) -- a dict an inner layer's pass
+# records into what an input layer's read-out or draw needs of it, keyed as the two agree (`LowRank(top_k)`: a reading
+# sum's posterior counts of its leaf's slots, `SumParameterization.input_conditional`; the slot its draw took,
+# `SumParameterization.input_sample`); the sampler's also holds `"conditional"`
+QUERY_RECORDS_KWARG = "_query_records"
+
 # The flat staging buffer the views point into, supplied by the PC so that kernels spanning several
 # nodes can address it directly instead of taking one pointer per node
 EXTERNAL_PARAMS_BUFFER_KWARG = "sum_external_params_buffer"

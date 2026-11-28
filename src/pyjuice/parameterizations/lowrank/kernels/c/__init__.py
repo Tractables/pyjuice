@@ -166,7 +166,9 @@ def get_top_k_module():
 
 
 _top_k_leaf_module = None
+_top_k_walk_module = None
 _top_k_leaf_attempted = False
+_top_k_walk_attempted = False
 
 
 def get_top_k_leaf_module():
@@ -208,6 +210,45 @@ def get_top_k_leaf_module():
 _top_k_tilt_module = None
 _top_k_tilt_attempted = False
 
+
+
+def get_top_k_walk_module():
+    """`juice.queries.sample`'s walk of a run of `LowRank(top_k)` levels, a CTA a sample (`lowrank_top_k_walk.cu`), or
+    None if unavailable (warns once): the walk then takes its Triton kernel (`top_k_query_kernels`). Plain CUDA."""
+    global _top_k_walk_module, _top_k_walk_attempted
+
+    if _top_k_walk_attempted:
+        return _top_k_walk_module
+
+    _top_k_walk_attempted = True
+
+    if not ENABLE_CUDA_KERNELS:
+        return None
+
+    import torch
+    if not torch.cuda.is_available():
+        return None
+
+    flags = _compile_flags()
+    if flags is None:
+        return None
+
+    from pyjuice.utils.cuda_ext import jit_load
+    try:
+        _top_k_walk_module = jit_load(
+            "pyjuice_lowrank_top_k_walk_cuda",
+            sources = [os.path.join(_THIS_DIR, "lowrank_top_k_walk.cu")],
+            extra_cuda_cflags = flags, verbose = False)
+    except Exception as e:
+        warnings.warn(
+            f"pyjuice CUDA kernel 'pyjuice_lowrank_top_k_walk_cuda' failed to compile ({type(e).__name__}: {e}). "
+            "The `LowRank(top_k)` walk takes its Triton kernel.", RuntimeWarning)
+        _top_k_walk_module = None
+    return _top_k_walk_module
+
+
+_top_k_tilt_module = None
+_top_k_tilt_attempted = False
 
 def get_top_k_tilt_module():
     """`LowRank(top_k)` soft-evidence leaves' tilt products (`lowrank_top_k_tilt.cu`: the forward's tilts log2 e (A B)^T

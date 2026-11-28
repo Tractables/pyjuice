@@ -287,6 +287,27 @@ class SumParameterization():
         """
         raise NotImplementedError(f"{self.get_signature()} does not parameterize input nodes.")
 
+    def input_conditional(self, layer, node_flows, kwargs, rows: dict, num_rows: int):
+        """
+        `juice.queries.conditional` of an input layer whose node vectors were given tensors (:func:`input_forward_replaces`):
+        `[B, num_rows, num_cats]`, the posterior of each target variable `v` in row `rows[v]`, from the backward's
+        log-space `node_flows`; the rows of the variables the layer has none of, zero. `kwargs` holds what the inner
+        layers' backward recorded for it (`QUERY_RECORDS_KWARG`).
+        """
+        raise NotImplementedError(f"{self.get_signature()} does not answer conditional queries of input nodes.")
+
+    def input_sample(self, layer, samples, node_flows, kwargs, seed = None) -> bool:
+        """
+        `juice.queries.sample`'s draw of an input layer: a value for each sample's selected node of the layer (`node_flows`
+        1 there) into `samples [num_vars, B]`; True, done. False (the default): the distribution's own draw -- refused
+        where the layer's node vectors were given tensors (:func:`input_forward_replaces`), which it would ignore.
+        `kwargs` holds what the inner layers' draws recorded for it (`QUERY_RECORDS_KWARG`).
+        """
+        if self.input_forward_replaces(layer, kwargs):
+            raise NotImplementedError(f"{self.get_signature()} does not draw samples of input nodes it was given "
+                                      f"tensors for.")
+        return False
+
     def tensor_shapes(self, ns, batch_size: int) -> Tuple[Tuple[int,...],...]:
         """
         Shapes of the external tensors this parameterization consumes, for `ns` at `batch_size`, in
@@ -1090,6 +1111,16 @@ class SumParameterization():
             f"per-sample parameters and quietly return samples from a different distribution than "
             f"the forward pass scores, so it is refused instead."
         )
+
+    def sample_levels(self, pc, plan, layer_id: int, node_samples, seed_ptr, conditional: bool, kwargs: dict) -> int:
+        """
+        Take over the structural top-down pass (`juice.queries.sample`) from inner layer group `layer_id` -- a sum group
+        whose layer has this parameterization -- down: a run of levels drawn by the parameterization itself (one
+        launch for many levels, where per-level launches would be the pass's cost), the frontier `node_samples` left as
+        the scoped pass would leave it. Returns the number of layer groups taken; 0 (the default): none, the scoped
+        pass draws the group itself.
+        """
+        return 0
 
     def sample_layer_pairs(self, layer, ns_tensors, node_mars, element_mars, params, node_samples,
                            element_samples, ind_target, ind_n, ind_b, conditional: bool = False,

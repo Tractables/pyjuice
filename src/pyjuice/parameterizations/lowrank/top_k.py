@@ -35,6 +35,10 @@ from typing import Optional
 #: the torch passes' dtype: float32 (fast: the default where no kernel serves) or float64 (the reference: tests, checks)
 PASSES_DTYPE = torch.float32
 
+#: A leaf layer's record of the torch forward's tokens: `dict(B, place = {id(node vector): [B] long})`, each sample's
+#: token's place among its candidates, -1 none of them, -2 missing
+TOKENS = "_lr_top_k_tokens"
+
 
 def _d(t: torch.Tensor) -> torch.Tensor:
     return t.to(PASSES_DTYPE)
@@ -137,12 +141,14 @@ def leaf_forward(desc, layer, data: torch.Tensor, node_mars: torch.Tensor, kwarg
     """The values of the input layer's node vectors that were given tensors, written over the shared forward's (the
     layer's missing mask applies after). `data` `[num_vars, B]`, `kwargs` the evidence as the caller gave it."""
     from . import top_k_leaf_fused
+    layer.__dict__.pop(TOKENS, None)
     if top_k_leaf_fused.leaf_forward(desc, layer, data, node_mars, kwargs):
         return None
     staged = _staged(kwargs)
     if not staged:
         return None
     lp, ids = per_sample_evidence(kwargs)
+    places = {}
     for ns in layer.nodes:
         tilt = staged.get(ns)
         if tilt is None:
@@ -156,6 +162,11 @@ def leaf_forward(desc, layer, data: torch.Tensor, node_mars: torch.Tensor, kwarg
         val = logp.gather(2, place[:, None, None].expand(-1, logp.size(1), 1))[:, :, 0]         # [B, M]
         val = torch.where(found[:, None], val, torch.full_like(val, -float("inf")))
         node_mars[s:e, :] = val.t().to(node_mars.dtype)
+        miss = _missing(kwargs.get("missing_mask"), v, val.size(0), val.device, kwargs.get("_batch_first", True))
+        places[id(ns)] = torch.where(miss, -2, torch.where(found, place, -1))
+    # (the tokens' places, for a conditional draw on this forward: `top_k_queries.forward_places`; the kernels' forward
+    # keeps them in its state)
+    layer.__dict__[TOKENS] = dict(B = node_mars.size(1), place = places)
     return None
 
 
@@ -340,6 +351,7 @@ def sum_backward(desc, layer, ns_tensors, ns_grad_tensors, node_flows, element_f
     gradient (summed over i), the tilt's, and the leaf's EM statistics there, F+ += rho, F- += f P_b(c | i).
     """
     from . import top_k_leaf_fused, top_k_backward, top_k_fused
+    from pyjuice.layer.parameterized_sum_layer import QUERY_RECORDS_KWARG
     dev = node_flows.device
     sibs = layer.__dict__["_sibling_leaves"]
     gviews, fresh = _grads_kw(kwargs)
@@ -400,6 +412,9 @@ def sum_backward(desc, layer, ns_tensors, ns_grad_tensors, node_flows, element_f
                 if want_denom:
                     desc._scatter_add(geo, denom_param_flows, d0, _safe_div(Fm, theta).float())
         if rows.numel() > 0 and a_rows is not None and not top_k_leaf_fused.add_counts(sib, desc.top_k, B, a_rows):
+            records = kwargs.get(QUERY_RECORDS_KWARG)               # (a conditional query's: the leaf's read-out)
+            if records is not None:
+                records[("top_k_slot_counts", id(sib["ns"]))] = (rows, a_rows)
             f = _d(nf.t()).exp() if f is None else f
             _leaf_terms(desc, sib, rows, logp, tilt, logw_rows, a_rows, f[rows], kwargs, glp, gviews, fresh, want_flows,
                         pm)

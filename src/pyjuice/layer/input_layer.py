@@ -890,6 +890,11 @@ class InputLayer(Layer, nn.Module):
         node_flows:    [num_nodes, B]
         """
 
+        # (an external parameterization's draw where its node vectors were given tensors)
+        if self.parameterization is not None and self.parameterization.input_sample(self, samples, node_flows, kwargs,
+                                                                                     seed = seed):
+            return None
+
         if params is None:
             params = self.params
         else:

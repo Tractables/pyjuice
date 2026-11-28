@@ -50,6 +50,18 @@ def _log_normalizers(layer, inputs: torch.Tensor, node_mars: torch.Tensor, kwarg
     return scratch[sid:eid]
 
 
+def _parameterized_backward(layer, node_flows: torch.Tensor, kwargs: dict) -> torch.Tensor:
+    """The conditional of a layer whose node vectors were all given external tensors: its parameterization's
+    (`SumParameterization.input_conditional`)."""
+    if kwargs.get("soft_evidence_value_mask", None) is not None:
+        raise NotImplementedError(f"A conditional query of a `SoftEvidenceCategorical` layer under "
+                                  f"{layer.parameterization.get_signature()} with `soft_evidence_value_mask`.")
+    tv = kwargs.get("target_vars")
+    tv = range(layer_facts(layer).num_vars) if tv is None else [int(v) for v in tv]
+    rows = {v: r for r, v in enumerate(tv)}                                    # (a variable listed twice: its last row)
+    return layer.parameterization.input_conditional(layer, node_flows, kwargs, rows, len(tv))
+
+
 def backward(layer, inputs: torch.Tensor, node_flows: torch.Tensor, node_mars: torch.Tensor,
              params: Optional[torch.Tensor] = None, **kwargs):
 
@@ -58,6 +70,9 @@ def backward(layer, inputs: torch.Tensor, node_flows: torch.Tensor, node_mars: t
         raise ValueError("A conditional query of a `SoftEvidenceCategorical` layer needs its `categorical_evidence_logp`.")
     if kwargs.get("categorical_evidence_logp_grad", None) is not None:
         raise ValueError("A conditional query does not compute `categorical_evidence_logp_grad`.")
+
+    if layer.parameterization is not None and layer.parameterization.input_forward_replaces(layer, kwargs):
+        return _parameterized_backward(layer, node_flows, kwargs)
 
     if params is None:
         params = layer.params

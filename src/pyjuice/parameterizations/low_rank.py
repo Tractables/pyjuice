@@ -226,6 +226,37 @@ class LowRank(_ForwardMixin, _BackwardMixin, _DenominatorsMixin, SumParameteriza
         return lowrank_top_k.leaf_backward(self, layer, data, node_flows, kwargs, logspace_flows, missing_mask, batch_first,
                                            compute_param_flows)
 
+    def input_conditional(self, layer, node_flows, kwargs, rows: dict, num_rows: int):
+        """The conditional of the leaf's variables over their candidates (`lowrank/top_k_queries.py`)."""
+        from .lowrank import top_k_queries
+        return top_k_queries.conditional(self, layer, node_flows, kwargs, rows, num_rows)
+
+    def input_sample(self, layer, samples, node_flows, kwargs, seed = None) -> bool:
+        """The leaf's draw where its node vectors were given tensors: each selected node's candidate, within the slot the
+        sum beside it drew (`lowrank/top_k_queries.py`); False (none given), the plain leaf's."""
+        if not self.input_forward_replaces(layer, kwargs):
+            return super().input_sample(layer, samples, node_flows, kwargs, seed = seed)
+        from .lowrank import top_k_queries
+        top_k_queries.sample_leaves(self, layer, samples, node_flows, kwargs)
+        return True
+
+    def sample_levels(self, pc, plan, layer_id: int, node_samples, seed_ptr, conditional: bool, kwargs: dict) -> int:
+        """With `top_k`: a run of its sum levels walked by one kernel, a program a sample (`lowrank/top_k_queries.py`)."""
+        if self.top_k is None:
+            return 0
+        from .lowrank import top_k_queries
+        return top_k_queries.walk(pc, plan, layer_id, node_samples, seed_ptr, conditional, kwargs)
+
+    def sample_layer(self, layer, ns_tensors, node_mars, element_mars, params, node_samples, element_samples, rows,
+                     erows, seed_ptr, conditional: bool = False, **kwargs) -> None:
+        """With `top_k`: each selected node's slot and child drawn together (`lowrank/top_k_queries.py`)."""
+        if self.top_k is None:
+            return super().sample_layer(layer, ns_tensors, node_mars, element_mars, params, node_samples,
+                                        element_samples, rows, erows, seed_ptr, conditional = conditional, **kwargs)
+        from .lowrank import top_k_queries
+        top_k_queries.sample_sums(self, layer, ns_tensors, element_mars, params, node_samples, element_samples, rows,
+                                  erows, seed_ptr, conditional, kwargs)
+
     def storage_owner(self, ns):
         """With `tie_external`, every copy of a tied node reads one shared pair of tensors -- the source's."""
         if self.tie_external and ns.is_tied():

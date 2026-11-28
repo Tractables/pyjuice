@@ -6,7 +6,7 @@ import random
 from collections import OrderedDict
 from typing import Optional
 
-from pyjuice.layer.parameterized_sum_layer import ParameterizedSumLayer
+from pyjuice.layer.parameterized_sum_layer import ParameterizedSumLayer, QUERY_RECORDS_KWARG
 from pyjuice.model import TensorCircuit
 from pyjuice.model.tensorcircuit import device_grad_controller
 
@@ -302,8 +302,21 @@ def _scoped_top_down(pc, plan, node_samples, element_samples, seed_ptr, conditio
     node_samples.fill_(-1)
     node_samples[plan.root_row, :] = pc.root_ns._output_ind_range[0]
 
-    for layer_id in range(len(pc.inner_layer_groups) - 1, -1, -1):
+    layer_id = len(pc.inner_layer_groups) - 1
+    while layer_id >= 0:
         layer_group = pc.inner_layer_groups[layer_id]
+
+        # A sum group whose layer's parameterization walks a run of levels itself (`sample_levels`): those groups taken
+        taken = 0
+        if layer_group.is_sum() and not do_calibration:
+            layers = list(layer_group)
+            if len(layers) == 1 and isinstance(layers[0], ParameterizedSumLayer) and \
+                    layers[0].parameterization is not None:
+                taken = layers[0].parameterization.sample_levels(pc, plan, layer_id, node_samples, seed_ptr,
+                                                                 conditional, kwargs)
+        if taken > 0:
+            layer_id -= taken
+            continue
 
         if layer_group.is_sum():
             element_samples.fill_(-1)
@@ -349,6 +362,8 @@ def _scoped_top_down(pc, plan, node_samples, element_samples, seed_ptr, conditio
                         plan.prod_crows[id(layer)][partition_id],
                         node_samples, element_samples, rows
                     )
+
+        layer_id -= 1
 
 
 def sample(pc: TensorCircuit, num_samples: Optional[int] = None, conditional: bool = False,
@@ -491,6 +506,8 @@ def _sample(pc, num_samples, conditional, use_cudagraph, fuse_top_down, _use_sco
     _drop_caches_if_moved(pc)
 
     pc._check_external_params_kwargs(kwargs)
+    # (what a sum layer's draw hands the input layers' draws: `SumParameterization.input_sample`)
+    kwargs[QUERY_RECORDS_KWARG] = {"conditional": bool(conditional)}
     if conditional:
         pc._resolve_backward_external_params(kwargs)
     else:
