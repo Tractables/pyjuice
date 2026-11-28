@@ -53,6 +53,9 @@ def query(pc: TensorCircuit, inputs: torch.Tensor,
     assert bk_input_fn is not None
     kwargs.setdefault("logspace_flows", False)
     kwargs.setdefault("allow_modify_flows", True)
+    # (a query reads the flows alone: no gradients of external parameters -- the backward's default makes them, MEASURED
+    # on the Codpula head's circuit, 96 samples: its dA kernels and a buffer the size of the staged tensors)
+    kwargs.setdefault("compute_external_grads", False)
     pc.backward(inputs, input_layer_fn = bk_input_fn, compute_param_flows = False, **kwargs)
 
     return None
