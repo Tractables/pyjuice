@@ -743,41 +743,43 @@ class _ExternalParamsMixin:
                     f"'{_claimed[ns]}' and '{key}'."
                 _claimed[ns] = key
 
-        # The nodes whose parameterization reads its tensors IN PLACE (`SumParameterization.reads_in_place`; the
-        # forward's own staging alone): the layers are handed views of the caller's tensors -- a group's split along
-        # its axis -- and nothing is copied; the caller's tensors' versions are noted for the backward.
+        # The nodes whose parameterization reads its tensors IN PLACE (`SumParameterization.reads_in_place`): the
+        # layers are handed views of the caller's tensors -- a group's split along its axis -- and nothing is copied;
+        # the caller's tensors' versions are noted for the backward. (An unconditional draw's staging too -- its own
+        # call's views, the forward's state untouched: MEASURED, the Codpula head at 96 samples, 4.8 ms of copies a
+        # draw, 3.7 GB.)
         in_place, in_place_versions = {}, []
-        if owns_forward_state:
-            keys = frozenset(ns2tensors)
-            ns2tensors, in_place, in_place_versions = self._take_in_place(
-                ns2tensors, batch_size, self._external_params_device())
-            if in_place and not ns2tensors:
-                # (every entry read in place: what the steps below make of it -- the nodes whose storage group was
-                # supplied, each handed its group's tensors, in the buffer's order -- from a plan kept per (keys,
-                # batch size), no node looked at one by one. And no staging buffer: nothing is copied into one, and
-                # the layers that read it are those of nodes staged by copy, none here -- not allocating it is its
-                # size kept off the device, MEASURED 1.76 GB for the Codpula head at 48 blocks, and as much again for
-                # the gradient buffer, `_init_external_params_grads`)
-                memo = self.__dict__.setdefault("_ext_in_place_plans", {})
-                plan = memo.get((keys, batch_size))
-                if plan is None:
-                    member = {}
-                    for ns in in_place:
-                        member[self._ext_ns_static(ns)[1]] = ns
-                    pairs = tuple((ns, member[self._ext_ns_static(ns)[1]])
-                                  for ns in self._external_params_layout(batch_size)[1]
-                                  if self._ext_ns_static(ns)[1] in member)
-                    plan = memo[(keys, batch_size)] = (
-                        pairs, frozenset(member), all(ns.parameterization.initializes_grads(ns) for ns, _ in pairs))
-                views = StagedExternalParams({ns: in_place[m] for ns, m in plan[0]})
-                views.in_place_versions = in_place_versions
-                views.in_place_owners = set(plan[1])
-                views.in_place_plan = plan[0]
-                views.in_place_initializes = plan[2]
-                kwargs[EXTERNAL_PARAMS_KWARG] = views
-                kwargs[EXTERNAL_PARAMS_BUFFER_KWARG] = None
+        keys = frozenset(ns2tensors)
+        ns2tensors, in_place, in_place_versions = self._take_in_place(
+            ns2tensors, batch_size, self._external_params_device())
+        if in_place and not ns2tensors:
+            # (every entry read in place: what the steps below make of it -- the nodes whose storage group was
+            # supplied, each handed its group's tensors, in the buffer's order -- from a plan kept per (keys,
+            # batch size), no node looked at one by one. And no staging buffer: nothing is copied into one, and
+            # the layers that read it are those of nodes staged by copy, none here -- not allocating it is its
+            # size kept off the device, MEASURED 1.76 GB for the Codpula head at 48 blocks, and as much again for
+            # the gradient buffer, `_init_external_params_grads`)
+            memo = self.__dict__.setdefault("_ext_in_place_plans", {})
+            plan = memo.get((keys, batch_size))
+            if plan is None:
+                member = {}
+                for ns in in_place:
+                    member[self._ext_ns_static(ns)[1]] = ns
+                pairs = tuple((ns, member[self._ext_ns_static(ns)[1]])
+                              for ns in self._external_params_layout(batch_size)[1]
+                              if self._ext_ns_static(ns)[1] in member)
+                plan = memo[(keys, batch_size)] = (
+                    pairs, frozenset(member), all(ns.parameterization.initializes_grads(ns) for ns, _ in pairs))
+            views = StagedExternalParams({ns: in_place[m] for ns, m in plan[0]})
+            views.in_place_versions = in_place_versions
+            views.in_place_owners = set(plan[1])
+            views.in_place_plan = plan[0]
+            views.in_place_initializes = plan[2]
+            kwargs[EXTERNAL_PARAMS_KWARG] = views
+            kwargs[EXTERNAL_PARAMS_BUFFER_KWARG] = None
+            if owns_forward_state:
                 self._staged_external_params = views
-                return None
+            return None
 
         views = StagedExternalParams(self._external_params_views(
             name = name, batch_size = batch_size
