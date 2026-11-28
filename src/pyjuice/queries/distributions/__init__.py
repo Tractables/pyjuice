@@ -8,7 +8,9 @@ layers they call the module of each layer's distribution, found by the layer's `
   into its rows of ``node_mars``; a module that sets ``NODE_RUNS`` also takes ``node_runs`` -- ``(start, end)`` ranges
   of the layer's nodes, the only ones it must compute (see :meth:`~pyjuice.layer.InputLayer._forward_runs`);
 * ``backward(layer, inputs, node_flows, node_mars, params = None, **kwargs) -> torch.Tensor``: the conditional
-  probabilities of the query's target variables (``target_vars`` in ``kwargs``), from the flows of the layer's nodes.
+  probabilities of the query's target variables (``target_vars`` in ``kwargs``), from the flows of the layer's nodes;
+  a module that sets ``OVER_CANDIDATES`` also takes ``over_candidates`` (the probabilities of each target's candidates,
+  `[B, targets, C]`, in place of its categories').
 
 A layer whose distribution has no module here is refused: the query then needs its own ``fw_input_fn`` /
 ``bk_input_fn``.
@@ -40,10 +42,16 @@ def forward(layer, inputs, node_mars, **kwargs) -> None:
     module.forward(layer, inputs, node_mars, **kwargs)
 
 
-def backward(layer, inputs, node_flows, node_mars, **kwargs):
-    """The conditional probabilities the input layer ``layer`` gives, by its distribution's module."""
+def backward(layer, inputs, node_flows, node_mars, over_candidates: bool = False, **kwargs):
+    """The conditional probabilities the input layer ``layer`` gives, by its distribution's module -- over the
+    candidates of its soft evidence where ``over_candidates`` (a module that sets ``OVER_CANDIDATES``)."""
     module = MODULES.get(layer.dist_signature)
     if module is None:
         raise TypeError(f"Unknown/unsupported layer type {type(layer)} for the backward pass. Please implement and provide your own `bk_input_fn`.")
+    if over_candidates:
+        if not getattr(module, "OVER_CANDIDATES", False):
+            raise ValueError(f"`over_candidates`: the conditional of a {layer.dist_signature} layer is over its "
+                             f"categories; only soft evidence over candidates (`SoftEvidenceCategorical`) has them.")
+        return module.backward(layer, inputs, node_flows, node_mars, layer.params, over_candidates = True, **kwargs)
 
     return module.backward(layer, inputs, node_flows, node_mars, layer.params, **kwargs)

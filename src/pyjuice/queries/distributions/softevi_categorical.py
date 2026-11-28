@@ -50,7 +50,11 @@ def _log_normalizers(layer, inputs: torch.Tensor, node_mars: torch.Tensor, kwarg
     return scratch[sid:eid]
 
 
-def _parameterized_backward(layer, node_flows: torch.Tensor, kwargs: dict) -> torch.Tensor:
+# `backward` takes `over_candidates` (see `queries.distributions`)
+OVER_CANDIDATES = True
+
+
+def _parameterized_backward(layer, node_flows: torch.Tensor, kwargs: dict, over_candidates: bool = False) -> torch.Tensor:
     """The conditional of a layer whose node vectors were all given external tensors: its parameterization's
     (`SumParameterization.input_conditional`)."""
     if kwargs.get("soft_evidence_value_mask", None) is not None:
@@ -59,11 +63,12 @@ def _parameterized_backward(layer, node_flows: torch.Tensor, kwargs: dict) -> to
     tv = kwargs.get("target_vars")
     tv = range(layer_facts(layer).num_vars) if tv is None else [int(v) for v in tv]
     rows = {v: r for r, v in enumerate(tv)}                                    # (a variable listed twice: its last row)
-    return layer.parameterization.input_conditional(layer, node_flows, kwargs, rows, len(tv))
+    return layer.parameterization.input_conditional(layer, node_flows, kwargs, rows, len(tv),
+                                                    over_candidates = over_candidates)
 
 
 def backward(layer, inputs: torch.Tensor, node_flows: torch.Tensor, node_mars: torch.Tensor,
-             params: Optional[torch.Tensor] = None, **kwargs):
+             params: Optional[torch.Tensor] = None, over_candidates: bool = False, **kwargs):
 
     assert kwargs.get("logspace_flows", False), "The conditional backward reads log-space flows (`logspace_flows = True`)."
     if kwargs.get("categorical_evidence_logp", None) is None:
@@ -72,7 +77,7 @@ def backward(layer, inputs: torch.Tensor, node_flows: torch.Tensor, node_mars: t
         raise ValueError("A conditional query does not compute `categorical_evidence_logp_grad`.")
 
     if layer.parameterization is not None and layer.parameterization.input_forward_replaces(layer, kwargs):
-        return _parameterized_backward(layer, node_flows, kwargs)
+        return _parameterized_backward(layer, node_flows, kwargs, over_candidates)
 
     if params is None:
         params = layer.params
@@ -119,6 +124,9 @@ def backward(layer, inputs: torch.Tensor, node_flows: torch.Tensor, node_mars: t
     m = logits.amax(dim = 2, keepdim = True)
     probs = torch.exp(logits - torch.where(torch.isfinite(m), m, 0.0))
     probs /= (probs.sum(dim = 2, keepdim = True) + 1e-12)
+
+    if over_candidates:                                                     # (each target's candidates' own)
+        return probs if cat_ids is not None else probs[:, :, :evidence.size(2)].contiguous()
 
     if cat_ids is not None:
         probs = torch.zeros([batch_size, num_target_vars, num_cats], dtype = probs.dtype, device = device) \

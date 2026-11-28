@@ -287,12 +287,13 @@ class SumParameterization():
         """
         raise NotImplementedError(f"{self.get_signature()} does not parameterize input nodes.")
 
-    def input_conditional(self, layer, node_flows, kwargs, rows: dict, num_rows: int):
+    def input_conditional(self, layer, node_flows, kwargs, rows: dict, num_rows: int, over_candidates: bool = False):
         """
         `juice.queries.conditional` of an input layer whose node vectors were given tensors (:func:`input_forward_replaces`):
         `[B, num_rows, num_cats]`, the posterior of each target variable `v` in row `rows[v]`, from the backward's
-        log-space `node_flows`; the rows of the variables the layer has none of, zero. `kwargs` holds what the inner
-        layers' backward recorded for it (`QUERY_RECORDS_KWARG`).
+        log-space `node_flows` -- with `over_candidates`, `[B, num_rows, C]` over each target's candidates (the
+        evidence's `soft_evidence_cat_ids`, in their order) --; the rows of the variables the layer has none of, zero.
+        `kwargs` holds what the inner layers' backward recorded for it (`QUERY_RECORDS_KWARG`).
         """
         raise NotImplementedError(f"{self.get_signature()} does not answer conditional queries of input nodes.")
 

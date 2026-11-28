@@ -28,7 +28,7 @@ LOG2E = 1.4426950408889634
 def _tk_conditional_kernel(out_ptr, s_ob, s_or, nf_ptr, lz_ptr, lb_ptr, tauk_ptr, tauf_ptr, tab_ptr, crow_ptr, ids_ptr,
                            lp_ptr, emap_ptr, cnt_ptr, wrow_ptr, tg_t_ptr, tg_r_ptr, tg_cnt_ptr, tg_tf_ptr, nv_tab_ptr,
                            nv_lvid_ptr, nv_row0_ptr, B, Bx, M, C, K, S, nrows, nvars, ev_mapped, x_mapped, CS,
-                           BLOCK_C: tl.constexpr, BLOCK_M: tl.constexpr):
+                           BLOCK_C: tl.constexpr, BLOCK_M: tl.constexpr, DENSE: tl.constexpr):
     pid = tl.program_id(0)
     g = pid // B                                                       # (the target)
     b = pid % B
@@ -92,14 +92,18 @@ def _tk_conditional_kernel(out_ptr, s_ob, s_or, nf_ptr, lz_ptr, lb_ptr, tauk_ptr
     acc = tl.where(cm, acc, 0.0)
     tot = tl.sum(acc, axis = 0)
     p = acc / tl.maximum(tot, 1e-30)
-    tl.atomic_add(out_ptr + b.to(tl.int64) * s_ob + r.to(tl.int64) * s_or + tok, p, mask = cm)
+    if DENSE:                                                          # (at the tokens: one twice, its shares add)
+        tl.atomic_add(out_ptr + b.to(tl.int64) * s_ob + r.to(tl.int64) * s_or + tok, p, mask = cm)
+    else:                                                              # (at the candidates' places)
+        tl.store(out_ptr + b.to(tl.int64) * s_ob + r.to(tl.int64) * s_or + offs_c, p, mask = cm)
 
 
-def conditional(st: dict, plan: dict, node_flows: torch.Tensor, staged, targets, num_rows: int, num_cats: int):
+def conditional(st: dict, plan: dict, node_flows: torch.Tensor, staged, targets, num_rows: int, num_cats: int,
+                over_candidates: bool = False):
     """The dense conditional `[B, num_rows, num_cats]` float32 of the targets `targets` -- `(node vector index, its
-    output row)` -- from the leaf layer's forward state `st`, its plan, the backward's log-space `node_flows`; `staged`
-    the tilts' tensors (made into their full tilt where a flows pair needs it). None where the state cannot serve (the
-    sums' top_k not the leaves')."""
+    output row)` -- or (`over_candidates`) `[B, num_rows, C]` over each target's candidates, from the leaf layer's
+    forward state `st`, its plan, the backward's log-space `node_flows`; `staged` the tilts' tensors (made into their
+    full tilt where a flows pair needs it). None where the state cannot serve (the sums' top_k not the leaves')."""
     from .top_k_leaf_fused import _tilts
     B, K, S, M = st["B"], st["K"], st["S"], st["lz"].size(2)
     if K != S - 1 or not targets:
@@ -125,9 +129,9 @@ def conditional(st: dict, plan: dict, node_flows: torch.Tensor, staged, targets,
     tauk = st["tauK"] if st["tauK"] is not None else tau[:, :, S - 1, :].contiguous()
     i32 = lambda xs: torch.tensor(xs, dtype = torch.int32, device = dev)
     tg = i32([[t, r, int(hc), tf_of.get(t, -1)] for (t, r), hc in zip(targets, has_cnt)]).t().contiguous()
-    out = torch.zeros(B, num_rows, num_cats, dtype = torch.float32, device = dev)
     ids, lp, emap = st["ids"], st["lp"], st["emap"]
     C = ids.size(2)
+    out = torch.zeros(B, num_rows, C if over_candidates else num_cats, dtype = torch.float32, device = dev)
     nf = node_flows if node_flows.dtype == torch.float32 and node_flows.is_contiguous() else \
         node_flows.float().contiguous()
     cnt = counts if counts is not None else torch.empty(0, dtype = torch.float32, device = dev)
@@ -136,7 +140,7 @@ def conditional(st: dict, plan: dict, node_flows: torch.Tensor, staged, targets,
         emap, cnt, st["wrow"], tg[0], tg[1], tg[2], tg[3], plan["nv_tab"], plan["nv_lvid"], plan["nv_row0"],
         B, Bx, M, C, K, S, st["tab"].size(1), ids.size(1), int(ids.size(0) != B), int(emap.numel() > 0),
         cnt.size(2) if cnt.dim() == 3 else 72,
-        BLOCK_C = triton.next_power_of_2(C), BLOCK_M = 32, num_warps = 4)
+        BLOCK_C = triton.next_power_of_2(C), BLOCK_M = 32, DENSE = not over_candidates, num_warps = 4)
     return out
 
 

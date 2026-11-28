@@ -226,10 +226,10 @@ class LowRank(_ForwardMixin, _BackwardMixin, _DenominatorsMixin, SumParameteriza
         return lowrank_top_k.leaf_backward(self, layer, data, node_flows, kwargs, logspace_flows, missing_mask, batch_first,
                                            compute_param_flows)
 
-    def input_conditional(self, layer, node_flows, kwargs, rows: dict, num_rows: int):
+    def input_conditional(self, layer, node_flows, kwargs, rows: dict, num_rows: int, over_candidates: bool = False):
         """The conditional of the leaf's variables over their candidates (`lowrank/top_k_queries.py`)."""
         from .lowrank import top_k_queries
-        return top_k_queries.conditional(self, layer, node_flows, kwargs, rows, num_rows)
+        return top_k_queries.conditional(self, layer, node_flows, kwargs, rows, num_rows, over_candidates)
 
     def input_sample(self, layer, samples, node_flows, kwargs, seed = None) -> bool:
         """The leaf's draw where its node vectors were given tensors: each selected node's candidate, within the slot the

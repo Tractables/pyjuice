@@ -297,6 +297,37 @@ def test_softevi_categorical(model, evidence):
 
 
 @cuda_only
+@pytest.mark.parametrize("evidence", ["dense_short", "topk"])
+def test_softevi_categorical_over_candidates(evidence):
+    """`over_candidates = True`: each target's answer over its candidates in their order (`soft_evidence_cat_ids`), or
+    over the evidence's first K categories -- the dense answer there, rows summing to 1."""
+    pc, V = _soft_pc("tied")
+    B, targets = 8, [1, 3]
+    inputs = _soft_evidence(B, V, **dict(dense_short = dict(K = SOFT_C - 2), topk = dict(topk = 3))[evidence])
+    data, missing = _soft_data(inputs), _missing(B, V, targets, 7)
+    dense = juice.queries.conditional(pc, data = data, missing_mask = missing, target_vars = targets, **inputs)
+    got = juice.queries.conditional(pc, data = data, missing_mask = missing, target_vars = targets,
+                                    over_candidates = True, **inputs)
+    if evidence == "topk":
+        want = dense.gather(2, inputs["soft_evidence_cat_ids"][:, targets, :])
+    else:
+        want = dense[..., :SOFT_C - 2]
+    assert got.shape == want.shape, (got.shape, want.shape)
+    assert torch.allclose(got, want, atol = 1e-6), float((got - want).abs().max())
+    assert torch.allclose(got.sum(dim = 2), torch.ones_like(got[..., 0]), atol = 1e-5)
+
+
+@cuda_only
+def test_over_candidates_needs_soft_evidence_over_candidates():
+    """A distribution whose conditional is over its categories has no candidates: `over_candidates` refused."""
+    pc, _ = _chain(lambda: dists.Categorical(num_cats = 4), 4, 8)
+    data = torch.randint(0, 4, (3, 4), device = DEV)
+    with pytest.raises(ValueError, match = "over_candidates"):
+        juice.queries.conditional(pc, data = data, missing_mask = _missing(3, 4, [1], 0), target_vars = [1],
+                                  over_candidates = True)
+
+
+@cuda_only
 @pytest.mark.parametrize("evidence", ["dense", "topk"])
 def test_softevi_categorical_value_mask(evidence):
     """A free target (value mask False): brute force observing each value with the mask True; a missing one (q):

@@ -256,6 +256,37 @@ def test_conditional_through_the_rows_map(N, evidence, readout):
 
 
 @pytest.mark.parametrize("N", [4, 128])
+@pytest.mark.parametrize("mapped", [False, True])               # (a sample its own row; samples reading 3 rows)
+def test_conditional_over_candidates_is_the_dense_answer_at_the_candidates(N, mapped, readout):
+    """`over_candidates = True`: `[B, targets, C]`, each target's answer at its candidates in their order -- the
+    candidates of the evidence's row the sample reads --, the dense answer gathered there (the definition), a target
+    listed twice in its last row only, the earlier one zero."""
+    _needs_kernels(N)
+    T, C, K = 4, 5, 2
+    if mapped:
+        pc, tab, ext, ids, lp, _, _ = _case(N, C, K, 3, 2, T = T)
+        rows = torch.tensor([2, 0, 0, 1, 2, 2, 1], device = DEV)
+        g = torch.Generator().manual_seed(3)
+        x = ids[rows].gather(2, torch.randint(0, C, (rows.numel(), T), generator = g).to(DEV)[..., None])[..., 0]
+        miss = (torch.rand(rows.numel(), T, generator = g) < 0.5).to(DEV)
+        kw, ids_b = _kw(ext, ids, lp, N, external_params_rows = rows), ids[rows]
+    else:
+        pc, tab, ext, ids, lp, x, miss = _case(N, C, K, 6, 4, T = T)
+        kw, ids_b = _kw(ext, ids, lp, N), ids
+    assert _slots_matter(miss)
+    tv = [T - 1, 0, T - 1, 1]
+    dense = conditional(pc, x, missing_mask = miss, target_vars = tv, **kw)
+    cand = conditional(pc, x, missing_mask = miss, target_vars = tv, over_candidates = True, **kw)
+    assert cand.shape == (x.size(0), len(tv), C) and cand.dtype == torch.float32, cand.shape
+    assert float(cand[:, 0].abs().max()) == 0.0
+    tvt = torch.tensor(tv, device = DEV)
+    at = dense.gather(2, ids_b[:, tvt, :])                                  # (distinct candidates: one entry a token)
+    assert float((cand[:, 1:] - at[:, 1:]).abs().max()) < 1e-6
+    assert float((cand[:, 1:].sum(dim = 2) - 1).abs().max()) < 1e-5
+    assert readout == [_READOUT[N]] * 2, readout
+
+
+@pytest.mark.parametrize("N", [4, 128])
 def test_conditional_refuses_a_value_mask(N):
     """`soft_evidence_value_mask` (a free position's p w) has no answer under the parameterization: refused."""
     _needs_kernels(N)

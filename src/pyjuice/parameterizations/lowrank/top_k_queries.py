@@ -45,10 +45,12 @@ def slot_counts(layer, ns, batch_size: int, kwargs: dict):
     return None if records is None else records.get(("top_k_slot_counts", id(ns)))
 
 
-def conditional(desc, layer, node_flows: torch.Tensor, kwargs: dict, rows: dict, num_rows: int) -> torch.Tensor:
+def conditional(desc, layer, node_flows: torch.Tensor, kwargs: dict, rows: dict, num_rows: int,
+                over_candidates: bool = False) -> torch.Tensor:
     """`[B, num_rows, V]` float32: each target variable's posterior over its candidates in its row `rows[v]`, at their
-    tokens (`SumParameterization.input_conditional`), from the log-space `node_flows` -- by the read-out's kernel from
-    the kernels' forward state where there is one (`top_k_query_kernels`), else `conditional_reference`."""
+    tokens -- with `over_candidates`, `[B, num_rows, C]` at the candidates' places -- (`SumParameterization.
+    input_conditional`), from the log-space `node_flows`: by the read-out's kernel from the kernels' forward state
+    where there is one (`top_k_query_kernels`), else `conditional_reference`."""
     from . import top_k_leaf_fused, top_k_query_kernels
     B = node_flows.size(1)
     st = top_k_leaf_fused._state(layer, B)
@@ -56,10 +58,12 @@ def conditional(desc, layer, node_flows: torch.Tensor, kwargs: dict, rows: dict,
         plan = top_k_leaf_fused._plan(layer)
         targets = [(t, rows[n["v"]]) for t, n in enumerate(plan["nodes"]) if n["v"] in rows]
         out = top_k_query_kernels.conditional(st, plan, node_flows, _staged(kwargs), targets, num_rows,
-                                              layer.dist.num_cats)
+                                              layer.dist.num_cats, over_candidates)
         if out is not None:
             return out
     probs, ids = conditional_reference(desc, layer, node_flows, kwargs, rows, num_rows)
+    if over_candidates:
+        return probs
     out = torch.zeros(B, num_rows, layer.dist.num_cats, dtype = torch.float32, device = node_flows.device)
     return out.scatter_add_(2, ids, probs)
 
