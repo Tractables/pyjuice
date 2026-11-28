@@ -58,11 +58,11 @@ STACKED = True
 #: chain, their slots' sums made off it -- where the caller says no backward follows (`_no_backward`: a query's that
 #: runs none; any other forward may be followed by `backward`, whose recompute is the throughput mode's, rounded its own
 #: way) and the batch is at most `LATENCY_MAX_B` samples (the chain latency-bound); else the throughput mode's launches
-#: (`tk_sk_kernel`). MEASURED (the Codpula head, 31 positions, RTX PRO 6000): the marginal 30%, 33%, 15% faster at 1,
-#: 2, 4 samples (9%, 2% at 5, 6), 10% slower at 8 -- a position's step never slower, but the slots' sums' launch before
-#: the chain (~42 us a sample) outgrows it
+#: (`tk_sk_kernel`). MEASURED (the Codpula head, 31 positions, RTX PRO 6000): the marginal 30%, 33%, 15%, 9%, 2% faster
+#: at 1, 2, 4, 5, 6 samples, 10% slower at 8 -- a position's step never slower, but the slots' sums' launch before the
+#: chain (~42 us a sample) outgrows it
 LATENCY = True
-LATENCY_MAX_B = 4
+LATENCY_MAX_B = 6
 
 _CACHE_KEY = "stack"               # (its entry in the leaf's pass cache: a SumStack, or False -- none serves this pass)
 _SETTLED = "_lr_top_k_settled"     # (a layer's record for its settled calls: its node vectors and their leaves)
