@@ -260,13 +260,13 @@ def test_inner_layers_never_read_an_input_only_kwarg():
             elif isinstance(node, ast.arg) and node.arg in names:
                 found.append((f.name, node.lineno, node.arg))
     # Two readers by design, neither inside a recorded pass: `LowRank(top_k)` reads the evidence of the leaf beside its
-    # sum (and its own leaves' -- the leaves' passes by its kernels too, `top_k_leaf_fused.py`), and `LowRank` is not
-    # `cuda_graph_safe` -- its layers always run eagerly; and the descriptor's INPUT-layer hooks (`input_forward` /
-    # `input_backward`) take the input layer's own keywords.
+    # sum (and its own leaves' -- the leaves' passes by its kernels too, `top_k_leaf_fused.py`; the queries' draws and
+    # read-out, `top_k_queries.py`), and `LowRank` is not `cuda_graph_safe` -- its layers always run eagerly; and the
+    # descriptor's INPUT-layer hooks (`input_forward` / `input_backward`) take the input layer's own keywords.
     from pyjuice.parameterizations import LowRank
     assert LowRank.cuda_graph_safe is False
     found = [(f, line, name) for f, line, name in found
-             if f not in ("low_rank.py", "top_k.py", "top_k_leaf_fused.py") and
+             if f not in ("low_rank.py", "top_k.py", "top_k_leaf_fused.py", "top_k_queries.py") and
              not (f == "sum_parameterization.py" and name == "missing_mask")]
     assert not found, f"inner-layer code reads input-only call kwargs: {found}"
 
