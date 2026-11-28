@@ -69,8 +69,8 @@ def _sum_rows(pc):
 
 
 # MEASURED (the stack tests' circuit, b 1 .. 8, the maps and sources below): the largest |latency - throughput| of the
-# log-likelihoods and of the sums' values, 1.9e-6 and 2.9e-6 every token observed, 3.7e-5 and 5.8e-4 half of them
-# masked, 2.4e-6 and 2.1e-4 all of them -- each mode 6.8e-4 and 2.9e-3 from the torch passes at most, alike
+# log-likelihoods and of the sums' values, 1.9e-6 and 2.9e-6 every token observed, 4.4e-5 and 5.8e-4 half of them
+# masked, 1.6e-6 and 2.6e-4 all of them -- each mode 6.8e-4 and 2.9e-3 from the torch passes at most, alike
 _BOUNDS = {0.0: (1e-5, 2e-5), 0.5: (2e-4, 3e-3), 1.0: (1e-5, 1e-3)}
 
 
@@ -98,9 +98,10 @@ def test_the_latency_forward_is_the_throughput_one(masked, rows, tied):
         fin = torch.isfinite(b)
         assert torch.equal(torch.isfinite(a), fin)
         assert float((a - b)[fin].abs().max()) < bv, (s, float((a - b)[fin].abs().max()))
-    if masked == 1.0:                                               # (every token summed out: Z and U's W the same
-        assert float(lat[0].abs().max()) < 1e-5, lat[0]             #  fp16 operands -- MEASURED 2.4e-6; at W's lazy
-                                                                    #  reference in the slots' sums, 5e-5)
+    if masked == 1.0:                                               # (every token summed out: Z and U of each chunk
+        assert float(lat[0].abs().max()) < 1e-5, lat[0]             #  the same fp16 W, at the reference the slot
+                                                                    #  sums kept for it -- MEASURED 2.4e-6; Z's W at
+                                                                    #  another reference than U's, 5e-5)
 
 
 def test_the_latency_forward_is_the_same_call_to_call(monkeypatch):

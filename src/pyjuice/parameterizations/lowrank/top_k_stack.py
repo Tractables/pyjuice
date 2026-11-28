@@ -56,8 +56,8 @@ STACKED = True
 #: the LATENCY mode of a stack's forward (`kernels/c/lowrank_top_k_latency.cuh`): a position's sums one launch on the
 #: chain, their slots' sums made off it -- where no backward follows and the batch is at most `LATENCY_MAX_B` samples
 #: (the chain latency-bound); off, the throughput mode's launches (`tk_sk_kernel`). MEASURED (the Codpula head, 31
-#: positions, RTX PRO 6000): the marginal 27%, 30%, 11%, 4% faster at 1, 2, 4, 5 samples, 4% and 16% slower at 6 and 8
-#: -- a position's step never slower, but the slots' sums' launch before the chain (~50 us a sample) outgrows it
+#: positions, RTX PRO 6000): the marginal 30%, 33%, 15% faster at 1, 2, 4 samples (9%, 2% at 5, 6), 10% slower at 8 -- a
+#: position's step never slower, but the slots' sums' launch before the chain (~42 us a sample) outgrows it
 LATENCY = True
 LATENCY_MAX_B = 4
 

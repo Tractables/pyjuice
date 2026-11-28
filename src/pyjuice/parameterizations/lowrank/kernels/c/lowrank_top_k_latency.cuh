@@ -11,19 +11,21 @@
 // few CTAs that fold their partials in turn -- ~26 us a position at 2 samples, latency all of it. Here:
 //
 // * OFF the chain, one launch for every position (`tk_lat_zh_kernel`, after the leaf's forward: an observed sample's
-//   slot is its token's place): each (position, sample, tile)'s Z -- masked: every slot, by the fp16 MMAs of W and E
-//   the throughput mode takes (E16, W times 2^W_OFF at the rows' largest logits: a first pass over the chunks finds
-//   them, so W's fp16 operands are the chain's to the bit -- U and Z alike rounded, as the throughput mode's one pass
-//   makes them: MEASURED, every token masked (each likelihood 1), the log-likelihoods' error 5e-5 with Z's W at its
-//   lazy reference against 1e-6), the rest slot by fp32 sums; observed: its slot by fp32 sums (W at a lazy
-//   reference: fp32 sums alike either way) -- and W's reference (h, log2) its sums were made at.
+//   slot is its token's place): each (position, sample, tile)'s Z, its 16 chunks in one pass -- masked: every slot, by
+//   the fp16 MMAs of W and E the throughput mode takes (E16, W times 2^W_OFF at a reference raised as the chunks come,
+//   the throughput mode's lazy rule: `exp_tile`), the rest slot by fp32 sums, and EACH CHUNK'S REFERENCE kept (R), so
+//   that the chain's W of a chunk is made of the same fp16 operands to the bit -- U and Z alike rounded (MEASURED,
+//   every token masked, each likelihood 1: Z's W at another reference than U's, the log-likelihoods' error 5e-5
+//   against 1e-6); observed: its slot by fp32 sums (W at a lazy reference: fp32 sums alike either way) -- and the
+//   reference (h, log2) the sums end at.
 // * ON the chain, one launch a position (`tk_lat_step_kernel`, PDL: the launch after it starts as soon as this one's
 //   chain-free part is done), a CTA a (chunk of 64 children, tile of 128 nodes, sample): before the wait for the
-//   position below, W of its chunk at the reference h (the logits' MMAs); after it, its children's values (shifted
-//   by their largest in the chunk: no position-wide maximum), W exp(c) -- masked: in fp16 into the slots' MMAs, as
-//   the throughput mode makes U --, and at once its share of the value's sum, R_i = sum_s q_is U_is (Z complete: off
-//   the chain) -- one float a node. The tile's last CTA (a count) adds its 16 shares (their shifts to the largest, in
-//   the chunks' order: no atomics on values) into the values.
+//   position below, W of its chunk (the logits' MMAs) at the chunk's reference (masked: R; observed: h); after it, its
+//   children's values (shifted by their largest in the chunk: no position-wide maximum), W exp(c) -- masked: in fp16
+//   into the slots' MMAs, as the throughput mode makes U --, and at once its share of the value's sum, R_i = sum_s
+//   q_is U_is (Z complete: off the chain; U at the chunk's reference, times 2^(R - h)) -- one float a node. The
+//   tile's last CTA (a count) adds its 16 shares (their shifts to the largest, in the chunks' order: no atomics on
+//   values) into the values.
 //
 // The same operands and roundings as the throughput mode's (the fp16 factors, W and W exp(c) as fp16 MMA operands for
 // the masked slots, fp32 sums elsewhere); the sums reassociated (U a chunk at a time, each chunk's children shifted by
@@ -32,7 +34,9 @@
 // a position's slot sums off the chain: each reader's operands (`TopKStackPlan`)
 struct LatZh {
     const float* A; long sA; const __half* BP; const __half* E16; const uint2* LTh;
-    float* h; float* Z;                // [B, M] W's reference (log2); [B, M, SP] masked: slots 0 .. 64, observed: [0]
+    float* h;                          // [B, M] the sums' reference (log2)
+    float* Z;                          // [B, M, SP] masked: slots 0 .. 64; observed: [0]
+    float* R;                          // [B, N / TN, M] masked: each chunk's W's reference (log2)
     int r, M, N, S, t;                 // t: its leaf's place among the layer's (`wrow`, `slot32` rows)
 };
 
@@ -43,19 +47,20 @@ __device__ __forceinline__ void lat_kind(const int* wrow, const int* slot32, int
 }
 
 // the stage's segments: the B chunk [KP][BROW] fp16, then E16's rows -- every slot's (masked) or the sample's own slot's
-// (observed, row 0) -- of the chunk's 64 children; `erows` false: the B chunk alone
+// (observed, row 0) -- of the chunk's 64 children
 template <int KP>
 __device__ __forceinline__ void lat_load(unsigned bs, const __half* BP, const __half* E16, int e, int S, int N, int j0,
-                                         bool masked, int sl, int tid, bool erows = true) {
+                                         bool masked, int sl, int tid) {
     constexpr int NB = KP * (TN / 8);
-    const int nseg = NB + (erows ? (masked ? (8 * NS8 + 1) : 1) : 0) * (TN / 8);
+    const int nseg = NB + (masked ? (8 * NS8 + 1) : 1) * (TN / 8);
     for (int q = tid; q < nseg; q += NW * 32) {
         if (q < NB) {
             const int k = q / (TN / 8), s = q % (TN / 8);
             cp16(bs + (k * BROW + s * 8) * 2, BP + ((long)e * KP + k) * N + j0 + s * 8);
         } else {
             const int qq = q - NB, row = qq / (TN / 8), s = qq % (TN / 8);
-            cp16(bs + KP * BROW * 2 + (row * BROW + s * 8) * 2, E16 + ((long)e * S + (masked ? row : sl)) * N + j0 + s * 8);
+            cp16(bs + KP * BROW * 2 + (row * BROW + s * 8) * 2,
+                 E16 + ((long)e * S + (masked ? row : sl)) * N + j0 + s * 8);
         }
     }
     cp_commit();
@@ -86,34 +91,7 @@ __global__ void __launch_bounds__(NW * 32) tk_lat_zh_kernel(const LatZh* __restr
     const unsigned hoff = (((lane & 7) + ((lane >> 4) << 3)) * BROW + ((lane >> 3) & 1) * 8) * 2;
 
     float m0 = NEG, m1 = NEG, zr0 = 0.f, zr1 = 0.f;
-    if (masked) {
-        // the first pass: the rows' largest logits (W's reference here and on the chain), the B chunks alone
-        lat_load<KP>(smem_u32(smem), a.BP, a.E16, e, a.S, N, 0, masked, sl, tid, false);
-        #pragma unroll
-        for (int nt = 0; nt < 8; ++nt) lt[nt] = __ldg(ltp + nt * 32);
-        for (int jc = 0; jc < nchunks; ++jc) {
-            const int st = jc & 1;
-            const bool more = jc + 1 < nchunks;
-            cp_wait<0>();
-            __syncthreads();
-            if (more) lat_load<KP>(smem_u32(smem + (st ^ 1) * G::STAGE), a.BP, a.E16, e, a.S, N, (jc + 1) * TN, masked,
-                                   sl, tid, false);
-            float Sx[8][4];
-            logits<NK>(Sx, af, reinterpret_cast<const __half*>(smem + st * G::STAGE), lt, lane);
-            if (more) {
-                #pragma unroll
-                for (int nt = 0; nt < 8; ++nt) lt[nt] = __ldg(ltp + ((jc + 1) * 8 + nt) * 32);
-            }
-            float x0 = NEG, x1 = NEG;
-            #pragma unroll
-            for (int nt = 0; nt < 8; ++nt) {
-                x0 = fmaxf(x0, fmaxf(Sx[nt][0], Sx[nt][1]));
-                x1 = fmaxf(x1, fmaxf(Sx[nt][2], Sx[nt][3]));
-            }
-            m0 = fmaxf(m0, quad_max(x0)); m1 = fmaxf(m1, quad_max(x1));
-        }
-        __syncthreads();                     // (every warp past the first pass's stages)
-    }
+    float* const rk = a.R + (long)b * nchunks * a.M + node0;    // (masked: chunk jc's reference of node0 at jc * M)
     lat_load<KP>(smem_u32(smem), a.BP, a.E16, e, a.S, N, 0, masked, sl, tid);
     #pragma unroll
     for (int nt = 0; nt < 8; ++nt) lt[nt] = __ldg(ltp + nt * 32);
@@ -126,8 +104,9 @@ __global__ void __launch_bounds__(NW * 32) tk_lat_zh_kernel(const LatZh* __restr
         const int st = jc & 1;
         const bool more = jc + 1 < nchunks;
         cp_wait<0>();
-        __syncthreads();                     // (this chunk's stage complete; the other free: every warp past the last chunk)
-        if (more) lat_load<KP>(smem_u32(smem + (st ^ 1) * G::STAGE), a.BP, a.E16, e, a.S, N, (jc + 1) * TN, masked, sl, tid);
+        __syncthreads();                     // (this chunk's stage complete; the other free: every warp past the last)
+        if (more)
+            lat_load<KP>(smem_u32(smem + (st ^ 1) * G::STAGE), a.BP, a.E16, e, a.S, N, (jc + 1) * TN, masked, sl, tid);
         const unsigned char* p = smem + st * G::STAGE;
         const __half* Hs = reinterpret_cast<const __half*>(p + G::B_BYTES);
         float Sx[8][4];
@@ -137,12 +116,18 @@ __global__ void __launch_bounds__(NW * 32) tk_lat_zh_kernel(const LatZh* __restr
             for (int nt = 0; nt < 8; ++nt) lt[nt] = __ldg(ltp + ((jc + 1) * 8 + nt) * 32);
         }
         if (masked) {
-            // (W at the rows' largest, as the chain step makes it)
-            const float h0 = (m0 == NEG ? 0.f : m0) - W_OFF, h1 = (m1 == NEG ? 0.f : m1) - W_OFF;
-            #pragma unroll
-            for (int nt = 0; nt < 8; ++nt) {
-                Sx[nt][0] = exp2f(Sx[nt][0] - h0); Sx[nt][1] = exp2f(Sx[nt][1] - h0);
-                Sx[nt][2] = exp2f(Sx[nt][2] - h1); Sx[nt][3] = exp2f(Sx[nt][3] - h1);
+            // (W at a reference raised as the chunks come -- the throughput mode's rule: below 2^(W_OFF + W_LAZY),
+            // fp16's range -- the sums so far moved with it; the chunk's reference kept: the chain step's W the same)
+            exp_tile(Sx, m0, m1, [&](float a0, float a1) {
+                #pragma unroll
+                for (int sn = 0; sn < NS8; ++sn) {
+                    Zc[sn][0] *= a0; Zc[sn][1] *= a0; Zc[sn][2] *= a1; Zc[sn][3] *= a1;
+                }
+                zr0 *= a0; zr1 *= a1;
+            }, W_OFF, W_LAZY);
+            if (t == 0) {
+                rk[(long)jc * a.M] = m0;
+                rk[(long)jc * a.M + 8] = m1;
             }
             const __half* Rs = Hs + 8 * NS8 * BROW;
             const unsigned hb = smem_u32(Hs) + hoff;
@@ -195,7 +180,7 @@ __global__ void __launch_bounds__(NW * 32) tk_lat_zh_kernel(const LatZh* __restr
 // a position's chain step: its reader's operands (`TopKStackPlan::forward`)
 struct LatStep {
     const float* A; long sA; const __half* BP; const __half* E16; const uint2* LTh;
-    const float* h; const float* Z; const float* logw;
+    const float* h; const float* Z; const float* R; const float* logw;
     ChildValues cv; const bool* has;   // the children's values (element values at eid, or their products': pairs)
     float* out; long nid0, ostride;    // the node values (the circuit's buffer)
     int r, M, N, S, t;
@@ -228,14 +213,20 @@ __global__ void __launch_bounds__(NW * 32, 2) tk_lat_step_kernel(const LatStep a
     uint2 lt[8];
     #pragma unroll
     for (int nt = 0; nt < 8; ++nt) lt[nt] = __ldg(ltp + nt * 32);
+    // (the sums' reference: Z's; W's of this chunk -- masked: the chunk's own, observed: the same)
     const float hm0 = a.h[(long)b * a.M + node0], hm1 = a.h[(long)b * a.M + node1];
+    float cr0 = hm0, cr1 = hm1;
+    if (masked) {
+        const float* rk = a.R + ((long)b * nchunks + c) * a.M + node0;
+        cr0 = __ldg(rk); cr1 = __ldg(rk + 8);
+    }
     cp_wait<0>();
     __syncthreads();
     float Sx[8][4];
     logits<NK>(Sx, af, reinterpret_cast<const __half*>(smem), lt, lane);
-    {                                                                        // W at the reference the sums were made at
+    {                                                                        // W at the reference the sums made it at
         const float off = masked ? W_OFF : 0.f;
-        const float h0 = (hm0 == NEG ? 0.f : hm0) - off, h1 = (hm1 == NEG ? 0.f : hm1) - off;
+        const float h0 = (cr0 == NEG ? 0.f : cr0) - off, h1 = (cr1 == NEG ? 0.f : cr1) - off;
         #pragma unroll
         for (int nt = 0; nt < 8; ++nt) {
             Sx[nt][0] = exp2f(Sx[nt][0] - h0); Sx[nt][1] = exp2f(Sx[nt][1] - h0);
@@ -318,6 +309,9 @@ __global__ void __launch_bounds__(NW * 32, 2) tk_lat_step_kernel(const LatStep a
         const float zra = __ldg(z0 + 8 * NS8), zrb = __ldg(z1 + 8 * NS8);
         if (zra > 0.f) R0 += __expf(__ldg(lw0 + 8 * NS8)) * (ur0 / zra);
         if (zrb > 0.f) R1 += __expf(__ldg(lw1 + 8 * NS8)) * (ur1 / zrb);
+        // (U at the chunk's reference, Z at the sums' last: the share times 2^(cr - h), at most 1)
+        R0 *= cr0 == NEG ? 0.f : exp2f(cr0 - hm0);
+        R1 *= cr1 == NEG ? 0.f : exp2f(cr1 - hm1);
     } else {
         float u0 = 0.f, u1 = 0.f;
         #pragma unroll

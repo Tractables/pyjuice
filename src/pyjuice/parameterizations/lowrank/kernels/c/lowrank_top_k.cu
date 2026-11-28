@@ -3204,6 +3204,7 @@ class TopKStackPlan {
             const int tiles = M / TM, nch = N / TN;
             latH_ = torch::empty({(long)P * B_ * M}, f32);
             latZ_ = torch::empty({(long)P * B_ * M * SP}, f32);
+            latR_ = torch::empty({(long)P * B_ * nch * M}, f32);
             latPart_ = torch::empty({(long)B_ * tiles * nch * TM}, f32);
             latPmax_ = torch::empty({(long)B_ * tiles * nch}, f32);
             latCnt_ = torch::zeros({(long)B_ * tiles}, i32);
@@ -3214,10 +3215,12 @@ class TopKStackPlan {
                 z.A = q.args.A; z.sA = q.args.sA; z.BP = q.args.BP; z.E16 = q.args.E16; z.LTh = q.args.LTh;
                 z.h = latH_.data_ptr<float>() + (long)i * B_ * M;
                 z.Z = latZ_.data_ptr<float>() + (long)i * B_ * M * SP;
+                z.R = latR_.data_ptr<float>() + (long)i * B_ * nch * M;
                 z.r = q.r; z.M = M; z.N = N; z.S = q.S; z.t = q.t;
                 LatStep& st = q.lat;
                 st = LatStep{};
                 st.A = z.A; st.sA = z.sA; st.BP = z.BP; st.E16 = z.E16; st.LTh = z.LTh; st.h = z.h; st.Z = z.Z;
+                st.R = z.R;
                 st.logw = logw.data_ptr<float>();           // (the leaf's whole: a masked sample's row is its `wrow`)
                 st.has = q.has; st.out = node_mars.data_ptr<float>(); st.nid0 = q.args.nid0; st.ostride = B_;
                 st.r = q.r; st.M = M; st.N = N; st.S = q.S; st.t = q.t;
@@ -3422,7 +3425,7 @@ class TopKStackPlan {
             prep_d_ = torch::Tensor();
         mitems_ = oitems_ = noitems_ = slot32_ = logw_ = counts_ = torch::Tensor();
         AH_ = L2T_ = LTc_ = EF_ = fl_ = fmx_ = rows_ = torch::Tensor();
-        latH_ = latZ_ = latPart_ = latPmax_ = latCnt_ = latZh_d_ = torch::Tensor();
+        latH_ = latZ_ = latR_ = latPart_ = latPmax_ = latCnt_ = latZh_d_ = torch::Tensor();
         theta_.clear();
         hold_.clear();
         nm_ = torch::Tensor();
@@ -3440,7 +3443,7 @@ class TopKStackPlan {
     };
     bool stash_, released_ = false, bw_ready_ = false, lat_ = false;
     int latNK_ = 0;
-    torch::Tensor latH_, latZ_, latPart_, latPmax_, latCnt_, latZh_d_;
+    torch::Tensor latH_, latZ_, latR_, latPart_, latPmax_, latCnt_, latZh_d_;
     int dev_ = 0, B_ = 0;
     const float* em_ = nullptr;
     long em_stride_ = 0;
