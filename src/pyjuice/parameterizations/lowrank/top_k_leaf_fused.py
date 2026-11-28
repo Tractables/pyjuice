@@ -168,7 +168,15 @@ def leaf_forward(desc, layer, data: torch.Tensor, node_mars: torch.Tensor, kwarg
 
     if copied is not None:
         copied.synchronize()
-    tables = [mod.top_k_leaf_table(layer.params, spids, V, crow, int(nrows[0])) for spids in plan["tables"]]
+    nr = int(nrows[0])
+    if 4 * nr < V:
+        # (few categories taken -- a small batch's --: their rows from their list, a launch their size; the scan of V
+        # read every 32-block holding one -- MEASURED, the Codpula head at 2 samples, ~4.6K of 126K taken: 0.32 ms)
+        uids = torch.empty(nr + 1, dtype = torch.int32, device = dev)
+        uids.scatter_(0, torch.where(used, crow, nr).long(), torch.arange(V, dtype = torch.int32, device = dev))
+        tables = [mod.top_k_leaf_table_rows(layer.params, spids, uids, nr) for spids in plan["tables"]]
+    else:
+        tables = [mod.top_k_leaf_table(layer.params, spids, V, crow, nr) for spids in plan["tables"]]
     tab = tables[0][None] if len(tables) == 1 else torch.stack(tables)
     counts = rmask.sum(dim = 1).tolist()
     offs = [0]

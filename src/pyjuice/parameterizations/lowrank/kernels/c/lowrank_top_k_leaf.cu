@@ -116,6 +116,24 @@ __global__ void tk_leaf_table_kernel(const float* __restrict__ params, const lon
     }
 }
 
+// the same rows from the categories' list `uids` [rows] (their rows' order): a block 32 of them x 32 nodes, only theirs
+// read -- where few categories are taken (`top_k_leaf_fused`), the scan above reads every 32-block holding one of them
+__global__ void tk_leaf_table_rows_kernel(const float* __restrict__ params, const long* __restrict__ spids,
+                                          const int* __restrict__ uids, float* __restrict__ tab, int M, int rows) {
+    __shared__ float tile[32][33];
+    const int r0 = blockIdx.x * 32, i0 = blockIdx.y * 32, tx = threadIdx.x, ty = threadIdx.y;
+    const int v = r0 + tx < rows ? uids[r0 + tx] : 0;
+    for (int k = ty; k < 32; k += 8) {
+        const int i = i0 + k;
+        tile[k][tx] = (i < M && r0 + tx < rows) ? params[spids[i] + v] : 1.f;
+    }
+    __syncthreads();
+    for (int k = ty; k < 32; k += 8) {
+        const int r = r0 + k, i = i0 + tx;
+        if (r < rows && i < M) tab[(long)r * M + i] = __log2f(tile[tx][k]);
+    }
+}
+
 // what a tile reads: a node vector's table, tilt, evidence, token
 struct Tile {
     const float* tab; long tab_stride; const int* nv_tab;       // log2 theta^T [ntab][V][M]; a node vector's table
@@ -1569,6 +1587,22 @@ torch::Tensor top_k_leaf_table(torch::Tensor params, torch::Tensor spids, int64_
     return tab;
 }
 
+// log2 theta^T [rows, M] of a node vector's M nodes as `top_k_leaf_table` makes it, from the categories' list `uids`
+// [rows] int32 (a category of row r: uids[r]) -- a launch the size of the rows, not of V
+torch::Tensor top_k_leaf_table_rows(torch::Tensor params, torch::Tensor spids, torch::Tensor uids, int64_t rows) {
+    check(params, at::kFloat, "params"); check(spids, at::kLong, "spids"); check(uids, at::kInt, "uids");
+    TORCH_CHECK(uids.numel() >= rows, "top_k leaf: uids [rows]");
+    const at::cuda::CUDAGuard guard(params.device());
+    const int M = (int)spids.size(0);
+    auto tab = torch::empty({rows, M}, params.options());
+    if (rows == 0) return tab;
+    dim3 grid((unsigned)((rows + 31) / 32), (unsigned)((M + 31) / 32)), block(32, 8);
+    tk_leaf_table_rows_kernel<<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
+        params.data_ptr<float>(), spids.data_ptr<long>(), uids.data_ptr<int>(), tab.data_ptr<float>(), M, (int)rows);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return tab;
+}
+
 // the forward of T node vectors over B samples: writes their node values (observed tokens) into node_mars; returns
 // (lz [T, B, M], lb [T, B, M], place [T, B], logw [R, M, max(K + 1, 72)] -- slots 0 .. K, the rows 72 wide as the sums'
 // kernels read them (the rest zeros, or not written past 72) --) -- R the rows wrow names (logw empty where none).
@@ -1841,6 +1875,7 @@ torch::Tensor top_k_leaf_backward(torch::Tensor tab, torch::Tensor nv_tab, torch
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("top_k_leaf_table", &top_k_leaf_table, "log2 theta^T of a soft-evidence leaf node vector");
+    m.def("top_k_leaf_table_rows", &top_k_leaf_table_rows, "its rows of a list of categories");
     m.def("top_k_leaf_forward", &top_k_leaf_forward, "LowRank(top_k) leaves' forward");
     m.def("top_k_leaf_backward", &top_k_leaf_backward, "LowRank(top_k) leaves' backward and EM statistics");
 }
