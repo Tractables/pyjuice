@@ -132,8 +132,9 @@ def leaf_forward(desc, layer, data: torch.Tensor, node_mars: torch.Tensor, kwarg
     # DISTINCT=1 rows)
     V = nodes[0]["ns"].dist.num_cats
     ids = kwargs["soft_evidence_cat_ids"].to(torch.int32).contiguous()
-    used = torch.zeros(V, dtype = torch.bool, device = dev)
-    used[ids.reshape(-1).long()] = True
+    # (`index_fill_`, not `used[ids] = True`: an indexed assignment of a Python scalar waits for the device -- MEASURED,
+    # torch 2.10: the host blocked until the stream drains, ~170 us a forward of the Codpula head at 2 samples)
+    used = torch.zeros(V, dtype = torch.bool, device = dev).index_fill_(0, ids.reshape(-1).long(), True)
     crow = torch.cumsum(used, 0, dtype = torch.int32) - 1
     nrows_d = crow[-1:] + 1
     crow = torch.where(used, crow, torch.full_like(crow, -1))
