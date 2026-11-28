@@ -932,9 +932,11 @@ class ParameterizedSumLayer(SumLayer):
                kwargs.get("precision", "auto"), tuple(kwargs))
         return key, own[1]
 
-    def _check_staged_batch(self, ns_tensors, num_samples: int) -> None:
+    def _check_staged_batch(self, ns_tensors, num_samples: int, rows = None) -> None:
         """
-        The staged tensors must describe THIS many samples.
+        The staged tensors must describe THIS many samples -- or, read through a map of rows (`rows`, the forward's
+        `external_params_rows`: one entry a sample, `SumParameterization.takes_external_rows`), the rows' batch, the
+        map the draw's.
 
         The compiled tables express offsets in per-batch units and the kernels multiply by the sample
         count, so tensors staged for another batch would be read at addresses scaled by the wrong
@@ -942,12 +944,21 @@ class ParameterizedSumLayer(SumLayer):
         validation for already-staged views, which is exactly the case this can arise in.
         """
         for ns_info, tensors in ns_tensors:
-            shapes = self.parameterization.storage_shapes(ns_info.ns, num_samples)
-            for tensor, shape in zip(tensors, shapes):
+            # (the storage's batch axis: where the shapes of one and of two samples differ)
+            one = self.parameterization.storage_shapes(ns_info.ns, 1)
+            two = self.parameterization.storage_shapes(ns_info.ns, 2)
+            axes = [next((d for d, (a, b) in enumerate(zip(s1, s2)) if a != b), None) for s1, s2 in zip(one, two)]
+            mapped = rows is not None and self.parameterization.takes_external_rows(ns_info.ns)
+            if mapped:
+                assert rows.numel() == num_samples, \
+                    f"Sampling {num_samples} sample(s) through a map of {rows.numel()} rows of external parameters."
+            for tensor, axis, k in zip(tensors, axes, range(len(axes))):
+                batch = tensor.size(axis) if mapped and axis is not None else num_samples
+                shape = self.parameterization.storage_shapes(ns_info.ns, batch)[k]
                 if tuple(tensor.size()) == tuple(shape):
                     continue
 
-                staged_batch = tensor.size(-1)
+                staged_batch = tensor.size(axis) if axis is not None else "?"
                 raise AssertionError(
                     f"Sampling {num_samples} sample(s) from this circuit, but the external sum "
                     f"parameters staged on it are for a batch of {staged_batch}.\n\n"
@@ -978,7 +989,7 @@ class ParameterizedSumLayer(SumLayer):
         if len(ns_tensors) == 0:
             return False
 
-        self._check_staged_batch(ns_tensors, node_samples.size(1))
+        self._check_staged_batch(ns_tensors, node_samples.size(1), kwargs.get(EXTERNAL_PARAMS_ROWS_KWARG))
         self.parameterization.sample_layer(
             self, ns_tensors, node_mars, element_mars, params, node_samples, element_samples,
             rows, erows, seed_ptr, conditional = conditional, **kwargs
@@ -1011,7 +1022,7 @@ class ParameterizedSumLayer(SumLayer):
         if len(ns_tensors) == 0:
             return False
 
-        self._check_staged_batch(ns_tensors, num_samples)
+        self._check_staged_batch(ns_tensors, num_samples, kwargs.get(EXTERNAL_PARAMS_ROWS_KWARG))
 
         self.parameterization.sample_layer_pairs(
             self, ns_tensors, node_mars, element_mars, params, node_samples, element_samples,

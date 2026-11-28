@@ -980,7 +980,8 @@ class _ExternalParamsMixin:
         each a row of the tensors -- and left in `kwargs` as a long tensor on the tensors' device.
         """
         rows = kwargs[EXTERNAL_PARAMS_ROWS_KWARG]
-        assert forward, f"`{EXTERNAL_PARAMS_ROWS_KWARG}` is the forward pass's: a sampler reads one row a sample."
+        # (an unconditional draw's too: its layers read the rows through the map as a forward's do -- each node's
+        # parameterization checked below)
         assert torch.is_tensor(rows) and rows.dim() == 1 and rows.numel() == batch_size and \
             not rows.is_floating_point() and not rows.is_complex() and rows.dtype != torch.bool, \
             f"`{EXTERNAL_PARAMS_ROWS_KWARG}` should be an integer tensor of one entry a sample ({batch_size}), the " \
