@@ -17,9 +17,17 @@ tables) are made with them, and a backward that asks for no gradients nor EM sta
 `plan.backward(i, ...)`; any other backward reads the stack's stash (`SumStack.kept`). A stack is made by the first
 reading sum's call of a pass and kept in the leaf's pass cache (`top_k_leaf_fused.pass_cache`: made again by every
 forward, so nothing in it outlives the tensors it was made from); it serves the calls of the pass it was made for
-(`SumStack.serves`: the same buffers, staged tensors and options). Any other call, and any reader whose kernels do not
-serve, takes the unstacked path (`top_k_fused.sum_forward`, `top_k_backward.terms`), the reference the stack's
-operands are bit for bit (the same device code).
+(`SumStack.serves`: the same buffers, staged tensors and options). Where no backward follows, its buffers are given back
+after every reader's launch -- the unstacked path's footprint between passes -- and a reader called again in the pass
+(a decision's trials run sums before it) makes the stack again (`stack_of`). Any other call, and any reader whose
+kernels do not serve, takes the unstacked path (`top_k_fused.sum_forward`, `top_k_backward.terms`), the reference the
+stack's operands are bit for bit (the same device code).
+
+Where no backward follows and the batch is small (`LATENCY`, `LATENCY_MAX_B`), a stack's forward is its LATENCY mode
+(`kernels/c/lowrank_top_k_latency.cuh`): each node's slot sums -- what of the second part no children's value enters --
+made with the first part for every reader, in one more launch, and a reader's forward ONE launch (the children's values
+into the node values, its chain-free part before the wait for the launch below): the throughput mode's operands and
+roundings, its sums reassociated (the children a chunk at a time).
 
 A layer whose node vectors a stack took gets a settled forward and backward (`settled_forward`, `settled_backward`:
 `ParameterizedSumLayer`'s contract): its next calls go straight to the pass's stack -- a position's host time is what
@@ -44,6 +52,14 @@ from . import top_k_fused, top_k_leaf_fused
 
 #: the stacked passes where they serve; off, every sum's forward takes the unstacked path (`top_k_fused.sum_forward`)
 STACKED = True
+
+#: the LATENCY mode of a stack's forward (`kernels/c/lowrank_top_k_latency.cuh`): a position's sums one launch on the
+#: chain, their slots' sums made off it -- where no backward follows and the batch is at most `LATENCY_MAX_B` samples
+#: (the chain latency-bound); off, the throughput mode's launches (`tk_sk_kernel`). MEASURED (the Codpula head, 31
+#: positions, RTX PRO 6000): the marginal 27%, 30%, 11%, 4% faster at 1, 2, 4, 5 samples, 4% and 16% slower at 6 and 8
+#: -- a position's step never slower, but the slots' sums' launch before the chain (~50 us a sample) outgrows it
+LATENCY = True
+LATENCY_MAX_B = 4
 
 _CACHE_KEY = "stack"               # (its entry in the leaf's pass cache: a SumStack, or False -- none serves this pass)
 _SETTLED = "_lr_top_k_settled"     # (a layer's record for its settled calls: its node vectors and their leaves)
@@ -87,8 +103,8 @@ class SumStack:
                 bool(kwargs.get("_grad_enabled", False)) == self.grad)
 
     def takes(self, ns) -> bool:
-        """Whether the stack takes the node vector `ns`'s forward: one of its readers, its buffers not given back (a
-        reader's second call of a pass where no backward follows)."""
+        """Whether the stack takes the node vector `ns`'s forward: one of its readers, its buffers not given back (after
+        every reader's launch where no backward follows: `stack_of` makes the stack again for a later call)."""
         return self.plan is not None and id(ns) in self.index
 
     def forward(self, ns, pairs = None) -> bool:
@@ -151,7 +167,10 @@ def stack_of(sib: dict, B: int, kwargs: dict, node_mars, element_mars, params) -
     if cache is None:
         return None
     got = cache.get(_CACHE_KEY)
-    if got is None:
+    if got is None or (got and got.plan is None):
+        # (none made yet; or its buffers given back after every reader's launch and a reader called again in the pass --
+        #  a decision's trials run sums before the pass, `TensorCircuit._stream_fusion_groups`: made again, so every
+        #  call of a pass takes the same launches)
         got = cache[_CACHE_KEY] = _make(sib["layer"], B, kwargs, node_mars, element_mars, params, cache) or False
     return got if got and got.serves(node_mars, element_mars, kwargs) else None
 
@@ -250,11 +269,12 @@ def _make(leaf_layer, B: int, kwargs: dict, node_mars, element_mars, params, cac
         for r, _ in picked:                      # (their rows of the leaf's counts the sums' kernels' to write)
             if offs[r.t + 1] > offs[r.t]:
                 st["written"].add(r.t)
+    latency = LATENCY and not keep and B <= LATENCY_MAX_B
     plan = top_k_fused.top_k_module().TopKStackPlan(
         [t[0] for _, t in picked], [t[1] for _, t in picked], [t[2] for _, t in picked],
         [r.geo["eid"] for r, _ in picked], [r.has for r, _ in picked], [r.nid0 for r, _ in picked],
         [r.t for r, _ in picked], src, [u["theta"] for u in tabs],
-        *flat, st["logw"], st["offs"], counts, node_mars, element_mars, keep)
+        *flat, st["logw"], st["offs"], counts, node_mars, element_mars, keep, latency, st["wrow"], st["emap"])
     for s, tab in enumerate(tabs):               # (the forward's table, for the readers the stack does not take)
         tab.setdefault("LTh", plan.lth(s))
     if keep:                                     # (the backward's operands too: made while the pass's start is

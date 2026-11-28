@@ -3001,6 +3001,28 @@ static const int2* scatter_pairs(const std::optional<torch::Tensor>& pairs, long
     return child_pairs(pairs, N, flows);
 }
 
+namespace {
+#include "lowrank_top_k_latency.cuh"
+}  // namespace
+
+// the latency mode's launches: the slot sums of every reader (off the chain), a reader's chain step (PDL)
+template <int NK>
+void lat_zh_launch(const LatZh* readers, int P, int M, const int* wrow, const int* slot32, const int* emap, int B,
+                   int dev, cudaStream_t stream) {
+    static bool done[64] = {};
+    smem_attr(tk_lat_zh_kernel<NK>, MaskedGeo<NK>::BYTES, dev, done);
+    tk_lat_zh_kernel<NK><<<dim3((unsigned)(M / TM), (unsigned)B, (unsigned)P), NW * 32, MaskedGeo<NK>::BYTES, stream>>>(
+        readers, wrow, slot32, emap, B);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+template <int NK>
+void lat_step_launch(const LatStep& a, cudaStream_t stream) {
+    launch_pdl(tk_lat_step_kernel<NK>, dim3((unsigned)(a.N / TN), (unsigned)(a.M / TM), (unsigned)a.B), dim3(NW * 32),
+               MaskedGeo<NK>::STAGE, stream, a);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
 // ---------------------------------------------------------------------------------------------------------------------
 // A STACK: a pass's forward of the sums reading a leaf layer (`lowrank/top_k_stack.py`). Their chain-independent
 // operands -- B in fp16, E16, theta's tables -- made by one launch for all of them (`tk_stack_prep_kernel`) into buffers
@@ -3016,12 +3038,15 @@ class TopKStackPlan {
     // (`theta[src]` [M, N] fp32, the sources' dense parameters). The leaf layer's: its work items (`top_k_items`'
     // four, every leaf's), its masked samples' slot weights `logw` [R, M, 72] and their rows' offsets `offs` [T + 1];
     // with `stash`, its counts' buffer `counts` [R, M, 72] (the stash's posterior there). The circuit's buffers.
+    // `latency` (no stash): the latency mode (`lowrank_top_k_latency.cuh`) -- its leaf's masked rows `wrow` [T, B]
+    // (int32, -1 where observed) and the rows of tensors its samples read `emap32` [B] (empty: their own).
     TopKStackPlan(std::vector<torch::Tensor> A, std::vector<torch::Tensor> Bm, std::vector<torch::Tensor> G,
                   std::vector<torch::Tensor> eid, std::vector<torch::Tensor> has, std::vector<int64_t> nid0,
                   std::vector<int64_t> leaf, std::vector<int64_t> src, std::vector<torch::Tensor> theta,
                   torch::Tensor mitems, torch::Tensor oitems, torch::Tensor noitems, torch::Tensor slot32,
                   torch::Tensor logw, std::vector<int64_t> offs, torch::Tensor counts, torch::Tensor node_mars,
-                  torch::Tensor element_mars, bool stash) : stash_(stash) {
+                  torch::Tensor element_mars, bool stash, bool latency, torch::Tensor wrow, torch::Tensor emap32)
+        : stash_(stash) {
         const int P = (int)A.size();
         TORCH_CHECK(P >= 1 && (int)Bm.size() == P && (int)G.size() == P && (int)eid.size() == P &&
                     (int)has.size() == P && (int)nid0.size() == P && (int)leaf.size() == P && (int)src.size() == P,
@@ -3164,7 +3189,64 @@ class TopKStackPlan {
         launch_pdl(tk_stack_prep_kernel, dim3((unsigned)std::max(1L, std::min(296L, items)), 3, P), dim3(256), 0,
                    at::cuda::getCurrentCUDAStream(), reinterpret_cast<const StackPrep*>(prep_d_.data_ptr()));
         C10_CUDA_KERNEL_LAUNCH_CHECK();
+        // the latency mode: every reader's slot sums made here (one launch, after the prep), each reader's chain step
+        // one launch (`forward`) -- every reader of one padded rank (one launch's kernel)
+        lat_ = latency && !stash;
+        for (int i = 1; lat_ && i < P; ++i) lat_ = pos_[i].KP == pos_[0].KP;
+        if (lat_) {
+            check(wrow, at::kInt, "wrow");
+            TORCH_CHECK(wrow.dim() == 2 && wrow.size(0) == T && wrow.size(1) == B_, "top_k stack: wrow [T, B]");
+            const bool mapped = emap32.numel() > 0;
+            if (mapped) {
+                check(emap32, at::kInt, "emap");
+                TORCH_CHECK(emap32.numel() == B_, "top_k stack: emap [B]");
+            }
+            const int tiles = M / TM, nch = N / TN;
+            latH_ = torch::empty({(long)P * B_ * M}, f32);
+            latZ_ = torch::empty({(long)P * B_ * M * SP}, f32);
+            latPart_ = torch::empty({(long)B_ * tiles * nch * TM}, f32);
+            latPmax_ = torch::empty({(long)B_ * tiles * nch}, f32);
+            latCnt_ = torch::zeros({(long)B_ * tiles}, i32);
+            std::vector<LatZh> zh(P);
+            for (int i = 0; i < P; ++i) {
+                Pos& q = pos_[i];
+                LatZh& z = zh[i];
+                z.A = q.args.A; z.sA = q.args.sA; z.BP = q.args.BP; z.E16 = q.args.E16; z.LTh = q.args.LTh;
+                z.h = latH_.data_ptr<float>() + (long)i * B_ * M;
+                z.Z = latZ_.data_ptr<float>() + (long)i * B_ * M * SP;
+                z.r = q.r; z.M = M; z.N = N; z.S = q.S; z.t = q.t;
+                LatStep& st = q.lat;
+                st = LatStep{};
+                st.A = z.A; st.sA = z.sA; st.BP = z.BP; st.E16 = z.E16; st.LTh = z.LTh; st.h = z.h; st.Z = z.Z;
+                st.logw = logw.data_ptr<float>();           // (the leaf's whole: a masked sample's row is its `wrow`)
+                st.has = q.has; st.out = node_mars.data_ptr<float>(); st.nid0 = q.args.nid0; st.ostride = B_;
+                st.r = q.r; st.M = M; st.N = N; st.S = q.S; st.t = q.t;
+                st.wrow = wrow.data_ptr<int>(); st.slot32 = slot32.data_ptr<int>();
+                st.emap = mapped ? emap32.data_ptr<int>() : nullptr; st.B = B_;
+                st.part = latPart_.data_ptr<float>(); st.pmax = latPmax_.data_ptr<float>();
+                st.cnt = latCnt_.data_ptr<int>();
+            }
+            auto zh_h = torch::empty({(long)(P * sizeof(LatZh))}, torch::dtype(torch::kUInt8).pinned_memory(true));
+            std::memcpy(zh_h.data_ptr(), zh.data(), P * sizeof(LatZh));
+            latZh_d_ = zh_h.to(node_mars.device(), /*non_blocking=*/true);
+            hold_.push_back(zh_h); hold_.push_back(wrow); hold_.push_back(emap32);
+            latNK_ = pos_[0].KP / 16;
+            const LatZh* zd = reinterpret_cast<const LatZh*>(latZh_d_.data_ptr());
+            const int* wr = wrow.data_ptr<int>(), * sl = slot32.data_ptr<int>();
+            const int* em = mapped ? emap32.data_ptr<int>() : nullptr;
+            auto stream = at::cuda::getCurrentCUDAStream();
+            switch (latNK_) {
+                case 2: lat_zh_launch<2>(zd, P, M, wr, sl, em, B_, dev_, stream); break;
+                case 4: lat_zh_launch<4>(zd, P, M, wr, sl, em, B_, dev_, stream); break;
+                case 6: lat_zh_launch<6>(zd, P, M, wr, sl, em, B_, dev_, stream); break;
+                case 8: lat_zh_launch<8>(zd, P, M, wr, sl, em, B_, dev_, stream); break;
+                default: TORCH_CHECK(false, "top_k: ranks padded to 32, 64, 96 or 128");
+            }
+        }
     }
+
+    // whether the plan's forward is the latency mode's
+    bool latency() const { return lat_; }
 
     // reader i's forward: its chain-dependent operands, then its sums' launches (the values; the stash where kept) --
     // its children's values the element values', or, `pairs` given (int32 [N, 2]: the product layer group below handed
@@ -3176,6 +3258,19 @@ class TopKStackPlan {
         const int2* pr = child_pairs(pairs, q.N, nm_);
         const ChildValues cv = pr != nullptr ? ChildValues{nm_.data_ptr<float>(), nm_.stride(0), q.eid, pr} :
             ChildValues{em_, em_stride_, q.eid, nullptr};
+        if (lat_) {                                          // (one launch: `tk_lat_step_kernel`)
+            LatStep st = q.lat;
+            st.cv = cv;
+            auto stream = at::cuda::getCurrentCUDAStream();
+            switch (latNK_) {
+                case 2: lat_step_launch<2>(st, stream); break;
+                case 4: lat_step_launch<4>(st, stream); break;
+                case 6: lat_step_launch<6>(st, stream); break;
+                case 8: lat_step_launch<8>(st, stream); break;
+                default: TORCH_CHECK(false, "top_k: ranks padded to 32, 64, 96 or 128");
+            }
+            return;
+        }
         launch_pdl(tk_ev_kernel, dim3((unsigned)B_), dim3(EV_T), 0, at::cuda::getCurrentCUDAStream(), cv, q.has, q.ev,
                    q.cmax, q.N, q.args.flags, 2 * q.P);
         C10_CUDA_KERNEL_LAUNCH_CHECK();
@@ -3327,6 +3422,7 @@ class TopKStackPlan {
             prep_d_ = torch::Tensor();
         mitems_ = oitems_ = noitems_ = slot32_ = logw_ = counts_ = torch::Tensor();
         AH_ = L2T_ = LTc_ = EF_ = fl_ = fmx_ = rows_ = torch::Tensor();
+        latH_ = latZ_ = latPart_ = latPmax_ = latCnt_ = latZh_d_ = torch::Tensor();
         theta_.clear();
         hold_.clear();
         nm_ = torch::Tensor();
@@ -3336,12 +3432,15 @@ class TopKStackPlan {
     struct Pos {
         TkArgs args;
         BwArgs bw;                                   // (a query's backward: `prepare_backward`)
+        LatStep lat;                                 // (the latency mode's chain step, its children's values a call's)
         const long* eid; const bool* has; float* ev; float* cmax;
         const long* cols = nullptr; const long* kids = nullptr; int nk = 0;
         int Bx, M, r, N, S, KP, t, src, Rm, P, split;
         long bp, e16, so, mo, oo, r0, ah = 0;
     };
-    bool stash_, released_ = false, bw_ready_ = false;
+    bool stash_, released_ = false, bw_ready_ = false, lat_ = false;
+    int latNK_ = 0;
+    torch::Tensor latH_, latZ_, latPart_, latPmax_, latCnt_, latZh_d_;
     int dev_ = 0, B_ = 0;
     const float* em_ = nullptr;
     long em_stride_ = 0;
@@ -3780,7 +3879,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
                       std::vector<torch::Tensor>, std::vector<torch::Tensor>, std::vector<int64_t>,
                       std::vector<int64_t>, std::vector<int64_t>, std::vector<torch::Tensor>, torch::Tensor,
                       torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, std::vector<int64_t>, torch::Tensor,
-                      torch::Tensor, torch::Tensor, bool>())
+                      torch::Tensor, torch::Tensor, bool, bool, torch::Tensor, torch::Tensor>())
+        .def("latency", &TopKStackPlan::latency, "whether its forward is the latency mode's")
         .def("forward", &TopKStackPlan::forward, "reader i's launches", py::arg("i"), py::arg("pairs") = py::none())
         .def("kept", &TopKStackPlan::kept, "reader i's operands and stash (the backward's)")
         .def("lth", &TopKStackPlan::lth, "source s's l2t")

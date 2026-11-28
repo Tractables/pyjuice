@@ -2,9 +2,11 @@
 `LowRank(top_k)` sums' STACKED forward (`lowrank/top_k_stack.py`): a pass's operands that no other layer's values
 enter, made once for every sum reading a leaf layer, and each sum's forward two launches from the stack's plan --
 against the unstacked fused forward (`top_k_fused.sum_forward`, the reference of its operands): the values bit for bit
-(the same device code), whatever the masks, the map of rows and the parameters' sources; the stash a backward takes
-from it (the conditional's answers, the gradients: up to the backward kernels' order of adds); the settled forward
-(the layer's next calls straight to the stack) taking every call of a pass it serves, and none it does not.
+(the same device code: the stacks' THROUGHPUT mode, which these tests pin -- the latency mode rounds its own way,
+`lowrank_top_k_latency_test.py`), whatever the masks, the map of rows and the parameters' sources; the stash a
+backward takes from it (the conditional's answers, the gradients: up to the backward kernels' order of adds); the
+settled forward (the layer's next calls straight to the stack) taking every call of a pass it serves, and none it does
+not.
 """
 
 import contextlib
@@ -30,6 +32,17 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs a
 
 DEV = H.DEV
 T, N, C, K, R, RE, V2 = 4, 128, 70, 64, 20, 8, 80            # (the kernels' shapes: 128 nodes, top_k 64)
+
+
+@pytest.fixture(autouse = True)
+def _throughput_mode():
+    """the stacks' throughput mode (`top_k_stack.LATENCY` off): the unstacked path's launches"""
+    import pyjuice.parameterizations.lowrank.top_k_stack as tks
+    was, tks.LATENCY = tks.LATENCY, False
+    try:
+        yield
+    finally:
+        tks.LATENCY = was
 
 
 def _modules():
