@@ -421,6 +421,7 @@ struct TkArgs {
     const int4* mitems; const int4* oitems; const int* noitems; const int* slot32; const float* logw;
     float* out; float* ws; int* flags;
     long nid0, ostride, sA; int r, M, N, S, Rm;                    // sA: A's batch stride (its rows contiguous)
+    int split;                          // the most CTAs a tile (`fw_split`: its chunks shared out where tiles are few)
     // the STASH ending's (what a backward takes from the forward's sums; `out` may be null then: no values): the
     // slots' posterior [Rm, M, SA] (a masked sample's), ao, bo [B, M], W's shift h [B, M] (every sample's); a masked
     // row's alpha, beta [Rm, M, SH] fp16: the slots times a node's d (a power of 2: `masked_stash`), the rest slot
@@ -1014,13 +1015,14 @@ __global__ void __launch_bounds__(NW * 32, 1) tk_sk_kernel(const TkArgs a) {
     using St = typename std::conditional<MASKED, MState, OState>::type;
     const int nx = a.M / TM, nch = a.N / TN;
     const long Tm = (long)nx * a.Rm, To = (long)nx * (*a.noitems);
-    // the SMs each kind takes: its share of both kinds' cost (all where the other has none), at most a CTA a tile -- a
-    // kind's tiles split only where its share is short of them (a split's prologue and partial cost ~4 us a part)
+    // the SMs each kind takes: its share of both kinds' cost (all where the other has none), at most `split` CTAs a
+    // tile -- a kind's tiles split only where its share is short of them (a split's prologue and partial cost ~4 us a
+    // part; `fw_split`)
     const long cm = Tm * WM, co = To * WO, G = gridDim.x;
     long Pm = cm == 0 ? 0 : (co == 0 ? G : max(1L, min(G - 1, (G * cm + (cm + co) / 2) / (cm + co))));
     long Po = G - Pm;
-    Pm = min(Pm, Tm);
-    Po = min(Po, To);
+    Pm = min(Pm, Tm * (long)max(1, a.split));
+    Po = min(Po, To * (long)max(1, a.split));
     const int P = (int)(MASKED ? Pm : Po), k = blockIdx.x;
     if (k >= P) return;
     const long T = MASKED ? Tm : To;
@@ -2463,6 +2465,15 @@ void bw_launches(BwArgs args, bool grads, int B, long gsz, int sms, int dev, cud
 
 }  // namespace
 
+// The forward's CTAs a tile where its tiles are fewer than the SMs: the tile's chunks shared out among them (stream-K's
+// partials), at most 4 (a part's prologue and partial ~4 us: MEASURED, the Codpula head's sums at 2 samples -- 16 tiles
+// on 188 SMs --, the sums' forward 1.87 -> 0.96 ms at 4 a tile, 1.09 at 8; at 16 samples -- 96 tiles -- 3.22 -> 2.45
+// ms at 2; from ~48 samples none, every SM already a tile). `ocap` the observed items' upper bound.
+static int fw_split(int M, long Rm, long ocap, int sms) {
+    const long tiles = std::max((long)(M / TM) * (Rm + ocap), 1L);
+    return (int)std::max(1L, std::min(4L, ((long)sms + tiles - 1) / tiles));     // (rounded up: the SMs all taken)
+}
+
 // The operands of one node vector: B [Bx, r, N] and G [Bx, S, N] (fp32) a row of tensors each; the circuit's element
 // values `em` [elements, B'] with every child's element id `eid` [N] (and `has` [N], or an empty tensor where every
 // child is reached); theta [M, N] (fp32); a sample each (B of them): the observed slots `slot` [B], the row each reads
@@ -2523,7 +2534,8 @@ std::vector<torch::Tensor> top_k_prep(torch::Tensor Bm, torch::Tensor G, torch::
     // upper bound here); its flags, the masked launch's and the observed one's
     const int sms = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
     const long chunks = (long)(M / TM) * (N / TN) * std::max((long)Rm, ocap);
-    const int P = (int)std::max(2L, std::min((long)sms, chunks / 4));       // (two at least: a CTA for each kind)
+    const long split_ctas = (long)(M / TM) * (Rm + ocap) * fw_split(M, Rm, ocap, sms);  // (few tiles: their parts)
+    const int P = (int)std::max(2L, std::min((long)sms, std::max(chunks / 4, split_ctas)));   // (two at least: a kind each)
     auto flags = torch::empty({2 * P}, i32);
     auto stream = at::cuda::getCurrentCUDAStream();
     launch_pdl(tk_prep_kernel, dim3(296, 5), dim3(256), 0, stream,
@@ -2676,6 +2688,8 @@ std::vector<torch::Tensor> top_k_forward(torch::Tensor A, torch::Tensor BP, torc
     auto ws = torch::empty({(long)P * (WS_M + WS_O) * NW * 32}, o);
     TkArgs args = sk_args(A, BP, E16, ev, cmax, LTh, mitems, oitems, noitems, slot32, logw, flags, ws);
     if (values) { args.out = out.data_ptr<float>(); args.nid0 = nid0; args.ostride = out.size(1); }
+    args.split = fw_split(M, Rm, std::max<long>((B - Rm + 1) / 2, 1),
+                          at::cuda::getCurrentDeviceProperties()->multiProcessorCount);
     if (!stash) {
         sk_launch<false>(args, BP.size(1), P, Rm, B, A.get_device());
         return {};
