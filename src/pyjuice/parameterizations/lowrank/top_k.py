@@ -303,18 +303,26 @@ def _sum_backward_terms(A, Bm, G, ltheta, lc, logw, f, pm = None):
 
 
 def sum_forward(desc, layer, ns_tensors, node_mars, element_mars, params, kwargs) -> None:
-    """The node values of a `LowRank(top_k)` sum layer, written over its rows of `node_mars`: by the fused kernel
-    where it serves (`top_k_fused.py`), else here."""
-    top_k_fused = _kernel_modules()[2]
+    """The node values of a `LowRank(top_k)` sum layer, written over its rows of `node_mars`: by the pass's stack of the
+    sums reading the leaf beside it where it takes the node vector (`top_k_stack.py`), else by the fused kernels where
+    they serve (`top_k_fused.py`), else here. A layer whose every node vector a stack took is settled
+    (`top_k_stack.settle`: its next calls straight to the stack)."""
+    top_k_fused, top_k_stack = _kernel_modules()[2], _stack_module()
     sibs = layer.__dict__.get("_sibling_leaves")
     assert sibs is not None, "A `LowRank(top_k)` sum layer compiled without its leaves (`_resolve_top_k_siblings`)."
     assert "_inputs" in kwargs, "A `LowRank(top_k)` sum layer reads the tokens; the circuit's forward passes them."
+    B = node_mars.size(1)
     layer.__dict__["_lr_state"] = dict()
-    layer.__dict__["_lr_topk_batch"] = node_mars.size(1)
+    layer.__dict__["_lr_topk_batch"] = B
+    stacked = []
     for ns_info, tensors in ns_tensors:
+        sib = sibs[id(ns_info.ns)]
+        stack = top_k_stack.stack_of(sib, B, kwargs, node_mars, element_mars, params)
+        if stack is not None and stack.forward(ns_info.ns):
+            stacked.append((ns_info.ns, sib))
+            continue
         geo = desc._geometry(layer, ns_info, node_mars.device)
-        if top_k_fused.sum_forward(desc, layer, ns_info, tensors, geo, params, element_mars, node_mars,
-                                   sibs[id(ns_info.ns)], kwargs):
+        if top_k_fused.sum_forward(desc, layer, ns_info, tensors, geo, params, element_mars, node_mars, sib, kwargs):
             continue
         A, Bm, G = (_d(t) for t in per_sample(tensors, external_rows(kwargs)))
         ltheta = desc._dense_params(geo, params, dtype = PASSES_DTYPE).log()        # [M, N]
@@ -322,6 +330,8 @@ def sum_forward(desc, layer, ns_tensors, node_mars, element_mars, params, kwargs
         logw = slot_log_weights(desc, sibs[id(ns_info.ns)], A.size(0), kwargs, node_mars.device)[0]
         ln = _sum_values(A, Bm, G, ltheta, lc, logw)
         node_mars[ns_info.nid_start:ns_info.nid_end, :] = ln.t().to(node_mars.dtype)
+    if stacked and len(stacked) == len(ns_tensors):
+        top_k_stack.settle(layer, stacked)
     return None
 
 
@@ -362,6 +372,15 @@ def _kernel_modules():
     return got
 
 
+def _stack_module():
+    """`top_k_stack` (imported when first asked for)"""
+    got = _MODS.get("stack")
+    if got is None:
+        from . import top_k_stack as got
+        _MODS["stack"] = got
+    return got
+
+
 def sum_backward(desc, layer, ns_tensors, ns_grad_tensors, node_flows, element_flows, node_mars, element_mars, params,
                  param_flows, denom_param_flows, kwargs) -> None:
     """
@@ -390,11 +409,18 @@ def sum_backward(desc, layer, ns_tensors, ns_grad_tensors, node_flows, element_f
         for geo in geos:
             element_flows.index_fill_(0, geo["kids"], -float("inf"))
     ef_kernel = element_flows.dtype == torch.float32 and element_flows.stride(1) == 1
+    # (a backward asking for no gradients nor EM statistics -- a query's -- of a node vector whose forward a stack took:
+    # by the stack, one call; `top_k_stack`)
+    plain = not want_flows and ef_kernel and node_flows.dtype == torch.float32 and node_flows.stride(1) == 1
+    B = node_flows.size(1)
 
     for (ns_info, tensors), grads, geo in zip(ns_tensors, ns_grad_tensors, geos):
         sib = sibs[id(ns_info.ns)]
+        if plain and grads is None:
+            stack = _stack_module().stack_made(sib, B)
+            if stack is not None and stack.backward(ns_info.ns, node_flows, element_flows, alone):
+                continue
         nf = node_flows[ns_info.nid_start:ns_info.nid_end, :]                        # [M, B] (log-space flows)
-        B = nf.size(1)
         f = None                                                                      # (f [B, M]: where torch needs it)
         kernels = top_k_backward.serves(desc, geo["M"], geo["N"], tensors[0].size(2), B, dev, kwargs, want_flows) \
             and element_mars.stride(1) == 1 and nf.dtype == torch.float32 and nf.stride(1) == 1

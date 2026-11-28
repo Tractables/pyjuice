@@ -123,6 +123,9 @@
 #include <cuda_fp16.h>
 #include <math_constants.h>
 #include <type_traits>
+#include <algorithm>
+#include <cstring>
+#include <vector>
 
 namespace {
 
@@ -1075,6 +1078,95 @@ __global__ void __launch_bounds__(NW * 32, 1) tk_sk_kernel(const TkArgs a) {
     }
 }
 
+// The prep's tasks (`tk_prep_kernel`, a node vector's; `tk_stack_prep_kernel` and `tk_ev_kernel`, a stack's: the same
+// arithmetic, so a stacked pass is the unstacked one bit for bit). B in fp16, its ranks zero-padded to KP: a thread a
+// pair of children, grid-stride over [Bx, KP, N / 2]
+__device__ __forceinline__ void prep_bp(const float* Bm, long sB, __half* BP, int Bx, int KP, int N, int r, long tid0,
+                                        long nth) {
+    const long total = (long)Bx * KP * (N / 2);
+    for (long q = tid0; q < total; q += nth) {
+        const int j2 = (int)(q % (N / 2));
+        const long bk = q / (N / 2);
+        const int k = (int)(bk % KP);
+        const long bb = bk / KP;
+        float2 v = make_float2(0.f, 0.f);
+        if (k < r) v = reinterpret_cast<const float2*>(Bm + bb * sB + (long)k * N)[j2];
+        reinterpret_cast<__half2*>(BP)[q] = __floats2half2_rn(v.x, v.y);
+    }
+}
+
+// E = exp(G - max) in TF32, kept in fp16 times 2^E_OFF (E16): a warp a row of [Bx, S]
+__device__ __forceinline__ void prep_e16(const float* Gt, long sG, __half* E16, int Bx, int S, int N, long wid,
+                                         long nwarp, int lane) {
+    for (long row = wid; row < (long)Bx * S; row += nwarp) {
+        const float2* gr = reinterpret_cast<const float2*>(Gt + (row / S) * sG + (row % S) * N);
+        float mx = NEG;
+        for (int j = lane; j < N / 2; j += 32) { const float2 v = gr[j]; mx = fmaxf(mx, fmaxf(v.x, v.y)); }
+        mx = warp_max(mx);
+        const float sh = isfinite(mx) ? mx : 0.f;
+        auto e16 = [&](float v) {
+            const unsigned u = __float_as_uint(__expf(v - sh));
+            return __uint_as_float((u + 0x1000u) & ~0x1FFFu) * (float)(1 << E_OFF_I);
+        };
+        __half2* hr = reinterpret_cast<__half2*>(E16 + row * N);
+        for (int j = lane; j < N / 2; j += 32) {
+            const float2 v = gr[j];
+            hr[j] = __floats2half2_rn(e16(v.x), e16(v.y));
+        }
+    }
+}
+
+// the children's values over their largest (ev [B, N]) and that largest (cmax [B], -inf where every child's is), from
+// the circuit's element values `em` [elements, B'] (the children's element ids `eid`, `has` null where every child is
+// reached): a warp a sample
+__device__ __forceinline__ void prep_ev(const float* em, long em_stride, const long* eid, const bool* has, float* ev,
+                                        float* cmax, int B, int N, long wid, long nwarp, int lane) {
+    for (long bb = wid; bb < B; bb += nwarp) {
+        float mx = NEG;
+        for (int j = lane; j < N; j += 32)
+            mx = fmaxf(mx, (has == nullptr || has[j]) ? em[eid[j] * em_stride + bb] : NEG);
+        mx = warp_max(mx);
+        const float sh = isfinite(mx) ? mx : 0.f;
+        for (int j = lane; j < N; j += 32) {
+            const float v = (has == nullptr || has[j]) ? em[eid[j] * em_stride + bb] : NEG;
+            ev[bb * N + j] = __expf(v - sh);
+        }
+        if (lane == 0) cmax[bb] = mx;
+    }
+}
+
+// theta [M, N]'s l2t in the MMAs' fragment order, a CTA a 16-row tile -- every thread of the CTA calls it (a barrier
+// inside)
+__device__ __forceinline__ void prep_lth(const float* theta, uint2* LTh, int M, int N, int lane) {
+    __shared__ float rmax[16];
+    const int nch = N / TN;
+    const int warp = threadIdx.x >> 5;
+    for (int tile = blockIdx.x; tile < M / 16; tile += gridDim.x) {
+        for (int rw = warp; rw < 16; rw += blockDim.x >> 5) {
+            const float* tr = theta + ((long)tile * 16 + rw) * N;
+            float mx = 0.f;
+            for (int j = lane; j < N; j += 32) mx = fmaxf(mx, tr[j]);
+            mx = warp_max(mx);
+            if (lane == 0) rmax[rw] = mx > 0.f ? log2f(mx) : 0.f;
+        }
+        __syncthreads();
+        for (int q = threadIdx.x; q < nch * 8 * 32; q += blockDim.x) {
+            const int ln = q & 31, nt = (q >> 5) & 7, jc = q >> 8;
+            const int g = ln >> 2, t = ln & 3;
+            const long i = (long)tile * 16 + g;
+            const int j = jc * TN + nt * 8 + 2 * t;
+            const float2 u = *reinterpret_cast<const float2*>(theta + i * N + j);
+            const float2 w = *reinterpret_cast<const float2*>(theta + (i + 8) * N + j);
+            const float s0 = rmax[g], s1 = rmax[g + 8];
+            uint2 o;
+            o.x = h2u(__floats2half2_rn(log2f(u.x) - s0, log2f(u.y) - s0));
+            o.y = h2u(__floats2half2_rn(log2f(w.x) - s1, log2f(w.y) - s1));
+            LTh[((long)tile * nch * 8) * 32 + q] = o;
+        }
+        __syncthreads();
+    }
+}
+
 // The operands, one launch: blockIdx.y the task, blockIdx.x grid-stride over its items. B and G a row of tensors each
 // (Bx of them), the children's values a sample each (B).
 __global__ void tk_prep_kernel(
@@ -1091,76 +1183,15 @@ __global__ void tk_prep_kernel(
         for (int i = threadIdx.x; i < nflags; i += blockDim.x) flags[i] = 0;
     const long wid = tid0 >> 5, nwarp = nth >> 5;
     const int lane = threadIdx.x & 31;
-    if (task == 0) {                                                         // B, fp16, its ranks padded
-        const long total = (long)Bx * KP * (N / 2);
-        for (long q = tid0; q < total; q += nth) {
-            const int j2 = (int)(q % (N / 2));
-            const long bk = q / (N / 2);
-            const int k = (int)(bk % KP);
-            const long bb = bk / KP;
-            float2 v = make_float2(0.f, 0.f);
-            if (k < r) v = reinterpret_cast<const float2*>(Bm + bb * sB + (long)k * N)[j2];
-            reinterpret_cast<__half2*>(BP)[q] = __floats2half2_rn(v.x, v.y);
-        }
-    } else if (task == 1) {          // E = exp(G - max) in TF32, kept in fp16 times 2^E_OFF (E16), a warp a row
-        for (long row = wid; row < (long)Bx * S; row += nwarp) {
-            const float2* gr = reinterpret_cast<const float2*>(Gt + (row / S) * sG + (row % S) * N);
-            float mx = NEG;
-            for (int j = lane; j < N / 2; j += 32) { const float2 v = gr[j]; mx = fmaxf(mx, fmaxf(v.x, v.y)); }
-            mx = warp_max(mx);
-            const float sh = isfinite(mx) ? mx : 0.f;
-            auto e16 = [&](float v) {
-                const unsigned u = __float_as_uint(__expf(v - sh));
-                return __uint_as_float((u + 0x1000u) & ~0x1FFFu) * (float)(1 << E_OFF_I);
-            };
-            __half2* hr = reinterpret_cast<__half2*>(E16 + row * N);
-            for (int j = lane; j < N / 2; j += 32) {
-                const float2 v = gr[j];
-                hr[j] = __floats2half2_rn(e16(v.x), e16(v.y));
-            }
-        }
-    } else if (task == 2) {                                                  // the children's values, a warp a sample
-        for (long bb = wid; bb < B; bb += nwarp) {
-            float mx = NEG;
-            for (int j = lane; j < N; j += 32)
-                mx = fmaxf(mx, (has == nullptr || has[j]) ? em[eid[j] * em_stride + bb] : NEG);
-            mx = warp_max(mx);
-            const float sh = isfinite(mx) ? mx : 0.f;
-            for (int j = lane; j < N; j += 32) {
-                const float v = (has == nullptr || has[j]) ? em[eid[j] * em_stride + bb] : NEG;
-                ev[bb * N + j] = __expf(v - sh);
-            }
-            if (lane == 0) cmax[bb] = mx;
-        }
-    } else if (task == 3) {                                                  // l2t in fragment order, a CTA a 16-row tile
+    if (task == 0) {
+        prep_bp(Bm, sB, BP, Bx, KP, N, r, tid0, nth);
+    } else if (task == 1) {
+        prep_e16(Gt, sG, E16, Bx, S, N, wid, nwarp, lane);
+    } else if (task == 2) {
+        prep_ev(em, em_stride, eid, has, ev, cmax, B, N, wid, nwarp, lane);
+    } else if (task == 3) {
         if (theta == nullptr) return;                                        // (an earlier call's table reused)
-        __shared__ float rmax[16];
-        const int nch = N / TN;
-        const int warp = threadIdx.x >> 5;
-        for (int tile = blockIdx.x; tile < M / 16; tile += gridDim.x) {
-            for (int rw = warp; rw < 16; rw += blockDim.x >> 5) {
-                const float* tr = theta + ((long)tile * 16 + rw) * N;
-                float mx = 0.f;
-                for (int j = lane; j < N; j += 32) mx = fmaxf(mx, tr[j]);
-                mx = warp_max(mx);
-                if (lane == 0) rmax[rw] = mx > 0.f ? log2f(mx) : 0.f;
-            }
-            __syncthreads();
-            for (int q = threadIdx.x; q < nch * 8 * 32; q += blockDim.x) {
-                const int ln = q & 31, nt = (q >> 5) & 7, jc = q >> 8;
-                const int g = ln >> 2, t = ln & 3;
-                const long i = (long)tile * 16 + g;
-                const int j = jc * TN + nt * 8 + 2 * t;
-                const float2 u = *reinterpret_cast<const float2*>(theta + i * N + j);
-                const float2 w = *reinterpret_cast<const float2*>(theta + (i + 8) * N + j);
-                const float s0 = rmax[g], s1 = rmax[g + 8];
-                uint2 o;
-                o.x = h2u(__floats2half2_rn(log2f(u.x) - s0, log2f(u.y) - s0));
-                o.y = h2u(__floats2half2_rn(log2f(w.x) - s1, log2f(w.y) - s1));
-                LTh[((long)tile * nch * 8) * 32 + q] = o;
-            }
-            __syncthreads();
-        }
+        prep_lth(theta, LTh, M, N, lane);
     } else {                                                                 // the masked samples' weights, fp32, padded
         const long total = logwin != nullptr ? (long)Rm * M * SP : 0;      // (none to copy: given padded)
         for (long q = tid0; q < total; q += nth) {
@@ -1168,6 +1199,62 @@ __global__ void tk_prep_kernel(
             logw[q] = s < S ? logwin[(q / SP) * S + s] : NEG;
         }
     }
+}
+
+// A stack's reader as its prep reads it (`TopKStackPlan`): its B and G (a row of tensors each), its operands' places
+// in the stack's buffers, theta and its table where this reader makes its source's (null: another reader does)
+struct StackPrep {
+    const float* Bm; long sB; const float* Gt; long sG; __half* BP; __half* E16;
+    const float* theta; uint2* LTh;
+    int Bx, KP, N, r, S, M;
+};
+
+// A stack's chain-independent operands, one launch: blockIdx.z the reader, blockIdx.y the task (its B in fp16, its
+// E16; its source's l2t where it makes it), blockIdx.x grid-stride over the task's items
+__global__ void tk_stack_prep_kernel(const StackPrep* __restrict__ readers) {
+    pdl_entry();
+    const StackPrep p = readers[blockIdx.z];
+    const long tid0 = (long)blockIdx.x * blockDim.x + threadIdx.x, nth = (long)gridDim.x * blockDim.x;
+    const int lane = threadIdx.x & 31;
+    if (blockIdx.y == 0) prep_bp(p.Bm, p.sB, p.BP, p.Bx, p.KP, p.N, p.r, tid0, nth);
+    else if (blockIdx.y == 1) prep_e16(p.Gt, p.sG, p.E16, p.Bx, p.S, p.N, tid0 >> 5, nth >> 5, lane);
+    else if (p.theta != nullptr) prep_lth(p.theta, p.LTh, p.M, p.N, lane);
+}
+
+// A stacked reader's chain-dependent operands, one launch before its sums: the children's values over their largest
+// (`prep_ev`'s, the same bits: the largest is exact in any order) and the stream-K flags its sums' launches start from,
+// zeroed. A CTA a sample, a thread EV_PT of its children at most held in registers between the two passes -- every load
+// issued at once: on the chain, its latency is the pass's (MEASURED, the Codpula head at 2 samples: a warp a sample, as
+// `prep_ev`, 8.6 us a position)
+constexpr int EV_T = 256, EV_PT = 16;                // (children N <= EV_T EV_PT = 4096)
+__global__ void __launch_bounds__(EV_T) tk_ev_kernel(const float* em, long em_stride, const long* eid, const bool* has,
+                                                     float* ev, float* cmax, int N, int* flags, int nflags) {
+    pdl_entry();
+    if (blockIdx.x == 0)
+        for (int i = threadIdx.x; i < nflags; i += EV_T) flags[i] = 0;
+    const int bb = blockIdx.x;
+    float v[EV_PT];
+    float mx = NEG;
+#pragma unroll
+    for (int u = 0; u < EV_PT; ++u) {
+        const int j = threadIdx.x + u * EV_T;
+        v[u] = (j < N && (has == nullptr || has[j])) ? em[eid[j] * em_stride + bb] : NEG;
+        mx = fmaxf(mx, v[u]);
+    }
+    __shared__ float red[EV_T / 32];
+    mx = warp_max(mx);
+    if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = mx;
+    __syncthreads();
+    mx = red[0];
+#pragma unroll
+    for (int w = 1; w < EV_T / 32; ++w) mx = fmaxf(mx, red[w]);
+    const float sh = isfinite(mx) ? mx : 0.f;
+#pragma unroll
+    for (int u = 0; u < EV_PT; ++u) {
+        const int j = threadIdx.x + u * EV_T;
+        if (j < N) ev[(long)bb * N + j] = __expf(v[u] - sh);
+    }
+    if (threadIdx.x == 0) cmax[bb] = mx;
 }
 
 // The work items (a CTA a node vector's): a masked item a masked sample, its row of tensors and up to two observed
@@ -2246,50 +2333,45 @@ __global__ void __launch_bounds__(NW * 32, 1) tk_bw_em_obs_kernel(const EmArgs a
     }
 }
 
-// The backward's operands beside the prep's (one launch, blockIdx.y the task): AH [Bx, M, KP] = fp16(log2 e A), the
-// ranks zero-padded (a thread 8 of a row's, one 16-byte store); l2t [M, N] fp16 = log2 theta less its row's largest
-// (the forward's values, row-major; a warp a row)
-__global__ void tk_bw_prep_kernel(const float* A, long sA, const float* theta,
-                                  __half* AH, __half* L2T, int Bx, int M, int N, int r, int KP) {
-    pdl_entry();
-    const int task = blockIdx.y;
-    const long tid0 = (long)blockIdx.x * blockDim.x + threadIdx.x, nth = (long)gridDim.x * blockDim.x;
-    if (task == 0) {
-        const int G8 = KP / 8;
-        const long total = (long)Bx * M * G8;
-        for (long q = tid0; q < total; q += nth) {
-            const long row = q / G8;
-            const int k0 = (int)(q - row * G8) * 8;
-            const float* src = A + (row / M) * sA + (row % M) * r;
-            float v[8];
-            #pragma unroll
-            for (int u = 0; u < 8; ++u) v[u] = k0 + u < r ? src[k0 + u] * LOG2E : 0.f;
-            uint4 o;
-            o.x = h2u(__floats2half2_rn(v[0], v[1])); o.y = h2u(__floats2half2_rn(v[2], v[3]));
-            o.z = h2u(__floats2half2_rn(v[4], v[5])); o.w = h2u(__floats2half2_rn(v[6], v[7]));
-            reinterpret_cast<uint4*>(AH)[q] = o;
-        }
-    } else {
-        const int lane = threadIdx.x & 31;
-        const long wid = tid0 >> 5, nwarp = nth >> 5;
-        for (long i = wid; i < M; i += nwarp) {
-            const float* tr = theta + i * N;
-            float mx = 0.f;
-            for (int j = lane; j < N; j += 32) mx = fmaxf(mx, tr[j]);
-            mx = warp_max(mx);
-            const float s = mx > 0.f ? log2f(mx) : 0.f;
-            for (int j = lane; j < N; j += 32) L2T[i * N + j] = __float2half_rn(log2f(tr[j]) - s);
-        }
+// The backward's operands beside the prep's (`tk_bw_prep_kernel`, `tk_bw_ltc_kernel`; a stack's in its prep: the
+// same arithmetic). AH [Bx, M, KP] = fp16(log2 e A), the ranks zero-padded: a thread 8 of a row's, one 16-byte store
+__device__ __forceinline__ void bw_prep_ah(const float* A, long sA, __half* AH, int Bx, int M, int r, int KP, long tid0,
+                                           long nth) {
+    const int G8 = KP / 8;
+    const long total = (long)Bx * M * G8;
+    for (long q = tid0; q < total; q += nth) {
+        const long row = q / G8;
+        const int k0 = (int)(q - row * G8) * 8;
+        const float* src = A + (row / M) * sA + (row % M) * r;
+        float v[8];
+        #pragma unroll
+        for (int u = 0; u < 8; ++u) v[u] = k0 + u < r ? src[k0 + u] * LOG2E : 0.f;
+        uint4 o;
+        o.x = h2u(__floats2half2_rn(v[0], v[1])); o.y = h2u(__floats2half2_rn(v[2], v[3]));
+        o.z = h2u(__floats2half2_rn(v[4], v[5])); o.w = h2u(__floats2half2_rn(v[6], v[7]));
+        reinterpret_cast<uint4*>(AH)[q] = o;
+    }
+}
+
+// l2t [M, N] fp16 = log2 theta less its row's largest (the forward's values, row-major): a warp a row
+__device__ __forceinline__ void bw_prep_l2t(const float* theta, __half* L2T, int M, int N, long wid, long nwarp,
+                                            int lane) {
+    for (long i = wid; i < M; i += nwarp) {
+        const float* tr = theta + i * N;
+        float mx = 0.f;
+        for (int j = lane; j < N; j += 32) mx = fmaxf(mx, tr[j]);
+        mx = warp_max(mx);
+        const float s = mx > 0.f ? log2f(mx) : 0.f;
+        for (int j = lane; j < N; j += 32) L2T[i * N + j] = __float2half_rn(log2f(tr[j]) - s);
     }
 }
 
 // l2t in the cols kernel's fragment order (`LTc`): a 16-child tile J, a node 8-tile I, a lane (g, t): {l2t[8I + 2t][16J
 // + g], l2t[8I + 2t + 1][16J + g]}, the same at child 16J + g + 8 -- the C operand of W^T's first k-step, a warp's load
 // one 256-byte run
-__global__ void tk_bw_ltc_kernel(const __half* L2T, uint2* LTc, int M, int N) {
-    pdl_entry();
+__device__ __forceinline__ void bw_ltc(const __half* L2T, uint2* LTc, int M, int N, long tid0, long nth) {
     const long total = (long)(N / 16) * (M / 8) * 32;
-    for (long q = (long)blockIdx.x * blockDim.x + threadIdx.x; q < total; q += (long)gridDim.x * blockDim.x) {
+    for (long q = tid0; q < total; q += nth) {
         const int lane = (int)(q & 31), g = lane >> 2, t = lane & 3;
         const long JI = q >> 5;
         const int I = (int)(JI % (M / 8)), J = (int)(JI / (M / 8));
@@ -2299,6 +2381,40 @@ __global__ void tk_bw_ltc_kernel(const __half* L2T, uint2* LTc, int M, int N) {
         o.y = h2u(__halves2half2(L2T[i * N + j + 8], L2T[(i + 1) * N + j + 8]));
         LTc[q] = o;
     }
+}
+
+// The backward's operands beside the prep's (one launch, blockIdx.y the task): AH (`bw_prep_ah`), l2t (`bw_prep_l2t`)
+__global__ void tk_bw_prep_kernel(const float* A, long sA, const float* theta,
+                                  __half* AH, __half* L2T, int Bx, int M, int N, int r, int KP) {
+    pdl_entry();
+    const long tid0 = (long)blockIdx.x * blockDim.x + threadIdx.x, nth = (long)gridDim.x * blockDim.x;
+    if (blockIdx.y == 0) bw_prep_ah(A, sA, AH, Bx, M, r, KP, tid0, nth);
+    else bw_prep_l2t(theta, L2T, M, N, tid0 >> 5, nth >> 5, threadIdx.x & 31);
+}
+
+__global__ void tk_bw_ltc_kernel(const __half* L2T, uint2* LTc, int M, int N) {
+    pdl_entry();
+    bw_ltc(L2T, LTc, M, N, (long)blockIdx.x * blockDim.x + threadIdx.x, (long)gridDim.x * blockDim.x);
+}
+
+// A stack's backward operands (`TopKStackPlan`, where a backward may follow), two launches: every reader's AH and its
+// source's l2t (the source's first reader: `l2t` null for the others; blockIdx.y the task, blockIdx.z the reader), then
+// each source's LTc (blockIdx.z the source)
+struct StackBwPrep {
+    const float* A; long sA; __half* AH; const float* theta; __half* L2T; uint2* LTc;
+    int Bx, M, N, r, KP;
+};
+__global__ void tk_stack_bw_prep_kernel(const StackBwPrep* __restrict__ readers) {
+    pdl_entry();
+    const StackBwPrep p = readers[blockIdx.z];
+    const long tid0 = (long)blockIdx.x * blockDim.x + threadIdx.x, nth = (long)gridDim.x * blockDim.x;
+    if (blockIdx.y == 0) bw_prep_ah(p.A, p.sA, p.AH, p.Bx, p.M, p.r, p.KP, tid0, nth);
+    else if (p.theta != nullptr) bw_prep_l2t(p.theta, p.L2T, p.M, p.N, tid0 >> 5, nth >> 5, threadIdx.x & 31);
+}
+__global__ void tk_stack_ltc_kernel(const StackBwPrep* __restrict__ sources) {
+    pdl_entry();
+    const StackBwPrep p = sources[blockIdx.z];
+    bw_ltc(p.L2T, p.LTc, p.M, p.N, (long)blockIdx.x * blockDim.x + threadIdx.x, (long)gridDim.x * blockDim.x);
 }
 
 // The node flows into the stash, in place (the backward's first step). blockIdx.y the task, a CTA a sample (task 0)
@@ -2779,6 +2895,373 @@ std::vector<torch::Tensor> top_k_sum_forward(torch::Tensor A, torch::Tensor Bm, 
     return ops;
 }
 
+// The children's element flows from the backward's EF [B, N] (`top_k_scatter_ef`, a stack's backward): a CTA a 32 x 32
+// tile of (child, sample), log EF transposed into `ef` [elements][ld] -- added (log-space) or, `STORE`, stored
+template <bool STORE>
+__global__ void tk_scatter_ef_kernel(const float* EF, const long* cols,
+                                     const long* kids, float* ef, long ld, int B, int N, int nk) {
+    pdl_entry();
+    __shared__ float tile[32][33];
+    const int k0 = blockIdx.x * 32, b0 = blockIdx.y * 32, tx = threadIdx.x, ty = threadIdx.y;
+    const int kx = k0 + tx;
+    const long cx = kx < nk ? cols[kx] : 0;
+    for (int u = ty; u < 32; u += 8) {
+        const int b = b0 + u;
+        tile[u][tx] = (kx < nk && b < B) ? EF[(long)b * N + cx] : 0.f;
+    }
+    __syncthreads();
+    for (int u = ty; u < 32; u += 8) {
+        const int k = k0 + u, b = b0 + tx;
+        if (k >= nk || b >= B) continue;
+        float* p = ef + kids[k] * ld + b;
+        const float y = __logf(tile[tx][u]);
+        if (STORE) { *p = y; continue; }                            // (the rows' one writer: no fill before)
+        const float x = *p;
+        const float m = fmaxf(x, y);
+        *p = m == -INFINITY ? m : m + log1pf(__expf(-fabsf(x - y)));
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// A STACK: a pass's forward of the sums reading a leaf layer (`lowrank/top_k_stack.py`). Their chain-independent
+// operands -- B in fp16, E16, theta's tables -- made by one launch for all of them (`tk_stack_prep_kernel`) into buffers
+// allocated once; each reader's launches -- its chain-dependent operands (`tk_ev_kernel`: the children's values, made by
+// the step before it), then the values and, where a backward may follow, the stash (`sk_launch`) -- from arguments
+// made here once, so a reader's forward is one call: `forward(i)`. The same arithmetic as the unstacked path
+// (`top_k_prep`, `top_k_forward`): the same values bit for bit.
+class TopKStackPlan {
+  public:
+    // A reader i: its tensors A [Bx, M, r], B [Bx, r, N], G [Bx, S, N] (fp32, rows contiguous: as `check_rows`), its
+    // children's element ids `eid` [N] (`has` [N], or an empty tensor where every child is reached), its rows of the
+    // node values from `nid0`, its leaf's place `leaf` among the leaf layer's node vectors, its parameters' source `src`
+    // (`theta[src]` [M, N] fp32, the sources' dense parameters). The leaf layer's: its work items (`top_k_items`'
+    // four, every leaf's), its masked samples' slot weights `logw` [R, M, 72] and their rows' offsets `offs` [T + 1];
+    // with `stash`, its counts' buffer `counts` [R, M, 72] (the stash's posterior there). The circuit's buffers.
+    TopKStackPlan(std::vector<torch::Tensor> A, std::vector<torch::Tensor> Bm, std::vector<torch::Tensor> G,
+                  std::vector<torch::Tensor> eid, std::vector<torch::Tensor> has, std::vector<int64_t> nid0,
+                  std::vector<int64_t> leaf, std::vector<int64_t> src, std::vector<torch::Tensor> theta,
+                  torch::Tensor mitems, torch::Tensor oitems, torch::Tensor noitems, torch::Tensor slot32,
+                  torch::Tensor logw, std::vector<int64_t> offs, torch::Tensor counts, torch::Tensor node_mars,
+                  torch::Tensor element_mars, bool stash) : stash_(stash) {
+        const int P = (int)A.size();
+        TORCH_CHECK(P >= 1 && (int)Bm.size() == P && (int)G.size() == P && (int)eid.size() == P &&
+                    (int)has.size() == P && (int)nid0.size() == P && (int)leaf.size() == P && (int)src.size() == P,
+                    "top_k stack: a reader's every list entry");
+        const c10::cuda::CUDAGuard guard(node_mars.device());
+        dev_ = node_mars.get_device();
+        TORCH_CHECK(node_mars.is_cuda() && node_mars.is_contiguous() && node_mars.scalar_type() == at::kFloat,
+                    "top_k stack: the node values, a contiguous CUDA float32 tensor");
+        TORCH_CHECK(element_mars.is_cuda() && element_mars.scalar_type() == at::kFloat && element_mars.dim() == 2 &&
+                    element_mars.stride(1) == 1, "top_k stack: the element values, batch innermost");
+        B_ = (int)node_mars.size(1);
+        TORCH_CHECK(B_ <= 4096, "top_k stack: at most 4096 samples (the work items' scans)");
+        em_ = element_mars.data_ptr<float>(); em_stride_ = element_mars.stride(0);
+        const int T = (int)offs.size() - 1;
+        TORCH_CHECK(T >= 1 && slot32.dim() == 2 && slot32.size(0) == T && slot32.size(1) == B_ && noitems.numel() == T,
+                    "top_k stack: the leaf layer's items: slot32 [T, B], noitems [T]");
+        check(mitems, at::kInt, "mitems"); check(oitems, at::kInt, "oitems"); check(noitems, at::kInt, "noitems");
+        check(slot32, at::kInt, "slot32");
+        TORCH_CHECK(logw.dim() == 3 && logw.size(2) == SP && logw.size(0) == offs[T], "top_k stack: logw [R, M, 72]");
+        check(logw, at::kFloat, "logw");
+        if (stash) {
+            TORCH_CHECK(offs[T] == 0 || (counts.dim() == 3 && counts.size(0) == offs[T] && counts.size(2) == SA),
+                        "top_k stack: the leaf's counts [R, M, 72]");
+            if (counts.numel() > 0) check(counts, at::kFloat, "counts");
+        }
+        // the items' places, a leaf's past the earlier leaves' (`top_k_items`' layout)
+        std::vector<long> mo(T + 1, 0), oo(T + 1, 0);
+        for (int t = 0; t < T; ++t) {
+            const long rm = offs[t + 1] - offs[t];
+            mo[t + 1] = mo[t] + std::max(rm, 1L);
+            oo[t + 1] = oo[t] + 2 * std::max((B_ - rm + 1) / 2, 1L) + 1;
+        }
+        TORCH_CHECK(mitems.size(0) == mo[T] && oitems.size(0) == oo[T], "top_k stack: the items' counts");
+        // the readers' shapes and the buffers' places
+        const int sms = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
+        auto f32 = node_mars.options(), f16 = f32.dtype(at::kHalf), i32 = f32.dtype(at::kInt);
+        long nbp = 0, ne16 = 0, nstash = 0;
+        int maxP = 2;
+        pos_.resize(P);
+        for (int i = 0; i < P; ++i) {
+            A[i] = as_rows(A[i]); Bm[i] = as_rows(Bm[i]); G[i] = as_rows(G[i]);       // (copies where they must)
+            check_rows(A[i], at::kFloat, "A"); check_rows(Bm[i], at::kFloat, "B"); check_rows(G[i], at::kFloat, "G");
+            check(eid[i], at::kLong, "eid");
+            Pos& q = pos_[i];
+            q.Bx = (int)A[i].size(0); q.M = (int)A[i].size(1); q.r = (int)A[i].size(2); q.N = (int)Bm[i].size(2);
+            q.S = (int)G[i].size(1); q.KP = padded_rank(q.r); q.t = (int)leaf[i]; q.src = (int)src[i];
+            TORCH_CHECK(Bm[i].size(0) == q.Bx && Bm[i].size(1) == q.r && G[i].size(0) == q.Bx && G[i].size(2) == q.N &&
+                        eid[i].numel() == q.N && q.M % TM == 0 && q.N % TN == 0 && q.r <= 128 && q.S == 8 * NS8 + 1 &&
+                        q.t >= 0 && q.t < T && q.src >= 0 && q.src < (int)theta.size() && logw.size(1) == q.M,
+                        "top_k stack: a reader's shapes (nodes a multiple of 128, children of 64, rank <= 128, top_k "
+                        "= 64)");
+            if (has[i].numel() > 0) TORCH_CHECK(has[i].is_cuda() && has[i].scalar_type() == at::kBool &&
+                                                has[i].numel() == q.N, "top_k stack: has [N] bool");
+            q.Rm = (int)(offs[q.t + 1] - offs[q.t]);
+            const long ocap = std::max((B_ - q.Rm + 1) / 2, 1);
+            const long chunks = (long)(q.M / TM) * (q.N / TN) * std::max((long)q.Rm, ocap);
+            const long split_ctas = (long)(q.M / TM) * (q.Rm + ocap) * fw_split(q.M, q.Rm, ocap, sms);
+            q.P = (int)std::max(2L, std::min((long)sms, std::max(chunks / 4, split_ctas)));
+            q.split = fw_split(q.M, q.Rm, ocap, sms);
+            q.bp = nbp; nbp += (long)q.Bx * q.KP * q.N;
+            q.e16 = ne16; ne16 += (long)q.Bx * q.S * q.N;
+            q.so = nstash; nstash += std::max(q.Rm, 1);
+            q.mo = mo[q.t]; q.oo = oo[q.t]; q.r0 = offs[q.t];
+            maxP = std::max(maxP, q.P);
+        }
+        for (int i = 0; i < P; ++i)
+            TORCH_CHECK(pos_[i].M == pos_[0].M && pos_[i].N == pos_[0].N && pos_[i].N <= EV_T * EV_PT,
+                        "top_k stack: its readers' nodes and children (at most 4096)");
+        const int M = pos_[0].M, N = pos_[0].N;
+        for (const auto& th : theta) {
+            check(th, at::kFloat, "theta");
+            TORCH_CHECK(th.size(0) == M && th.size(1) == N, "top_k stack: theta [M, N]");
+        }
+        BP_ = torch::empty({nbp}, f16); E16_ = torch::empty({ne16}, f16);
+        LTh_ = torch::empty({(long)theta.size() * M * N / 2}, i32);
+        ev_ = torch::empty({(long)P * B_ * N}, f32); cmax_ = torch::empty({(long)P * B_}, f32);
+        flags_ = torch::empty({2 * maxP}, i32);
+        ws_ = torch::empty({(long)maxP * (WS_M + WS_O) * NW * 32}, f32);
+        if (stash) {
+            alpha16_ = torch::empty({nstash, M, SH}, f16); beta16_ = torch::empty_like(alpha16_);
+            invd_ = torch::empty({nstash, M}, f32); acnt0_ = torch::empty({1, M, SA}, f32);
+            ao_ = torch::empty({P, B_, M}, f32); bo_ = torch::empty_like(ao_); hrow_ = torch::empty_like(ao_);
+        }
+        // every reader's arguments: its sums' launches' (`sk_args`, `top_k_forward`), its prep's
+        std::vector<StackPrep> prep(P);
+        std::vector<bool> made(theta.size(), false);
+        for (int i = 0; i < P; ++i) {
+            Pos& q = pos_[i];
+            TkArgs& a = q.args;
+            a = TkArgs{};
+            a.A = A[i].data_ptr<float>(); a.sA = A[i].stride(0);
+            a.BP = reinterpret_cast<const __half*>(BP_.data_ptr<at::Half>()) + q.bp;
+            a.E16 = reinterpret_cast<const __half*>(E16_.data_ptr<at::Half>()) + q.e16;
+            a.LTh = reinterpret_cast<const uint2*>(LTh_.data_ptr<int>() + (long)q.src * M * N / 2);
+            q.ev = ev_.data_ptr<float>() + (long)i * B_ * N; q.cmax = cmax_.data_ptr<float>() + (long)i * B_;
+            a.ev = q.ev; a.cmax = q.cmax;
+            a.mitems = reinterpret_cast<const int4*>(mitems.data_ptr<int>()) + q.mo;
+            a.oitems = reinterpret_cast<const int4*>(oitems.data_ptr<int>()) + q.oo;
+            a.noitems = noitems.data_ptr<int>() + q.t; a.slot32 = slot32.data_ptr<int>() + (long)q.t * B_;
+            a.logw = logw.data_ptr<float>() + q.r0 * M * SP;
+            a.ws = ws_.data_ptr<float>(); a.flags = flags_.data_ptr<int>();
+            a.r = q.r; a.M = M; a.N = N; a.S = q.S; a.Rm = q.Rm; a.split = q.split;
+            a.out = node_mars.data_ptr<float>(); a.nid0 = nid0[i]; a.ostride = B_;
+            TORCH_CHECK(nid0[i] >= 0 && nid0[i] + M <= node_mars.size(0), "top_k stack: a reader's rows of the values");
+            if (stash) {
+                a.acnt = q.Rm > 0 ? counts.data_ptr<float>() + q.r0 * M * SA : acnt0_.data_ptr<float>();
+                a.ao = ao_.data_ptr<float>() + (long)i * B_ * M; a.bo = bo_.data_ptr<float>() + (long)i * B_ * M;
+                a.hrow = hrow_.data_ptr<float>() + (long)i * B_ * M;
+                a.alpha16 = reinterpret_cast<__half*>(alpha16_.data_ptr<at::Half>()) + q.so * M * SH;
+                a.beta16 = reinterpret_cast<__half*>(beta16_.data_ptr<at::Half>()) + q.so * M * SH;
+                a.invd = invd_.data_ptr<float>() + q.so * M;
+            }
+            q.eid = eid[i].data_ptr<long>(); q.has = has[i].numel() > 0 ? has[i].data_ptr<bool>() : nullptr;
+            StackPrep& d = prep[i];
+            d.Bm = Bm[i].data_ptr<float>(); d.sB = Bm[i].stride(0); d.Gt = G[i].data_ptr<float>(); d.sG = G[i].stride(0);
+            d.BP = reinterpret_cast<__half*>(BP_.data_ptr<at::Half>()) + q.bp;
+            d.E16 = reinterpret_cast<__half*>(E16_.data_ptr<at::Half>()) + q.e16;
+            d.theta = made[q.src] ? nullptr : theta[q.src].data_ptr<float>();             // (a source's table once)
+            d.LTh = reinterpret_cast<uint2*>(LTh_.data_ptr<int>() + (long)q.src * M * N / 2);
+            made[q.src] = true;
+            d.Bx = q.Bx; d.KP = q.KP; d.N = N; d.r = q.r; d.S = q.S; d.M = M;
+        }
+        // (the tensors the launches read: kept as long as the plan)
+        hold_ = {mitems, oitems, noitems, slot32, logw, counts, node_mars, element_mars};
+        for (int i = 0; i < P; ++i) { hold_.push_back(A[i]); hold_.push_back(Bm[i]); hold_.push_back(G[i]);
+                                      hold_.push_back(eid[i]); hold_.push_back(has[i]); }
+        for (const auto& th : theta) hold_.push_back(th);
+        theta_ = theta;
+        mitems_ = mitems; oitems_ = oitems; noitems_ = noitems; slot32_ = slot32; logw_ = logw; counts_ = counts;
+        // the prep: its readers' arguments to the device (a pinned copy, kept until the plan goes), one launch
+        auto host = torch::empty({(long)(P * sizeof(StackPrep))}, torch::dtype(torch::kUInt8).pinned_memory(true));
+        std::memcpy(host.data_ptr(), prep.data(), P * sizeof(StackPrep));
+        prep_d_ = host.to(node_mars.device(), /*non_blocking=*/true);
+        hold_.push_back(host);
+        long items = 0;
+        for (const auto& q : pos_)
+            items = std::max({items, ((long)q.Bx * q.KP * (N / 2) + 255) / 256, ((long)q.Bx * q.S + 7) / 8, (long)M / 16});
+        launch_pdl(tk_stack_prep_kernel, dim3((unsigned)std::max(1L, std::min(296L, items)), 3, P), dim3(256), 0,
+                   at::cuda::getCurrentCUDAStream(), reinterpret_cast<const StackPrep*>(prep_d_.data_ptr()));
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+    }
+
+    // reader i's forward: its chain-dependent operands, then its sums' launches (the values; the stash where kept)
+    void forward(int64_t i) const {
+        TORCH_CHECK(!released_ && i >= 0 && i < (int64_t)pos_.size(), "top_k stack: a reader's index");
+        const Pos& q = pos_[i];
+        const c10::cuda::CUDAGuard guard(dev_);
+        launch_pdl(tk_ev_kernel, dim3((unsigned)B_), dim3(EV_T), 0, at::cuda::getCurrentCUDAStream(), em_,
+                   em_stride_, q.eid, q.has, q.ev, q.cmax, q.N, q.args.flags, 2 * q.P);
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+        if (stash_) sk_launch<true>(q.args, q.KP, q.P, q.Rm, B_, dev_);
+        else sk_launch<false>(q.args, q.KP, q.P, q.Rm, B_, dev_);
+    }
+
+    // reader i's operands and stash as the unstacked forward returns them (`top_k_prep`'s eleven, `top_k_forward`'s
+    // seven): the backward's
+    std::vector<torch::Tensor> kept(int64_t i) const {
+        TORCH_CHECK(!released_ && stash_ && i >= 0 && i < (int64_t)pos_.size(), "top_k stack: a kept reader's index");
+        const Pos& q = pos_[i];
+        const long M = q.args.M, N = q.N, Rm1 = std::max(q.Rm, 1);
+        const long ocap = std::max((B_ - q.Rm + 1) / 2, 1);
+        return {
+            BP_.narrow(0, q.bp, (long)q.Bx * q.KP * N).view({q.Bx, q.KP, N}),
+            E16_.narrow(0, q.e16, (long)q.Bx * q.S * N).view({q.Bx, q.S, N}),
+            ev_.narrow(0, (long)i * B_ * N, (long)B_ * N).view({B_, N}), cmax_.narrow(0, (long)i * B_, B_),
+            LTh_.narrow(0, (long)q.src * M * N / 2, M * N / 2),
+            mitems_.narrow(0, q.mo, q.Rm), oitems_.narrow(0, q.oo, 2 * ocap + 1), noitems_.narrow(0, q.t, 1),
+            slot32_.select(0, q.t), logw_.narrow(0, q.r0, q.Rm), flags_,
+            alpha16_.narrow(0, q.so, Rm1), beta16_.narrow(0, q.so, Rm1), invd_.narrow(0, q.so, Rm1),
+            q.Rm > 0 ? counts_.narrow(0, q.r0, q.Rm) : acnt0_,
+            ao_.select(0, i), bo_.select(0, i), hrow_.select(0, i)};
+    }
+
+    // source s's l2t (`theta_tables`' "LTh")
+    torch::Tensor lth(int64_t s) const {
+        const long M = pos_[0].M, N = pos_[0].N;
+        TORCH_CHECK(!released_ && s >= 0 && (s + 1) * M * N / 2 <= LTh_.numel(), "top_k stack: a source's index");
+        return LTh_.narrow(0, s * M * N / 2, M * N / 2);
+    }
+
+    // Where a backward may follow (`stash`): its operands -- every reader's AH, each source's l2t and LTc, two launches
+    // (`tk_stack_bw_prep_kernel`, `tk_stack_ltc_kernel`) -- and each reader's arguments for a backward that asks for no
+    // gradients nor EM statistics (a query's: `backward`); `cols`, `kids` a reader's children an edge reaches (their
+    // columns of EF, their element ids), `rows` the leaf layer's masked samples (in its slot weights' order).
+    void prepare_backward(std::vector<torch::Tensor> cols, std::vector<torch::Tensor> kids, torch::Tensor rows) {
+        const int P = (int)pos_.size();
+        TORCH_CHECK(stash_ && !released_ && !bw_ready_ && (int)cols.size() == P && (int)kids.size() == P,
+                    "top_k stack: a backward's operands, once, of a stack keeping its stash");
+        check(rows, at::kLong, "rows");
+        TORCH_CHECK(rows.numel() == logw_.size(0), "top_k stack: the leaf's masked samples");
+        const c10::cuda::CUDAGuard guard(dev_);
+        const long M = pos_[0].M, N = pos_[0].N;
+        auto f32 = ev_.options(), f16 = f32.dtype(at::kHalf), i32 = f32.dtype(at::kInt);
+        long nah = 0;
+        for (auto& q : pos_) { q.ah = nah; nah += (long)q.Bx * M * q.KP; }
+        const long nsrc = theta_.size();
+        AH_ = torch::empty({nah}, f16); L2T_ = torch::empty({nsrc * M * N}, f16); LTc_ = torch::empty({nsrc * M * N / 2}, i32);
+        EF_ = torch::empty({(long)B_, N}, f32); fl_ = torch::empty({(long)B_, M}, f32); fmx_ = torch::empty({(long)B_}, f32);
+        rows_ = rows;
+        std::vector<StackBwPrep> prep(P), srcs(nsrc);
+        std::vector<bool> made(nsrc, false);
+        for (int i = 0; i < P; ++i) {
+            Pos& q = pos_[i];
+            check(cols[i], at::kLong, "cols"); check(kids[i], at::kLong, "kids");
+            TORCH_CHECK(cols[i].numel() == kids[i].numel() && cols[i].numel() <= N, "top_k stack: cols, kids");
+            q.cols = cols[i].data_ptr<long>(); q.kids = kids[i].data_ptr<long>(); q.nk = (int)cols[i].numel();
+            hold_.push_back(cols[i]); hold_.push_back(kids[i]);
+            __half* l2t = reinterpret_cast<__half*>(L2T_.data_ptr<at::Half>()) + (long)q.src * M * N;
+            uint2* ltc = reinterpret_cast<uint2*>(LTc_.data_ptr<int>() + (long)q.src * M * N / 2);
+            StackBwPrep& d = prep[i];
+            d.A = q.args.A; d.sA = q.args.sA; d.AH = reinterpret_cast<__half*>(AH_.data_ptr<at::Half>()) + q.ah;
+            d.theta = made[q.src] ? nullptr : theta_[q.src].data_ptr<float>();
+            d.L2T = l2t; d.LTc = ltc; d.Bx = q.Bx; d.M = (int)M; d.N = (int)N; d.r = q.r; d.KP = q.KP;
+            if (!made[q.src]) srcs[q.src] = d;
+            made[q.src] = true;
+            // (a query's backward: `top_k_bw_grads`' arguments without gradients)
+            BwArgs& a = q.bw;
+            a = BwArgs{};
+            a.AH = d.AH; a.BP = q.args.BP; a.E16 = q.args.E16; a.ev = q.args.ev; a.LTc = ltc;
+            a.mitems = q.args.mitems; a.oitems = q.args.oitems; a.noitems = q.args.noitems; a.slot32 = q.args.slot32;
+            if (q.Rm > 0) { a.alpha16 = q.args.alpha16; a.beta16 = q.args.beta16; a.invd = q.args.invd; }
+            a.ao = q.args.ao; a.bo = q.args.bo; a.hrow = q.args.hrow;
+            a.fl = fl_.data_ptr<float>(); a.fmx = fmx_.data_ptr<float>(); a.EF = EF_.data_ptr<float>();
+            a.A = q.args.A; a.sA = q.args.sA; a.LTh = q.args.LTh;
+            a.r = q.r; a.M = (int)M; a.N = (int)N; a.S = q.S; a.Rm = q.Rm;
+        }
+        auto up = [&](const std::vector<StackBwPrep>& v) {          // (a pinned copy, kept with the plan)
+            auto host = torch::empty({(long)(v.size() * sizeof(StackBwPrep))}, torch::dtype(torch::kUInt8).pinned_memory(true));
+            std::memcpy(host.data_ptr(), v.data(), v.size() * sizeof(StackBwPrep));
+            hold_.push_back(host);
+            auto dv = host.to(ev_.device(), /*non_blocking=*/true);
+            hold_.push_back(dv);
+            return reinterpret_cast<const StackBwPrep*>(dv.data_ptr());
+        };
+        auto stream = at::cuda::getCurrentCUDAStream();
+        long items = M;
+        for (const auto& q : pos_) items = std::max(items, ((long)q.Bx * M * (q.KP / 8) + 255) / 256);
+        launch_pdl(tk_stack_bw_prep_kernel, dim3((unsigned)std::min(296L, items), 2, P), dim3(256), 0, stream, up(prep));
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+        launch_pdl(tk_stack_ltc_kernel, dim3(296, 1, (unsigned)nsrc), dim3(256), 0, stream, up(srcs));
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+        bw_ready_ = true;
+    }
+
+    // reader i's backward where it asks for no gradients nor EM statistics (a query's): the node flows into its stash
+    // (`tk_flows_kernel`; its masked rows' into the leaf's counts beside their posterior), its cols passes into EF
+    // (`bw_launches`), the children's element flows (`tk_scatter_ef_kernel`; `store`: their one writer of the pass) --
+    // `top_k_sum_backward`'s launches, from arguments made once. `node_flows` [nodes, B], `element_flows` [elements, B]
+    // (log space, fp32, a sample a column): the circuit's buffers.
+    void backward(int64_t i, torch::Tensor node_flows, torch::Tensor element_flows, bool store) const {
+        TORCH_CHECK(bw_ready_ && !released_ && i >= 0 && i < (int64_t)pos_.size(), "top_k stack: a backward's reader");
+        TORCH_CHECK(node_flows.is_cuda() && node_flows.scalar_type() == at::kFloat && node_flows.dim() == 2 &&
+                    node_flows.stride(1) == 1 && node_flows.size(1) == B_ && element_flows.is_cuda() &&
+                    element_flows.scalar_type() == at::kFloat && element_flows.dim() == 2 &&
+                    element_flows.stride(1) == 1 && element_flows.size(1) == B_,
+                    "top_k stack: the flows, fp32 [rows, B], a sample a column");
+        const Pos& q = pos_[i];
+        TORCH_CHECK(q.args.nid0 + q.args.M <= node_flows.size(0), "top_k stack: the reader's rows of the node flows");
+        const c10::cuda::CUDAGuard guard(dev_);
+        auto stream = at::cuda::getCurrentCUDAStream();
+        const long fld = node_flows.stride(0);
+        launch_pdl(tk_flows_kernel, dim3((unsigned)std::max(B_, q.Rm), q.Rm > 0 ? 2 : 1), dim3(256), 0, stream,
+                   (const float*)node_flows.data_ptr<float>() + q.args.nid0 * fld, fld, q.args.ao, q.args.bo,
+                   fl_.data_ptr<float>(), fmx_.data_ptr<float>(),
+                   q.Rm > 0 ? rows_.data_ptr<long>() + q.r0 : (const long*)nullptr,
+                   q.Rm > 0 ? q.args.acnt : (float*)nullptr, B_, q.args.M, q.Rm, EF_.data_ptr<float>(), q.N, GradInit{});
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+        const int sms = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
+        const long gsz = std::max(q.Rm, 1);
+        switch (q.KP / 16) {
+            case 2: bw_launches<2>(q.bw, false, B_, gsz, sms, dev_, stream); break;
+            case 4: bw_launches<4>(q.bw, false, B_, gsz, sms, dev_, stream); break;
+            case 6: bw_launches<6>(q.bw, false, B_, gsz, sms, dev_, stream); break;
+            case 8: bw_launches<8>(q.bw, false, B_, gsz, sms, dev_, stream); break;
+            default: TORCH_CHECK(false, "top_k: ranks padded to 32, 64, 96 or 128");
+        }
+        if (q.nk > 0) {
+            dim3 grid((unsigned)((q.nk + 31) / 32), (unsigned)((B_ + 31) / 32)), block(32, 8);
+            launch_pdl(store ? tk_scatter_ef_kernel<true> : tk_scatter_ef_kernel<false>, grid, block, 0, stream,
+                       (const float*)q.bw.EF, (const long*)q.cols, (const long*)q.kids, element_flows.data_ptr<float>(),
+                       element_flows.stride(0), B_, q.N, q.nk);
+            C10_CUDA_KERNEL_LAUNCH_CHECK();
+        }
+    }
+
+    // its buffers given back -- no backward follows, every reader launched: what the unstacked forward freed a position
+    // at a time. Safe with launches in flight: the caching allocator hands a block again only to later work on the
+    // stream it was made on, which the side stream's launches are joined into (`sk_launch`)
+    void release() {
+        released_ = true;
+        BP_ = E16_ = LTh_ = ev_ = cmax_ = flags_ = ws_ = alpha16_ = beta16_ = invd_ = acnt0_ = ao_ = bo_ = hrow_ =
+            prep_d_ = torch::Tensor();
+        mitems_ = oitems_ = noitems_ = slot32_ = logw_ = counts_ = torch::Tensor();
+        AH_ = L2T_ = LTc_ = EF_ = fl_ = fmx_ = rows_ = torch::Tensor();
+        theta_.clear();
+        hold_.clear();
+    }
+
+  private:
+    struct Pos {
+        TkArgs args;
+        BwArgs bw;                                   // (a query's backward: `prepare_backward`)
+        const long* eid; const bool* has; float* ev; float* cmax;
+        const long* cols = nullptr; const long* kids = nullptr; int nk = 0;
+        int Bx, M, r, N, S, KP, t, src, Rm, P, split;
+        long bp, e16, so, mo, oo, r0, ah = 0;
+    };
+    bool stash_, released_ = false, bw_ready_ = false;
+    int dev_ = 0, B_ = 0;
+    const float* em_ = nullptr;
+    long em_stride_ = 0;
+    std::vector<Pos> pos_;
+    torch::Tensor BP_, E16_, LTh_, ev_, cmax_, flags_, ws_, alpha16_, beta16_, invd_, acnt0_, ao_, bo_, hrow_, prep_d_;
+    torch::Tensor mitems_, oitems_, noitems_, slot32_, logw_, counts_;
+    torch::Tensor AH_, L2T_, LTc_, EF_, fl_, fmx_, rows_;
+    std::vector<torch::Tensor> theta_;
+    std::vector<torch::Tensor> hold_;
+};
+
 // The node flows into a stash, in place (`tk_flows_kernel`): `nf` [M, B] the node vector's log-space rows of the node
 // flows (fp32, a sample a column), ao, bo [B, M]; `rows` [Rm] the masked samples and `acnt` their rows of the leaf's
 // buffer [Rm, M, SA] (empty: none) -- the flow into the slot after the posterior's. Returns (fl [B, M] the samples'
@@ -3087,31 +3570,6 @@ std::vector<torch::Tensor> top_k_em_index(torch::Tensor slot32, torch::Tensor ro
 
 // element_flows[kids[k], b] = logaddexp(element_flows[kids[k], b], log EF[b, cols[k]]): the children's element flows
 // (log space, a sample a column) from the backward's EF [B, N] (linear), a 32 x 32 tile a CTA through shared memory
-template <bool STORE>
-__global__ void tk_scatter_ef_kernel(const float* EF, const long* cols,
-                                     const long* kids, float* ef, long ld, int B, int N, int nk) {
-    pdl_entry();
-    __shared__ float tile[32][33];
-    const int k0 = blockIdx.x * 32, b0 = blockIdx.y * 32, tx = threadIdx.x, ty = threadIdx.y;
-    const int kx = k0 + tx;
-    const long cx = kx < nk ? cols[kx] : 0;
-    for (int u = ty; u < 32; u += 8) {
-        const int b = b0 + u;
-        tile[u][tx] = (kx < nk && b < B) ? EF[(long)b * N + cx] : 0.f;
-    }
-    __syncthreads();
-    for (int u = ty; u < 32; u += 8) {
-        const int k = k0 + u, b = b0 + tx;
-        if (k >= nk || b >= B) continue;
-        float* p = ef + kids[k] * ld + b;
-        const float y = __logf(tile[tx][u]);
-        if (STORE) { *p = y; continue; }                            // (the rows' one writer: no fill before)
-        const float x = *p;
-        const float m = fmaxf(x, y);
-        *p = m == -INFINITY ? m : m + log1pf(__expf(-fabsf(x - y)));
-    }
-}
-
 // `element_flows[kids, :] = logaddexp(element_flows[kids, :], log EF[:, cols]^T)`, or with `store` (the rows' one
 // writer of the pass: their -inf fill not made) `= log EF[:, cols]^T`
 void top_k_scatter_ef(torch::Tensor EF, torch::Tensor cols, torch::Tensor kids, torch::Tensor element_flows,
@@ -3220,6 +3678,18 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("top_k_prep", &top_k_prep, "a LowRank(top_k) sum node vector's operands and work items for `top_k_forward`");
     m.def("top_k_items", &top_k_items, "the paired work items of the node vectors reading a leaf layer, one launch");
     m.def("top_k_sum_forward", &top_k_sum_forward, "top_k_prep then top_k_forward, one call");
+    py::class_<TopKStackPlan>(m, "TopKStackPlan", "a pass's stacked forward of the top_k sums reading a leaf layer")
+        .def(py::init<std::vector<torch::Tensor>, std::vector<torch::Tensor>, std::vector<torch::Tensor>,
+                      std::vector<torch::Tensor>, std::vector<torch::Tensor>, std::vector<int64_t>,
+                      std::vector<int64_t>, std::vector<int64_t>, std::vector<torch::Tensor>, torch::Tensor,
+                      torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, std::vector<int64_t>, torch::Tensor,
+                      torch::Tensor, torch::Tensor, bool>())
+        .def("forward", &TopKStackPlan::forward, "reader i's launches")
+        .def("kept", &TopKStackPlan::kept, "reader i's operands and stash (the backward's)")
+        .def("lth", &TopKStackPlan::lth, "source s's l2t")
+        .def("release", &TopKStackPlan::release, "its buffers given back (no backward follows: every reader launched)")
+        .def("prepare_backward", &TopKStackPlan::prepare_backward, "a backward's operands and arguments (stash kept)")
+        .def("backward", &TopKStackPlan::backward, "reader i's backward (no gradients nor EM statistics: a query's)");
     m.def("top_k_forward", &top_k_forward,
           "a LowRank(top_k) sum node vector's values and its backward's stash: a persistent stream-K launch for each "
           "kind of work item");

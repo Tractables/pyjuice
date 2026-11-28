@@ -410,16 +410,23 @@ def test_the_fused_forward_is_the_reference():
     pc, _, _ = _hmm_pc(T, N, K, r, re, tab, V2)
     ext, ids, lp, x, miss = _batch(b, T, N, C, K, r, re, 12, V = V2)
     pext, lp = _pc_ext(ext, T, N), lp.float()
+    import pyjuice.parameterizations.lowrank.top_k_stack as tks
     calls = []
-    real = tkf.sum_forward
+    real, real_stacked = tkf.sum_forward, tks.SumStack.forward
 
-    def spy(*a, **k):                                                   # (the node vectors the kernels took)
-        got = real(*a, **k)
+    def spy(*a, **k):                                                   # (the node vectors the kernels took: by the
+        got = real(*a, **k)                                             #  pass's stack, or unstacked)
         if got:
             calls.append(1)
         return got
 
-    tkf.sum_forward = spy
+    def spy_stacked(self, ns):
+        got = real_stacked(self, ns)
+        if got:
+            calls.append(1)
+        return got
+
+    tkf.sum_forward, tks.SumStack.forward = spy, spy_stacked
     try:
         vals = {}
         for fused in (False, True):
@@ -434,7 +441,7 @@ def test_the_fused_forward_is_the_reference():
             vals[fused] = (full, vis, one)
     finally:
         tkf.TOP_K_FUSED = True
-        tkf.sum_forward = real
+        tkf.sum_forward, tks.SumStack.forward = real, real_stacked
     assert len(calls) == 3 * (T - 1), len(calls)                                  # (every transition, every call, fused)
     for a, ref in zip(vals[True][:2], vals[False][:2]):
         assert float((a - ref).abs().max()) < 2e-2, float((a - ref).abs().max())
@@ -462,8 +469,10 @@ def test_the_fused_leaf_is_the_torch_passes(C):
     pext, lp = _pc_ext(ext, T, N), lp.float()
     rows = torch.arange(b, device = DEV).repeat(2)
     ran = []
+    import pyjuice.parameterizations.lowrank.top_k_stack as tks
     real_sum, real_leaf, real_bw = tkf.sum_forward, tlf.leaf_forward, tkb.serves
     tkf.sum_forward, tkb.serves = (lambda *a, **k: False), (lambda *a, **k: False)
+    tks.STACKED = False                                                 # (the sums by torch: no stack either)
     tlf.leaf_forward = lambda *a, **k: (lambda got: (ran.append(got), got)[1])(real_leaf(*a, **k))
 
     def passes():
@@ -492,6 +501,7 @@ def test_the_fused_leaf_is_the_torch_passes(C):
     finally:
         tkf.TOP_K_FUSED = True
         tkf.sum_forward, tlf.leaf_forward, tkb.serves = real_sum, real_leaf, real_bw
+        tks.STACKED = True
     assert ran == [False] * 3 + [True] * 3, ran                                     # (the torch passes, then the kernels)
     assert torch.allclose(got[0], ref[0], atol = 1e-4), float((got[0] - ref[0]).abs().max())
     names = ("A", "B", "G", "U", "D", "lp", "leaf F (all observed)", "sums' F (all observed)", "leaf F (visible)",
@@ -602,8 +612,10 @@ def test_the_fused_leaf_em_statistics_are_the_torch_passes(N, V2, tied):
     pext, lp = _pc_ext(ext, T, N), lp.float()
     rows = torch.arange(b, device = DEV).repeat(2)
     ran = []
+    import pyjuice.parameterizations.lowrank.top_k_stack as tks
     real_sum, real_leaf, real_bw = tkf.sum_forward, tlf.leaf_forward, tkb.serves
     tkf.sum_forward, tkb.serves = (lambda *a, **k: False), (lambda *a, **k: False)
+    tks.STACKED = False                                                 # (the sums by torch: no stack either)
     tlf.leaf_forward = lambda *a, **k: (lambda got: (ran.append(got), got)[1])(real_leaf(*a, **k))
 
     def passes():
@@ -632,6 +644,7 @@ def test_the_fused_leaf_em_statistics_are_the_torch_passes(N, V2, tied):
     finally:
         tkf.TOP_K_FUSED = True
         tkf.sum_forward, tlf.leaf_forward, tkb.serves = real_sum, real_leaf, real_bw
+        tks.STACKED = True
     assert ran == [False] * 3 + [True] * 3, ran                                     # (the torch passes, then the kernels)
     for name, a, r_ in zip(("all observed", "visible", "the conditional's (mask)"), got, ref):
         assert _rel(a, r_) < 1e-4, (name, _rel(a, r_))

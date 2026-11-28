@@ -201,10 +201,13 @@ def test_conditional_at_the_kernels_shapes(C, grad, readout, monkeypatch):
     (measured <= 1e-3 relative, 1e-4 absolute, at observed and missing tokens alike; the torch passes at these shapes
     ~1e-7)."""
     _needs_kernels(128, sums = True)
-    from pyjuice.parameterizations.lowrank import top_k_backward
+    from pyjuice.parameterizations.lowrank import top_k_backward, top_k_stack
     sums = []
-    terms = top_k_backward.terms
+    terms, stacked = top_k_backward.terms, top_k_stack.SumStack.backward
     monkeypatch.setattr(top_k_backward, "terms", lambda *a, **k: (sums.append(1), terms(*a, **k))[1])
+    # (the sums' kernels by the pass's stack where its forward kept their stash there: `top_k_stack`)
+    monkeypatch.setattr(top_k_stack.SumStack, "backward",
+                        lambda self, *a, **k: (lambda got: (sums.append(1) if got else None, got)[1])(stacked(self, *a, **k)))
     T, N, K, b, V2 = 3, 128, 64, 6, 80
     pc, tab, ext, ids, lp, x, _ = _case(N, C, K, b, 11, T = T, V = V2, r = 20, re = 8)
     miss = _half_masked(T)

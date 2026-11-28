@@ -197,6 +197,14 @@ def _top_k():
     return m
 
 
+def _stack():
+    m = _MODS.get("stack")
+    if m is None:
+        from . import top_k_stack as m
+        _MODS["stack"] = m
+    return m
+
+
 def _backward():
     m = _MODS.get("backward")
     if m is None:
@@ -207,8 +215,13 @@ def _backward():
 
 def kept_of(layer, ns, B: int):
     """`(ops, stash)`: the forward's operands of the node vector (`prep`'s) and its sums' stash (`forward`'s), kept
-    where a backward may follow (`sum_forward`), taken -- a backward uses them once (the flows go into the stash), a
-    second one makes its own --; None where the forward kept none, or for another batch."""
+    where a backward may follow (`sum_forward`, or the pass's stack: `top_k_stack.SumStack.kept`), taken -- a backward
+    uses them once (the flows go into the stash), a second one makes its own --; None where the forward kept none, or
+    for another batch."""
     st = layer.__dict__.get("_lr_state")
     got = st.pop(("kept", id(ns)), None) if isinstance(st, dict) else None
-    return got[1:] if got is not None and got[0] == B else None
+    if got is not None:
+        return got[1:] if got[0] == B else None
+    sib = layer.__dict__.get("_sibling_leaves", {}).get(id(ns))
+    stack = None if sib is None else _stack().stack_made(sib, B)
+    return None if stack is None else stack.kept(ns)

@@ -127,117 +127,31 @@ def leaf_forward(desc, layer, data: torch.Tensor, node_mars: torch.Tensor, kwarg
     T, B, dev = len(nodes), node_mars.size(1), node_mars.device
     M, K = plan["M"][0], (plan["Ks"][0] if plan["Ks"] else desc.top_k)
 
-    # the categories some tile takes among its candidates: their rows of the tables (the others none -- never read:
-    # the tables hold the pass's categories alone, MEASURED 48 blocks: 494 -> 193 MiB on the dump's rows, -> 383 with
-    # DISTINCT=1 rows)
+    # one call into the module (`top_k_leaf_pass`): the categories some tile takes among its candidates and their rows
+    # of the tables (the others none -- never read: the tables hold the pass's categories alone, MEASURED 48 blocks:
+    # 494 -> 193 MiB on the dump's rows, -> 383 with DISTINCT=1 rows); the missing tokens a sum reads, their rows of the
+    # slot weights -- the pass's one synchronization, waited on after the work that needs none of it --; the tables;
+    # the kernel. Its ~40 operations one by one from Python were ~450 us of host time a pass at 2 samples (the pass's
+    # start host-bound); the tilts made in the forward's kernel where it can (no tau [T, Bx, S, M] made, read, nor kept
+    # for the backward: its rest slot alone, tauK), else by their own kernel first
     V = nodes[0]["ns"].dist.num_cats
-    ids = kwargs["soft_evidence_cat_ids"].to(torch.int32).contiguous()
-    # (`index_fill_`, not `used[ids] = True`: an indexed assignment of a Python scalar waits for the device -- MEASURED,
-    # torch 2.10: the host blocked until the stream drains, ~170 us a forward of the Codpula head at 2 samples)
-    used = torch.zeros(V, dtype = torch.bool, device = dev).index_fill_(0, ids.reshape(-1).long(), True)
-    crow = torch.cumsum(used, 0, dtype = torch.int32) - 1
-    nrows_d = crow[-1:] + 1
-    crow = torch.where(used, crow, torch.full_like(crow, -1))
-    # the missing tokens a sum reads: their rows of the slot weights -- the pass's one synchronization (with the
-    # tables' rows), its copy started here and waited on after the launches that need none of it (the tilts), so the
-    # host plans while the device works
     miss = _missing_all(kwargs.get("missing_mask"), plan["vars"], B, dev, kwargs.get("_batch_first", True))
-    rmask_d = miss & plan["read"][:, None]
-    rmask = torch.empty(rmask_d.shape, dtype = rmask_d.dtype, pin_memory = rmask_d.is_cuda)
-    rmask.copy_(rmask_d, non_blocking = True)
-    nrows = torch.empty(1, dtype = torch.int32, pin_memory = rmask_d.is_cuda)
-    nrows.copy_(nrows_d, non_blocking = True)
-    copied = torch.cuda.Event() if rmask_d.is_cuda else None
-    if copied is not None:
-        copied.record(torch.cuda.current_stream(dev))
-
-    emap = external_rows(kwargs)
     tilts = [staged[n["ns"]] for n in nodes]
-    Bx, S = tilts[0][0].size(0), tilts[0][1].size(2)
-    # the tilts made in the forward's kernel where it can (no tau [T, Bx, S, M] made, read, nor kept for the backward:
-    # its rest slot alone, tauK), else by their own kernel
-    fw = _fw_tilt_args(tilts, K, S, T)
-    if fw is None:
-        tau, tauK, fw = torch.empty(T, Bx, S, M, dtype = torch.float32, device = dev), None, ([], [], 0)
+    tA, tB = [t[0] for t in tilts], [t[1] for t in tilts]
+    args = (layer.params, plan["tables"], plan["nv_tab"], plan["nv_lvid"], plan["nv_row0"], plan["vars"], plan["read"],
+            miss, kwargs["soft_evidence_cat_ids"], kwargs["categorical_evidence_logp"], data, external_rows(kwargs))
+    tau = None
+    got = mod.top_k_leaf_pass(*args, None, tA, tB, node_mars, V, K, tB[0].size(2), M)
+    if not got:
+        tau = torch.empty(T, tA[0].size(0), tB[0].size(2), M, dtype = torch.float32, device = dev)
         _tilts(tilts, tau)
-    else:
-        tau, tauK = None, torch.empty(T, Bx, M, dtype = torch.float32, device = dev)
-    lp = kwargs["categorical_evidence_logp"].float().contiguous()
-    emap32 = torch.empty(0, dtype = torch.int32, device = dev) if emap is None else emap.to(torch.int32).contiguous()
-    tok = data.index_select(0, plan["vars"]).to(torch.int32).contiguous()
-    ord_, rank, rowstart = _by_row(emap32, B, Bx) if ids.size(0) != B else (_none_i32(dev),) * 3   # (evidence by row)
-
-    if copied is not None:
-        copied.synchronize()
-    nr = int(nrows[0])
-    if 4 * nr < V:
-        # (few categories taken -- a small batch's --: their rows from their list, a launch their size; the scan of V
-        # read every 32-block holding one -- MEASURED, the Codpula head at 2 samples, ~4.6K of 126K taken: 0.32 ms)
-        uids = torch.empty(nr + 1, dtype = torch.int32, device = dev)
-        uids.scatter_(0, torch.where(used, crow, nr).long(), torch.arange(V, dtype = torch.int32, device = dev))
-        tables = [mod.top_k_leaf_table_rows(layer.params, spids, uids, nr) for spids in plan["tables"]]
-    else:
-        tables = [mod.top_k_leaf_table(layer.params, spids, V, crow, nr) for spids in plan["tables"]]
-    tab = tables[0][None] if len(tables) == 1 else torch.stack(tables)
-    counts = rmask.sum(dim = 1).tolist()
-    offs = [0]
-    for c in counts:
-        offs.append(offs[-1] + c)
-    R = offs[-1]
-    nz = rmask.nonzero()
-    wrow = torch.full((T, B), -1, dtype = torch.int32)
-    wrow[nz[:, 0], nz[:, 1]] = torch.arange(R, dtype = torch.int32)
-    wrow, rows = _to_device(wrow, dev), _to_device(nz[:, 1], dev)
-    sids, slp = _bulk_by_id(ids, lp, min(ids.size(2), max(K, S - 1)))
-    none = torch.empty(0, device = dev)
-    lz, lb, place, logw = mod.top_k_leaf_forward(tab, plan["nv_tab"], none if tau is None else tau, emap32, ids, lp,
-                                                 plan["nv_lvid"], plan["nv_row0"], tok, miss.to(torch.uint8).contiguous(),
-                                                 wrow, R, S, K, node_mars, ord_, rank, crow[sids.long()], slp, crow,
-                                                 *fw, none if tauK is None else tauK)
-    layer.__dict__[_STATE] = dict(B = B, K = K, S = S, tab = tab, tau = tau, tauK = tauK, emap = emap32, ids = ids,
-                                  lp = lp, lz = lz, lb = lb, place = place, miss = miss, wrow = wrow, logw = logw,
-                                  offs = offs, rows = rows, counts = None, ord = ord_, rank = rank, rowstart = rowstart,
-                                  crow = crow)
+        got = mod.top_k_leaf_pass(*args, tau, [], [], node_mars, V, K, tau.size(2), M)
+    tab, tauK, emap32, ids, lp, lz, lb, place, wrow, logw, rows, ord_, rank, rowstart, crow, offs = got
+    layer.__dict__[_STATE] = dict(B = B, K = K, S = tB[0].size(2), tab = tab, tau = tau, tauK = None if tau is not None
+                                  else tauK, emap = emap32, ids = ids, lp = lp, lz = lz, lb = lb, place = place,
+                                  miss = miss, wrow = wrow, logw = logw, offs = offs.tolist(), rows = rows,
+                                  counts = None, ord = ord_, rank = rank, rowstart = rowstart, crow = crow)
     return True
-
-
-def _fw_tilt_args(tilts, K: int, S: int, T: int):
-    """`(ptrs, strides, re)` of the tilts' tensors for the forward's kernel to make them in (`tk_leaf_forward_kernel`'s
-    INL): each position's `(A [Bx, M, re], B [Bx, re, S])` fp32, A's rows 16-B aligned with their ranks contiguous,
-    every position's strides alike, re <= 64 a multiple of 4, K = Kl <= 64 (S = K + 1), at most 64 positions; else
-    None (tau then, by `_tilts`)."""
-    A0, B0 = tilts[0]
-    re = A0.size(2)
-    if T > 64 or S != K + 1 or K > 64 or re > 64 or re % 4 != 0:
-        return None
-    sa, sb, f32 = A0.stride(), B0.stride(), torch.float32
-    if not (sa[2] == 1 and sa[0] % 4 == 0 and sa[1] % 4 == 0):
-        return None
-    # (every position's tensors checked with their strides read once: the same strides as the first's -- so `_vec`'s
-    # conditions but the address --, its address 16-B aligned; MEASURED, 32 positions: ~25 calls a position, 80 us)
-    pa, pb = [], []
-    for A, Bt in tilts:
-        a = A.data_ptr()
-        if A.dtype != f32 or Bt.dtype != f32 or a % 16 != 0 or A.stride() != sa or Bt.stride() != sb or \
-                Bt.shape[1:] != B0.shape[1:]:
-            return None
-        pa.append(a)
-        pb.append(Bt.data_ptr())
-    if B0.size(1) != re or B0.size(2) != S:
-        return None
-    return pa + pb, list(sa) + list(sb), re
-
-
-def _none_i32(dev):
-    return torch.empty(0, dtype = torch.int32, device = dev)
-
-
-def _bulk_by_id(ids: torch.Tensor, lp: torch.Tensor, H: int):
-    """`(ids, lp)` of each tile's candidates past the head `H` (no slot of their own: their order is free) sorted by
-    token id -- the forward walks them so: the CTAs running side by side then read the table rows they share at about
-    the same time (MEASURED, 48 blocks, the rows' evidence distinct: 1.79 -> 1.56 ms)."""
-    sids, perm = torch.sort(ids[:, :, H:], dim = 2)
-    return sids.contiguous(), torch.gather(lp[:, :, H:], 2, perm).contiguous()
 
 
 def _to_device(t: torch.Tensor, dev) -> torch.Tensor:
@@ -248,16 +162,6 @@ def _to_device(t: torch.Tensor, dev) -> torch.Tensor:
     h = torch.empty(t.shape, dtype = t.dtype, pin_memory = True)
     h.copy_(t)
     return h.to(dev, non_blocking = True)
-
-
-def _by_row(emap32: torch.Tensor, B: int, rows: int):
-    """`(ord, rank, rowstart)` int32: the samples [B] by the row of evidence they read (stable) -- the forward's CTAs in
-    that order --, each place's rank among its row's (the backward's CTA a row's samples: no host synchronization), and
-    where each of the `rows` rows' samples start among the places [rows + 1]."""
-    srt, ord_ = torch.sort(emap32.long(), stable = True)
-    rank = torch.arange(B, device = srt.device) - torch.searchsorted(srt, srt)
-    rowstart = torch.searchsorted(srt, torch.arange(rows + 1, device = srt.device))
-    return ord_.to(torch.int32).contiguous(), rank.to(torch.int32).contiguous(), rowstart.to(torch.int32).contiguous()
 
 
 def _state(layer, B: int):
@@ -311,24 +215,28 @@ def sum_parts(sib: dict, K: int, batch_size: int, emap, cache: dict):
     got = parts.get(id(sib["ns"]))
     if got is None:
         t = _plan(sib["layer"])["index"][id(sib["ns"])]
-        items = cache.get("items")
-        if items is None:
-            items = cache["items"] = _work_items(st, emap)
+        items = work_items(st, emap, cache)[1]
         got = parts[id(sib["ns"])] = (*_slot_views(st, t, K), items[t], st["offs"][t + 1] - st["offs"][t], t)
     return got
 
 
-def _work_items(st: dict, emap):
-    """Each leaf's paired work items `[mitems, oitems, noitems, slot32]` (`top_k_items`: one launch, the slices made
-    there), from its layer's forward state (its slots, its masked rows)."""
-    offs, dev = st["offs"], st["rows"].device
-    if st.get("slot") is None:
-        st["slot"] = st["place"].long().clamp_(0, st["K"])
-    roff = _to_device(torch.tensor(offs, dtype = torch.int32), dev)
-    got = top_k_fused.top_k_module().top_k_items(
-        torch.empty(0, dtype = torch.long, device = dev) if emap is None else emap.long().contiguous(),
-        st["rows"].long().contiguous(), roff, offs, st["slot"].contiguous())
-    return [got[4 + 4 * t:8 + 4 * t] for t in range(len(offs) - 1)]
+def work_items(st: dict, emap, cache: dict):
+    """`(flat, per_leaf)`: the paired work items of every sum reading the leaf layer, from its forward state (its slots,
+    its masked rows) -- `top_k_items`' four buffers `[mitems, oitems, noitems, slot32]`, a leaf's after the earlier
+    leaves', and each leaf's four slices of them --, one launch a pass, kept in the pass's `cache` (`pass_cache`).
+    `emap` [B] long the row each sample reads (None: its own)."""
+    got = cache.get("items")
+    if got is None:
+        offs, dev = st["offs"], st["rows"].device
+        if st.get("slot") is None:
+            st["slot"] = st["place"].long().clamp_(0, st["K"])
+        roff = _to_device(torch.tensor(offs, dtype = torch.int32), dev)
+        made = top_k_fused.top_k_module().top_k_items(
+            torch.empty(0, dtype = torch.long, device = dev) if emap is None else emap.long().contiguous(),
+            st["rows"].long().contiguous(), roff, offs, st["slot"].contiguous())
+        cache["items_flat"] = made[:4]
+        got = cache["items"] = [made[4 + 4 * t:8 + 4 * t] for t in range(len(offs) - 1)]
+    return cache["items_flat"], got
 
 
 #: The counts' rows as the sums' kernels write them (`SA` of `kernels/c/lowrank_top_k.cu`: K + 2 padded)

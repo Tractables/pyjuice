@@ -417,7 +417,8 @@ class _BuildMixin:
         (`SumParameterization.reads_sibling_leaf`): that leaf -- the one input node vector in its ONE parent product,
         paired node i with node i --, checked by the parameterization (`validate_sibling_leaf`) and noted on the layer
         (`_sibling_leaves[id(ns)]`: the leaf, its input layer, its variable) and on the leaf's input layer
-        (`_read_by_sums`: its node vectors such a sum reads, each with its readers' parameterizations);
+        (`_read_by_sums`: its node vectors such a sum reads, each with its readers' parameterizations; `_sum_readers`:
+        the reading sums, `(layer, ns)`);
         `_sums_read_inputs` on the circuit. Anything else -- several parents, no leaf or two, nodes not paired one to
         one, two such sums in one product -- is refused here, with the reason: the circuit would not be the one the
         parameterization defines.
@@ -458,6 +459,9 @@ class _BuildMixin:
                 ns = xs, layer = input_layer_of[id(xs)], var = xs.scope.to_list()[0])
             input_layer_of[id(xs)].__dict__.setdefault("_read_by_sums", dict()).setdefault(id(xs), []).append(
                 ns.parameterization)
+            # (and the reading sums themselves, in compile order: what a pass may make for all of them at once --
+            # their operands that no other layer's values enter, `lowrank.top_k_stack`)
+            input_layer_of[id(xs)].__dict__.setdefault("_sum_readers", []).append((layer, ns))
 
     def _categorize_input_nodes(self, nodes: Sequence[InputNodes]):
         signature2nodes = dict()
