@@ -86,10 +86,38 @@ def theta_tables(desc, sib, ns, geo, params, batch_size: int, cache = False) -> 
     return tab
 
 
+def child_pairs(layer, ns, children, geo = None):
+    """The node rows of each child's product's two children, int32 [N, 2] -- `table[eid - first]` for the circuit's
+    `stream_children` `(table, first)` (the product layer group below handed over, its passes not run; 0 where no edge
+    reaches a child) -- of the node vector `ns` of `layer`: where the kernels read each child's value (the two node values
+    summed: the product layer's add) and write its flow (`top_k_prep`, `top_k_scatter_ef`, the stack's launches). Made
+    once a node vector and table, kept on the layer (`_lr_top_k_pairs`, dropped with its device caches); `geo` the node
+    vector's geometry where the caller has it. None without `children`."""
+    if children is None:
+        return None
+    table, first = children
+    got = layer.__dict__.get("_lr_top_k_pairs")
+    if got is None:
+        got = layer.__dict__["_lr_top_k_pairs"] = {}
+    hit = got.get(id(ns))
+    if hit is not None and hit[0] is table:
+        return hit[1]
+    if geo is None:
+        geo = layer.parameterization._geometry(layer, _stack()._node_info(layer, ns), table.device)
+    rows = geo["eid"].long() - first
+    if not geo["full"]:
+        rows = torch.where(geo["has"], rows, torch.zeros_like(rows))
+    pairs = table[rows].contiguous()
+    got[id(ns)] = (table, pairs)
+    return pairs
+
+
 def prep(Bm, G, element_mars, eid, has, theta, slot, rows_m, logw_m, emap = None, pair: bool = True, lth = None,
-         items = None):
+         items = None, pairs = None):
     """`top_k_prep`'s operands: `B [Bx, r, N]`, `G [Bx, K + 1, N]` a row of tensors each; the children's values
-    `element_mars [eid, :]` (`has` [N] bool where an edge reaches them, None where every child is reached); `theta [M,
+    `element_mars [eid, :]` (`has` [N] bool where an edge reaches them, None where every child is reached) -- with
+    `pairs` (`child_pairs`: the product layer group below handed over, its forward not run) `element_mars` is the
+    circuit's node values, each child's value its product's; `theta [M,
     N]` the shared parameters (0 where none); a sample each: `slot [B]` the observed token's slot, `emap [B]` the row of
     tensors it reads (None: its own, Bx = B); `rows_m` the samples whose token is missing and their slots' log-weights
     `logw_m [b, M, K + 1]` (None where none); `pair`: the samples reading a row share its work items (else a sample an
@@ -102,7 +130,7 @@ def prep(Bm, G, element_mars, eid, has, theta, slot, rows_m, logw_m, emap = None
         _rows(Bm), _rows(G), element_mars, _as(eid, L), _empty(dev, torch.bool) if has is None else has,
         _as(theta, torch.float32), _as(slot, L), _empty(dev, L) if emap is None else _as(emap, L), _as(rows_m, L),
         _empty(dev, torch.float32) if logw_m is None else _weights_operand(logw_m), pair,
-        _empty(dev, torch.int32) if lth is None else lth, [] if items is None else items)
+        _empty(dev, torch.int32) if lth is None else lth, [] if items is None else items, pairs)
     return got
 
 
@@ -130,11 +158,13 @@ def forward(A, ops, node_mars, nid0: int, stash: bool = False, counts = None):
     return got if stash else None
 
 
-def sum_forward(desc, layer, ns_info, tensors, geo, params, element_mars, node_mars, sib, kwargs) -> bool:
+def sum_forward(desc, layer, ns_info, tensors, geo, params, element_mars, node_mars, sib, kwargs,
+                pairs = None) -> bool:
     """A `LowRank(top_k)` sum node vector's values by the fused kernels, written over its rows of `node_mars`; False
     where they do not serve (the reference then). Samples reading the same row of tensors (`external_params_rows`)
     share its tile. One call into the module (`top_k_sum_forward`: the prep and the values), its operands as they lie
-    (the module converts what it must): a position's host time is what the small batches' passes take."""
+    (the module converts what it must): a position's host time is what the small batches' passes take. `pairs`: the
+    product layer group below handed over (`child_pairs`: `prep`'s), or None."""
     B = node_mars.size(1)
     A, Bm, G = tensors
     leaf = _leaf()
@@ -167,9 +197,10 @@ def sum_forward(desc, layer, ns_info, tensors, geo, params, element_mars, node_m
         items = []
         counts = leaf.counts_buffer(sib, desc.top_k, B) if keep and rows_m.numel() > 0 else None
     tab = theta_tables(desc, sib, ns_info.ns, geo, params, B, cache)    # (the parameters' tables: once a pass)
-    got = top_k_module().top_k_sum_forward(A, Bm, G, element_mars, geo["eid"], None if geo["full"] else geo["has"],
-                                           tab["theta"], slot, emap, rows_m, logw_m, tab.get("LTh"), items, node_mars,
-                                           ns_info.nid_start, keep, counts)
+    got = top_k_module().top_k_sum_forward(A, Bm, G, element_mars if pairs is None else node_mars, geo["eid"],
+                                           None if geo["full"] else geo["has"], tab["theta"], slot, emap, rows_m,
+                                           logw_m, tab.get("LTh"), items, node_mars, ns_info.nid_start, keep, counts,
+                                           pairs)
     if "LTh" not in tab:
         tab["LTh"] = got[4]
     if keep:

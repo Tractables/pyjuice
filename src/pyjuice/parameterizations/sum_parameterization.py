@@ -91,6 +91,14 @@ class SumParameterization():
     #: layer group takes the least of its layers'. None -- the default -- the circuit's.
     param_operands_min_work: Optional[int] = None
 
+    def stream_fusion_accepts(self, layer, extra: frozenset) -> bool:
+        """Whether this parameterization's passes of `layer`, handed the product layer group below (`stream_children`,
+        where it sets `fuses_stream_children`: that group's own passes then not run), honor a call's options beyond the
+        plain regime's -- `extra` their names (`TensorCircuit._stream_fusion_groups`, `_stream_fusion_bk_groups`;
+        `SumLayer.stream_fusion_accepts`): typically the options its own passes read, which it takes alike with or
+        without the product layer. The default honors none: a call with any keeps the product layer's passes."""
+        return not extra
+
     def param_operand_columns(self, batch_size: int) -> int:
         """The columns this parameterization's kernels on that copy run at, for a pass of `batch_size` samples -- what
         the circuit's rule on the copy reckons a layer's work with, and its least columns (16: below them the kernels

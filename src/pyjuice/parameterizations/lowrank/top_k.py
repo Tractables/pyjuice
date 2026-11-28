@@ -302,11 +302,13 @@ def _sum_backward_terms(A, Bm, G, ltheta, lc, logw, f, pm = None):
     return Q.sum(dim = 1), (Q * keep).sum(dim = 0), (Tm * keep).sum(dim = 0), Q - Tm, dG, a
 
 
-def sum_forward(desc, layer, ns_tensors, node_mars, element_mars, params, kwargs) -> None:
+def sum_forward(desc, layer, ns_tensors, node_mars, element_mars, params, kwargs, children = None) -> None:
     """The node values of a `LowRank(top_k)` sum layer, written over its rows of `node_mars`: by the pass's stack of the
     sums reading the leaf beside it where it takes the node vector (`top_k_stack.py`), else by the fused kernels where
     they serve (`top_k_fused.py`), else here. A layer whose every node vector a stack took is settled
-    (`top_k_stack.settle`: its next calls straight to the stack)."""
+    (`top_k_stack.settle`: its next calls straight to the stack). `children`: the product layer group below handed over
+    (its `(table, first_row)`, the circuit's `stream_children`: its forward not run) -- the kernels read each child's
+    value as its product's, the passes here have the element values formed first."""
     top_k_fused, top_k_stack = _kernel_modules()[2], _stack_module()
     sibs = layer.__dict__.get("_sibling_leaves")
     assert sibs is not None, "A `LowRank(top_k)` sum layer compiled without its leaves (`_resolve_top_k_siblings`)."
@@ -314,16 +316,21 @@ def sum_forward(desc, layer, ns_tensors, node_mars, element_mars, params, kwargs
     B = node_mars.size(1)
     layer.__dict__["_lr_state"] = dict()
     layer.__dict__["_lr_topk_batch"] = B
-    stacked = []
+    stacked, formed = [], children is None
     for ns_info, tensors in ns_tensors:
         sib = sibs[id(ns_info.ns)]
+        pairs = top_k_fused.child_pairs(layer, ns_info.ns, children)    # (the kernels': the children's products' rows)
         stack = top_k_stack.stack_of(sib, B, kwargs, node_mars, element_mars, params)
-        if stack is not None and stack.forward(ns_info.ns):
+        if stack is not None and stack.forward(ns_info.ns, pairs):
             stacked.append((ns_info.ns, sib))
             continue
         geo = desc._geometry(layer, ns_info, node_mars.device)
-        if top_k_fused.sum_forward(desc, layer, ns_info, tensors, geo, params, element_mars, node_mars, sib, kwargs):
+        if top_k_fused.sum_forward(desc, layer, ns_info, tensors, geo, params, element_mars, node_mars, sib, kwargs,
+                                   pairs):
             continue
+        if not formed:                                          # (the element values: formed once for the passes here)
+            _fused_children().form_elements(element_mars, node_mars, children)
+            formed = True
         A, Bm, G = (_d(t) for t in per_sample(tensors, external_rows(kwargs)))
         ltheta = desc._dense_params(geo, params, dtype = PASSES_DTYPE).log()        # [M, N]
         lc = _d(desc._child_values(geo, element_mars))                              # [B, N]
@@ -381,6 +388,15 @@ def _stack_module():
     return got
 
 
+def _fused_children():
+    """`pyjuice.layer.fused_children` (imported when first asked for: `pyjuice.layer` imports `pyjuice.nodes`)"""
+    got = _MODS.get("fused_children")
+    if got is None:
+        from pyjuice.layer import fused_children as got
+        _MODS["fused_children"] = got
+    return got
+
+
 def sum_backward(desc, layer, ns_tensors, ns_grad_tensors, node_flows, element_flows, node_mars, element_mars, params,
                  param_flows, denom_param_flows, kwargs) -> None:
     """
@@ -405,20 +421,32 @@ def sum_backward(desc, layer, ns_tensors, ns_grad_tensors, node_flows, element_f
     # one's rows written by its node vector alone (the kernels' scatter stores them: no -inf fill first, a launch a
     # position); else filled here and each node vector's added in
     alone = desc._kids_own(layer, dev)
+    # the product layer group below handed over (`_bk_stream_children`: its forward -- the recompute -- and backward not
+    # run): the kernels read each child's value as its product's and, each child's flow its node vector's alone, store
+    # it as the product's children's node flows; else the element flows made as without it (its values formed first),
+    # then written as the children's
+    sc = layer.__dict__.get("_bk_stream_children")
+    fallback = None
+    if sc is not None and not alone:
+        _fused_children().form_elements(element_mars, node_mars, sc)
+        fallback, sc = sc, None
     if not alone:
         for geo in geos:
             element_flows.index_fill_(0, geo["kids"], -float("inf"))
-    ef_kernel = element_flows.dtype == torch.float32 and element_flows.stride(1) == 1
+    values, flows_out = (element_mars, element_flows) if sc is None else (node_mars, node_flows)
+    ef_kernel = flows_out.dtype == torch.float32 and flows_out.stride(1) == 1
     # (a backward asking for no gradients nor EM statistics -- a query's -- of a node vector whose forward a stack took:
     # by the stack, one call; `top_k_stack`)
     plain = not want_flows and ef_kernel and node_flows.dtype == torch.float32 and node_flows.stride(1) == 1
     B = node_flows.size(1)
+    formed = sc is None
 
     for (ns_info, tensors), grads, geo in zip(ns_tensors, ns_grad_tensors, geos):
         sib = sibs[id(ns_info.ns)]
+        pairs = top_k_fused.child_pairs(layer, ns_info.ns, sc, geo)    # (the kernels': the children's products' rows)
         if plain and grads is None:
             stack = _stack_module().stack_made(sib, B)
-            if stack is not None and stack.backward(ns_info.ns, node_flows, element_flows, alone):
+            if stack is not None and stack.backward(ns_info.ns, node_flows, element_flows, alone, pairs):
                 continue
         nf = node_flows[ns_info.nid_start:ns_info.nid_end, :]                        # [M, B] (log-space flows)
         f = None                                                                      # (f [B, M]: where torch needs it)
@@ -449,13 +477,16 @@ def sum_backward(desc, layer, ns_tensors, ns_grad_tensors, node_flows, element_f
             if want_flows:
                 em_out = top_k_backward.em_accumulator(geo, params, param_flows, pf0,
                                                        denom_param_flows if want_denom else None, d0, dev)
-            ef, a_rows, flows = top_k_backward.terms(*tensors, tab, element_mars, geo, slot, rows, logw_rows, nf,
+            ef, a_rows, flows = top_k_backward.terms(*tensors, tab, values, geo, slot, rows, logw_rows, nf,
                                                      external_rows(kwargs), grads, gviews, fresh, want_flows, pm, counts,
                                                      top_k_fused.kept_of(layer, ns_info.ns, B), em_out = em_out,
-                                                     element_flows = element_flows if ef_kernel else None,
-                                                     store = alone)
+                                                     element_flows = flows_out if ef_kernel else None,
+                                                     store = alone, pairs = pairs)
             Fp, Fm = flows if want_flows else (None, None)
         else:
+            if not formed:                                     # (the element values: formed once for the passes here)
+                _fused_children().form_elements(element_mars, node_mars, sc)
+                formed = True
             f = _d(nf.t()).exp()
             A, Bm, G = (_d(t) for t in per_sample(tensors, external_rows(kwargs)))
             lc = _d(desc._child_values(geo, element_mars))
@@ -471,6 +502,8 @@ def sum_backward(desc, layer, ns_tensors, ns_grad_tensors, node_flows, element_f
                 element_flows.index_fill_(0, kids, -float("inf"))
             element_flows[kids, :] = torch.logaddexp(element_flows[kids, :],
                                                      ef.log().t()[geo["cols"], :].to(element_flows.dtype))
+            if sc is not None:                                         # (the node vector's alone: its rows' now)
+                _fused_children().scatter_flows(node_flows, element_flows, sc, kids)
         if want_flows and em_out is None:
             if not (kernels and top_k_backward.scatter_statistics(geo, Fp, Fm, params, param_flows, pf0,
                                                                     denom_param_flows if want_denom else None, d0)):
@@ -484,6 +517,8 @@ def sum_backward(desc, layer, ns_tensors, ns_grad_tensors, node_flows, element_f
             f = _d(nf.t()).exp() if f is None else f
             _leaf_terms(desc, sib, rows, logp, tilt, logw_rows, a_rows, f[rows], kwargs, glp, gviews, fresh, want_flows,
                         pm)
+    if fallback is not None:                                           # (every node vector's added in: the children's)
+        _fused_children().scatter_flows(node_flows, element_flows, fallback, layer._element_rows())
     return None
 
 

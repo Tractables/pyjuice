@@ -642,7 +642,7 @@ def test_no_backward_fusion_of_parameter_flows_that_are_not_deferred(fused_prefe
         pc(x)
         pc.backward(x, compute_param_flows = False)
     assert pc.__dict__["_stream_fusion_bk_"][(B, pc.precision, pc.params.dtype, pc._param_operand_groups(B), False,
-                                              False)]
+                                              frozenset(), False)]           # (no options past the plain regime's)
 
 
 @cuda_only

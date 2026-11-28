@@ -83,11 +83,13 @@ def _operand_columns(readers, batch_size: int) -> int:
 
 # The forward options a fused product forward serves (`_stream_fusion_groups`): the plain regime's, and the external
 # parameters' (a gated layer whose parameterization takes the fused forward, `fuses_stream_children`); and the call's
-# grad mode, a hint of what a layer may keep for a backward (`_grad_enabled`), which changes no value
+# grad mode, a hint of what a layer may keep for a backward (`_grad_enabled`), which changes no value. Any other option
+# of a call: a pair fuses where every layer of its sum group honors it (`SumLayer.stream_fusion_accepts`)
 _STREAM_FUSION_FW_OPTS = frozenset(("precision", "pflow_temperature", "sum_external_params",
                                     "sum_external_params_buffer", "_grad_enabled"))
 
-# The backward options of the plain regime a fused product backward serves (`_stream_fusion_bk_groups`)
+# The backward options of the plain regime a fused product backward serves (`_stream_fusion_bk_groups`); others as the
+# forward's
 _STREAM_FUSION_BK_OPTS = frozenset(("param_flows", "denom_param_flows", "allow_modify_flows", "logspace_flows",
                                     "negate_pflows", "precision", "pflow_temperature", "temper_eflow",
                                     "defer_param_flows", "pf_store_first", "sum_external_params",
@@ -563,16 +565,18 @@ class TensorCircuit(_BuildMixin, _CudaGraphsMixin, _ExternalParamsMixin, _Learni
         launched then: where every layer of that sum group is a plain `SumLayer` whose settled forward runs the stream
         kernel and takes the fused copy (`SumLayer._stream_fusion`), and that copy MEASURES the faster -- against the
         product group's forward and the sum group's (`autotune.pick`, keyed by the pair's shape; no margin: the same
-        bits either way, so the faster is taken). One more option of the tuners: decided once per batch size, at its
-        second plain forward (the first settles the layers' launches), and kept; none before, nor for a pass of another
-        regime (not LL, tempered, keyword arguments). Asked outside the pass: the trials run on the live buffers, whose
-        rows the pass then computes again."""
+        bits either way, so the faster is taken). One more option of the tuners: decided once per batch size and set of
+        the call's options beyond the plain regime's (`_STREAM_FUSION_FW_OPTS`), at its second forward (the first
+        settles the layers' launches), and kept; none before, nor for a pass of another regime (not LL, tempered), nor
+        for a pair one of whose sum layers does not honor those options (`SumLayer.stream_fusion_accepts`: a plain
+        layer none, a parameterized one what its parameterization says). Asked outside the pass: the trials run on the
+        live buffers, whose rows the pass then computes again."""
         pt = sum_opts.get("pflow_temperature", 1.0)
-        if (propagation_alg != "LL" or pt != 1.0 or sum_opts.keys() - _STREAM_FUSION_FW_OPTS
-                or not self.node_mars.is_cuda):
+        if propagation_alg != "LL" or pt != 1.0 or not self.node_mars.is_cuda:
             return frozenset()
+        extra, gated = frozenset(sum_opts.keys() - _STREAM_FUSION_FW_OPTS), "sum_external_params" in sum_opts
         state = self.__dict__.setdefault("_stream_fusion_", {})
-        key = (batch_size, self.precision, self.params.dtype, op_groups, "sum_external_params" in sum_opts)
+        key = (batch_size, self.precision, self.params.dtype, op_groups, extra, gated)
         seen = state.get(key)
         if isinstance(seen, frozenset):
             return seen
@@ -590,8 +594,9 @@ class TensorCircuit(_BuildMixin, _CudaGraphsMixin, _ExternalParamsMixin, _Learni
         for k in range(len(groups) - 1):
             prod, sumg = groups[k], groups[k + 1]
             if not (prod.is_prod() and sumg.is_sum() and all(
-                    type(layer) is SumLayer or getattr(getattr(layer, "parameterization", None), "fuses_stream_children",
-                                                       False) for layer in sumg)):
+                    (type(layer) is SumLayer or getattr(getattr(layer, "parameterization", None),
+                                                        "fuses_stream_children", False))
+                    and layer.stream_fusion_accepts(extra, gated) for layer in sumg)):
                 continue
             opts = dict(sum_opts, op_params = op) if (op is not None and id(sumg) in op_groups) else sum_opts
             plans = [layer._stream_fusion((batch_size, self.params.dtype, self.precision,
@@ -627,17 +632,21 @@ class TensorCircuit(_BuildMixin, _CudaGraphsMixin, _ExternalParamsMixin, _Learni
         writes); and where that MEASURES the faster -- the product layer's forward, the sum group's backward and the
         product layer's backward against the sum group's fused backward, element flows only, into scratch flow buffers
         (`autotune.pick`, keyed by the pair's shape; margin 1.0: the same bits). One more option of the tuners: decided
-        once per batch size at its second plain backward (the first settles the layers' kernels), and kept; none
-        before, nor for a backward of another regime (not LL in log space, tempered, negated or modified flows, keyword
-        arguments, layer callbacks)."""
+        once per batch size and set of the call's options beyond the plain regime's (`_STREAM_FUSION_BK_OPTS`), at its
+        second backward (the first settles the layers' kernels), and kept; none before, nor for a backward of another
+        regime (not LL in log space, tempered, negated or modified flows, layer callbacks), nor for a pair one of whose
+        sum layers does not honor those options (`SumLayer.stream_fusion_accepts`, as the forward's)."""
         if not (propagation_alg == "LL" and sum_opts.get("logspace_flows", False)
                 and not sum_opts.get("allow_modify_flows", False) and not sum_opts.get("negate_pflows", False)
                 and sum_opts.get("pflow_temperature", 1.0) == 1.0 and not sum_opts.get("temper_eflow", False)
-                and not (sum_opts.keys() - _STREAM_FUSION_BK_OPTS) and self.node_mars.is_cuda):
+                and self.node_mars.is_cuda):
             return frozenset()
         pf = sum_opts.get("param_flows") is not None
+        extra = frozenset(sum_opts.keys() - _STREAM_FUSION_BK_OPTS)
+        gated = "sum_external_params" in sum_opts or "sum_external_params_buffer" in sum_opts
         state = self.__dict__.setdefault("_stream_fusion_bk_", {})
-        key = (batch_size, self.precision, self.params.dtype, op_groups, pf, "sum_external_params_buffer" in sum_opts)
+        key = (batch_size, self.precision, self.params.dtype, op_groups, pf, extra,
+               "sum_external_params_buffer" in sum_opts)
         seen = state.get(key)
         if isinstance(seen, frozenset):
             return seen
@@ -663,8 +672,9 @@ class TensorCircuit(_BuildMixin, _CudaGraphsMixin, _ExternalParamsMixin, _Learni
         for k in range(len(groups) - 1):
             prod, sumg = groups[k], groups[k + 1]
             if not (prod.is_prod() and sumg.is_sum() and all(
-                    type(layer) is SumLayer or getattr(getattr(layer, "parameterization", None), "fuses_stream_children",
-                                                       False) for layer in sumg)):
+                    (type(layer) is SumLayer or getattr(getattr(layer, "parameterization", None),
+                                                        "fuses_stream_children", False))
+                    and layer.stream_fusion_accepts(extra, gated) for layer in sumg)):
                 continue
             table = tables[k]
             given = op is not None and id(sumg) in op_groups

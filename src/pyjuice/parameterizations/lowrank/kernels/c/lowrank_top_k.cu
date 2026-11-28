@@ -1116,19 +1116,35 @@ __device__ __forceinline__ void prep_e16(const float* Gt, long sG, __half* E16, 
     }
 }
 
+// The children's values as the preps read them (`prep_ev`, `tk_ev_kernel`): the circuit's element values `v`
+// [elements][ld] at the children's element rows `eid` -- or, where the sum takes the product layer group below (its
+// forward not run: the circuit's `stream_children`), the node values `v` [nodes][ld] of each child's product's two
+// children, summed (`pairs` [N] their rows) -- the product layer's add, the same bits. A child's reference (`ref`: its
+// element row, or its product's children's rows) is the circuit's structure, no launch of the chain writes it: a
+// kernel may load it before the chain's wait (`tk_ev_kernel`)
+struct ChildValues {
+    const float* v; long ld; const long* eid; const int2* pairs;
+    __device__ __forceinline__ int2 ref(int j) const {
+        return pairs != nullptr ? pairs[j] : make_int2((int)eid[j], 0);
+    }
+    __device__ __forceinline__ float at(int2 r, long b) const {
+        const float x = v[(long)r.x * ld + b];
+        return pairs != nullptr ? x + v[(long)r.y * ld + b] : x;
+    }
+};
+
 // the children's values over their largest (ev [B, N]) and that largest (cmax [B], -inf where every child's is), from
-// the circuit's element values `em` [elements, B'] (the children's element ids `eid`, `has` null where every child is
-// reached): a warp a sample
-__device__ __forceinline__ void prep_ev(const float* em, long em_stride, const long* eid, const bool* has, float* ev,
-                                        float* cmax, int B, int N, long wid, long nwarp, int lane) {
+// `cv` (`has` null where every child is reached): a warp a sample
+__device__ __forceinline__ void prep_ev(const ChildValues& cv, const bool* has, float* ev, float* cmax, int B, int N,
+                                        long wid, long nwarp, int lane) {
     for (long bb = wid; bb < B; bb += nwarp) {
         float mx = NEG;
         for (int j = lane; j < N; j += 32)
-            mx = fmaxf(mx, (has == nullptr || has[j]) ? em[eid[j] * em_stride + bb] : NEG);
+            mx = fmaxf(mx, (has == nullptr || has[j]) ? cv.at(cv.ref(j), bb) : NEG);
         mx = warp_max(mx);
         const float sh = isfinite(mx) ? mx : 0.f;
         for (int j = lane; j < N; j += 32) {
-            const float v = (has == nullptr || has[j]) ? em[eid[j] * em_stride + bb] : NEG;
+            const float v = (has == nullptr || has[j]) ? cv.at(cv.ref(j), bb) : NEG;
             ev[bb * N + j] = __expf(v - sh);
         }
         if (lane == 0) cmax[bb] = mx;
@@ -1170,9 +1186,8 @@ __device__ __forceinline__ void prep_lth(const float* theta, uint2* LTh, int M, 
 // The operands, one launch: blockIdx.y the task, blockIdx.x grid-stride over its items. B and G a row of tensors each
 // (Bx of them), the children's values a sample each (B).
 __global__ void tk_prep_kernel(
-        const float* Bm, long sB, const float* Gt, long sG, const float* em,
-        long em_stride,
-        const long* eid, const bool* has, const float* theta,
+        const float* Bm, long sB, const float* Gt, long sG, const ChildValues cv, const bool* has,
+        const float* theta,
         const float* logwin, __half* BP, __half* E16, float* ev,
         float* cmax, uint2* LTh, float* logw,
         int Bx, int B, int M, int N, int r, int KP, int S, int Rm, int* flags, int nflags) {
@@ -1188,7 +1203,7 @@ __global__ void tk_prep_kernel(
     } else if (task == 1) {
         prep_e16(Gt, sG, E16, Bx, S, N, wid, nwarp, lane);
     } else if (task == 2) {
-        prep_ev(em, em_stride, eid, has, ev, cmax, B, N, wid, nwarp, lane);
+        prep_ev(cv, has, ev, cmax, B, N, wid, nwarp, lane);
     } else if (task == 3) {
         if (theta == nullptr) return;                                        // (an earlier call's table reused)
         prep_lth(theta, LTh, M, N, lane);
@@ -1225,20 +1240,31 @@ __global__ void tk_stack_prep_kernel(const StackPrep* __restrict__ readers) {
 // (`prep_ev`'s, the same bits: the largest is exact in any order) and the stream-K flags its sums' launches start from,
 // zeroed. A CTA a sample, a thread EV_PT of its children at most held in registers between the two passes -- every load
 // issued at once: on the chain, its latency is the pass's (MEASURED, the Codpula head at 2 samples: a warp a sample, as
-// `prep_ev`, 8.6 us a position)
+// `prep_ev`, 8.6 us a position). The children's references (`ChildValues::ref`, the circuit's structure) are loaded
+// before the wait for the launch before -- their latency off the chain: MEASURED, the products' children read through
+// the group's table after the wait (element id, then its row of the table, then the values: three dependent loads),
+// 5.2 us a position against 2.2 for the element values
 constexpr int EV_T = 256, EV_PT = 16;                // (children N <= EV_T EV_PT = 4096)
-__global__ void __launch_bounds__(EV_T) tk_ev_kernel(const float* em, long em_stride, const long* eid, const bool* has,
-                                                     float* ev, float* cmax, int N, int* flags, int nflags) {
-    pdl_entry();
-    if (blockIdx.x == 0)
-        for (int i = threadIdx.x; i < nflags; i += EV_T) flags[i] = 0;
+__global__ void __launch_bounds__(EV_T) tk_ev_kernel(const ChildValues cv, const bool* has, float* ev, float* cmax,
+                                                     int N, int* flags, int nflags) {
+    cudaTriggerProgrammaticLaunchCompletion();       // (`pdl_entry`'s, split around the references' loads)
     const int bb = blockIdx.x;
+    int2 r[EV_PT];
+    bool in[EV_PT];
+#pragma unroll
+    for (int u = 0; u < EV_PT; ++u) {
+        const int j = threadIdx.x + u * EV_T;
+        in[u] = j < N && (has == nullptr || has[j]);
+        r[u] = in[u] ? cv.ref(j) : make_int2(0, 0);
+    }
+    cudaGridDependencySynchronize();
+    if (blockIdx.x == 0)                             // (after the wait: a launch before may be this reader's sums')
+        for (int i = threadIdx.x; i < nflags; i += EV_T) flags[i] = 0;
     float v[EV_PT];
     float mx = NEG;
 #pragma unroll
     for (int u = 0; u < EV_PT; ++u) {
-        const int j = threadIdx.x + u * EV_T;
-        v[u] = (j < N && (has == nullptr || has[j])) ? em[eid[j] * em_stride + bb] : NEG;
+        v[u] = in[u] ? cv.at(r[u], bb) : NEG;
         mx = fmaxf(mx, v[u]);
     }
     __shared__ float red[EV_T / 32];
@@ -2590,24 +2616,47 @@ static int fw_split(int M, long Rm, long ocap, int sms) {
     return (int)std::max(1L, std::min(4L, ((long)sms + tiles - 1) / tiles));     // (rounded up: the SMs all taken)
 }
 
+// A node vector's products' children (`pairs`, int32 [N, 2]: its child j's product's two children's node rows) as the
+// kernels read them, or null where not given
+static const int2* child_pairs(const std::optional<torch::Tensor>& pairs, long N, const torch::Tensor& on) {
+    if (!pairs.has_value()) return nullptr;
+    const auto& t = *pairs;
+    TORCH_CHECK(t.is_cuda() && t.get_device() == on.get_device() && t.scalar_type() == at::kInt && t.dim() == 2 &&
+                t.size(0) == N && t.size(1) == 2 && t.is_contiguous(),
+                "top_k: the children's products' children, a contiguous int32 [N, 2] tensor on the values' device");
+    return reinterpret_cast<const int2*>(t.data_ptr<int>());
+}
+
+// A call's children's values (`ChildValues`): the circuit's element values `em` [elements, B'] at `eid` -- or, `pairs`
+// given (the product layer group below handed over, its forward not run: the circuit's `stream_children`), its node
+// values `em` [nodes, B'], each child's its product's two children's
+static ChildValues child_values(const torch::Tensor& em, const torch::Tensor& eid,
+                                const std::optional<torch::Tensor>& pairs) {
+    TORCH_CHECK(em.is_cuda() && em.scalar_type() == at::kFloat && em.dim() == 2 && em.stride(1) == 1 &&
+                em.size(0) < (1L << 31), "top_k: the children's values (the element values, or the node values with "
+                "`pairs`), a CUDA float32 [rows, batch] tensor, batch innermost, rows of 32-bit indices");
+    return ChildValues{em.data_ptr<float>(), em.stride(0), eid.data_ptr<long>(), child_pairs(pairs, eid.size(0), em)};
+}
+
 // The operands of one node vector: B [Bx, r, N] and G [Bx, S, N] (fp32) a row of tensors each; the circuit's element
 // values `em` [elements, B'] with every child's element id `eid` [N] (and `has` [N], or an empty tensor where every
-// child is reached); theta [M, N] (fp32); a sample each (B of them): the observed slots `slot` [B], the row each reads
-// `emap` [B] (an empty tensor: its own); the masked samples `rows` [Rm] and their weights `logw` [Rm, M, S] (float32;
-// empty where none); `pair`: a row's samples in one item (else a sample an item); `lth` theta's l2t as an earlier
-// call made it (int32 [M N / 2], its LTh: not made again), or an empty tensor; `items` the work items (mitems, oitems,
-// noitems, slot32) `top_k_items` made for it with the others reading the leaf layer (pair), or empty (made here):
-// (BP, E16, ev, cmax, LTh, mitems, oitems, noitems, slot32, logw, flags) -- E16 [Bx, S, N] E in fp16, times 2^15 (its
-// one copy: every reader's).
+// child is reached) -- or, `pairs` given (int32 [N, 2], each child's product's two children's node rows: the product
+// layer group below handed over, its forward not run), the node values, each child's value its product's
+// (`child_values`); theta [M, N] (fp32); a sample
+// each (B of them): the observed slots `slot` [B], the row each reads `emap` [B] (an empty tensor: its own); the masked
+// samples `rows` [Rm] and their weights `logw` [Rm, M, S] (float32; empty where none); `pair`: a row's samples in one
+// item (else a sample an item); `lth` theta's l2t as an earlier call made it (int32 [M N / 2], its LTh: not made
+// again), or an empty tensor; `items` the work items (mitems, oitems, noitems, slot32) `top_k_items` made for it with
+// the others reading the leaf layer (pair), or empty (made here): (BP, E16, ev, cmax, LTh, mitems, oitems, noitems,
+// slot32, logw, flags) -- E16 [Bx, S, N] E in fp16, times 2^15 (its one copy: every reader's).
 std::vector<torch::Tensor> top_k_prep(torch::Tensor Bm, torch::Tensor G, torch::Tensor em, torch::Tensor eid,
                                       torch::Tensor has, torch::Tensor theta, torch::Tensor slot64, torch::Tensor emap,
                                       torch::Tensor rows, torch::Tensor logwin, bool pair, torch::Tensor lth,
-                                      std::vector<torch::Tensor> items) {
+                                      std::vector<torch::Tensor> items, std::optional<torch::Tensor> pairs) {
     const c10::cuda::CUDAGuard guard(Bm.device());
     check_rows(Bm, at::kFloat, "B"); check_rows(G, at::kFloat, "G"); check(theta, at::kFloat, "theta");
     check(eid, at::kLong, "eid"); check(slot64, at::kLong, "slot"); check(rows, at::kLong, "rows");
-    TORCH_CHECK(em.is_cuda() && em.scalar_type() == at::kFloat && em.dim() == 2 && em.stride(1) == 1,
-                "top_k: the element values, a CUDA float32 [elements, batch] tensor, batch innermost");
+    const ChildValues cv = child_values(em, eid, pairs);
     const int Bx = Bm.size(0), r = Bm.size(1), N = Bm.size(2), M = theta.size(0), S = G.size(1), Rm = rows.size(0);
     const int B = slot64.size(0);
     const bool mapped = emap.numel() > 0;
@@ -2655,8 +2704,7 @@ std::vector<torch::Tensor> top_k_prep(torch::Tensor Bm, torch::Tensor G, torch::
     auto flags = torch::empty({2 * P}, i32);
     auto stream = at::cuda::getCurrentCUDAStream();
     launch_pdl(tk_prep_kernel, dim3(296, 5), dim3(256), 0, stream,
-        Bm.data_ptr<float>(), Bm.stride(0), G.data_ptr<float>(), G.stride(0), em.data_ptr<float>(), em.stride(0),
-        eid.data_ptr<long>(),
+        Bm.data_ptr<float>(), Bm.stride(0), G.data_ptr<float>(), G.stride(0), cv,
         full ? nullptr : has.data_ptr<bool>(), reuse ? nullptr : theta.data_ptr<float>(),
         Rm > 0 && !padded ? logwin.data_ptr<float>() : nullptr,
         reinterpret_cast<__half*>(BP.data_ptr<at::Half>()), reinterpret_cast<__half*>(E16.data_ptr<at::Half>()),
@@ -2872,8 +2920,9 @@ torch::Tensor or_empty(const std::optional<torch::Tensor>& t, const torch::Tenso
 // position, ~12 of them the two calls' and the tensors' checks and conversions in Python. The caller's A, B, G as they
 // lie (a contiguous float32 copy where the kernels cannot read them in place: `as_rows`), the masked samples' weights
 // likewise (`weights_operand`); None for `has` (every child reached), `emap` (a sample's own row), `logw` (none
-// masked), `lth` (made here), `out` (no values), `acnt_out` (the counts in the stash's own tensor); `items` empty: made
-// here. The prep's operands (BP, E16, ev, cmax, LTh, mitems, oitems, noitems, slot32, logw, flags), then the stash
+// masked), `lth` (made here), `out` (no values), `acnt_out` (the counts in the stash's own tensor), `pairs` (the
+// element values `em`: else `em` the node values, the children's their products' -- `top_k_prep`'s); `items` empty:
+// made here. The prep's operands (BP, E16, ev, cmax, LTh, mitems, oitems, noitems, slot32, logw, flags), then the stash
 // where `stash` (alpha16, beta16, invd, acnt, ao, bo, hrow).
 std::vector<torch::Tensor> top_k_sum_forward(torch::Tensor A, torch::Tensor Bm, torch::Tensor G, torch::Tensor em,
                                              torch::Tensor eid, std::optional<torch::Tensor> has, torch::Tensor theta,
@@ -2881,13 +2930,14 @@ std::vector<torch::Tensor> top_k_sum_forward(torch::Tensor A, torch::Tensor Bm, 
                                              torch::Tensor rows, std::optional<torch::Tensor> logw,
                                              std::optional<torch::Tensor> lth, std::vector<torch::Tensor> items,
                                              std::optional<torch::Tensor> out, int64_t nid0, bool stash,
-                                             std::optional<torch::Tensor> acnt_out) {
+                                             std::optional<torch::Tensor> acnt_out,
+                                             std::optional<torch::Tensor> pairs) {
     const auto L = at::kLong;
     auto emap_t = emap.has_value() ? as_dense(*emap, L) : torch::empty({0}, eid.options());
     auto ops = top_k_prep(as_rows(Bm), as_rows(G), em, as_dense(eid, L), or_empty(has, eid, at::kBool),
                           as_dense(theta, at::kFloat), as_dense(slot64, L), emap_t, as_dense(rows, L),
                           logw.has_value() ? weights_operand(*logw) : torch::empty({0}, theta.options()), true,
-                          or_empty(lth, eid, at::kInt), items);
+                          or_empty(lth, eid, at::kInt), items, pairs);
     auto st = top_k_forward(as_rows(A), ops[0], ops[1], ops[2], ops[3], ops[4], ops[5], ops[6], ops[7], ops[8], ops[9],
                             ops[10], or_empty(out, theta, at::kFloat), nid0, stash,
                             or_empty(acnt_out, theta, at::kFloat));
@@ -2896,10 +2946,13 @@ std::vector<torch::Tensor> top_k_sum_forward(torch::Tensor A, torch::Tensor Bm, 
 }
 
 // The children's element flows from the backward's EF [B, N] (`top_k_scatter_ef`, a stack's backward): a CTA a 32 x 32
-// tile of (child, sample), log EF transposed into `ef` [elements][ld] -- added (log-space) or, `STORE`, stored
+// tile of (child, sample), log EF transposed into `ef` [elements][ld] -- added (log-space) or, `STORE`, stored; with
+// `pairs` (the product layer group below handed over, its passes not run: the child of column j's product's two
+// children at pairs[j]) stored as both children's node flows, `ef` the node flows -- the product layer's backward where
+// each child has one parent element (logaddexp(-inf, f) = f: the same bits)
 template <bool STORE>
-__global__ void tk_scatter_ef_kernel(const float* EF, const long* cols,
-                                     const long* kids, float* ef, long ld, int B, int N, int nk) {
+__global__ void tk_scatter_ef_kernel(const float* EF, const long* cols, const long* kids, float* ef, long ld, int B,
+                                     int N, int nk, const int2* pairs) {
     pdl_entry();
     __shared__ float tile[32][33];
     const int k0 = blockIdx.x * 32, b0 = blockIdx.y * 32, tx = threadIdx.x, ty = threadIdx.y;
@@ -2913,13 +2966,27 @@ __global__ void tk_scatter_ef_kernel(const float* EF, const long* cols,
     for (int u = ty; u < 32; u += 8) {
         const int k = k0 + u, b = b0 + tx;
         if (k >= nk || b >= B) continue;
-        float* p = ef + kids[k] * ld + b;
         const float y = __logf(tile[tx][u]);
+        if (pairs != nullptr) {                                     // (STORE: the products' children's flows)
+            const int2 c = pairs[cols[k]];
+            ef[(long)c.x * ld + b] = y;
+            ef[(long)c.y * ld + b] = y;
+            continue;
+        }
+        float* p = ef + kids[k] * ld + b;
         if (STORE) { *p = y; continue; }                            // (the rows' one writer: no fill before)
         const float x = *p;
         const float m = fmaxf(x, y);
         *p = m == -INFINITY ? m : m + log1pf(__expf(-fabsf(x - y)));
     }
+}
+
+// The scatter's `pairs` (`child_pairs`, N children; null: none) -- its flows stored, each child's one parent element
+static const int2* scatter_pairs(const std::optional<torch::Tensor>& pairs, long N, const torch::Tensor& flows,
+                                 bool store) {
+    TORCH_CHECK(!pairs.has_value() || store,
+                "top_k: the products' children's flows stored (each child's one parent element), not added");
+    return child_pairs(pairs, N, flows);
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -2953,9 +3020,11 @@ class TopKStackPlan {
                     "top_k stack: the node values, a contiguous CUDA float32 tensor");
         TORCH_CHECK(element_mars.is_cuda() && element_mars.scalar_type() == at::kFloat && element_mars.dim() == 2 &&
                     element_mars.stride(1) == 1, "top_k stack: the element values, batch innermost");
+        TORCH_CHECK(element_mars.size(0) < (1L << 31) && node_mars.size(0) < (1L << 31),
+                    "top_k stack: the values' rows of 32-bit indices (`ChildValues`)");
         B_ = (int)node_mars.size(1);
         TORCH_CHECK(B_ <= 4096, "top_k stack: at most 4096 samples (the work items' scans)");
-        em_ = element_mars.data_ptr<float>(); em_stride_ = element_mars.stride(0);
+        em_ = element_mars.data_ptr<float>(); em_stride_ = element_mars.stride(0); nm_ = node_mars;
         const int T = (int)offs.size() - 1;
         TORCH_CHECK(T >= 1 && slot32.dim() == 2 && slot32.size(0) == T && slot32.size(1) == B_ && noitems.numel() == T,
                     "top_k stack: the leaf layer's items: slot32 [T, B], noitems [T]");
@@ -3085,13 +3154,18 @@ class TopKStackPlan {
         C10_CUDA_KERNEL_LAUNCH_CHECK();
     }
 
-    // reader i's forward: its chain-dependent operands, then its sums' launches (the values; the stash where kept)
-    void forward(int64_t i) const {
+    // reader i's forward: its chain-dependent operands, then its sums' launches (the values; the stash where kept) --
+    // its children's values the element values', or, `pairs` given (int32 [N, 2]: the product layer group below handed
+    // over, its forward not run), their products' from the node values (`ChildValues`)
+    void forward(int64_t i, std::optional<torch::Tensor> pairs) const {
         TORCH_CHECK(!released_ && i >= 0 && i < (int64_t)pos_.size(), "top_k stack: a reader's index");
         const Pos& q = pos_[i];
         const c10::cuda::CUDAGuard guard(dev_);
-        launch_pdl(tk_ev_kernel, dim3((unsigned)B_), dim3(EV_T), 0, at::cuda::getCurrentCUDAStream(), em_,
-                   em_stride_, q.eid, q.has, q.ev, q.cmax, q.N, q.args.flags, 2 * q.P);
+        const int2* pr = child_pairs(pairs, q.N, nm_);
+        const ChildValues cv = pr != nullptr ? ChildValues{nm_.data_ptr<float>(), nm_.stride(0), q.eid, pr} :
+            ChildValues{em_, em_stride_, q.eid, nullptr};
+        launch_pdl(tk_ev_kernel, dim3((unsigned)B_), dim3(EV_T), 0, at::cuda::getCurrentCUDAStream(), cv, q.has, q.ev,
+                   q.cmax, q.N, q.args.flags, 2 * q.P);
         C10_CUDA_KERNEL_LAUNCH_CHECK();
         if (stash_) sk_launch<true>(q.args, q.KP, q.P, q.Rm, B_, dev_);
         else sk_launch<false>(q.args, q.KP, q.P, q.Rm, B_, dev_);
@@ -3191,8 +3265,10 @@ class TopKStackPlan {
     // (`tk_flows_kernel`; its masked rows' into the leaf's counts beside their posterior), its cols passes into EF
     // (`bw_launches`), the children's element flows (`tk_scatter_ef_kernel`; `store`: their one writer of the pass) --
     // `top_k_sum_backward`'s launches, from arguments made once. `node_flows` [nodes, B], `element_flows` [elements, B]
-    // (log space, fp32, a sample a column): the circuit's buffers.
-    void backward(int64_t i, torch::Tensor node_flows, torch::Tensor element_flows, bool store) const {
+    // (log space, fp32, a sample a column): the circuit's buffers; with `pairs` (the product layer group below handed
+    // over: `top_k_scatter_ef`'s) the element flows stored as the products' children's node flows instead.
+    void backward(int64_t i, torch::Tensor node_flows, torch::Tensor element_flows, bool store,
+                  std::optional<torch::Tensor> pairs) const {
         TORCH_CHECK(bw_ready_ && !released_ && i >= 0 && i < (int64_t)pos_.size(), "top_k stack: a backward's reader");
         TORCH_CHECK(node_flows.is_cuda() && node_flows.scalar_type() == at::kFloat && node_flows.dim() == 2 &&
                     node_flows.stride(1) == 1 && node_flows.size(1) == B_ && element_flows.is_cuda() &&
@@ -3219,11 +3295,13 @@ class TopKStackPlan {
             case 8: bw_launches<8>(q.bw, false, B_, gsz, sms, dev_, stream); break;
             default: TORCH_CHECK(false, "top_k: ranks padded to 32, 64, 96 or 128");
         }
+        const int2* pr = scatter_pairs(pairs, q.N, node_flows, store);
         if (q.nk > 0) {
+            const torch::Tensor& out = pr != nullptr ? node_flows : element_flows;
             dim3 grid((unsigned)((q.nk + 31) / 32), (unsigned)((B_ + 31) / 32)), block(32, 8);
             launch_pdl(store ? tk_scatter_ef_kernel<true> : tk_scatter_ef_kernel<false>, grid, block, 0, stream,
-                       (const float*)q.bw.EF, (const long*)q.cols, (const long*)q.kids, element_flows.data_ptr<float>(),
-                       element_flows.stride(0), B_, q.N, q.nk);
+                       (const float*)q.bw.EF, (const long*)q.cols, (const long*)q.kids, out.data_ptr<float>(),
+                       out.stride(0), B_, q.N, q.nk, pr);
             C10_CUDA_KERNEL_LAUNCH_CHECK();
         }
     }
@@ -3239,6 +3317,7 @@ class TopKStackPlan {
         AH_ = L2T_ = LTc_ = EF_ = fl_ = fmx_ = rows_ = torch::Tensor();
         theta_.clear();
         hold_.clear();
+        nm_ = torch::Tensor();
     }
 
   private:
@@ -3254,6 +3333,7 @@ class TopKStackPlan {
     int dev_ = 0, B_ = 0;
     const float* em_ = nullptr;
     long em_stride_ = 0;
+    torch::Tensor nm_;                              // (the node values: `forward`'s with `pairs`)
     std::vector<Pos> pos_;
     torch::Tensor BP_, E16_, LTh_, ev_, cmax_, flags_, ws_, alpha16_, beta16_, invd_, acnt0_, ao_, bo_, hrow_, prep_d_;
     torch::Tensor mitems_, oitems_, noitems_, slot32_, logw_, counts_;
@@ -3571,20 +3651,23 @@ std::vector<torch::Tensor> top_k_em_index(torch::Tensor slot32, torch::Tensor ro
 // element_flows[kids[k], b] = logaddexp(element_flows[kids[k], b], log EF[b, cols[k]]): the children's element flows
 // (log space, a sample a column) from the backward's EF [B, N] (linear), a 32 x 32 tile a CTA through shared memory
 // `element_flows[kids, :] = logaddexp(element_flows[kids, :], log EF[:, cols]^T)`, or with `store` (the rows' one
-// writer of the pass: their -inf fill not made) `= log EF[:, cols]^T`
+// writer of the pass: their -inf fill not made) `= log EF[:, cols]^T`; with `pairs` (int32 [N, 2], each child's
+// product's two children's node rows: the product layer group below handed over, its passes not run), `element_flows`
+// the node flows, each child's flow stored as its product's two children's (`store` then: each has one parent element)
 void top_k_scatter_ef(torch::Tensor EF, torch::Tensor cols, torch::Tensor kids, torch::Tensor element_flows,
-                      bool store) {
+                      bool store, std::optional<torch::Tensor> pairs) {
     const c10::cuda::CUDAGuard guard(EF.device());
     check(EF, at::kFloat, "EF"); check(cols, at::kLong, "cols"); check(kids, at::kLong, "kids");
     TORCH_CHECK(element_flows.is_cuda() && element_flows.scalar_type() == at::kFloat && element_flows.dim() == 2 &&
                 element_flows.stride(1) == 1 && element_flows.size(1) == EF.size(0) && cols.numel() == kids.numel(),
-                "top_k: the element flows [rows, B] fp32 and EF [B, N]");
+                "top_k: the element flows (the node flows with `pairs`) [rows, B] fp32 and EF [B, N]");
+    const int2* pr = scatter_pairs(pairs, EF.size(1), element_flows, store);
     const int B = EF.size(0), N = EF.size(1), nk = cols.numel();
     if (nk == 0 || B == 0) return;
     dim3 grid((unsigned)((nk + 31) / 32), (unsigned)((B + 31) / 32)), block(32, 8);
     launch_pdl(store ? tk_scatter_ef_kernel<true> : tk_scatter_ef_kernel<false>, grid, block, 0,
         at::cuda::getCurrentCUDAStream(), EF.data_ptr<float>(), cols.data_ptr<long>(), kids.data_ptr<long>(),
-        element_flows.data_ptr<float>(), element_flows.stride(0), B, N, nk);
+        element_flows.data_ptr<float>(), element_flows.stride(0), B, N, nk, pr);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
@@ -3595,7 +3678,8 @@ void top_k_scatter_ef(torch::Tensor EF, torch::Tensor cols, torch::Tensor kids, 
 // tables `l2t`, `ltc` an earlier call's (None: made here); `ops` the prep's 11, `stash` the forward's 7 (the node
 // flows not in them yet); `own`: the masked samples' posterior is their leaf's buffer (the stash's acnt: the flow
 // written beside it); with gradients (`dests` dA, dB, dG; empty: none) `drow`, `sgn` and, where the kernels
-// initialize the destinations, `dflag`. Returns (EF [B, N], fl [B, M], fmx [B], AH, L2T, LTc).
+// initialize the destinations, `dflag`; `pairs` as `top_k_scatter_ef`'s (`element_flows` the node flows then).
+// Returns (EF [B, N], fl [B, M], fmx [B], AH, L2T, LTc).
 std::vector<torch::Tensor> top_k_sum_backward(torch::Tensor A, torch::Tensor theta, std::optional<torch::Tensor> l2t,
                                               std::optional<torch::Tensor> ltc, std::vector<torch::Tensor> ops,
                                               std::vector<torch::Tensor> stash, torch::Tensor nf, torch::Tensor rows,
@@ -3603,7 +3687,7 @@ std::vector<torch::Tensor> top_k_sum_backward(torch::Tensor A, torch::Tensor the
                                               std::optional<torch::Tensor> sgn, std::vector<torch::Tensor> dests,
                                               std::optional<torch::Tensor> dflag,
                                               std::optional<torch::Tensor> element_flows, torch::Tensor cols,
-                                              torch::Tensor kids, bool store) {
+                                              torch::Tensor kids, bool store, std::optional<torch::Tensor> pairs) {
     TORCH_CHECK(ops.size() == 11 && stash.size() == 7 && (dests.empty() || dests.size() == 3),
                 "top_k: the prep's 11 operands, the forward's 7 stashed, no gradients or dA, dB, dG");
     const bool grads = !dests.empty(), stores = grads && dflag.has_value();
@@ -3621,7 +3705,7 @@ std::vector<torch::Tensor> top_k_sum_backward(torch::Tensor A, torch::Tensor the
     top_k_bw_grads(A_, bp[0], ops[0], ops[1], ops[2], ops[4], bp[2], ops[5], ops[6], ops[7], ops[8], stash[0], stash[1],
                    stash[2], stash[4], stash[5], stash[6], ff[0], ff[1], grads ? *drow : e32, grads ? *sgn : e32, EF,
                    grads ? dests[0] : e32, grads ? dests[1] : e32, grads ? dests[2] : e32, stores ? *dflag : ei);
-    if (element_flows.has_value()) top_k_scatter_ef(EF, cols, kids, *element_flows, store);
+    if (element_flows.has_value()) top_k_scatter_ef(EF, cols, kids, *element_flows, store, pairs);
     return {EF, ff[0], ff[1], bp[0], bp[1], bp[2]};
 }
 
@@ -3684,12 +3768,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
                       std::vector<int64_t>, std::vector<int64_t>, std::vector<torch::Tensor>, torch::Tensor,
                       torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, std::vector<int64_t>, torch::Tensor,
                       torch::Tensor, torch::Tensor, bool>())
-        .def("forward", &TopKStackPlan::forward, "reader i's launches")
+        .def("forward", &TopKStackPlan::forward, "reader i's launches", py::arg("i"), py::arg("pairs") = py::none())
         .def("kept", &TopKStackPlan::kept, "reader i's operands and stash (the backward's)")
         .def("lth", &TopKStackPlan::lth, "source s's l2t")
         .def("release", &TopKStackPlan::release, "its buffers given back (no backward follows: every reader launched)")
         .def("prepare_backward", &TopKStackPlan::prepare_backward, "a backward's operands and arguments (stash kept)")
-        .def("backward", &TopKStackPlan::backward, "reader i's backward (no gradients nor EM statistics: a query's)");
+        .def("backward", &TopKStackPlan::backward, "reader i's backward (no gradients nor EM statistics: a query's)",
+             py::arg("i"), py::arg("node_flows"), py::arg("element_flows"), py::arg("store"),
+             py::arg("pairs") = py::none());
     m.def("top_k_forward", &top_k_forward,
           "a LowRank(top_k) sum node vector's values and its backward's stash: a persistent stream-K launch for each "
           "kind of work item");
@@ -3701,7 +3787,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "the backward's dA and cols passes: the element flows and the gradients, added into their destinations");
     m.def("top_k_em_index", &top_k_em_index, "the samples the backward's EM statistics take, in the kernels' terms");
     m.def("top_k_scatter_ef", &top_k_scatter_ef, "the children's element flows from the backward's EF (log space)",
-          py::arg("EF"), py::arg("cols"), py::arg("kids"), py::arg("element_flows"), py::arg("store") = false);
+          py::arg("EF"), py::arg("cols"), py::arg("kids"), py::arg("element_flows"), py::arg("store") = false,
+          py::arg("pairs") = py::none());
     m.def("top_k_sum_backward", &top_k_sum_backward, "a node vector's backward passes, one call");
     m.def("top_k_scatter_em", &top_k_scatter_em,
           "the EM statistics onto a node vector's slots of the parameter flows and the denominators (block-major)");

@@ -705,6 +705,13 @@ class ParameterizedSumLayer(SumLayer):
 
         return None
 
+    def stream_fusion_accepts(self, extra: frozenset, gated: bool) -> bool:
+        """`SumLayer.stream_fusion_accepts`: for a gated call its parameterization's answer
+        (`SumParameterization.stream_fusion_accepts`), else the plain layer's."""
+        if not gated:
+            return super().stream_fusion_accepts(extra, gated)
+        return self.parameterization.stream_fusion_accepts(self, extra)
+
     def _stream_fusion(self, fast_key: tuple, children: Tuple[torch.Tensor, int]) -> Optional[tuple]:
         """The fused stream forward a call of ``fast_key``'s shape can take over the product group below (``children``):
         the parameterization's, where it forms the node values with the product fused (`stream_fusion_plan`, a gated

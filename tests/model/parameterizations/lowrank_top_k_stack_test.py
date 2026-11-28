@@ -65,11 +65,15 @@ def _untied_pc(tab, seed):
     return pc
 
 
-def _case(b, masked, seed = 7, tied = True, rows = None):
+def _case(b, masked, seed = 7, tied = True, rows = None, fuses = False):
     """a circuit at the kernels' shapes and a call's arguments: `rows` the map of rows (`external_params_rows`), the
-    evidence of the rows' batch then"""
+    evidence of the rows' batch then; `fuses`: the circuit hands the product layer groups to the sums above them where
+    its decisions say (`lowrank_top_k_fusion_test.py`) -- else never (the decisions' trials, which run a layer's passes
+    again, left out of what these tests count)"""
     tab = H._tables(N, seed, V2)
     pc = H._hmm_pc(T, N, K, R, RE, tab, V2)[0] if tied else _untied_pc(tab, seed)
+    if not fuses:
+        H._never_fuses(pc)
     ext, ids, lp, x, miss = H._batch(b, T, N, C, K, R, RE, seed + 1, masked = masked, V = V2)
     kw = dict(external_params = H._pc_ext(ext, T, N), categorical_evidence_logp = lp.float(), soft_evidence_cat_ids = ids)
     if rows is not None:
@@ -84,8 +88,8 @@ def _spy_stacks(tks):
     """the node vectors the stacks' plans took, a list of `id(ns)` in call order"""
     taken, real = [], tks.SumStack.forward
 
-    def forward(self, ns):
-        got = real(self, ns)
+    def forward(self, ns, children = None):
+        got = real(self, ns, children)
         if got:
             taken.append(id(ns))
         return got

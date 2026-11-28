@@ -121,6 +121,14 @@ def _hmm_pc(T, N, K, r, re, tab, V = V, tie_leaves = True):
     return pc, trans, leaves
 
 
+def _never_fuses(pc):
+    """`pc` never handing a product layer group to the sums above it (`TensorCircuit._stream_fusion_groups`,
+    `_stream_fusion_bk_groups`): for the tests counting a pass's calls -- the decisions' trials run a layer's passes
+    again (`lowrank_top_k_fusion_test.py`: the fused passes)"""
+    pc._stream_fusion_groups = pc._stream_fusion_bk_groups = lambda *a, **k: frozenset()
+    return pc
+
+
 def _tables(N, seed, V = V):
     g = torch.Generator().manual_seed(seed)
     mk = lambda *s: torch.log_softmax(torch.randn(*s, generator = g, dtype = torch.float64), dim = -1).to(DEV)
@@ -407,7 +415,7 @@ def test_the_fused_forward_is_the_reference():
         pytest.skip("the CUDA module did not build")
     T, N, C, K, r, re, b, V2 = 3, 128, 70, 64, 20, 8, 4, 80
     tab = _tables(N, 11, V2)
-    pc, _, _ = _hmm_pc(T, N, K, r, re, tab, V2)
+    pc = _never_fuses(_hmm_pc(T, N, K, r, re, tab, V2)[0])
     ext, ids, lp, x, miss = _batch(b, T, N, C, K, r, re, 12, V = V2)
     pext, lp = _pc_ext(ext, T, N), lp.float()
     import pyjuice.parameterizations.lowrank.top_k_stack as tks
@@ -420,8 +428,8 @@ def test_the_fused_forward_is_the_reference():
             calls.append(1)
         return got
 
-    def spy_stacked(self, ns):
-        got = real_stacked(self, ns)
+    def spy_stacked(self, ns, children = None):
+        got = real_stacked(self, ns, children)
         if got:
             calls.append(1)
         return got
@@ -664,7 +672,7 @@ def test_the_backward_kernels_are_the_reference():
         pytest.skip("the CUDA module did not build, or no Triton")
     T, N, C, K, r, re, b, V2 = 3, 128, 70, 64, 20, 8, 4, 80
     tab = _tables(N, 31, V2)
-    pc, _, _ = _hmm_pc(T, N, K, r, re, tab, V2)
+    pc = _never_fuses(_hmm_pc(T, N, K, r, re, tab, V2)[0])
     ext, ids, lp, x, miss = _batch(b, T, N, C, K, r, re, 32, V = V2)
     pext, lp = _pc_ext(ext, T, N), lp.float()
     rows = torch.arange(b, device = DEV).repeat(2)
@@ -727,7 +735,7 @@ def test_the_backward_kernels_give_a_sample_its_own_gradients_through_the_map(ke
     if tkf.top_k_module() is None or tkb.triton is None:
         pytest.skip("the CUDA module did not build, or no Triton")
     T, N, C, K, r, re, V2 = 3, 128, 70, 64, 20, 8, 80
-    pc, _, _ = _hmm_pc(T, N, K, r, re, _tables(N, 33, V2), V2)
+    pc = _never_fuses(_hmm_pc(T, N, K, r, re, _tables(N, 33, V2), V2)[0])
     ext = _batch(4, T, N, C, K, r, re, 34, V = V2)[0]
     rows = torch.tensor([3, 0, 0, 2, 1, 3, 0], device = DEV)                  # (rows read by one, two and three samples)
     _, ids, lp, x, miss = _batch(rows.numel(), T, N, C, K, r, re, 35, V = V2)

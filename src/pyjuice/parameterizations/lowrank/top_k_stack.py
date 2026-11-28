@@ -25,6 +25,12 @@ A layer whose node vectors a stack took gets a settled forward and backward (`se
 `ParameterizedSumLayer`'s contract): its next calls go straight to the pass's stack -- a position's host time is what
 the small batches' passes take.
 
+Where the circuit hands a sum layer the product layer group below (`stream_children`: that group's passes not run --
+LowRank's `stream_fusion_plan`, `stream_fusion_bk`), a reader's launches read each child's value as its product's (the
+node values of its two children, summed: `tk_ev_kernel`) and store each child's flow as its product's children's node
+flows (`tk_scatter_ef_kernel`) -- the children's rows composed once a node vector and table
+(`top_k_fused.child_pairs`), so the reads are as deep as the element values'.
+
 The readers of a leaf layer are the compile step's (`_resolve_sibling_leaves`: `_sum_readers`).
 """
 
@@ -85,12 +91,17 @@ class SumStack:
         reader's second call of a pass where no backward follows)."""
         return self.plan is not None and id(ns) in self.index
 
-    def forward(self, ns) -> bool:
-        """The node vector `ns`'s forward by its launches (True), or False: the stack does not take it (`takes`)."""
+    def forward(self, ns, pairs = None) -> bool:
+        """The node vector `ns`'s forward by its launches (True), or False: the stack does not take it (`takes`).
+        `pairs`: the product layer group below handed over (`top_k_fused.child_pairs`: its forward not run), each
+        child's value read as its product's."""
         i = self.index.get(id(ns))
         if i is None or self.plan is None:
             return False
-        self.plan.forward(i)
+        if pairs is None:
+            self.plan.forward(i)
+        else:
+            self.plan.forward(i, pairs)
         self.left.discard(i)
         if not self.left and not self.keep:
             self.plan.release()
@@ -103,16 +114,21 @@ class SumStack:
         i = self.index.get(id(ns))
         return i is not None and self.keep and i not in self.taken and self.plan is not None
 
-    def backward(self, ns, node_flows, element_flows, store: bool) -> bool:
+    def backward(self, ns, node_flows, element_flows, store: bool, pairs = None) -> bool:
         """The node vector `ns`'s backward by its launches where it asks for no gradients nor EM statistics (a query's:
         the caller's to check) -- the flows into its stash (its leaf's counts beside the slots' posterior), its element
-        flows into `element_flows` (`store`: their one writer of the pass, not filled before) --, True; False where the
-        stack does not take it (not a reader, nothing kept, or its stash taken already: a second backward)."""
+        flows into `element_flows` (`store`: their one writer of the pass, not filled before) or, with `pairs` (the
+        product layer group below handed over: `forward`'s; `store` then), stored as its products' children's node
+        flows --, True; False where the stack does not take it (not a reader, nothing kept, or its stash taken already:
+        a second backward)."""
         i = self.index.get(id(ns))
         if i is None or not self.keep or i in self.taken or self.plan is None:
             return False
         self.taken.add(i)
-        self.plan.backward(i, node_flows, element_flows, store)
+        if pairs is None:
+            self.plan.backward(i, node_flows, element_flows, store)
+        else:
+            self.plan.backward(i, node_flows, element_flows, store, pairs)
         return True
 
     def kept(self, ns):
@@ -228,11 +244,11 @@ def settle(layer, taken) -> None:
 def settled_forward(layer, node_mars, element_mars, params, propagation_alg, op_params, kwargs) -> bool:
     """`ParameterizedSumLayer._settled_forward` of a `LowRank(top_k)` layer whose node vectors a stack took (`settle`):
     at a call whose every node vector a stack of its pass takes, what the full path does -- its checks (the algorithm,
-    whole partitions, no product layer handed over, the tokens given; the tensors the staging's) and settings
-    (`_lr_state`, `_lr_topk_batch`: `top_k.sum_forward`'s) -- by their launches, True; else False, nothing done."""
+    whole partitions, the tokens given; the tensors the staging's) and settings (`_lr_state`, `_lr_topk_batch`:
+    `top_k.sum_forward`'s), the product layer group below handed over to the launches (`stream_children`: LowRank's
+    forward takes it, `fuses_stream_children`) -- by their launches, True; else False, nothing done."""
     rec = layer.__dict__.get(_SETTLED)
-    if rec is None or propagation_alg != "LL" or kwargs.get("partition_runs") is not None or \
-            kwargs.get("stream_children") is not None or "_inputs" not in kwargs:
+    if rec is None or propagation_alg != "LL" or kwargs.get("partition_runs") is not None or "_inputs" not in kwargs:
         return False
     B = node_mars.size(1)
     stacks = []
@@ -243,8 +259,9 @@ def settled_forward(layer, node_mars, element_mars, params, propagation_alg, op_
         stacks.append(stack)
     layer.__dict__["_lr_state"] = dict()
     layer.__dict__["_lr_topk_batch"] = B
+    sc = kwargs.get("stream_children")
     for (ns, _), stack in zip(rec, stacks):
-        stack.forward(ns)
+        stack.forward(ns, top_k_fused.child_pairs(layer, ns, sc))
     return True
 
 
@@ -253,17 +270,19 @@ def settled_backward(layer, node_flows, element_flows, node_mars, element_mars, 
     """`ParameterizedSumLayer._settled_backward` of a `LowRank(top_k)` layer whose node vectors a stack took (`settle`):
     at a call asking for no gradients nor EM statistics (a query's) whose every node vector its pass's stack takes
     (`SumStack.backward`), what the full path does -- `ParameterizedSumLayer.backward`'s checks (the algorithm, whole
-    partitions, no product layer handed over, flows in log space neither modified nor negated; the tensors the
-    staging's) and settings (its gated call, no product layer, the copy of the parameters), the deferral's side stream
-    joined, a launch-plan recording around it failed (none of this is recorded); `LowRank.pre_backward_layer`'s (the
-    forward of this batch); `top_k.sum_backward`'s element flows -- by their launches, True; else False, nothing done."""
+    partitions, flows in log space neither modified nor negated; the tensors the staging's) and settings (its gated
+    call, the product layer group handed over -- LowRank's backward always takes it, `stream_fusion_bk` --, the copy of
+    the parameters), the deferral's side stream joined, a launch-plan recording around it failed (none of this is
+    recorded); `LowRank.pre_backward_layer`'s (the forward of this batch); `top_k.sum_backward`'s element flows (with
+    the product layer group, its children's node flows: where each child's flow is one node vector's, `_kids_own`) --
+    by their launches, True; else False, nothing done."""
     from pyjuice.layer import deferred_par
     from pyjuice.layer.parameterized_sum_layer import StagedExternalParams, _NO_BW_HOOKS
     from pyjuice.utils.launch_plans import LaunchPlans
     rec = layer.__dict__.get(_SETTLED)
     if rec is None or param_flows is not None or propagation_alg != "LL" or kwargs.get("partition_runs") is not None \
-            or kwargs.get("stream_children") is not None or not kwargs.get("logspace_flows", False) \
-            or kwargs.get("allow_modify_flows", False) or kwargs.get("negate_pflows", False):
+            or not kwargs.get("logspace_flows", False) or kwargs.get("allow_modify_flows", False) \
+            or kwargs.get("negate_pflows", False):
         return False
     top_k = _mods()[0]
     B = node_mars.size(1)
@@ -278,21 +297,25 @@ def settled_backward(layer, node_flows, element_flows, node_mars, element_mars, 
         if (gviews is not None and gviews.get(ns) is not None) or stack is None or not stack.keeps(ns):
             return False
         stacks.append(stack)
-    # (the full path's settings for the call, its join and its recording's failure: `ParameterizedSumLayer.backward`)
+    # (`top_k.sum_backward`'s: the children's element flows each node vector's alone, else filled first and added into
+    # -- with the product layer group below, the full path's: the element flows added up, then the children's)
     desc = layer.parameterization
+    alone = desc._kids_own(layer, node_flows.device)
+    sc = kwargs.get("stream_children")
+    if sc is not None and not alone:
+        return False
+    # (the full path's settings for the call, its join and its recording's failure: `ParameterizedSumLayer.backward`)
     op = op_params if op_params is not None and desc.reads_param_operands and \
         layer.__dict__.get("_reads_param_operands", False) else None
-    layer.__dict__.update(_bk_gated_call = True, _bk_stream_children = None, _bk_op_params = op)
+    layer.__dict__.update(_bk_gated_call = True, _bk_stream_children = sc, _bk_op_params = op)
     deferred_par.join_side(node_mars.device)
     if LaunchPlans.nested():
         LaunchPlans.fail()
-    # (`top_k.sum_backward`'s: the children's element flows each node vector's alone, else filled first and added into)
-    alone = desc._kids_own(layer, node_flows.device)
     if not alone:
         for ns, _ in rec:
             element_flows.index_fill_(0, desc._geometry(layer, _node_info(layer, ns), node_flows.device)["kids"],
                                       -float("inf"))
     for (ns, _), stack in zip(rec, stacks):
-        stack.backward(ns, node_flows, element_flows, alone)
+        stack.backward(ns, node_flows, element_flows, alone, top_k_fused.child_pairs(layer, ns, sc))
     layer.__dict__.update(_NO_BW_HOOKS)
     return True

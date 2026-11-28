@@ -159,7 +159,7 @@ def _dest_ok(g: torch.Tensor) -> bool:
 
 def terms(A, Bm, G, tab, element_mars, geo, slot, rows, logw_rows, nf, emap, grads, gviews, fresh: bool,
           want_flows: bool = False, pmask = None, counts = None, kept = None, em_out = None, element_flows = None,
-          store: bool = False):
+          store: bool = False, pairs = None):
     """`top_k._sum_backward_terms`' element flows `[B, N]`, the posterior counts `a` of the masked samples `rows`
     `[b, M, 65]` (None where they went into `counts`, or none is masked) and the EM statistics `(F+, F-)` `[M, N]` (None
     unless `want_flows`; of the samples `pmask` [B] holds, if given) by the kernels; the gradients of
@@ -173,8 +173,11 @@ def terms(A, Bm, G, tab, element_mars, geo, slot, rows, logw_rows, nf, emap, gra
     `kept` None, or the forward's operands and stash (`top_k_fused.kept_of`: its items made with the samples of a row
     sharing them); `element_flows` None, or the circuit's buffer the children's element flows go into by the same call
     -- `element_flows[kids, :] = logaddexp(element_flows[kids, :], log EF[:, cols]^T)` (`top_k_scatter_ef`), with
-    `store` (the rows' one writer of the pass, not filled with -inf before) `= log EF[:, cols]^T`. The passes in one
-    call into the module (`top_k_sum_backward`): a position's host time is what the small batches' passes take."""
+    `store` (the rows' one writer of the pass, not filled with -inf before) `= log EF[:, cols]^T`; `pairs` the product
+    layer group below handed over (`top_k_fused.child_pairs`, its passes not run): `element_mars` the circuit's node
+    values then, each child's value its product's (`top_k_fused.prep`), and `element_flows` its node flows, each child's
+    flow stored as its product's two children's (`store`: each of them has one parent element). The passes in one call into the module (`top_k_sum_backward`): a position's host time is what
+    the small batches' passes take."""
     tkf = _fused()
     mod = tkf.top_k_module()
     B = nf.size(1)
@@ -185,7 +188,7 @@ def terms(A, Bm, G, tab, element_mars, geo, slot, rows, logw_rows, nf, emap, gra
     if ops is None or not pair:
         # (its own items; the forward's stash still serves: a sample's terms, whatever the items that made them)
         ops = tkf.prep(Bm, G, element_mars, geo["eid"], None if geo["full"] else geo["has"], tab["theta"], slot, rows,
-                       logw_rows, emap, pair = pair, lth = tab.get("LTh"))
+                       logw_rows, emap, pair = pair, lth = tab.get("LTh"), pairs = pairs)
         tab.setdefault("LTh", ops[4])
     if stash is None:
         stash = tkf.forward(tkf._rows(A), ops, None, 0, True, counts)
@@ -214,7 +217,7 @@ def terms(A, Bm, G, tab, element_mars, geo, slot, rows, logw_rows, nf, emap, gra
     # where the kernels store --, the cols passes, the element flows' scatter: one call)
     EF, fl, fmx, AH, L2T, LTc = mod.top_k_sum_backward(A, tab["theta"], tab.get("L2T"), tab.get("LTc"), ops, stash, nf,
                                                        rows, own, drow, sgn, dests, dflag, element_flows, geo["cols"],
-                                                       geo["kids"], store)
+                                                       geo["kids"], store, pairs)
     if "L2T" not in tab:
         tab["L2T"], tab["LTc"] = L2T, LTc
     if grads is not None:

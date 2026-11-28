@@ -723,6 +723,13 @@ class SumLayer(Layer, nn.Module):
         plans[fast_key] = (table, tuple(out))
         return plans[fast_key][1]
 
+    def stream_fusion_accepts(self, extra: frozenset, gated: bool) -> bool:
+        """Whether this layer's passes handed the product layer group below (`stream_children`: that group's own passes
+        not run; `TensorCircuit._stream_fusion_groups`, `_stream_fusion_bk_groups`) honor a call's options beyond the
+        plain regime's -- `extra` their names, `gated` whether the call gives external tensors. The plain layer's stream
+        kernels honor none: for any such option the circuit keeps the product layer's passes."""
+        return not extra
+
     def _stream_fusion_bk(self, batch_size: int, dtype: torch.dtype, op: bool, param_flows: bool) -> bool:
         """Whether a backward of this layer at ``batch_size`` (its parameters' ``dtype``, given the bf16 copy or not:
         ``op``; with parameter flows or not) can take `stream_children`: every backward partition's element flows

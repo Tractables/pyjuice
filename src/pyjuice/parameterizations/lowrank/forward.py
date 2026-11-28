@@ -207,9 +207,11 @@ class _ForwardMixin:
     def stream_fusion_plan(self, layer, fast_key: tuple, children) -> Optional[tuple]:
         """What `ParameterizedSumLayer._stream_fusion` asks for the circuit's decision to leave the product group
         below (``children``) to this layer's forward: taken where the forward goes through the mixture's virtual batch,
-        whose `expand` then reads each product's value from its two children."""
+        whose `expand` then reads each product's value from its two children; with `top_k`, for products of two
+        children: its kernels read each child's value as its product's through the table, its torch passes have the
+        values formed first (`top_k.sum_forward`)."""
         if self.top_k is not None:
-            return None
+            return (children,) if children[0].size(1) == 2 else None
         return (children,) if lowrank_virtual.fuses(self, layer, children) else None
 
     def stream_fusion_bk(self, layer, batch_size: int, dtype, op: bool, param_flows: bool) -> bool:
@@ -217,12 +219,20 @@ class _ForwardMixin:
         handed the product group below (`_bk_stream_children`: its forward and backward not run): taken where this
         layer's last forward went through the virtual batch (a backward at another batch size than that forward's is
         refused whatever this says), whose backward then reads each product's value from its two children and writes
-        its flow as theirs; or through the fp16 exp_sum kernels (`_h_stream_bk`), whose backward does."""
-        if self.top_k is not None:                              # (the per-candidate form's passes take no fusion)
-            return False
+        its flow as theirs; or through the fp16 exp_sum kernels (`_h_stream_bk`), whose backward does; with `top_k`,
+        always: its kernels store each child's flow as its product's children's through the table, its torch passes
+        write the element flows then the children's (`top_k.sum_backward`)."""
+        if self.top_k is not None:
+            return True
         if isinstance(layer.__dict__.get("_lr_state"), tuple):
             return lowrank_virtual.fuses_bk()
         return self._h_stream_bk(layer, batch_size)
+
+    def stream_fusion_accepts(self, layer, extra: frozenset) -> bool:
+        """`SumParameterization.stream_fusion_accepts`: with `top_k`, any options -- the product layer below changes
+        only where its passes read the children's values and write their flows, whatever the call's other options (the
+        tokens, the evidence, the masks, the map of rows, a query's records); else the plain regime's alone."""
+        return self.top_k is not None or not extra
 
     def forward(self, layer, ns_info, tensors, node_mars, element_mars, params, **kwargs) -> None:
         raise NotImplementedError("`LowRank` is served by `forward_layer`.")
@@ -235,12 +245,10 @@ class _ForwardMixin:
         self._require_full_supply(layer, ns_tensors)
 
         children = kwargs.pop("stream_children", None)
-        if self.top_k is not None:                              # (the per-candidate form: its reference passes)
-            if children is not None:
-                from pyjuice.layer.fused_children import form_elements
-                form_elements(element_mars, node_mars, children)
+        if self.top_k is not None:                              # (the per-candidate form: the product layer below to it)
             from . import top_k as lowrank_top_k
-            return lowrank_top_k.sum_forward(self, layer, ns_tensors, node_mars, element_mars, params, kwargs)
+            return lowrank_top_k.sum_forward(self, layer, ns_tensors, node_mars, element_mars, params, kwargs,
+                                             children = children)
         if lowrank_virtual.serves(self, layer, node_mars, element_mars):
             return lowrank_virtual.forward(self, layer, ns_tensors, node_mars, element_mars, params, kwargs,
                                            stream_children = children)
