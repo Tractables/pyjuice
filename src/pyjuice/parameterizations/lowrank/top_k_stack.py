@@ -171,66 +171,96 @@ def _node_info(layer, ns):
     return infos.get(id(ns))
 
 
+class _Reader:
+    """A sum node vector reading the leaf layer as the stacks take it: what no call changes -- its layer, its
+    parameterization, its geometry, its leaf (`sib`, its place `t` among the layer's), its parameters' source (`src`:
+    tied node vectors read one), whether its shapes are the kernels' (`fw`: the forward's, `bw`: the backward's) -- made
+    once a device (`_readers`)."""
+
+    __slots__ = ("layer", "ns", "desc", "info", "geo", "sib", "t", "src", "fw", "bw", "has", "nid0")
+
+    def __init__(self, layer, ns, info, dev, index_of: dict, none_b):
+        self.layer, self.ns, self.desc, self.info = layer, ns, ns.parameterization, info
+        self.geo = geo = self.desc._geometry(layer, info, dev)
+        self.sib = layer.__dict__["_sibling_leaves"][id(ns)]
+        self.t = index_of[id(self.sib["ns"])]
+        self.src = (id(ns.get_source_ns() if ns.is_tied() else ns), geo["M"], geo["N"])
+        # (the kernels' shapes with the factors' rank at its bound: the call's rank is checked a pass)
+        self.fw = top_k_fused.serves_shape(self.desc, geo["M"], geo["N"], 0)
+        self.bw = _mods()[1].serves_shape(self.desc, geo["M"], geo["N"], 0)
+        self.has = none_b if geo["full"] else geo["has"]
+        self.nid0 = info.nid_start
+
+
+def _readers(leaf_layer, dev) -> list:
+    """The leaf layer's reading sums (`_sum_readers`, the compile step's) as `_Reader`s -- made once a device, kept on
+    the leaf layer: a stack's making a pass looks at what its call changes alone (MEASURED, the Codpula head at 2
+    samples: the look-ups a reader a pass ~3 us, ~95 us a stack)."""
+    got = leaf_layer.__dict__.get("_lr_top_k_readers")
+    if got is not None and got[0] == dev:
+        return got[1]
+    index_of = top_k_leaf_fused._plan(leaf_layer)["index"]
+    none_b = torch.empty(0, dtype = torch.bool, device = dev)
+    out = []
+    for layer, ns in leaf_layer.__dict__.get("_sum_readers") or ():
+        info = _node_info(layer, ns)
+        if info is not None:
+            out.append(_Reader(layer, ns, info, dev, index_of, none_b))
+    leaf_layer.__dict__["_lr_top_k_readers"] = (dev, out)
+    return out
+
+
 def _make(leaf_layer, B: int, kwargs: dict, node_mars, element_mars, params, cache: dict) -> Optional[SumStack]:
-    """The stack of the leaf layer's readers (`_sum_readers`) whose kernels serve this call -- their tensors staged, the
+    """The stack of the leaf layer's readers (`_readers`) whose kernels serve this call -- their tensors staged, the
     leaf's forward state their slots, weights and work items --, its prep launched (where a backward may follow, the
     backward's too); None where none serves."""
     from pyjuice.layer.parameterized_sum_layer import StagedExternalParams
     top_k, top_k_backward = _mods()
     st = top_k_leaf_fused._state(leaf_layer, B)
-    readers = leaf_layer.__dict__.get("_sum_readers")
     staged = top_k._staged(kwargs)
-    mod = top_k_fused.top_k_module()
-    if (st is None or not readers or mod is None or not isinstance(staged, StagedExternalParams)
-            or element_mars.stride(1) != 1 or "_inputs" not in kwargs):
+    if (st is None or not isinstance(staged, StagedExternalParams) or element_mars.stride(1) != 1
+            or "_inputs" not in kwargs or not top_k_fused.serves_call(node_mars, kwargs)):
         return None
     dev, K = node_mars.device, st["K"]
     emap = top_k.external_rows(kwargs)
-    index_of = top_k_leaf_fused._plan(leaf_layer)["index"]
-    picked = []
-    for layer, ns in readers:
-        desc, tensors, info = ns.parameterization, staged.get(ns), _node_info(layer, ns)
-        if tensors is None or info is None or desc.top_k != K:
-            continue
-        geo = desc._geometry(layer, info, dev)
-        if not top_k_fused.serves(desc, geo["M"], geo["N"], tensors[0].size(2), node_mars, kwargs) or \
-                (emap is None and tensors[0].size(0) != B):
-            continue
-        sib = layer.__dict__["_sibling_leaves"][id(ns)]
-        picked.append((layer, ns, desc, info, geo, tensors, sib, index_of[id(sib["ns"])]))
+    picked = []                                  # (the readers the kernels take at this call, their tensors)
+    for r in _readers(leaf_layer, dev):
+        tensors = staged.get(r.ns)
+        if (r.fw and r.desc.top_k == K and tensors is not None and tensors[0].size(2) <= 128 and
+                (emap is not None or tensors[0].size(0) == B)):
+            picked.append((r, tensors))
     if not picked:
         return None
     # (a backward may follow -- the call had grad on, or a query's -- and its kernels serve every reader: the stash kept)
-    keep = bool(kwargs.get("_grad_enabled", False)) and all(
-        top_k_backward.serves(desc, geo["M"], geo["N"], tensors[0].size(2), B, dev, kwargs, False)
-        for _, _, desc, _, geo, tensors, _, _ in picked)
+    keep = bool(kwargs.get("_grad_enabled", False)) and top_k_backward.serves_call(B, dev, kwargs, False) and \
+        all(r.bw for r, _ in picked)
     # the parameters' sources (tied node vectors read one) -- their dense theta the pass's tables', shared with the
     # backward (`top_k_fused.theta_tables`)
-    tabs, src = [], []
-    for layer, ns, desc, info, geo, tensors, sib, t in picked:
-        tab = top_k_fused.theta_tables(desc, sib, ns, geo, params, B, cache)
-        s = next((k for k, u in enumerate(tabs) if u is tab), None)
+    tabs, of_src, src = [], {}, []
+    for r, _ in picked:
+        s = of_src.get(r.src)
         if s is None:
-            s = len(tabs)
-            tabs.append(tab)
+            s = of_src[r.src] = len(tabs)
+            tabs.append(top_k_fused.theta_tables(r.desc, r.sib, r.ns, r.geo, params, B, cache))
         src.append(s)
-    flat, _ = top_k_leaf_fused.work_items(st, None if emap is None else emap.long().contiguous(), cache)
+    flat = top_k_leaf_fused.work_items(st, None if emap is None else emap.long().contiguous(), cache)
     counts = top_k_leaf_fused._counts(st) if keep else torch.empty(0, device = dev)
     if keep:
-        for *_, t in picked:                     # (their rows of the leaf's counts the sums' kernels' to write)
-            if st["offs"][t + 1] > st["offs"][t]:
-                st["written"].add(t)
-    none_b = torch.empty(0, dtype = torch.bool, device = dev)
-    plan = mod.TopKStackPlan(
-        [p[5][0] for p in picked], [p[5][1] for p in picked], [p[5][2] for p in picked],
-        [p[4]["eid"] for p in picked], [none_b if p[4]["full"] else p[4]["has"] for p in picked],
-        [p[3].nid_start for p in picked], [p[7] for p in picked], src, [u["theta"] for u in tabs],
+        offs = st["offs"]
+        for r, _ in picked:                      # (their rows of the leaf's counts the sums' kernels' to write)
+            if offs[r.t + 1] > offs[r.t]:
+                st["written"].add(r.t)
+    plan = top_k_fused.top_k_module().TopKStackPlan(
+        [t[0] for _, t in picked], [t[1] for _, t in picked], [t[2] for _, t in picked],
+        [r.geo["eid"] for r, _ in picked], [r.has for r, _ in picked], [r.nid0 for r, _ in picked],
+        [r.t for r, _ in picked], src, [u["theta"] for u in tabs],
         *flat, st["logw"], st["offs"], counts, node_mars, element_mars, keep)
     for s, tab in enumerate(tabs):               # (the forward's table, for the readers the stack does not take)
         tab.setdefault("LTh", plan.lth(s))
     if keep:                                     # (the backward's operands too: made while the pass's start is
-        plan.prepare_backward([p[4]["cols"] for p in picked], [p[4]["kids"] for p in picked], st["rows"])  # host-bound
-    return SumStack(plan, {id(p[1]): i for i, p in enumerate(picked)}, keep, node_mars, element_mars, kwargs)
+        plan.prepare_backward([r.geo["cols"] for r, _ in picked], [r.geo["kids"] for r, _ in picked],  # host-bound
+                              st["rows"])
+    return SumStack(plan, {id(r.ns): i for i, (r, _) in enumerate(picked)}, keep, node_mars, element_mars, kwargs)
 
 
 def settle(layer, taken) -> None:

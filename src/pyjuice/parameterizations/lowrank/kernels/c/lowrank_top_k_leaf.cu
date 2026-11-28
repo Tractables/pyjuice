@@ -1570,6 +1570,176 @@ Tile make_tile(const torch::Tensor& tab, const torch::Tensor& nv_tab, const torc
     return g;
 }
 
+// ---------------------------------------------------------------------------------------------------------------------
+// THE LEAF PASS'S PREP (`top_k_leaf_pass`): what the leaf forward's kernel and the reading sums take of the call's
+// evidence and mask, by two launches, and T + 3 integers to the host -- the pass's one synchronization. (MEASURED, the
+// Codpula head at 2 samples: done by ~40 ATen operations, ~250 us of host time a pass.)
+
+// `tk_leaf_prep_kernel`'s operands. Task 0, a candidate each (`nid` of them, [Bx, nvars, C] contiguous): its id as
+// int32 into `ids32` (null: the ids are int32 already), its category marked in `mark` [V] (1), an id outside [0, V)
+// flagging `err`. Task 1, a (position t, sample b) each: whether its variable is missing (`miss`, uint8 [T, B], from the
+// caller's mask: `mm_kind` 0 none, 1 [nvars], 2 [B, nvars], 3 [nvars, B], its strides `ms0`, `ms1`), whether it is a
+// missing token a sum reads (`rmask`: missing and `read[t]`), its token (`tok`, int32 [T, B], from data [nvars, B], its
+// strides `ds0`, `ds1`). Task 2, a row of candidates each (`nrow` = Bx nvars of them): its candidates past the head `H`
+// (nt = C - H of them, at most LP_NT) sorted by id -- stable: tied ids keep their order -- into `sids` [nrow, nt], their
+// evidence beside them into `slp`.
+struct LeafPrep {
+    const void* ids; int ids64; int* ids32; int* mark; int* err; long nid; int V;
+    const bool* mm; int mm_kind; long ms0, ms1; const long* vars; const bool* read;
+    const void* data; int data64; long ds0, ds1; uint8_t* miss; uint8_t* rmask; int* tok; int T, B;
+    const float* lp; int* sids; float* slp; long nrow; int C, H, nt;
+};
+constexpr int LP_NT = 64;            // (the most candidates past the head a row the prep sorts; more: ATen's sort)
+
+__device__ __forceinline__ long lp_id(const LeafPrep& p, long i) {
+    return p.ids64 ? reinterpret_cast<const long*>(p.ids)[i] : (long)reinterpret_cast<const int*>(p.ids)[i];
+}
+
+__global__ void tk_leaf_prep_kernel(const LeafPrep p) {
+    const long tid0 = (long)blockIdx.x * blockDim.x + threadIdx.x, nth = (long)gridDim.x * blockDim.x;
+    if (blockIdx.y == 0) {
+        for (long i = tid0; i < p.nid; i += nth) {
+            const long v = lp_id(p, i);
+            if (p.ids32 != nullptr) p.ids32[i] = (int)v;
+            if (v >= 0 && v < p.V) p.mark[v] = 1;
+            else *p.err = 1;
+        }
+    } else if (blockIdx.y == 1) {
+        const long n = (long)p.T * p.B;
+        for (long i = tid0; i < n; i += nth) {
+            const int t = (int)(i / p.B), b = (int)(i % p.B);
+            const long v = p.vars[t];
+            bool m = false;
+            if (p.mm_kind == 1) m = p.mm[v * p.ms0];
+            else if (p.mm_kind == 2) m = p.mm[(long)b * p.ms0 + v * p.ms1];
+            else if (p.mm_kind == 3) m = p.mm[v * p.ms0 + (long)b * p.ms1];
+            p.miss[i] = m ? 1 : 0;
+            p.rmask[i] = (m && p.read[t]) ? 1 : 0;
+            const long d = v * p.ds0 + (long)b * p.ds1;
+            p.tok[i] = p.data64 ? (int)reinterpret_cast<const long*>(p.data)[d] : reinterpret_cast<const int*>(p.data)[d];
+        }
+    } else {
+        int key[LP_NT];
+        float val[LP_NT];
+        for (long q = tid0; q < p.nrow; q += nth) {
+            const long base = q * p.C + p.H;
+            for (int k = 0; k < p.nt; ++k) {                                 // (insertion: a few candidates a row)
+                const int x = (int)lp_id(p, base + k);
+                const float y = p.lp[base + k];
+                int j = k - 1;
+                while (j >= 0 && key[j] > x) { key[j + 1] = key[j]; val[j + 1] = val[j]; --j; }
+                key[j + 1] = x; val[j + 1] = y;
+            }
+            for (int k = 0; k < p.nt; ++k) { p.sids[q * p.nt + k] = key[k]; p.slp[q * p.nt + k] = val[k]; }
+        }
+    }
+}
+
+// `tk_leaf_rows_kernel`'s operands: the marks `mark` [V] (`tk_leaf_prep_kernel`'s), made into the categories' rows in
+// place (`crow`: a marked category's rank among the marked ones, -1 for the others) with row r's category in `uids`
+// [V] (r < nr); the tiles' counts and flags `part`, `flag` [G] and the finished tiles' count `done` (all zeroed); the
+// candidates past the head `sids` [ntail] and their rows `trow` (null: none made here); the masked tokens a sum reads
+// `rmask` [T, B], their rows `wrow` [T, B] (int32, -1 for the others), their samples `rows` [T B at most] (int64), and
+// `meta` [3 + T] (int32: nr, the prep's error flag, each position's first row and their count R -- the offsets).
+struct LeafRows {
+    int* mark; int* uids; int* part; int* flag; int* done; int V, G;
+    const int* sids; int* trow; long ntail;
+    const uint8_t* rmask; int* wrow; long* rows; int* meta; int T, B;
+};
+constexpr int LR_T = 1024, LR_PT = 4, LR_TILE = LR_T * LR_PT;
+
+// an exclusive scan of a value a thread over LR_T threads, `total` their sum (`sh` 33 ints of shared memory)
+__device__ __forceinline__ int lr_scan(int x, int* sh, int& total) {
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    int inc = x;
+#pragma unroll
+    for (int o = 1; o < 32; o <<= 1) { const int y = __shfl_up_sync(0xffffffffu, inc, o); if (lane >= o) inc += y; }
+    if (lane == 31) sh[warp] = inc;
+    __syncthreads();
+    if (warp == 0) {
+        const int w = sh[lane];
+        int wi = w;
+#pragma unroll
+        for (int o = 1; o < 32; o <<= 1) { const int y = __shfl_up_sync(0xffffffffu, wi, o); if (lane >= o) wi += y; }
+        sh[lane] = wi - w;
+        if (lane == 31) sh[32] = wi;
+    }
+    __syncthreads();
+    total = sh[32];
+    const int r = sh[warp] + inc - x;
+    __syncthreads();                                                         // (sh read by all: free for the next)
+    return r;
+}
+
+// CTAs 0 .. G - 1: a tile of LR_TILE categories each, its marks' prefix past the lower tiles' (a tile publishes its
+// count, then waits on the lower tiles' only -- dispatched first: no deadlock --), the last tile done then the
+// candidates past the head's rows (`trow` = crow[sids]); CTA G: the masked tokens a sum reads, in (position, sample)
+// order -- `rmask.nonzero()`'s.
+__global__ void __launch_bounds__(LR_T) tk_leaf_rows_kernel(const LeafRows p) {
+    __shared__ int sh[33];
+    __shared__ int last;
+    const int g = blockIdx.x;
+    if (g < p.G) {
+        const long v0 = (long)g * LR_TILE + (long)threadIdx.x * LR_PT;
+        int mk[LR_PT], cnt = 0;
+#pragma unroll
+        for (int u = 0; u < LR_PT; ++u) { mk[u] = v0 + u < p.V ? p.mark[v0 + u] : 0; cnt += mk[u]; }
+        int total;
+        const int pre = lr_scan(cnt, sh, total);
+        if (threadIdx.x == 0) {
+            reinterpret_cast<volatile int*>(p.part)[g] = total;
+            __threadfence();
+            atomicExch(p.flag + g, 1);
+        }
+        int lower = 0;
+        for (int k = threadIdx.x; k < g; k += LR_T) {
+            while (atomicAdd(p.flag + k, 0) == 0) {}
+            __threadfence();
+            lower += reinterpret_cast<volatile int*>(p.part)[k];
+        }
+        int base;
+        (void)lr_scan(lower, sh, base);                                     // (the lower tiles' count)
+        int r = base + pre;
+#pragma unroll
+        for (int u = 0; u < LR_PT; ++u) {
+            const long v = v0 + u;
+            if (v >= p.V) break;
+            if (mk[u]) { p.mark[v] = r; p.uids[r] = (int)v; ++r; }
+            else p.mark[v] = -1;
+        }
+        if (g == p.G - 1 && threadIdx.x == 0) p.meta[0] = base + total;
+        if (p.trow == nullptr) return;
+        __threadfence();                                                     // (this thread's rows, before the count)
+        __syncthreads();
+        if (threadIdx.x == 0) last = atomicAdd(p.done, 1) == p.G - 1;
+        __syncthreads();
+        if (!last) return;
+        __threadfence();
+        for (long i = threadIdx.x; i < p.ntail; i += LR_T) p.trow[i] = __ldcg(p.mark + p.sids[i]);
+        return;
+    }
+    const long n = (long)p.T * p.B;
+    int run = 0;
+    for (long b0 = 0; b0 < n; b0 += LR_TILE) {
+        const long i0 = b0 + (long)threadIdx.x * LR_PT;
+        int mk[LR_PT], cnt = 0;
+#pragma unroll
+        for (int u = 0; u < LR_PT; ++u) { mk[u] = i0 + u < n ? p.rmask[i0 + u] : 0; cnt += mk[u]; }
+        int total;
+        int r = run + lr_scan(cnt, sh, total);
+#pragma unroll
+        for (int u = 0; u < LR_PT; ++u) {
+            const long i = i0 + u;
+            if (i >= n) break;
+            if (i % p.B == 0) p.meta[2 + i / p.B] = r;                       // (position i / B's first row)
+            if (mk[u]) { p.wrow[i] = r; p.rows[r] = i % p.B; ++r; }
+            else p.wrow[i] = -1;
+        }
+        run += total;
+    }
+    if (threadIdx.x == 0) p.meta[2 + p.T] = run;
+}
+
 }  // namespace
 
 // log2 theta^T [rows, M] of a node vector's M nodes, node i's V probabilities at params[spids[i]:] -- the categories
@@ -1873,23 +2043,23 @@ torch::Tensor top_k_leaf_backward(torch::Tensor tab, torch::Tensor nv_tab, torch
     return dtau;
 }
 
-// A leaf layer's whole forward in one call from Python (`top_k_leaf_fused.leaf_forward`'s: its ~40 torch ops ~450 us of
-// host time a pass at 2 samples, the pass's start host-bound) -- the same operations in the same order, so the same
-// state and values: the categories some candidate takes and their rows of the tables (`crow`, their count); the missing
-// tokens a sum reads (`miss & read`) copied to the host, waited on after the work that needs none of it -- the pass's
-// one synchronization --; the tables (from the categories' list where few are taken: `top_k_leaf_table_rows`); each
-// position's masked rows (their order the slot weights'), the candidates past the head sorted by token id, the kernel
-// (`top_k_leaf_forward`). `tau` [T, Bx, S, M] the tilts made outside (None: made in the
-// kernel from `tiltA`, `tiltB` [Bx, M, re], [Bx, re, S] a position -- an empty result where it cannot: the caller makes
-// tau then). Returns (tab, tauK, emap32, ids32, lp32, lz, lb, place, wrow, logw, rows, ord, rank, rowstart, crow, offs
-// [T + 1] int64 on the host).
+// A leaf layer's whole forward in one call from Python (`top_k_leaf_fused.leaf_forward`'s): the categories some
+// candidate takes and their rows of the tables (`crow`, their count), the missing tokens a sum reads (missing and
+// `read`) and their rows of the slot weights in (position, sample) order, the tokens, the candidates past the head
+// sorted by token id -- two launches (`tk_leaf_prep_kernel`, `tk_leaf_rows_kernel`) -- then the categories' count and
+// each position's masked rows' offsets to the host, waited on after the work that needs none of it (the pass's one
+// synchronization); the tables (from the categories' list where few are taken: `top_k_leaf_table_rows`); the kernel
+// (`top_k_leaf_forward`). `missing` the caller's mask ([B, nvars] where `batch_first`, else [nvars, B]; [nvars]; None:
+// none missing); `tau` [T, Bx, S, M] the tilts made outside (None: made in the kernel from `tiltA`, `tiltB` [Bx, M, re],
+// [Bx, re, S] a position -- an empty result where it cannot: the caller makes tau then). Returns (tab, tauK, emap32,
+// ids32, lp32, lz, lb, place, wrow, logw, rows, ord, rank, rowstart, crow, offs [T + 1] int64 on the host).
 std::vector<torch::Tensor> top_k_leaf_pass(torch::Tensor params, std::vector<torch::Tensor> tables, torch::Tensor nv_tab,
                                            torch::Tensor nv_lvid, torch::Tensor nv_row0, torch::Tensor vars,
-                                           torch::Tensor read, torch::Tensor miss, torch::Tensor ids_in,
-                                           torch::Tensor lp_in, torch::Tensor data, std::optional<torch::Tensor> emap,
-                                           std::optional<torch::Tensor> tau, std::vector<torch::Tensor> tiltA,
-                                           std::vector<torch::Tensor> tiltB, torch::Tensor node_mars, int64_t V,
-                                           int64_t K, int64_t S, int64_t M) {
+                                           torch::Tensor read, std::optional<torch::Tensor> missing, bool batch_first,
+                                           torch::Tensor ids_in, torch::Tensor lp_in, torch::Tensor data,
+                                           std::optional<torch::Tensor> emap, std::optional<torch::Tensor> tau,
+                                           std::vector<torch::Tensor> tiltA, std::vector<torch::Tensor> tiltB,
+                                           torch::Tensor node_mars, int64_t V, int64_t K, int64_t S, int64_t M) {
     const at::cuda::CUDAGuard guard(node_mars.device());
     const auto dev = node_mars.device();
     const int64_t T = nv_tab.size(0), B = node_mars.size(1);
@@ -1918,31 +2088,88 @@ std::vector<torch::Tensor> top_k_leaf_pass(torch::Tensor params, std::vector<tor
         for (int k = 0; k < 3; ++k) fstrides.push_back(A0.stride(k));
         for (int k = 0; k < 3; ++k) fstrides.push_back(B0.stride(k));
     }
-    // the categories some tile takes among its candidates: their rows of the tables
-    auto ids = ids_in.to(torch::kInt32).contiguous();
-    auto used = torch::zeros({V}, torch::dtype(torch::kBool).device(dev)).index_fill_(0, ids.reshape({-1}).to(torch::kInt64), true);
-    auto crow = torch::cumsum(used, 0, torch::kInt32) - 1;
-    auto nrows_d = crow.narrow(0, V - 1, 1) + 1;
-    crow = torch::where(used, crow, torch::full_like(crow, -1));
-    // the missing tokens a sum reads, to the host: the copy started here, waited on after the work that needs none of it
-    auto rmask_d = miss & read.unsqueeze(1);
-    auto rmask = torch::empty(rmask_d.sizes(), torch::dtype(torch::kBool).pinned_memory(true));
-    rmask.copy_(rmask_d, /*non_blocking=*/true);
-    auto nrows = torch::empty({1}, torch::dtype(torch::kInt32).pinned_memory(true));
-    nrows.copy_(nrows_d, /*non_blocking=*/true);
+    // the operands as the prep reads them: the ids, the tokens int32 or int64, the evidence fp32, contiguous; the mask
+    // bool on the device (where the caller's are not: converted first)
+    if (!((ids_in.scalar_type() == at::kLong || ids_in.scalar_type() == at::kInt) && ids_in.is_contiguous()))
+        ids_in = ids_in.to(torch::kInt64).contiguous();
+    if (!(data.scalar_type() == at::kLong || data.scalar_type() == at::kInt)) data = data.to(torch::kInt64);
+    auto lp = lp_in.to(torch::kFloat32).contiguous();
+    torch::Tensor mm;
+    int mm_kind = 0;
+    if (missing.has_value()) {
+        mm = missing->device() == dev && missing->scalar_type() == at::kBool ? *missing : missing->to(dev, torch::kBool);
+        TORCH_CHECK(mm.dim() == 1 || mm.dim() == 2, "top_k leaf pass: a missing mask [B, nvars], [nvars, B] or [nvars]");
+        mm_kind = mm.dim() == 1 ? 1 : (batch_first ? 2 : 3);
+    }
+    TORCH_CHECK(ids_in.dim() == 3 && lp.sizes() == ids_in.sizes() && data.dim() == 2 && data.size(1) == B &&
+                V < (1L << 31) && T * B < (1L << 31), "top_k leaf pass: ids, lp [Bx, nvars, C], data [nvars, B]");
+    check(vars, at::kLong, "vars"); check(read, at::kBool, "read");
+    const int64_t Bx = ids_in.size(0), nvars = ids_in.size(1), C = ids_in.size(2);
+    const bool ids32_given = ids_in.scalar_type() == at::kInt;
+    auto ids = ids32_given ? ids_in : torch::empty(ids_in.sizes(), i32);
+    // the candidates past the head H (no slot of their own: their order is free) by token id: the kernel walks them so,
+    // the CTAs side by side reading the table rows they share at about the same time (MEASURED, 48 blocks, the rows'
+    // evidence distinct: 1.79 -> 1.56 ms)
+    const int64_t H = std::min(C, std::max(K, S - 1)), nt = C - H;
+    const bool sort_here = nt <= LP_NT;
+    // one zeroed buffer: the categories' marks (then rows) [V], the rows kernel's tiles' counts, flags [G] and finished
+    // count, the host's integers [3 + T]
+    const int G = (int)((V + LR_TILE - 1) / LR_TILE);
+    auto buf = torch::zeros({V + 2 * G + 1 + 3 + T}, i32);
+    int* const bp = buf.data_ptr<int>();
+    int* const meta = bp + V + 2 * G + 1;
+    auto crow = buf.narrow(0, 0, V);
+    auto uids = torch::empty({V}, i32);
+    auto masks = torch::empty({2, T, B}, torch::dtype(torch::kUInt8).device(dev));     // (missing; a sum reads it)
+    auto tok = torch::empty({T, B}, i32), wrow = torch::empty({T, B}, i32);
+    auto rows_all = torch::empty({T * B}, i64);
+    auto tails = torch::empty({2, Bx, nvars, nt}, i32);                                    // (sids; their rows)
+    auto slp = torch::empty({Bx, nvars, nt}, torch::dtype(torch::kFloat32).device(dev));
+    uint8_t* const mp = masks.data_ptr<uint8_t>();
+    const auto stream = at::cuda::getCurrentCUDAStream();
+    LeafPrep pa;
+    pa.ids = ids_in.data_ptr(); pa.ids64 = ids32_given ? 0 : 1; pa.ids32 = ids32_given ? nullptr : ids.data_ptr<int>();
+    pa.mark = bp; pa.err = meta + 1; pa.nid = Bx * nvars * C; pa.V = (int)V;
+    pa.mm = mm_kind > 0 ? mm.data_ptr<bool>() : nullptr; pa.mm_kind = mm_kind;
+    pa.ms0 = mm_kind > 0 ? mm.stride(0) : 0; pa.ms1 = mm_kind > 1 ? mm.stride(1) : 0;
+    pa.vars = vars.data_ptr<long>(); pa.read = read.data_ptr<bool>();
+    pa.data = data.data_ptr(); pa.data64 = data.scalar_type() == at::kLong ? 1 : 0;
+    pa.ds0 = data.stride(0); pa.ds1 = data.stride(1);
+    pa.miss = mp; pa.rmask = mp + T * B; pa.tok = tok.data_ptr<int>(); pa.T = (int)T; pa.B = (int)B;
+    pa.lp = lp.data_ptr<float>(); pa.sids = tails.data_ptr<int>(); pa.slp = slp.data_ptr<float>();
+    pa.nrow = sort_here ? Bx * nvars : 0; pa.C = (int)C; pa.H = (int)H; pa.nt = (int)nt;
+    const long most = std::max({pa.nid, T * B, pa.nrow});
+    tk_leaf_prep_kernel<<<dim3((unsigned)std::max(1L, std::min(296L, (most + 255) / 256)), 3), 256, 0, stream>>>(pa);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    LeafRows ra;
+    ra.mark = bp; ra.uids = uids.data_ptr<int>(); ra.part = bp + V; ra.flag = bp + V + G; ra.done = bp + V + 2 * G;
+    ra.V = (int)V; ra.G = G;
+    ra.sids = tails.data_ptr<int>(); ra.trow = sort_here && nt > 0 ? tails.data_ptr<int>() + Bx * nvars * nt : nullptr;
+    ra.ntail = Bx * nvars * nt;
+    ra.rmask = mp + T * B; ra.wrow = wrow.data_ptr<int>(); ra.rows = rows_all.data_ptr<long>(); ra.meta = meta;
+    ra.T = (int)T; ra.B = (int)B;
+    tk_leaf_rows_kernel<<<G + 1, LR_T, 0, stream>>>(ra);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    auto sids = tails.select(0, 0), trow = tails.select(0, 1);
+    if (!sort_here) {                                        // (many candidates past the head: ATen's sort)
+        auto sorted = torch::sort(ids.narrow(2, H, nt), 2);
+        sids = std::get<0>(sorted).contiguous();
+        slp = torch::gather(lp.narrow(2, H, nt), 2, std::get<1>(sorted)).contiguous();
+        trow = crow.index({sids.to(torch::kInt64)}).contiguous();
+    }
+    // the host's integers: the copy started here, waited on after the work that needs none of it
+    auto meta_h = torch::empty({3 + T}, torch::dtype(torch::kInt32).pinned_memory(true));
+    C10_CUDA_CHECK(cudaMemcpyAsync(meta_h.data_ptr<int>(), meta, (3 + T) * sizeof(int), cudaMemcpyDeviceToHost, stream));
     at::cuda::CUDAEvent copied;
-    copied.record(at::cuda::getCurrentCUDAStream());
-    const int64_t Bx = tau.has_value() ? tau->size(1) : tiltA[0].size(0);
+    copied.record(stream);
     auto tauK = tau.has_value() ? torch::empty({0}, torch::dtype(torch::kFloat32).device(dev))
                                 : torch::empty({T, Bx, M}, torch::dtype(torch::kFloat32).device(dev));
-    auto lp = lp_in.to(torch::kFloat32).contiguous();
     auto emap32 = emap.has_value() ? emap->to(torch::kInt32).contiguous() : torch::empty({0}, i32);
-    auto tok = data.index_select(0, vars).to(torch::kInt32).contiguous();
     torch::Tensor ord, rank, rowstart;
     // (the evidence a row of samples each: the samples by the row they read, stable -- the forward's CTAs in that order
     // --, each place's rank among its row's -- the backward's CTA a row's samples: no host synchronization --, where each
     // of the Bx rows' samples start among the places)
-    if (ids.size(0) != B) {
+    if (Bx != B) {
         auto sorted = torch::sort(emap32.to(torch::kInt64), /*stable=*/true, 0, false);
         auto srt = std::get<0>(sorted);
         ord = std::get<1>(sorted).to(torch::kInt32).contiguous();
@@ -1952,42 +2179,25 @@ std::vector<torch::Tensor> top_k_leaf_pass(torch::Tensor params, std::vector<tor
         ord = rank = rowstart = torch::empty({0}, i32);
     }
     copied.synchronize();
-    const int64_t nr = nrows.data_ptr<int>()[0];
+    const int* const hm = meta_h.data_ptr<int>();
+    TORCH_CHECK(hm[1] == 0, "top_k leaf pass: a candidate's category outside [0, ", V, ") (`soft_evidence_cat_ids`)");
+    const int64_t nr = hm[0];
+    auto offs = torch::empty({T + 1}, torch::kInt64);
+    int64_t* const op = offs.data_ptr<int64_t>();
+    for (int64_t t = 0; t <= T; ++t) op[t] = hm[2 + t];
+    const int64_t R = op[T];
     std::vector<torch::Tensor> tabs;
     if (4 * nr < V) {
-        auto uids = torch::empty({nr + 1}, i32);
-        uids.scatter_(0, torch::where(used, crow, torch::full_like(crow, (int)nr)).to(torch::kInt64), torch::arange(V, i32));
         for (const auto& spids : tables) tabs.push_back(top_k_leaf_table_rows(params, spids, uids, nr));
     } else {
         for (const auto& spids : tables) tabs.push_back(top_k_leaf_table(params, spids, V, crow, nr));
     }
     auto tab = tabs.size() == 1 ? tabs[0].unsqueeze(0) : torch::stack(tabs);
-    // each position's masked rows, in their order (the slot weights' rows): on the host, then to the device
-    auto counts = rmask.sum(1, false, torch::kInt64);
-    auto offs = torch::zeros({T + 1}, torch::kInt64);
-    offs.narrow(0, 1, T).copy_(counts.cumsum(0));
-    const int64_t R = offs.data_ptr<int64_t>()[T];
-    auto nz = rmask.nonzero();
-    auto wrow_h = torch::full({T, B}, -1, torch::kInt32);
-    wrow_h.index_put_({nz.select(1, 0), nz.select(1, 1)}, torch::arange(R, torch::kInt32));
-    auto to_device = [&](const torch::Tensor& h0) {
-        auto h = torch::empty(h0.sizes(), h0.options().pinned_memory(true));
-        h.copy_(h0);
-        return h.to(dev, /*non_blocking=*/true);
-    };
-    auto wrow = to_device(wrow_h), rows = to_device(nz.select(1, 1).contiguous());
-    // each tile's candidates past the head H (no slot of their own: their order is free) by token id: the kernel walks
-    // them so, the CTAs side by side reading the table rows they share at about the same time (MEASURED, 48 blocks, the
-    // rows' evidence distinct: 1.79 -> 1.56 ms)
-    const int64_t H = std::min(ids.size(2), std::max(K, S - 1));
-    auto sorted = torch::sort(ids.narrow(2, H, ids.size(2) - H), 2);
-    auto sids = std::get<0>(sorted).contiguous();
-    auto slp = torch::gather(lp.narrow(2, H, lp.size(2) - H), 2, std::get<1>(sorted)).contiguous();
+    auto rows = rows_all.narrow(0, 0, R);
     auto none = torch::empty({0}, torch::dtype(torch::kFloat32).device(dev));
     auto got = top_k_leaf_forward(tab, nv_tab, tau.has_value() ? *tau : none, emap32, ids, lp, nv_lvid, nv_row0, tok,
-                                  miss.to(torch::kUInt8).contiguous(), wrow, R, S, K, node_mars, ord, rank,
-                                  crow.index({sids.to(torch::kInt64)}), slp, crow, fptrs, fstrides, re,
-                                  tau.has_value() ? none : tauK);
+                                  masks.select(0, 0), wrow, R, S, K, node_mars, ord, rank, trow, slp, crow, fptrs,
+                                  fstrides, re, tau.has_value() ? none : tauK);
     return {tab, tauK, emap32, ids, lp, got[0], got[1], got[2], wrow, got[3], rows, ord, rank, rowstart, crow, offs};
 }
 

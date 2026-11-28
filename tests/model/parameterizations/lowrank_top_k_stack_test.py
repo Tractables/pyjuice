@@ -167,8 +167,12 @@ def test_the_stash_a_backward_takes_from_the_stack(masked):
         if masked < 1.0:
             assert H._rel(u, v) < 1e-5, (k, H._rel(u, v))
         else:                                                       # (every token summed out: each likelihood 1
-            assert float((u - v).abs().max()) < 1e-7, k             #  whatever the tensors, its gradients 0 up to
-                                                                    #  the roundoff, ~1e-10: compared absolutely)
+            assert float((u - v).abs().max()) < 1e-6, k             #  whatever the tensors, its gradients 0 up to
+                                                                    #  the roundoff, compared absolutely -- a
+                                                                    #  residue of O(1) terms, ~1e-7 apart where the
+                                                                    #  plain root layer's element backward was timed
+                                                                    #  between the two runs (an empty autotune store:
+                                                                    #  its arms' bits differ): MEASURED 2e-7)
 
 
 def test_the_settled_forward_declines_what_its_stack_does_not_serve():

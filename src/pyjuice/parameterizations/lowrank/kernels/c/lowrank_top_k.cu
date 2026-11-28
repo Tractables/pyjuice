@@ -2730,7 +2730,7 @@ std::vector<torch::Tensor> top_k_prep(torch::Tensor Bm, torch::Tensor G, torch::
 // a leaf): leaf t's masked samples rows [offs[t], offs[t + 1]) of `rows` (int64; `roff` the offsets on the device,
 // int32 [T + 1]), its observed slots `slots` [T, B] (int64), `emap` [B] the row each sample reads (empty: its own) --
 // (mitems [sum max(Rm_t, 1), 4], oitems [sum (2 max((B - Rm_t + 1) / 2, 1) + 1), 4], noitems [T], slot32 [T, B]), a
-// leaf's after the earlier leaves' -- then each leaf's four slices, `top_k_prep`'s `items` (4 + 4 T tensors).
+// leaf's after the earlier leaves' (each leaf's slices of them: `top_k_items_slices`).
 std::vector<torch::Tensor> top_k_items(torch::Tensor emap, torch::Tensor rows, torch::Tensor roff,
                                        std::vector<int64_t> offs, torch::Tensor slots) {
     const c10::cuda::CUDAGuard guard(slots.device());
@@ -2757,8 +2757,19 @@ std::vector<torch::Tensor> top_k_items(torch::Tensor emap, torch::Tensor rows, t
         roff.data_ptr<int>(), slots.data_ptr<long>(), reinterpret_cast<int4*>(mitems.data_ptr<int>()),
         reinterpret_cast<int4*>(oitems.data_ptr<int>()), noitems.data_ptr<int>(), slot32.data_ptr<int>(), B, 0, 1);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
-    // (then each leaf's slices, 4 a leaf: made here, ~0.2 us a view, not in Python a position)
-    std::vector<torch::Tensor> got = {mitems, oitems, noitems, slot32};
+    return {mitems, oitems, noitems, slot32};
+}
+
+// Each leaf's slices of `top_k_items`' four buffers -- `top_k_prep`'s `items`, 4 a leaf (4 T tensors) -- for the
+// passes that take a leaf's items one node vector at a time (a stack takes the buffers whole): made here, ~0.2 us a
+// view, not in Python a position. `offs` the leaves' masked rows' offsets [T + 1], as `top_k_items`' were.
+std::vector<torch::Tensor> top_k_items_slices(torch::Tensor mitems, torch::Tensor oitems, torch::Tensor noitems,
+                                              torch::Tensor slot32, std::vector<int64_t> offs) {
+    const int T = (int)offs.size() - 1, B = (int)slot32.size(1);
+    TORCH_CHECK(T >= 1 && slot32.dim() == 2 && slot32.size(0) == T && noitems.numel() == T,
+                "top_k: items' slices of T leaves: slot32 [T, B], noitems [T], offsets T + 1");
+    std::vector<torch::Tensor> got;
+    got.reserve(4 * T);
     long mo = 0, oo = 0;
     for (int t = 0; t < T; ++t) {
         const long rm = offs[t + 1] - offs[t];
@@ -2767,6 +2778,7 @@ std::vector<torch::Tensor> top_k_items(torch::Tensor emap, torch::Tensor rows, t
         got.push_back(noitems.narrow(0, t, 1)); got.push_back(slot32.select(0, t));
         mo = m1; oo = o1;
     }
+    TORCH_CHECK(mo == mitems.size(0) && oo == oitems.size(0), "top_k: items' slices: the buffers' sizes");
     return got;
 }
 
@@ -3761,6 +3773,7 @@ void top_k_scatter_em(torch::Tensor FP, torch::Tensor FM, torch::Tensor params, 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("top_k_prep", &top_k_prep, "a LowRank(top_k) sum node vector's operands and work items for `top_k_forward`");
     m.def("top_k_items", &top_k_items, "the paired work items of the node vectors reading a leaf layer, one launch");
+    m.def("top_k_items_slices", &top_k_items_slices, "each leaf's slices of `top_k_items`' buffers");
     m.def("top_k_sum_forward", &top_k_sum_forward, "top_k_prep then top_k_forward, one call");
     py::class_<TopKStackPlan>(m, "TopKStackPlan", "a pass's stacked forward of the top_k sums reading a leaf layer")
         .def(py::init<std::vector<torch::Tensor>, std::vector<torch::Tensor>, std::vector<torch::Tensor>,

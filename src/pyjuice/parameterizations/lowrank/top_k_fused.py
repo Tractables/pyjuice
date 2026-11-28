@@ -33,10 +33,23 @@ def top_k_module():
 
 
 def serves(desc, M: int, N: int, rank: int, node_mars: torch.Tensor, kwargs: dict) -> bool:
-    """Whether the fused forward takes a node vector of `M` nodes over `N` children, its factors of rank `rank`."""
+    """Whether the fused forward takes a node vector of `M` nodes over `N` children, its factors of rank `rank`: the
+    call's part (`serves_call`) and the node vector's (`serves_shape`)."""
+    return serves_call(node_mars, kwargs) and serves_shape(desc, M, N, rank)
+
+
+def serves_call(node_mars: torch.Tensor, kwargs: dict) -> bool:
+    """`serves`' part no node vector changes: the switch, the module built, the circuit's values (fp32 on the GPU, at
+    most `MAX_SAMPLES` samples), the precision."""
     return (TOP_K_FUSED and node_mars.is_cuda and node_mars.dtype == torch.float32 and node_mars.is_contiguous()
-            and desc.top_k == 64 and M % 128 == 0 and N % 64 == 0 and rank <= 128 and node_mars.size(1) <= MAX_SAMPLES
-            and kwargs.get("precision", "auto") != "fp32" and top_k_module() is not None)
+            and node_mars.size(1) <= MAX_SAMPLES and kwargs.get("precision", "auto") != "fp32"
+            and top_k_module() is not None)
+
+
+def serves_shape(desc, M: int, N: int, rank: int) -> bool:
+    """`serves`' part of the node vector alone: the kernels' shapes (top_k 64, nodes a multiple of 128, children of 64,
+    rank at most 128)."""
+    return desc.top_k == 64 and M % 128 == 0 and N % 64 == 0 and rank <= 128
 
 
 def tf32_round(x: torch.Tensor) -> torch.Tensor:

@@ -87,11 +87,23 @@ if triton is not None:
 
 def serves(desc, M: int, N: int, r: int, B: int, device, kwargs: dict, want_flows: bool) -> bool:
     """Whether the kernels take a node vector's backward (`B` samples): its element flows, gradients and (`want_flows`:
-    by Triton) EM statistics."""
+    by Triton) EM statistics -- the call's part (`serves_call`) and the node vector's (`serves_shape`)."""
+    return serves_call(B, device, kwargs, want_flows) and serves_shape(desc, M, N, r)
+
+
+def serves_call(B: int, device, kwargs: dict, want_flows: bool) -> bool:
+    """`serves`' part no node vector changes: the switch, the module built (and Triton for the EM statistics), the
+    device, at most `MAX_SAMPLES` samples, the precision."""
     from . import top_k_fused
-    return (top_k_fused.TOP_K_FUSED and device.type == "cuda" and desc.top_k == 64 and M % 128 == 0 and N % 128 == 0
-            and r <= 128 and B <= MAX_SAMPLES and kwargs.get("precision", "auto") != "fp32"
-            and (triton is not None or not want_flows) and top_k_fused.top_k_module() is not None)
+    return (top_k_fused.TOP_K_FUSED and device.type == "cuda" and B <= MAX_SAMPLES
+            and kwargs.get("precision", "auto") != "fp32" and (triton is not None or not want_flows)
+            and top_k_fused.top_k_module() is not None)
+
+
+def serves_shape(desc, M: int, N: int, r: int) -> bool:
+    """`serves`' part of the node vector alone: the kernels' shapes (top_k 64, nodes and children multiples of 128, rank
+    at most 128)."""
+    return desc.top_k == 64 and M % 128 == 0 and N % 128 == 0 and r <= 128
 
 
 def scatter_statistics(geo, Fp, Fm, params, param_flows, pf0: int, denom, d0) -> bool:

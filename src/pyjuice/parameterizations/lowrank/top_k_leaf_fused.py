@@ -104,16 +104,6 @@ def serves(desc, layer, node_mars: torch.Tensor, kwargs: dict, staged) -> bool:
     return True
 
 
-def _missing_all(missing_mask, vars_: torch.Tensor, B: int, dev, batch_first: bool) -> torch.Tensor:
-    """`[T, B]` bool: each node vector's variable missing in each sample."""
-    if missing_mask is None:
-        return torch.zeros(vars_.numel(), B, dtype = torch.bool, device = dev)
-    m = missing_mask.to(device = dev, dtype = torch.bool)
-    if m.dim() == 1:
-        return m[vars_][:, None].expand(-1, B)
-    return (m[:, vars_].t() if batch_first else m[vars_, :])
-
-
 def leaf_forward(desc, layer, data: torch.Tensor, node_mars: torch.Tensor, kwargs: dict) -> bool:
     """The layer's node values by the kernels (`top_k.leaf_forward`'s), its state kept for the passes that follow;
     False where they do not serve (the torch passes then, and no state)."""
@@ -130,16 +120,17 @@ def leaf_forward(desc, layer, data: torch.Tensor, node_mars: torch.Tensor, kwarg
     # one call into the module (`top_k_leaf_pass`): the categories some tile takes among its candidates and their rows
     # of the tables (the others none -- never read: the tables hold the pass's categories alone, MEASURED 48 blocks:
     # 494 -> 193 MiB on the dump's rows, -> 383 with DISTINCT=1 rows); the missing tokens a sum reads, their rows of the
-    # slot weights -- the pass's one synchronization, waited on after the work that needs none of it --; the tables;
-    # the kernel. Its ~40 operations one by one from Python were ~450 us of host time a pass at 2 samples (the pass's
-    # start host-bound); the tilts made in the forward's kernel where it can (no tau [T, Bx, S, M] made, read, nor kept
-    # for the backward: its rest slot alone, tauK), else by their own kernel first
+    # slot weights -- two launches, then the pass's one synchronization, waited on after the work that needs none of
+    # it --; the tables; the kernel. (MEASURED, the Codpula head at 2 samples: ~40 operations one by one from Python
+    # ~450 us of host time a pass, from C++ ~350; two launches ~100.) The tilts made in the forward's kernel where it
+    # can (no tau [T, Bx, S, M] made, read, nor kept for the backward: its rest slot alone, tauK), else by their own
+    # kernel first. The mask as the caller gave it (the prep reads it: [B, nvars] batch first, [nvars, B], [nvars])
     V = nodes[0]["ns"].dist.num_cats
-    miss = _missing_all(kwargs.get("missing_mask"), plan["vars"], B, dev, kwargs.get("_batch_first", True))
     tilts = [staged[n["ns"]] for n in nodes]
     tA, tB = [t[0] for t in tilts], [t[1] for t in tilts]
     args = (layer.params, plan["tables"], plan["nv_tab"], plan["nv_lvid"], plan["nv_row0"], plan["vars"], plan["read"],
-            miss, kwargs["soft_evidence_cat_ids"], kwargs["categorical_evidence_logp"], data, external_rows(kwargs))
+            kwargs.get("missing_mask"), kwargs.get("_batch_first", True), kwargs["soft_evidence_cat_ids"],
+            kwargs["categorical_evidence_logp"], data, external_rows(kwargs))
     tau = None
     got = mod.top_k_leaf_pass(*args, None, tA, tB, node_mars, V, K, tB[0].size(2), M)
     if not got:
@@ -149,7 +140,7 @@ def leaf_forward(desc, layer, data: torch.Tensor, node_mars: torch.Tensor, kwarg
     tab, tauK, emap32, ids, lp, lz, lb, place, wrow, logw, rows, ord_, rank, rowstart, crow, offs = got
     layer.__dict__[_STATE] = dict(B = B, K = K, S = tB[0].size(2), tab = tab, tau = tau, tauK = None if tau is not None
                                   else tauK, emap = emap32, ids = ids, lp = lp, lz = lz, lb = lb, place = place,
-                                  miss = miss, wrow = wrow, logw = logw, offs = offs.tolist(), rows = rows,
+                                  wrow = wrow, logw = logw, offs = offs.tolist(), rows = rows,
                                   counts = None, ord = ord_, rank = rank, rowstart = rowstart, crow = crow)
     return True
 
@@ -215,28 +206,36 @@ def sum_parts(sib: dict, K: int, batch_size: int, emap, cache: dict):
     got = parts.get(id(sib["ns"]))
     if got is None:
         t = _plan(sib["layer"])["index"][id(sib["ns"])]
-        items = work_items(st, emap, cache)[1]
+        items = leaf_work_items(st, emap, cache)
         got = parts[id(sib["ns"])] = (*_slot_views(st, t, K), items[t], st["offs"][t + 1] - st["offs"][t], t)
     return got
 
 
 def work_items(st: dict, emap, cache: dict):
-    """`(flat, per_leaf)`: the paired work items of every sum reading the leaf layer, from its forward state (its slots,
-    its masked rows) -- `top_k_items`' four buffers `[mitems, oitems, noitems, slot32]`, a leaf's after the earlier
-    leaves', and each leaf's four slices of them --, one launch a pass, kept in the pass's `cache` (`pass_cache`).
-    `emap` [B] long the row each sample reads (None: its own)."""
-    got = cache.get("items")
+    """The paired work items of every sum reading the leaf layer, from its forward state (its slots, its masked rows):
+    `top_k_items`' four buffers `[mitems, oitems, noitems, slot32]`, a leaf's after the earlier leaves' -- one launch a
+    pass, kept in the pass's `cache` (`pass_cache`). `emap` [B] long the row each sample reads (None: its own)."""
+    got = cache.get("items_flat")
     if got is None:
         offs, dev = st["offs"], st["rows"].device
         if st.get("slot") is None:
             st["slot"] = st["place"].long().clamp_(0, st["K"])
         roff = _to_device(torch.tensor(offs, dtype = torch.int32), dev)
-        made = top_k_fused.top_k_module().top_k_items(
+        got = cache["items_flat"] = top_k_fused.top_k_module().top_k_items(
             torch.empty(0, dtype = torch.long, device = dev) if emap is None else emap.long().contiguous(),
             st["rows"].long().contiguous(), roff, offs, st["slot"].contiguous())
-        cache["items_flat"] = made[:4]
-        got = cache["items"] = [made[4 + 4 * t:8 + 4 * t] for t in range(len(offs) - 1)]
-    return cache["items_flat"], got
+    return got
+
+
+def leaf_work_items(st: dict, emap, cache: dict):
+    """`work_items` a leaf: each leaf's four slices of the buffers (`top_k_items_slices`), for the passes that take a
+    node vector at a time -- made where one asks for them (a stack takes the buffers whole), kept in the pass's
+    `cache`."""
+    got = cache.get("items")
+    if got is None:
+        made = top_k_fused.top_k_module().top_k_items_slices(*work_items(st, emap, cache), st["offs"])
+        got = cache["items"] = [made[4 * t:4 * t + 4] for t in range(len(st["offs"]) - 1)]
+    return got
 
 
 #: The counts' rows as the sums' kernels write them (`SA` of `kernels/c/lowrank_top_k.cu`: K + 2 padded)
