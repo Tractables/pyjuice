@@ -139,6 +139,8 @@ print("CHILD_OK")
 """
 
 
+# (MEASURED ~16 s a run with warm caches: `slow`)
+@pytest.mark.slow
 @pytest.mark.skipif(_two_gpus() is None, reason = "requires >= 2 GPUs")
 def test_a_circuit_moved_after_running_computes_as_one_compiled_there():
     """Every kind of layer -- plain sum layers at small and large batch, an HCLT, a PD, BlockScale and LowRank sums,

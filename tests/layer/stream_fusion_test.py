@@ -849,6 +849,8 @@ print("CHILD_OK")
 """
 
 
+# (MEASURED ~68 s a run with warm caches: `slow`)
+@pytest.mark.slow
 @pytest.mark.skipif(_two_gpus() is None, reason = "requires >= 2 GPUs")
 def test_a_fused_circuit_moved_after_running_computes_as_one_compiled_there():
     """A circuit whose forwards fused on one GPU, `pc.to` another: its passes there decide anew (the layers' fused plans,

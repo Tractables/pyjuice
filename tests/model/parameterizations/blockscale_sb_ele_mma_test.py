@@ -227,8 +227,15 @@ def _capture(monkeypatch):
     return mod, real, captured
 
 
+# The arms of the batched form heaviest against float64 (MEASURED with warm caches: 29, 19, 18 s), `slow` -- the form is
+# the other arms' of 16 samples and more too
+_SLOW_ARMS = ("hmm1024x4_g128_fp32", "hmm1024x16_g32_bf16", "hmm4096x4_g8_bf16")
+
+
 @needs_kernels
-@pytest.mark.parametrize("name,builder,dt,B,neg_gates,neg_children", CASES, ids = [c[0] for c in CASES])
+@pytest.mark.parametrize("name,builder,dt,B,neg_gates,neg_children",
+                         [pytest.param(*c, id = c[0], marks = pytest.mark.slow) if c[0] in _SLOW_ARMS else
+                          pytest.param(*c, id = c[0]) for c in CASES])
 def test_every_arm_matches_float64(name, builder, dt, B, neg_gates, neg_children, monkeypatch):
     ext_c = _ext()
     pc, phi, x = _instance(builder, dt, B, neg_gates, neg_children)

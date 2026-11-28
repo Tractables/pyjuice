@@ -107,7 +107,8 @@ class _Stored:
         return self.real.cached(key)
 
 
-@pytest.mark.parametrize("module", ["not_loaded_yet", "not_loadable_here"])
+# (`not_loaded_yet` builds the module in its child process: MEASURED 410 s a run, warm caches or not -- `slow`)
+@pytest.mark.parametrize("module", [pytest.param("not_loaded_yet", marks = pytest.mark.slow), "not_loadable_here"])
 def test_a_stored_choice_of_the_pipelined_forward_runs(module, monkeypatch):
     """A choice the tuner's on-disk store holds was measured by another process. In a fresh one -- the pipelined
     kernel's module not loaded yet, which only the making of the gate's candidates does -- the forward taking a stored
