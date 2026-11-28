@@ -2566,7 +2566,7 @@ std::vector<torch::Tensor> top_k_prep(torch::Tensor Bm, torch::Tensor G, torch::
 // a leaf): leaf t's masked samples rows [offs[t], offs[t + 1]) of `rows` (int64; `roff` the offsets on the device,
 // int32 [T + 1]), its observed slots `slots` [T, B] (int64), `emap` [B] the row each sample reads (empty: its own) --
 // (mitems [sum max(Rm_t, 1), 4], oitems [sum (2 max((B - Rm_t + 1) / 2, 1) + 1), 4], noitems [T], slot32 [T, B]), a
-// leaf's after the earlier leaves' (`top_k_prep`'s `items` the slices).
+// leaf's after the earlier leaves' -- then each leaf's four slices, `top_k_prep`'s `items` (4 + 4 T tensors).
 std::vector<torch::Tensor> top_k_items(torch::Tensor emap, torch::Tensor rows, torch::Tensor roff,
                                        std::vector<int64_t> offs, torch::Tensor slots) {
     const c10::cuda::CUDAGuard guard(slots.device());
@@ -2593,7 +2593,17 @@ std::vector<torch::Tensor> top_k_items(torch::Tensor emap, torch::Tensor rows, t
         roff.data_ptr<int>(), slots.data_ptr<long>(), reinterpret_cast<int4*>(mitems.data_ptr<int>()),
         reinterpret_cast<int4*>(oitems.data_ptr<int>()), noitems.data_ptr<int>(), slot32.data_ptr<int>(), B, 0, 1);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
-    return {mitems, oitems, noitems, slot32};
+    // (then each leaf's slices, 4 a leaf: made here, ~0.2 us a view, not in Python a position)
+    std::vector<torch::Tensor> got = {mitems, oitems, noitems, slot32};
+    long mo = 0, oo = 0;
+    for (int t = 0; t < T; ++t) {
+        const long rm = offs[t + 1] - offs[t];
+        const long m1 = mo + std::max(rm, 1L), o1 = oo + 2 * std::max((B - rm + 1) / 2, 1L) + 1;
+        got.push_back(mitems.narrow(0, mo, m1 - mo)); got.push_back(oitems.narrow(0, oo, o1 - oo));
+        got.push_back(noitems.narrow(0, t, 1)); got.push_back(slot32.select(0, t));
+        mo = m1; oo = o1;
+    }
+    return got;
 }
 
 // The sums' persistent launches (`tk_sk_kernel`): the masked items' and the observed items' beside it on a side stream
@@ -2708,6 +2718,65 @@ std::vector<torch::Tensor> top_k_forward(torch::Tensor A, torch::Tensor BP, torc
     args.beta16 = reinterpret_cast<__half*>(beta16.data_ptr<at::Half>()); args.invd = invd.data_ptr<float>();
     sk_launch<true>(args, BP.size(1), P, Rm, B, A.get_device());
     return {alpha16, beta16, invd, acnt, ao, bo, hrow};
+}
+
+namespace {
+
+// `t` [batch, rows, n] as `check_rows` takes it: itself where it lies so (float32, its rows contiguous and adjacent,
+// 16-byte aligned, a batch stride of a multiple of 4: a view of a group's tensor), else a contiguous float32 copy
+torch::Tensor as_rows(torch::Tensor t) {
+    if (t.scalar_type() != at::kFloat) t = t.to(at::kFloat);
+    const bool ok = t.dim() == 3 && t.stride(2) == 1 && t.stride(1) == t.size(2) && t.stride(0) % 4 == 0 &&
+                    reinterpret_cast<uintptr_t>(t.data_ptr()) % 16 == 0;
+    return ok ? t : t.contiguous();
+}
+
+// the masked samples' weights `w` [b, M, S] as the kernels read them: where `w` is a view of rows SP wide (the leaf's:
+// `top_k_leaf_fused.slot_rows`), those rows -- no copy --, else contiguous (the prep pads them)
+torch::Tensor weights_operand(torch::Tensor w) {
+    if (w.scalar_type() == at::kFloat && w.dim() == 3 && w.size(2) <= SP && w.stride(2) == 1 && w.stride(1) == SP &&
+        w.stride(0) == w.size(1) * SP)
+        return w.as_strided({w.size(0), w.size(1), SP}, {w.size(1) * SP, SP, 1});
+    return w.to(at::kFloat).contiguous();
+}
+
+// `t` contiguous of `dt`: itself where it is (no dispatch)
+torch::Tensor as_dense(const torch::Tensor& t, at::ScalarType dt) {
+    return t.scalar_type() == dt && t.is_contiguous() ? t : t.to(dt).contiguous();
+}
+
+torch::Tensor or_empty(const std::optional<torch::Tensor>& t, const torch::Tensor& like, at::ScalarType dt) {
+    return t.has_value() ? *t : torch::empty({0}, like.options().dtype(dt));
+}
+
+}  // namespace
+
+// A node vector's whole forward in one call from Python (`top_k_fused.sum_forward`'s: `top_k_prep`, then
+// `top_k_forward`) -- MEASURED, the Codpula head's circuit at 2 samples: its forward host-bound, ~40 us of host time a
+// position, ~12 of them the two calls' and the tensors' checks and conversions in Python. The caller's A, B, G as they
+// lie (a contiguous float32 copy where the kernels cannot read them in place: `as_rows`), the masked samples' weights
+// likewise (`weights_operand`); None for `has` (every child reached), `emap` (a sample's own row), `logw` (none
+// masked), `lth` (made here), `out` (no values), `acnt_out` (the counts in the stash's own tensor); `items` empty: made
+// here. The prep's operands (BP, E16, ev, cmax, LTh, mitems, oitems, noitems, slot32, logw, flags), then the stash
+// where `stash` (alpha16, beta16, invd, acnt, ao, bo, hrow).
+std::vector<torch::Tensor> top_k_sum_forward(torch::Tensor A, torch::Tensor Bm, torch::Tensor G, torch::Tensor em,
+                                             torch::Tensor eid, std::optional<torch::Tensor> has, torch::Tensor theta,
+                                             torch::Tensor slot64, std::optional<torch::Tensor> emap,
+                                             torch::Tensor rows, std::optional<torch::Tensor> logw,
+                                             std::optional<torch::Tensor> lth, std::vector<torch::Tensor> items,
+                                             std::optional<torch::Tensor> out, int64_t nid0, bool stash,
+                                             std::optional<torch::Tensor> acnt_out) {
+    const auto L = at::kLong;
+    auto emap_t = emap.has_value() ? as_dense(*emap, L) : torch::empty({0}, eid.options());
+    auto ops = top_k_prep(as_rows(Bm), as_rows(G), em, as_dense(eid, L), or_empty(has, eid, at::kBool),
+                          as_dense(theta, at::kFloat), as_dense(slot64, L), emap_t, as_dense(rows, L),
+                          logw.has_value() ? weights_operand(*logw) : torch::empty({0}, theta.options()), true,
+                          or_empty(lth, eid, at::kInt), items);
+    auto st = top_k_forward(as_rows(A), ops[0], ops[1], ops[2], ops[3], ops[4], ops[5], ops[6], ops[7], ops[8], ops[9],
+                            ops[10], or_empty(out, theta, at::kFloat), nid0, stash,
+                            or_empty(acnt_out, theta, at::kFloat));
+    ops.insert(ops.end(), st.begin(), st.end());
+    return ops;
 }
 
 // The node flows into a stash, in place (`tk_flows_kernel`): `nf` [M, B] the node vector's log-space rows of the node
@@ -3018,6 +3087,7 @@ std::vector<torch::Tensor> top_k_em_index(torch::Tensor slot32, torch::Tensor ro
 
 // element_flows[kids[k], b] = logaddexp(element_flows[kids[k], b], log EF[b, cols[k]]): the children's element flows
 // (log space, a sample a column) from the backward's EF [B, N] (linear), a 32 x 32 tile a CTA through shared memory
+template <bool STORE>
 __global__ void tk_scatter_ef_kernel(const float* EF, const long* cols,
                                      const long* kids, float* ef, long ld, int B, int N, int nk) {
     pdl_entry();
@@ -3034,13 +3104,18 @@ __global__ void tk_scatter_ef_kernel(const float* EF, const long* cols,
         const int k = k0 + u, b = b0 + tx;
         if (k >= nk || b >= B) continue;
         float* p = ef + kids[k] * ld + b;
-        const float x = *p, y = __logf(tile[tx][u]);
+        const float y = __logf(tile[tx][u]);
+        if (STORE) { *p = y; continue; }                            // (the rows' one writer: no fill before)
+        const float x = *p;
         const float m = fmaxf(x, y);
         *p = m == -INFINITY ? m : m + log1pf(__expf(-fabsf(x - y)));
     }
 }
 
-void top_k_scatter_ef(torch::Tensor EF, torch::Tensor cols, torch::Tensor kids, torch::Tensor element_flows) {
+// `element_flows[kids, :] = logaddexp(element_flows[kids, :], log EF[:, cols]^T)`, or with `store` (the rows' one
+// writer of the pass: their -inf fill not made) `= log EF[:, cols]^T`
+void top_k_scatter_ef(torch::Tensor EF, torch::Tensor cols, torch::Tensor kids, torch::Tensor element_flows,
+                      bool store) {
     const c10::cuda::CUDAGuard guard(EF.device());
     check(EF, at::kFloat, "EF"); check(cols, at::kLong, "cols"); check(kids, at::kLong, "kids");
     TORCH_CHECK(element_flows.is_cuda() && element_flows.scalar_type() == at::kFloat && element_flows.dim() == 2 &&
@@ -3049,10 +3124,47 @@ void top_k_scatter_ef(torch::Tensor EF, torch::Tensor cols, torch::Tensor kids, 
     const int B = EF.size(0), N = EF.size(1), nk = cols.numel();
     if (nk == 0 || B == 0) return;
     dim3 grid((unsigned)((nk + 31) / 32), (unsigned)((B + 31) / 32)), block(32, 8);
-    launch_pdl(tk_scatter_ef_kernel, grid, block, 0, at::cuda::getCurrentCUDAStream(),
-        EF.data_ptr<float>(), cols.data_ptr<long>(), kids.data_ptr<long>(), element_flows.data_ptr<float>(),
-        element_flows.stride(0), B, N, nk);
+    launch_pdl(store ? tk_scatter_ef_kernel<true> : tk_scatter_ef_kernel<false>, grid, block, 0,
+        at::cuda::getCurrentCUDAStream(), EF.data_ptr<float>(), cols.data_ptr<long>(), kids.data_ptr<long>(),
+        element_flows.data_ptr<float>(), element_flows.stride(0), B, N, nk);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+// A node vector's backward in one call from Python (`top_k_backward.terms`': `top_k_bw_prep`, `top_k_flows`,
+// `top_k_bw_grads`, then the element flows' scatter where `element_flows` is given -- `top_k_scatter_ef`, `store` as
+// there) -- MEASURED, the Codpula head's conditional at 2 samples: host-bound, ~45 us of host time a position, ~14 of
+// them the calls' and their tensors' handling in Python. A [Bx, M, r] the caller's as it lies (`as_rows`); theta's
+// tables `l2t`, `ltc` an earlier call's (None: made here); `ops` the prep's 11, `stash` the forward's 7 (the node
+// flows not in them yet); `own`: the masked samples' posterior is their leaf's buffer (the stash's acnt: the flow
+// written beside it); with gradients (`dests` dA, dB, dG; empty: none) `drow`, `sgn` and, where the kernels
+// initialize the destinations, `dflag`. Returns (EF [B, N], fl [B, M], fmx [B], AH, L2T, LTc).
+std::vector<torch::Tensor> top_k_sum_backward(torch::Tensor A, torch::Tensor theta, std::optional<torch::Tensor> l2t,
+                                              std::optional<torch::Tensor> ltc, std::vector<torch::Tensor> ops,
+                                              std::vector<torch::Tensor> stash, torch::Tensor nf, torch::Tensor rows,
+                                              bool own, std::optional<torch::Tensor> drow,
+                                              std::optional<torch::Tensor> sgn, std::vector<torch::Tensor> dests,
+                                              std::optional<torch::Tensor> dflag,
+                                              std::optional<torch::Tensor> element_flows, torch::Tensor cols,
+                                              torch::Tensor kids, bool store) {
+    TORCH_CHECK(ops.size() == 11 && stash.size() == 7 && (dests.empty() || dests.size() == 3),
+                "top_k: the prep's 11 operands, the forward's 7 stashed, no gradients or dA, dB, dG");
+    const bool grads = !dests.empty(), stores = grads && dflag.has_value();
+    TORCH_CHECK(!grads || (drow.has_value() && sgn.has_value()), "top_k: the gradients' rows and signs");
+    auto A_ = as_rows(A);
+    auto f32 = A_.options(), i32 = A_.options().dtype(at::kInt);
+    auto e32 = torch::empty({0}, f32), ei = torch::empty({0}, i32);
+    auto bp = top_k_bw_prep(A_, theta, ops[0].size(1), l2t.has_value() ? *l2t : torch::empty({0}, f32.dtype(at::kHalf)),
+                            ltc.has_value() ? *ltc : ei);
+    const long B = ops[2].size(0), N = ops[0].size(2);
+    auto EF = torch::empty({B, N}, f32);
+    auto ff = top_k_flows(nf, stash[4], stash[5], as_dense(rows, at::kLong), own ? stash[3] : e32, EF,
+                          stores ? ops[5] : ei, stores ? *drow : ei, stores ? *dflag : ei, stores ? dests[0] : e32,
+                          stores ? dests[1] : e32, stores ? dests[2] : e32);
+    top_k_bw_grads(A_, bp[0], ops[0], ops[1], ops[2], ops[4], bp[2], ops[5], ops[6], ops[7], ops[8], stash[0], stash[1],
+                   stash[2], stash[4], stash[5], stash[6], ff[0], ff[1], grads ? *drow : e32, grads ? *sgn : e32, EF,
+                   grads ? dests[0] : e32, grads ? dests[1] : e32, grads ? dests[2] : e32, stores ? *dflag : ei);
+    if (element_flows.has_value()) top_k_scatter_ef(EF, cols, kids, *element_flows, store);
+    return {EF, ff[0], ff[1], bp[0], bp[1], bp[2]};
 }
 
 // The EM statistics onto a node vector's slots where its parameters lie block-major (`LowRank._scatter_add`'s grid:
@@ -3107,6 +3219,7 @@ void top_k_scatter_em(torch::Tensor FP, torch::Tensor FM, torch::Tensor params, 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("top_k_prep", &top_k_prep, "a LowRank(top_k) sum node vector's operands and work items for `top_k_forward`");
     m.def("top_k_items", &top_k_items, "the paired work items of the node vectors reading a leaf layer, one launch");
+    m.def("top_k_sum_forward", &top_k_sum_forward, "top_k_prep then top_k_forward, one call");
     m.def("top_k_forward", &top_k_forward,
           "a LowRank(top_k) sum node vector's values and its backward's stash: a persistent stream-K launch for each "
           "kind of work item");
@@ -3117,7 +3230,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("top_k_bw_grads", &top_k_bw_grads,
           "the backward's dA and cols passes: the element flows and the gradients, added into their destinations");
     m.def("top_k_em_index", &top_k_em_index, "the samples the backward's EM statistics take, in the kernels' terms");
-    m.def("top_k_scatter_ef", &top_k_scatter_ef, "the children's element flows from the backward's EF (log space)");
+    m.def("top_k_scatter_ef", &top_k_scatter_ef, "the children's element flows from the backward's EF (log space)",
+          py::arg("EF"), py::arg("cols"), py::arg("kids"), py::arg("element_flows"), py::arg("store") = false);
+    m.def("top_k_sum_backward", &top_k_sum_backward, "a node vector's backward passes, one call");
     m.def("top_k_scatter_em", &top_k_scatter_em,
           "the EM statistics onto a node vector's slots of the parameter flows and the denominators (block-major)");
 }

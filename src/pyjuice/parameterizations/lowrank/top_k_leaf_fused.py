@@ -210,12 +210,22 @@ def _fw_tilt_args(tilts, K: int, S: int, T: int):
     re = A0.size(2)
     if T > 64 or S != K + 1 or K > 64 or re > 64 or re % 4 != 0:
         return None
+    sa, sb, f32 = A0.stride(), B0.stride(), torch.float32
+    if not (sa[2] == 1 and sa[0] % 4 == 0 and sa[1] % 4 == 0):
+        return None
+    # (every position's tensors checked with their strides read once: the same strides as the first's -- so `_vec`'s
+    # conditions but the address --, its address 16-B aligned; MEASURED, 32 positions: ~25 calls a position, 80 us)
+    pa, pb = [], []
     for A, Bt in tilts:
-        if A.dtype != torch.float32 or Bt.dtype != torch.float32 or not _vec(A) or A.stride() != A0.stride() or \
-                Bt.stride() != B0.stride() or Bt.size(1) != re or Bt.size(2) != S:
+        a = A.data_ptr()
+        if A.dtype != f32 or Bt.dtype != f32 or a % 16 != 0 or A.stride() != sa or Bt.stride() != sb or \
+                Bt.shape[1:] != B0.shape[1:]:
             return None
-    return ([A.data_ptr() for A, _ in tilts] + [Bt.data_ptr() for _, Bt in tilts], list(A0.stride()) + list(B0.stride()),
-            re)
+        pa.append(a)
+        pb.append(Bt.data_ptr())
+    if B0.size(1) != re or B0.size(2) != S:
+        return None
+    return pa + pb, list(sa) + list(sb), re
 
 
 def _none_i32(dev):
@@ -269,11 +279,56 @@ def slot_rows(sib: dict, K: int, batch_size: int):
     st = _state(sib["layer"], batch_size)
     if st is None or st["K"] != K:
         return None
-    t = _plan(sib["layer"])["index"][id(sib["ns"])]
-    o0, o1 = st["offs"][t], st["offs"][t + 1]
-    if st.get("slot") is None:                                     # (every position's, once a forward)
-        st["slot"] = st["place"].long().clamp_(0, K)
-    return st["slot"][t], st["rows"][o0:o1], st["logw"][o0:o1, :, :K + 1]       # (its rows 72 wide: slots 0 .. K)
+    return _slot_views(st, _plan(sib["layer"])["index"][id(sib["ns"])], K)
+
+
+def _slot_views(st: dict, t: int, K: int):
+    # (every position's, made once a forward -- its sums' forward and backward both read them --, a call a kind of view:
+    # ~2 us a view made one by one in Python)
+    views = st.get("slot_views")
+    if views is None:
+        if st.get("slot") is None:
+            st["slot"] = st["place"].long().clamp_(0, K)
+        offs = st["offs"]
+        sizes = [offs[u + 1] - offs[u] for u in range(len(offs) - 1)]
+        views = st["slot_views"] = list(zip(st["slot"].unbind(0), st["rows"].split(sizes),
+                                            st["logw"][:, :, :K + 1].split(sizes)))       # (rows 72 wide: 0 .. K)
+    return views[t]
+
+
+def sum_parts(sib: dict, K: int, batch_size: int, emap, cache: dict):
+    """`(slot [B], rows, logw_rows, items, Rm, t)`: what a reading sum's kernels take of its leaf `sib` from its layer's
+    forward state, in one look-up -- `slot_rows`' three, its paired work items (`top_k_items`' for every sum reading the
+    layer: one launch a pass, kept in `cache`, the pass's shared dict, `pass_cache`), its masked samples' count, its
+    place among the layer's leaves (`counts_rows`) --, made once a pass for its forward and its backward: a position's
+    host time is what the small batches' passes take (MEASURED, the Codpula head's circuit at 2 samples: these
+    look-ups one by one ~14 us a position, ~0.5 ms a forward). None where the layer has no forward state for this
+    batch, or for another K. `emap` [B] long the row each sample reads (None: its own)."""
+    st = _state(sib["layer"], batch_size)
+    if st is None or st["K"] != K:
+        return None
+    parts = st.setdefault("parts", {})
+    got = parts.get(id(sib["ns"]))
+    if got is None:
+        t = _plan(sib["layer"])["index"][id(sib["ns"])]
+        items = cache.get("items")
+        if items is None:
+            items = cache["items"] = _work_items(st, emap)
+        got = parts[id(sib["ns"])] = (*_slot_views(st, t, K), items[t], st["offs"][t + 1] - st["offs"][t], t)
+    return got
+
+
+def _work_items(st: dict, emap):
+    """Each leaf's paired work items `[mitems, oitems, noitems, slot32]` (`top_k_items`: one launch, the slices made
+    there), from its layer's forward state (its slots, its masked rows)."""
+    offs, dev = st["offs"], st["rows"].device
+    if st.get("slot") is None:
+        st["slot"] = st["place"].long().clamp_(0, st["K"])
+    roff = _to_device(torch.tensor(offs, dtype = torch.int32), dev)
+    got = top_k_fused.top_k_module().top_k_items(
+        torch.empty(0, dtype = torch.long, device = dev) if emap is None else emap.long().contiguous(),
+        st["rows"].long().contiguous(), roff, offs, st["slot"].contiguous())
+    return [got[4 + 4 * t:8 + 4 * t] for t in range(len(offs) - 1)]
 
 
 #: The counts' rows as the sums' kernels write them (`SA` of `kernels/c/lowrank_top_k.cu`: K + 2 padded)
@@ -287,7 +342,16 @@ def counts_buffer(sib: dict, K: int, batch_size: int):
     st = _state(sib["layer"], batch_size)
     if st is None or st["K"] != K or K + 2 > COUNTS_STRIDE:
         return None
-    t = _plan(sib["layer"])["index"][id(sib["ns"])]
+    return _counts_rows(st, _plan(sib["layer"])["index"][id(sib["ns"])])
+
+
+def counts_rows(sib: dict, K: int, batch_size: int, t: int):
+    """`counts_buffer`'s, of the leaf `t` of its layer (`sum_parts`' place: no look-up)."""
+    st = _state(sib["layer"], batch_size)
+    return None if st is None or st["K"] != K or K + 2 > COUNTS_STRIDE else _counts_rows(st, t)
+
+
+def _counts_rows(st: dict, t: int) -> torch.Tensor:
     buf = _counts(st)
     st["written"].add(t)                                           # (its rows the sum's kernels' to write)
     return buf[st["offs"][t]:st["offs"][t + 1]]

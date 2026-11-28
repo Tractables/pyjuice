@@ -94,13 +94,6 @@ def serves(desc, M: int, N: int, r: int, B: int, device, kwargs: dict, want_flow
             and (triton is not None or not want_flows) and top_k_fused.top_k_module() is not None)
 
 
-def scatter_element_flows(EF, cols, kids, element_flows) -> None:
-    """`element_flows[kids, :] = logaddexp(element_flows[kids, :], log EF[:, cols]^T)` (`top_k.sum_backward`'s) by one
-    kernel: the children's element flows from `terms`' EF [B, N] (fp32 flows, a sample a column)."""
-    from . import top_k_fused as tkf
-    tkf.top_k_module().top_k_scatter_ef(EF, cols, kids, element_flows)
-
-
 def scatter_statistics(geo, Fp, Fm, params, param_flows, pf0: int, denom, d0) -> bool:
     """The EM statistics onto the node vector's slots by one kernel (`LowRank._scatter_add`'s): F+ into the parameter
     flows from `pf0` on (`Fp` None: none), F- / theta into the denominators from `d0` on (`denom` None: none) -- where
@@ -165,10 +158,11 @@ def _dest_ok(g: torch.Tensor) -> bool:
 
 
 def terms(A, Bm, G, tab, element_mars, geo, slot, rows, logw_rows, nf, emap, grads, gviews, fresh: bool,
-          want_flows: bool = False, pmask = None, counts = None, kept = None, em_out = None):
+          want_flows: bool = False, pmask = None, counts = None, kept = None, em_out = None, element_flows = None,
+          store: bool = False):
     """`top_k._sum_backward_terms`' element flows `[B, N]`, the posterior counts `a` of the masked samples `rows`
-    `[b, M, 65]` (None where they went into `counts`) and the EM statistics `(F+, F-)` `[M, N]` (None unless
-    `want_flows`; of the samples `pmask` [B] holds, if given) by the kernels; the gradients of
+    `[b, M, 65]` (None where they went into `counts`, or none is masked) and the EM statistics `(F+, F-)` `[M, N]` (None
+    unless `want_flows`; of the samples `pmask` [B] holds, if given) by the kernels; the gradients of
     `A [Bx, M, r]`, `Bm [Bx, r, N]`, `G [Bx, 65, N]` (a row of tensors each) ADDED into the destinations `grads` (None:
     none) -- where they fold (`StagedExternalParams.fold`) each sample's times its sign into the row it read, else
     into its own. `emap [B]` the row a sample reads (None: its own); `tab` the parameters, `theta [M, N]` (0 where none),
@@ -177,43 +171,36 @@ def terms(A, Bm, G, tab, element_mars, geo, slot, rows, logw_rows, nf, emap, gra
     buffer); the observed samples' slots `slot [B]`, the masked ones' weights `logw_rows`; `counts` None, or the buffer
     `[b, M, 72]` the posterior counts go into, as it holds them (their leaf's: `top_k_leaf_fused.counts_buffer`);
     `kept` None, or the forward's operands and stash (`top_k_fused.kept_of`: its items made with the samples of a row
-    sharing them)."""
-    from . import top_k_fused as tkf
+    sharing them); `element_flows` None, or the circuit's buffer the children's element flows go into by the same call
+    -- `element_flows[kids, :] = logaddexp(element_flows[kids, :], log EF[:, cols]^T)` (`top_k_scatter_ef`), with
+    `store` (the rows' one writer of the pass, not filled with -inf before) `= log EF[:, cols]^T`. The passes in one
+    call into the module (`top_k_sum_backward`): a position's host time is what the small batches' passes take."""
+    tkf = _fused()
     mod = tkf.top_k_module()
-    Bx, M, r = A.shape
-    N = Bm.size(2)
     B = nf.size(1)
-    dev = A.device
     fold = getattr(gviews, "fold", None) if grads is not None else None
     # (the samples reading a row share one item -- its tile -- where their gradients merge: a fold, or none asked)
     pair = emap is None or fold is not None or grads is None
-    A_ = tkf._rows(A)
     ops, stash = kept if kept is not None else (None, None)
     if ops is None or not pair:
         # (its own items; the forward's stash still serves: a sample's terms, whatever the items that made them)
         ops = tkf.prep(Bm, G, element_mars, geo["eid"], None if geo["full"] else geo["has"], tab["theta"], slot, rows,
                        logw_rows, emap, pair = pair, lth = tab.get("LTh"))
         tab.setdefault("LTh", ops[4])
-    BP, E16, ev, cmax, LTh, mitems, oitems, noitems, slot32, logw, flags = ops
-    none_h = tkf._empty(dev, torch.float16)
-    AH, L2T, LTc = mod.top_k_bw_prep(A_, tab["theta"], BP.size(1), tab.get("L2T", none_h),
-                                     tab.get("LTc", tkf._empty(dev, torch.int32)))
-    tab.setdefault("L2T", L2T)
-    tab.setdefault("LTc", LTc)
     if stash is None:
-        stash = tkf.forward(A_, ops, None, 0, True, counts)
-    alpha16, beta16, invd, acnt, ao, bo, hrow = stash
+        stash = tkf.forward(tkf._rows(A), ops, None, 0, True, counts)
     # the node flows: into the stash's ao, bo, and beside the masked samples' posterior where that lies in their leaf's
     # buffer; fl [B, M] the flows themselves (a masked sample's terms' factor in the passes below), fmx [B] their largest
-    Rm = rows.numel()
-    own = counts is not None and Rm > 0 and acnt.data_ptr() == counts.data_ptr()
-    none32 = tkf._empty(dev, torch.float32)
+    Rm = rows.size(0)
+    own = counts is not None and Rm > 0 and stash[3].data_ptr() == counts.data_ptr()
     # (the gradients' destinations: handed over unzeroed with this node vector their first writer, the kernels initialize
     # them -- the masked passes' first writer of a tile stores it, the rows no masked sample writes are zeroed
     # (`top_k_flows`' init, `top_k_bw_grads`' `dflag`) -- instead of a zeroing pass (MEASURED, the best Codpula head:
     # 0.87 ms of fills a step); else zeroed here, or added into)
-    stores, dflag, nonei = False, None, tkf._empty(dev, torch.int32)
+    drow = sgn = dflag = None
+    dests = []
     if grads is not None:
+        dev = A.device
         drow, sgn = _fold_operands(gviews, fold, B, dev)
         dests = [g if _dest_ok(g) else torch.zeros(g.shape, dtype = torch.float32, device = dev) for g in grads]
         first = fresh and gviews.claim(grads)
@@ -223,23 +210,23 @@ def terms(A, Bm, G, tab, element_mars, geo, slot, rows, logw_rows, nf, emap, gra
         if stores:
             Bd, M_, N_ = grads[0].size(0), grads[0].size(1), grads[1].size(2)
             dflag = torch.empty(Bd * (M_ // 128 + N_ // 128), dtype = torch.int32, device = dev)
-    # (the node flows into the stash; EF zeroed by the same launch, the destinations' init too where the kernels store)
-    EF = torch.empty(B, N, dtype = torch.float32, device = dev)
-    fl, fmx = mod.top_k_flows(nf, ao, bo, rows.long().contiguous(), acnt if own else none32, EF,
-                              mitems if stores else nonei, drow if stores else nonei, dflag if stores else nonei,
-                              *(dests if stores else (none32, none32, none32)))
+    # (the backward's prep, the node flows into the stash -- EF zeroed by the same launch, the destinations' init too
+    # where the kernels store --, the cols passes, the element flows' scatter: one call)
+    EF, fl, fmx, AH, L2T, LTc = mod.top_k_sum_backward(A, tab["theta"], tab.get("L2T"), tab.get("LTc"), ops, stash, nf,
+                                                       rows, own, drow, sgn, dests, dflag, element_flows, geo["cols"],
+                                                       geo["kids"], store)
+    if "L2T" not in tab:
+        tab["L2T"], tab["LTc"] = L2T, LTc
     if grads is not None:
-        mod.top_k_bw_grads(A_, AH, BP, E16, ev, LTh, LTc, mitems, oitems, noitems, slot32, alpha16, beta16, invd, ao,
-                           bo, hrow, fl, fmx, drow, sgn, EF, *dests, dflag if stores else nonei)
         for g, d in zip(grads, dests):
             if d is not g:
                 g.add_(d.to(g.dtype))
-    else:
-        none = torch.empty(0, dtype = torch.float32, device = dev)
-        mod.top_k_bw_grads(A_, AH, BP, E16, ev, LTh, LTc, mitems, oitems, noitems, slot32, alpha16, beta16, invd, ao,
-                           bo, hrow, fl, fmx, none, none, EF, none, none, none, nonei)
     flows = None
     if want_flows:
+        dev = A.device
+        M, N = A.size(1), Bm.size(2)
+        BP, E16, ev, cmax, LTh, mitems, oitems, noitems, slot32, logw, flags = ops
+        alpha16, beta16, invd, acnt, ao, bo, hrow = stash
         KP = BP.size(1)
         K0 = min(KP, 64)
         # (the samples the statistics take, in the kernels' terms: the observed ones' slots, -1 the others; the masked
@@ -270,5 +257,17 @@ def terms(A, Bm, G, tab, element_mars, geo, slot, rows, logw_rows, nf, emap, gra
                                      tkf._empty(dev, torch.int32) if emap is None else EMAP, OLIST, FP, FM)
         flows = (FP, FM)
     # (the counts: in the leaf's rows as it holds them -- the slots' posterior, the flow beside it --, else their product)
-    a_rows = None if own else acnt[:Rm, :, :65] * fl.index_select(0, rows)[:, :, None]
+    a_rows = None if own or Rm == 0 else stash[3][:Rm, :, :65] * fl.index_select(0, rows)[:, :, None]
     return EF, a_rows, flows
+
+
+_MODS = {}
+
+
+def _fused():
+    """`top_k_fused` (imported when first asked for)"""
+    m = _MODS.get("fused")
+    if m is None:
+        from . import top_k_fused as m
+        _MODS["fused"] = m
+    return m

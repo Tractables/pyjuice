@@ -411,8 +411,15 @@ def test_the_fused_forward_is_the_reference():
     ext, ids, lp, x, miss = _batch(b, T, N, C, K, r, re, 12, V = V2)
     pext, lp = _pc_ext(ext, T, N), lp.float()
     calls = []
-    real = tkf.forward
-    tkf.forward = lambda *a, **k: (calls.append(1), real(*a, **k))[1]
+    real = tkf.sum_forward
+
+    def spy(*a, **k):                                                   # (the node vectors the kernels took)
+        got = real(*a, **k)
+        if got:
+            calls.append(1)
+        return got
+
+    tkf.sum_forward = spy
     try:
         vals = {}
         for fused in (False, True):
@@ -427,7 +434,7 @@ def test_the_fused_forward_is_the_reference():
             vals[fused] = (full, vis, one)
     finally:
         tkf.TOP_K_FUSED = True
-        tkf.forward = real
+        tkf.sum_forward = real
     assert len(calls) == 3 * (T - 1), len(calls)                                  # (every transition, every call, fused)
     for a, ref in zip(vals[True][:2], vals[False][:2]):
         assert float((a - ref).abs().max()) < 2e-2, float((a - ref).abs().max())
@@ -982,7 +989,7 @@ def test_zero_weights_give_zero_gradients_and_no_em_statistics(kernels, impossib
 def test_tied_sums_make_their_parameters_tables_once_a_pass(monkeypatch):
     """Tied `LowRank(top_k)` sums make their parameters' tables (theta's grid, the forward's and the backward's l2t)
     once a pass and share them (`top_k_fused.theta_tables`), and the sums reading the leaf layer their work items in
-    one launch (`top_k_fused.work_items`): the values bit for bit those of tables and items made at every sum, the
+    one launch (`top_k_leaf_fused.sum_parts`): the values bit for bit those of tables and items made at every sum, the
     gradients and the EM statistics up to the order of the kernels' adds; the next forward makes them again -- an
     update of the parameters in place, through `.data` (no version bump), is seen."""
     import pyjuice.parameterizations.lowrank.top_k_fused as tkf

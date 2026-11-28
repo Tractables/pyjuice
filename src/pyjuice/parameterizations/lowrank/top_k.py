@@ -44,15 +44,26 @@ def _d(t: torch.Tensor) -> torch.Tensor:
     return t.to(PASSES_DTYPE)
 
 
+_KW = {}
+
+
+def _kw(name: str) -> str:
+    """The circuit's option `parameterized_sum_layer.<name>` (imported when first asked for: an import a call costs ~1 us
+    of a position's host time)"""
+    got = _KW.get(name)
+    if got is None:
+        import pyjuice.layer.parameterized_sum_layer as psl
+        got = _KW[name] = getattr(psl, name)
+    return got
+
+
 def _staged(kwargs):
-    from pyjuice.layer.parameterized_sum_layer import EXTERNAL_PARAMS_KWARG
-    return kwargs.get(EXTERNAL_PARAMS_KWARG)
+    return kwargs.get(_kw("EXTERNAL_PARAMS_KWARG"))
 
 
 def external_rows(kwargs):
     """`[B]` long: the row of the external tensors each sample reads (`external_params_rows`), or None (its own)."""
-    from pyjuice.layer.parameterized_sum_layer import EXTERNAL_PARAMS_ROWS_KWARG
-    return kwargs.get(EXTERNAL_PARAMS_ROWS_KWARG)
+    return kwargs.get(_kw("EXTERNAL_PARAMS_ROWS_KWARG"))
 
 
 def per_sample(tensors, rows):
@@ -294,7 +305,7 @@ def _sum_backward_terms(A, Bm, G, ltheta, lc, logw, f, pm = None):
 def sum_forward(desc, layer, ns_tensors, node_mars, element_mars, params, kwargs) -> None:
     """The node values of a `LowRank(top_k)` sum layer, written over its rows of `node_mars`: by the fused kernel
     where it serves (`top_k_fused.py`), else here."""
-    from . import top_k_fused
+    top_k_fused = _kernel_modules()[2]
     sibs = layer.__dict__.get("_sibling_leaves")
     assert sibs is not None, "A `LowRank(top_k)` sum layer compiled without its leaves (`_resolve_top_k_siblings`)."
     assert "_inputs" in kwargs, "A `LowRank(top_k)` sum layer reads the tokens; the circuit's forward passes them."
@@ -315,8 +326,7 @@ def sum_forward(desc, layer, ns_tensors, node_mars, element_mars, params, kwargs
 
 
 def _grads_kw(kwargs):
-    from pyjuice.layer.parameterized_sum_layer import EXTERNAL_PARAMS_GRAD_KWARG
-    gviews = kwargs.get(EXTERNAL_PARAMS_GRAD_KWARG)
+    gviews = kwargs.get(_kw("EXTERNAL_PARAMS_GRAD_KWARG"))
     return gviews, getattr(gviews, "fresh", False)
 
 
@@ -340,6 +350,18 @@ def _store(gviews, fresh, grads, values, rows = None) -> None:
             g.index_add_(0, rows, v.to(g.dtype))
 
 
+_MODS = {}
+
+
+def _kernel_modules():
+    """`(top_k_leaf_fused, top_k_backward, top_k_fused)` (imported when first asked for)"""
+    got = _MODS.get("kernels")
+    if got is None:
+        from . import top_k_leaf_fused, top_k_backward, top_k_fused
+        got = _MODS["kernels"] = (top_k_leaf_fused, top_k_backward, top_k_fused)
+    return got
+
+
 def sum_backward(desc, layer, ns_tensors, ns_grad_tensors, node_flows, element_flows, node_mars, element_mars, params,
                  param_flows, denom_param_flows, kwargs) -> None:
     """
@@ -350,8 +372,7 @@ def sum_backward(desc, layer, ns_tensors, ns_grad_tensors, node_flows, element_f
     the shared slot's spread over its candidates as P_b(c | i)), d / d logit(c) = rho - f P_b(c | i): the evidence's
     gradient (summed over i), the tilt's, and the leaf's EM statistics there, F+ += rho, F- += f P_b(c | i).
     """
-    from . import top_k_leaf_fused, top_k_backward, top_k_fused
-    from pyjuice.layer.parameterized_sum_layer import QUERY_RECORDS_KWARG
+    top_k_leaf_fused, top_k_backward, top_k_fused = _kernel_modules()
     dev = node_flows.device
     sibs = layer.__dict__["_sibling_leaves"]
     gviews, fresh = _grads_kw(kwargs)
@@ -361,33 +382,52 @@ def sum_backward(desc, layer, ns_tensors, ns_grad_tensors, node_flows, element_f
     glp = kwargs.get("categorical_evidence_logp_grad")
 
     geos = [desc._geometry(layer, ns_info, dev) for ns_info, _ in ns_tensors]
-    for geo in geos:
-        element_flows.index_fill_(0, geo["kids"], -float("inf"))
+    # the children's element flows: where no child is reached by two of the layer's node vectors (`_kids_own`), each
+    # one's rows written by its node vector alone (the kernels' scatter stores them: no -inf fill first, a launch a
+    # position); else filled here and each node vector's added in
+    alone = desc._kids_own(layer, dev)
+    if not alone:
+        for geo in geos:
+            element_flows.index_fill_(0, geo["kids"], -float("inf"))
+    ef_kernel = element_flows.dtype == torch.float32 and element_flows.stride(1) == 1
 
     for (ns_info, tensors), grads, geo in zip(ns_tensors, ns_grad_tensors, geos):
         sib = sibs[id(ns_info.ns)]
         nf = node_flows[ns_info.nid_start:ns_info.nid_end, :]                        # [M, B] (log-space flows)
         B = nf.size(1)
         f = None                                                                      # (f [B, M]: where torch needs it)
-        slot, rows, logw_rows, logp, tilt = slot_parts(desc, sib, B, kwargs, dev)
         kernels = top_k_backward.serves(desc, geo["M"], geo["N"], tensors[0].size(2), B, dev, kwargs, want_flows) \
             and element_mars.stride(1) == 1 and nf.dtype == torch.float32 and nf.stride(1) == 1
+        # (the leaf's parts as its forward state holds them, made once a pass -- the forward's --: one look-up)
+        cache = top_k_leaf_fused.pass_cache(sib, B) if kernels else None
+        parts = None if cache is None else \
+            top_k_leaf_fused.sum_parts(sib, desc.top_k, B, external_rows(kwargs), cache)
+        if parts is not None:
+            slot, rows, logw_rows, _, Rm, t = parts
+            logp = tilt = None
+        else:
+            slot, rows, logw_rows, logp, tilt = slot_parts(desc, sib, B, kwargs, dev)
+            Rm, t = rows.numel(), None
         # (the parameters: the kernels' fp32 grid and its tables, once a pass -- the forward's --; torch's in PASSES_DTYPE)
-        tab = top_k_fused.theta_tables(desc, sib, ns_info.ns, geo, params, B) if kernels else None
+        tab = top_k_fused.theta_tables(desc, sib, ns_info.ns, geo, params, B, cache) if kernels else None
         theta = tab["theta"] if kernels else desc._dense_params(geo, params, dtype = PASSES_DTYPE)
         pf0 = ns_info.ns._param_flow_range[0] if want_flows else None
         d0 = desc._denom_offsets(layer)[id(ns_info.ns)][0] if want_denom else None
         em_out = None
         if kernels:
             # (the gradients added into their destinations by the kernels; the counts into the leaf's buffer; the EM
-            # statistics into a pass's accumulator of the flow block, where there is one: scattered at the pass's end)
-            counts = top_k_leaf_fused.counts_buffer(sib, desc.top_k, B) if rows.numel() > 0 else None
+            # statistics into a pass's accumulator of the flow block, where there is one: scattered at the pass's end;
+            # the element flows by the same call where they can)
+            counts = None if Rm == 0 else (top_k_leaf_fused.counts_buffer(sib, desc.top_k, B) if t is None else
+                                           top_k_leaf_fused.counts_rows(sib, desc.top_k, B, t))
             if want_flows:
                 em_out = top_k_backward.em_accumulator(geo, params, param_flows, pf0,
                                                        denom_param_flows if want_denom else None, d0, dev)
             ef, a_rows, flows = top_k_backward.terms(*tensors, tab, element_mars, geo, slot, rows, logw_rows, nf,
                                                      external_rows(kwargs), grads, gviews, fresh, want_flows, pm, counts,
-                                                     top_k_fused.kept_of(layer, ns_info.ns, B), em_out = em_out)
+                                                     top_k_fused.kept_of(layer, ns_info.ns, B), em_out = em_out,
+                                                     element_flows = element_flows if ef_kernel else None,
+                                                     store = alone)
             Fp, Fm = flows if want_flows else (None, None)
         else:
             f = _d(nf.t()).exp()
@@ -400,9 +440,9 @@ def sum_backward(desc, layer, ns_tensors, ns_grad_tensors, node_flows, element_f
             a_rows = a[rows]
 
         kids = geo["kids"]
-        if kernels and element_flows.dtype == torch.float32 and element_flows.stride(1) == 1:
-            top_k_backward.scatter_element_flows(ef, geo["cols"], kids, element_flows)
-        else:
+        if not (kernels and ef_kernel):                                # (else written by `terms`' call)
+            if alone:
+                element_flows.index_fill_(0, kids, -float("inf"))
             element_flows[kids, :] = torch.logaddexp(element_flows[kids, :],
                                                      ef.log().t()[geo["cols"], :].to(element_flows.dtype))
         if want_flows and em_out is None:
@@ -411,8 +451,8 @@ def sum_backward(desc, layer, ns_tensors, ns_grad_tensors, node_flows, element_f
                 desc._scatter_add(geo, param_flows, pf0, Fp.float())
                 if want_denom:
                     desc._scatter_add(geo, denom_param_flows, d0, _safe_div(Fm, theta).float())
-        if rows.numel() > 0 and a_rows is not None and not top_k_leaf_fused.add_counts(sib, desc.top_k, B, a_rows):
-            records = kwargs.get(QUERY_RECORDS_KWARG)               # (a conditional query's: the leaf's read-out)
+        if Rm > 0 and a_rows is not None and not top_k_leaf_fused.add_counts(sib, desc.top_k, B, a_rows):
+            records = kwargs.get(_kw("QUERY_RECORDS_KWARG"))           # (a conditional query's: the leaf's read-out)
             if records is not None:
                 records[("top_k_slot_counts", id(sib["ns"]))] = (rows, a_rows)
             f = _d(nf.t()).exp() if f is None else f

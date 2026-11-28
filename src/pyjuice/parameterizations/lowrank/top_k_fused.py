@@ -1,7 +1,8 @@
 """
 `LowRank(top_k)` sum layers' forward by the fused CUDA kernels (`kernels/c/lowrank_top_k.cu`) where they serve
 (`TOP_K_FUSED`, the module built, the shapes they hold, the default precision); else the float64 reference
-(`top_k.py`), which stays what both are checked against. A node vector takes two launches: the prep (`top_k_prep`:
+(`top_k.py`), which stays what both are checked against. A node vector takes one call into the module
+(`top_k_sum_forward`) and two launches: the prep (`top_k_prep`:
 every operand from the caller's tensors, the circuit's element values and the shared parameters -- fp16 factors,
 the token rows in fp16, scaled (E16: TF32's 10 bits, every reader's), the children's values over their largest,
 log2 theta in the MMAs' fragment order, the masked rows' slot weights) and the values (`top_k_forward`: the masked
@@ -55,18 +56,26 @@ def _empty(device, dtype):
 def _rows(t: torch.Tensor) -> torch.Tensor:
     """`t` [batch, rows, n] float32 as the kernels read it: its rows contiguous and adjacent, 16-byte aligned with a
     batch stride of a multiple of 4 floats -- a view of a group's tensor as it lies, else a contiguous copy."""
-    t = t.float()
-    ok = t.stride(2) == 1 and t.stride(1) == t.size(2) and t.stride(0) % 4 == 0 and t.data_ptr() % 16 == 0
+    if t.dtype != torch.float32:
+        t = t.float()
+    st = t.stride()
+    ok = st[2] == 1 and st[1] == t.size(2) and st[0] % 4 == 0 and t.data_ptr() % 16 == 0
     return t if ok else t.contiguous()
 
 
-def theta_tables(desc, sib, ns, geo, params, batch_size: int) -> dict:
+def _as(t: torch.Tensor, dtype) -> torch.Tensor:
+    """`t` contiguous of `dtype`: itself where it is (no dispatch a call: a position's host time at small batches)."""
+    return t if t.dtype == dtype and t.is_contiguous() else t.to(dtype).contiguous()
+
+
+def theta_tables(desc, sib, ns, geo, params, batch_size: int, cache = False) -> dict:
     """The node vector's shared parameters as the kernels read them -- `{"theta": [M, N] fp32}`, and each table of them
     once a kernel made it ("LTh": the forward's l2t; "L2T", "LTc": the backward's) -- kept for the pass in its leaf's
-    state (`top_k_leaf_fused.pass_cache`: made again every forward) and shared by the node vectors of one source of
-    parameters (tied copies); a dict of this call alone where the leaf has no state."""
-    from . import top_k_leaf_fused
-    cache = top_k_leaf_fused.pass_cache(sib, batch_size)
+    state (`top_k_leaf_fused.pass_cache`: made again every forward; `cache` that dict where the caller has it, or None)
+    and shared by the node vectors of one source of parameters (tied copies); a dict of this call alone where the leaf
+    has no state."""
+    if cache is False:
+        cache = _leaf().pass_cache(sib, batch_size)
     src = ns.get_source_ns() if ns.is_tied() else ns
     key = ("theta", id(src), params.data_ptr(), params.dtype, geo["M"], geo["N"])
     tab = None if cache is None else cache.get(key)
@@ -85,41 +94,16 @@ def prep(Bm, G, element_mars, eid, has, theta, slot, rows_m, logw_m, emap = None
     tensors it reads (None: its own, Bx = B); `rows_m` the samples whose token is missing and their slots' log-weights
     `logw_m [b, M, K + 1]` (None where none); `pair`: the samples reading a row share its work items (else a sample an
     item); `lth` theta's l2t as an earlier call made it (`theta_tables`' "LTh": not made again), or None; `items` its
-    work items as `work_items` made them, or None (made by the prep). The operands the forward and the backward both
-    read: (BP, E16, ev, cmax, LTh, mitems, oitems, noitems, slot32, logw, flags)."""
+    work items as `top_k_leaf_fused.sum_parts` made them, or None (made by the prep). The operands the forward and the
+    backward both read: (BP, E16, ev, cmax, LTh, mitems, oitems, noitems, slot32, logw, flags)."""
     dev = Bm.device
-    f = lambda t: t.float().contiguous()
+    L = torch.long
     got = top_k_module().top_k_prep(
-        _rows(Bm), _rows(G), element_mars, eid.long().contiguous(), _empty(dev, torch.bool) if has is None else has, f(theta),
-        slot.long().contiguous(), _empty(dev, torch.long) if emap is None else emap.long().contiguous(),
-        rows_m.long().contiguous(), _empty(dev, torch.float32) if logw_m is None else _weights_operand(logw_m), pair,
+        _rows(Bm), _rows(G), element_mars, _as(eid, L), _empty(dev, torch.bool) if has is None else has,
+        _as(theta, torch.float32), _as(slot, L), _empty(dev, L) if emap is None else _as(emap, L), _as(rows_m, L),
+        _empty(dev, torch.float32) if logw_m is None else _weights_operand(logw_m), pair,
         _empty(dev, torch.int32) if lth is None else lth, [] if items is None else items)
     return got
-
-
-def work_items(sib: dict, batch_size: int, emap):
-    """The paired work items of a sum reading the leaf `sib` -- `top_k_items`' for every node vector reading the leaf's
-    layer, one launch a pass (kept in the leaf's forward state, whose slots and masked rows they are made from) --, or
-    None where the leaf's layer has no forward state (the prep makes its own)."""
-    from . import top_k_leaf_fused
-    cache = top_k_leaf_fused.pass_cache(sib, batch_size)
-    st = top_k_leaf_fused._state(sib["layer"], batch_size)
-    if cache is None or st is None or st.get("slot") is None:
-        return None
-    got = cache.get("items")
-    if got is None:
-        offs, B, dev = st["offs"], batch_size, st["slot"].device
-        roff = top_k_leaf_fused._to_device(torch.tensor(offs, dtype = torch.int32), dev)
-        mi, oi, ni, s32 = top_k_module().top_k_items(_empty(dev, torch.long) if emap is None else emap.long().contiguous(),
-                                                     st["rows"].long().contiguous(), roff, offs, st["slot"].contiguous())
-        got, mo, oo = [], 0, 0
-        for t in range(len(offs) - 1):                                     # (a leaf's after the earlier leaves')
-            rm = offs[t + 1] - offs[t]
-            m1, o1 = mo + max(rm, 1), oo + 2 * max((B - rm + 1) // 2, 1) + 1
-            got.append([mi[mo:m1], oi[oo:o1], ni[t:t + 1], s32[t]])
-            mo, oo = m1, o1
-        cache["items"] = got
-    return got[top_k_leaf_fused._plan(sib["layer"])["index"][id(sib["ns"])]]
 
 
 #: The masked samples' weights' row stride in the kernels' operand (`SP` of `kernels/c/lowrank_top_k.cu`)
@@ -149,29 +133,76 @@ def forward(A, ops, node_mars, nid0: int, stash: bool = False, counts = None):
 def sum_forward(desc, layer, ns_info, tensors, geo, params, element_mars, node_mars, sib, kwargs) -> bool:
     """A `LowRank(top_k)` sum node vector's values by the fused kernels, written over its rows of `node_mars`; False
     where they do not serve (the reference then). Samples reading the same row of tensors (`external_params_rows`)
-    share its tile."""
-    from .top_k import slot_parts, external_rows
-    from . import top_k_backward, top_k_leaf_fused
+    share its tile. One call into the module (`top_k_sum_forward`: the prep and the values), its operands as they lie
+    (the module converts what it must): a position's host time is what the small batches' passes take."""
     B = node_mars.size(1)
-    emap = external_rows(kwargs)
     A, Bm, G = tensors
-    if not serves(desc, geo["M"], geo["N"], A.size(2), node_mars, kwargs) or element_mars.stride(1) != 1 or \
-            (emap is None and A.size(0) != B):
+    leaf = _leaf()
+    # whether the kernels serve, the map of rows, whether the stash is kept: the pass's, decided once (in its leaf's
+    # pass cache: made again every forward)
+    cache = leaf.pass_cache(sib, B)
+    key = ("fw", id(desc), geo["M"], geo["N"], A.size(2), A.size(0))
+    decided = None if cache is None else cache.get(key)
+    if decided is None:
+        emap = _top_k().external_rows(kwargs)
+        ok = serves(desc, geo["M"], geo["N"], A.size(2), node_mars, kwargs) and element_mars.stride(1) == 1 and \
+            not (emap is None and A.size(0) != B)
+        # (a backward may follow -- the call had grad on, or a query's -- and its kernels serve: the operands and the
+        # sums' stash kept for it, which `top_k_backward.terms` takes: `kept_of`)
+        keep = ok and kwargs.get("_grad_enabled", False) and \
+            _backward().serves(desc, geo["M"], geo["N"], A.size(2), B, node_mars.device, kwargs, False)
+        decided = (ok, None if emap is None else emap.long().contiguous(), keep)
+        if cache is not None:
+            cache[key] = decided
+    ok, emap, keep = decided
+    if not ok:
         return False
-    slot, rows_m, logw_m, _, _ = slot_parts(desc, sib, B, kwargs, node_mars.device)
-    tab = theta_tables(desc, sib, ns_info.ns, geo, params, B)              # (the parameters' tables: once a pass)
-    ops = prep(Bm, G, element_mars, geo["eid"], None if geo["full"] else geo["has"], tab["theta"], slot, rows_m, logw_m,
-               emap, lth = tab.get("LTh"), items = work_items(sib, B, emap))
-    tab.setdefault("LTh", ops[4])
-    # (a backward may follow -- the call had grad on -- and its kernels serve: the operands and the sums' stash kept
-    # for it, which `top_k_backward.terms` takes: `kept_of`)
-    keep = kwargs.get("_grad_enabled", False) and \
-        top_k_backward.serves(desc, geo["M"], geo["N"], A.size(2), B, node_mars.device, kwargs, False)
-    counts = top_k_leaf_fused.counts_buffer(sib, desc.top_k, B) if keep and rows_m.numel() > 0 else None
-    stash = forward(A, ops, node_mars, ns_info.nid_start, keep, counts)
+    # the leaf's parts (its slots, masked rows and their weights, the work items): made once a pass in its state
+    parts = None if cache is None else leaf.sum_parts(sib, desc.top_k, B, emap, cache)
+    if parts is not None:
+        slot, rows_m, logw_m, items, Rm, t = parts
+        counts = leaf.counts_rows(sib, desc.top_k, B, t) if keep and Rm > 0 else None
+    else:
+        slot, rows_m, logw_m, _, _ = _top_k().slot_parts(desc, sib, B, kwargs, node_mars.device)
+        items = []
+        counts = leaf.counts_buffer(sib, desc.top_k, B) if keep and rows_m.numel() > 0 else None
+    tab = theta_tables(desc, sib, ns_info.ns, geo, params, B, cache)    # (the parameters' tables: once a pass)
+    got = top_k_module().top_k_sum_forward(A, Bm, G, element_mars, geo["eid"], None if geo["full"] else geo["has"],
+                                           tab["theta"], slot, emap, rows_m, logw_m, tab.get("LTh"), items, node_mars,
+                                           ns_info.nid_start, keep, counts)
+    if "LTh" not in tab:
+        tab["LTh"] = got[4]
     if keep:
-        layer.__dict__["_lr_state"][("kept", id(ns_info.ns))] = (B, ops, stash)
+        layer.__dict__["_lr_state"][("kept", id(ns_info.ns))] = (B, got[:11], got[11:])
     return True
+
+
+_MODS = {}
+
+
+def _leaf():
+    """`top_k_leaf_fused` (it imports this module: imported when first asked for)"""
+    m = _MODS.get("leaf")
+    if m is None:
+        from . import top_k_leaf_fused as m
+        _MODS["leaf"] = m
+    return m
+
+
+def _top_k():
+    m = _MODS.get("top_k")
+    if m is None:
+        from . import top_k as m
+        _MODS["top_k"] = m
+    return m
+
+
+def _backward():
+    m = _MODS.get("backward")
+    if m is None:
+        from . import top_k_backward as m
+        _MODS["backward"] = m
+    return m
 
 
 def kept_of(layer, ns, B: int):
