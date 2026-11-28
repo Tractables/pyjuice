@@ -602,9 +602,11 @@ class SumLayer(Layer, nn.Module):
                           circuit's passes: `TensorCircuit._stream_fusion_groups`.)
         """
         op = op_params if op_params is not None and self.__dict__.get("_reads_param_operands", False) else None
-        # (the call's grad mode: a hint of what a parameterized layer may keep for a backward -- a plain sum keeps nothing,
-        # and the hint is no option of its call)
+        # (the call's hints -- its grad mode, the caller's word that no backward follows: what a parameterized layer may
+        # keep for a backward or make for this forward alone; a plain sum keeps and makes nothing, and they are no
+        # option of its call)
         kwargs.pop("_grad_enabled", None)
+        kwargs.pop("_no_backward", None)
 
         # A plain call -- LL, no tempering, whole partitions, nothing else passed -- whose every partition the full
         # dispatch below sent to a tuned CUDA tlmm kernel launches those kernels straight away (`_fw_fast_launch`, which

@@ -139,6 +139,31 @@ def test_the_settled_forward_follows_the_tuner_and_the_switches(monkeypatch):
     assert len(s_calls) == 1
 
 
+def test_a_forward_no_backward_follows_is_a_plain_call(monkeypatch):
+    """A forward its caller says no backward follows (`_backward_follows = False`, the queries' word: the hint
+    `_no_backward` in the sum options, for the parameterized layers alone) is to a plain sum layer the plain call it
+    was: the same launches -- the settled ones, the same dispatches --, the circuit's product layer decisions the plain
+    forward's (none of its own), the values the plain forward's to the bit."""
+    if not (ck.is_available() and ck.prepass_is_available()):
+        pytest.skip("the CUDA kernels are not available here")
+    _cuda_first(monkeypatch)
+    pc = _hmm(torch.float32)
+    x = torch.randint(0, 16, (64, 8), device = DEV)
+    with torch.no_grad():
+        for _ in range(3):                                          # (tunes, records; the product layer decisions)
+            pc(x)
+    keys = set(pc.__dict__.get("_stream_fusion_", {}))
+    s_calls = _counted(monkeypatch, SumLayer, "_forward")
+    with torch.no_grad():
+        want = pc(x).clone()
+        plain = len(s_calls)
+        got = pc(x, _backward_follows = False)
+    assert plain < len(_layers(pc, SumLayer)), plain                # (the settled launches taken: the check's premise)
+    assert len(s_calls) == 2 * plain, (plain, len(s_calls))
+    assert set(pc.__dict__.get("_stream_fusion_", {})) == keys
+    assert torch.equal(got, want)
+
+
 def test_a_device_move_drops_the_settled_launches():
     if not (ck.is_available() and ck.prepass_is_available()):
         pytest.skip("the CUDA kernels are not available here")

@@ -1,12 +1,12 @@
 """
-`LowRank(top_k)` sums' LATENCY mode (`lowrank/top_k_stack.py`, `kernels/c/lowrank_top_k_latency.cuh`): where no
-backward follows and the batch is small, a stack's forward is one launch a position on the chain, each node's slot sums
-made before the chain -- the throughput mode's operands and roundings, its sums reassociated (the children a chunk at a
-time, each chunk shifted by its own largest). Against the throughput mode (the unstacked path's launches): the values up
-to that reassociation, whatever the masks, the map of rows and the parameters' sources, and the same -inf entries;
-every token masked, each likelihood 1 (the slots' sums and the chain's made of the same fp16 operands); the same bits
-call to call, the pass whose product layer decisions ran sums before it included; an impossible sample's -inf; the
-mode taken where it serves and nowhere else.
+`LowRank(top_k)` sums' LATENCY mode (`lowrank/top_k_stack.py`, `kernels/c/lowrank_top_k_latency.cuh`): where the
+caller says no backward follows (a query's: `marginal`) and the batch is small, a stack's forward is one launch a
+position on the chain, each node's slot sums made before the chain -- the throughput mode's operands and roundings, its
+sums reassociated (the children a chunk at a time, each chunk shifted by its own largest). Against the throughput mode
+(the unstacked path's launches): the values up to that reassociation, whatever the masks, the map of rows and the
+parameters' sources, and the same -inf entries; every token masked, each likelihood 1 (the slots' sums and the chain's
+made of the same fp16 operands); the same bits call to call, the pass whose product layer decisions ran sums before it
+included; an impossible sample's -inf; the mode taken where it serves and nowhere else.
 """
 
 import contextlib
@@ -16,7 +16,7 @@ import os
 import pytest
 import torch
 
-from pyjuice.queries import conditional
+from pyjuice.queries import conditional, marginal
 
 # (the stack tests' circuits and batches, loaded by path: the suite's importlib mode puts no test directory on
 # `sys.path`)
@@ -54,11 +54,11 @@ def _modes(tks, latency = True, max_b = 8):
 
 
 def _run(pc, x, miss, kw, calls = 2):
-    """the log-likelihoods and the node values of the last of `calls` no-grad calls (from the second, the settled
-    forwards')"""
+    """the log-likelihoods and the node values of the last of `calls` marginal queries (a forward its caller says no
+    backward follows; from the second, the settled forwards')"""
     with torch.no_grad():
         for _ in range(calls):
-            ll = pc(x, missing_mask = miss, **kw).view(-1).clone()
+            ll = marginal(pc, x, missing_mask = miss, **kw).view(-1).clone()
     return ll, pc.node_mars.clone()
 
 
@@ -149,14 +149,23 @@ def test_an_impossible_sample_is_minus_infinity():
 
 
 def test_the_latency_mode_where_no_backward_follows():
-    """Taken by a no-grad forward of at most `LATENCY_MAX_B` samples; not by a larger batch's, nor where a backward may
-    follow (the conditional's forward, which keeps the stash; a differentiable forward), nor with it off."""
+    """Taken by a forward of at most `LATENCY_MAX_B` samples its caller says no backward follows (a marginal; any call
+    passing `_backward_follows = False`, as the queries do); not by a plain forward, which `backward` may follow -- its
+    recompute the throughput mode's, rounded its own way (`lowrank_top_k_test.py`'s
+    `test_masked_em_statistics_are_the_sub_batch`) --, nor a larger batch's, nor where a backward follows (the
+    conditional's forward, which keeps the stash; a differentiable forward), nor with it off."""
     tkf, tlf, tks = S._modules()
     nb = tks.LATENCY_MAX_B
     pc, kw, x, miss = S._case(nb, 0.5)
     with _modes(tks, max_b = None) as modes:
         _run(pc, x, miss, kw, calls = 1)
     assert modes == [True] * (T - 1), modes
+    with _modes(tks, max_b = None) as modes, torch.no_grad():
+        pc(x, missing_mask = miss, _backward_follows = False, **kw)
+    assert modes == [True] * (T - 1), modes
+    with _modes(tks, max_b = None) as modes, torch.no_grad():
+        pc(x, missing_mask = miss, **kw)
+    assert modes == [False] * (T - 1), modes
     with _modes(tks, latency = False) as modes:
         _run(pc, x, miss, kw, calls = 1)
     assert modes == [False] * (T - 1), modes

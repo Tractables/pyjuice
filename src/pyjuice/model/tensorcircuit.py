@@ -83,10 +83,11 @@ def _operand_columns(readers, batch_size: int) -> int:
 
 # The forward options a fused product forward serves (`_stream_fusion_groups`): the plain regime's, and the external
 # parameters' (a gated layer whose parameterization takes the fused forward, `fuses_stream_children`); and the call's
-# grad mode, a hint of what a layer may keep for a backward (`_grad_enabled`), which changes no value. Any other option
-# of a call: a pair fuses where every layer of its sum group honors it (`SumLayer.stream_fusion_accepts`)
+# hints of what a layer may keep for a backward or make for this forward alone (`_grad_enabled`, `_no_backward`), which
+# the passes with or without the product layer honor alike. Any other option of a call: a pair fuses where every layer
+# of its sum group honors it (`SumLayer.stream_fusion_accepts`)
 _STREAM_FUSION_FW_OPTS = frozenset(("precision", "pflow_temperature", "sum_external_params",
-                                    "sum_external_params_buffer", "_grad_enabled"))
+                                    "sum_external_params_buffer", "_grad_enabled", "_no_backward"))
 
 # The backward options of the plain regime a fused product backward serves (`_stream_fusion_bk_groups`); others as the
 # forward's
@@ -761,8 +762,10 @@ class TensorCircuit(_BuildMixin, _CudaGraphsMixin, _ExternalParamsMixin, _Learni
         differentiable = bool(kwargs.pop("differentiable", False))
         param_flows_mask = kwargs.pop("param_flows_mask", None)               # (the backward's: below)
         grad_enabled = torch.is_grad_enabled()                                 # (the call's, before the layers' no_grad)
-        # (private, a query's: a backward of this forward follows whatever the grad mode -- `queries.base.query`)
-        backward_follows = grad_enabled or bool(kwargs.pop("_backward_follows", False))
+        # (private, a query's -- `queries.base.query` --: whether a backward of this forward follows whatever the grad
+        # mode, True or False; not given, a backward may follow: `backward` is called after a forward without grad)
+        stated = kwargs.pop("_backward_follows", None)
+        backward_follows = grad_enabled or bool(stated)
         self._num_runs = getattr(self, "_num_runs", 0) + 1
 
         with device_grad_controller(device = self.device, no_grad = True):
@@ -840,6 +843,12 @@ class TensorCircuit(_BuildMixin, _CudaGraphsMixin, _ExternalParamsMixin, _Learni
                 # (the call made with grad on, or a query's that runs its backward: a backward of it may follow -- what a
                 # layer may keep for one)
                 sum_opts["_grad_enabled"] = True
+            elif stated is not None:
+                # (the caller's word that no backward of this forward follows -- a query's that runs none, grad off --:
+                # what a layer may make for this forward alone, its values to no backward's recompute -- the
+                # `LowRank(top_k)` sums' latency mode; a call without it might be followed by `backward`, which
+                # recomputes)
+                sum_opts["_no_backward"] = True
 
             def _run_inner_layers():
                 # The buffers and parameters looked up once, and a group without hooks called at its `forward` -- what

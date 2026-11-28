@@ -23,7 +23,8 @@ after every reader's launch -- the unstacked path's footprint between passes -- 
 kernels do not serve, takes the unstacked path (`top_k_fused.sum_forward`, `top_k_backward.terms`), the reference the
 stack's operands are bit for bit (the same device code).
 
-Where no backward follows and the batch is small (`LATENCY`, `LATENCY_MAX_B`), a stack's forward is its LATENCY mode
+Where the caller says no backward follows (a query's: `_no_backward`) and the batch is small (`LATENCY`,
+`LATENCY_MAX_B`), a stack's forward is its LATENCY mode
 (`kernels/c/lowrank_top_k_latency.cuh`): each node's slot sums -- what of the second part no children's value enters --
 made with the first part for every reader, in one more launch, and a reader's forward ONE launch (the children's values
 into the node values, its chain-free part before the wait for the launch below): the throughput mode's operands and
@@ -54,10 +55,12 @@ from . import top_k_fused, top_k_leaf_fused
 STACKED = True
 
 #: the LATENCY mode of a stack's forward (`kernels/c/lowrank_top_k_latency.cuh`): a position's sums one launch on the
-#: chain, their slots' sums made off it -- where no backward follows and the batch is at most `LATENCY_MAX_B` samples
-#: (the chain latency-bound); off, the throughput mode's launches (`tk_sk_kernel`). MEASURED (the Codpula head, 31
-#: positions, RTX PRO 6000): the marginal 30%, 33%, 15% faster at 1, 2, 4 samples (9%, 2% at 5, 6), 10% slower at 8 -- a
-#: position's step never slower, but the slots' sums' launch before the chain (~42 us a sample) outgrows it
+#: chain, their slots' sums made off it -- where the caller says no backward follows (`_no_backward`: a query's that
+#: runs none; any other forward may be followed by `backward`, whose recompute is the throughput mode's, rounded its own
+#: way) and the batch is at most `LATENCY_MAX_B` samples (the chain latency-bound); else the throughput mode's launches
+#: (`tk_sk_kernel`). MEASURED (the Codpula head, 31 positions, RTX PRO 6000): the marginal 30%, 33%, 15% faster at 1,
+#: 2, 4 samples (9%, 2% at 5, 6), 10% slower at 8 -- a position's step never slower, but the slots' sums' launch before
+#: the chain (~42 us a sample) outgrows it
 LATENCY = True
 LATENCY_MAX_B = 4
 
@@ -80,8 +83,8 @@ class SumStack:
     """A pass's stacked forward of the sums reading a leaf layer (the module's notes): its plan, each reader's index in
     it, and what a call must be to be one of its pass."""
 
-    __slots__ = ("plan", "index", "keep", "node_mars", "element_mars", "staged", "emap", "precision", "grad", "taken",
-                 "left")
+    __slots__ = ("plan", "index", "keep", "node_mars", "element_mars", "staged", "emap", "precision", "grad", "alone",
+                 "taken", "left")
 
     def __init__(self, plan, index: dict, keep: bool, node_mars, element_mars, kwargs: dict):
         top_k = _mods()[0]
@@ -90,6 +93,7 @@ class SumStack:
         # (the call's options a stack's launches were made for: `serves`)
         self.staged, self.emap = top_k._staged(kwargs), top_k.external_rows(kwargs)
         self.precision, self.grad = kwargs.get("precision", "auto"), bool(kwargs.get("_grad_enabled", False))
+        self.alone = bool(kwargs.get("_no_backward", False))
         self.taken = set()          # (the readers whose kept operands a backward took: once)
         self.left = set(index.values())     # (the readers not launched yet: where no backward follows, the buffers
                                             #  are given back after the last -- the unstacked forward's footprint)
@@ -100,7 +104,8 @@ class SumStack:
         return (node_mars is self.node_mars and element_mars is self.element_mars and
                 top_k._staged(kwargs) is self.staged and top_k.external_rows(kwargs) is self.emap and
                 kwargs.get("precision", "auto") == self.precision and
-                bool(kwargs.get("_grad_enabled", False)) == self.grad)
+                bool(kwargs.get("_grad_enabled", False)) == self.grad and
+                bool(kwargs.get("_no_backward", False)) == self.alone)
 
     def takes(self, ns) -> bool:
         """Whether the stack takes the node vector `ns`'s forward: one of its readers, its buffers not given back (after
@@ -269,7 +274,7 @@ def _make(leaf_layer, B: int, kwargs: dict, node_mars, element_mars, params, cac
         for r, _ in picked:                      # (their rows of the leaf's counts the sums' kernels' to write)
             if offs[r.t + 1] > offs[r.t]:
                 st["written"].add(r.t)
-    latency = LATENCY and not keep and B <= LATENCY_MAX_B
+    latency = LATENCY and not keep and B <= LATENCY_MAX_B and bool(kwargs.get("_no_backward", False))
     plan = top_k_fused.top_k_module().TopKStackPlan(
         [t[0] for _, t in picked], [t[1] for _, t in picked], [t[2] for _, t in picked],
         [r.geo["eid"] for r, _ in picked], [r.has for r, _ in picked], [r.nid0 for r, _ in picked],
