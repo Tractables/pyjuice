@@ -306,6 +306,9 @@ def _tilts(tilts, tau: torch.Tensor) -> None:
     of positions whose tensors share their strides (`top_k_leaf_tau`), else cuBLAS's product (the scale on B)."""
     tm = tilt_module()
     ops = [tuple(x.float() for x in tl) for tl in tilts]
+    # (tau's rows the tensors': the kernel reads that many rows of each -- more would read past their ends)
+    assert all(A.size(0) == tau.size(1) and Bt.size(0) == tau.size(1) for A, Bt in ops), \
+        "top_k leaf: the tilts' rows are the tensors' (tau [T, Bx, S, M])"
     fits = tm is not None and ops[0][0].size(2) <= 64 and tau.size(2) <= 65 and tau.size(3) % 128 == 0
     k = 0
     while k < len(ops):

@@ -2068,11 +2068,11 @@ std::vector<torch::Tensor> top_k_leaf_pass(torch::Tensor params, std::vector<tor
     // B [Bx, re, S] fp32, A's rows 16-B aligned with their ranks contiguous, every position's strides alike, re <= 64 a
     // multiple of 4, K = Kl <= 64 (S = K + 1), at most 64 positions -- else none made here)
     std::vector<int64_t> fptrs, fstrides;
-    int64_t re = 0;
+    int64_t re = 0, tx = 0;                                  // (tx: the tilts' rows -- the tensors', not the evidence's)
     if (!tau.has_value()) {
         TORCH_CHECK((int64_t)tiltA.size() == T && (int64_t)tiltB.size() == T, "top_k leaf pass: a tilt a position");
         const auto& A0 = tiltA[0]; const auto& B0 = tiltB[0];
-        re = A0.size(2);
+        re = A0.size(2); tx = A0.size(0);
         bool ok = T <= 64 && S == K + 1 && K <= 64 && re <= 64 && re % 4 == 0 && A0.stride(2) == 1 &&
                   A0.stride(0) % 4 == 0 && A0.stride(1) % 4 == 0 && B0.size(1) == re && B0.size(2) == S;
         for (int64_t t = 0; ok && t < T; ++t) {
@@ -2080,7 +2080,7 @@ std::vector<torch::Tensor> top_k_leaf_pass(torch::Tensor params, std::vector<tor
             ok = A.scalar_type() == at::kFloat && Bt.scalar_type() == at::kFloat &&
                  reinterpret_cast<uintptr_t>(A.data_ptr()) % 16 == 0 && A.strides() == A0.strides() &&
                  Bt.strides() == B0.strides() && Bt.size(1) == B0.size(1) && Bt.size(2) == B0.size(2) &&
-                 A.size(1) == A0.size(1) && A.size(2) == A0.size(2);
+                 A.size(1) == A0.size(1) && A.size(2) == A0.size(2) && A.size(0) == tx && Bt.size(0) == tx;
         }
         if (!ok) return {};
         for (const auto& A : tiltA) fptrs.push_back(reinterpret_cast<int64_t>(A.data_ptr()));
@@ -2162,8 +2162,11 @@ std::vector<torch::Tensor> top_k_leaf_pass(torch::Tensor params, std::vector<tor
     C10_CUDA_CHECK(cudaMemcpyAsync(meta_h.data_ptr<int>(), meta, (3 + T) * sizeof(int), cudaMemcpyDeviceToHost, stream));
     at::cuda::CUDAEvent copied;
     copied.record(stream);
+    // (the tilts' rest slot a row of TENSORS: where the samples carry their own evidence and read their rows through the
+    // map, the evidence has more rows than the tensors -- and the backward's tau, made again with tauK's rows, would
+    // read past the tensors' ends)
     auto tauK = tau.has_value() ? torch::empty({0}, torch::dtype(torch::kFloat32).device(dev))
-                                : torch::empty({T, Bx, M}, torch::dtype(torch::kFloat32).device(dev));
+                                : torch::empty({T, tx, M}, torch::dtype(torch::kFloat32).device(dev));
     auto emap32 = emap.has_value() ? emap->to(torch::kInt32).contiguous() : torch::empty({0}, i32);
     torch::Tensor ord, rank, rowstart;
     // (the evidence a row of samples each: the samples by the row they read, stable -- the forward's CTAs in that order

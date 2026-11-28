@@ -1102,6 +1102,32 @@ def test_the_kernels_together_are_the_torch_passes():
         assert _rel(a, r_) < 5e-3, (name, _rel(a, r_))
 
 
+def test_the_tilts_made_again_have_the_rows_of_tensors(monkeypatch):
+    """Each sample its own evidence, reading its row of tensors through the map (8 samples, 4 rows): the tilts the
+    backward makes again (`top_k_leaf_fused._tilts`: tau [T, Bx, S, M], its kernel reading Bx rows of each position's A
+    and Bt) a row of TENSORS each -- with the evidence's rows (the samples'), the kernel read past the tensors' ends
+    (MEASURED with compute-sanitizer: out-of-bounds reads of `tk_tau_kernel`, an illegal access in a suite where an
+    allocation ended a mapping)."""
+    import pyjuice.parameterizations.lowrank.top_k_leaf_fused as tlf
+    if tlf.module() is None or tlf.tilt_module() is None:
+        pytest.skip("the CUDA modules did not build")
+    pc, (ext, ids, lp, x, miss), (T, N, b) = _mask_case(True)
+    pext, lp = _pc_ext(ext, T, N), lp.float()
+    real, seen = tlf._tilts, []
+
+    def tilts(ops, tau):
+        seen.append((tau.size(1), {int(t.size(0)) for tl in ops for t in tl[:2]}))
+        return real(ops, tau)
+    monkeypatch.setattr(tlf, "_tilts", tilts)
+    ts = {g_: tuple(t.clone().requires_grad_(True) for t in v) for g_, v in pext.items()}
+    ll = pc(x.repeat(2, 1), missing_mask = torch.cat([torch.zeros_like(miss), miss]), external_params = ts,
+            external_params_rows = torch.arange(b, device = DEV).repeat(2), soft_evidence_cat_ids = ids.repeat(2, 1, 1),
+            categorical_evidence_logp = lp.repeat(2, 1, 1), differentiable = True).view(-1)
+    ll.sum().backward()
+    assert seen and all(rows == {bx} for bx, rows in seen), seen                # (the backward's: made again, b rows)
+    assert all(bx == b for bx, _ in seen), seen
+
+
 @pytest.mark.parametrize("by_row", [False, True])
 def test_gradients_fold_into_rows_read_by_any_number_of_samples(by_row):
     """A map whose rows are read by three samples, two, one and none, in the autograd backward (each sample's gradients
