@@ -751,6 +751,8 @@ class TensorCircuit(_BuildMixin, _CudaGraphsMixin, _ExternalParamsMixin, _Learni
         differentiable = bool(kwargs.pop("differentiable", False))
         param_flows_mask = kwargs.pop("param_flows_mask", None)               # (the backward's: below)
         grad_enabled = torch.is_grad_enabled()                                 # (the call's, before the layers' no_grad)
+        # (private, a query's: a backward of this forward follows whatever the grad mode -- `queries.base.query`)
+        backward_follows = grad_enabled or bool(kwargs.pop("_backward_follows", False))
         self._num_runs = getattr(self, "_num_runs", 0) + 1
 
         with device_grad_controller(device = self.device, no_grad = True):
@@ -824,8 +826,9 @@ class TensorCircuit(_BuildMixin, _CudaGraphsMixin, _ExternalParamsMixin, _Learni
             if self.__dict__.get("_sums_read_inputs", False):
                 # (a sum whose parameters read the leaf beside it reads the inputs: `SumParameterization.reads_sibling_leaf`)
                 sum_opts["_inputs"] = origin_inputs
-            if grad_enabled:
-                # (the call made with grad on: a backward of it may follow -- what a layer may keep for one)
+            if backward_follows:
+                # (the call made with grad on, or a query's that runs its backward: a backward of it may follow -- what a
+                # layer may keep for one)
                 sum_opts["_grad_enabled"] = True
 
             def _run_inner_layers():

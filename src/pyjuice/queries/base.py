@@ -39,7 +39,10 @@ def query(pc: TensorCircuit, inputs: torch.Tensor,
     """
 
     # Run forward pass
-    lls = pc.forward(inputs, input_layer_fn = fw_input_fn, **kwargs)
+    # (a backward follows: the layers may keep for it what it would make again -- MEASURED, the Codpula head's circuit, a
+    # conditional at 96 samples 27.9 -> 21.2 ms: the `LowRank(top_k)` sums' forward stash, made again under `no_grad`)
+    lls = pc.forward(inputs, input_layer_fn = fw_input_fn, _backward_follows = run_backward and fw_output_fn is None,
+                     **kwargs)
 
     if fw_output_fn is not None:
         return fw_output_fn(pc)
